@@ -4,6 +4,8 @@
 内置步步高电子词典(BBK 4980 系列)模拟器、GB / GBC / NES / Arduboy 四个游戏引擎、
 电子书阅读器、蓝牙手柄与 WiFi 网页手柄。
 
+> **在线刷机**:https://bbk.linit.cn/flash/ (浏览器 WebSerial 直刷 16MB 固件,需 Chrome/Edge)
+
 ---
 
 ## 功能

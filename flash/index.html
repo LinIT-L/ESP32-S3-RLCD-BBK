@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BBK 固件刷写器</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: #f4f6f8; color: #222; display: flex; justify-content: center; padding: 32px 16px; }
+  .wrap { width: 100%; max-width: 560px; }
+  h1 { font-size: 26px; margin-bottom: 6px; }
+  .sub { color: #666; margin-bottom: 24px; font-size: 14px; }
+  .card { background: #fff; border: 1px solid #e3e6ea; border-radius: 10px;
+          padding: 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 16px; margin-bottom: 14px; }
+  label { display: block; padding: 8px 0; cursor: pointer; font-size: 15px; }
+  #fwInfo { margin-top: 10px; font-size: 13px; color: #2b6cb0; }
+  button { width: 100%; padding: 14px; font-size: 17px; font-weight: 600;
+           color: #fff; background: #2b6cb0; border: 0; border-radius: 10px; cursor: pointer; }
+  button:disabled { background: #9bb7d4; cursor: not-allowed; }
+  button.busy { background: #d69e2e; }
+  #status { margin-top: 14px; font-size: 15px; min-height: 22px; }
+  #log { margin-top: 10px; font-family: Menlo, Consolas, monospace; font-size: 12px;
+         color: #444; background: #0d1117; color: #9ecbff; border-radius: 8px;
+         padding: 12px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; display: none; }
+  details { margin-top: 16px; font-size: 14px; color: #555; }
+  details summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+  details ol { padding-left: 20px; line-height: 1.9; }
+  .warn { color: #c0392b; font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BBK 固件刷写器</h1>
+  <p class="sub">通过浏览器直接给 ESP32-S3 设备烧录固件 · 需 Chrome / Edge(支持 WebSerial)</p>
+
+  <div class="card">
+    <h2>选择固件</h2>
+    <label><input type="radio" name="src" value="site" checked> 站内固件：V1.1 完整 16MB 镜像（推荐）</label>
+    <label><input type="radio" name="src" value="local"> 本地文件（选择 .bin 文件）</label>
+    <input type="file" id="fileInput" accept=".bin" hidden>
+    <p id="fwInfo">已选：站内 V1.1 16MB 完整镜像（写入地址 0x0）</p>
+  </div>
+
+  <button id="flashBtn">连接设备并烧录</button>
+  <p id="status"></p>
+  <div id="log"></div>
+  <p class="warn" id="warn" style="display:none"></p>
+
+  <details>
+    <summary>使用说明</summary>
+    <ol>
+      <li>使用 <b>Chrome 或 Edge</b> 浏览器打开本页（必须 HTTPS）</li>
+      <li>用 USB 数据线连接设备</li>
+      <li>选择固件：站内镜像，或点「本地文件」选电脑上的 .bin</li>
+      <li>点击「连接设备并烧录」，在弹出的窗口选择设备端口</li>
+      <li>等待烧录完成（约 3-5 分钟），完成后设备自动重启</li>
+      <li>烧录过程中<b>请勿断开 USB 或关闭页面</b></li>
+    </ol>
+  </details>
+</div>
+
+<script type="module">
+import { ESPLoader, Transport } from './esptool-js.bundle.js';
+
+const SITE_FW_URL = './ESP32-S3-RLCD-BBK-16MB.bin';
+const FLASH_ADDR = 0x0;
+const $ = (id) => document.getElementById(id);
+
+function log(msg) {
+  const el = $('log');
+  el.style.display = 'block';
+  el.textContent += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+$('flashBtn').addEventListener('click', async () => {
+  const btn = $('flashBtn');
+  const status = $('status');
+  try {
+    /* 1. 固件来源 */
+    let data;
+    const src = document.querySelector('input[name="src"]:checked').value;
+    if (src === 'site') {
+      status.textContent = '正在下载站内固件…';
+      const r = await fetch(SITE_FW_URL);
+      if (!r.ok) throw new Error('固件下载失败: HTTP ' + r.status);
+      data = await r.arrayBuffer();
+    } else {
+      const f = $('fileInput').files[0];
+      if (!f) throw new Error('请先选择本地 .bin 文件');
+      data = await f.arrayBuffer();
+    }
+    log('固件已加载: ' + (data.byteLength / 1048576).toFixed(1) + ' MB');
+
+    /* 2. 连接设备 */
+    btn.disabled = true;
+    btn.classList.add('busy');
+    btn.textContent = '烧录中…';
+    status.textContent = '请在弹出的窗口中选择设备端口…';
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 460800 });
+    log('串口已连接，正在初始化…');
+
+    const transport = new Transport(port, true);
+    const loader = new ESPLoader(transport, { baudrate: 460800 });
+    await loader.main();
+    const chip = loader.chip ? loader.chip.chip_name : '未知';
+    log('芯片识别: ' + chip);
+
+    /* 3. 烧录 */
+    status.textContent = '正在烧录 0x0 …（约 3-5 分钟，请勿断开）';
+    await loader.writeFlash({
+      fileArray: [{ data, address: FLASH_ADDR }],
+      eraseAll: true,
+    });
+
+    /* 4. 复位 */
+    try { await loader.hardReset(); } catch (e) {}
+    status.textContent = '✅ 烧录完成，设备已重启';
+    log('烧录完成，设备已重启');
+  } catch (err) {
+    console.error(err);
+    status.textContent = '❌ ' + (err.message || err);
+    log('错误: ' + (err.message || err));
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('busy');
+    btn.textContent = '连接设备并烧录';
+  }
+});
+
+/* 本地文件选择 */
+document.querySelectorAll('input[name="src"]').forEach(r => {
+  r.addEventListener('change', () => {
+    if (r.value === 'local') {
+      $('fileInput').click();
+      $('fileInput').addEventListener('change', () => {
+        const f = $('fileInput').files[0];
+        $('fwInfo').textContent = '已选本地文件: ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB)';
+      });
+    } else {
+      $('fwInfo').textContent = '已选：站内 V1.1 16MB 完整镜像（写入地址 0x0）';
+    }
+  });
+});
+</script>
+</body>
+</html>
