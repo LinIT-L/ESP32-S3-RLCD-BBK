@@ -37,10 +37,10 @@
 
   <div class="card">
     <h2>选择固件</h2>
-    <label><input type="radio" name="src" value="site" checked> 站内固件：V1.1 完整 16MB 镜像（推荐）</label>
+    <label><input type="radio" name="src" value="site" checked> GitHub 固件：V1.1 完整 16MB 镜像（推荐）</label>
     <label><input type="radio" name="src" value="local"> 本地文件（选择 .bin 文件）</label>
     <input type="file" id="fileInput" accept=".bin" hidden>
-    <p id="fwInfo">已选：站内 V1.1 16MB 完整镜像（写入地址 0x0）</p>
+    <p id="fwInfo">已选：GitHub 仓库 V1.1 16MB 完整镜像（写入地址 0x0）</p>
   </div>
 
   <button id="flashBtn">连接设备并烧录</button>
@@ -53,7 +53,7 @@
     <ol>
       <li>使用 <b>Chrome 或 Edge</b> 浏览器打开本页（必须 HTTPS）</li>
       <li>用 USB 数据线连接设备</li>
-      <li>选择固件：站内镜像，或点「本地文件」选电脑上的 .bin</li>
+      <li>选择固件：GitHub 镜像（默认），或点「本地文件」选电脑上的 .bin</li>
       <li>点击「连接设备并烧录」，在弹出的窗口选择设备端口</li>
       <li>等待烧录完成（约 3-5 分钟），完成后设备自动重启</li>
       <li>烧录过程中<b>请勿断开 USB 或关闭页面</b></li>
@@ -64,7 +64,8 @@
 <script type="module">
 import { ESPLoader, Transport } from './esptool-js.bundle.js';
 
-const SITE_FW_URL = './ESP32-S3-RLCD-BBK-16MB.bin';
+/* V1.1: 固件优先从 GitHub 仓库拉取 (网站服务器慢, 不用站内文件) */
+const SITE_FW_URL = 'https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/flash/ESP32-S3-RLCD-BBK-16MB.bin';
 const FLASH_ADDR = 0x0;
 const $ = (id) => document.getElementById(id);
 
@@ -141,7 +142,7 @@ document.querySelectorAll('input[name="src"]').forEach(r => {
         $('fwInfo').textContent = '已选本地文件: ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB)';
       });
     } else {
-      $('fwInfo').textContent = '已选：站内 V1.1 16MB 完整镜像（写入地址 0x0）';
+      $('fwInfo').textContent = '已选：GitHub 仓库 V1.1 16MB 完整镜像（写入地址 0x0）';
     }
   });
 });
