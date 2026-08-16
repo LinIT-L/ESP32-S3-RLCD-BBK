@@ -9,10 +9,12 @@ idf_component_register(
 )
 
 # 嵌入多档 GB2312 点阵字库到 flash (XIP 只读, 运行时切换字号)
-target_add_binary_data(${COMPONENT_LIB} "assets/book20.fnt" BINARY)
-target_add_binary_data(${COMPONENT_LIB} "assets/book24.fnt" BINARY)
-target_add_binary_data(${COMPONENT_LIB} "assets/book28.fnt" BINARY)
-target_add_binary_data(${COMPONENT_LIB} "assets/book32.fnt" BINARY)
+target_add_binary_data(${COMPONENT_LIB} "assets/book16_fs.fnt" BINARY)
+target_add_binary_data(${COMPONENT_LIB} "assets/book24_fs.fnt" BINARY)
+target_add_binary_data(${COMPONENT_LIB} "assets/book32_fs.fnt" BINARY)
+target_add_binary_data(${COMPONENT_LIB} "assets/book16_hz.fnt" BINARY)
+target_add_binary_data(${COMPONENT_LIB} "assets/book24_hz.fnt" BINARY)
+target_add_binary_data(${COMPONENT_LIB} "assets/book32_hz.fnt" BINARY)
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wno-unused-function

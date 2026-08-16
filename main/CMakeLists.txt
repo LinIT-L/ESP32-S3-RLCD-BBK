@@ -12,7 +12,6 @@ idf_component_register(
         menu
         driver
         esp_timer
-        system_rom
         nvs_flash
         esp_event
         board_battery

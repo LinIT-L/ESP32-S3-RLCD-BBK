@@ -150,6 +150,11 @@ static int  s_touch_sx = 0, s_touch_sy = 0;
 static tp_point_t s_touch_cached;
 static bool       s_touch_cached_valid = false;
 static uint32_t   s_touch_cache_tick = 0;
+/* V1.0.68 fix: 连续读失败计数 — 触摸芯片挂死/总线卡住时触发自动恢复 */
+static uint32_t   s_touch_fail_count = 0;
+#define TOUCH_FAIL_RECOVER_N  12   /* 连续 12 次读失败 → 恢复触摸芯片 */
+
+static void touch_jump_filter(tp_point_t *pt, bool pressed);   /* 前向声明 */
 
 static void touch_read_once(tp_point_t *pt) {
     uint32_t tick = xTaskGetTickCount();
@@ -160,9 +165,20 @@ static void touch_read_once(tp_point_t *pt) {
     s_touch_cached_valid = true;
     s_touch_cache_tick = tick;
     if (!touch_panel_read(&s_touch_cached)) {
-        s_touch_cached.pressed = false;
-        s_touch_cached.x = 0;
-        s_touch_cached.y = 0;
+        /* V1.0.68 fix: 读失败时**保留上一帧状态**(不伪造"松开").
+         * 旧代码把失败当成"手指已松开", 飞线 I2C 一个误码就会打断进行中的
+         * 手势 → 触摸跳变/误触/只能慢慢拖; 连续失败则是芯片挂死需重启.
+         * 现在: 单次失败忽略(坐标暂不更新), 连续失败自动恢复芯片. */
+        s_touch_fail_count++;
+        if (s_touch_fail_count >= TOUCH_FAIL_RECOVER_N) {
+            s_touch_fail_count = 0;
+            ESP_LOGW("INPUT", "触摸连续 %d 次读失败, 请求看门狗恢复",
+                     (int)TOUCH_FAIL_RECOVER_N);
+            touch_panel_request_recover();
+        }
+    } else {
+        s_touch_fail_count = 0;
+        touch_jump_filter(&s_touch_cached, s_touch_cached.pressed);
     }
     *pt = s_touch_cached;
 }
@@ -216,6 +232,11 @@ bool input_power_should_sleep(void) {
 }
 
 /* 把触摸面板原始坐标映射到 400x300 屏幕坐标 */
+/* V1.0.68 fix: 触摸跳变滤波 — 单帧位移超过屏宽 55% 视为噪声, 保持上一帧坐标.
+ * CST816 在受潮/干扰时偶尔返回跳变的坐标, 旧代码直接采用导致点击乱跳/误触. */
+#define TOUCH_JUMP_PCT 550   /* 千分比: 屏宽 55% */
+static int16_t s_flt_rx = -1, s_flt_ry = -1;
+
 static void touch_map_screen(int16_t rx, int16_t ry, int *sx, int *sy) {
     int mx, my;
     touch_panel_get_resolution(&mx, &my);
@@ -230,6 +251,35 @@ static void touch_map_screen(int16_t rx, int16_t ry, int *sx, int *sy) {
     if (*sx >= ST7305_WIDTH) *sx = ST7305_WIDTH - 1;
     if (*sy < 0) *sy = 0;
     if (*sy >= ST7305_HEIGHT) *sy = ST7305_HEIGHT - 1;
+}
+
+/* 在 raw 坐标上做跳变滤波 (按分辨率归一化), 返回滤波后的坐标 */
+static void touch_jump_filter(tp_point_t *pt, bool pressed) {
+    if (!pressed) {
+        s_flt_rx = s_flt_ry = -1;
+        return;
+    }
+    int res_x, res_y;
+    touch_panel_get_resolution(&res_x, &res_y);
+    if (s_flt_rx >= 0) {
+        int jx = res_x ? (int)(((int32_t)pt->x - s_flt_rx) * 1000 / res_x) : 0;
+        int jy = res_y ? (int)(((int32_t)pt->y - s_flt_ry) * 1000 / res_y) : 0;
+        if (jx * jx + jy * jy > TOUCH_JUMP_PCT * TOUCH_JUMP_PCT) {
+            /* 限频日志: 跳变风暴时最多 1 条/秒 */
+            static uint32_t s_jump_log_ms = 0;
+            uint32_t now_ms2 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now_ms2 - s_jump_log_ms >= 1000) {
+                s_jump_log_ms = now_ms2;
+                ESP_LOGW("INPUT", "触摸跳变被滤除: (%d,%d)->(%d,%d)",
+                         (int)s_flt_rx, (int)s_flt_ry, (int)pt->x, (int)pt->y);
+            }
+            pt->x = s_flt_rx;   /* 保持上一帧, 不采用跳变点 */
+            pt->y = s_flt_ry;
+            return;
+        }
+    }
+    s_flt_rx = pt->x;
+    s_flt_ry = pt->y;
 }
 
 /* === V1.0.68: 屏幕旋转 (电子书竖屏时触摸跟随旋转) ===

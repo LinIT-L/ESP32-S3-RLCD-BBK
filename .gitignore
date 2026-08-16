@@ -3,11 +3,7 @@ build/
 managed_components/
 sdkconfig
 sdkconfig.old
-
-# ===== 版权/运行时数据 (不提交) =====
-games/           # 游戏 ROM (有版权, 不提交)
-sd/              # SD 卡内容
-magic_tower.gam
+dependencies.lock
 
 # ===== 发布 / 打包产物 =====
 dist/
@@ -55,3 +51,5 @@ capture*.log
 .vscode/
 __pycache__/
 *.pyc
+.engine_backup/
+*.spec.md

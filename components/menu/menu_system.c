@@ -4589,11 +4589,11 @@ typedef struct __attribute__((packed)) {
     uint8_t  book_pagenum;    /* 0/1 显示页码 */
     uint8_t  book_rot;        /* 旋转方向: 0上 1下 2左 3右 (V1.0.62) */
     /* V1.0.63: 电子书布局 */
-    uint8_t  book_fontsize;   /* 0=20 1=24 2=28 3=32 */
+    uint8_t  book_fontsize;   /* 字号 0=16 1=24 2=32 */
     uint8_t  book_margin;     /* 0=窄 1=中 2=宽 */
     uint8_t  book_lineh;      /* 0=紧凑 1=标准 2=宽松 */
     uint8_t  book_gap;        /* 0=标准 1=宽松 */
-    uint8_t  book_font_family;/* 0=黑体 1=宋体 (V1.0.64) */
+    uint8_t  book_font_family;/* 0=仿宋 1=黑体/菜单字体 (V1.0.69) */
     uint8_t  wallpaper_mode;  /* 0=内置星空 1=TF动态图 2=游戏壁纸 (V1.0.64) */
     uint8_t  wallpaper_program; /* 内置壁纸程序 0..10 (V1.0.64) */
     uint8_t  wallpaper_timeout_min; /* 休眠分钟 1..30 (V1.0.64) */
@@ -4733,7 +4733,7 @@ static void config_unpack(const bbk_config_t *c) {
     g_menu.book_pagenum = false;
     g_menu.book_rot = (c->version >= 7 && c->book_rot <= 3) ? c->book_rot : 0;   /* 默认上 */
     /* V1.0.63: 电子书布局 (默认: 中字号/中边距/标准行高/标准字距) */
-    g_menu.book_fontsize = (c->version >= 8 && c->book_fontsize <= 3) ? c->book_fontsize : 1;
+    g_menu.book_fontsize = (c->version >= 8 && c->book_fontsize <= 3) ? c->book_fontsize : 2;   /* 默认 24 */
     g_menu.book_margin   = (c->version >= 8 && c->book_margin <= 2)   ? c->book_margin   : 1;
     g_menu.book_lineh    = (c->version >= 8 && c->book_lineh <= 2)    ? c->book_lineh    : 1;
     g_menu.book_gap      = (c->version >= 8 && c->book_gap <= 1)      ? c->book_gap      : 0;
@@ -6303,7 +6303,15 @@ static void render_main(menu_state_t *state) {
 
     /* === 切换动画 === */
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    uint32_t anim_duration = 240;
+    int dir = state->anim_direction;
+    int prev = state->prev_selected;
+    /* V1.0.68 fix: 惯性甩动 — 移动格数越多动画滑行越久; 缓出(快起慢停)接手指速度 */
+    int move_steps = (dir != 0) ? (sel - prev) : 0;
+    if (move_steps > 0 && move_steps > total / 2) move_steps -= total;
+    else if (move_steps < 0 && -move_steps > total / 2) move_steps += total;
+    if (move_steps < 0) move_steps = -move_steps;
+    uint32_t anim_duration = 240 + (uint32_t)move_steps * 70;
+    if (anim_duration > 700) anim_duration = 700;
     float t = 1.0f;
     if (state->anim_start_ms > 0 && (now_ms - state->anim_start_ms) < anim_duration) {
         t = (float)(now_ms - state->anim_start_ms) / (float)anim_duration;
@@ -6313,10 +6321,8 @@ static void render_main(menu_state_t *state) {
         state->prev_selected = sel;
         state->main_drag_offset = 0;   /* 动画结束, 拖动偏移归零 */
     }
-    float ease = (t < 0.5f) ? 4.0f * t * t * t : 1.0f - (float)pow(-2.0f * t + 2.0f, 3) / 2.0f;
-
-    int dir = state->anim_direction;
-    int prev = state->prev_selected;
+    /* 缓出 easeOutCubic: 快速起步(接手指速度) 逐渐减速到目标, 甩动更自然 */
+    float ease = 1.0f - (float)pow(1.0f - t, 3.0f);
 
     /* 计算每个图标的位置和尺寸 (循环滚动: 取到选中项的最短距离) */
     for (int i = 0; i < total; i++) {
@@ -7618,8 +7624,9 @@ static void book_apply_settings_to_reader(menu_state_t *state) {
     book_reader_set_settings(state->book_knock, (int)state->book_sens,
                              state->book_night, state->book_pagenum,
                              (int)state->book_rot,
-                             (int)state->book_fontsize, (int)state->book_margin,
-                             (int)state->book_lineh, (int)state->book_gap);
+                             (int)state->book_font_family, (int)state->book_fontsize,
+                             (int)state->book_margin, (int)state->book_lineh,
+                             (int)state->book_gap);
 }
 
 /* 构建右栏 (设置项 / 收藏 / 目录书籍) */
@@ -7627,7 +7634,7 @@ static int book_build_right(menu_state_t *state, char buf[][64], int max) {
     int n = 0;
     if (state->select_folder_idx == 0) {
         static const char *rot_name[4] = { "上", "下", "左", "右" };
-        static const char *fsize_name[4] = { "20", "24", "28", "32" };
+        static const char *fsize_name[3] = { "16", "24", "32" };
         static const char *margin_name[3] = { "窄", "中", "宽" };
         static const char *lineh_name[3] = { "紧凑", "标准", "宽松" };
         static const char *gap_name[2] = { "标准", "宽松" };
@@ -7639,8 +7646,12 @@ static int book_build_right(menu_state_t *state, char buf[][64], int max) {
         book_pad_name(tmp, sizeof(tmp), 5, "旋转方向");
         int r = (state->book_rot > 3) ? 0 : state->book_rot;
         snprintf(buf[n++], 64, "%s|%s", tmp, rot_name[r]);
+        static const char *family_name[2] = { "仿宋", "黑体" };
+        book_pad_name(tmp, sizeof(tmp), 5, "字体");
+        int ff = (state->book_font_family > 1) ? 0 : state->book_font_family;
+        snprintf(buf[n++], 64, "%s|%s", tmp, family_name[ff]);
         book_pad_name(tmp, sizeof(tmp), 5, "字体大小");
-        int fs = (state->book_fontsize > 3) ? 1 : state->book_fontsize;
+        int fs = (state->book_fontsize > 2) ? 1 : state->book_fontsize;
         snprintf(buf[n++], 64, "%s|%s", tmp, fsize_name[fs]);
         book_pad_name(tmp, sizeof(tmp), 5, "边距");
         int mg = (state->book_margin > 2) ? 1 : state->book_margin;
@@ -7758,10 +7769,11 @@ static bool book_on_confirm_item(menu_state_t *state, int idx) {
         case 0: state->book_night = !state->book_night; break;
         case 1: state->book_pagenum = !state->book_pagenum; break;
         case 2: state->book_rot = book_rot_next(state->book_rot); break;
-        case 3: state->book_fontsize = (uint8_t)((state->book_fontsize + 1) % 4); break;
-        case 4: state->book_margin = (uint8_t)((state->book_margin + 1) % 3); break;
-        case 5: state->book_lineh = (uint8_t)((state->book_lineh + 1) % 3); break;
-        case 6: state->book_gap = (uint8_t)((state->book_gap + 1) % 2); break;
+        case 3: state->book_font_family = (uint8_t)((state->book_font_family + 1) % 2); break;
+        case 4: state->book_fontsize = (uint8_t)((state->book_fontsize + 1) % 3); break;
+        case 5: state->book_margin = (uint8_t)((state->book_margin + 1) % 3); break;
+        case 6: state->book_lineh = (uint8_t)((state->book_lineh + 1) % 3); break;
+        case 7: state->book_gap = (uint8_t)((state->book_gap + 1) % 2); break;
         default: return false;
         }
         book_apply_settings_to_reader(state);
@@ -8781,8 +8793,8 @@ void menu_init(menu_state_t *state, st7305_handle_t *lcd) {
     state->book_night = false;
     state->book_pagenum = false;   /* 默认不显示右下角页码 */
     state->book_rot = 0;   /* 默认: 上 (0°, 与主菜单一致) */
-    state->book_fontsize = 1;   /* 中字号 24 */
-    state->book_font_family = 0; /* 黑体 */
+    state->book_fontsize = 2;   /* 中字号 24 */
+    state->book_font_family = 0; /* 仿宋 */
     state->book_margin = 1;     /* 中边距 */
     state->book_lineh = 1;      /* 标准行高 */
     state->book_gap = 0;        /* 标准字距 */

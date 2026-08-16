@@ -33,8 +33,8 @@ int font_book_cell_h(void);
 int font_book_ascii_w(void);
 int font_book_ascii_h(void);
 
-/* 切换字号: 0=20 1=24 2=28 3=32 */
-void font_book_select(int size_id);
+/* 切换字体: style 0=仿宋 1=黑体(菜单字体款式); size 0=16 1=24 2=32 (全原生简体点阵) */
+void font_book_select(int style, int size_id);
 
 /* 字库校验失败的说明 (调试用) */
 const char *font_book_error(void);

@@ -62,6 +62,13 @@ bool touch_panel_read(tp_point_t *pt);
 /* V1.0.68: 禁用触摸屏: 卸载 I2C 驱动(释放内存), 之后 read 恒 false. 可重新 init. */
 void touch_panel_deinit(void);
 
+/* V1.0.68 fix: 连续 I2C 读失败(芯片挂死/总线卡住)时自动恢复:
+ * RST 脉冲复位芯片 + 重装 I2C 驱动 + 重新探测. 由 input.c 调用. */
+void touch_panel_recover(void);
+
+/* V1.0.68: 非阻塞请求触摸恢复 (input.c 连续读失败时调用, 由后台看门狗执行) */
+void touch_panel_request_recover(void);
+
 /* 返回当前检测到的芯片类型 (调试/日志用). */
 tp_chip_t touch_panel_get_chip(void);
 

@@ -721,6 +721,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
                 draw_game_name(g_lcd, text_x, bottom_y + 6, display_name);
             }
         }
+        virtual_keys_draw(g_lcd);   /* V1.0.68 fix: 补画屏幕虚拟按键 */
         st7305_flush(g_lcd);
     } else {
         /* 点对点模式: 清空整个 fb 为白色 */
@@ -799,6 +800,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
             fake_settings.pad_connected = g_status_pad_connected;
             menu_draw_status_bar(g_lcd, &fake_settings, NULL);
         }
+        virtual_keys_draw(g_lcd);   /* V1.0.68 fix: 补画屏幕虚拟按键 */
         st7305_flush(g_lcd);
     }
 }
@@ -859,26 +861,31 @@ static void input_poll_cb(void) {}
 static int16_t joypad_state(unsigned id) {
     bool gp = false;
     bool phys = false;
+    /* V1.0.68 fix: 屏幕虚拟按键状态 (bit 清 0 = 按下), 与手柄/物理键并联合入 */
+    uint8_t vk = virtual_keys_is_enabled() ? virtual_keys_get_joypad() : 0xFF;
     switch (id) {
         case RETRO_DEVICE_ID_JOYPAD_A:
-            gp = bt_manager_is_key_pressed(F_CONFIRM);
+            gp = bt_manager_is_key_pressed(F_CONFIRM) || !(vk & 0x01);
             phys = input_is_held(0);
             break;
         case RETRO_DEVICE_ID_JOYPAD_B:
-            gp = bt_manager_is_key_pressed(F_BACK);
+            gp = bt_manager_is_key_pressed(F_BACK) || !(vk & 0x02);
             phys = input_is_held(1);
             break;
-        case RETRO_DEVICE_ID_JOYPAD_UP:    gp = bt_manager_is_key_pressed(F_UP);    break;
-        case RETRO_DEVICE_ID_JOYPAD_DOWN:  gp = bt_manager_is_key_pressed(F_DOWN);  break;
-        case RETRO_DEVICE_ID_JOYPAD_LEFT:  gp = bt_manager_is_key_pressed(F_LEFT);  break;
-        case RETRO_DEVICE_ID_JOYPAD_RIGHT: gp = bt_manager_is_key_pressed(F_RIGHT); break;
-        /* V1.0.38: 8 功能键只有 4 个, X/Y/L/R/SELECT/START 全部映射到 F_FAV (多功能键) */
+        case RETRO_DEVICE_ID_JOYPAD_UP:    gp = bt_manager_is_key_pressed(F_UP)    || !(vk & 0x40); break;
+        case RETRO_DEVICE_ID_JOYPAD_DOWN:  gp = bt_manager_is_key_pressed(F_DOWN)  || !(vk & 0x80); break;
+        case RETRO_DEVICE_ID_JOYPAD_LEFT:  gp = bt_manager_is_key_pressed(F_LEFT)  || !(vk & 0x20); break;
+        case RETRO_DEVICE_ID_JOYPAD_RIGHT: gp = bt_manager_is_key_pressed(F_RIGHT) || !(vk & 0x10); break;
+        /* V1.0.38: 8 功能键只有 4 个, X/Y/L/R/SELECT/START 全部映射到 F_FAV (多功能键).
+         * 屏幕虚拟按键的 Select/Start 也归到 F_FAV. */
         case RETRO_DEVICE_ID_JOYPAD_X:
         case RETRO_DEVICE_ID_JOYPAD_Y:
         case RETRO_DEVICE_ID_JOYPAD_L:
         case RETRO_DEVICE_ID_JOYPAD_R:
         case RETRO_DEVICE_ID_JOYPAD_SELECT:
-        case RETRO_DEVICE_ID_JOYPAD_START:  gp = bt_manager_is_key_pressed(F_FAV);   break;
+        case RETRO_DEVICE_ID_JOYPAD_START:
+            gp = bt_manager_is_key_pressed(F_FAV) || !(vk & 0x04) || !(vk & 0x08);
+            break;
         /* V1.0.46: 补充按键 (F/G/Shift/空格 → BBK 功能1-4)
          * 复用 RetroPad 扩展 ID 16..19, 由 libretro 的 _joyk 映射到对应 BBK 键. */
         case 16: gp = bt_manager_is_sup_pressed(0); break;  /* 功能1(F) */
@@ -1068,10 +1075,10 @@ static bool env_cb(unsigned cmd, void *data) {
             } else if (strcmp(var->key, "gam4980_lcd_color") == 0) {
                 var->value = "grey";  /* 灰白色 (lcd_bg=0xd6da, lcd_fg=0x0000) */
             } else if (strcmp(var->key, "gam4980_cpu_rate") == 0) {
-        /* V1.0.53: 8.0 是旧 PSRAM 慢速补偿, 每帧算 8 倍工作量导致
-         * retro_run=65ms → 游戏只有 15fps. 1.0 = 真实 4980 速度,
-         * retro_run 约 8-16ms, 可跑满 60fps. */
-        var->value = "1.0";
+        /* V1.0.69: 恢复 8.0 (与昨天版本一致, 用户习惯的"八倍速"手感):
+         * cpu_rate 同时放大 tstep 与每帧周期数, 每帧模拟 8 倍工作量,
+         * 游戏逻辑 8 倍速 (画面 ~15fps 但动作飞快). 1.0 = 真实 4980 速度. */
+        var->value = "8.0";
             } else if (strcmp(var->key, "gam4980_timer_rate") == 0) {
                 var->value = "1.0";
             } else if (strcmp(var->key, "gam4980_key_pressed_input_min_interval") == 0) {
@@ -1481,6 +1488,8 @@ static game_exit_result_t gam4980_exit_confirm_dialog(void) {
 
 game_exit_result_t gam4980_emu_run(void) {
     g_running = true;
+    /* V1.0.68 fix: BBK 游戏不走通用 game_run_loop, 必须在此启用屏幕虚拟按键 */
+    virtual_keys_set_enabled(g_menu.game_virtual_keys);
     s_home_prev = false;  /* 每次进入游戏重置退出键边沿状态 */
     game_exit_result_t exit_result = GAME_EXIT_CONFIRMED;
     ESP_LOGI(TAG, "开始运行游戏循环 (长按 BOOT 1秒 或 按 退出到菜单 键 退出, 60fps)");
@@ -1604,6 +1613,7 @@ game_exit_result_t gam4980_emu_run(void) {
         }
     }
     gam4980_emu_stop();
+    virtual_keys_set_enabled(false);
     return exit_result;
 }
 

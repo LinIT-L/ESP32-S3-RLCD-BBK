@@ -22,7 +22,6 @@
 #include "sd_scan.h"
 #include "bt_manager.h"
 #include "audio_player.h"
-#include "system_rom.h"
 #include "board_battery.h"
 #include "book_reader.h"
 #include "app_board.h"
@@ -41,6 +40,43 @@ static int s_select_drag_last_ty = 0;
 static int s_select_drag_moved = 0;
 /* V1.0.68: 主菜单拖动累计位移 (抑制松手帧的方向键, 物理按键放行) */
 static int s_main_drag_moved = 0;
+
+/* === V1.0.68: 主菜单惯性甩动 (fling) — 按松手速度追加滑动格数 ===
+ * 记录拖动期间最近若干采样点, 松手时用窗口内位移/时间算速度:
+ *   速度越快 -> 继续滑动的格数越多; 低于阈值不甩 (缓慢拖动仍按距离吸附). */
+#define FLING_SAMPLES   6
+#define FLING_MIN_V     0.40f    /* px/ms 阈值: 低于 ≈400px/s 不甩动 */
+#define FLING_STEPS_PER 1.2f     /* 速度->格数系数: 1000px/s ≈ 1.2 格 */
+static float     s_fling_x[FLING_SAMPLES];
+static uint32_t  s_fling_t[FLING_SAMPLES];
+static int       s_fling_n = 0;
+static int       s_fling_head = 0;
+
+static void fling_reset(void) {
+    s_fling_n = 0;
+    s_fling_head = 0;
+}
+
+static void fling_record(int x, uint32_t now) {
+    s_fling_x[s_fling_head] = (float)x;
+    s_fling_t[s_fling_head] = now;
+    s_fling_head = (s_fling_head + 1) % FLING_SAMPLES;
+    if (s_fling_n < FLING_SAMPLES) s_fling_n++;
+}
+
+/* 松手速度 (px/ms, 右正左负): 用窗口内最早样本到最新样本的位移/时间 */
+static float fling_velocity(uint32_t now) {
+    if (s_fling_n < 2) return 0.0f;
+    int oldest = 0;
+    for (int i = 1; i < s_fling_n; i++)
+        if (s_fling_t[i] < s_fling_t[oldest]) oldest = i;
+    uint32_t t0 = s_fling_t[oldest];
+    float x0 = s_fling_x[oldest];
+    uint32_t dt = now - t0;
+    if (dt == 0) return 0.0f;
+    return (s_fling_x[(s_fling_head + s_fling_n - 1) % FLING_SAMPLES] - x0) / (float)dt;
+}
+
 /* V1.0.68: 列表弹窗跟手拖动状态 (番茄钟时间列表等) */
 static bool s_list_drag_active = false;
 static int  s_list_drag_start_y = 0;
@@ -211,11 +247,13 @@ void app_main(void)
         if (g_menu.current_page == MENU_PAGE_MAIN && !menu_modal_active(&g_menu)) {
             int tx, ty;
             bool down = input_get_touch_pos(&tx, &ty);
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
             if (down && !g_menu.main_drag_active) {
                 g_menu.main_drag_active = true;
                 g_menu.main_drag_start_x = tx;
                 g_menu.main_drag_offset = 0;
                 s_main_drag_moved = 0;
+                fling_reset();                 /* V1.0.68: 新拖动, 清惯性速度历史 */
                 g_menu.anim_start_ms = 0;      /* 取消滑动动画, 改由拖动控制 */
                 g_menu.needs_redraw = true;
                 screensaver_reset();           /* 拖动算操作, 重置屏保计时 */
@@ -229,8 +267,9 @@ void app_main(void)
                     }
                     if (off < 0) off = -off;
                     if (off > s_main_drag_moved) s_main_drag_moved = off;
+                    fling_record(tx, now);     /* V1.0.68: 记录速度样本 */
                 } else {
-                    /* 松手: 按拖动距离吸附到对应图标 (支持跨多格, 每 100px 一格, 过半格进位) */
+                    /* 松手: 按拖动距离吸附 + 按松手速度惯性甩动 (V1.0.68) */
                     g_menu.main_drag_active = false;
                     int off = g_menu.main_drag_offset;
                     g_menu.needs_redraw = true;
@@ -238,12 +277,20 @@ void app_main(void)
                     int steps = 0;
                     if (off < 0) steps = (-off + spacing / 2) / spacing;  /* 左拖 -> 选中右移 */
                     else         steps = -((off + spacing / 2) / spacing); /* 右拖 -> 选中左移 */
+                    /* 惯性: 速度越快, 继续滑动的格数越多 (左甩右移 / 右甩左移) */
+                    float vel = fling_velocity(now);
+                    if (vel < -FLING_MIN_V)
+                        steps += (int)(-vel * FLING_STEPS_PER);
+                    else if (vel > FLING_MIN_V)
+                        steps -= (int)(vel * FLING_STEPS_PER);
                     if (steps != 0) {
                         /* 保持 drag_offset, 让 render 动画期间把它衰减到 0 (无缝过渡) */
                         menu_drag_settle(&g_menu, steps);
                     } else {
                         g_menu.main_drag_offset = 0;   /* 未过半格: 回弹 */
                     }
+                    ESP_LOGI("MAIN", "松手: vel=%.2fpx/ms off=%d steps=%d n=%d",
+                             vel, off, steps, s_fling_n);
                     /* V1.0.68: 本次触摸拖动过 → 抑制本帧 LEFT/RIGHT
                      * (拖动已接管横向切换; 物理 BOOT 短按不受影响) */
                     if (s_main_drag_moved >= 15) main_drag_suppress_lr = true;

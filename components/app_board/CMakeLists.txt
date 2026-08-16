@@ -7,7 +7,6 @@ idf_component_register(
         input
         nvs_flash
         esp_event
-        system_rom
         audio_player
         board_battery
         driver

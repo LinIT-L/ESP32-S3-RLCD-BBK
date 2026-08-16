@@ -42,7 +42,7 @@ bool book_reader_knock_active(void);
  * / 字体大小(0=20 1=24 2=28 3=32) / 边距(0窄 1中 2宽) / 行高(0紧凑 1标准 2宽松) / 字距(0标准 1宽松)
  * 在打开书籍前或设置变更时调用 */
 void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, int rot,
-                              int fontsize, int margin, int lineh, int gap);
+                              int fontstyle, int fontsize, int margin, int lineh, int gap);
 
 #ifdef __cplusplus
 }

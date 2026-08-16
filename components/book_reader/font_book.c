@@ -7,14 +7,19 @@
 
 /* 由 CMake target_add_binary_data 生成:
  * assets/book16.fnt -> _binary_book16_fnt_start/_end */
-extern const uint8_t book20_fnt_start[] asm("_binary_book20_fnt_start");
-extern const uint8_t book20_fnt_end[]   asm("_binary_book20_fnt_end");
-extern const uint8_t book24_fnt_start[] asm("_binary_book24_fnt_start");
-extern const uint8_t book24_fnt_end[]   asm("_binary_book24_fnt_end");
-extern const uint8_t book28_fnt_start[] asm("_binary_book28_fnt_start");
-extern const uint8_t book28_fnt_end[]   asm("_binary_book28_fnt_end");
-extern const uint8_t book32_fnt_start[] asm("_binary_book32_fnt_start");
-extern const uint8_t book32_fnt_end[]   asm("_binary_book32_fnt_end");
+/* 仿宋 (fs) / 黑体 (hz, 菜单字体款式) × 16/24/32, 全部原生 GB2312 简体点阵 */
+extern const uint8_t book16_fs_fnt_start[] asm("_binary_book16_fs_fnt_start");
+extern const uint8_t book16_fs_fnt_end[]   asm("_binary_book16_fs_fnt_end");
+extern const uint8_t book24_fs_fnt_start[] asm("_binary_book24_fs_fnt_start");
+extern const uint8_t book24_fs_fnt_end[]   asm("_binary_book24_fs_fnt_end");
+extern const uint8_t book32_fs_fnt_start[] asm("_binary_book32_fs_fnt_start");
+extern const uint8_t book32_fs_fnt_end[]   asm("_binary_book32_fs_fnt_end");
+extern const uint8_t book16_hz_fnt_start[] asm("_binary_book16_hz_fnt_start");
+extern const uint8_t book16_hz_fnt_end[]   asm("_binary_book16_hz_fnt_end");
+extern const uint8_t book24_hz_fnt_start[] asm("_binary_book24_hz_fnt_start");
+extern const uint8_t book24_hz_fnt_end[]   asm("_binary_book24_hz_fnt_end");
+extern const uint8_t book32_hz_fnt_start[] asm("_binary_book32_hz_fnt_start");
+extern const uint8_t book32_hz_fnt_end[]   asm("_binary_book32_hz_fnt_end");
 
 #define FONT_MAGIC "BK16FNT1"
 #define GB_GRID    94          /* GB2312 码区 94x94 */
@@ -111,16 +116,24 @@ static bool font_bind(const uint8_t *d, size_t len) {
 }
 
 bool font_book_init(void) {
-    return font_bind(book24_fnt_start, (size_t)(book24_fnt_end - book24_fnt_start));
+    return font_bind(book24_fs_fnt_start, (size_t)(book24_fs_fnt_end - book24_fs_fnt_start));
 }
 
-void font_book_select(int size_id) {
+/* 样式: 0=仿宋 1=黑体; 字号: 0=16 1=24 2=32 */
+void font_book_select(int style, int size_id) {
     const uint8_t *d;
     size_t len;
-    if (size_id == 0) { d = book20_fnt_start; len = (size_t)(book20_fnt_end - book20_fnt_start); }
-    else if (size_id == 2) { d = book28_fnt_start; len = (size_t)(book28_fnt_end - book28_fnt_start); }
-    else if (size_id == 3) { d = book32_fnt_start; len = (size_t)(book32_fnt_end - book32_fnt_start); }
-    else { d = book24_fnt_start; len = (size_t)(book24_fnt_end - book24_fnt_start); }
+    int st = (style < 0) ? 0 : (style > 1 ? 1 : style);
+    int sz = (size_id < 0) ? 1 : (size_id > 2 ? 2 : size_id);
+    if (st == 1) {   /* 黑体 (菜单字体款式) */
+        if (sz == 0)      { d = book16_hz_fnt_start; len = (size_t)(book16_hz_fnt_end - book16_hz_fnt_start); }
+        else if (sz == 2) { d = book32_hz_fnt_start; len = (size_t)(book32_hz_fnt_end - book32_hz_fnt_start); }
+        else              { d = book24_hz_fnt_start; len = (size_t)(book24_hz_fnt_end - book24_hz_fnt_start); }
+    } else {           /* 仿宋 */
+        if (sz == 0)      { d = book16_fs_fnt_start; len = (size_t)(book16_fs_fnt_end - book16_fs_fnt_start); }
+        else if (sz == 2) { d = book32_fs_fnt_start; len = (size_t)(book32_fs_fnt_end - book32_fs_fnt_start); }
+        else              { d = book24_fs_fnt_start; len = (size_t)(book24_fs_fnt_end - book24_fs_fnt_start); }
+    }
     font_bind(d, len);
 }
 

@@ -9,7 +9,6 @@
 #include "input.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
-#include "system_rom.h"
 #include "bt_manager.h"
 #include "audio_player.h"
 #include "board_battery.h"
@@ -55,15 +54,7 @@ esp_err_t app_board_init(app_board_t *board)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_LOGI(TAG, "事件循环创建成功");
 
-    /* 6. 部署内置资源到 SD 卡 (失败不阻塞) */
-    if (board->sd_ok) {
-        int rom_ret = system_rom_install_to_sd();
-        if (rom_ret != 0) {
-            ESP_LOGW(TAG, "8.BIN/E.BIN 部署返回 %d (进入菜单后用户可重试)", rom_ret);
-        }
-    }
-
-    /* 7. 启动 SD 卡监控任务 */
+    /* 6. 启动 SD 卡监控任务 */
     sd_watcher_start();
     return ESP_OK;
 }
