@@ -31,6 +31,8 @@ jobs:
           ls -la pkg && cat pkg/package.json
 
       - name: Publish to GitHub Packages
-        run: npm publish pkg --registry=https://npm.pkg.github.com/
+        run: |
+          cd pkg
+          npm publish --registry=https://npm.pkg.github.com/
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
