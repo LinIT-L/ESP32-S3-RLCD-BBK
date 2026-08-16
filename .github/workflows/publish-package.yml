@@ -27,18 +27,8 @@ jobs:
         run: |
           mkdir -p pkg
           cp flash/ESP32-S3-RLCD-BBK-16MB.bin pkg/ESP32-S3-RLCD-BBK-16MB.bin
-          cat > pkg/package.json <<'JSON'
-          {
-            "name": "@linit-l/esp32-s3-rlcd-bbk",
-            "version": "1.1.2",
-            "description": "ESP32-S3-RLCD-BBK 完整 16MB 固件镜像 (阅读器双字体/触摸看门狗/BBK八倍速/WIFI手柄横屏全屏)",
-            "license": "MIT",
-            "repository": { "type": "git", "url": "https://github.com/LinIT-L/ESP32-S3-RLCD-BBK" },
-            "files": ["ESP32-S3-RLCD-BBK-16MB.bin"],
-            "scripts": { "flash": "python3 -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 ESP32-S3-RLCD-BBK-16MB.bin" },
-            "keywords": ["esp32-s3", "st7305", "bbk", "firmware", "retro"]
-          }
-          JSON
+          node -e "const fs=require('fs');fs.writeFileSync('pkg/package.json',JSON.stringify({name:'@linit-l/esp32-s3-rlcd-bbk',version:'1.1.2',description:'ESP32-S3-RLCD-BBK complete 16MB firmware image',license:'MIT',repository:{type:'git',url:'https://github.com/LinIT-L/ESP32-S3-RLCD-BBK'},files:['ESP32-S3-RLCD-BBK-16MB.bin'],scripts:{flash:'python3 -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 ESP32-S3-RLCD-BBK-16MB.bin'},keywords:['esp32-s3','st7305','bbk','firmware','retro']},null,2))"
+          ls -la pkg && cat pkg/package.json
 
       - name: Publish to GitHub Packages
         run: npm publish pkg --registry=https://npm.pkg.github.com/
