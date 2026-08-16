@@ -64,8 +64,11 @@
 <script type="module">
 import { ESPLoader, Transport } from './esptool-js.bundle.js';
 
-/* V1.1: 固件优先从 GitHub 仓库拉取 (网站服务器慢, 不用站内文件) */
-const SITE_FW_URL = 'https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/flash/ESP32-S3-RLCD-BBK-16MB.bin';
+/* V1.1: 固件从 GitHub 仓库拉取 — jsDelivr CDN 优先 (国内可访问), 失败兜底 GitHub raw */
+const FW_URLS = [
+  'https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/flash/ESP32-S3-RLCD-BBK-16MB.bin',
+  'https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/flash/ESP32-S3-RLCD-BBK-16MB.bin',
+];
 const FLASH_ADDR = 0x0;
 const $ = (id) => document.getElementById(id);
 
@@ -84,9 +87,12 @@ $('flashBtn').addEventListener('click', async () => {
     let data;
     const src = document.querySelector('input[name="src"]:checked').value;
     if (src === 'site') {
-      status.textContent = '正在下载站内固件…';
-      const r = await fetch(SITE_FW_URL);
-      if (!r.ok) throw new Error('固件下载失败: HTTP ' + r.status);
+      status.textContent = '正在从 GitHub 下载固件…';
+      let r = null;
+      for (const u of FW_URLS) {
+        try { r = await fetch(u); if (r.ok) break; } catch (e) {}
+      }
+      if (!r || !r.ok) throw new Error('固件下载失败, 请检查网络或改用本地文件');
       data = await r.arrayBuffer();
     } else {
       const f = $('fileInput').files[0];
