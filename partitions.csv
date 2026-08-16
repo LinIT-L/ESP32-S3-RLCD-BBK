@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# ESP32-S3 16MB Flash
+# 应用 ~8.9MB + 系统 ROM 4MB (8.BIN + E.BIN, gam4980 模拟器固件)
+# system.bin 布局: [0..2MB]=8.BIN, [2MB..4MB]=E.BIN
+# SubType 0x40 = raw (custom data partition; 0x90 在 IDF5.5 被 tee_ota 占用)
+nvs,      data, nvs,     ,         0x6000,
+phy_init, data, phy,     ,         0x1000,
+factory,  app,  factory, ,         0x8F0000,
+system,   data, 0x40,    0x900000, 4M,

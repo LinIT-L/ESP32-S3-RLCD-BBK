@@ -1,0 +1,57 @@
+# ===== ESP-IDF 构建产物 (可重新生成) =====
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+
+# ===== 版权/运行时数据 (不提交) =====
+games/           # 游戏 ROM (有版权, 不提交)
+sd/              # SD 卡内容
+magic_tower.gam
+
+# ===== 发布 / 打包产物 =====
+dist/
+release/
+backups/
+merged_*.bin
+*.zip
+
+# ===== 本地开发环境 hack (不影响其他机器) =====
+idf_patched.py
+python_wrapper.py
+sitecustomize.py
+custom_toolchain.cmake
+check_python_dependencies_*.py
+
+# ===== 开发临时目录 =====
+.cowork-temp/
+.workbuddy/
+icons_choices/
+icons_preview/
+third_party_gbemu_firmware/
+
+# ===== 主程序调试历史 / 替代实现 =====
+main/main.c.backup
+main/main_diagnostic.c
+main/main_hello.c
+main/main_minimal_test.c
+
+# ===== 运行时日志 =====
+*.log
+boot_log.txt
+build_chk*.log
+flash_chk*.log
+cap*.log
+capture*.log
+
+# ===== 操作系统 / 编辑器 / Python =====
+.DS_Store
+*.bak
+*.swp
+*.tmp
+.cache/
+.pytest_cache/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
