@@ -4,9 +4,7 @@
 内置步步高(BBK 4980 系列)电子词典模拟器,以及 GB / GBC / NES / Arduboy / 文曲星 / 暴龙机
 等多款掌机游戏引擎,还有电子书阅读器、仿真键鼠、收藏系统等多个实用应用。
 
-> **在线刷机**:https://bbk.linit.cn/flash/ (浏览器 WebSerial 直刷 16MB 固件)
-> **发布与固件下载**:https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases
-
+> **在线刷机**:https://bbk.linit.cn/flash/ 
 
 ---
 
