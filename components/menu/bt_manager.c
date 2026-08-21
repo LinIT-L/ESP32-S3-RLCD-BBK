@@ -141,6 +141,14 @@ static uint8_t s_hid_devs_bda[BT_HID_DEV_MAX][6];
 static bool    s_hid_devs_bda_set[BT_HID_DEV_MAX] = {false};
 
 static char s_connected_dev_name[32] = "";
+/* V1.0.9x: 每设备 HID report 分类 (由 report descriptor 解析):
+ *  - s_dev_kb_rid:   键盘输入报告的 report_id (0=该设备未识别出键盘)
+ *  - s_dev_game_rid: 手柄输入报告的 report_id (0=未识别, 用兜底 4)
+ *  - s_dev_has_rid:  设备是否声明了 report_id (无则单报告, 一律当输入处理) */
+static uint8_t s_dev_kb_rid[BT_HID_DEV_MAX] = {0};
+static uint8_t s_dev_game_rid[BT_HID_DEV_MAX] = {0};
+static bool    s_dev_has_rid[BT_HID_DEV_MAX] = {false};
+#define GAMEPAD_FALLBACK_RID 4   /* Q36 手柄 report_id 兜底 */
 static const char *s_init_status = "未初始化";
 static bool s_hidh_ready = false;
 static bool s_initializing = false;
@@ -202,6 +210,52 @@ static int find_free_hid_slot(void) {
         if (s_hid_devs[i] == NULL) return i;
     }
     return -1;
+}
+
+/* ========================================================================
+ *  HID report descriptor 极简解析 — V1.0.9x
+ *  目的: 从原始 report descriptor 里识别"键盘输入报告"和"手柄输入报告"的
+ *  report_id, 以便 INPUT 事件按设备区分键盘/手柄 (兼容更多键盘与手柄).
+ *  只需解析: Usage Page / Report ID / Usage(Local) / Input(Main).
+ *  键盘判据: 某 Input 项所在 Usage Page 为 Generic Desktop(0x01) 且 Usage 为
+ *  Keyboard(0x06), 或 Usage Page 为 0x07(Keyboard page, 键码区).
+ * ======================================================================== */
+static void bt_parse_report_map(const uint8_t *p, uint16_t len,
+                                uint8_t *out_kb_rid, uint8_t *out_game_rid, bool *out_has_rid) {
+    uint8_t kb = 0, game = 0;
+    bool has_rid = false;
+    uint16_t i = 0;
+    uint32_t usage_page = 0, cur_rid = 0;
+    uint8_t usages[8];          /* 当前 Input 项的 Local Usage 列表 */
+    uint8_t n_usage = 0;
+    while (i < len) {
+        uint8_t b = p[i++];
+        uint8_t size = b & 0x03; if (size == 3) size = 4;
+        uint8_t type = (b >> 2) & 0x03;
+        uint8_t tag  = (b >> 4) & 0x0F;
+        if (i + size > len) break;
+        int32_t v = 0;
+        for (int k = 0; k < size; k++) v |= ((int32_t)p[i + k]) << (8 * k);
+        i += size;
+        if (type == 0x4) {                       /* Global */
+            if (tag == 0x04) usage_page = (uint32_t)v;        /* Usage Page */
+            else if (tag == 0x84) { cur_rid = (uint8_t)v; if (v) has_rid = true; } /* Report ID */
+        } else if (type == 0x8 && tag == 0x08 && n_usage < 8) {
+            usages[n_usage++] = (uint8_t)v;      /* Usage (Local) */
+        } else if (type == 0xA && tag == 0x80) { /* Input (Main) */
+            bool is_kb = (usage_page == 0x07);
+            if (usage_page == 0x01) {
+                for (int k = 0; k < n_usage; k++) if (usages[k] == 0x06) { is_kb = true; break; }
+            }
+            if (is_kb) { if (kb == 0) kb = (uint8_t)cur_rid; }
+            else       { if (game == 0) game = (uint8_t)cur_rid; }
+            n_usage = 0;                          /* Local 项在 Main 后重置 */
+        }
+    }
+    *out_kb_rid = kb;
+    *out_game_rid = game;
+    *out_has_rid = has_rid;
+    ESP_LOGI(TAG, "report map: kb_rid=%u game_rid=%u has_rid=%d", kb, game, (int)has_rid);
 }
 
 /* ========================================================================
@@ -309,6 +363,19 @@ static void hidh_event_handler(void *arg, esp_event_base_t event_base,
                 s_connected = (s_hid_dev_count > 0);
                 memcpy(s_hid_devs_bda[slot], s_pending_dev.bd_addr, 6);
                 s_hid_devs_bda_set[slot] = true;
+                /* V1.0.9x: 解析 HID report descriptor, 识别键盘/手柄 report_id */
+                {
+                    size_t n_maps = 0;
+                    esp_hid_raw_report_map_t *maps = NULL;
+                    s_dev_kb_rid[slot] = 0;
+                    s_dev_game_rid[slot] = 0;
+                    s_dev_has_rid[slot] = false;
+                    if (esp_hidh_dev_report_maps_get(data->open.dev, &n_maps, &maps) == ESP_OK &&
+                        n_maps > 0 && maps && maps[0].data && maps[0].len > 0) {
+                        bt_parse_report_map(maps[0].data, maps[0].len,
+                                            &s_dev_kb_rid[slot], &s_dev_game_rid[slot], &s_dev_has_rid[slot]);
+                    }
+                }
                 /* 进游戏等高负载会短暂抢占 CPU; HID 链路监督超时过短会被误断.
                  * 连接建立后请求把监督超时拉到 20s, 短时卡顿不再掉线. */
                 esp_ble_conn_update_params_t cparams = {
@@ -342,50 +409,81 @@ static void hidh_event_handler(void *arg, esp_event_base_t event_base,
         }
         case ESP_HIDH_INPUT_EVENT: {
             if (data->input.length == 0) break;
-            /* === V1.0.40: K 模式(键盘鼠标) HID 解码 — 基于实测 ===
-             * ESP32 esp_hidh 的 data 不含 report_id (rid 在 data->input.report_id 字段)
-             * Q36 K模式 gamepad HID (report_id=4, len=10) 字段位置:
-             *   d[0..3] = 4 摇杆轴 (0x80=中点)
-             *   d[4] = hat switch: 0x00=上, 0x02=右, 0x04=下, 0x06=左, 0xFF=居中
-             *   d[5] = 主按钮: bit0=A, bit1=B, bit3=X, bit4=Y, bit6=L1, bit7=R1
-             *   d[6] = 副按钮: bit0=L2, bit1=R2, bit2=Select, bit3=Start */
-            if (data->input.report_id != 4) break;   /* 只听 gamepad HID, 忽略 keyboard HID */
+
+            /* === 按设备区分 键盘 / 手柄 报告 ===
+             * V1.0.9x: 由 report descriptor 解析得到每设备的 kb/game report_id.
+             *  - 键盘: 标准 6KRO 报文, 方向键→s_hat, Enter→确认(B), Esc→返回(A)
+             *  - 手柄: report 布局按实测 Q36, 但 report_id 自适应(支持更多手柄)
+             * 无 report_id 的单报告设备: 一律当输入处理. */
+            int slot = find_hid_dev_index(data->input.dev);
+            uint8_t rid = data->input.report_id;
+            bool kb = false, game = false;
+            if (slot >= 0) {
+                if (s_dev_kb_rid[slot] != 0 && rid == s_dev_kb_rid[slot]) {
+                    kb = true;
+                } else {
+                    game = (rid == GAMEPAD_FALLBACK_RID)
+                        || (s_dev_game_rid[slot] != 0 && rid == s_dev_game_rid[slot]);
+                    if (!s_dev_has_rid[slot]) game = !kb;  /* 单报告设备: 一律输入 */
+                }
+            } else {
+                game = (rid == GAMEPAD_FALLBACK_RID);      /* 未知设备: 沿用旧行为 */
+            }
+            if (!kb && !game) break;                       /* 其余报告(鼠标等)忽略 */
+
             const uint8_t *d = data->input.data;
             uint8_t len = data->input.length;
-            if (len < 7) break;
-
             uint8_t old_hat = s_hat;
             uint16_t old_btn = s_btn;
-            /* V1.0.40: hat 从 d[4] 读取 (ESP32 data 无 rid, macOS 的 d[5] 对应 ESP32 d[4]) */
-            uint8_t raw_hat = d[4];
-            switch (raw_hat) {
-                case 0x00: s_hat = 0; break;  /* 上 N */
-                case 0x02: s_hat = 2; break;  /* 右 E */
-                case 0x04: s_hat = 4; break;  /* 下 S */
-                case 0x06: s_hat = 6; break;  /* 左 W */
-                default:   s_hat = 8; break;  /* 0xFF 或其它 = 居中 */
-            }
-            /* V1.0.40: 按钮从 d[5]+d[6] 重新映射到标准 10 位 s_btn
-             * s_btn: bit0=A bit1=B bit2=X bit3=Y bit4=L1 bit5=R1 bit6=L2 bit7=R2
-             *        bit8=SELECT bit9=START */
-            s_btn = 0;
-            if (d[5] & 0x01) s_btn |= 0x01;  /* A */
-            if (d[5] & 0x02) s_btn |= 0x02;  /* B */
-            if (d[5] & 0x08) s_btn |= 0x04;  /* X */
-            if (d[5] & 0x10) s_btn |= 0x08;  /* Y */
-            if (d[5] & 0x40) s_btn |= 0x10;  /* L1 */
-            if (d[5] & 0x80) s_btn |= 0x20;  /* R1 */
-            if (d[6] & 0x01) s_btn |= 0x40;  /* L2 */
-            if (d[6] & 0x02) s_btn |= 0x80;  /* R2 */
-            if (d[6] & 0x04) s_btn |= 0x100; /* Select */
-            if (d[6] & 0x08) s_btn |= 0x200; /* Start */
 
-            /* V1.0.40: 调试日志 — 打印完整 HID 报告 */
-            if (s_hat != old_hat || s_btn != old_btn) {
-                ESP_LOGI(TAG, "HID raw: len=%d rid=%d d[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X | hat_raw=0x%02X→s_hat=%d btn=0x%02X",
-                         len, data->input.report_id,
-                         d[0],d[1],d[2],d[3],d[4],d[5],d[6],(len>7?d[7]:0),
-                         raw_hat, s_hat, s_btn);
+            if (kb) {
+                /* ---- 键盘 6KRO 解码 ----
+                 * 有 report_id: d[0]=rid, d[1]=mod, d[2]=reserved, d[3..8]=6 keys
+                 * 无 report_id: d[0]=mod,  d[1]=reserved,  d[2..7]=6 keys */
+                uint8_t koff = (slot >= 0 && s_dev_has_rid[slot]) ? 3 : 2;
+                if (len < koff + 1) break;
+                uint8_t dir = 8;            /* 居中 */
+                uint16_t b = 0;
+                for (int i = 0; i < 6 && (koff + i) < len; i++) {
+                    switch (d[koff + i]) {
+                        case 0x4F: dir = 0; break;  /* ↑ Up    */
+                        case 0x50: dir = 4; break;  /* ↓ Down  */
+                        case 0x51: dir = 6; break;  /* ← Left  */
+                        case 0x52: dir = 2; break;  /* → Right */
+                        case 0x1A: if (dir == 8) dir = 0; break;  /* W */
+                        case 0x16: if (dir == 8) dir = 4; break;  /* S */
+                        case 0x04: if (dir == 8) dir = 6; break;  /* A */
+                        case 0x07: if (dir == 8) dir = 2; break;  /* D */
+                        case 0x28: b |= 0x02; break;  /* Enter → 确认(B) */
+                        case 0x29: b |= 0x01; break;  /* Esc   → 返回(A) */
+                        default: break;
+                    }
+                }
+                s_hat = dir;
+                s_btn = b;   /* 键盘只驱动 A/B, 其余清零 */
+            } else {
+                /* ---- 现有 Q36 手柄解码 (参考注释见上) ----
+                 * hat 在 d[4], 按钮在 d[5]+d[6]. 兼容更多手柄时其 report_id 已自适应. */
+                if (len < 7) break;
+                uint8_t raw_hat = d[4];
+                switch (raw_hat) {
+                    case 0x00: s_hat = 0; break;  /* 上 N */
+                    case 0x02: s_hat = 2; break;  /* 右 E */
+                    case 0x04: s_hat = 4; break;  /* 下 S */
+                    case 0x06: s_hat = 6; break;  /* 左 W */
+                    default:   s_hat = 8; break;  /* 0xFF 或其它 = 居中 */
+                }
+                s_btn = 0;
+                if (d[5] & 0x01) s_btn |= 0x01;  /* A */
+                if (d[5] & 0x02) s_btn |= 0x02;  /* B */
+                if (d[5] & 0x08) s_btn |= 0x04;  /* X */
+                if (d[5] & 0x10) s_btn |= 0x08;  /* Y */
+                if (d[5] & 0x40) s_btn |= 0x10;  /* L1 */
+                if (d[5] & 0x80) s_btn |= 0x20;  /* R1 */
+                if (d[6] & 0x01) s_btn |= 0x40;  /* L2 */
+                if (d[6] & 0x02) s_btn |= 0x80;  /* R2 */
+                if (d[6] & 0x04) s_btn |= 0x100; /* Select */
+                if (d[6] & 0x08) s_btn |= 0x200; /* Start */
             }
 
             /* 边沿检测 → 累加到 s_pending_press (待 poll_new_press 消费) */
@@ -396,6 +494,9 @@ static void hidh_event_handler(void *arg, esp_event_base_t event_base,
             }
             uint16_t new_btn = s_btn & ~old_btn;
             if (new_btn) s_pending_press |= ((uint16_t)new_btn) << 4;
+            if (s_hat != old_hat || s_btn != old_btn)
+                ESP_LOGI(TAG, "HID %s: rid=%d hat=%d btn=0x%02X",
+                         kb ? "KB" : "PAD", rid, s_hat, s_btn);
             break;
         }
         case ESP_HIDH_CLOSE_EVENT: {
@@ -407,6 +508,9 @@ static void hidh_event_handler(void *arg, esp_event_base_t event_base,
                 s_hid_devs[dev_idx] = NULL;
                 s_hid_devs_bda_set[dev_idx] = false;
                 memset(s_hid_devs_bda[dev_idx], 0, 6);
+                s_dev_kb_rid[dev_idx] = 0;
+                s_dev_game_rid[dev_idx] = 0;
+                s_dev_has_rid[dev_idx] = false;
                 if (s_hid_dev_count > 0) s_hid_dev_count--;
             }
             s_connected = (s_hid_dev_count > 0);
