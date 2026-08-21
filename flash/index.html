@@ -34,7 +34,7 @@
     <label><input type="radio" name="src" value="web"> 网站固件</label>
     <label><input type="radio" name="src" value="local"> 本地文件</label>
     <input type="file" id="fileInput" accept=".bin" hidden>
-    <p id="fwInfo">GitHub Release v1.1 · 16MB 完整镜像</p>
+    <p id="fwInfo">GitHub Release v1.2 · 16MB 完整镜像</p>
   </div>
 
   <button id="flashBtn">连接并烧录</button>
@@ -46,7 +46,7 @@
 <script type="module">
 import { ESPLoader, Transport } from './esptool-js.bundle.js';
 
-const FW_GITHUB = 'https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases/download/v1.1/ESP32-S3-RLCD-BBK-16MB.bin';
+const FW_GITHUB = 'https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases/download/v1.2/ESP32-S3-RLCD-BBK-16MB.bin';
 const FW_WEB = 'https://bbk.linit.cn/flash/ESP32-S3-RLCD-BBK-16MB.bin';
 const FLASH_ADDR = 0x0;
 const $ = (id) => document.getElementById(id);
@@ -149,7 +149,7 @@ document.querySelectorAll('input[name="src"]').forEach(r => {
         $('fwInfo').textContent = '本地文件 · ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB)';
       });
     } else {
-      $('fwInfo').textContent = r.value === 'github' ? 'GitHub Release v1.1 · 16MB 完整镜像' : '本网站固件 · 16MB 完整镜像';
+      $('fwInfo').textContent = r.value === 'github' ? 'GitHub Release v1.2 · 16MB 完整镜像' : '本网站固件 · 16MB 完整镜像';
     }
   });
 });
