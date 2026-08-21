@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <title>BBK 固件刷写</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -14,142 +16,288 @@
   .ver { font-size: 11px; color: #999; font-weight: 400; margin-left: 6px; }
   label { display: flex; align-items: center; gap: 6px; padding: 4px 0; cursor: pointer; font-size: 13px; }
   input[type="radio"] { margin: 0; }
+  select { width: 100%; padding: 6px; font-size: 14px; border: 1px solid #e3e6ea; border-radius: 6px;
+           background: #fff; color: #222; margin: 4px 0 6px; }
   #fwInfo { margin: 6px 0 10px; font-size: 12px; color: #2b6cb0; word-break: break-all; }
   button { width: 100%; padding: 10px; font-size: 15px; font-weight: 600;
            color: #fff; background: #2b6cb0; border: 0; border-radius: 8px; cursor: pointer; }
   button:disabled { background: #9bb7d4; cursor: not-allowed; }
   button.busy { background: #d69e2e; }
   #status { margin-top: 8px; font-size: 13px; min-height: 18px; }
-  #log { margin-top: 8px; font-family: Menlo, Consolas, monospace; font-size: 11px;
-         color: #9ecbff; background: #0d1117; border-radius: 6px;
-         padding: 8px; max-height: 100px; overflow-y: auto; white-space: pre-wrap; display: none; }
+  #pbar { height: 10px; background: #e3e6ea; border-radius: 5px; overflow: hidden; margin-top: 8px; display: none; }
+  #pfill { height: 100%; width: 0%; background: #2b6cb0; transition: width .1s; }
   .warn { color: #c0392b; font-size: 12px; margin-top: 6px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="card">
-    <div class="title">BBK 固件刷写 <span class="ver">v2.2</span></div>
+    <div class="title">BBK 固件刷写 <span class="ver">v2.4</span></div>
     <label><input type="radio" name="src" value="github" checked> GitHub 固件（推荐）</label>
-    <label><input type="radio" name="src" value="web"> 网站固件</label>
     <label><input type="radio" name="src" value="local"> 本地文件</label>
     <input type="file" id="fileInput" accept=".bin" hidden>
-    <p id="fwInfo">GitHub Release v1.2 · 16MB 完整镜像</p>
+    <p id="fwInfo">GitHub 仓库固件 · 16MB</p>
   </div>
 
-  <button id="flashBtn">连接并烧录</button>
+  <button id="flashBtn">下载固件</button>
   <p id="status"></p>
-  <div id="log"></div>
+  <div id="pbar"><div id="pfill"></div></div>
   <p class="warn" id="warn" style="display:none"></p>
 </div>
 
 <script type="module">
 import { ESPLoader, Transport } from './esptool-js.bundle.js';
 
-const FW_GITHUB = 'https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases/download/v1.2/ESP32-S3-RLCD-BBK-16MB.bin';
-const FW_WEB = 'https://bbk.linit.cn/flash/ESP32-S3-RLCD-BBK-16MB.bin';
+/* 固件 = GitHub 仓库文件, 经 jsDelivr 按提交号(SHA)直链拉取 */
+const FW_URLS = [
+  'https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases/latest/download/ESP32-S3-RLCD-BBK-16MB.bin',
+  'https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/flash/ESP32-S3-RLCD-BBK-16MB.bin'
+];
 const FLASH_ADDR = 0x0;
+const BAUD = 115200;   /* 固定 (USB-JTAG 设备波特率不影响速度, 与硬件无关) */
 const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-function log(msg) {
-  const el = $('log');
-  el.style.display = 'block';
-  el.textContent += msg + '\n';
-  el.scrollTop = el.scrollHeight;
+let fwData = null;   /* 固件数据 (Uint8Array, 与官方 esptool-js 一致) */
+let device = null, transport = null, esploader = null;
+
+/* ===== 后台保活: Chrome 会对隐藏页面节流 setTimeout, 导致写入近乎暂停。
+ * 已知豁免: 页面在播放音频时不被节流。烧录开始后播放一段静音循环,
+ * 让浏览器认为页面"有声音输出", 切到其它标签页也能继续写入。
+ * 只在用户点击烧录(用户手势)后启动, 烧录结束自动停止。 ===== */
+let keepAliveCtx = null, keepAliveSrc = null;
+function startKeepAlive() {
+  try {
+    if (keepAliveCtx) return;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    keepAliveCtx = new Ctx();
+    const buf = keepAliveCtx.createBuffer(1, keepAliveCtx.sampleRate, keepAliveCtx.sampleRate);
+    const src = keepAliveCtx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    src.connect(keepAliveCtx.destination);
+    src.start();
+    keepAliveSrc = src;
+  } catch (e) { /* 忽略: 不支持的浏览器只是没有保活 */ }
+}
+function stopKeepAlive() {
+  try { keepAliveSrc?.stop(); } catch (e) {}
+  try { keepAliveCtx?.close(); } catch (e) {}
+  keepAliveSrc = null; keepAliveCtx = null;
+}
+
+function setProgress(pct) {
+  $('pbar').style.display = 'block';
+  $('pfill').style.width = pct + '%';
+}
+function hideProgress() {
+  $('pbar').style.display = 'none';
+  $('pfill').style.width = '0%';
+}
+
+/* ========== 阶段1: 下载固件 (结果为 Uint8Array) ========== */
+async function downloadFirmware() {
+  const status = $('status');
+  const src = document.querySelector('input[name="src"]:checked').value;
+  if (src === 'github') {
+    let r = null;
+    for (const u of FW_URLS) {
+      status.textContent = '正在连接固件源…';
+      try { r = await fetch(u); if (r.ok) break; } catch (e) { r = null; }
+    }
+    if (!r || !r.ok) throw new Error('固件下载失败, 请检查网络后重试');
+    const total = Number(r.headers.get('Content-Length')) || 0;
+    const reader = r.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (total > 0) {
+        const pct = Math.min(100, Math.round((received / total) * 100));
+        setProgress(pct);
+        status.textContent = '正在下载固件… ' + pct + '%';
+      } else {
+        status.textContent = '正在下载固件… ' + (received / 1048576).toFixed(1) + ' MB';
+      }
+    }
+    /* 关键: 与官方一致, 必须 Uint8Array */
+    fwData = new Uint8Array(await new Blob(chunks).arrayBuffer());
+  } else {
+    const f = $('fileInput').files[0];
+    if (!f) throw new Error('请先选择本地 .bin 文件');
+    fwData = new Uint8Array(await f.arrayBuffer());
+  }
+  hideProgress();
+  status.textContent = '固件就绪, 再点一次「连接并烧录」';
+}
+
+/* ========== 参考 lemio/EmbeddedScreenSharing (官方 esptool-js 流程) ==========
+ * 1) connect 阶段只打开端口, 不重置设备 (main() 会在 sync 时无条件重置,
+ *    那会把正在运行的固件直接打进下载模式)
+ * 2) 烧录前在已打开的端口上做显式 RTS/DTR 脉冲进入下载模式 (USB-JTAG 序列),
+ *    然后断开、用全新 Transport/ESPLoader 以 no_reset 模式同步, 失败重试 3 次
+ * 3) 写入完成后不用 esploader.after() —— 它在 USB-JTAG 上只释放 RTS, 是
+ *    no-op, 设备不会真正重启; 改为手动 RTS 脉冲硬复位, 让设备真正跑新固件
+ */
+async function resetIntoBootloader(t) {
+  await t.setRTS(false);
+  await t.setDTR(false);
+  await sleep(100);
+  await t.setDTR(true);
+  await t.setRTS(false);
+  await sleep(100);
+  await t.setRTS(true);
+  await t.setDTR(false);
+  await t.setRTS(true);
+  await sleep(100);
+  await t.setRTS(false);
+  await t.setDTR(false);
+  await sleep(500); /* 给 USB-CDC bootloader 时间完成初始化 */
+}
+
+async function syncWithDevice(targetDevice) {
+  /* 全新对象, 避免复用残留状态 (如 IS_STUB) 导致的二次烧录失败 */
+  transport = new Transport(targetDevice, false);
+  esploader = new ESPLoader({
+    transport,
+    baudrate: BAUD,
+    debugLogging: false,
+  });
+  await esploader.main('no_reset');
+}
+
+async function connectAndFlash() {
+  const status = $('status');
+  const btn = $('flashBtn');
+
+  /* 1. 选择端口并打开 (不重置设备) */
+  status.textContent = '请在弹出的窗口中选择设备端口…';
+  device = await navigator.serial.requestPort();
+  transport = new Transport(device, false);
+  await transport.connect(BAUD, {});
+  status.textContent = '正在连接芯片…';
+
+  /* 2. 显式进入下载模式 + 同步, 失败重试 3 次 */
+  let lastSyncError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      status.textContent = '正在连接芯片… (第 ' + attempt + ' 次)';
+      await resetIntoBootloader(transport);
+      await transport.disconnect();
+      await sleep(200); /* 让浏览器/系统完全释放端口再重开 */
+      await syncWithDevice(device);
+      lastSyncError = null;
+      break;
+    } catch (e) {
+      lastSyncError = e;
+      status.textContent = '同步失败, 正在重试… (' + attempt + '/3)';
+    }
+  }
+  if (lastSyncError) throw lastSyncError;
+  status.textContent = '芯片识别完成, 开始写入…';
+
+  /* 3. 写入 (参数全部固定) */
+  let writtenBytes = 0;
+  await esploader.writeFlash({
+    fileArray: [{ data: fwData, address: FLASH_ADDR }],
+    eraseAll: false,
+    compress: false,
+    flashSize: '16MB',
+    flashMode: 'dio',
+    flashFreq: '80m',
+    reportProgress: (fileIndex, written, total) => {
+      writtenBytes = written;
+      const pct = total > 0 ? Math.min(100, Math.round((written / total) * 100)) : 0;
+      setProgress(pct);
+      status.textContent = '正在烧录… ' + pct + '%';
+    },
+  });
+  /* 防假成功: 写入量必须达标 */
+  if (writtenBytes < 1048576) {
+    throw new Error('写入异常: 仅写入 ' + (writtenBytes / 1048576).toFixed(2) + ' MB, 未完成。现有固件未被破坏');
+  }
+  hideProgress();
+
+  /* 4. 手动 RTS 脉冲硬复位 (替代 esploader.after(), USB-JTAG 上 after() 无效) */
+  status.textContent = '烧录完成, 正在重启设备…';
+  try {
+    await transport.setRTS(true);
+    await sleep(100);
+    await transport.setRTS(false);
+    await sleep(1000); /* 给芯片时间真正启动新固件 */
+  } catch (e) {
+    $('warn').style.display = 'block';
+    $('warn').textContent = '设备未自动重启, 请拔下 USB 线重新插上';
+    status.textContent = '✅ 烧录完成。请拔下 USB 重新插上启动设备';
+    await cleanup();
+    return;
+  }
+
+  status.textContent = '✅ 烧录完成, 设备已重启';
+  await cleanup();
+}
+
+async function cleanup() {
+  try { await transport?.disconnect(); } catch (e) {}
+  try { await device?.close(); } catch (e) {}
+  device = null; transport = null; esploader = null;
 }
 
 $('flashBtn').addEventListener('click', async () => {
   const btn = $('flashBtn');
   const status = $('status');
-  let port = null;
-  let transport = null;
+  $('warn').style.display = 'none';
   try {
-    /* 1. 固件来源 */
-    let data;
-    const src = document.querySelector('input[name="src"]:checked').value;
-    if (src === 'github' || src === 'web') {
-      const urls = src === 'github' ? [FW_GITHUB, FW_WEB] : [FW_WEB];
-      status.textContent = '正在下载固件…';
-      let r = null;
-      let used = '';
-      for (const u of urls) {
-        try { r = await fetch(u); if (r.ok) { used = u; break; } } catch (e) {}
-      }
-      if (!r || !r.ok) throw new Error('固件下载失败, 请检查网络或改用本地文件');
-      if (src === 'github' && used === FW_WEB) log('GitHub 固件下载失败，已自动改用网站固件');
-      data = await r.arrayBuffer();
-    } else {
-      const f = $('fileInput').files[0];
-      if (!f) throw new Error('请先选择本地 .bin 文件');
-      data = await f.arrayBuffer();
+    if (fwData === null) {
+      btn.disabled = true;
+      await downloadFirmware();
+      btn.textContent = '连接并烧录';
+      btn.disabled = false;
+      return;
     }
-    log('固件已加载: ' + (data.byteLength / 1048576).toFixed(1) + ' MB');
 
-    /* 2. 连接设备 */
+    /* ========== 阶段2: 烧录 ========== */
     btn.disabled = true;
     btn.classList.add('busy');
-    btn.textContent = '烧录中…';
-    status.textContent = '请在弹出的窗口中选择设备端口…';
-    port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 460800 });
-    log('串口已连接，正在初始化…');
-
-    transport = new Transport(port, true);
-    // USB-Serial/JTAG (PID 0x1001) 不需要也无法换波特率, 保持 115200 跳过 changeBaud 重连
-    const isUsbJtag = port.getInfo().usbProductId === 0x1001;
-    const loader = new ESPLoader({ transport, baudrate: isUsbJtag ? 115200 : 460800 });
-    await loader.main();
-    const chip = loader.chip ? loader.chip.chip_name : '未知';
-    log('芯片识别: ' + chip);
-
-    /* 3. 烧录 */
-    status.textContent = '正在烧录 0x0 …（约 3-5 分钟，请勿断开）';
-    await loader.writeFlash({
-      fileArray: [{ data, address: FLASH_ADDR }],
-      eraseAll: true,
-      flashSize: 'keep',
-      compress: true,
-      reportProgress: (fileIndex, written, total) => {
-        const pct = total > 0 ? Math.round((written / total) * 100) : 0;
-        status.textContent = '正在烧录… ' + pct + '%（请勿断开）';
-      },
-    });
-
-    /* 4. 复位 */
-    try { await loader.hardReset(); } catch (e) {}
-    status.textContent = '✅ 烧录完成，设备已重启';
-    log('烧录完成，设备已重启');
+    startKeepAlive();   /* 后台保活: 防止切标签页被 Chrome 节流暂停写入 */
+    try {
+      await connectAndFlash();
+    } finally {
+      stopKeepAlive();
+    }
+    fwData = null;
   } catch (err) {
     console.error(err);
+    hideProgress();
     const msg = err.message || String(err);
     let tip = '';
-    if (msg.includes('already open')) {
-      tip = '（端口已被占用：请关闭其它打开了本刷写页面的标签页/窗口，再重新点“连接并烧录”）';
-    } else if (msg.includes('NotFoundError') || msg.includes('找不到')) {
-      tip = '（未找到设备：请确认设备已连接并处于下载模式）';
-    }
+    if (msg.includes('already open')) tip = '（端口被占用：请关闭其它打开本刷写页的标签页，刷新本页后再试）';
+    else if (msg.includes('user gesture') || msg.includes('requestPort')) tip = '（请再点一次“连接并烧录”）';
     status.textContent = '❌ ' + msg + tip;
-    log('错误: ' + msg + tip);
   } finally {
-    try { if (transport) await transport.disconnect(); } catch (e) {}
-    try { if (port) await port.close(); } catch (e) {}
     btn.disabled = false;
     btn.classList.remove('busy');
-    btn.textContent = '连接并烧录';
+    btn.textContent = (fwData === null) ? '下载固件' : '连接并烧录';
   }
 });
 
-/* 本地文件选择 */
+/* 切换固件来源时清空已下载数据 */
 document.querySelectorAll('input[name="src"]').forEach(r => {
   r.addEventListener('change', () => {
+    fwData = null;
+    $('flashBtn').textContent = '下载固件';
     if (r.value === 'local') {
       $('fileInput').click();
       $('fileInput').addEventListener('change', () => {
         const f = $('fileInput').files[0];
-        $('fwInfo').textContent = '本地文件 · ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB)';
+        $('fwInfo').textContent = '本地文件 · ' + f.name;
       });
     } else {
-      $('fwInfo').textContent = r.value === 'github' ? 'GitHub Release v1.2 · 16MB 完整镜像' : '本网站固件 · 16MB 完整镜像';
+      $('fwInfo').textContent = 'GitHub 仓库固件 · 16MB';
     }
   });
 });
