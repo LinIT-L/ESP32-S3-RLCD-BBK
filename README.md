@@ -6,10 +6,19 @@
 
 > **在线刷机**:https://bbk.linit.cn/flash/ (浏览器 WebSerial 直刷 16MB 固件)
 > **发布与固件下载**:https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases
->
-> 💡 主菜单还有 **隐藏游戏(GB/GBC/NES/Arduboy)与隐藏设置**,解锁方法见文末「隐藏功能」。
+
 
 ---
+
+## 隐藏功能 
+
+> **隐藏游戏**(GB / GBC / NES / Arduboy。应用菜单):
+
+1. 主菜单 → **设置** → **「请作者喝杯水」**(全屏赞助图)
+2. 赞助图上**连按确认键 5 次**
+3. 返回主菜单即可看到这些引擎图标
+---
+
 
 ## 功能
 
