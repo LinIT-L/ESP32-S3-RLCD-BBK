@@ -70,27 +70,45 @@ function updateFwInfo() {
   $('fwInfo').textContent = 'GitHub 固件 · ' + (ver === 'latest' ? '最新版' : ver) + ' · 16MB';
 }
 
+/* 取版本列表: 优先 GitHub Releases API, 失败则用 jsDelivr tag 接口兜底(境内可访问) */
 async function loadVersions() {
   const sel = $('verSel');
+  let tags = [];
   try {
     const res = await fetch('https://api.github.com/repos/' + REPO + '/releases?per_page=30');
-    if (!res.ok) throw new Error(String(res.status));
-    const rels = await res.json();
+    if (res.ok) {
+      const rels = await res.json();
+      if (Array.isArray(rels)) tags = rels.map(r => r.tag_name).filter(Boolean);
+    }
+  } catch (e) { /* 忽略，走备用源 */ }
+  if (tags.length === 0) {
+    try {
+      /* jsDelivr 的 versions 是去掉了 'v' 前缀的 git tag, 补回 'v' 以匹配 GitHub Release 标签 */
+      const res = await fetch('https://data.jsdelivr.com/v1/package/gh/' + REPO);
+      if (res.ok) {
+        const j = await res.json();
+        const vs = (j && Array.isArray(j.versions)) ? j.versions : [];
+        tags = vs.map(v => { const s = String(v); return /^v/i.test(s) ? s : ('v' + s); }).filter(Boolean);
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  if (tags.length === 0) {
+    sel.innerHTML = '<option value="latest">最新版（无法取版本列表，默认最新）</option>';
+  } else {
+    const cur = sel.value;
     sel.innerHTML = '';
-    const latest = rels[0];
     const oLatest = document.createElement('option');
     oLatest.value = 'latest';
-    oLatest.textContent = '最新版' + (latest ? '（' + latest.tag_name + '）' : '');
+    oLatest.textContent = '最新版（' + tags[0] + '）';
     sel.appendChild(oLatest);
-    for (const r of rels) {
-      if (!(r.assets && r.assets.some(a => a.name === FW_ASSET))) continue;
+    for (const t of tags) {
       const o = document.createElement('option');
-      o.value = r.tag_name;
-      o.textContent = r.tag_name;
+      o.value = t;
+      o.textContent = t;
       sel.appendChild(o);
     }
-  } catch (e) {
-    sel.innerHTML = '<option value="latest">最新版（无法取版本列表，默认最新）</option>';
+    /* 保留用户已选版本(若仍存在) */
+    if (cur && cur !== 'latest' && tags.includes(cur)) sel.value = cur;
   }
   updateFwInfo();
 }
@@ -146,19 +164,21 @@ async function downloadFirmware() {
   const src = document.querySelector('input[name="src"]:checked').value;
   if (src === 'github') {
     const ver = $('verSel').value || 'latest';
+    const verLabel = (ver === 'latest') ? '最新版' : ver;
     let r = null;
     if (ver === 'latest') {
       for (const u of FW_URLS) {
-        status.textContent = '正在连接固件源…';
+        status.textContent = '正在连接固件源（最新版）…';
         try { r = await fetch(u); if (r.ok) break; } catch (e) { r = null; }
       }
       if (!r || !r.ok) throw new Error('最新版固件下载失败, 请检查网络后重试');
     } else {
-      status.textContent = '正在下载 ' + ver + ' 固件…';
+      status.textContent = '正在下载 ' + verLabel + ' 固件…';
       const u = 'https://github.com/' + REPO + '/releases/download/' + ver + '/' + FW_ASSET;
       try { r = await fetch(u); } catch (e) { r = null; }
       if (!r || !r.ok) throw new Error('版本 ' + ver + ' 固件下载失败');
     }
+    $('fwInfo').textContent = 'GitHub 固件 · ' + verLabel + ' · 16MB';
     const total = Number(r.headers.get('Content-Length')) || 0;
     const reader = r.body.getReader();
     const chunks = [];
@@ -171,9 +191,9 @@ async function downloadFirmware() {
       if (total > 0) {
         const pct = Math.min(100, Math.round((received / total) * 100));
         setProgress(pct);
-        status.textContent = '正在下载固件… ' + pct + '%';
+        status.textContent = '正在下载 ' + verLabel + ' 固件… ' + pct + '%';
       } else {
-        status.textContent = '正在下载固件… ' + (received / 1048576).toFixed(1) + ' MB';
+        status.textContent = '正在下载 ' + verLabel + ' 固件… ' + (received / 1048576).toFixed(1) + ' MB';
       }
     }
     /* 关键: 与官方一致, 必须 Uint8Array */
