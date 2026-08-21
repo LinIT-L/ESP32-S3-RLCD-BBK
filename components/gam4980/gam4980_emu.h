@@ -28,10 +28,11 @@ bool gam4980_emu_is_ready(void);
 bool gam4980_emu_is_bg_active(void);   /* 后台是否正在初始化 */
 int  gam4980_emu_get_bg_progress(void); /* 后台初始化进度 0-100 */
 
-/* 显示模式: 全屏(400x240按比例缩放) 或 点对点(320x192 2x缩放居中) */
+/* 显示模式: 点对点(320x192 2x缩放居中) / 全屏(400x240按比例缩放) / 拉伸(400x240铺满) */
 typedef enum {
     DISP_MODE_POINT2POINT = 0,  /* 点对点 2x (320x192) */
     DISP_MODE_FULLSCREEN,       /* 全屏 (400x240) */
+    DISP_MODE_STRETCH,          /* 拉伸 (400x240) */
 } display_mode_t;
 
 /* V1.0.46: 画面优化 (0=关, 1=标准圆角, 2=深度灰度模拟) */
@@ -44,7 +45,7 @@ display_mode_t gam4980_get_display_mode(void);
 
 
 /* 兼容旧接口 */
-void gam4980_set_fullscreen(bool fs);
+void gam4980_set_fullscreen(int mode);   /* 0=点对点, 1=全屏, 2=拉伸 */
 bool gam4980_get_fullscreen(void);
 
 /* 游戏壁纸模式: 打开时任意设备按键强制退出游戏 (V1.0.64) */

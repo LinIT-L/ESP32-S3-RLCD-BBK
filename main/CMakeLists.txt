@@ -17,4 +17,6 @@ idf_component_register(
         board_battery
         book_reader
         tone_player
+        vibrator
+        engine_manager
 )

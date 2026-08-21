@@ -4,6 +4,10 @@
  */
 
 #include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <math.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -16,6 +20,7 @@
 #include "st7305.h"
 #include "bbk_boot.h"
 #include "menu_system.h"
+#include "diagnosis.h"   /* V1.0.98: 电脑诊断页每帧轮询 diag_poll */
 #include "input.h"
 #include "gam4980_emu.h"
 #include "user_config.h"
@@ -24,8 +29,11 @@
 #include "audio_player.h"
 #include "board_battery.h"
 #include "book_reader.h"
+#include "mini_apps.h"
 #include "app_board.h"
 #include "tone_player.h"   /* V1.0.68: 方波直驱音调播放器 (开机音/按键音) */
+#include "engine_manager.h" /* V1.0.98: 主菜单定时复核引擎残留 (unload_all 幂等) */
+#include "vibrator.h"      /* V1.0.76: 苹果 Taptic Engine 震动马达 (GPIO2) */
 #include "self_test.h"
 #include "display_test.h"
 #include "esp_attr.h"
@@ -41,40 +49,64 @@ static int s_select_drag_moved = 0;
 /* V1.0.68: 主菜单拖动累计位移 (抑制松手帧的方向键, 物理按键放行) */
 static int s_main_drag_moved = 0;
 
-/* === V1.0.68: 主菜单惯性甩动 (fling) — 按松手速度追加滑动格数 ===
- * 记录拖动期间最近若干采样点, 松手时用窗口内位移/时间算速度:
- *   速度越快 -> 继续滑动的格数越多; 低于阈值不甩 (缓慢拖动仍按距离吸附). */
-#define FLING_SAMPLES   6
-#define FLING_MIN_V     0.40f    /* px/ms 阈值: 低于 ≈400px/s 不甩动 */
-#define FLING_STEPS_PER 1.2f     /* 速度->格数系数: 1000px/s ≈ 1.2 格 */
-static float     s_fling_x[FLING_SAMPLES];
-static uint32_t  s_fling_t[FLING_SAMPLES];
-static int       s_fling_n = 0;
-static int       s_fling_head = 0;
+/* === V1.0.90: 自动保存日志到 TF 卡 (排查随机重启/内存问题).
+ * 通过 esp_log_set_vprintf 接管日志: 串口照常打印, 同时按行缓存进内部缓冲,
+ * 再由主循环 log_drain() 追加写入 /sdcard/log/bbk.log. 只在 SD 挂载后写盘,
+ * 失败静默跳过; 文件超过上限后从 0 回绕重建, 避免无限膨胀.
+ * s_log_skip 用于多任务/写盘期间的重入保护, 防止日志递归写盘死循环. */
+#define LOG_SAVE_BUF       4096
+#define LOG_SAVE_MAX       (1024UL * 1024)   /* 单个日志文件上限 1MB */
+#define LOG_SAVE_PATH      "/sdcard/log/bbk.log"
+EXT_RAM_BSS_ATTR static char          s_log_buf[LOG_SAVE_BUF];
+static volatile size_t    s_log_len = 0;
+static volatile bool      s_log_skip = false;
 
-static void fling_reset(void) {
-    s_fling_n = 0;
-    s_fling_head = 0;
+static int log_to_file_vprintf(const char *fmt, va_list arg) {
+    /* 1) 串口照常输出 (保留原有监视能力) */
+    va_list arg_console;
+    va_copy(arg_console, arg);
+    int n = vprintf(fmt, arg_console);
+    va_end(arg_console);
+    /* 2) 只缓存到文件缓冲, 不阻塞串口输出 */
+    if (!s_log_skip && s_log_len < LOG_SAVE_BUF) {
+        s_log_skip = true;
+        va_list arg_file;
+        va_copy(arg_file, arg);
+        int k = vsnprintf(s_log_buf + s_log_len, LOG_SAVE_BUF - s_log_len,
+                          fmt, arg_file);
+        va_end(arg_file);
+        if (k > 0) {
+            size_t need = (size_t)k;
+            if (need >= LOG_SAVE_BUF - s_log_len)
+                need = LOG_SAVE_BUF - s_log_len - 1;
+            s_log_len += need;
+        }
+        s_log_skip = false;
+    }
+    return n;
 }
 
-static void fling_record(int x, uint32_t now) {
-    s_fling_x[s_fling_head] = (float)x;
-    s_fling_t[s_fling_head] = now;
-    s_fling_head = (s_fling_head + 1) % FLING_SAMPLES;
-    if (s_fling_n < FLING_SAMPLES) s_fling_n++;
-}
-
-/* 松手速度 (px/ms, 右正左负): 用窗口内最早样本到最新样本的位移/时间 */
-static float fling_velocity(uint32_t now) {
-    if (s_fling_n < 2) return 0.0f;
-    int oldest = 0;
-    for (int i = 1; i < s_fling_n; i++)
-        if (s_fling_t[i] < s_fling_t[oldest]) oldest = i;
-    uint32_t t0 = s_fling_t[oldest];
-    float x0 = s_fling_x[oldest];
-    uint32_t dt = now - t0;
-    if (dt == 0) return 0.0f;
-    return (s_fling_x[(s_fling_head + s_fling_n - 1) % FLING_SAMPLES] - x0) / (float)dt;
+/* 主循环每帧调用: 把缓冲内容追加写入日志文件. 仅 SD 挂载且缓冲非空时写盘. */
+static void log_drain(void) {
+    if (!sd_is_mounted()) return;          /* 无卡/未挂载: 保留缓冲稍后再写 */
+    s_log_skip = true;
+    size_t len = s_log_len;
+    if (len == 0) { s_log_skip = false; return; }
+    /* 超限回绕: 重建文件保留最新内容 */
+    struct stat st;
+    if (stat(LOG_SAVE_PATH, &st) == 0 &&
+        st.st_size + (off_t)len > (off_t)LOG_SAVE_MAX) {
+        remove(LOG_SAVE_PATH);
+    }
+    FILE *f = fopen(LOG_SAVE_PATH, "ab");
+    if (f) {
+        fwrite(s_log_buf, 1, len, f);
+        fclose(f);
+    }
+    /* 移走已写部分, 保留写盘期间新追加的日志 */
+    if (s_log_len >= len) s_log_len -= len; else s_log_len = 0;
+    if (s_log_len && len) memmove(s_log_buf, s_log_buf + len, s_log_len);
+    s_log_skip = false;
 }
 
 /* V1.0.68: 列表弹窗跟手拖动状态 (番茄钟时间列表等) */
@@ -82,8 +114,24 @@ static bool s_list_drag_active = false;
 static int  s_list_drag_start_y = 0;
 static int  s_list_drag_moved = 0;
 
+/* V1.0.90: 底部屏蔽带 (仅用于返回/退出, 禁止拖动页面).
+ * 手指从屏幕底部中间约 20px (y>=280, x∈[100,300]) 内按下开始,
+ * 整个手势期间任何页面都不会被拖动; 点击/确认等其它操作照常, 向上滑触发返回.
+ * 需要锁存"本次按下起点是否在屏蔽带内", 手指抬起后清除. */
+#define TOUCH_SHIELD_Y      280   /* 距屏幕底部约 20px (屏幕总高 300) */
+static bool touch_shield_blocks_drag(void) {
+    /* V1.0.99: 只读查询 input_touch_in_bottom_zone (复用 input_get_touch_pos 已锁存的
+     * 起点屏蔽带结果), 不再内部自调 input_get_touch_pos. 旧实现同帧内把
+     * input_get_touch_pos 的 static 状态消费两次, 残留状态导致所有拖动方都无法建立
+     * 拖动 (拖动全面失效, 重启即消). 各拖动分支保证本函数在 input_get_touch_pos 之后
+     * 调用, 且手势期间 s_o_zone 由 input_get_touch_pos 锁存不变, 故无需再自行锁存. */
+    return input_touch_in_bottom_zone();
+}
+
 void app_main(void)
 {
+    /* V1.0.90: 自动保存日志到 TF (串口照常打印, 同时缓存进 /sdcard/log/bbk.log) */
+    esp_log_set_vprintf(&log_to_file_vprintf);
     ESP_LOGI(TAG, "==== BBK 游戏模拟器启动 ====");
     /* V1.0.68: 判断本次启动来源 (deep sleep 唤醒 = 电源键开机) */
     {
@@ -101,6 +149,9 @@ void app_main(void)
         return;
     }
     g_lcd = board.lcd;
+
+    /* V1.0.76: 震动马达 LEDC 初始化 (幂等, 无硬件也不影响运行) */
+    vibrator_init();
 
     /* 显示开机 Logo (1.5秒, 按 A 键跳过) */
     st7305_clear(&g_lcd, ST7305_COLOR_WHITE);
@@ -161,12 +212,17 @@ void app_main(void)
     uint32_t render_total_us = 0;
     /* V1.0.43: 电池电压采样间隔 (5秒读一次, 避免频繁ADC影响性能) */
     uint32_t battery_last_ms = 0;
+    /* V1.0.98: 主菜单引擎残留复核间隔 (60秒一次, 兜底卸载未释放引擎) */
+    uint32_t engine_check_last_ms = 0;
     while (1) {
+        log_drain();   /* V1.0.90: 每帧把缓存日志追加写入 TF 卡 */
         /* V1.0.68: 软关机键 GPIO1 长按 2 秒软关机 */
         if (input_power_should_sleep()) {
             menu_soft_power_off(&g_lcd);
         }
         menu_check_dialog_timeout();
+        /* V1.0.72: SD 晚挂载后补读 TF 配置 (一次性; 实现 TF 优先的鲁棒性) */
+        menu_config_tf_reload_if_needed();
         /* 蓝牙开启后, 等 HID Host 就绪自动启动一次主动连接扫描 (无需用户操作) */
         menu_poll_bt_auto_connect(&g_menu);
         menu_action_t action = input_get_action();
@@ -193,8 +249,8 @@ void app_main(void)
             action = MENU_ACTION_NONE;
             has_input = false;
         }
-        /* V1.0.68: 软关机键 (GPIO1):
-         *  点按 = 锁屏休眠; 0.5s = 弹"返回菜单"提示; 0.5s 后松手 = 返回主菜单; 2s = 关机 */
+        /* V1.0.69: 软关机键 (GPIO1): 点按 = 锁屏休眠; 长按 2s = 关机(input_power_should_sleep).
+         * 已去掉 0.5s"返回菜单"提示中间层 (HOME 改由状态栏长按/BOOT 长按承担). */
         if (action == MENU_ACTION_POWER_LOCK) {
             if (screensaver_is_active()) {
                 /* V1.0.68: 锁屏界面点按软关机键 = 立即退出休眠 */
@@ -207,19 +263,6 @@ void app_main(void)
                 action = MENU_ACTION_NONE;
                 has_input = false;
             }
-        } else if (action == MENU_ACTION_POWER_HINT) {
-            /* 0.5s: 弹出"返回菜单"提示 (持续按住, 2s 变关机) */
-            snprintf(g_menu.hint_text, sizeof(g_menu.hint_text),
-                     "\xe8\xbf\x94\xe5\x9b\x9e\xe8\x8f\x9c\xe5\x8d\x95");  /* 返回菜单 */
-            g_menu.hint_until_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 2000;
-            g_menu.needs_redraw = true;
-            action = MENU_ACTION_NONE;
-            has_input = false;
-        } else if (action == MENU_ACTION_POWER_RELEASE) {
-            /* 松手: 清提示, 立即返回主菜单 */
-            g_menu.hint_text[0] = '\0';
-            g_menu.hint_until_ms = 0;
-            action = MENU_ACTION_HOME;
         }
         
         /* 音乐播放/暂停时不允许进入屏保, 且重置屏保计时
@@ -232,6 +275,15 @@ void app_main(void)
         }
         
         if (screensaver_is_active()) {
+            /* V1.0.95: 删除"触摸退出"选项; 触摸只有长按 1 秒才退出壁纸,
+             * 快速点击/上滑等一次性触摸动作不退出 (物理键 / 手柄 / 软关机键仍可退出).
+             * 按住 ≥1s 实时放行, 无需松手. */
+            if (has_input && input_touch_last_action()) {
+                has_input = false;   /* 触摸的一次性动作先拦截 */
+            }
+            if (input_touch_hold_ms() >= 1000) {
+                has_input = true;    /* 触摸长按 1 秒达标 → 退出壁纸 */
+            }
             screensaver_check_and_render(&g_lcd, has_input);
             if (!screensaver_is_active()) {
                 /* 屏保刚退出, 重绘菜单 + 触发蓝牙立即重连 */
@@ -247,14 +299,13 @@ void app_main(void)
         if (g_menu.current_page == MENU_PAGE_MAIN && !menu_modal_active(&g_menu)) {
             int tx, ty;
             bool down = input_get_touch_pos(&tx, &ty);
-            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (down && !g_menu.main_drag_active) {
+            if (down && !g_menu.main_drag_active && !touch_shield_blocks_drag()) {
                 g_menu.main_drag_active = true;
                 g_menu.main_drag_start_x = tx;
                 g_menu.main_drag_offset = 0;
                 s_main_drag_moved = 0;
-                fling_reset();                 /* V1.0.68: 新拖动, 清惯性速度历史 */
-                g_menu.anim_start_ms = 0;      /* 取消滑动动画, 改由拖动控制 */
+                g_menu.main_cam_base = g_menu.main_cam_cur;  /* 相机接续当前显示位置 */
+                g_menu.main_cam_anim_start = 0;              /* 取消动画, 改由手指控制 */
                 g_menu.needs_redraw = true;
                 screensaver_reset();           /* 拖动算操作, 重置屏保计时 */
             }
@@ -267,30 +318,21 @@ void app_main(void)
                     }
                     if (off < 0) off = -off;
                     if (off > s_main_drag_moved) s_main_drag_moved = off;
-                    fling_record(tx, now);     /* V1.0.68: 记录速度样本 */
                 } else {
-                    /* 松手: 按拖动距离吸附 + 按松手速度惯性甩动 (V1.0.68) */
+                    /* V1.0.97 松手吸附: 相机 = 拖动起点 + 像素/格间距, 向最近格吸附.
+                     * 由 menu_main_cam_animate 把相机 from→round(from) 插值 → 松手
+                     * 首帧与最后一帧拖动共用同一相机, 像素级衔接, 停在指下、无回弹. */
                     g_menu.main_drag_active = false;
-                    int off = g_menu.main_drag_offset;
-                    g_menu.needs_redraw = true;
                     const int spacing = 100;
-                    int steps = 0;
-                    if (off < 0) steps = (-off + spacing / 2) / spacing;  /* 左拖 -> 选中右移 */
-                    else         steps = -((off + spacing / 2) / spacing); /* 右拖 -> 选中左移 */
-                    /* 惯性: 速度越快, 继续滑动的格数越多 (左甩右移 / 右甩左移) */
-                    float vel = fling_velocity(now);
-                    if (vel < -FLING_MIN_V)
-                        steps += (int)(-vel * FLING_STEPS_PER);
-                    else if (vel > FLING_MIN_V)
-                        steps -= (int)(vel * FLING_STEPS_PER);
-                    if (steps != 0) {
-                        /* 保持 drag_offset, 让 render 动画期间把它衰减到 0 (无缝过渡) */
-                        menu_drag_settle(&g_menu, steps);
-                    } else {
-                        g_menu.main_drag_offset = 0;   /* 未过半格: 回弹 */
-                    }
-                    ESP_LOGI("MAIN", "松手: vel=%.2fpx/ms off=%d steps=%d n=%d",
-                             vel, off, steps, s_fling_n);
+                    float cur = g_menu.main_cam_base - (float)g_menu.main_drag_offset / (float)spacing;
+                    int target = lroundf(cur);
+                    int steps = (int)(target - lroundf(g_menu.main_cam_base));
+                    if (steps < 0) steps = -steps;
+                    uint32_t dur = 240 + (uint32_t)steps * 70;
+                    if (dur > 700) dur = 700;
+                    menu_main_cam_animate(&g_menu, cur, target, dur);
+                    g_menu.needs_redraw = true;
+                    ESP_LOGI("MAIN", "松手: cur=%.2f target=%d", cur, target);
                     /* V1.0.68: 本次触摸拖动过 → 抑制本帧 LEFT/RIGHT
                      * (拖动已接管横向切换; 物理 BOOT 短按不受影响) */
                     if (s_main_drag_moved >= 15) main_drag_suppress_lr = true;
@@ -320,7 +362,8 @@ void app_main(void)
             bool down = input_get_touch_pos(&tx, &ty);
             /* V1.0.68 fix: 记录本帧开始时是否在拖动 (松手帧在下方才会清零) */
             bool content_drag_was_active = g_menu.select_game_drag_active;
-            if (down && !g_menu.select_game_drag_active && tx >= 104) {
+            if (down && !g_menu.select_game_drag_active && tx >= 104 &&
+                !touch_shield_blocks_drag()) {
                 g_menu.select_game_drag_active = true;
                 g_menu.select_game_drag_start_y = ty;
                 g_menu.select_game_drag_offset = 0;
@@ -371,7 +414,10 @@ void app_main(void)
         if (g_menu.list_dialog_active && !g_menu.list_dialog_on_render) {
             int tx, ty;
             bool down = input_get_touch_pos(&tx, &ty);
-            if (down && !s_list_drag_active) {
+            /* V1.0.90: 内容全部显示得下(不可滚动)时不启动拖动, 屏蔽滑动误拖 */
+            bool can_scroll = menu_list_dialog_scrollable(&g_menu);
+            if (down && !s_list_drag_active && can_scroll &&
+                !touch_shield_blocks_drag()) {
                 s_list_drag_active = true;
                 s_list_drag_start_y = ty;
                 s_list_drag_moved = 0;
@@ -395,6 +441,31 @@ void app_main(void)
                     menu_list_dialog_release(&g_menu);   /* 松手固定内容位置 */
                 }
                 /* 拖动期间忽略 swipe 产生的 UP/DOWN (由拖动接管) */
+                if (action == MENU_ACTION_UP || action == MENU_ACTION_DOWN) {
+                    action = MENU_ACTION_NONE;
+                    has_input = false;
+                }
+            }
+        }
+        /* V1.0.9x: 应用管理内容页上下拖动 (触摸屏跟手滚动), 显示更多项 */
+        if (g_menu.current_page == MENU_PAGE_APP_MANAGER && !menu_modal_active(&g_menu)) {
+            app_manager_tick(&g_menu);   /* V1.0.9x fix: 逐帧推进回弹动画, 落位后命中才准 */
+            int tx, ty;
+            bool down = input_get_touch_pos(&tx, &ty);
+            if (down && !app_manager_drag_is_active() && !touch_shield_blocks_drag()) {
+                app_manager_drag_begin(tx, ty);
+                g_menu.needs_redraw = true;
+                screensaver_reset();
+            }
+            if (app_manager_drag_is_active()) {
+                if (down) {
+                    app_manager_drag_update(tx, ty);
+                    g_menu.needs_redraw = true;
+                } else {
+                    if (app_manager_drag_end()) drag_suppress_confirm = true;
+                    g_menu.needs_redraw = true;
+                }
+                /* 拖动期间忽略 swipe 产生的 UP/DOWN (由滚动接管), 避免误移选中 */
                 if (action == MENU_ACTION_UP || action == MENU_ACTION_DOWN) {
                     action = MENU_ACTION_NONE;
                     has_input = false;
@@ -435,6 +506,14 @@ void app_main(void)
         }
         /* 长按收藏检测: 必须在 menu_handle_action 后调用 (检查 KEY 是否持续按住) */
         menu_poll_long_press(&g_menu);
+        /* V1.0.9x: 网络工具独立页每帧轮询 (定时刷新/任务推进) */
+        if (nettool_poll(&g_menu)) {
+            /* needs_redraw 已在 nettool_poll 内置 */
+        }
+        /* V1.0.98: 电脑诊断页每帧轮询 (右侧概率栏拖动滚动) */
+        if (g_menu.current_page == MENU_PAGE_DIAGNOSIS) {
+            diag_poll(&g_menu);
+        }
         /* 按键映射模式: 每帧轮询手柄按键并捕获 (不依赖物理按键) */
         menu_poll_gamepad_mapping(&g_menu);
         /* 补充按键映射模式: 每帧轮询物理键 + 处理确定/跳过 */
@@ -456,20 +535,33 @@ void app_main(void)
         }
         vTaskDelay(pdMS_TO_TICKS(2));
         uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        /* V1.0.43: 每5秒读取一次电池电压, 更新状态栏电量 */
-        if (now_ms - battery_last_ms >= 5000) {
+        /* V1.0.43: 每分钟读取一次电池电压, 更新状态栏电量.
+         * V1.0.74: 模态弹窗/二级菜单打开时不强制整页重绘, 避免状态栏刷新
+         * 每隔一段时间触发一次全屏闪烁 (如键鼠布局菜单). 弹窗关闭后的下一次
+         * 渲染会自然带上最新电量. */
+        if (now_ms - battery_last_ms >= 60000) {
             battery_last_ms = now_ms;
             board_battery_status_t bat;
+            bool modal = menu_modal_active(&g_menu);
             if (board_battery_read(&bat) == ESP_OK) {
                 g_menu.settings.battery = bat.percent;
-                g_menu.needs_redraw = true;
+                if (!modal) g_menu.needs_redraw = true;
             } else {
                 /* V1.0.68: 未检测到电池 -> 255 哨兵值, 状态栏电池上显示 "?" */
                 if (g_menu.settings.battery != 255) {
                     g_menu.settings.battery = 255;
-                    g_menu.needs_redraw = true;
+                    if (!modal) g_menu.needs_redraw = true;
                 }
             }
+        }
+        /* V1.0.98: 主菜单每 60 秒兜底复核一次引擎残留.
+         * 正常路径下返回主菜单已 unload_all; 此处针对异常退出/状态残留导致
+         * 未成功卸载的引擎做二次清理, 并触发内存泄漏检测. 仅在主菜单且无弹窗
+         * 时执行, 避免干扰正在使用的引擎. */
+        if (g_menu.current_page == MENU_PAGE_MAIN && !menu_modal_active(&g_menu) &&
+            now_ms - engine_check_last_ms >= 60000) {
+            engine_check_last_ms = now_ms;
+            engine_manager_unload_all();
         }
         if (now_ms - fps_last_ms >= 1000) {
             if (render_total_us > 0) {
@@ -479,6 +571,14 @@ void app_main(void)
             } else {
                 ESP_LOGI(TAG, "idle");
             }
+            /* 栈/内存监控: 每秒打印 main 任务栈高水位 + 各内存区空闲, 辅助排查
+             * 打开引擎/WiFi手柄时崩溃. DMA=WiFi能用的内部DMA段, 剩余越少越危险. */
+            ESP_LOGI(TAG, "STACK main_free=%u 内部=%u DMA=%u DMA大块=%u PSRAM=%u",
+                     (unsigned)uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             fps_count = 0;
             render_total_us = 0;
             fps_last_ms = now_ms;

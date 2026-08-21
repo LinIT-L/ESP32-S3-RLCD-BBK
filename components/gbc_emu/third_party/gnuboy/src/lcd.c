@@ -729,24 +729,14 @@ inline static void updatepalette(int i)
 
 	c = (low | (high << 8)) & 0x7fff;
 
-	if (hw.cgb)
-	{
-		/* CGB 调色板字 (15-bit): bit 0-4 = 红, bit 5-9 = 绿, bit 10-14 = 蓝,
-		 * 与 pal_write_dmg 的打包顺序一致 (红在低位), 写入顺序为小端.
-		 * V1.0.68 fix: 旧代码误按"BGR 序"解析导致红蓝对调 —
-		 * 灰度下红色(高亮度权重)被当成蓝色(低权重)渲染成近黑,
-		 * 蓝色被当成红色渲染成中灰, 画面亮暗错乱 (GBC 颜色不太对). */
-		r = c & 0x1f;
-		g = (c >> 5) & 0x1f;
-		b = (c >> 10) & 0x1f;
-	}
-	else
-	{
-		/* DMG: pal_write_dmg 已按 RGB 序打包 (r 在 bit 0-4) */
-		r = c & 0x1f;
-		g = (c >> 5) & 0x1f;
-		b = (c >> 10) & 0x1f;
-	}
+	//bit 0-4 red
+	r = c & 0x1f;
+
+	// bit 5-9 green
+	g = (c >> 5) & 0x1f;
+
+	// bit 10-14 blue
+	b = (c >> 10) & 0x1f;
 
 	// PAL2[i] = (r << 11) | (g << (5 + 1)) | (b);
 	PAL2[i] = make_color(r << 3 , g << 3 , b << 3);

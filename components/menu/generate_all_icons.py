@@ -245,6 +245,24 @@ def gen_icon_pad():
     return px
 
 
+def gen_icon_keyboard():
+    """键鼠 - 小键盘: 圆角键盘体 + 4 排键 (上3排 5 列 + 底排空格). 极简实心."""
+    px = blank()
+    # 键盘体: 圆角矩形描边
+    stroke_rounded_rect(px, 14, 30, 82, 80, 6, thickness=3)
+    # 顶部一行如上排按键
+    rows_y = [38, 50, 62, 74]
+    for ri, y0 in enumerate(rows_y):
+        if ri == 3:
+            # 底排: 宽空格键
+            fill_rounded_rect2(px, 20, y0, 76, y0 + 6, 2)
+            break
+        for c in range(5):
+            x0 = 20 + c * 12
+            fill_rounded_rect2(px, x0, y0, x0 + 8, y0 + 8, 2)
+    return px
+
+
 def gen_icon_arduboy():
     """Arduboy: 圆角板身 + 大圆键 + 四小键 + 屏幕 + 扬声器. 极简."""
     px = blank()

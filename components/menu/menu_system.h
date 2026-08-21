@@ -33,6 +33,14 @@ typedef enum {
     MENU_PAGE_BOOK,              /* 电子书 */
     MENU_PAGE_WALLPAPER,         /* 壁纸设置 */
     MENU_PAGE_POMODORO,          /* 番茄钟 */
+    MENU_PAGE_USB_HID,           /* USB HID 键鼠 */
+    MENU_PAGE_APP_MANAGER,       /* 应用管理: 统一管理固件内置模块启用/停用/卸载 */
+    MENU_PAGE_MINIAPPS,          /* 迷你应用: 独立小工具/小游戏启动器 (计算器/秒表/日历等) */
+    MENU_PAGE_NETTOOL,           /* 网络工具: 独立主菜单应用 (Wi-Fi 扫描/连接 + 安全/测试/其他分类) */
+    MENU_PAGE_ICON_EDITOR,       /* 图标编辑器: 编辑内置 64x64 图标 / 自定义图标仓库 (SD) */
+    MENU_PAGE_DIAGNOSIS,         /* 故障诊断: 按故障现象分层排查 + 设备概率排序 */
+    MENU_PAGE_WQX,               /* wqx 文曲星: LavaX 虚拟机游戏 (lavaxvm, .lav) */
+    MENU_PAGE_VPET,              /* 暴龙机: vpet-emu-zepp E0C6200 虚拟宠物 (.bin) */
     MENU_PAGE_COUNT
 } menu_page_t;
 
@@ -48,6 +56,7 @@ typedef enum {
     MENU_ACTION_HOME,    /* 退出到菜单页面 (手柄映射第 7 键) */
     MENU_ACTION_LONG_LEFT,  /* LEFT 长按 500ms (V1.0.39: 手柄配置弹窗用此快捷键直接扫描) */
     MENU_ACTION_LONG_PRESS, /* V1.0.68: 触摸长按 (游戏列表收藏等) */
+    MENU_ACTION_KEY_FAV,    /* V1.0.69: 有触摸机型物理 KEY 长按 = 收藏当前项 */
     MENU_ACTION_POWER_LOCK,    /* V1.0.68: 软关机键点按 = 锁屏休眠 */
     MENU_ACTION_POWER_HINT,    /* V1.0.68: 软关机键 0.5s = 弹"返回菜单"提示 */
     MENU_ACTION_POWER_RELEASE, /* V1.0.68: 软关机键 0.5s 后松手 = 返回主菜单 */
@@ -98,6 +107,15 @@ typedef struct {
     screensaver_type_t screensaver_type;  /* 保留供内部使用 (仅星空类型) */
     /* 游戏状态栏: 游戏界面是否显示状态栏 (true=显示, false=隐藏) */
     bool    game_status_bar;
+    /* 主菜单功能开关 bitmap: 置 0 的位对应用户关闭该功能(隐藏主菜单图标).
+     * 位定义见 menu_system.c 的 MAINF_FEAT_* 宏. 默认全 1 全部启用. */
+    uint32_t feature_switch;
+    /* 应用管理: 已安装/已点亮模块位图 (s_modules 物理索引逐位).
+     * 默认 0 = 仅强制项显示; 经"应用管理"点亮某模块后置位则显示在对应子菜单.
+     * 与 feature_switch 独立: 前者决定"是否已装/出现在菜单", 后者决定"已装功能是否关闭". */
+    uint32_t app_installed;
+    /* V1.0.89: 菜单字体字重 — 0=粗体(默认) 1=细体. "设置->字体设置"切换并持久化. */
+    uint8_t  font_style;
 } menu_settings_t;
 
 /* 前置声明: 保证下方函数指针参数与 menu_state_t 内的回调指针是同一 struct 类型
@@ -157,6 +175,9 @@ typedef struct menu_state_s {
     int              list_dialog_selected;
     int              list_dialog_scroll;
     menu_page_t      list_dialog_return_page;
+    /* 全屏模块(游戏等)返回页: 从应用管理进入时记录为 APP_MANAGER,
+     * 退出该模块时返回应用管理而非主菜单. 默认/一次性使用 (MAIN=0=主菜单). */
+    menu_page_t      module_return_page;
     void             (*list_dialog_on_select)(struct menu_state_s *state, int idx);
     /* 弹窗局部刷新: 仅 list_dialog_active 期间, 选项变化时只重绘新旧两行
      * (避免每帧 st7305_clear + 整页重绘造成的闪烁) */
@@ -172,6 +193,17 @@ typedef struct menu_state_s {
     int              main_drag_offset;  /* 当前拖动偏移(像素), 渲染时叠加到图标 x */
     bool             main_drag_active;  /* 是否正在拖动 */
     int              main_drag_start_x; /* 拖动起始触摸屏幕 x */
+    /* V1.0.97: 主菜单"统一相机"模型 — 整排图标行用单一小数相机 main_cam_cur(单位:格)
+     * 表示位置, 拖动 / 松手吸附 / 按键切换全部由它插值渲染, 索引按 g 取模回绕.
+     * 彻底替代 selected_index + main_drag_offset "双锚点叠加" → 松手瞬间像素级
+     * 不连续(哪怕短距离也左右回弹)的根本原因. */
+    float            main_cam_base;        /* 拖动起始相机(格) */
+    float            main_cam_cur;         /* 当前渲染相机(格, 可小数) */
+    float            main_cam_anim_from;   /* 相机动画起始(格) */
+    float            main_cam_anim_to;     /* 相机动画终点(格) */
+    uint32_t         main_cam_anim_start;  /* 相机动画开始时刻 */
+    uint32_t         main_cam_anim_dur;    /* 相机动画时长(ms) */
+    int              main_cam_anim_sel;    /* 相机动画对应的 selected_index (守卫不匹配即取消) */
     /* V1.0.68: 游戏二级菜单右栏跟手拖动 (上下滑动列表跟随手指) */
     int              select_game_drag_offset;  /* 右栏垂直拖动偏移(像素) */
     bool             select_game_drag_active;  /* 是否正在拖动右栏 */
@@ -264,7 +296,8 @@ typedef struct menu_state_s {
     uint8_t          game_display_mode;     /* 游戏显示模式: 0=点对点, 1=全屏, 2=强制拉伸全屏 */
     bool             game_show_statusbar;   /* 状态栏显示: 在游戏界面是否显示顶部状态栏 */
     bool             game_key_sound;        /* BBK 按键音效: true=开, false=关 */
-    bool             game_virtual_keys;     /* V1.0.68: 游戏内屏幕虚拟按键 (开/关) */
+    uint8_t          game_virtual_keys;     /* V1.0.94: 游戏内屏幕虚拟按键三态: 0=关 1=开 2=自动 (V1.0.68 原为 bool 开关) */
+    bool             game_vkey_auto;        /* V1.0.71: 虚拟按键自动切换 (手柄弹窗"自动虚拟按键"). 1=自动(有触屏+连手柄→关, 仅触屏→开) 0=手动 */
     /* V1.0.46: 画面优化选项 (选项已从菜单移除, 字段保留固定为 0=关) */
     int              game_gray_mode;        /* 模拟灰度模式: 0=纯黑白, 1=4级点聚, 2=5级点聚 */
     int              game_pic_opt;          /* 画面优化: 0=关, 1=标准圆角, 2=深度灰度模拟 (默认关) */
@@ -294,6 +327,10 @@ typedef struct menu_state_s {
     uint8_t          wallpaper_timeout_min; /* 休眠时间: 1..30 分钟, 默认 3 */
     uint8_t          wallpaper_bmp_fps;     /* TF动态图速度: 0=慢 1=标准 2=快 */
     uint8_t          wallpaper_game_rot;    /* 游戏壁纸轮换序号 (运行时) */
+    bool             wallpaper_auto_shutdown; /* 壁纸自动软关机开关 (V1.0.90) */
+    uint8_t          wallpaper_shutdown_time; /* 自动软关机时间值 (10/20/.../60分钟, 1-24小时, 1-7天) (V1.0.90) */
+    uint8_t          wallpaper_shutdown_unit; /* 自动软关机单位 0=分钟 1=小时 2=天 (V1.0.90) */
+    bool             wallpaper_touch_exit;   /* 壁纸触摸退出开关 (V1.0.90) */
     /* === V1.0.64: 番茄钟 === */
     uint8_t          pomo_work_min;         /* 工作分钟 1..120 */
     uint8_t          pomo_rest_min;         /* 休息分钟 1..60 */
@@ -349,9 +386,11 @@ void menu_handle_action(menu_state_t *state, menu_action_t action);
  * 未命中/不适用返回 false (main.c 回退为普通 CONFIRM). */
 bool menu_handle_touch(menu_state_t *state, int x, int y);
 
-/* V1.0.66: 主菜单拖动松手吸附. steps 为选中项变化量(正=右移选中, 负=左移选中),
- * 带循环 wrap; 触发 cover-flow 动画. 拖动残留 main_drag_offset 由 render 动画期间衰减. */
-void menu_drag_settle(menu_state_t *state, int steps);
+/* V1.0.97: 主菜单相机吸附/切换动画 — 主菜单图标行是循环 wrap, 渲染永远由 float 相机
+ * main_cam_cur 决定。松手或按键换位都把相机 from(可小数)→to_idx 插值, to 在最近的
+ * 同余位置(wrap 最短路径)上取, 保证任意拖动距离(含 <半格)松手都停在指下、无跳变回弹.
+ * selected_index 立即置为 to_idx(逻辑选中)。 */
+void menu_main_cam_animate(menu_state_t *state, float from, int to_idx, uint32_t dur_ms);
 /* V1.0.68: 游戏二级菜单右栏拖动松手吸附 (steps 正=选中下移, 负=上移) */
 void menu_select_game_settle(menu_state_t *state, int steps);
 /* V1.0.68: 游戏列表拖动/按下实时选中: 选中手指所在行的游戏 (ty=手指物理y, off=拖动偏移) */
@@ -362,17 +401,34 @@ void menu_touch_long_press(menu_state_t *state, int x, int y);
 void menu_list_dialog_touch_track(menu_state_t *state, int ty);
 /* V1.0.68: 列表弹窗松手: 固定内容位置 (scroll 补偿偏移, 不回弹) */
 void menu_list_dialog_release(menu_state_t *state);
+/* V1.0.90: 列表弹窗当前内容是否可滚动 (内容项超过可见行数才允许拖动滚动) */
+bool menu_list_dialog_scrollable(const menu_state_t *state);
 /* V1.0.68: 是否有模态弹窗/全屏覆盖激活 (弹窗期间禁止背景拖动等) */
 bool menu_modal_active(const menu_state_t *state);
+/* V1.0.9x: 应用管理内容页上下拖动滚动 (触摸屏跟手). 由 main.c 主循环每帧调用:
+ * 按下调 begin, 拖动调 update, 松手调 end (返回 true 走真实拖动, 应先抑制 CONFIRM). */
+void app_manager_drag_begin(int tx, int ty);
+void app_manager_drag_update(int tx, int ty);
+bool app_manager_drag_end(void);
+bool app_manager_drag_is_active(void);
+/* V1.0.9x: 应用管理回弹动画逐帧推进 (主循环每帧调用, 静止时零开销) */
+void app_manager_tick(menu_state_t *state);
 /* V1.0.68: 手动锁屏 (点按软关机键): 下一次 check_and_render 立即进入屏保 */
 void menu_screensaver_activate(void);
+/* V1.0.9x: 主菜单图标拖动排序是否激活 (main.c 据此屏蔽主菜单滚动拖拽, 避免抢相机) */
+bool menu_main_reorder_active(void);
 void menu_check_dialog_timeout(void);
+/* V1.0.72: SD 晚挂载后的 TF 配置补读 (每帧主菜单空闲时调用, 一次性).
+ * 实现"开机优先读 TF 配置, 读不到回退设备内"的鲁棒性. */
+void menu_config_tf_reload_if_needed(void);
 /* 后台轮询: 蓝牙开启后, 等 HID Host 就绪自动启动"主动连接"扫描 */
 void menu_poll_bt_auto_connect(menu_state_t *state);
 /* 把 g_menu.settings.volume 同步到 audio_player.
  * 必须在 audio_player_init 完成后调用 (例如 main.c 初始化末尾). */
 void menu_apply_volume_setting(void);
 void menu_render(menu_state_t *state);
+/* V1.0.94: 虚拟按键三态生效判断 (0=关 1=开 2=自动), 供引擎层开启/关闭屏幕虚拟按键 */
+bool menu_vkey_effective(const menu_state_t *state);
 /* 每帧轮询: 检测 KEY 长按 -> 收藏/取消收藏. 必须在 menu_handle_action 后调用. */
 void menu_poll_long_press(menu_state_t *state);
 /* 按键映射模式下每帧调用: 捕获手柄按下的键并推进映射进度 (需在 menu_render 前调用) */

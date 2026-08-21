@@ -22,10 +22,11 @@ extern "C" {
 
 typedef enum {
     ENGINE_GAM4980 = 0,   /* 电子词典 (gam4980 libretro 核心) */
-    ENGINE_GB,            /* GB (esp-box-emu gnuboy) */
-    ENGINE_GBC,           /* GBC (esp-box-emu gnuboy) */
+    ENGINE_GB,            /* GB/GBC (Peanut-GB, 存档目录分开) */
     ENGINE_NES,           /* NES (esp-box-emu nofrendo) */
     ENGINE_ARDUBOY,       /* Arduboy (simavr ATmega32u4) */
+    ENGINE_LAVAX,         /* wqx 文曲星 (LavaX 虚拟机 lavaxvm) */
+    ENGINE_VPET,          /* 暴龙机 (vpet-emu-zepp E0C6200 4-bit CPU) */
     ENGINE_COUNT
 } engine_id_t;
 

@@ -32,7 +32,7 @@ uint8_t nes_emu_get_volume(void);
 
 void nes_emu_pause(void);
 void nes_emu_resume(void);
-void nes_emu_set_fullscreen(bool fs);
+void nes_emu_set_fullscreen(int mode);   /* 0=点对点, 1=全屏, 2=拉伸 */
 
 #ifdef __cplusplus
 }

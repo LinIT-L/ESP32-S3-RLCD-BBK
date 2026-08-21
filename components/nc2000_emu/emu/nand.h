@@ -1,0 +1,14 @@
+#include "comm.h"
+
+extern char nand_magic[11];
+
+uint8_t read_nand();
+void nand_write(uint8_t);
+
+void read_nand0_file();
+void read_nand_file();
+
+void write_nand0_file(string file="");
+void write_nand_file(string file="");
+
+void clear_nand_status();

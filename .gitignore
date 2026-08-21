@@ -25,6 +25,8 @@ check_python_dependencies_*.py
 icons_choices/
 icons_preview/
 third_party_gbemu_firmware/
+# 原始 Zepp 参考源(本地参考, 构建不需要, 不入库)
+third_party/vpet-emu-zepp/
 
 # ===== 主程序调试历史 / 替代实现 =====
 main/main.c.backup

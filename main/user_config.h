@@ -10,14 +10,13 @@
 #define RLCD_SCK_PIN   GPIO_NUM_11
 #define RLCD_MOSI_PIN  GPIO_NUM_12
 #define RLCD_RST_PIN   GPIO_NUM_41
-#define RLCD_TE_PIN    GPIO_NUM_6
 
 /* I2C (SHTC3/PCF85063, 模拟器暂不使用) */
 #define ESP32_I2C_SDA_PIN   GPIO_NUM_13
 #define ESP32_I2C_SCL_PIN   GPIO_NUM_14
 
 /* 按键 GPIO
- * 已被 LCD 占用: 5(DC),6(TE),11(SCK),12(MOSI),40(CS),41(RST)
+ * 已被 LCD 占用: 5(DC),11(SCK),12(MOSI),40(CS),41(RST)   [GPIO6 空闲, TE 线不接]
  * 已被 I2C 占用: 13(SDA),14(SCL)
  *
  * 板载按键 (来自 Waveshare ESP32-S3-RLCD-4.2 官方文档):

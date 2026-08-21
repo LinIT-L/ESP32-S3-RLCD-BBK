@@ -23,6 +23,8 @@ typedef enum {
     FAV_ENGINE_FC,        /* NES (.nes) */
     FAV_ENGINE_AB,        /* arduboy (.hex) */
     FAV_ENGINE_BOOK,      /* 电子书 (.txt) */
+    FAV_ENGINE_WQX,       /* wqx 文曲星 (.lav) */
+    FAV_ENGINE_VPET,      /* 暴龙机 (.bin) */
     FAV_ENGINE_MAX
 } fav_engine_t;
 
@@ -49,6 +51,9 @@ const char *const *favorites_list(fav_engine_t e, int *count);
 
 /* 数量 (指定引擎) */
 int favorites_count(fav_engine_t e);
+
+/* V1.0.9x: 清理所有引擎中"文件已不存在"(改名/删除)的失效收藏 (打开收藏栏时调用) */
+void favorites_prune_missing(void);
 
 #ifdef __cplusplus
 }

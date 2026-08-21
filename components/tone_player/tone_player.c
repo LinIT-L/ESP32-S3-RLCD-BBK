@@ -58,6 +58,15 @@ void tone_stop(void) {
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
+void tone_tone_on(int freq_hz) {
+    if (!s_ready) return;
+    if (freq_hz < 40) freq_hz = 40;
+    if (freq_hz > 20000) freq_hz = 20000;
+    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, (uint32_t)freq_hz);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, TONE_DUTY);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
 void tone_beep(int freq_hz, int ms) {
     if (!s_ready || ms <= 0) return;
     if (freq_hz < 40) freq_hz = 40;

@@ -55,8 +55,8 @@ static const char *TAG = "gbc_emu";
 #define GBC_EMU_FRAME_US         16667
 #define GBC_EMU_IDLE_DELAY_INTERVAL 30
 
-#define GBC_EMU_AUDIO_SAMPLE_RATE 44100  /* V1.0.61: 44100 是实测零欠载的采样率 (ES8311 在 24000 时实际播放时钟偏快, 环形缓冲被抽干 → 断音) */
-#define GBC_EMU_AUDIO_MAX_SAMPLES 8192   /* int16 数 (立体声交错), ~93ms @44.1kHz */
+#define GBC_EMU_AUDIO_SAMPLE_RATE 24000  /* V1.0.61: 恢复官方 esp-box-emu gnuboy 采样率 (旧适配器同款, GB 声音正常) */
+#define GBC_EMU_AUDIO_MAX_SAMPLES 8192   /* int16 数 (立体声交错), ~171ms @24kHz */
 
 /* V1.0.53: 任务栈 PSRAM 静态, 不占内部 RAM */
 EXT_RAM_BSS_ATTR static StackType_t s_gbc_task_stack[GBC_EMU_TASK_STACK_SIZE / sizeof(StackType_t)];
@@ -79,13 +79,6 @@ static uint8_t *s_rom_data = NULL;   /* 当前 ROM 数据 (gnuboy 直接引用, 
 static size_t   s_rom_size = 0;
 static bool     s_rom_owned = false; /* true = 本组件负责释放 s_rom_data */
 static int      s_current_buffer = 0;
-/* [DIAG] 最近一次音频产出样本数 (挂 GBC diag 周期日志) */
-static volatile int s_diag_produced = 0;
-/* V1.0.61: 按真实时间喂送 (BBK 同款): 每帧喂 24000×dt 个样本,
- * 产出不足补静音, 产量恒等于扬声器消耗 → 消除 GBC 59fps 时的欠载断音. */
-static int64_t s_gbc_last_audio_us = 0;
-static int64_t s_gbc_audio_acc = 0;
-EXT_RAM_BSS_ATTR static int16_t s_gbc_audio_out[2048 * 2];
 /* V1.0.60: GB/GBC 音频按真实时间重采样.
  * sound_mix 按游戏时钟产出样本 (每模拟帧 ~735), 模拟核心只有 ~50fps 时
  * 产量低于扬声器消耗, 环形缓冲被掏空 -> 卡顿. 这里每帧喂 44100×实际耗时
@@ -104,6 +97,7 @@ static int  s_display_mode = 1;   /* 0=点对点(1x), 1=全屏(2x), 2=强制拉�
 static volatile uint8_t s_output_volume = 80;
 static gbc_emu_progress_cb_t s_progress_cb = NULL;
 static char s_save_path[160] = {0};   /* 电池存档路径 (派生自 ROM 路径) */
+static char s_save_dir[64] = "/sdcard/dict/GB";   /* 电池存档目录 (gbc_emu_set_save_dir 可改) */
 
 /* === 电池存档持久化 (V1.0.53) ===
  * 格式: 8 字节头 ('GBSR' + uint32 size) + 原始 SRAM (8192 * mbc.ramsize 字节).
@@ -119,12 +113,22 @@ static void gbc_make_save_path(const char *rom_path)
     const char *dot = strrchr(name, '.');
     int len = dot ? (int)(dot - name) : (int)strlen(name);
     if (len <= 0 || len > 96) len = 32;
-    snprintf(s_save_path, sizeof(s_save_path), "/sdcard/dict/GB/%.*s.sav", len, name);
+    snprintf(s_save_path, sizeof(s_save_path), "%s/%.*s.sav", s_save_dir, len, name);
 }
 
 void gbc_emu_set_save_path(const char *rom_path)
 {
     gbc_make_save_path(rom_path);
+}
+
+/* 设置电池存档目录 (默认 "/sdcard/dict/GB"). gb_emu 兼容层用它对 GB/GBC 分区存档.
+ * 在 load_rom / start 之前调用生效. */
+void gbc_emu_set_save_dir(const char *dir)
+{
+    if (!dir) return;
+    snprintf(s_save_dir, sizeof(s_save_dir), "%s", dir);
+    size_t n = strlen(s_save_dir);
+    while (n > 1 && s_save_dir[n - 1] == '/') s_save_dir[--n] = 0;   /* 去末尾斜杠 */
 }
 
 static void gbc_emu_load_sram(void)
@@ -154,10 +158,8 @@ static void gbc_emu_save_sram(void)
 {
     if (!mbc.batt || !ram.sbank || !mbc.ramsize || !ram.loaded || s_save_path[0] == 0) return;
     size_t sram_len = (size_t)8192 * mbc.ramsize;
-    char dir[64];
-    snprintf(dir, sizeof(dir), "/sdcard/dict/GB");
     mkdir("/sdcard/dict", 0777);
-    mkdir(dir, 0777);
+    mkdir(s_save_dir, 0777);
     FILE *f = fopen(s_save_path, "wb");
     if (!f) return;
     uint32_t magic = GB_SRAM_MAGIC;
@@ -222,37 +224,15 @@ void gbc_emu_set_joypad(uint8_t joypad)
 
 static void gbc_emu_feed_audio(void)
 {
+    /* V1.0.61: 官方 esp-box-emu 方式 — 核心原生产出多少就直喂多少,
+     * 不做重采样/插值 (旧适配器同款, 验证 GB 声音正常).
+     * 之前自定义的实时重采样路径引入过: 缓冲越界 (进游戏重启)、
+     * 2 倍拉伸 (声音慢一半). 双速 CGB 的产量减半问题已在 cpu.c
+     * sound_advance 修复, 现在 GB/GBC 都是完整产量 (24000 样本/秒),
+     * 直喂即可, 环形缓冲 (16K 帧, ~680ms) 足够吸收帧率抖动. */
     int produced = (pcm.pos > 0) ? (pcm.pos / 2) : 0;
-    if (produced > GBC_EMU_AUDIO_MAX_SAMPLES / 2)
-        produced = GBC_EMU_AUDIO_MAX_SAMPLES / 2;   /* 防御: 防越界 */
-    /* [DIAG] 最近一次产出样本数 (挂 GBC diag 周期日志) */
-    s_diag_produced = produced;
-
-    /* 按真实经过时间决定本次喂送样本数: want = 24000 × dt.
-     * 核心 59fps 时每帧只产 400 (23600/秒), 直接喂会欠载 (环形缓冲
-     * 慢慢掏空 → 断音). 这里补静音到 want, 产量恒等于消耗, 不断音. */
-    int64_t now = esp_timer_get_time();
-    if (s_gbc_last_audio_us == 0) s_gbc_last_audio_us = now;
-    int64_t dt_us = now - s_gbc_last_audio_us;
-    s_gbc_last_audio_us = now;
-    if (dt_us < 1000) dt_us = 1000;
-    if (dt_us > 100000) dt_us = 100000;
-    s_gbc_audio_acc += (int64_t)GBC_EMU_AUDIO_SAMPLE_RATE * dt_us;
-    int want = (int)(s_gbc_audio_acc / 1000000);
-    s_gbc_audio_acc %= 1000000;
-    if (want < 256) want = 256;
-    if (want > 2048) want = 2048;
-
-    if (produced >= want) {
-        /* 产出够: 只取前 want 个 (丢弃多余, 不做插值) */
-        audio_player_feed_pcm(pcm.buf, (size_t)want, GBC_EMU_AUDIO_SAMPLE_RATE);
-    } else {
-        /* 产出不足: 原样保留 produced, 其余补静音 (不插值, 不越界) */
-        if (produced > 0)
-            memcpy(s_gbc_audio_out, pcm.buf, (size_t)produced * 2 * sizeof(int16_t));
-        memset(s_gbc_audio_out + produced * 2, 0,
-               (size_t)(want - produced) * 2 * sizeof(int16_t));
-        audio_player_feed_pcm(s_gbc_audio_out, (size_t)want, GBC_EMU_AUDIO_SAMPLE_RATE);
+    if (produced > 0) {
+        audio_player_feed_pcm(pcm.buf, (size_t)produced, GBC_EMU_AUDIO_SAMPLE_RATE);
     }
     pcm.pos = 0;
 }
@@ -316,9 +296,9 @@ static void gbc_emu_task(void *arg)
             int64_t now_us = esp_timer_get_time();
             uint32_t fps = (uint32_t)((uint64_t)180 * 1000000u /
                                       (uint64_t)(now_us - last_diag_us));
-            ESP_LOGI(TAG, "GBC diag: frames=%u fps=%u frame_avg=%dus pcm.pos=%d prod=%d",
+            ESP_LOGI(TAG, "GBC diag: frames=%u fps=%u frame_avg=%dus pcm.pos=%d",
                      (unsigned)frame_count, (unsigned)fps,
-                     (int)(diag_frame_us / 180), (int)pcm.pos, (int)s_diag_produced);
+                     (int)(diag_frame_us / 180), (int)pcm.pos);
             last_diag_us = now_us;
             diag_frame_us = 0;
         }
@@ -475,8 +455,6 @@ esp_err_t gbc_emu_start_data(uint8_t *data, size_t size, bool owned)
     memset(displayBuffer[1], 0, GBC_EMU_SCREEN_WIDTH * GBC_EMU_SCREEN_HEIGHT * 2);
     pcm.pos = 0;
     frame = 0;
-    s_gbc_last_audio_us = 0;
-    s_gbc_audio_acc = 0;
 
     sound_reset();
     loader_init(data, size);
@@ -496,7 +474,7 @@ esp_err_t gbc_emu_start_data(uint8_t *data, size_t size, bool owned)
 
     board_rlcd_video_task_start();
     /* GB/GBC: 30Hz 刷新 (转换 + SPI 需在 33ms 内完成, 留足余量) */
-    board_rlcd_video_task_set_interval_us(66667);   /* 15Hz */
+    board_rlcd_video_task_set_interval_us(33000);
     TaskHandle_t task = xTaskCreateStaticPinnedToCore(gbc_emu_task, "gbc_emu",
                                                       GBC_EMU_TASK_STACK_SIZE / sizeof(StackType_t),
                                                       NULL, GBC_EMU_TASK_PRIORITY,

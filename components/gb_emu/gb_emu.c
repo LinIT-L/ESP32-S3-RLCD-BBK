@@ -26,6 +26,13 @@ void gb_emu_set_progress_cb(gb_emu_progress_cb_t cb)
     s_progress_cb = cb;
 }
 
+/* 设置电池存档目录 (转发 gbc_emu): 菜单用它区分 GB(/sdcard/dict/GB) 与 GBC(/sdcard/dict/GBC).
+ * 必须在 gb_emu_load_rom 之前调用. */
+void gb_emu_set_save_dir(const char *dir)
+{
+    gbc_emu_set_save_dir(dir);
+}
+
 esp_err_t gb_emu_load_rom(const char *path, gb_emu_rom_t *rom)
 {
     if (!path || !rom) return ESP_ERR_INVALID_ARG;

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include "esp_attr.h"
 
 typedef struct {
     FILE *out;
@@ -176,7 +177,8 @@ int fb2_convert(const char *src, const char *dst, char *title, size_t title_cap)
     memset(&c, 0, sizeof(c));
     c.out = out;
 
-    static uint8_t buf[4096];
+    /* 读取缓冲放 PSRAM, 不占内部 RAM (4KB) */
+    EXT_RAM_BSS_ATTR static uint8_t buf[4096];
     size_t n;
     int st = 0;        /* 0=普通文本 1=在标签内 2=注释 3=CDATA */
     char tag[64];

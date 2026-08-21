@@ -86,11 +86,12 @@ static StaticTask_t s_video_tcb;
  * 视频任务从内部 RAM 解包缩放 -> 写 FB -> SPI (全部在 core0, 不拖模拟帧). */
 static const uint8_t *s_nes_shade_src = NULL;  /* 模拟任务打包帧 (PSRAM) */
 static int s_nes_shade_w = 0, s_nes_shade_h = 0;
-static bool s_nes_shade_fullscreen = true;
+static int s_nes_shade_mode = 2;   /* NES 显示模式: 0=点对点, 1=全屏, 2=拉伸 */
 static int s_nes_packed_bytes = 0;
 static uint8_t *s_nes_internal = NULL;   /* 内部 RAM 单块: [显示打包帧 | FB 暂存] */
 static uint8_t *s_nes_disp = NULL;
 static uint8_t *s_fb_stage = NULL;
+static bool     s_gb_stage_owned = false;  /* GB (Peanut-GB) 独占的 s_fb_stage */
 static int64_t s_nes_scale_us = 0;       /* 诊断: 最近一次缩放耗时 */
 
 /* GB/GBC (gnuboy): 模拟任务只产出 RGB565 双缓冲帧, 视频任务做 2x 灰度转换+SPI.
@@ -103,7 +104,7 @@ static int64_t s_gbc_spi_us = 0;     /* 诊断: 最近一次 SPI 耗时 */
 static int64_t s_gbc_pack_us = 0;    /* 诊断: 拉伸打包阶段耗时 */
 static int64_t s_gbc_scale_us = 0;   /* 诊断: 拉伸缩放阶段耗时 */
 
-void board_rlcd_set_nes_shade_source(const uint8_t *shade, int w, int h, bool fullscreen)
+void board_rlcd_set_nes_shade_source(const uint8_t *shade, int w, int h, int mode)
 {
     if (shade && w > 0 && h > 0) {
         int packed = w * h / 4;
@@ -124,7 +125,9 @@ void board_rlcd_set_nes_shade_source(const uint8_t *shade, int w, int h, bool fu
         s_nes_shade_src = shade;
         s_nes_shade_w = w;
         s_nes_shade_h = h;
-        s_nes_shade_fullscreen = fullscreen;
+        if (mode < 0) mode = 0;
+        if (mode > 2) mode = 2;
+        s_nes_shade_mode = mode;
     } else {
         s_nes_shade_src = NULL;
         s_nes_shade_w = 0;
@@ -201,7 +204,8 @@ static void board_video_flush_task(void *arg)
         if (s_nes_shade_src) {
             /* NES: 灰度帧 -> 全屏缩放/点对点 -> FB, 全部在 core0 视频任务内完成 */
             board_rlcd_fb_lock();
-            if (s_nes_shade_fullscreen) {
+            if (s_nes_shade_mode != 0) {
+                /* 1=全屏 / 2=拉伸: 均走 scaled 拉伸到全屏 (400 宽) 归一处理 */
                 board_rlcd_draw_nes_scaled(s_nes_disp, s_nes_shade_w, s_nes_shade_h);
             } else {
                 memcpy(s_fb_stage, s_lcd->fb, ST7305_WIDTH * ST7305_HEIGHT / 8);
@@ -371,6 +375,52 @@ void board_rlcd_video_task_stop(void)
 
 void board_shim_set_lcd(st7305_handle_t *lcd) {
     s_lcd = lcd;
+}
+
+/* === GB (Peanut-GB) 2x 绘制暂存 ===
+ * board_rlcd_draw_gb_line_2x 直接画到 s_fb_stage (内部 RAM), 需要显式分配.
+ * NES/GBC 路径用 s_nes_internal 里的暂存, 与本函数互斥 (各引擎不会同时运行). */
+esp_err_t board_shim_gb_stage_alloc(void)
+{
+    if (s_fb_stage) return ESP_OK;
+    uint8_t *m = heap_caps_malloc(ST7305_WIDTH * ST7305_HEIGHT / 8,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!m) {
+        /* 内部 RAM 不足时回退 PSRAM: Peanut-GB 单帧 <2ms, 放 PSRAM 性能余量充足 */
+        m = heap_caps_malloc(ST7305_WIDTH * ST7305_HEIGHT / 8,
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!m) {
+        ESP_LOGE(TAG, "GB stage 分配失败 (%d B)", ST7305_WIDTH * ST7305_HEIGHT / 8);
+        return ESP_ERR_NO_MEM;
+    }
+    s_fb_stage = m;
+    s_gb_stage_owned = true;
+    return ESP_OK;
+}
+
+void board_shim_gb_stage_free(void)
+{
+    if (s_gb_stage_owned && s_fb_stage) {
+        heap_caps_free(s_fb_stage);
+        s_gb_stage_owned = false;
+    }
+    s_fb_stage = NULL;
+}
+
+/* 返回 GB 2x 绘制暂存指针 (供 1x 模式 board_rlcd_draw_gb_line_to 使用) */
+uint8_t *board_shim_gb_stage_get(void)
+{
+    return s_fb_stage;
+}
+
+/* 提交 GB 暂存到 LCD FB (锁保护), 再调 board_rlcd_flush_async() 异步刷新 */
+void board_shim_gb_stage_commit(void)
+{
+    if (!s_lcd || !s_lcd->fb || !s_fb_stage) return;
+    board_rlcd_fb_lock();
+    memcpy(s_lcd->fb, s_fb_stage, ST7305_WIDTH * ST7305_HEIGHT / 8);
+    board_rlcd_fb_unlock();
 }
 
 /* === board_rlcd 兼容接口 === */

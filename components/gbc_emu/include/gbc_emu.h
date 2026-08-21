@@ -42,6 +42,9 @@ esp_err_t gbc_emu_start_data(uint8_t *data, size_t size, bool owned);
  * gb_emu 兼容层在 load_rom 时调用; gbc_emu_start(path) 内部自动设置. */
 void gbc_emu_set_save_path(const char *rom_path);
 
+/* 设置电池存档目录 (默认 "/sdcard/dict/GB"). gb_emu 兼容层用它对 GB/GBC 分区存档. */
+void gbc_emu_set_save_dir(const char *dir);
+
 /* 阻塞等待模拟任务完全退出 (gb_emu 兼容层在释放外部 ROM 缓冲前调用) */
 void gbc_emu_wait_stopped(void);
 

@@ -27,6 +27,12 @@ bool input_consume_tap(int *x, int *y);
  * 返回 false 表示当前无手指按下. */
 bool input_get_touch_pos(int *x, int *y);
 
+/* V1.0.99: 只读查询"当前手指按下 且 本次手势起点落在底部屏蔽带" (不消费任何状态).
+ * 仅供 main.c 的 touch_shield_blocks_drag 使用: 它复用 input_get_touch_pos 已维护的
+ * 锁存结果, 必须在同帧 input_get_touch_pos 调用之后使用, 避免对 input_get_touch_pos
+ * 二次调用导致锁存状态被两次消费而残留 (拖动全面失效的竞态). */
+bool input_touch_in_bottom_zone(void);
+
 /* V1.0.68: 只轮询一次触摸芯片并刷新缓存坐标 (不跑手势/动作状态机).
  * 供游戏内虚拟按键等每帧需要触摸坐标、但又不希望产生菜单动作的场景
  * (如 BBK 模拟器游戏循环本身不调用 input_get_action). 同一 tick 内重复
@@ -47,9 +53,17 @@ bool input_power_should_sleep(void);
  * 用于确认框区分"触摸上滑(BACK)"与"物理 BACK 键". */
 bool input_touch_last_action(void);
 
+/* V1.0.95: 返回当前触摸按住时长(ms); 未按住返回 0.
+ * 供壁纸屏保"触摸需长按 1 秒才退出"判定. */
+uint32_t input_touch_hold_ms(void);
+
 /* V1.0.68: 设置屏幕旋转方向 (电子书竖屏时触摸跟随旋转).
  * rot: 0=横屏 1=180° 2=左90°竖屏 3=右90°竖屏. */
 void input_set_screen_rotation(int rot);
+
+/* V1.0.90: 判断逻辑坐标是否落在"物理屏幕底部中间"区域 (跟随当前旋转方向).
+ * 用于: 底部上滑=返回 / 拖动屏蔽带. thick 为厚度(逻辑像素). */
+bool input_in_bottom_zone(int sx, int sy, int thick);
 
 /* GB/GBC joypad 掩码 (低电平有效), 供 GB/GBC 模拟器每帧查询按键状态.
  * bit0=A bit1=B bit2=Select bit3=Start bit4=右 bit5=左 bit6=上 bit7=下

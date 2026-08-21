@@ -1,10 +1,12 @@
 /*
- * simavr 内存分配覆盖: 强制把 simavr 核心内的 malloc/calloc/realloc/free
- * 优先指向 PSRAM (MALLOC_CAP_SPIRAM), 避免占满紧张的内部 SRAM.
+ * simavr 内存分配覆盖: 把 simavr 核心内的 malloc/calloc/realloc/free
+ * 优先指向内部 SRAM/DMA (MALLOC_CAP_INTERNAL), PSRAM 仅作回退.
  *
- * 背景: Arduboy 模拟核心 ~35-40KB (flash 32KB + data 2.5KB + avr 结构 + irq 池)
- * 全部走内部 RAM 极易耗尽. 通过与 gbc_mem_override.h 相同的 -include 机制,
- * 把 base 的堆分配转到 PSRAM, 仅当 PSRAM 分配失败时才回退到内部 RAM.
+ * 背景: Arduboy 模拟核心 ~35-40KB (flash 32KB + data 2.5KB + avr 结构 + irq 池).
+ * simavr 是纯 CPU 解释执行, 每条 AVR 指令都要随机读 avr->flash / avr->data,
+ * 之前强制分到 PSRAM 时随机访问延迟比内部 SRAM 高数倍, 导致吞吐不足、
+ * 游戏卡顿甚至"不动". 核心总量仅 ~40KB, 内部 RAM 空闲 (~90KB+) 放得下,
+ * 故改为优先内部 DMA 内存; 内部不足时回退 PSRAM 保证可用.
  *
  * 通过 CMakeLists 的 -include 对组件内所有源文件生效; 本头文件只做宏替换.
  */
@@ -17,8 +19,8 @@
 
 static inline void *sim_malloc(size_t n)
 {
-    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) p = heap_caps_malloc(n, MALLOC_CAP_8BIT);   /* PSRAM 失败回退内部 RAM */
+    void *p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);   /* 内部不足回退 PSRAM */
     return p;
 }
 
@@ -32,8 +34,8 @@ static inline void *sim_calloc(size_t n, size_t s)
 
 static inline void *sim_realloc(void *p, size_t n)
 {
-    void *np = heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!np) np = heap_caps_realloc(p, n, MALLOC_CAP_8BIT);   /* PSRAM 失败回退内部 RAM */
+    void *np = heap_caps_realloc(p, n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!np) np = heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);   /* 内部不足回退 PSRAM */
     return np;
 }
 

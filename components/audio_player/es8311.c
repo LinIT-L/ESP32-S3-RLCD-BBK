@@ -13,8 +13,12 @@ static const char *TAG = "ES8311";
 static i2c_port_t s_i2c_port = I2C_NUM_0;
 static bool s_initialized = false;
 static bool s_started = false;
+/* 芯片是否真实存在 (I2C 探测到才为 true). 部分机型主板未焊 ES8311,
+ * 此时所有寄存器读写都应跳过, 避免报错刷屏. */
+static bool s_present = false;
 
 static esp_err_t es8311_write_reg(uint8_t reg, uint8_t val) {
+    if (!s_present) return ESP_OK;   /* 芯片不存在, 静默跳过 */
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (ES8311_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -30,6 +34,7 @@ static esp_err_t es8311_write_reg(uint8_t reg, uint8_t val) {
 }
 
 static int es8311_read_reg(uint8_t reg, uint8_t *val) {
+    if (!s_present) { if (val) *val = 0; return ESP_OK; }   /* 芯片不存在, 静默跳过 */
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     /* 写寄存器地址 */
     i2c_master_start(cmd);
@@ -83,8 +88,9 @@ int es8311_init(int sda, int scl) {
         return -1;
     }
 
-    /* 扫描 I2C 总线, 确认有哪些设备 */
+    /* 扫描 I2C 总线, 确认有哪些设备, 同时判断 ES8311 是否存在 */
     ESP_LOGI(TAG, "I2C 总线扫描:");
+    bool found = false;
     for (int addr = 0x08; addr < 0x78; addr++) {
         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
         i2c_master_start(cmd);
@@ -94,8 +100,20 @@ int es8311_init(int sda, int scl) {
         i2c_cmd_link_delete(cmd);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "  I2C 设备发现: 0x%02X", addr);
+            if (addr == 0x18 || addr == 0x1A) found = true;   /* ES8311 两个可能地址 */
         }
     }
+
+    if (!found) {
+        /* 本机主板未焊 ES8311 (部分机型如此): 标记不存在, 跳过全部寄存器配置.
+         * 返回 0 让上层继续 (I2S/ES7210 仍可用), 只是没有 DAC 扬声器输出. */
+        s_present = false;
+        s_initialized = true;
+        s_started = false;
+        ESP_LOGW(TAG, "未检测到 ES8311 (0x18/0x1A 无响应), 本机无此芯片, 跳过初始化 (无 DAC 扬声器输出)");
+        return 0;
+    }
+    s_present = true;
 
     /* 尝试读取 ES8311 芯片 ID (先试 0x18, 再试 0x1A) */
     int es_addr = ES8311_ADDR;

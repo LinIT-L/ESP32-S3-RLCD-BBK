@@ -43,6 +43,7 @@ static int16_t           s_wd_last_x = -1, s_wd_last_y = -1;
 static uint32_t          s_wd_last_ms = 0;
 static uint32_t          s_wd_recover_times[WD_MAX_RECOVER] = {0};
 static int               s_wd_recover_idx = 0;
+static bool              s_wd_window_full = false;   /* 恢复记录窗口是否已填满(空位拉低"最旧", 会误判超频) */
 static TaskHandle_t      s_wd_task = NULL;
 
 static void touch_watchdog_task(void *arg);   /* 前向声明 (init 里启动) */
@@ -291,7 +292,9 @@ static bool wd_recover_throttle(void) {
     int idx = s_wd_recover_idx;
     s_wd_recover_times[idx] = now;
     s_wd_recover_idx = (idx + 1) % WD_MAX_RECOVER;
-    uint32_t oldest = s_wd_recover_times[idx];
+    if (s_wd_recover_idx == 0) s_wd_window_full = true;   /* 一圈填满 */
+    if (!s_wd_window_full) return true;                    /* 窗口未满, 不节流 */
+    uint32_t oldest = s_wd_recover_times[s_wd_recover_idx];
     if (now - oldest < WD_THROTTLE_MS) {
         ESP_LOGE(TAG, "3分钟内恢复次数过多, 节流暂停 (避免反复重启)");
         return false;
@@ -404,6 +407,12 @@ static void touch_watchdog_task(void *arg) {
 
 tp_chip_t touch_panel_get_chip(void) {
     return s_chip;
+}
+
+/* V1.0.69: 是否检测到触摸屏 (有触摸机型 = true, 无触摸机型 = false).
+ * 供 input.c 按机型分支物理键语义用. */
+bool touch_panel_is_present(void) {
+    return (s_chip != TP_CHIP_NONE);
 }
 
 void touch_panel_get_resolution(int *max_x, int *max_y) {

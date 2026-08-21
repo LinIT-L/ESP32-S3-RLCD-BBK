@@ -7,6 +7,7 @@
 #include "esp_netif_sntp.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_attr.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -23,9 +24,9 @@ static char s_status[48] = "未连接";
 static char s_ssid[33] = "";
 static char s_pass[65] = "";
 
-/* V1.0.46: 扫描结果 */
+/* V1.0.46: 扫描结果 (放 PSRAM, 不占内部 RAM ~2.4KB) */
 #define MAX_AP 16
-static wifi_ap_record_t s_ap[MAX_AP];
+EXT_RAM_BSS_ATTR static wifi_ap_record_t s_ap[MAX_AP];
 static int s_ap_count = 0;
 static bool s_scan_done = false;
 static bool s_connected_just_now = false;  /* 刚连接成功事件 (菜单提示用) */

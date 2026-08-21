@@ -32,6 +32,16 @@ void board_shim_set_lcd(st7305_handle_t *lcd);
 /* V1.0.46+: GB/GBC 灰度模式三档 (0=纯黑白, 1=4档点聚, 2=5档点聚) */
 void board_shim_set_gb_gray(int mode);
 
+/* GB (Peanut-GB) 2x 绘制暂存: board_rlcd_draw_gb_line_2x 画到 s_fb_stage (内部 RAM).
+ * 进入 GB 引擎时调用 alloc, 退出时调用 free (须等视频任务停止后). */
+esp_err_t board_shim_gb_stage_alloc(void);
+void      board_shim_gb_stage_free(void);
+
+/* 返回 GB 暂存指针 (1x 模式 board_rlcd_draw_gb_line_to 用) */
+uint8_t  *board_shim_gb_stage_get(void);
+/* 提交 GB 暂存到 LCD FB (锁保护), 之后调 board_rlcd_flush_async() */
+void      board_shim_gb_stage_commit(void);
+
 /* === board_rlcd 兼容接口 === */
 bool     board_rlcd_is_initialized(void);
 esp_err_t board_rlcd_clear(uint8_t color);
@@ -50,7 +60,7 @@ void      board_rlcd_video_task_set_interval_us(uint32_t us);
 
 /* NES: 把模拟任务产出的灰度帧交给视频任务 (core0) 做缩放+刷屏.
  * shade 必须保持有效; 传 NULL 表示 NES 结束, 释放内部暂存. */
-void      board_rlcd_set_nes_shade_source(const uint8_t *shade, int w, int h, bool fullscreen);
+void      board_rlcd_set_nes_shade_source(const uint8_t *shade, int w, int h, int mode);   /* mode: 0=点对点, 1=全屏, 2=拉伸 */
 
 /* NES: 返回视频任务持有的内部 RAM 显示缓冲 (2bit 打包, w*h/4 字节),
  * 模拟任务把打包帧拷到这里后通知刷屏. */
@@ -71,6 +81,10 @@ esp_err_t board_rlcd_draw_gb_line_2x(int x, int y, const uint8_t *pixels, int wi
 
 /* V1.0.46: GB 模拟器 1x 点对点绘制 (游戏全屏关闭时用) */
 esp_err_t board_rlcd_draw_gb_line(int x, int y, const uint8_t *pixels, int width);
+
+/* GB 1x 点对点绘制到指定 fb (Peanut-GB 用 s_fb_stage 暂存, 避免直接写 s_lcd->fb) */
+esp_err_t board_rlcd_draw_gb_line_to(uint8_t *fb, int x, int y,
+                                     const uint8_t *pixels, int width);
 
 /* NES 拉伸全屏: 最近邻缩放 2bit 打包帧到整个 400x300 屏幕 (内部 RAM 快速路径) */
 esp_err_t board_rlcd_draw_nes_scaled(const uint8_t *shade, int src_w, int src_h);

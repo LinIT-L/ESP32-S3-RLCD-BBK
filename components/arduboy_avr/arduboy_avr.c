@@ -32,6 +32,7 @@
 #include "avr_timer.h"
 #include "ssd1306_virt.h"
 #include "audio_player.h"
+#include "virtual_keys.h"
 
 #define AB_AVR_W   128
 #define AB_AVR_H   64
@@ -227,6 +228,9 @@ static void arduboy_avr_render(void)
     const int y_off = (ST7305_HEIGHT - H) / 2;
     st7305_set_window(s_lcd, x_off, y_off, W, H);
     st7305_blit_1bit_white(s_lcd, x_off, y_off, W, H, s_frame);
+    /* Arduboy 直接 st7305_flush, 绕过 board_shim 视频任务 (虚拟按键只在视频任务里画),
+     * 故在此补画屏幕虚拟按键, 否则 Arduboy 游戏内永远看不到虚拟按键. */
+    virtual_keys_draw(s_lcd);
     st7305_flush(s_lcd);
     ssd1306_set_flag(&s_disp, SSD1306_FLAG_DIRTY, 0);
 }
@@ -381,6 +385,9 @@ static void arduboy_avr_task(void *arg)
     }
 
     ESP_LOGW(TAG, "arduboy AVR task exiting (state=%d)", s_avr ? (int)s_avr->state : -1);
+    /* 注销任务看门狗: 任务退出后若不注销, TWDT 会每 5s 持续触发 (日志刷屏),
+     * 且残留订阅会让后续误判任务仍在运行. */
+    esp_task_wdt_delete(NULL);   /* NULL = 注销当前任务 */
     s_task = NULL;
     vTaskDelete(NULL);
 }
@@ -569,7 +576,7 @@ esp_err_t arduboy_avr_start(const char *path)
 
     if (!s_task) {
         BaseType_t r = xTaskCreatePinnedToCore(arduboy_avr_task, "arduboy_avr",
-                                               8192, NULL, 3, &s_task, 1);
+                                               16384, NULL, 3, &s_task, 1);
         if (r != pdPASS) {
             s_task = NULL;
             ESP_LOGE(TAG, "无法创建模拟任务");

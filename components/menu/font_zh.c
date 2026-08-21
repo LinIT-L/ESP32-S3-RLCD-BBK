@@ -3,21 +3,32 @@
 #include <stdbool.h>
 
 /* V1.0.64: 紧凑二进制字库 (components/menu/font_zh.bin, 由 CMake target_add_binary_data 嵌入)
- * 布局: [8B magic "ZH1FNT01"][u32 count][字符表 count*3 UTF-8][字形 count*72] */
+ * 布局: [8B magic "ZH1FNT01"][u32 count][字符表 count*3 UTF-8][字形 count*72]
+ * V1.0.89: 双字重 — font_zh.bin(粗) / font_zh_light.bin(细), 经 font_zh_set_style 运行时切换 */
 extern const uint8_t font_zh_bin_start[] asm("_binary_font_zh_bin_start");
 extern const uint8_t font_zh_bin_end[]   asm("_binary_font_zh_bin_end");
+extern const uint8_t font_zh_light_bin_start[] asm("_binary_font_zh_light_bin_start");
+extern const uint8_t font_zh_light_bin_end[]   asm("_binary_font_zh_light_bin_end");
 
 static uint32_t s_zh_count = 0;
 static const uint8_t *s_zh_chars = NULL;   /* 字符表 (count*3) */
 static const uint8_t *s_zh_glyphs = NULL;  /* 字形 (count*72) */
 static bool s_zh_bound = false;
+static bool s_zh_light = false;            /* V1.0.89: 当前是否用细字库 */
 
 const char *zh_chars = NULL;
 const uint8_t (*zh_font_data)[72] = NULL;
 
 static void font_zh_bind(void) {
-    const uint8_t *d = font_zh_bin_start;
-    size_t len = (size_t)(font_zh_bin_end - font_zh_bin_start);
+    const uint8_t *d;
+    size_t len;
+    if (s_zh_light) {
+        d = font_zh_light_bin_start;
+        len = (size_t)(font_zh_light_bin_end - font_zh_light_bin_start);
+    } else {
+        d = font_zh_bin_start;
+        len = (size_t)(font_zh_bin_end - font_zh_bin_start);
+    }
     if (len < 12 || memcmp(d, "ZH1FNT01", 8) != 0) return;
     uint32_t n = (uint32_t)d[8] | ((uint32_t)d[9] << 8) |
                  ((uint32_t)d[10] << 16) | ((uint32_t)d[11] << 24);
@@ -64,6 +75,32 @@ const uint8_t *font_zh_get_bitmap_by_index(int idx) {
     if (!s_zh_bound) font_zh_bind();
     if (!s_zh_bound || (uint32_t)idx >= s_zh_count) return NULL;
     return s_zh_glyphs + (size_t)idx * 72;
+}
+
+/* V1.0.89: 切换字重 (粗/细). 将绑定标记置为无效, 下次取字重新绑定对应字库. */
+void font_zh_set_style(bool light) {
+    if (s_zh_light == light) return;
+    s_zh_light = light;
+    s_zh_bound = false;
+}
+
+bool font_zh_is_light(void) {
+    return s_zh_light;
+}
+
+/* V1.0.92: 查找 ASCII 字符索引. 字库中 ASCII 以 "0x00 0x00 <ascii>" 3 字节槽存放. */
+int font_zh_find_ascii(unsigned char c) {
+    if (!s_zh_bound) font_zh_bind();
+    if (!s_zh_bound || !s_zh_chars) return -1;
+    for (uint32_t i = 0; i < s_zh_count; i++) {
+        int pos = i * 3;
+        if ((uint8_t)s_zh_chars[pos]     == 0x00 &&
+            (uint8_t)s_zh_chars[pos + 1] == 0x00 &&
+            (uint8_t)s_zh_chars[pos + 2] == c) {
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
 /* 旧接口 - 已废弃, 仅做兼容 */

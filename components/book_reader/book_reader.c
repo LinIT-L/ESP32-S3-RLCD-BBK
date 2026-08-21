@@ -128,12 +128,17 @@ static TaskHandle_t s_idx_task = NULL;
 static volatile bool s_idx_stop = false;
 
 /* === 阅读菜单 === */
-enum { BM_READ = 0, BM_MENU = 1, BM_TOC = 2, BM_BMKS = 3 };
+enum { BM_READ = 0, BM_MENU = 1, BM_TOC = 2, BM_BMKS = 3, BM_FONT = 4 };
 static uint8_t      s_menu = BM_READ;
 static uint32_t     s_menu_sel = 0;
 static uint32_t     s_menu_scroll = 0;
 static char         s_menu_msg[40] = {0};
 static bool         s_exit_confirm = false;   /* 返回菜单键退出确认 */
+
+/* V1.0.88: TF 卡字体 
+ * V1.0.96: s_sd_fonts 移到 PSRAM (仅在字体选择/扫描时用, 低频, 省 1KB 内部 RAM). */
+EXT_RAM_BSS_ATTR static char s_sd_fonts[16][64];      /* TF 卡字体文件名列表 */
+static int          s_sd_font_count = 0;     /* TF 卡字体数量 */
 
 /* === 旋转/夜间 === */
 static uint8_t      s_rot = 0;            /* 0上 1下 2左 3右 */
@@ -1202,6 +1207,9 @@ static const char *menu_str(const char *utf8, const char *gbk) {
 #define M_NO_BM       menu_str("\xE6\x97\xA0\xE4\xB9\xA6\xE7\xAD\xBE", "\xCE\xDE\xCA\xE9\xC7\xA9")
 #define M_ADDED       menu_str("\xE5\xB7\xB2\xE6\xB7\xBB\xE5\x8A\xA0", "\xD2\xD1\xCC\xED\xBC\xD3")
 #define M_BM_FULL     menu_str("\xE4\xB9\xA6\xE7\xAD\xBE\xE5\xB7\xB2\xE6\xBB\xA1", "\xCA\xE9\xC7\xA9\xD2\xD1\xC2\xFA")
+#define M_FONT_SEL    menu_str("\xE5\xAD\x97\xE4\xBD\x93\xE9\x80\x89\xE6\x8B\xA9", "\xD7\xD6\xCC\xE5\xD1\xA1\xD4\xF1")  /* 字体选择 */
+#define M_EMB_FS      menu_str("\xE5\x86\x85\xE5\xB5\x8C\xE4\xBB\xBF\xE5\xAE\x8B", "\xC4\xDA\xC7\xB6\xB7\xC2\xCB\xCE")  /* 内嵌仿宋 */
+#define M_EMB_HT      menu_str("\xE5\x86\x85\xE5\xB5\x8C\xE9\xBB\x91\xE4\xBD\x93", "\xC4\xDA\xC7\xB6\xBA\xDA\xCC\xE5")  /* 内嵌黑体 */
 #define M_CLEARED     menu_str("\xE5\xB7\xB2\xE6\xB8\x85\xE7\xA9\xBA", "\xD2\xD1\xC7\xE5\xBF\xD5")
 #define M_EXIT_ASK    menu_str("\xE7\xA1\xAE\xE5\xAE\x9A\xE9\x80\x80\xE5\x87\xBA\xE9\x98\x85\xE8\xAF\xBB\xEF\xBC\x9F", "\xC8\xB7\xB6\xA8\xCD\xCB\xB3\xF6\xD4\xC4\xB6\xC1\xA3\xBF")
 static void menu_fb_px(st7305_handle_t *lcd, int x, int y, bool black) {
@@ -1272,9 +1280,10 @@ static void menu_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bo
 
 static int menu_item_count(void) {
     switch (s_menu) {
-        case BM_MENU: return 4;
+        case BM_MENU: return 5;   /* V1.0.88: 添加书签/书签列表/字体选择/返回书库/继续阅读 */
         case BM_TOC:  return (s_chapter_count == 0) ? 2 : (int)s_chapter_count + 1;
         case BM_BMKS: return (s_bm_count == 0) ? 2 : (int)s_bm_count + 2;
+        case BM_FONT: return s_sd_font_count + 3;  /* SD字体 + 内嵌仿宋 + 内嵌黑体 + 返回 */
         default: return 0;
     }
 }
@@ -1282,11 +1291,12 @@ static int menu_item_count(void) {
 static const char *menu_item_text(int i) {
     switch (s_menu) {
         case BM_MENU:
-            /* V1.0.68: 添加书签 / 书签列表 / 返回书库 / 继续阅读 */
+            /* V1.0.88: 添加书签 / 书签列表 / 字体选择 / 返回书库 / 继续阅读 */
             switch (i) {
                 case 0: return M_ADD_BM;
                 case 1: return M_BM_LIST;
-                case 2: return M_BACK_LIB;
+                case 2: return M_FONT_SEL;
+                case 3: return M_BACK_LIB;
                 default: return M_CONT_READ;
             }
         case BM_TOC:
@@ -1298,6 +1308,11 @@ static const char *menu_item_text(int i) {
             if (i < (int)s_bm_count) return s_bms[i].title;
             if (i == (int)s_bm_count) return M_CLEAR_BM;
             return M_BACK;
+        case BM_FONT:
+            if (i < s_sd_font_count) return s_sd_fonts[i];
+            if (i == s_sd_font_count) return M_EMB_FS;
+            if (i == s_sd_font_count + 1) return M_EMB_HT;
+            return M_BACK;
         default: return "";
     }
 }
@@ -1307,6 +1322,7 @@ static const char *menu_title_text(void) {
         case BM_MENU: return "";   /* V1.0.68: 不显示"阅读菜单"标题 */
         case BM_TOC:  return M_TOC;
         case BM_BMKS: return M_BM_LIST;
+        case BM_FONT: return M_FONT_SEL;
         default: return "";
     }
 }
@@ -1537,10 +1553,43 @@ static void book_menu_select(void) {
             switch (idx) {
                 case 0: book_add_bookmark(); break;
                 case 1: s_menu = BM_BMKS; s_menu_sel = 0; s_menu_scroll = 0; break;
-                case 2: book_reader_close(); break;   /* 返回书库 (二级菜单) */
+                case 2: /* V1.0.88: 字体选择 */
+                    s_menu = BM_FONT; s_menu_sel = 0; s_menu_scroll = 0;
+                    break;
+                case 3: book_reader_close(); break;   /* 返回书库 (二级菜单) */
                 default: s_menu = BM_READ; break;     /* 继续阅读 */
             }
             return;
+        case BM_FONT: {
+            bool font_changed = false;
+            if (idx < s_sd_font_count) {
+                /* TF 卡字体: 构造完整路径并加载 */
+                char path[128];
+                snprintf(path, sizeof(path), "/sdcard/fonts/%s", s_sd_fonts[idx]);
+                if (font_book_select_file(path)) {
+                    font_changed = true;
+                    snprintf(s_menu_msg, sizeof(s_menu_msg), "%s", "已加载");
+                } else {
+                    snprintf(s_menu_msg, sizeof(s_menu_msg), "%s", font_book_error());
+                }
+            } else if (idx == s_sd_font_count) {
+                /* 内嵌仿宋 */
+                font_book_select(0, s_fontsize);
+                font_changed = true;
+                snprintf(s_menu_msg, sizeof(s_menu_msg), "%s", "已切换");
+            } else if (idx == s_sd_font_count + 1) {
+                /* 内嵌黑体 */
+                font_book_select(1, s_fontsize);
+                font_changed = true;
+                snprintf(s_menu_msg, sizeof(s_menu_msg), "%s", "已切换");
+            }
+            if (font_changed) {
+                /* 字体变了, 重新分页 */
+                book_restart_index();
+            }
+            s_menu = BM_MENU; s_menu_sel = 0; s_menu_scroll = 0;
+            return;
+        }
         case BM_TOC:
             if (s_chapter_count == 0) return;
             if (idx < (int)s_chapter_count) {
@@ -1591,6 +1640,12 @@ bool book_reader_open(const char *path) {
         return false;
     }
     font_book_select(s_fontstyle, s_fontsize);   /* 按设置切换字号 */
+
+    /* V1.0.88: 扫描 TF 卡字体 (仅在阅读器内扫描, 不影响开机/菜单) */
+    s_sd_font_count = font_book_scan_sd(s_sd_fonts, 16);
+    if (s_sd_font_count > 0) {
+        ESP_LOGI(TAG, "发现 %d 个 TF 卡字体", s_sd_font_count);
+    }
 
     struct stat st;
     if (stat(path, &st) != 0) {

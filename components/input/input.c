@@ -29,13 +29,19 @@
 #define TOUCH_TAP_MAX_MS     300   /* 单击最长时长 */
 #define TOUCH_SWIPE_MIN      40    /* 滑动最小位移(原始像素), 低于算点击 */
 #define TOUCH_LONG_MS        3000  /* V1.0.68: 状态栏长按 3 秒 = 返回主菜单 */
-#define TOUCH_LONG_PRESS_MS  800   /* V1.0.68: 其他区域长按 = LONG_PRESS (游戏列表收藏等) */
+#define TOUCH_LONG_PRESS_MS  2000  /* V1.0.9x: 游戏名/收藏栏长按 2s = 收藏/取消收藏; 应用管理长按弹窗也走此阈值 */
 #define TOUCH_STILL_MAX      20    /* 长按判定时允许的抖动位移 */
 #define TOUCH_STATUS_H       24    /* 状态栏高度: 长按此区域(按下点 y<24) = 返回主菜单 */
 #define TOUCH_BACK_EDGE_Y    270   /* 底部上滑返回: 按下点屏幕 y >= 此值 */
-#define TOUCH_BACK_EDGE_MINX 100   /* 底部上滑返回: 按下点屏幕 x 中间区域下限 */
-#define TOUCH_BACK_EDGE_MAXX 300   /* 底部上滑返回: 按下点屏幕 x 中间区域上限 */
+#define TOUCH_BACK_EDGE_MINX 0     /* 底部上滑返回: 按下点屏幕 x 全宽下限 (V1.0.95: 100->0 全宽屏蔽) */
+#define TOUCH_BACK_EDGE_MAXX 400   /* 底部上滑返回: 按下点屏幕 x 全宽上限 (V1.0.95: 300->400) */
 #define TOUCH_BACK_SWIPE_DY  50    /* 底部上滑返回: 需往上滑动的屏幕距离 */
+#define TOUCH_DOUBLE_SWIPE_MS 500  /* V1.0.9x: 0.5s 内连续两次底部上滑 → HOME 强制退出 */
+
+/* V1.0.69: 本机是否带触摸屏 (运行时探测), 决定物理键语义分支.
+ * 有触摸:  BOOT=返回上级/回主菜单, KEY=确认/收藏
+ * 无触摸:  BOOT=下一步/返回上级,  KEY=确认/直达蓝牙映射 */
+static bool s_has_touch = false;
 
 static uint32_t now_ms(void) {
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -70,24 +76,32 @@ void input_init(void) {
     ESP_LOGI(TAG, "GPIO ret=%d K%d B%d P%d", _ret,
              gpio_get_level(GPIO_NUM_18), gpio_get_level(GPIO_NUM_0),
              gpio_get_level(GPIO_NUM_1));
-    s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, MENU_ACTION_RIGHT, MENU_ACTION_BACK, "BOOT" };
-    /* KEY 物理键 (LEFT_GPIO):
-     *   短按 = 确认 (CONFIRM)
-     *   长按 = 自动搜索蓝牙设备 (LONG_LEFT) -- V1.0.39: 全局快捷键 */
-    s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, MENU_ACTION_CONFIRM, MENU_ACTION_LONG_LEFT, "KEY" };
-    /* V1.0.68: 软关机键 (GPIO1):
-     *   点按(短按) = 锁屏休眠 (POWER_LOCK)
-     *   长按 0.5s = 弹"返回菜单"提示 (POWER_HINT)
-     *   0.5s 后松手 = 立即返回主菜单 (POWER_RELEASE)
-     *   长按 2s = 软关机 (input_power_should_sleep) */
-    s_btns[2] = (btn_ctx_t){ BTN_GPIO_PWR,   ST_IDLE, 0, MENU_ACTION_POWER_LOCK, MENU_ACTION_POWER_HINT, "PWR" };
+
+    /* 触摸面板 (V1.0.65): 未检测到芯片时 read 恒返回 false, 零开销 */
+    touch_panel_init();
+    /* V1.0.69: 运行时分清两套机型, 物理键语义按有没有触摸屏分支. */
+    s_has_touch = touch_panel_is_present();
+
+    if (s_has_touch) {
+        /* 有触摸机型: 导航/确认靠触摸手势, 两颗物理键只是触摸的等价物.
+         *   BOOT: 短按=返回上级, 长按=回主菜单
+         *   KEY : 短按=确认,     长按=收藏当前项 */
+        s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, MENU_ACTION_BACK, MENU_ACTION_HOME, "BOOT" };
+        s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, MENU_ACTION_CONFIRM, MENU_ACTION_KEY_FAV, "KEY" };
+    } else {
+        /* 无触摸机型: 只剩两颗物理键, 要让两键也能闭环操作到蓝牙映射界面.
+         *   BOOT: 短按=下一步(右移/选中右移), 长按=返回上级
+         *   KEY : 短按=确认(进入),             长按=直达蓝牙映射界面 */
+        s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, MENU_ACTION_RIGHT, MENU_ACTION_BACK, "BOOT" };
+        s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, MENU_ACTION_CONFIRM, MENU_ACTION_LONG_LEFT, "KEY" };
+    }
+    /* 开关键 (V1.0.69): 短按=锁屏(POWER_LOCK); 长按不再弹"返回菜单"中间层,
+     * 长按 2s 的软关机由 input_power_should_sleep 独立轮询. */
+    s_btns[2] = (btn_ctx_t){ BTN_GPIO_PWR, ST_IDLE, 0, MENU_ACTION_POWER_LOCK, MENU_ACTION_NONE, "PWR" };
 
     /* V1.0.68: 软关机键 GPIO1 同时配置 deep sleep 唤醒 (长按2s软关机后按下唤醒) */
     rtc_gpio_pullup_en(BTN_GPIO_PWR);
     esp_sleep_enable_ext1_wakeup_io(1ULL << BTN_GPIO_PWR, ESP_EXT1_WAKEUP_ANY_LOW);
-
-    /* 触摸面板 (V1.0.65): 未检测到芯片时 read 恒返回 false, 零开销 */
-    touch_panel_init();
 }
 
 static menu_action_t tick(btn_ctx_t *b) {
@@ -114,10 +128,9 @@ static menu_action_t tick(btn_ctx_t *b) {
             break;
         case ST_LONG_FIRED:
             /* 长按已发射, 等待按键释放, 期间不产生任何动作.
-             * V1.0.68: 软关机键 0.5s 后松手 = 立即返回主菜单 (POWER_RELEASE) */
+             * V1.0.69: 开关键去掉 0.5s"返回菜单"中间层, 此处不再投递 POWER_RELEASE */
             if (!pressed) {
                 b->state = ST_IDLE;
-                if (b->gpio == BTN_GPIO_PWR) return MENU_ACTION_POWER_RELEASE;
             }
             break;
     }
@@ -125,8 +138,8 @@ static menu_action_t tick(btn_ctx_t *b) {
 }
 
 /* ==== 触摸手势状态机 (V1.0.65) ====
- * 单击 = 确认(CONFIRM); 长按状态栏 = 返回(BACK); 底部中间上滑 = 返回;
- * 上下左右滑动 = 方向键.
+ * 单击 = 确认(CONFIRM); 长按状态栏 = 返回(HOME); 物理屏幕底部中间上滑 = 返回(BACK);
+ * 不使用左右/上下滑动触发方向键(打开仅靠点击确定位置).
  * 每个手势只在"释放瞬间"投递一次 action (长按在按住超时瞬间投递),
  * 与物理键/手柄的边沿触发语义一致. */
 typedef enum { TG_IDLE, TG_PRESS, TG_WAIT_RELEASE } touch_gest_t;
@@ -164,12 +177,28 @@ static void touch_read_once(tp_point_t *pt) {
     }
     s_touch_cached_valid = true;
     s_touch_cache_tick = tick;
+    /* V1.0.xx: 无触摸机型自动识别: 未探测到触摸芯片 → 直接视为"未按压"跳过读取,
+     * 避免每帧 touch_panel_read 恒返回 false 被误判为连续读失败狂刷日志/请求恢复. */
+    if (!touch_panel_is_present()) {
+        s_touch_cached.pressed = false;
+        s_touch_fail_count = 0;
+        *pt = s_touch_cached;
+        return;
+    }
     if (!touch_panel_read(&s_touch_cached)) {
         /* V1.0.68 fix: 读失败时**保留上一帧状态**(不伪造"松开").
          * 旧代码把失败当成"手指已松开", 飞线 I2C 一个误码就会打断进行中的
          * 手势 → 触摸跳变/误触/只能慢慢拖; 连续失败则是芯片挂死需重启.
-         * 现在: 单次失败忽略(坐标暂不更新), 连续失败自动恢复芯片. */
+         * 现在: 单次失败忽略(坐标暂不更新), 连续失败自动恢复芯片.
+         *
+         * V1.0.xx: 但如果连续失败 ≥3 次, 强制释放触摸状态, 防止状态残留
+         * 导致 s_touch_down 永远为 true → 菜单无法左右滑动 → 需重启恢复. */
         s_touch_fail_count++;
+        if (s_touch_fail_count >= 3) {
+            s_touch_cached.pressed = false;
+            ESP_LOGW("INPUT", "触摸连续 %d 次读失败, 强制释放触摸状态",
+                     (int)s_touch_fail_count);
+        }
         if (s_touch_fail_count >= TOUCH_FAIL_RECOVER_N) {
             s_touch_fail_count = 0;
             ESP_LOGW("INPUT", "触摸连续 %d 次读失败, 请求看门狗恢复",
@@ -191,6 +220,15 @@ void input_poll_touch(void) {
     touch_read_once(&pt);
     s_touch_down = pt.pressed;
     if (pt.pressed) touch_map_screen(pt.x, pt.y, &s_touch_sx, &s_touch_sy);
+}
+
+/* V1.0.95: 返回当前触摸按住时长(ms); 未按住返回 0.
+ * 依赖 input_get_action / input_get_touch_action 的触摸轮询维护 s_touch_down/s_tg_t0.
+ * 用于壁纸屏保"触摸需长按 1 秒才退出"的实时判定. */
+uint32_t input_touch_hold_ms(void) {
+    if (!s_touch_down) return 0;
+    uint32_t t = now_ms();
+    return ((int32_t)(t - s_tg_t0)) >= 0 ? (t - s_tg_t0) : 0;
 }
 
 menu_action_t input_get_touch_action(void) {
@@ -311,6 +349,31 @@ static void rotate_screen_coord(int *x, int *y) {
     }
 }
 
+/* V1.0.90: 判断逻辑坐标 (sx,sy) 是否落在"物理屏幕底部中间"区域.
+ * 该区域在触摸上用作: 底部上滑=返回 + 拖动屏蔽带. 屏幕旋转时, 物理底边
+ * 映射到不同的逻辑区域, 这里按当前旋转方向 s_screen_rot 逐态换算:
+ *   rot0 横屏   : 底边 = 逻辑下侧 (y 大)
+ *   rot1 180°   : 底边 = 逻辑上侧 (y 小)
+ *   rot2 左转90°: 底边 = 逻辑右侧 (x 大, 竖屏宽=ST7305_HEIGHT)
+ *   rot3 右转90°: 底边 = 逻辑左侧 (x 小)
+ * thick 为厚度 (逻辑像素), 底边中心带 x/y 按另一个轴取中间区域. */
+bool input_in_bottom_zone(int sx, int sy, int thick) {
+    switch (s_screen_rot) {
+    case 1:
+        return sx >= TOUCH_BACK_EDGE_MINX && sx <= TOUCH_BACK_EDGE_MAXX &&
+               sy >= 0 && sy < thick;
+    case 2:
+        return sx >= (ST7305_HEIGHT - thick) && sx < ST7305_HEIGHT &&
+               sy >= TOUCH_BACK_EDGE_MINX && sy <= TOUCH_BACK_EDGE_MAXX;
+    case 3:
+        return sx >= 0 && sx < thick &&
+               sy >= TOUCH_BACK_EDGE_MINX && sy <= TOUCH_BACK_EDGE_MAXX;
+    default:
+        return sx >= TOUCH_BACK_EDGE_MINX && sx <= TOUCH_BACK_EDGE_MAXX &&
+               sy >= (ST7305_HEIGHT - thick);
+    }
+}
+
 static menu_action_t touch_gesture_poll(void) {
     /* 每帧先清点击坐标: 只有本帧真正产生"点击"时才会重新写入,
      * 避免屏保唤醒等场景把上一帧的点击坐标残留到下一次 CONFIRM. */
@@ -356,6 +419,21 @@ static menu_action_t touch_gesture_poll(void) {
                     out = MENU_ACTION_HOME;
                 }
             }
+            /* V1.0.xx: 触摸状态超时保护 — 按住超过 9 秒且无位移, 强制复位.
+             * 防止触摸芯片读失败导致 s_touch_down 状态残留, 菜单无法滑动.
+             * (5 秒被主菜单长按删除用, 故提到 9 秒避免误复位) */
+            if ((int32_t)(t - s_tg_t0) >= 9000) {
+                int dx = s_tg_x - s_tg_x0, dy = s_tg_y - s_tg_y0;
+                int adx = dx < 0 ? -dx : dx;
+                int ady = dy < 0 ? -dy : dy;
+                if (adx < 10 && ady < 10) {
+                    ESP_LOGW(TAG, "触摸状态超时 5s 复位 (可能芯片读失败导致状态残留)");
+                    s_tg_state = TG_IDLE;
+                    s_tg_long_fired = false;
+                    s_touch_down = false;
+                    /* 不设置 out, 直接复位, 不产生任何按键动作 */
+                }
+            }
             /* 其他区域长按不在此处触发: 改为松手时判定 (见释放分支),
              * 避免"按住再拖动"误触收藏 */
         } else {
@@ -379,22 +457,20 @@ static menu_action_t touch_gesture_poll(void) {
                 s_tap_x = s_tg_sx0; s_tap_y = s_tg_sy0;
                 ESP_LOGI(TAG, "触摸点击 (%lums) raw=%d,%d -> %d,%d",
                          (unsigned long)dt, s_tg_x0, s_tg_y0, s_tap_x, s_tap_y);
-            } else if (s_tg_y0 >= TOUCH_BACK_EDGE_Y &&
-                       s_tg_x0 >= TOUCH_BACK_EDGE_MINX && s_tg_x0 <= TOUCH_BACK_EDGE_MAXX &&
+            } else if (input_in_bottom_zone(s_tg_sx0, s_tg_sy0, ST7305_HEIGHT - TOUCH_BACK_EDGE_Y) &&
                        dy <= -TOUCH_BACK_SWIPE_DY) {
-                /* V1.0.68: 物理屏幕底部中间区域往上滑 -> 返回 (不随旋转) */
-                out = MENU_ACTION_BACK;
-                ESP_LOGI(TAG, "底部上滑 (%d,%d)->(%d,%d) -> BACK",
-                         s_tg_x0, s_tg_y0, s_tg_x, s_tg_y);
-            } else if (adx >= ady) {
-                out = (dx > 0) ? MENU_ACTION_RIGHT : MENU_ACTION_LEFT;
-                ESP_LOGI(TAG, "触摸滑动 dx=%d dy=%d -> %s", dx, dy,
-                         (dx > 0) ? "RIGHT" : "LEFT");
-            } else {
-                out = (dy > 0) ? MENU_ACTION_DOWN : MENU_ACTION_UP;
-                ESP_LOGI(TAG, "触摸滑动 dx=%d dy=%d -> %s", dx, dy,
-                         (dy > 0) ? "DOWN" : "UP");
+                /* V1.0.68: 物理屏幕底部中间区域往上滑 -> 返回 (V1.0.90: 跟随屏幕旋转).
+                 * V1.0.94: 1s 内连续两次上滑 -> HOME, 免确认强制退出到主菜单
+                 * (游戏内/游戏列表或任意菜单, 上滑只会触发退出, 不会拖动页面). */
+                static uint32_t s_last_sw_ms = 0;
+                bool double_sw = s_last_sw_ms && (int32_t)(t - s_last_sw_ms) <= TOUCH_DOUBLE_SWIPE_MS;
+                s_last_sw_ms = t;
+                out = double_sw ? MENU_ACTION_HOME : MENU_ACTION_BACK;
+                ESP_LOGI(TAG, "底部上滑 (%d,%d)->(%d,%d) -> %s",
+                         s_tg_x0, s_tg_y0, s_tg_x, s_tg_y,
+                         double_sw ? "HOME" : "BACK");
             }
+            /* V1.0.8x: 已删除左右/上下滑动 -> 方向键. 打开仅靠点击确定位置. */
             s_tg_state = TG_IDLE;
         }
         break;
@@ -517,6 +593,28 @@ menu_action_t input_get_action(void) {
 #undef NAV_HOLD_CAP_MS
 #undef NAV_LONG_LEFT_MS
     }
+    /* V1.0.xx: 网页手柄 (WiFi AP, 手机浏览器) 导航接入.
+     * 背景: 开启 WiFi 手柄时会 bt_manager_disable() 关蓝牙腾 DMA, 故上方蓝牙块不生效;
+     * 此前 web_gamepad 只在 GB/GBC 引擎 (input_get_held_gb_joypad) 生效, 菜单导航完全无反应.
+     * web_gamepad 掩码与 GB joypad 一致 (低电平有效):
+     *   bit0=A bit1=B bit2=Select bit3=Start bit4=右 bit5=左 bit6=上 bit7=下.
+     * 状态是"保持态"(按住常量), 这里用上升沿(某位从 1→0)触发一次 action, 与摇杆边沿语义一致. */
+    if (s_gamepad_nav_enabled && web_gamepad_is_running()) {
+        static uint8_t s_wp_prev = 0xFF;
+        uint8_t wp_cur = web_gamepad_get_joypad_state();
+        uint8_t pressed = (uint8_t)(s_wp_prev & ~wp_cur);   /* 本次新按下 (prev=1, cur=0) */
+        s_wp_prev = wp_cur;
+        if (pressed) {
+            s_tap_x = s_tap_y = -1;
+            if (pressed & (1 << 6)) return MENU_ACTION_UP;      /* 上 */
+            if (pressed & (1 << 7)) return MENU_ACTION_DOWN;    /* 下 */
+            if (pressed & (1 << 5)) return MENU_ACTION_LEFT;    /* 左 */
+            if (pressed & (1 << 4)) return MENU_ACTION_RIGHT;   /* 右 */
+            if (pressed & (1 << 0)) return MENU_ACTION_CONFIRM; /* A=确认 */
+            if (pressed & (1 << 1)) return MENU_ACTION_BACK;    /* B=返回 */
+            if (pressed & (1 << 3)) return MENU_ACTION_CONFIRM; /* Start=确认 */
+        }
+    }
     /* 触摸手势 (V1.0.65): 物理键/手柄无动作时才投递, 三者互不抢占 */
     menu_action_t ta = touch_gesture_poll();
     if (ta != MENU_ACTION_NONE) {
@@ -531,6 +629,11 @@ bool input_is_held(int idx) {
     return (gpio_get_level(s_btns[idx].gpio) == 0);
 }
 
+/* V1.0.69: 本机是否带触摸屏 (两套硬件). 供 menu_system 区分物理 KEY 收藏与触摸收藏 */
+bool input_has_touch(void) {
+    return s_has_touch;
+}
+
 /* 消费最近一次"点击"的屏幕坐标 (V1.0.65). 返回 true 表示有未消费的点击,
  * 并把坐标写入 x 和 y (可为 NULL). 取走后自动清零, 保证一次点击只 hit-test 一次. */
 bool input_consume_tap(int *x, int *y) {
@@ -542,11 +645,71 @@ bool input_consume_tap(int *x, int *y) {
 }
 
 /* V1.0.66: 返回当前触摸的实时屏幕坐标 (供主菜单跟手拖动).
- * 返回 false 表示当前没有手指按下. */
+ * 返回 false 表示当前没有手指按下.
+ * V1.0.94: 底部屏蔽带统一拦截 —— 凡是从物理屏幕底部中间区域开始的手势, 一旦发生
+ * 拖动位移 (>40px) 就返回 false (视同无触摸), 这样依赖本函数的各拖动方 (应用管理、
+ * 游戏引擎虚拟按键、游戏列表等) 都无法从屏蔽带拖动内容页. 原地/点击不受影响
+ * (点击走 input_consume_tap, 与本节无关), 屏蔽带内的点击/确认照常生效. */
+/* V1.0.99: 拖动屏蔽带的锁存状态提升到文件作用域, 供 input_get_touch_pos 与
+ * input_touch_in_bottom_zone 共享. 目的: 二者必须**复用同一套锁存结果**, 绝不
+ * 在本帧内对 input_get_touch_pos 二次调用 (multi-consumer 竞态会让 static 状态
+ * 被两次消费而残留, 导致 s_o_armed/s_o_zone 破坏 → 所有拖动方都无法建立拖动).
+ * 约定: 本帧内 input_touch_in_bottom_zone 必须先于/紧随 input_get_touch_pos 调用. */
+static bool s_o_armed = true;   /* 本手势是否尚未记录起点 (进入抬起态复位) */
+static bool s_o_zone  = false;  /* 手势起点是否落在底部屏蔽带 */
+static int  s_o_sx = 0, s_o_sy = 0;
+static bool s_o_prev_down = false; /* 上一帧 s_touch_down, 用于上升沿检测 */
+
 bool input_get_touch_pos(int *x, int *y) {
+    /* V1.0.xx: 检测 s_touch_down 上升沿 — 新触摸开始, 强制复位状态.
+     * 修复场景: 从底部屏蔽带触摸返回后, 若状态机复位不完整导致 s_o_zone
+     * 残留为 true, 后续所有滑动(位移≥40px)都被拦截, 菜单无法左右拖动.
+     * 上升沿检测确保每次新触摸都重新计算起点, 不受上一轮残留影响. */
+    if (s_touch_down && !s_o_prev_down) {
+        s_o_armed = true;
+        s_o_zone  = false;
+    }
+    s_o_prev_down = s_touch_down;
+
+    if (s_touch_down) {
+        if (s_o_armed) {
+            s_o_armed = false;
+            s_o_sx = s_touch_sx;
+            s_o_sy = s_touch_sy;
+            s_o_zone = input_in_bottom_zone(s_o_sx, s_o_sy,
+                                            ST7305_HEIGHT - TOUCH_BACK_EDGE_Y);
+        }
+        if (s_o_zone) {
+            int dx = s_touch_sx - s_o_sx, dy = s_touch_sy - s_o_sy;
+            int adx = dx < 0 ? -dx : dx;
+            int ady = dy < 0 ? -dy : dy;
+            if (adx >= TOUCH_SWIPE_MIN || ady >= TOUCH_SWIPE_MIN)
+                return false;   /* 屏蔽带内拖动 → 隐藏坐标, 禁止拖动 */
+        }
+        if (x) *x = s_touch_sx;
+        if (y) *y = s_touch_sy;
+        return true;
+    }
+    s_o_armed = true;
+    s_o_zone  = false;
+    return false;
+}
+
+/* V1.0.99: 只读查询"当前手指按下 且 本次手势起点落在底部屏蔽带" (不消费任何状态).
+ * 供 main.c 的 touch_shield_blocks_drag 使用, 替代其内部二次调用 input_get_touch_pos,
+ * 从而消除"同帧对 input_get_touch_pos 两次调用 → 锁存状态被两次消费而残留
+ * → 所有拖动方无法建立拖动 (拖动全面失效, 重启即消)"的多消费者竞态 bug.
+ * 前提: 本函数复用 input_get_touch_pos 已维护的 s_o_armed/s_o_zone 锁存结果,
+ * 必须在同帧 input_get_touch_pos 调用之后 (main.c 拖动分支即此顺序) 使用. */
+bool input_touch_in_bottom_zone(void) {
+    return s_touch_down && s_o_zone;
+}
+
+/* V1.0.9x: 本次手势按下的屏幕起点 (逻辑坐标). 未按住返回 false. */
+bool input_touch_start_pos(int *x, int *y) {
     if (!s_touch_down) return false;
-    if (x) *x = s_touch_sx;
-    if (y) *y = s_touch_sy;
+    if (x) *x = s_tg_sx0;
+    if (y) *y = s_tg_sy0;
     return true;
 }
 

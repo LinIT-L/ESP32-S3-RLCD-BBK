@@ -126,8 +126,11 @@ static void bbk_audio_flush_frame(void);
     }
 #include "s6502.c"
 
-/* sys.ram 放在内部 SRAM 加速访问 (32KB, PSRAM 随机访问太慢) */
-static uint8_t sys_ram[0x8000];
+/* sys.ram 32KB: 引擎热数据. V1.0.6x+ 改放 PSRAM:
+ * 原放内部 SRAM 需 32KB 连续块, 但主菜单系统占掉 ~88KB 内部后最大连续块常 <32KB,
+ * 内部分配失败 -> 游戏 5% 崩溃. PSRAM 一定分配成功, 电子词典帧率低影响可忽略.
+ * (若后续主菜单内部占用压缩出 32KB 连续块, 可再改回 INTERNAL 提升性能) */
+static uint8_t *sys_ram = NULL;
 
 /* PSRAM 大数组 (共 6MB) - 进电子词典时动态分配, 回主菜单时释放.
  * 由 retro_mem_alloc()/retro_mem_free() (见 retro_init/retro_deinit) 管理. */
@@ -141,7 +144,7 @@ static s6502_t      s_cpu;
 static uint8_t     *s_mem_r[0x100];
 static uint8_t    (*s_mem_ir[0x100])(uint16_t);
 static void       (*s_mem_iw[0x100])(uint16_t, uint8_t);
-static uint8_t     *s_ram = sys_ram;
+static uint8_t     *s_ram = NULL;   /* sys_init 分配成功后指向 sys_ram */
 static uint8_t      s_flash_cmd;
 static uint8_t      s_flash_cycles;
 static uint8_t      s_bk_sel;
@@ -793,32 +796,39 @@ void gam4980_set_boot_progress_cb(void (*cb)(int percent, const char *msg)) {
     g_boot_progress_cb = cb;
 }
 
-/* 动态分配引擎用内存 (6MB ROM, 放 PSRAM).
+/* 动态分配引擎用内存 (6MB ROM 放 PSRAM + 32KB sys_ram 放内部 SRAM).
  * 进电子词典时调用; 任一失败则全部释放并返回 false. */
 static bool retro_mem_alloc(void)
 {
-    if (sys_flash && sys_rom_8 && sys_rom_e)
+    if (sys_flash && sys_rom_8 && sys_rom_e && sys_ram)
         return true;   /* 已分配 */
+
+    /* sys_ram 32KB: 引擎热数据. 放 PSRAM (内部 32KB 连续块被主菜单占碎, 分配常失败). */
+    if (!sys_ram)
+        sys_ram = (uint8_t *)heap_caps_malloc(0x8000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     sys_flash = (uint8_t *)heap_caps_malloc(SYS_FLASH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     sys_rom_8 = (uint8_t *)heap_caps_malloc(SYS_FLASH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     sys_rom_e = (uint8_t *)heap_caps_malloc(SYS_FLASH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
-    if (sys_flash && sys_rom_8 && sys_rom_e)
+    if (sys_ram && sys_flash && sys_rom_8 && sys_rom_e)
         return true;
 
     /* 任一失败: 释放已成功的部分, 避免泄漏 */
+    if (sys_ram)     { heap_caps_free(sys_ram);     sys_ram     = NULL; }
     if (sys_flash)   { heap_caps_free(sys_flash);   sys_flash   = NULL; }
     if (sys_rom_8)   { heap_caps_free(sys_rom_8);   sys_rom_8   = NULL; }
     if (sys_rom_e)   { heap_caps_free(sys_rom_e);   sys_rom_e   = NULL; }
-    ESP_LOGE("INIT", "PSRAM 分配失败: sys_flash=%p sys_rom_8=%p sys_rom_e=%p (空闲=%u)",
-             (void*)sys_flash, (void*)sys_rom_8, (void*)sys_rom_e,
+    ESP_LOGE("INIT", "内存分配失败: sys_ram=%p sys_flash=%p sys_rom_8=%p sys_rom_e=%p (内部空闲=%u PSRAM空闲=%u)",
+             (void*)sys_ram, (void*)sys_flash, (void*)sys_rom_8, (void*)sys_rom_e,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return false;
 }
 
 static void retro_mem_free(void)
 {
+    if (sys_ram)     { heap_caps_free(sys_ram);     sys_ram     = NULL; }
     if (sys_flash)   { heap_caps_free(sys_flash);   sys_flash   = NULL; }
     if (sys_rom_8)   { heap_caps_free(sys_rom_8);   sys_rom_8   = NULL; }
     if (sys_rom_e)   { heap_caps_free(sys_rom_e);   sys_rom_e   = NULL; }
@@ -826,15 +836,14 @@ static void retro_mem_free(void)
 
 static void sys_init(const char *romdir)
 {
-    /* 确保 ram 指针指向内部 SRAM (PSRAM_BSS 变量不能用初始化器) */
-    s_ram = sys_ram;
-
-    /* 动态分配 6MB PSRAM; 失败则无法启动引擎 */
+    /* 动态分配 6MB PSRAM + 32KB 内部 sys_ram; 失败则无法启动引擎 */
     if (!retro_mem_alloc()) {
-        error_msg("GAM4980: PSRAM alloc failed (6MB)");
+        error_msg("GAM4980: mem alloc failed");
         environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
         return;
     }
+    /* 分配成功后再把 ram 指针指向内部 SRAM */
+    s_ram = sys_ram;
 
     static struct retro_input_descriptor inputs[] = {
         { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "EXIT" },
@@ -1248,7 +1257,8 @@ static void frame_cb(retro_usec_t usec)
 
 void retro_set_environment(retro_environment_t cb)
 {
-    static struct retro_core_option_definition opts[] = {
+    /* const: 选项表只读, 移入 Flash 不占内部 DRAM (~6KB) */
+    static const struct retro_core_option_definition opts[] = {
         {
             .key = "gam4980_lcd_color",
             .desc = "LCD color theme",
@@ -1474,10 +1484,10 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
 
 void retro_deinit(void)
 {
-    /* 释放引擎动态分配的 6MB PSRAM (sys_flash + sys_rom_8 + sys_rom_e).
+    /* 释放引擎动态分配的 6MB PSRAM + 32KB 内部 sys_ram.
      * 重进电子词典时由 retro_init → sys_init → retro_mem_alloc 重新分配并重读 ROM. */
     retro_mem_free();
-    s_ram = sys_ram;
+    s_ram = NULL;   /* sys_ram 已释放, 指针置空 */
 }
 
 void retro_reset(void)

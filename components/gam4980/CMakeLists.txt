@@ -5,7 +5,7 @@ idf_component_register(
         "gam4980_emu.c"
     INCLUDE_DIRS "." "${CMAKE_SOURCE_DIR}/main" "${CMAKE_SOURCE_DIR}/components/menu" "${CMAKE_SOURCE_DIR}/components/audio_player"
     PRIV_REQUIRES "st7305"
-    REQUIRES "fatfs" "virtual_keys"
+    REQUIRES "fatfs" "virtual_keys" "web_gamepad"
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

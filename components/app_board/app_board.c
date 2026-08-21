@@ -62,18 +62,24 @@ esp_err_t app_board_init(app_board_t *board)
 void app_board_init_bt(void)
 {
     /* 蓝牙栈必须在内部 RAM: esp_bt_controller_init 期间 cache 禁用,
-     * PSRAM 栈会触发 esp_task_stack_is_sane_cache_disabled 断言. */
+     * PSRAM 栈会触发 esp_task_stack_is_sane_cache_disabled 断言.
+     * V1.0.96: 复用 bt_manager 的初始化栈 (内部 RAM 16KB), 避免再占一份. */
 #if CONFIG_BT_ENABLED
-    static StackType_t bt_task_stack[4096];  /* 16KB, 12KB 仍会栈溢出 */
+    int words = 0;
+    StackType_t *stack = bt_manager_get_init_stack(&words);
     static StaticTask_t bt_task_buf;
+    if (!stack) {
+        ESP_LOGE(TAG, "蓝牙初始化栈不可用");
+        return;
+    }
     TaskHandle_t bt_task = xTaskCreateStatic((TaskFunction_t)bt_manager_init, "bt_init",
-                                              sizeof(bt_task_stack) / sizeof(StackType_t), NULL, 1,
-                                              bt_task_stack, &bt_task_buf);
+                                              words, NULL, 1,
+                                              stack, &bt_task_buf);
     if (bt_task == NULL) {
         ESP_LOGE(TAG, "蓝牙初始化任务创建失败!");
     } else {
-        ESP_LOGI(TAG, "蓝牙初始化任务已启动 (栈=%u bytes 内部RAM, 优先级=1)",
-                 (unsigned)(sizeof(bt_task_stack)));
+        ESP_LOGI(TAG, "蓝牙初始化任务已启动 (栈=%u bytes 内部RAM 共享, 优先级=1)",
+                 (unsigned)(words * sizeof(StackType_t)));
     }
 #else
     ESP_LOGI(TAG, "蓝牙未启用 (CONFIG_BT_ENABLED=n), 跳过 bt_init");

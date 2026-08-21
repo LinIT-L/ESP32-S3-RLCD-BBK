@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"   /* 供 bt_manager_get_init_stack 的 StackType_t (V1.0.96) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -140,6 +141,9 @@ typedef void (*bt_connect_cb_t)(bool connected);
 typedef void (*bt_connect_progress_cb_t)(const char *stage);
 
 void bt_manager_init(void);
+/* V1.0.96: 取得蓝牙初始化任务用的内部 RAM 静态栈 (供 app_board.c 开机 bt_init 复用,
+ * 避免与 enable() 各持一份 16KB 静态栈). BT 关闭时返回 NULL. */
+StackType_t *bt_manager_get_init_stack(int *words_out);
 const char *bt_manager_get_status(void);
 void bt_manager_start_scan(bt_scan_callback_t callback);
 void bt_manager_start_scan_continuous(bt_device_found_cb_t callback);
@@ -229,6 +233,7 @@ static inline bool bt_manager_is_connecting(void) { return false; }
 static inline void bt_manager_cancel_connect(void) {}
 static inline void bt_manager_enable(void) {}
 static inline void bt_manager_disable(void) {}
+static inline StackType_t *bt_manager_get_init_stack(int *w) { (void)w; return NULL; }
 static inline bool bt_manager_is_ready(void) { return false; }
 static inline bool bt_manager_is_stack_ready(void) { return false; }
 static inline void bt_manager_suspend(void) {}

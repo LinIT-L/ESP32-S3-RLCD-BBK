@@ -62,6 +62,7 @@ idf_component_register(
         "nofrendo/mappers/map094.c"
         "nofrendo/mappers/map099.c"
         "nofrendo/mappers/map160.c"
+        "nofrendo/mappers/map164.c"
         "nofrendo/mappers/map229.c"
         "nofrendo/mappers/map231.c"
         "nofrendo/mappers/mapvrc.c"

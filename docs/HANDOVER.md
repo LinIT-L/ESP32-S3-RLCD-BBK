@@ -24,7 +24,7 @@ ESP32-S3 复古学习机/游戏机：内置步步高电子词典（BBK）、GB/G
 
 ## 4. 引擎架构（核心）
 
-- **BBK 步步高**：`components/gam4980/`（libretro 核心 + s6502）。V1.0.61 已按用户要求**删除 BBK 音频**（`GAM4980_ENABLE_AUDIO=0`，`audio_player_stop()` 防残留任务）；`cpu_rate=8.0` 是从桌面 `esp32-bbk-emu-lite-backup-20260808.zip` 还原的游戏速度（用户认可"正常速度"），sys_ram(32KB) 在内部 RAM。
+- **BBK 步步高**：`components/gam4980/`（libretro 核心 + s6502）。V1.0.61 已按用户要求**删除 BBK 音频**（`GAM4980_ENABLE_AUDIO=0`，`audio_player_stop()` 防残留任务）；`cpu_rate=8.0` 是从桌面 `esp32-bbk-emu-lite-backup-20260808.zip` 还原的游戏速度（用户认可"正常速度"），sys_ram(32KB) 改为动态分配（进引擎才分配内部 RAM，退出释放）。
 - **GB/GBC**：`components/gbc_emu/`（esp-box-emu gnuboy 移植）。音频恢复官方 esp-box-emu 方式：**24000Hz 直喂、无重采样**；`cpu.c` 修复了 CGB 双速模式音频周期减半 bug（`sound_advance` 移到 `clen >>= cpu->speed` 之前）。
 - **NES**：`components/nes_emu/`（nofrendo）。灰度帧 2bit 打包 → core0 视频任务拉伸/点对点 → LCD。
 - **AB**：`components/arduboy_avr/`（simavr ATmega32u4）。
@@ -55,7 +55,7 @@ ESP32-S3 复古学习机/游戏机：内置步步高电子词典（BBK）、GB/G
 
 ## 6.1 V1.0.61 变更清单（本次会话）
 
-- gam4980：从桌面 `esp32-bbk-emu-lite-backup-20260808.zip` 还原 BBK 引擎（cpu_rate=8.0 游戏速度、vTaskDelayUntil 节流、sys_ram 内部 RAM）；删音频；补 `gam4980_set_key_sound` 兼容空实现。
+- gam4980：从桌面 `esp32-bbk-emu-lite-backup-20260808.zip` 还原 BBK 引擎（cpu_rate=8.0 游戏速度、vTaskDelayUntil 节流、sys_ram 动态分配内部 RAM）；删音频；补 `gam4980_set_key_sound` 兼容空实现。
 - gbc_emu/cpu.c：GB/GBC 音频改 24000Hz 官方直喂；修 CGB 双速周期减半；修 LCDC-off 1/3 帧。
 - sd_scan.c：快速挂载（2 档速度）；watcher 轻量化（15s 补挂、无动态调速死代码）；USB MSC 进入时暂停 watcher。
 - menu_system.c：MSC 进入/失败路径暂停/恢复 watcher；删除收藏栏 DIAG 日志。

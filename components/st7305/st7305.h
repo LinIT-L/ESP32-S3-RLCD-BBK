@@ -57,6 +57,10 @@ void st7305_draw_bitmap_1bit(st7305_handle_t *dev,
 
 void st7305_draw_text(st7305_handle_t *dev, int x, int y, const char *text);
 
+/* 带 1px 白描边的文字: 先对每个字形做一次 1px 二值膨胀画白 (描边), 再画黑色实体.
+ * 用于虚拟按键等需要叠在黑色游戏画面上仍清晰可辨的场景 (V1.0.69). */
+void st7305_draw_text_outlined(st7305_handle_t *dev, int x, int y, const char *text);
+
 esp_err_t st7305_flush(st7305_handle_t *dev);
 
 /* 从指定缓冲发送整帧 (与 st7305_flush 相同, 但数据源可独立于 dev->fb).

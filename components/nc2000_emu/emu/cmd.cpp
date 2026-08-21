@@ -1,0 +1,672 @@
+#include "comm.h"
+
+#include "nand.h"
+#include "nor.h"
+#include <cstdint>
+#include <cstdio>
+#include <time.h>
+
+#include <mutex>
+#include "mem.h"
+#include "ram.h"
+#include "state.h"
+#include "cpu.h"
+extern "C" {
+#include "ansi/w65c02.h"
+}
+#include "compare/pc1000bus.h"
+#include "nc2000.h"
+#include "nor.h"
+#include "settings.h"
+#include <SDL2/SDL.h>
+#include "misc/bin_dec.h"
+extern nc2k_states_t nc2k_states;
+extern CPUInterface *cpu;
+
+deque<string> udp_msgs;
+std::mutex g_mutex;
+
+bool is_nc2600_rom(){
+	/*if(nand_magic=="ggv nc2010"){
+		return true;
+	}*/
+	if(nand_magic[8]=='1') return true;
+	return false;
+}
+
+bool is_nc2000_rom(){
+	if(nand_magic[8]=='0' &&nor_buff[2]==0x36) return true;
+	return false;
+}
+
+bool is_nc2010_rom(){
+	if(nand_magic[8]=='0' &&nor_buff[2]==0x4f) return true;
+	return false;
+}
+
+// call this function when you want to cheat wqx to do a soft boot
+// other wise wqx will do cold boot
+// this is only a trick, mianly used in this cmd.cpp, not part of emulation
+void set_warm_reset_flag(){
+/*
+    lda io_timer0_val
+    ora io_timer1_val
+    beq cold_start
+*/
+	// as long as one is non-zero, it will pass the check
+	ram_io[2]=1;
+	ram_io[3]=1;
+}
+
+
+void push_message(string msg){
+	if(msg.empty()) return;
+	g_mutex.lock();
+	udp_msgs.push_back(msg);
+	g_mutex.unlock();
+}
+
+string get_message(){
+    string res;
+    g_mutex.lock();
+    if(!udp_msgs.empty()){
+        res= udp_msgs.front();
+        udp_msgs.pop_front();
+        udp_msgs.clear();
+    }
+	g_mutex.unlock();
+    return res;
+}
+
+char *peek_message(){
+	char *p=NULL;
+	g_mutex.lock();
+    if(!udp_msgs.empty()){
+        p= (char *)udp_msgs.front().c_str();
+    }
+	g_mutex.unlock();
+    return p;
+}
+
+
+static deque<char> queue;
+static int32_t dummy_io_cnt=-1;
+static int put_total_size=0;
+bool dummy_io_for_read(uint16_t addr, uint8_t &value){
+	if(addr!=0x3fff) return false;
+	if(dummy_io_cnt== -1) return false;
+	if(queue.empty()) {
+		value=0;
+        dummy_io_cnt=-1;
+		printf("[put] done, total size=%d\n",put_total_size);
+		put_total_size=0;
+		//printf("<dummy read %02x>\n",value);
+		return true;
+	}
+	if(dummy_io_cnt++%2==0) {
+		value=1;
+	}else{
+		put_total_size++;
+		if(put_total_size%10000==0){
+			printf("[put] sent %d bytes\n",put_total_size);
+		}
+		value=queue.front();
+		queue.pop_front();
+	}
+	//printf("<dummy read %02x>\n",value);
+	return true;
+}
+
+static deque<char> queue_for_write;
+static string file_name_for_write;
+static int32_t dummy_io_write_cnt=-1;
+bool dummy_io_for_write(uint16_t addr, uint8_t value){
+	if(addr!=0x3fff) return false;
+
+	if(dummy_io_write_cnt== -1) {
+		//printf("write value=%02x pc=%04x!!\n",value,mPC);
+		//printf("but dummy io is closed\n");
+		return false;
+	}
+	if(dummy_io_write_cnt++%2==0) {
+		if(value==1) {
+			//printf("continue!!\n");
+			//do nothing
+		}
+		else if(value==0) {
+			printf("[get] done, total size=%d\n",(int)queue_for_write.size());
+			if(dummy_io_write_cnt!=-1){
+				auto fp=fopen(file_name_for_write.c_str(),"wb");
+				for(auto c: queue_for_write){
+					fwrite(&c,1,1,fp);
+				}
+				fclose(fp);
+				queue_for_write.clear();
+			}
+			dummy_io_write_cnt=-1;
+
+		}else{
+			printf("got invalid value for dummy_io");
+			assert(false);
+		}
+	}else{
+		//printf("got char %02x, off=%d\n",value,(int)queue_for_write.size());
+		queue_for_write.push_back(value);
+		if(queue_for_write.size()%10000==0) {
+			printf("[get] got %d bytes\n",(int)queue_for_write.size());
+		}
+	}
+	//printf("<dummy read %02x>\n",value);
+	return true;
+}
+
+void clear_cmds(){
+	//put, dummy_io_for_read()
+	queue.clear();
+	dummy_io_cnt=-1;
+	put_total_size=0;
+
+	//get, dummy_io_for_write()
+	dummy_io_write_cnt=-1;
+	queue_for_write.clear();
+	file_name_for_write.clear();
+
+	//pending messages
+	g_mutex.lock();
+	udp_msgs.clear();
+	g_mutex.unlock();
+}
+
+void copy_to_addr(uint16_t addr, uint8_t * buf,uint16_t size){
+	for(uint32_t i=0;i<size;i++){
+		Peek16(addr+i)=buf[i];
+	}
+}
+
+std::string HexToBytes(const std::string& hex) {
+  std::string bytes;
+
+  for (unsigned int i = 0; i < hex.length(); i += 2) {
+    std::string byteString = hex.substr(i, 2);
+    char b = (char) strtol(byteString.c_str(), NULL, 16);
+    bytes.push_back(b);
+  }
+
+  return bytes;
+}
+string translate_cmd_alias(string name){
+	if(name=="wr") name="warm_reset";
+	if(name=="cr") name="cold_reset";
+	if(name=="sf") name="save_flash";
+	if(name=="sa") name="save_all";
+	//if(name=="ss") name="save_state";
+	if(name=="ds"||name=="del_state") name="delete_state";
+	if(name=="f") name="file_manager";
+	if(name=="cf"||name=="create_dir") name="create_folder";
+	if(name=="cfh"||name=="create_dir_hex") name="create_folder_hex";
+	if(name=="st") name="sync_time";
+	if(name=="sp") name="speed";
+	if(name=="ed"||name=="ec"||name=="modify") name="edit";
+	if(name=="ffl") name="fast_forward_limit";
+
+	if(name=="rl") name="reload";
+	if(name=="rls") name="reload_state";
+
+	if(name=="l0") name="load_pc1000";
+	if(name=="l1") name="load_nc1020";
+	if(name=="l1t"||name=="l1tw") name="load_nc1020tw";
+	if(name=="l2") name="load_nc2000";
+	if(name=="l3") name="load_nc3000";
+
+	if(name=="ls0") name="load_state_pc1000";
+	if(name=="ls1") name="load_state_nc1020";
+	if(name=="ls1t"||name=="ls1tw") name="load_state_nc1020tw";
+	if(name=="ls2") name="load_state_nc2000";
+	if(name=="ls3") name="load_state_nc3000";
+	return name;
+}
+void handle_cmd(string str){
+	printf("handling cmd ");
+	auto cmds=split_s(str," ");
+	for(int i=0;i<cmds.size();i++){
+		printf("<%s>",cmds[i].c_str());
+	}
+	printf("\n");
+	fflush(stdout);
+	if(cmds.size()==0) return;
+	if(cmds[0]=="?"||cmds[0]=="/?"||cmds[0]=="h"||cmds[0]=="H"||cmds[0]=="HELP"||cmds[0]=="help")
+	{
+		void print_help();
+		print_help();
+		return;
+	}
+	cmds[0]=translate_cmd_alias(cmds[0]);
+	if(cmds[0]=="hack1"){
+		void hack1_save_nc1020_12m_rom();
+		hack1_save_nc1020_12m_rom();
+		return;
+	}
+	if(cmds[0]=="warm_reset"){
+		set_warm_reset_flag();
+		void warm_reset();
+		warm_reset();
+		return;
+	}
+	if(cmds[0]=="cold_reset"){
+		void cold_reset();
+		cold_reset();
+		return;
+	}
+	if(cmds[0]=="exit"){
+		exit(-1);
+	}
+
+	if(cmds[0]=="reload"||cmds[0]=="reload_state"){
+		if(save_state_on_exit||save_flash_on_exit){
+			SaveNC2kIfNeed();
+		}
+		enable_load_state=(cmds[0]=="reload_state");
+		reload_pending=true;
+		return;
+	}
+
+	bool is_load_state_cmd = cmds[0].find("load_state") != string::npos;
+	if(is_load_state_cmd){
+		cmds[0]=cmds[0].substr(strlen("load_state_")); //remove "load_state_"
+		cmds[0]="load_"+cmds[0];
+	}
+
+	if(cmds[0]=="load_nc2000"||cmds[0]=="load_nc3000"||cmds[0]=="load_nc1020"||cmds[0]=="load_nc1020tw"||cmds[0]=="load_pc1000") {
+		if(cmds.size()>1){
+			if(!fileExists(cmds[1]+".nor")) { //basic typo check, if nor file not exist, don't even try to load
+				printf("file %s.nor not exist, cannot load\n",cmds[1].c_str());
+				return;
+			}
+		}
+		if(save_state_on_exit||save_flash_on_exit){
+			SaveNC2kIfNeed();
+		}
+		rom_path.clear();
+		if(cmds.size()>1){
+			rom_path=cmds[1];
+		}
+
+		extern WqxRom nc2k_rom;
+		nc2k_rom.clear();
+		nc2000mode=nc3000mode=nc1020mode=nc1020tw_mode=pc1000mode=false;
+		
+		enable_load_state=is_load_state_cmd;
+
+		if(cmds[0]=="load_nc2000") nc2000mode=true;
+		if(cmds[0]=="load_nc3000") nc3000mode=true;
+		if(cmds[0]=="load_nc1020"||cmds[0]=="load_nc1020tw") nc1020mode=true;
+		if(cmds[0]=="load_nc1020tw") nc1020tw_mode=true;
+		if(cmds[0]=="load_pc1000") pc1000mode=true;
+
+		init_parameters();
+		handle_rom();
+
+		reload_pending=true;
+
+		extern SDL_Window* window;
+		SDL_SetWindowTitle(window, get_title().c_str());
+		return;
+	}
+
+	if(cmds[0]=="save_flash"||cmds[0]=="save_all"/*||cmds[0]=="save_state"*/){
+		//pitfall: don't use save_state alone, expecially on nc1020
+		//         since sometimes wqx might modify nor even if you don't change any file. then saved state won't match with nor
+		//         use save_all instead
+		string file="";
+		if(cmds.size()>1){
+			file=cmds[1];	
+		}
+		if(cmds[0]=="save_flash"||cmds[0]=="save_all"){
+			save_flash(file);
+		}
+		if(/*cmds[0]=="save_state"||*/cmds[0]=="save_all"){
+			save_state(file);
+		}
+		return;
+	}
+	if(cmds[0]=="delete_state"){
+		string file="";
+		if(cmds.size()>1){
+			file=cmds[1];	
+		}
+		delete_state(file);
+		return;
+	}
+	if(cmds[0]=="dump"){
+		if(cmds.size()<2){
+			printf("dump: not enough argument\n");
+			return;
+		}
+		uint32_t start=stoi(cmds[1],0,16);
+		uint32_t size=stoi(cmds[2],0,10);
+		for(uint32_t i=start;i<start+size;i++){
+			printf("%02x ",Peek16(i));
+		}
+		printf("\n");
+		return;
+	}
+
+	if(cmds[0]=="edit"){
+		uint32_t start=stoi(cmds[1],0,16);
+		for(uint32_t i=2;i<cmds.size();i++){
+			Peek16(start++)=stoi(cmds[i],0,16);;
+		}
+		printf("edit done\n");
+		return;
+	}
+
+	if(cmds[0]=="file_manager"){
+		if(!nc2000mode&&!nc3000mode) return;
+		cpu->PC=0x3000;
+		/*if(nc1020mode){
+			uint8_t buf[]={0x00,0x2d,0x93,0x18,0x90,0xfa};
+			copy_to_addr(0x3000, buf, sizeof buf);
+		}*/
+		
+		if(nc2000mode){
+			if(is_nc2600_rom()){
+				uint8_t buf[]={0x00,0x27,0x05,0x18,0x90,0xfa};
+				copy_to_addr(0x3000, buf, sizeof buf);
+			}else{
+				uint8_t buf[]={0x00,0x28,0x05,0x18,0x90,0xfa};
+				copy_to_addr(0x3000, buf, sizeof buf);
+			}
+		}
+		if(nc3000mode){
+				uint8_t buf[]={0x00,0x28,0x05,0x18,0x90,0xfa};
+				copy_to_addr(0x3000, buf, sizeof buf);
+		}
+		return;
+	}
+
+	if(cmds[0]=="create_folder" || cmds[0]=="create_folder_hex"){
+			if(cmds.size()<2){
+				printf("not enough argument\n");
+				return;
+			}
+			//printf("<pc=%x>\n",cpu->PC);
+			cpu->PC=0x3000;
+			string dir_name=cmds[1];
+			if(cmds[0]=="create_dir_hex"|| cmds[0]=="create_folder_hex"){
+				dir_name=HexToBytes(dir_name);
+			}
+			if(nc1020mode){
+				copy_to_addr(0x121c, (uint8_t*)(dir_name+"                    ").c_str(), 16);
+				Peek16(0x1219)=0x02;
+				Peek16(0x121A)=0xF0; 
+				Peek16(0x121B)=0xFF;
+				Peek16(0x122F)=0xFF;
+				Peek16(0x1230)=0xFF; 
+				Peek16(0x1231)=0xFF;  
+				if(nc1020tw_mode){
+					uint8_t buf[]={0x00,0x01,0x10,0x00,0x04,0x83,0x18,0x90,0xfa};
+					copy_to_addr(0x3000, buf, sizeof buf);
+				}else {
+					uint8_t buf[]={0x00,0x01,0x93,0x00,0x04,0x83,0x18,0x90,0xfa};
+					copy_to_addr(0x3000, buf, sizeof buf);
+				}
+
+			}
+			if(nc2000mode){
+				set_warm_reset_flag();
+				if(is_nc2600_rom()){
+					copy_to_addr(0x08d6, (uint8_t*)dir_name.c_str(), dir_name.size()+1);
+					//Peek16(0x0912)=0x02; //not really useful?
+					uint8_t buf[]={0x00,0x0b,0x05,0x00,0x01,0xc0};
+					copy_to_addr(0x3000, buf, sizeof buf);
+				}else{
+					if(is_nc2000_rom()){
+						if(debug_level>=1) printf("is nc2000 rom\n");
+						copy_to_addr(0x08be, (uint8_t*)dir_name.c_str(), dir_name.size()+1);
+					}else{
+						if(debug_level>=1) printf("is nc2010 rom\n");
+						copy_to_addr(0x08ac, (uint8_t*)dir_name.c_str(), dir_name.size()+1);
+					}
+					uint8_t buf[]={0x00,0x0b,0x05,0x00,0x01,0xc0};
+					copy_to_addr(0x3000, buf, sizeof buf);
+				}
+			}
+
+			if(nc3000mode){
+					copy_to_addr(0x088d, (uint8_t*)dir_name.c_str(), dir_name.size()+1);
+					uint8_t buf[]={0x00,0x0b,0x05,0x00,0x28,0x05,0x18,0x90,0xfa};
+					copy_to_addr(0x3000, buf, sizeof buf);	
+			}
+			return;
+	}
+
+
+	if(cmds[0]=="wqxhex"){
+			vector<char> wqxhex;
+			read_file("wqxhex.bin", wqxhex);
+			memcpy(nc2k_states.ext_ram+0x4000, &wqxhex[0], wqxhex.size());
+			ram_io[0x00]=0x80;
+			ram_io[0x0a]=0x80;
+			super_switch();
+			cpu->PC=0x4018;
+			return;
+	}
+	if(cmds[0]=="speed"){
+			if(cmds.size()==1) speed_multiplier=1;
+			else{
+				sscanf(cmds[1].c_str(),"%lf",&speed_multiplier);
+			}
+			printf("change speed to %f\n",speed_multiplier);
+			return;
+	}
+	if(cmds[0]=="log"){
+			enable_dyn_debug=true;
+			return;
+	}
+	if(cmds[0]=="nolog"){
+			enable_dyn_debug=false;
+			return;
+	}
+	if(cmds[0]=="fast_forward_limit"){
+		if(cmds.size()==1) {
+			fast_forward_limit=0;
+		}
+		else{
+			fast_forward_limit= stod(cmds[1]);
+		}
+		printf("set fast forward limit to %f\n",fast_forward_limit);
+		return;
+	}
+	if(cmds[0]=="get"){
+			if(cmds.size()<2){
+				printf("not enough argument\n");
+				return;
+			}
+			//if(!nc2000mode) return;
+			string src=cmds[1];
+			string target=cmds[1];
+			if(cmds.size()>2) target=cmds[2];
+			file_name_for_write=target;
+			dummy_io_write_cnt = 0;
+			if(nc2000mode){
+				set_warm_reset_flag();
+				if(is_nc2600_rom()){
+					copy_to_addr(0x08d6, (uint8_t*)src.c_str(), src.size()+1);
+					uint8_t buf[]={0xA9,0x80,0x8D,0x12,0x09,0xA9,0xEF,0x8D,0x13,0x09,0x8D,0x14,0x09,0x00,0x14,0x05,
+					0xA9,0x00,0x8D,0xF6,0x03,0xA9,0x00,0x85,0xDD,0xA9,0x32,0x85,0xDE,0xA9,0x01,0x8D,
+					0x0F,0x09,0xA9,0x00,0x8D,0x10,0x09,0x8D,0x11,0x09,0x00,0x15,0x05,0xAD,0x0F,0x09,
+					0xF0,0x0E,0xA9,0x01,0x8D,0xFF,0x3F,0xAD,0x00,0x32,0x8D,0xFF,0x3F,0xB8,0x50,0xD0,
+					0xA9,0x00,0x8D,0xFF,0x3F,0x00,0x16,0x05,0x00,0x01,0xC0,};
+					copy_to_addr(0x3000,buf,sizeof(buf));
+				}else{
+					if(is_nc2000_rom()){
+						if(debug_level>=1) printf("is nc2000 rom\n");
+						copy_to_addr(0x08be, (uint8_t*)src.c_str(), src.size()+1);
+					}else{
+						if(debug_level>=1) printf("is nc2010 rom\n");
+						copy_to_addr(0x08ac, (uint8_t*)src.c_str(), src.size()+1);
+					}
+					uint8_t buf[]={0xA9,0x80,0x8D,0xFA,0x08,0xA9,0xEF,0x8D,0xFB,0x08,0x8D,0xFC,0x08,0x00,0x15,0x05,
+					0xA9,0x00,0x8D,0xF6,0x03,0xA9,0x00,0x85,0xDD,0xA9,0x32,0x85,0xDE,0xA9,0x01,0x8D,
+					0xF7,0x08,0xA9,0x00,0x8D,0xF8,0x08,0x8D,0xF9,0x09,0x00,0x16,0x05,0xAD,0xF7,0x08,
+					0xF0,0x0E,0xA9,0x01,0x8D,0xFF,0x3F,0xAD,0x00,0x32,0x8D,0xFF,0x3F,0xB8,0x50,0xD0,
+					0xA9,0x00,0x8D,0xFF,0x3F,0x00,0x16,0x05,0x00,0x01,0xC0,};
+					copy_to_addr(0x3000,buf,sizeof(buf));
+				}
+			}
+			if(nc1020mode){
+				set_warm_reset_flag();
+				copy_to_addr(0x121c, (uint8_t*)(src+"                    ").c_str(), 16);
+				if(nc1020tw_mode){
+					uint8_t buf[]={0xA9,0x00,0x8D,0x14,0x12,0x00,0x02,0x10,0xB0,0x32,0xA9,0x00,0x8D,0x6E,0x04,0x8D,
+	0xAE,0x04,0xA9,0x00,0x8D,0x0D,0x12,0xA9,0x32,0x8D,0x0E,0x12,0xA9,0x01,0x8D,0x0F,
+	0x12,0xA9,0x00,0x8D,0x10,0x12,0x00,0x04,0x10,0xAD,0x0F,0x12,0xF0,0x0E,0xA9,0x01,
+	0x8D,0xFF,0x3F,0xAD,0x00,0x32,0x8D,0xFF,0x3F,0xB8,0x50,0xCE,0xA9,0x00,0x8D,0xFF,
+	0x3F,0x00,0x07,0x10,0x00,0x01,0xC0,};
+					copy_to_addr(0x3000,buf,sizeof(buf));
+				}else{
+					uint8_t buf[]={0xA9,0x00,0x8D,0x14,0x12,0x00,0x02,0x93,0xB0,0x32,0xA9,0x00,0x8D,0x6E,0x04,0x8D,
+	0xAE,0x04,0xA9,0x00,0x8D,0x0D,0x12,0xA9,0x32,0x8D,0x0E,0x12,0xA9,0x01,0x8D,0x0F,
+	0x12,0xA9,0x00,0x8D,0x10,0x12,0x00,0x04,0x93,0xAD,0x0F,0x12,0xF0,0x0E,0xA9,0x01,
+	0x8D,0xFF,0x3F,0xAD,0x00,0x32,0x8D,0xFF,0x3F,0xB8,0x50,0xCE,0xA9,0x00,0x8D,0xFF,
+	0x3F,0x00,0x07,0x93,0x00,0x01,0xC0,};
+					copy_to_addr(0x3000,buf,sizeof(buf));
+				}
+			}
+			cpu->PC=0x3000;
+			//enable_dyn_debug=true;
+			return;
+	}
+	if(cmds[0]=="putx"){
+			if(cmds.size()<2){
+				printf("not enough argument\n");
+				return;
+			}
+			string outname="bindec.tmp";
+			if(bin_dec(cmds[1],outname)){
+				printf("binary decode failed.\n");
+				return ;
+			}
+			cmds[0]="put";
+			if(cmds.size()<3){
+				cmds.push_back(split_s(cmds[1],"/").back());
+			}
+			cmds[1]=outname;
+
+			//no return here, continue to next if. since putx is a wrapper around put
+	}
+	if(cmds[0]=="put"){
+			if(cmds.size()<2){
+				printf("not enough argument\n");
+				return;
+			}
+			vector<char> file;
+			if(read_file_noexit(cmds[1], file)!=0){
+				return ;
+			}
+			string target=split_s(cmds[1],"/").back();
+			if(cmds.size()>2) target=cmds[2];
+			queue.clear();
+			for(int i=0;i<file.size();i++){
+				queue.push_back(file[i]);
+			}
+			dummy_io_cnt=0;
+			if(nc1020mode){
+				copy_to_addr(0x121c, (uint8_t*)(target+"                    ").c_str(), 16);
+				Peek16(0x1219)=0x61;
+				Peek16(0x121A)=0xF8; 
+				Peek16(0x121B)=0xFF;
+				Peek16(0x122F)=0xFF;
+				Peek16(0x1230)=0xFF; 
+				Peek16(0x1231)=0xFF;
+				set_warm_reset_flag();
+				if(nc1020tw_mode){
+					uint8_t buf[]={0xea,0xea,0xea,0x00,0x01,0x10,0xA9,0x00,0x8D,0x6E,0x04,0x8D,0xAE,0x04,0xAD,0xFF,
+	0x3F,0xC9,0x00,0xF0,0x20,0xAD,0xFF,0x3F,0x8D,0x00,0x32,0xA9,0x00,0x8D,0x0D,0x12,
+	0xA9,0x32,0x8D,0x0E,0x12,0xA9,0x01,0x8D,0x0F,0x12,0xA9,0x00,0x8D,0x10,0x12,0x00,
+	0x05,0x10,0xB8,0x50,0xD1,0x00,0x07,0x10,0x00,0x01,0xC0,};
+					copy_to_addr(0x3000, buf, sizeof buf);
+				}else{
+					uint8_t buf[]={0xea,0xea,0xea,0x00,0x01,0x93,0xA9,0x00,0x8D,0x6E,0x04,0x8D,0xAE,0x04,0xAD,0xFF,
+	0x3F,0xC9,0x00,0xF0,0x20,0xAD,0xFF,0x3F,0x8D,0x00,0x32,0xA9,0x00,0x8D,0x0D,0x12,
+	0xA9,0x32,0x8D,0x0E,0x12,0xA9,0x01,0x8D,0x0F,0x12,0xA9,0x00,0x8D,0x10,0x12,0x00,
+	0x05,0x93,0xB8,0x50,0xD1,0x00,0x07,0x93,0x00,0x01,0xC0,};
+					copy_to_addr(0x3000, buf, sizeof buf);		
+				}
+			}
+
+			if(nc2000mode){
+				if(is_nc2600_rom()){
+					copy_to_addr(0x08d6, (uint8_t*)target.c_str(), target.size()+1);
+
+					/*
+					for(;;){
+						auto value=Load(0x3fff);
+						printf("<%02x>",value);
+						if(value==0) break;
+						auto value2=Load(0x3fff);
+						printf("<%02x>",value2);
+					}
+					printf("\n");*/
+					set_warm_reset_flag();
+					uint8_t buf[]={0x00,0x1C,0x05,0xA9,0x70,0x8D,0x12,0x09,0xA9,0xEF,0x8D,0x13,0x09,0x8D,0x14,0x09,
+					0x00,0x14,0x05,0xA9,0x00,0x8D,0xF6,0x03,0xAD,0xFF,0x3F,0xC9,0x00,0xF0,0x21,0xAD,
+					0xFF,0x3F,0x8D,0x00,0x32,0xA9,0x00,0x85,0xDD,0xA9,0x32,0x85,0xDE,0xA9,0x01,0x8D,
+					0x0F,0x09,0xA9,0x00,0x8D,0x10,0x09,0x8D,0x11,0x09,0x00,0x17,0x05,0xB8,0x50,0xD3,
+					0x00,0x16,0x05,0x00,0x01,0xC0,};
+					copy_to_addr(0x3000,buf,sizeof(buf));
+				}else{
+					set_warm_reset_flag();
+					if(is_nc2000_rom()){
+						if(debug_level>=1) printf("is nc2000 rom\n");
+						copy_to_addr(0x08be, (uint8_t*)target.c_str(), target.size()+1);
+						uint8_t buf[]={0x00,0x1D,0x05,0xA9,0x70,0x8D,0xFA,0x08,0xA9,0xEF,0x8D,0xFB,0x08,0x8D,0xFC,0x08,
+							0x00,0x15,0x05,0xA9,0x00,0x8D,0xF6,0x03,0xAD,0xFF,0x3F,0xC9,0x00,0xF0,0x21,0xAD,
+							0xFF,0x3F,0x8D,0x00,0x32,0xA9,0x00,0x85,0xDD,0xA9,0x32,0x85,0xDE,0xA9,0x01,0x8D,
+							0xF7,0x08,0xA9,0x00,0x8D,0xF8,0x08,0x8D,0xF9,0x08,0x00,0x18,0x05,0xB8,0x50,0xD3,
+							0x00,0x17,0x05,0x00,0x01,0xC0,};
+						copy_to_addr(0x3000,buf,sizeof(buf));
+					}else{
+						if(debug_level>=1) printf("is nc2010 rom\n");
+						copy_to_addr(0x08ac, (uint8_t*)target.c_str(), target.size()+1);
+						uint8_t buf[]={0x00,0x1D,0x05,0xA9,0x70,0x8D,0xE8,0x08,0xA9,0xEF,0x8D,0xE9,0x08,0x8D,0xEA,0x08,
+							0x00,0x15,0x05,0xA9,0x00,0x8D,0xF6,0x03,0xAD,0xFF,0x3F,0xC9,0x00,0xF0,0x21,0xAD,
+							0xFF,0x3F,0x8D,0x00,0x32,0xA9,0x00,0x85,0xDD,0xA9,0x32,0x85,0xDE,0xA9,0x01,0x8D,
+							0xE5,0x08,0xA9,0x00,0x8D,0xE6,0x08,0x8D,0xE7,0x08,0x00,0x18,0x05,0xB8,0x50,0xD3,
+							0x00,0x17,0x05,0x00,0x01,0xC0,};
+						copy_to_addr(0x3000,buf,sizeof(buf));
+					}
+				}
+				
+				
+			}
+			if(nc3000mode){
+					copy_to_addr(0x088d, (uint8_t*)target.c_str(), target.size()+1);
+					uint8_t buf[]={0xA9,0x70,0x8D,0xC9,0x08,0xA9,0xEF,0x8D,0xCA,0x08,0x8D,0xCB,0x08,0x00,0x15,0x05,
+0xA9,0x00,0x8D,0xF6,0x03,0xAD,0xFF,0x3F,0xC9,0x00,0xF0,0x21,0xAD,0xFF,0x3F,0x8D,
+0x00,0x32,0xA9,0x00,0x85,0xE0,0xA9,0x32,0x85,0xE1,0xA9,0x01,0x8D,0xC6,0x08,0xA9,
+0x00,0x8D,0xC7,0x08,0x8D,0xC8,0x08,0x00,0x18,0x05,0x4C,0x10,0x30,0x00,0x17,0x05,
+0x00,0x28,0x05,0x4C,0x40,0x30,};
+					copy_to_addr(0x3000,buf,sizeof(buf));
+			}
+			cpu->PC=0x3000;
+
+			return;
+	}
+
+	if(cmds[0]=="sync_time") {
+		if(nc2000mode){
+			extern void sync_time_2000();
+			sync_time_2000();
+		}
+		if(nc1020mode){
+			extern void sync_time_1020();
+			sync_time_1020();
+		}
+		return ;
+	}
+	printf("unknow command <%s>\n",cmds[0].c_str());
+	fflush(stdout);
+}
+
+

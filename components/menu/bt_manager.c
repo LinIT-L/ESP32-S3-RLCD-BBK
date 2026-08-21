@@ -108,9 +108,21 @@ static inline bool hat_is(int dir) {
 #define CONNECT_TASK_STACK_WORDS 3584
 EXT_RAM_BSS_ATTR static StackType_t s_connect_task_stack[CONNECT_TASK_STACK_WORDS];
 static StaticTask_t s_connect_task_buf;
+/* V1.0.96 fix: 蓝牙初始化任务栈 MUST 放内部 RAM.
+ * bt_manager_init → bt_manager_load_paired → nvs_get_blob 读 SPI Flash 会禁用 cache,
+ * 若任务栈在 PSRAM, cache 禁用后无法访问 → esp_task_stack_is_sane_cache_disabled 断言重启.
+ * (开机路径 app_board.c 早已用内部 RAM 栈并注释警告; enable() 启动 WiFi 手柄后恢复蓝牙
+ * 走的这条路径漏了, 见 docs/HANDOVER.md 6.7. 此处由 PSRAM 改为内部 RAM 静态栈修复.)
+ * 侧注: 原 PSRAM 栈 s_init_task_stack[4096] 已删除, 避免与内部栈并存浪费内存.
+ * 该栈同时供 app_board.c 开机 bt_init 任务复用 (见 bt_manager_get_init_stack), 只占一份. */
 #define INIT_TASK_STACK_WORDS 4096
-EXT_RAM_BSS_ATTR static StackType_t s_init_task_stack[INIT_TASK_STACK_WORDS];
+static StackType_t s_init_task_stack[INIT_TASK_STACK_WORDS];
 static StaticTask_t s_init_task_buf;
+/* 供 app_board.c 开机 bt_init 任务复用同一份内部 RAM 栈 (避免两份 16KB 静态栈) */
+StackType_t *bt_manager_get_init_stack(int *words_out) {
+    if (words_out) *words_out = INIT_TASK_STACK_WORDS;
+    return s_init_task_stack;
+}
 
 static bt_device_t s_scan_results[MAX_SCAN_RESULTS];
 static int s_scan_count = 0;
@@ -851,9 +863,14 @@ const char *bt_manager_get_device_name(const bt_device_t *dev) {
 }
 const char *bt_manager_get_connected_device_name(void) { return s_connected_dev_name; }
 
-/* 连接任务 */
-#define CONNECT_MAX_ATTEMPTS   1
-#define CONNECT_ATTEMPT_US     (5 * 1000 * 1000)
+/* 连接任务
+ * V1.0.xx(主动连接提速): 早期版本单次 5s 超时连接极快; 后改为 3.5s 超时+
+ * 快重试, 反而导致设备在线但 OPEN 稍慢(BLE 连接建立+HID 服务发现约 2-4s)时
+ * 被误判超时 close, 重试又打断进行中的连接 -> 十几秒连不上, 需反复多次.
+ * 这里恢复早期"宽预算"单次连接(5s 足够在线设备完成 OPEN), 保留 3 次重试
+ * 作为容错兜底, 重试间隔拉长让协议栈充分清理. */
+#define CONNECT_MAX_ATTEMPTS   3
+#define CONNECT_ATTEMPT_US     (5000 * 1000)   /* 单次连接宽预算 5s (早期版本值) */
 static void connect_task(void *arg) {
     ESP_LOGI(TAG, "连接任务启动: %s", bt_manager_get_device_name(&s_pending_dev));
     if (!s_hidh_ready) {
@@ -870,7 +887,10 @@ static void connect_task(void *arg) {
     bool success = false;
     for (int attempt = 1; attempt <= CONNECT_MAX_ATTEMPTS && !success && !s_connect_cancel; attempt++) {
         if (s_scanning) bt_manager_stop_scan();
-        vTaskDelay(pdMS_TO_TICKS(attempt == 1 ? 200 : 800));
+        /* V1.0.xx: 首次尝试前等待 300ms (v1.1 为 200ms): 确保扫描已停止、
+         * GAP 状态机收敛后再发起连接, 降低首次 OPEN 失败率.
+         * 重试间隔 1s: 让失败连接在协议栈中的清理充分完成, 避免连打连败. */
+        vTaskDelay(pdMS_TO_TICKS(attempt == 1 ? 300 : 1000));
         if (s_connected) { success = true; break; }
 
         s_open_failed = false;
@@ -932,12 +952,13 @@ static void connect_task(void *arg) {
 
 bool bt_manager_connect_device(const bt_device_t *dev) {
     bt_lock();
-    /* V1.0.60: 断开后 10 秒冷却. 手柄休眠/掉线后立刻重连会在 Bluedroid/HID
+    /* V1.0.xx: 断开后冷却时间 10s→5s. 手柄休眠/掉线后立刻重连会在 Bluedroid/HID
      * 协议栈清理未完成时 esp_hidh_dev_open -> LoadProhibited 崩溃 (开机约 5 分钟
-     * 自动重启循环的根因). 冷却期后协议栈状态干净, 重连才安全. */
+     * 自动重启循环的根因). 5s 内协议栈已完成清理, 冷却仍能防崩, 但不再让用户
+     * 断开后要苦等 10s 才能重连. */
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (s_last_disconnect_ms &&
-        (uint32_t)(now_ms - s_last_disconnect_ms) < 10000) {
+        (uint32_t)(now_ms - s_last_disconnect_ms) < 5000) {
         snprintf(s_connect_error, sizeof(s_connect_error), "断开冷却中, 稍后重连");
         bt_unlock();
         return false;
@@ -1125,7 +1146,14 @@ void bt_manager_add_to_history(const bt_device_t *dev) {
     if (!dev || dev->name[0] == '\0') return;
     int found = -1;
     for (int i = 0; i < s_history_count; i++) {
+        /* 按 MAC 去重 (同一设备更新到最新) */
         if (memcmp(s_history[i].bd_addr, dev->bd_addr, 6) == 0) { found = i; break; }
+        /* V1.0.96: 按名称去重 — 不同 MAC 但同名的新设备, 移除旧的同名记录,
+         * 避免自动连接按名称匹配到旧 MAC 起冲突 (每次连接同名即覆盖). */
+        if (dev->has_name && s_history[i].has_name &&
+            strncmp(s_history[i].name, dev->name, sizeof(dev->name)) == 0) {
+            found = i; break;
+        }
     }
     bt_device_t entry = *dev;
     if (found >= 0) {

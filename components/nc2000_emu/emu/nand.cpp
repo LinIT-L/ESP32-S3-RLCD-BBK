@@ -1,0 +1,471 @@
+
+#include "ansi/w65c02.h"
+#include "comm.h"
+#include "state.h"
+#include <cassert>
+#include <cstdio>
+#include "nand.h"
+extern WqxRom nc2k_rom;
+extern nc2k_states_t nc2k_states;
+static uint8_t* ram_buff = nc2k_states.ram;
+static uint8_t* ram_io = nc2k_states.ram_io;
+
+static deque<uint8_t> nand_cmd;
+static deque<uint8_t> nand_addr;
+static deque<uint8_t> nand_data;
+
+static int nand_read_cnt=0;
+//char nand_ori[65536*2][512];
+static char nand[65536*2+64][528];
+//char nand_spare[65536+64][16];
+
+char nand_magic[11];
+
+void read_nand0_file(){
+    memset(nand,0xff, 64*528);
+    char *p0= &nand[0][0];
+    FILE *f = fopen(nc2k_rom.nand0Path.c_str(), "rb");
+    if(f==0) {
+        printf("file %s not exist!\n",nc2k_rom.nand0Path.c_str());
+        exit(-1);
+    }
+    fseek(f, 0, SEEK_END);
+    long long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);  /* same as rewind(f); */
+    assert(fsize<= 64*528);
+    fread(p0, fsize, 1, f);
+    fclose(f);
+    printf("<nand0_file_size=%llu>\n",fsize);
+    for(int i=0;i<sizeof(nand_magic)-1;i++){
+        nand_magic[i]=p0[0x200+0x10+i];
+    }
+    nand_magic[sizeof(nand_magic)-1]=0;
+    printf("nand magic: %s\n",nand_magic);
+}
+
+void read_nand_file(){
+    char *p0= &nand[64][0];
+    memset(p0,0xff,sizeof(nand)-64*528);
+    FILE *f = fopen(nc2k_rom.nandFlashPath.c_str(), "rb");
+    if(f==0) {
+        printf("file %s not exist!\n",nc2k_rom.nandFlashPath.c_str());
+        exit(-1);
+    }
+    fseek(f, 0, SEEK_END);
+    long long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);  /* same as rewind(f); */
+    assert(fsize + 64*528 <= (int)sizeof(nand));
+    fread(p0, fsize, 1, f);
+    fclose(f);
+    printf("<nand_file_size=%llu>\n",fsize);
+
+#if 0
+    if(nc2000mode){
+        if(!nc2000_use_2600_rom){
+            //if it's not 2600 rom, then it should always be this
+            memcpy(&nand[0][0]+0x200+0x10 /*512+16=528*/,"ggv nc2000",strlen("ggv nc2000"));
+        }
+        else{
+            if(!nc2600_rom_use_ggvsim){
+                //2600 physical nor expect this to be "ggv nc2010"
+                //nc2kutil dump shows there is a '\n' or 0x0A. But this doesn't matter. It boots either with or without `\n`
+                memcpy(&nand[0][0]+0x200+0x10 /*512+16=528*/,"ggv nc2010\n",strlen("ggv nc2010\n"));
+            }else{
+                memcpy(&nand[0][0]+0x200+0x10 /*512+16=528*/,"ggv nc2000",strlen("ggv nc2000"));
+            }
+        }
+    }
+    if(nc3000mode){
+        memcpy(&nand[0][0]+0x200+0x10 /*512+16=528*/,"ggv nc3000",strlen("ggv nc3000"));
+    }
+#endif
+
+}
+
+void write_nand0_file(string file){
+    if(!nc2000mode &&!nc3000mode) return;
+    if(file.empty()) file=nc2k_rom.nand0Path;
+    else file+=".nand0";
+     FILE *f = fopen(file.c_str(), "wb");
+    fwrite(&nand[0][0], 64*528 , 1 , f);
+    fclose(f);
+}
+
+void write_nand_file(string file){
+    if(!nc2000mode &&!nc3000mode) return;
+    if(file.empty()) file=nc2k_rom.nandFlashPath;
+    else file+=".nand";
+    FILE *f = fopen(file.c_str(), "wb");
+    assert(num_nand_pages*528 + 64*528 <= sizeof(nand));
+    fwrite(&nand[0][0]+ 64*528, num_nand_pages*528, 1 , f);
+    fclose(f);
+}
+void clear_nand_status(){
+    nand_cmd.clear();
+    nand_data.clear();
+    nand_addr.clear();
+    nand_read_cnt = 0;
+}
+
+static uint8_t & nand_peek(int off){
+    static uint8_t dummy;
+    if(off<0 || off>=sizeof(nand)){
+        dummy=0xff;
+        if(debug_level>=1) printf("oops, read nand out of bound %d\n",off);
+        return dummy;
+    }
+    uint8_t *p=(uint8_t*)&nand[0][0];
+    return p[off];
+}
+
+#define nand_read_assert(expr)  \
+    do {  \
+        if(enable_assert_for_wqx_software) assert(expr); \
+        if(!(expr)) { \
+            printf("unexpected nand read %s:%d\n",__FILE__, __LINE__); \
+            clear_nand_status(); \
+            return 0xff; \
+        } \
+    } while(0)
+
+uint8_t read_nand(){
+    bool CLE;
+    bool ALE;
+    bool CE;
+    if(nc3000mode){
+        CLE = ram_io[0x18]&0x20;
+        ALE = ram_io[0x18]&0x10;
+        CE = ram_io[0x18]&0x04;
+        if(CE) {
+            if(debug_level>=1) printf("read while no CE\n");
+        }
+    }
+    if(nc2000mode){
+        CLE = ram_io[0x18]&0x01;
+        ALE = ram_io[0x18]&0x02;
+        CE = ram_io[0x18]&0x40;
+        if(CE) {
+            if(debug_level>=1) printf("read while no CE\n");
+        }
+    }
+    if(CLE && ALE){
+        if(debug_level>=1) printf("oops, in nand read, both CLE and ALE true!\n");
+    }
+
+    //printf("tick=%lld, read %x  %02x\n",tick, addr, ram_io[addr]);
+    uint8_t roa_bbs=ram_io[0x0a];
+    uint8_t ramb_vol=ram_io[0x0d];
+    uint8_t bs=ram_io[0x00];
+   ///////// uint16_t p=nc1020_states.cpu.reg_pc-4;
+
+     if(enable_debug_nand) printf("tick=%llu read $29\n",tick%10000);
+
+    if(nand_cmd.size()==0) {
+        if(debug_level>=1) printf("oops! no nand cmd %d %d %d\n",CLE,ALE,CE);
+        return 0xff;
+    }
+
+    /*
+        special handle of read status after a long time
+    */
+    if(nand_cmd[0]==0x70 && nand_cmd.size()==1 && nand_addr.size()==0 &&nand_data.size()==0) {
+        clear_nand_status();
+        return 0x40;
+    }
+
+    if(nand_cmd[0]==0x90 &&nand_cmd.size()==1 && nand_addr.size()==1 && nand_addr[0]==0x00 &&nand_data.size()==0) {
+        if(nand_read_cnt==0) {
+            nand_read_cnt++;
+            return 0xec;
+        }
+        if(nand_read_cnt==1) {
+            clear_nand_status();
+            return 0x75;
+        }
+        nand_read_assert(false);
+    }
+
+    /*
+        robust check
+    */
+    if(nand_cmd[0]!=0x0 && nand_cmd[0]!=0x1 &&nand_cmd[0]!=0x60 &&nand_cmd[0]!=0x50){
+        printf("<<%x>>!!!\n",(unsigned char)nand_cmd[0]);
+        for(int i=0;i<nand_cmd.size();i++){
+            printf("<%x>",(unsigned char)nand_cmd[i]);
+        }
+        printf("\n");
+        nand_read_assert(false);
+    }
+
+    /*
+        read low/high and read spare
+    */
+    unsigned char cmd=nand_cmd[0];
+    if(cmd ==0 ||cmd==1||cmd==0x50){
+        if(nand_cmd.size()!=1 || nand_addr.size()!=4  ||nand_data.size()!=0){
+            printf("oops cmd size!=5\n");
+            for(int i=0;i<nand_cmd.size();i++){
+                printf("<%x>",(unsigned char)nand_cmd[i]);
+            }
+            printf("\n");
+
+            /*if(nand_cmd.size()==1 && nand_cmd[0]==0x0){
+                printf("oops!! nand_cmd=[0] but trying to read\n");
+                return 0xff;
+            }*/
+            nand_read_assert(false);
+        }
+
+        nand_read_assert(nand_cmd.size()==1 && nand_addr.size()==4 && nand_data.size()==0);
+
+        unsigned char low=nand_addr[0];
+        unsigned char mid=nand_addr[1];
+        unsigned char high=nand_addr[2];
+        unsigned char a25=nand_addr[3]&0x01;
+
+        uint32_t pos=a25*256u*256u+   high*256u+mid;
+
+        /*
+        if(nand_cmd.size()==5&&false){
+            printf("[%x %x]",low,high);
+            
+            for(int i=0;i<nand_cmd.size();i++){
+                printf("<%x>",(unsigned char)nand_cmd[i]);
+            }
+            printf("\n");
+            exit(-1);
+            //printf("<%x;%x,%x:%x,%d>", final, pos, low,cmd,nand_read_cnt);
+        }*/
+        
+        unsigned int x=pos;
+        unsigned int y=low;
+        if(cmd==0x1) y+=256u;
+        if(cmd==0x50) y+=512u;
+        unsigned int final= pos*528u+ y +nand_read_cnt;
+        if(nand_read_cnt!=0||cmd!=0){
+            if(final%528==0) if(debug_level>=1) printf("warn: read %04x accross 528 boundary\n",final);
+        }
+
+        if(nand_read_cnt==0 && enable_debug_nand){
+            printf("[%x %x]",low,high);
+            
+            for(int i=0;i<nand_cmd.size();i++){
+                printf("<%x>",(unsigned char)nand_cmd[i]);
+            }
+            printf("<%x;%x,%x:%x,%d>\n", final, pos, low,cmd,nand_read_cnt);
+        }
+        uint8_t result=nand_peek(final);
+        nand_read_cnt++;
+        //printf("<<%02x>>",result);
+        return result;
+    }
+
+    nand_read_assert(false);
+}
+
+void debug_show_nand_cmd(){
+    if(enable_debug_nand)
+    {
+        for(int i=0;i<nand_cmd.size();i++){
+            printf("<%02x>",(unsigned char)nand_cmd[i]);
+        }
+        printf("\n");
+    }
+}
+
+#define nand_write_assert(expr)  \
+    do {  \
+        if(enable_assert_for_wqx_software) assert(expr); \
+        if(!(expr)) { \
+            printf("unexpected nand write %s:%d\n",__FILE__, __LINE__); \
+            clear_nand_status(); \
+            return; \
+        } \
+    } while(0)
+
+void nand_write(uint8_t value){
+    bool CLE;
+    bool ALE;
+    bool CE;
+    if(nc3000mode){
+        CLE = ram_io[0x18]&0x20;
+        ALE = ram_io[0x18]&0x10;
+        CE = ram_io[0x18]&0x04;
+    }
+    if(nc2000mode){
+        CLE = ram_io[0x18]&0x01;
+        ALE = ram_io[0x18]&0x02;
+        CE = ram_io[0x18]&0x40;
+    }
+    if(CLE && ALE){
+        if(debug_level>=1) printf("oops, in nand write, both CLE and ALE true!\n");
+        return;
+    }
+
+    //printf("tick=%llu write $29 %x  CLE=%d ALE=%d %d\n",tick%10000,value,CLE,ALE,(int)nand_cmd.size());
+    if(enable_debug_nand) printf("tick=%llu write $29 %x  CLE=%d ALE=%d\n",tick%10000,value,CLE,ALE);
+    //printf("tick=%lld, write %x  %02x\n",tick, addr, value);
+    uint8_t roa_bbs=ram_io[0x0a];
+    uint8_t ramb_vol=ram_io[0x0d];
+    uint8_t bs=ram_io[0x00];
+
+    if(CLE){
+        //note: the datasheet says 0xff doesn't need CLE, but in wqx code seems like CLE is always enabled when 0xff is used
+        if(value ==0xff || value == 0x00|| value==0x01 || value ==0x50 ||value==0x60||value ==0x70||value==0x90){
+            debug_show_nand_cmd();
+            if(nand_cmd.size()>0){
+                if(nand_cmd.size()==1 && nand_addr.size()==4 && nand_data.size()==0) nand_write_assert(nand_cmd[0]==0x00||nand_cmd[0]==0x01||nand_cmd[0]==0x50);
+                else if(nand_cmd.size()==2 && nand_addr.size()==3 &&nand_data.size()==0) nand_write_assert(nand_cmd[0]==0x60);
+                else nand_write_assert(false);
+            }
+            clear_nand_status();
+            if(value!=0xff){
+                nand_cmd.push_back(value);
+            }
+            goto out;
+        }
+        if(value ==0x10) {
+            if(nand_cmd[0]==0x50 && nand_cmd.size()== 2&& nand_addr.size()==4 && nand_data.size()==16) {
+                nand_write_assert(nand_cmd[1]==0x80);
+
+                unsigned char low=nand_addr[0];
+                unsigned char mid=nand_addr[1];
+                unsigned char high=nand_addr[2];
+                unsigned char a25=nand_addr[3]&0x01;
+
+                uint32_t pos=a25*256u*256u+high*256u+mid;
+
+                unsigned int x=pos;
+                unsigned int y=low;
+                unsigned int final= pos*528u+ y +512;
+
+                nand_write_assert((final-512)%(528)==0);
+
+                bool warn=false;
+                for(int i=0;i<16;i++){
+                    if(nand_peek(final+i)!=0xff){
+                        warn=true;
+                        //this is allowed, but wqx's software always erase before write
+                        if(forced_erase_before_write) nand_peek(final+i)=0xff;
+                    }
+                    nand_peek(final+i)&=nand_data[i];
+                }
+                if(warn){
+                    if(debug_level>=1) printf("oops writing to non-erased byte at %x!!!!!!!!!!\n",final);
+                }
+                printf("[nand] program spare, offset=%x\n",final);
+                clear_nand_status();
+            }
+            else if(nand_cmd[0]==0x0 && nand_cmd.size()==2 && nand_addr.size()==4 && nand_data.size()==528){
+                nand_write_assert(nand_cmd[1]==0x80);
+
+                unsigned char low=nand_addr[0];
+                unsigned char mid=nand_addr[1];
+                unsigned char high=nand_addr[2];
+                unsigned char a25=nand_addr[3]&0x01;
+
+                uint32_t pos=a25*256u*256u+high*256u+mid;
+
+                unsigned int x=pos;
+                unsigned int y=low;
+                unsigned int final= pos*528u+ y;
+                nand_write_assert(final%(528)==0);
+                printf("[nand] program, offset=%x\n",final);
+
+                bool warn=false;
+                for(int i=0;i<528;i++){
+                    if(nand_peek(final+i)!=0xff){
+                        warn=true;
+                        //this is allowed, but wqx's software always erase before write
+                        if(forced_erase_before_write) nand_peek(final+i)=0xff;
+                    }
+                    nand_peek(final+i)&=nand_data[i];
+                }
+                if(warn){
+                    if(debug_level>=1) printf("oops writing to non-erased byte at %x!!!!!!!!!!\n",final);
+                }
+                clear_nand_status();
+            }
+            else{
+                debug_show_nand_cmd();
+                printf("unexpected situation for cmd 0x10 %d",(int)nand_cmd.size());
+                nand_write_assert(false);
+            }
+            goto out;
+        }
+        if(value==0xd0||value==0x80){
+            if(value==0xd0){
+                nand_write_assert(nand_cmd.size()==1);
+                nand_write_assert(nand_cmd[0]==0x60);
+                nand_write_assert(nand_addr.size()==3);
+                nand_write_assert(nand_data.size()==0);
+
+                unsigned char low=nand_addr[0];
+                unsigned char mid=nand_addr[1];
+                unsigned char high=nand_addr[2]&0x01;
+
+                unsigned int final= (high*256u*256u + mid*256u+low)*528u;
+
+                nand_read_cnt++;
+                char *p=&nand[0][0];
+                printf("[nand] erase, offset=%x\n",final);
+
+                nand_write_assert(final%(32*528)==0);
+                nand_write_assert(final +32*528 <= sizeof(nand));
+                memset(p+final,0xff,32*528);
+            }
+            if(value==0x80){
+                nand_write_assert(nand_cmd.size()>=1);
+                nand_write_assert(nand_cmd[0]==0x50||nand_cmd[0]==0x00);
+                nand_write_assert(nand_addr.size()==0);
+                nand_write_assert(nand_data.size()==0);
+            }
+            nand_cmd.push_back(value);
+            goto out;
+        }
+        nand_write_assert(false);
+    }
+
+    if(ALE){
+        if(nand_cmd.size()==0){
+            printf("got addr %02x while nand_cmd is empty\n",value);
+            nand_write_assert(false);
+        }
+
+        nand_addr.push_back(value);
+        goto out;
+    }
+ 
+
+    if(nand_cmd.size()!=0) {
+        if(nand_cmd[0]==0x50) {
+            nand_write_assert(nand_cmd.size()>=2);
+            nand_write_assert(nand_cmd[1]==0x80);
+            nand_write_assert(nand_cmd.size()<22);
+        }else if (nand_cmd[0]==0x00){
+            nand_write_assert(nand_cmd.size()>=2);
+            nand_write_assert(nand_cmd[1]==0x80);
+            nand_write_assert(nand_cmd.size()<534);
+        }else{
+            nand_write_assert(false);
+        }
+        nand_data.push_back(value);
+    }
+    else{
+        for(int i=0;i<nand_cmd.size();i++){
+            printf("<%02x>",nand_cmd[i]);
+        }
+        printf("[%02x]\n",value);
+        printf("got data %02x while nand_cmd is empty\n",value);
+        nand_write_assert(false);
+    }
+    goto out;
+
+    out:;
+
+    // the out label here is for put some print cmd for debug
+
+    //if(nand_cmd.size()==1&& nand_cmd[0]==0xff) nand_cmd.clear();
+    //printf("bs=%x roa_bbs=%x pc=%x  %x %x %x %x \n",ram_io[0x00], ram_io[0x0a], reg_pc,  Peek16(p), Peek16(p+1),Peek16(p+2),Peek16(p+3));
+    //if(do_inject) wanna_inject=true;
+}

@@ -2,6 +2,7 @@
 #define FONT_ZH_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,17 @@ int font_zh_find_utf8(const char *str);
 
 /* 通过字符索引获取位图数据 */
 const uint8_t *font_zh_get_bitmap_by_index(int idx);
+
+/* V1.0.89: 切换字重 — light=false 用粗体(默认), light=true 用细体.
+ * 下次任何取字操作按新字库绑定; 调用方再触发重绘即可. */
+void font_zh_set_style(bool light);
+
+/* 当前是否使用细字库 */
+bool font_zh_is_light(void);
+
+/* V1.0.92: 查找字库中 ASCII 字符(英文/数字/符号)的索引, 找不到返回 -1
+ * 字库中 ASCII 以 "0x00 0x00 <ascii>" 三字节槽存储, 跟随粗/细字库(冬青 W6/W3)样式. */
+int font_zh_find_ascii(unsigned char c);
 
 /* 旧接口 (已废弃 - 保留兼容) */
 int font_zh_find_char(char c);

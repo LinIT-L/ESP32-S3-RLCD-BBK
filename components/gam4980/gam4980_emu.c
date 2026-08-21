@@ -10,6 +10,7 @@
 #include "font_zh.h"
 #include "audio_player.h"
 #include "virtual_keys.h"
+#include "web_gamepad.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
@@ -266,8 +267,13 @@ display_mode_t gam4980_get_display_mode(void) { return g_display_mode; }
 
 
 /* 兼容旧接口 */
-void gam4980_set_fullscreen(bool fs) { g_display_mode = fs ? DISP_MODE_FULLSCREEN : DISP_MODE_POINT2POINT; }
-bool gam4980_get_fullscreen(void) { return g_display_mode == DISP_MODE_FULLSCREEN; }
+void gam4980_set_fullscreen(int mode)
+{
+    if (mode < 0) mode = 0;
+    if (mode > 2) mode = 2;
+    g_display_mode = (display_mode_t)mode;
+}
+bool gam4980_get_fullscreen(void) { return g_display_mode != DISP_MODE_POINT2POINT; }
 
 /* libretro core callbacks (内部链接) */
 void retro_init(void);
@@ -603,8 +609,9 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
      * fb[idx] 的位 = 7 - ((y_sub<<1) | (x&1)), 其中 y_sub = (inv_y & 3)
      * 黑色 = 清除对应位, 白色 = 设置对应位 */
 
-    if (g_display_mode == DISP_MODE_FULLSCREEN) {
-        /* 全屏模式: 清空整个 fb 为白色 (memset 15KB, 比逐像素快很多) */
+    if (g_display_mode != DISP_MODE_POINT2POINT) {
+        /* 全屏(1) / 拉伸(2) 共用此分支: 源画面拉伸到全屏 400 像素宽
+         * (160x96 -> 400x240 与源比例一致, 拉伸/全屏渲染归一复用) */
         memset(g_lcd->fb, 0xFF, FB_BYTES);
         uint8_t *fb = g_lcd->fb;
 
@@ -667,7 +674,9 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
             menu_draw_status_bar(g_lcd, &fake_settings, NULL);
         }
 
-        {
+        /* V1.0.68+: 虚拟按键启用时不画底部装饰栏与游戏名称
+         * (会与底部 Select/Start 按键区域重叠碍眼) */
+        if (!virtual_keys_is_enabled()) {
             int bottom_y = FS_GAME_Y + FS_SCALED_H;
             /* 左侧装饰三角形 - 直接写 fb 跳过 st7305_draw_pixel */
             {
@@ -863,19 +872,23 @@ static int16_t joypad_state(unsigned id) {
     bool phys = false;
     /* V1.0.68 fix: 屏幕虚拟按键状态 (bit 清 0 = 按下), 与手柄/物理键并联合入 */
     uint8_t vk = virtual_keys_is_enabled() ? virtual_keys_get_joypad() : 0xFF;
+    /* V1.0.xx: 网页手柄 (WiFi AP) 掩码也与 GB joypad 一致 (bit 清 0 = 按下):
+     * bit0=A bit1=B bit2=Select bit3=Start bit4=右 bit5=左 bit6=上 bit7=下.
+     * 开启 WiFi 手柄时蓝牙会关闭, 为避免引擎内再按没反应, 并入各键判定. */
+    uint8_t wg = web_gamepad_is_running() ? web_gamepad_get_joypad_state() : 0xFF;
     switch (id) {
         case RETRO_DEVICE_ID_JOYPAD_A:
-            gp = bt_manager_is_key_pressed(F_CONFIRM) || !(vk & 0x01);
+            gp = bt_manager_is_key_pressed(F_CONFIRM) || !(vk & 0x01) || !(wg & 0x01);
             phys = input_is_held(0);
             break;
         case RETRO_DEVICE_ID_JOYPAD_B:
-            gp = bt_manager_is_key_pressed(F_BACK) || !(vk & 0x02);
+            gp = bt_manager_is_key_pressed(F_BACK) || !(vk & 0x02) || !(wg & 0x02);
             phys = input_is_held(1);
             break;
-        case RETRO_DEVICE_ID_JOYPAD_UP:    gp = bt_manager_is_key_pressed(F_UP)    || !(vk & 0x40); break;
-        case RETRO_DEVICE_ID_JOYPAD_DOWN:  gp = bt_manager_is_key_pressed(F_DOWN)  || !(vk & 0x80); break;
-        case RETRO_DEVICE_ID_JOYPAD_LEFT:  gp = bt_manager_is_key_pressed(F_LEFT)  || !(vk & 0x20); break;
-        case RETRO_DEVICE_ID_JOYPAD_RIGHT: gp = bt_manager_is_key_pressed(F_RIGHT) || !(vk & 0x10); break;
+        case RETRO_DEVICE_ID_JOYPAD_UP:    gp = bt_manager_is_key_pressed(F_UP)    || !(vk & 0x40) || !(wg & 0x40); break;
+        case RETRO_DEVICE_ID_JOYPAD_DOWN:  gp = bt_manager_is_key_pressed(F_DOWN)  || !(vk & 0x80) || !(wg & 0x80); break;
+        case RETRO_DEVICE_ID_JOYPAD_LEFT:  gp = bt_manager_is_key_pressed(F_LEFT)  || !(vk & 0x20) || !(wg & 0x20); break;
+        case RETRO_DEVICE_ID_JOYPAD_RIGHT: gp = bt_manager_is_key_pressed(F_RIGHT) || !(vk & 0x10) || !(wg & 0x10); break;
         /* V1.0.38: 8 功能键只有 4 个, X/Y/L/R/SELECT/START 全部映射到 F_FAV (多功能键).
          * 屏幕虚拟按键的 Select/Start 也归到 F_FAV. */
         case RETRO_DEVICE_ID_JOYPAD_X:
@@ -884,7 +897,8 @@ static int16_t joypad_state(unsigned id) {
         case RETRO_DEVICE_ID_JOYPAD_R:
         case RETRO_DEVICE_ID_JOYPAD_SELECT:
         case RETRO_DEVICE_ID_JOYPAD_START:
-            gp = bt_manager_is_key_pressed(F_FAV) || !(vk & 0x04) || !(vk & 0x08);
+            gp = bt_manager_is_key_pressed(F_FAV) || !(vk & 0x04) || !(vk & 0x08)
+                 || !(wg & 0x04) || !(wg & 0x08);   /* 网页 Select/Start */
             break;
         /* V1.0.46: 补充按键 (F/G/Shift/空格 → BBK 功能1-4)
          * 复用 RetroPad 扩展 ID 16..19, 由 libretro 的 _joyk 映射到对应 BBK 键. */
@@ -1450,8 +1464,23 @@ static game_exit_result_t gam4980_exit_confirm_dialog(void) {
 
         menu_action_t action = input_get_action();
 
+        /* V1.0.xx: 触摸 CONFIRM 区分点击区域 — 点击弹窗外=取消, 内=确认 */
         if (action == MENU_ACTION_CONFIRM) {
-            return GAME_EXIT_CONFIRMED;
+            int tx, ty;
+            if (input_consume_tap(&tx, &ty)) {
+                /* 计算弹窗区域 (与 draw_notice_popup 一致) */
+                const int NOTICE_B = 3, NOTICE_P = 3, NOTICE_H = 3+3+3+3+24;
+                int tw = 5 * 12; /* "退出游戏？" 5字 * 12px */
+                int W = NOTICE_B*2 + NOTICE_P*2 + tw;
+                int H = NOTICE_H;
+                int px = (ST7305_WIDTH - W) / 2;
+                int py = (ST7305_HEIGHT - H) / 2;
+                if (tx >= px && tx < px + W && ty >= py && ty < py + H) {
+                    return GAME_EXIT_CONFIRMED;  /* 点击弹窗内 → 确认 */
+                }
+                return GAME_EXIT_CANCEL;          /* 点击弹窗外 → 取消 */
+            }
+            return GAME_EXIT_CONFIRMED;  /* 物理键 CONFIRM → 确认 */
         }
         /* V1.0.68 fix: 手柄确认键 (F_CONFIRM) 上升沿 → 立即退出 */
         bool now_confirm = bt_manager_is_key_pressed(F_CONFIRM);
@@ -1488,8 +1517,8 @@ static game_exit_result_t gam4980_exit_confirm_dialog(void) {
 
 game_exit_result_t gam4980_emu_run(void) {
     g_running = true;
-    /* V1.0.68 fix: BBK 游戏不走通用 game_run_loop, 必须在此启用屏幕虚拟按键 */
-    virtual_keys_set_enabled(g_menu.game_virtual_keys);
+    /* V1.0.68 fix: BBK 游戏不走通用 game_run_loop, 必须在此启用屏幕虚拟按键 (V1.0.94: 三态) */
+    virtual_keys_set_enabled(menu_vkey_effective(&g_menu));
     s_home_prev = false;  /* 每次进入游戏重置退出键边沿状态 */
     game_exit_result_t exit_result = GAME_EXIT_CONFIRMED;
     ESP_LOGI(TAG, "开始运行游戏循环 (长按 BOOT 1秒 或 按 退出到菜单 键 退出, 60fps)");

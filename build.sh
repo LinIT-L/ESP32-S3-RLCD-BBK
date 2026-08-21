@@ -10,6 +10,7 @@
 #   SYS_ROM_DIR          系统 ROM 来源目录, 含 4988.font / 0E00.DAT (可选, 缺省时跳过组装 system.bin)
 
 export IDF_SKIP_CHECK_SUBMODULES=1
+export ESP_ROM_ELF_DIR="${HOME}/.espressif/tools/esp-rom-elfs/20241011"
 
 # 项目根目录 (脚本所在)
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"

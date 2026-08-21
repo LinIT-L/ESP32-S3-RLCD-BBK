@@ -30,6 +30,8 @@ static const char *const s_files[FAV_ENGINE_MAX] = {
     "/sdcard/system/fav_nes.txt",   /* FAV_ENGINE_FC  (NES) */
     "/sdcard/system/fav_ab.txt",    /* FAV_ENGINE_AB  */
     "/sdcard/system/fav_book.txt",  /* FAV_ENGINE_BOOK (电子书) */
+    "/sdcard/system/fav_wqx.txt",   /* FAV_ENGINE_WQX (文曲星) */
+    "/sdcard/system/fav_vpet.txt",  /* FAV_ENGINE_VPET (暴龙机) */
 };
 
 /* 各引擎独立存储: 路径二维数组 + 数量 + 指针数组.
@@ -40,8 +42,9 @@ static int s_count[FAV_ENGINE_MAX];
  * 原因: 直接返回 (const char **)s_paths 是 UB — 2D 数组的内存布局
  *       (连续 160 字节/行) 不等同于指针数组的布局 (每行 4 字节指针).
  *       使用单独的指针数组可避免这个问题, 同时 favorites_list() 返回的
- *       指针就是 s_paths[e][i] 的稳定地址, 不会被后续 add/remove 影响. */
-static const char *s_path_ptrs[FAV_ENGINE_MAX][FAVORITES_MAX];
+ *       指针就是 s_paths[e][i] 的稳定地址, 不会被后续 add/remove 影响.
+ * V1.0.96: 移到 PSRAM (仅在收藏栏渲染/遍历时用, 访问频率极低, 省 1.5KB 内部 RAM). */
+EXT_RAM_BSS_ATTR static const char *s_path_ptrs[FAV_ENGINE_MAX][FAVORITES_MAX];
 
 /* 确保 /sdcard/system 目录存在 (若失败静默, 后续 save 也会失败) */
 static void ensure_dir(void) {
@@ -58,6 +61,8 @@ fav_engine_t favorites_engine_for_path(const char *path) {
     if (strncmp(path, "/sdcard/nes/", 12) == 0) return FAV_ENGINE_FC;  /* NES 合并到 FC */
     if (strncmp(path, "/sdcard/AB/", 11) == 0)  return FAV_ENGINE_AB;
     if (strncmp(path, "/sdcard/books/", 13) == 0) return FAV_ENGINE_BOOK;
+    if (strncmp(path, "/sdcard/lavaXOS/", 17) == 0)  return FAV_ENGINE_WQX;  /* wqx 文曲星 */
+    if (strncmp(path, "/sdcard/vpet/", 13) == 0)     return FAV_ENGINE_VPET; /* 暴龙机 */
     return FAV_ENGINE_BBK;
 }
 
@@ -226,4 +231,18 @@ const char *const *favorites_list(fav_engine_t e, int *count) {
 int favorites_count(fav_engine_t e) {
     if (e < 0 || e >= FAV_ENGINE_MAX) return 0;
     return s_count[e];
+}
+
+/* V1.0.9x: 清理所有引擎中"文件已不存在"(被改名/删除)的失效收藏.
+ * 打开收藏栏时调用. 向后遍历, 因为 favorites_remove 是前移式删除, 低位索引不受影响. */
+void favorites_prune_missing(void) {
+    for (int e = 0; e < FAV_ENGINE_MAX; e++) {
+        for (int i = s_count[e] - 1; i >= 0; i--) {
+            struct stat st;
+            if (stat(s_paths[e][i], &st) != 0) {
+                ESP_LOGW(TAG, "清理失效收藏: %s", s_paths[e][i]);
+                favorites_remove((fav_engine_t)e, s_paths[e][i]);
+            }
+        }
+    }
 }

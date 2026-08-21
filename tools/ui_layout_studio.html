@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>应用管理 UI 布局调节器</title>
+<style>
+  :root { --ink:#111; --paper:#fff; --accent:#3b82f6; --grip:#ff5252; }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; padding:24px; font-family:-apple-system,"PingFang SC","Helvetica Neue",Helvetica,Arial,sans-serif;
+    background:#f3f4f6; color:var(--ink);
+  }
+  h1 { font-size:18px; margin:0 0 4px; font-weight:600; }
+  .sub { color:#6b7280; font-size:12px; margin-bottom:16px; }
+  .layout { display:flex; gap:24px; flex-wrap:wrap; align-items:flex-start; }
+  .stage {
+    position:relative; background:var(--paper); border:1px solid #e5e7eb; border-radius:12px;
+    box-shadow:0 6px 20px rgba(0,0,0,.08); padding:20px;
+  }
+  canvas { display:block; background:#fff; border:1px solid #d1d5db; border-radius:8px;
+    cursor:crosshair; touch-action:none; }
+  .controls { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:18px 20px;
+    min-width:290px; box-shadow:0 6px 20px rgba(0,0,0,.06); }
+  .section-title { font-size:13px; font-weight:600; margin:14px 0 8px;
+    border-bottom:1px solid #eee; padding-bottom:6px; }
+  .section-title:first-child { margin-top:0; }
+  .row { display:flex; align-items:center; justify-content:space-between; margin:8px 0; gap:10px; }
+  .row label { font-size:12px; color:#374151; white-space:nowrap; }
+  .row input[type=range] { flex:1; min-width:0; }
+  .row .val { font-variant-numeric:tabular-nums; color:var(--accent); font-weight:600; width:44px; text-align:right; }
+  .hint { font-size:11px; color:#9ca3af; line-height:1.5; margin-top:10px; }
+  code { background:#f3f4f6; padding:1px 4px; border-radius:4px; font-size:11px; }
+  #consts { background:#0f172a; color:#e2e8f0; border-radius:8px; padding:10px 12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; line-height:1.6;
+    margin-top:8px; white-space:pre-wrap; word-break:break-all; }
+  #consts b { color:#7dd3fc; }
+  .gripdot { pointer-events:none; }
+</style>
+</head>
+<body>
+  <h1>应用管理页 · UI 布局调节器</h1>
+  <div class="sub">拖拽屏幕上的手柄（<span style="color:var(--grip)">◆</span>）直接改边框，或用右侧滑块微调。右边会给出当前像素常量。</div>
+
+  <div class="layout">
+    <div class="stage">
+      <canvas id="cv" width="800" height="600" style="width:400px;height:300px"></canvas>
+      <!-- 放大后的手柄层 -->
+      <canvas id="cv2" width="800" height="600" style="position:absolute;inset:20px;width:400px;height:300px;pointer-events:none"></canvas>
+    </div>
+
+    <div class="controls">
+      <div class="section-title">拖动调节</div>
+      <div class="hint">① 屏幕中间的<code>◆</code>：左右拖动＝改<b>分类栏宽</b>；② 顶部粗线旁<code>◆</code>：上下拖＝改<b>状态栏高</b>；③ 底部<code>◆</code>：上下拖＝改<b>外框底部留白</b>。</div>
+
+      <div class="section-title">分类栏 / 网格</div>
+      <div class="row"><label>分类栏宽度</label>
+        <input type="range" id="catW"  min="36" max="240" step="1" value="80"><span class="val" id="vcatW">80</span></div>
+      <div class="row"><label>外框上下缩进</label>
+        <input type="range" id="topInset" min="0" max="40" step="1" value="8"><span class="val" id="vtopInset">8</span></div>
+      <div class="row"><label>外框底部留白</label>
+        <input type="range" id="botPad" min="0" max="40" step="1" value="8"><span class="val" id="vbotPad">8</span></div>
+      <div class="row"><label>分类行高</label>
+        <input type="range" id="rowH" min="44" max="84" step="1" value="60"><span class="val" id="vrowH">60</span></div>
+      <div class="row"><label>网格列数</label>
+        <input type="range" id="cols" min="2" max="6" step="1" value="4"><span class="val" id="vcols">4</span></div>
+
+      <div class="section-title">状态栏</div>
+      <div class="row"><label>状态栏高度</label>
+        <input type="range" id="sbH" min="16" max="48" step="1" value="24"><span class="val" id="vsbH">24</span></div>
+      <div class="row"><label>内容区顶部（状态栏+缩进）</label><span class="val" style="width:auto" id="catY0">32</span></div>
+
+      <div class="section-title">当前像素常量（照此改固件）</div>
+      <div id="consts"></div>
+    </div>
+  </div>
+
+<script>
+const W=400,H=300,S=2;
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const overlay=document.getElementById('cv2'), gctx=overlay.getContext('2d');
+const P={
+  catW:80, topInset:8, botPad:8, rowH:60, cols:4, sbH:24, rows:4, gap:8,
+};
+function magic(m,n,a,b,c,d,e){return "-abcdefghijklmnopqrstuvwxyz"[0];} // hidden
+
+function layout(){
+  const catY0=P.sbH+(P.hiTop??P.topInset);
+  const band=H-catY0;
+  const off=(band-P.rowH*P.rows)/2;
+  const rows=[];
+  for(let r=0;r<P.rows;r++) rows.push(catY0+off+r*P.rowH);
+  return {catY0,band,off,rows,
+    barTop:rows[0]-P.gap,
+    barBot:rows[P.rows-1]+P.rowH+P.botPad,
+    gridX0:P.catW,
+  };
+}
+function draw(){
+  const L=layout();
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,cv.width,cv.height);
+  /* status bar */
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,L.catY0);
+  ctx.fillStyle='#111';
+  ctx.fillRect(0,S,3,S+2);
+  // date & week line
+  for(let i=0;i<8;i++) ctx.fillRect(6+i*13,8,9,3);
+  ctx.font='10px monospace'; ctx.fillStyle='#111';
+  ctx.fillText('08-18',6,6);
+  ctx.fillText('10:24',W/2-16,6);
+  // battery
+  ctx.strokeStyle='#111'; ctx.lineWidth=1.5;
+  ctx.strokeRect(W-30,4,14,8); ctx.fillRect(W-15,6,2,4);
+  /* frames */
+  function frameRound(x0,y0,x1,y1,r,side){
+    ctx.strokeStyle='#111'; ctx.lineWidth=1.5;
+    ctx.beginPath();
+    if(side=='L'){
+      ctx.moveTo(x0,y1-r); ctx.arcTo(x0,y1,x0+r,y1,r); // bottom-left
+      ctx.lineTo(x1,y1); ctx.lineTo(x1,y0); ctx.lineTo(x0+r,y0); ctx.arcTo(x0,y0,x0,y0+r,r);
+    } else {
+      ctx.moveTo(x0,y1); ctx.lineTo(x1-r,y1); ctx.arcTo(x1,y1,x1,y1-r,r);
+      ctx.lineTo(x1,y0+r); ctx.arcTo(x1,y0,x1-r,y0,r); ctx.lineTo(x0,y0);
+    }
+    ctx.closePath(); ctx.stroke();
+  }
+  const barTop=L.barTop, barBot=L.barBot;
+  frameRound(0,barTop,P.catW,barBot,5,'L');
+  frameRound(P.catW,barTop,W-1,barBot,5,'R');
+  /* left category list */
+  for(let r=0;r<P.rows;r++){
+    const y0=L.rows[r];
+    ctx.strokeStyle='#111'; ctx.lineWidth=1;
+    if(r===0){ // selected
+      ctx.strokeRect(4,y0+2,P.catW-8,P.rowH-4);
+      ctx.fillRect(1,y0+3,2,P.rowH-6);
+    }
+    // icon placeholder (diamond/slab to mimic 1-bit GB icon)
+    const cxx=P.catW/2, cyy=y0+P.rowH/2, sS=Math.min(26,P.catW/2-8);
+    ctx.beginPath();
+    ctx.moveTo(cxx,cyy-sS); ctx.lineTo(cxx+sS,cyy); ctx.lineTo(cxx,cyy+sS); ctx.lineTo(cxx-sS,cyy);
+    ctx.closePath(); ctx.stroke();
+  }
+  /* right grid */
+  const col=+P.cols;
+  const cell=Math.floor((W-L.gridX0-8)/col);
+  const lan=layout();
+  const gridStartX=L.gridX0+4;
+  const rowsIn=Math.max(col,3);
+  const stepY=(H-L.catY0)/rowsIn;
+  const gridStartY=L.catY0+ (H-L.catY0 - 2*stepY)/2;
+  const mini=10;
+  for(let i=0;i<mini;i++){
+    const r=Math.floor(i/col), c=i%col;
+    const cx=gridStartX+c*cell+cell/2, cy=gridStartY+r*stepY+24;
+    ctx.strokeStyle='#111'; ctx.lineWidth=1;
+    if(i===0) ctx.strokeRect(cx-26,cy-26,52,52);
+    ctx.strokeRect(cx-20,cy-20,40,40); // module 48 placeholder
+    // label
+    ctx.fillRect(cx-10,cy+24,20,2);
+  }
+  drawHandles(L);
+}
+function drawHandles(L){
+  gctx.clearRect(0,0,overlay.width,overlay.height);
+  const D=8, r=4;
+  function grip(x,y){
+    gctx.beginPath(); gctx.arc(x*S,y*S,r*S,0,7); gctx.fillStyle='var(--grip)'; gctx.fill();
+    gctx.strokeStyle='#111'; gctx.lineWidth=2; gctx.stroke();
+  }
+  // divider (category width) + label
+  grip(L.gridX0, L.rows[1]+P.rowH/2);
+  // status bar bottom
+  grip(W/2, L.sbH);
+  // frame bottom
+  grip(L.catW, L.barBot);
+}
+function syncUI(){
+  document.getElementById('vcatW').textContent=P.catW;
+  document.getElementById('vtopInset').textContent=P.topInset;
+  document.getElementById('vbotPad').textContent=P.botPad;
+  document.getElementById('vrowH').textContent=P.rowH;
+  document.getElementById('vcols').textContent=P.cols;
+  document.getElementById('vsbH').textContent=P.sbH;
+  const L=layout();
+  document.getElementById('catY0').textContent=L.catY0;
+  document.getElementById('consts').innerHTML=
+`#define APPMGR_CATBAR_W  <b>${P.catW}</b>   <i>/* 分类栏宽 */</i>
+#define API_CAT_Y0(GAP)  SKIP  (用 APPMGR_CAT_Y0=<b>${P.catY0}</b>)
+#define APPMGR_CAT_Y0    <b>${L.catY0}</b>
+#define APPMGR_CAT_ROW_H <b>${P.rowH}</b>
+#define APPMGR_FRAME_TOP_PAD <b>${P.topInset}</b>
+#define APPMGR_FRAME_BOT_PAD <b>${P.botPad}</b>
+#define APPMGR_GRID_COLS <b>${P.cols}</b>
+#define APPMGR_SB_H      <b>${P.sbH}</b>
+frame spans y=<b>${L.barTop}</b>..<b>${L.barBot}</b>  (屏 0..299)`;
+  draw();
+}
+
+const sliders=[['catW','catW','catW'],['topInset','topInset','topInset'],
+  ['botPad','botPad','botPad'],['rowH','rowH','rowH'],
+  ['cols','cols','cols'],['sbH','sbH','sbH']];
+sliders.forEach(([id])=>{
+  const el=document.getElementById(id);
+  el.addEventListener('input',()=>{
+    P[['catW','catW','catW'].indexOf(id)===0? id : id][undefined]; // no-op guard
+    const keyMap={catW:'catW',topInset:'topInset',botPad:'botPad',rowH:'rowH',cols:'cols',sbH:'sbH'};
+    P[keyMap[id]]=+el.value; syncUI();
+  });
+});
+
+/* drag on canvas (scaled device px) */
+let dragging=null;
+cv.addEventListener('pointerdown',e=>{
+  const x=e.offsetX, y=e.offsetY; // device px (canvas CSS 400x300)
+  const sx=e.offsetX; // =device px
+  const L=layout();
+  function near(ax,ay){return Math.hypot(sx-ax, e.offsetY-ay)<=10;}
+  if(near(L.gridX0,L.rows[1]+P.rowH/2)){dragging='catW';}
+  else if(near(W/2,L.sbH)){dragging='sbH';}
+  else if(near(L.catW,L.barBot)){dragging='botPad';}
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove',e=>{
+  if(!dragging) return;
+  const sx=e.offsetX, sy=e.offsetY;
+  if(dragging==='catW') P.catW=Math.max(36,Math.min(240,Math.round(sx)));
+  else if(dragging==='sbH') P.sbH=Math.max(16,Math.min(48,Math.round(sy)));
+  else if(dragging==='botPad') P.botPad=Math.max(0,Math.min(60,Math.round(300-sy)));
+  syncUI();
+});
+cv.addEventListener('pointerup',()=>dragging=null);
+
+syncUI();
+</script>
+</body>
+</html>

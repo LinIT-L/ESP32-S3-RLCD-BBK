@@ -3,72 +3,51 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BBK 固件刷写器</title>
+<title>BBK 固件刷写</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-         background: #f4f6f8; color: #222; display: flex; justify-content: center; padding: 32px 16px; }
-  .wrap { width: 100%; max-width: 560px; }
-  h1 { font-size: 26px; margin-bottom: 6px; }
-  .sub { color: #666; margin-bottom: 24px; font-size: 14px; }
-  .card { background: #fff; border: 1px solid #e3e6ea; border-radius: 10px;
-          padding: 20px; margin-bottom: 16px; }
-  .card h2 { font-size: 16px; margin-bottom: 14px; }
-  label { display: block; padding: 8px 0; cursor: pointer; font-size: 15px; }
-  #fwInfo { margin-top: 10px; font-size: 13px; color: #2b6cb0; }
-  button { width: 100%; padding: 14px; font-size: 17px; font-weight: 600;
-           color: #fff; background: #2b6cb0; border: 0; border-radius: 10px; cursor: pointer; }
+         background: #f4f6f8; color: #222; padding: 10px; }
+  .wrap { width: 100%; max-width: 360px; margin: 0 auto; }
+  .card { background: #fff; border: 1px solid #e3e6ea; border-radius: 8px; padding: 12px; }
+  .title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+  .ver { font-size: 11px; color: #999; font-weight: 400; margin-left: 6px; }
+  label { display: flex; align-items: center; gap: 6px; padding: 4px 0; cursor: pointer; font-size: 13px; }
+  input[type="radio"] { margin: 0; }
+  #fwInfo { margin: 6px 0 10px; font-size: 12px; color: #2b6cb0; word-break: break-all; }
+  button { width: 100%; padding: 10px; font-size: 15px; font-weight: 600;
+           color: #fff; background: #2b6cb0; border: 0; border-radius: 8px; cursor: pointer; }
   button:disabled { background: #9bb7d4; cursor: not-allowed; }
   button.busy { background: #d69e2e; }
-  #status { margin-top: 14px; font-size: 15px; min-height: 22px; }
-  #log { margin-top: 10px; font-family: Menlo, Consolas, monospace; font-size: 12px;
-         color: #444; background: #0d1117; color: #9ecbff; border-radius: 8px;
-         padding: 12px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; display: none; }
-  details { margin-top: 16px; font-size: 14px; color: #555; }
-  details summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
-  details ol { padding-left: 20px; line-height: 1.9; }
-  .warn { color: #c0392b; font-size: 13px; margin-top: 8px; }
+  #status { margin-top: 8px; font-size: 13px; min-height: 18px; }
+  #log { margin-top: 8px; font-family: Menlo, Consolas, monospace; font-size: 11px;
+         color: #9ecbff; background: #0d1117; border-radius: 6px;
+         padding: 8px; max-height: 100px; overflow-y: auto; white-space: pre-wrap; display: none; }
+  .warn { color: #c0392b; font-size: 12px; margin-top: 6px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>BBK 固件刷写器</h1>
-  <p class="sub">通过浏览器直接给 ESP32-S3 设备烧录固件 · 需 Chrome / Edge(支持 WebSerial)</p>
-
   <div class="card">
-    <h2>选择固件</h2>
-    <label><input type="radio" name="src" value="site" checked> GitHub 固件：V1.1 完整 16MB 镜像（推荐）</label>
-    <label><input type="radio" name="src" value="local"> 本地文件（选择 .bin 文件）</label>
+    <div class="title">BBK 固件刷写 <span class="ver">v2.2</span></div>
+    <label><input type="radio" name="src" value="github" checked> GitHub 固件（推荐）</label>
+    <label><input type="radio" name="src" value="web"> 网站固件</label>
+    <label><input type="radio" name="src" value="local"> 本地文件</label>
     <input type="file" id="fileInput" accept=".bin" hidden>
-    <p id="fwInfo">已选：GitHub 仓库 V1.1 16MB 完整镜像（写入地址 0x0）</p>
+    <p id="fwInfo">GitHub Release v1.1 · 16MB 完整镜像</p>
   </div>
 
-  <button id="flashBtn">连接设备并烧录</button>
+  <button id="flashBtn">连接并烧录</button>
   <p id="status"></p>
   <div id="log"></div>
   <p class="warn" id="warn" style="display:none"></p>
-
-  <details>
-    <summary>使用说明</summary>
-    <ol>
-      <li>使用 <b>Chrome 或 Edge</b> 浏览器打开本页（必须 HTTPS）</li>
-      <li>用 USB 数据线连接设备</li>
-      <li>选择固件：GitHub 镜像（默认），或点「本地文件」选电脑上的 .bin</li>
-      <li>点击「连接设备并烧录」，在弹出的窗口选择设备端口</li>
-      <li>等待烧录完成（约 3-5 分钟），完成后设备自动重启</li>
-      <li>烧录过程中<b>请勿断开 USB 或关闭页面</b></li>
-    </ol>
-  </details>
 </div>
 
 <script type="module">
 import { ESPLoader, Transport } from './esptool-js.bundle.js';
 
-/* V1.1: 固件从 GitHub 仓库拉取 — jsDelivr CDN 优先 (国内可访问), 失败兜底 GitHub raw */
-const FW_URLS = [
-  'https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/flash/ESP32-S3-RLCD-BBK-16MB.bin',
-  'https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/flash/ESP32-S3-RLCD-BBK-16MB.bin',
-];
+const FW_GITHUB = 'https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases/download/v1.1/ESP32-S3-RLCD-BBK-16MB.bin';
+const FW_WEB = 'https://bbk.linit.cn/flash/ESP32-S3-RLCD-BBK-16MB.bin';
 const FLASH_ADDR = 0x0;
 const $ = (id) => document.getElementById(id);
 
@@ -82,17 +61,22 @@ function log(msg) {
 $('flashBtn').addEventListener('click', async () => {
   const btn = $('flashBtn');
   const status = $('status');
+  let port = null;
+  let transport = null;
   try {
     /* 1. 固件来源 */
     let data;
     const src = document.querySelector('input[name="src"]:checked').value;
-    if (src === 'site') {
-      status.textContent = '正在从 GitHub 下载固件…';
+    if (src === 'github' || src === 'web') {
+      const urls = src === 'github' ? [FW_GITHUB, FW_WEB] : [FW_WEB];
+      status.textContent = '正在下载固件…';
       let r = null;
-      for (const u of FW_URLS) {
-        try { r = await fetch(u); if (r.ok) break; } catch (e) {}
+      let used = '';
+      for (const u of urls) {
+        try { r = await fetch(u); if (r.ok) { used = u; break; } } catch (e) {}
       }
       if (!r || !r.ok) throw new Error('固件下载失败, 请检查网络或改用本地文件');
+      if (src === 'github' && used === FW_WEB) log('GitHub 固件下载失败，已自动改用网站固件');
       data = await r.arrayBuffer();
     } else {
       const f = $('fileInput').files[0];
@@ -106,12 +90,14 @@ $('flashBtn').addEventListener('click', async () => {
     btn.classList.add('busy');
     btn.textContent = '烧录中…';
     status.textContent = '请在弹出的窗口中选择设备端口…';
-    const port = await navigator.serial.requestPort();
+    port = await navigator.serial.requestPort();
     await port.open({ baudRate: 460800 });
     log('串口已连接，正在初始化…');
 
-    const transport = new Transport(port, true);
-    const loader = new ESPLoader(transport, { baudrate: 460800 });
+    transport = new Transport(port, true);
+    // USB-Serial/JTAG (PID 0x1001) 不需要也无法换波特率, 保持 115200 跳过 changeBaud 重连
+    const isUsbJtag = port.getInfo().usbProductId === 0x1001;
+    const loader = new ESPLoader({ transport, baudrate: isUsbJtag ? 115200 : 460800 });
     await loader.main();
     const chip = loader.chip ? loader.chip.chip_name : '未知';
     log('芯片识别: ' + chip);
@@ -121,6 +107,12 @@ $('flashBtn').addEventListener('click', async () => {
     await loader.writeFlash({
       fileArray: [{ data, address: FLASH_ADDR }],
       eraseAll: true,
+      flashSize: 'keep',
+      compress: true,
+      reportProgress: (fileIndex, written, total) => {
+        const pct = total > 0 ? Math.round((written / total) * 100) : 0;
+        status.textContent = '正在烧录… ' + pct + '%（请勿断开）';
+      },
     });
 
     /* 4. 复位 */
@@ -129,12 +121,21 @@ $('flashBtn').addEventListener('click', async () => {
     log('烧录完成，设备已重启');
   } catch (err) {
     console.error(err);
-    status.textContent = '❌ ' + (err.message || err);
-    log('错误: ' + (err.message || err));
+    const msg = err.message || String(err);
+    let tip = '';
+    if (msg.includes('already open')) {
+      tip = '（端口已被占用：请关闭其它打开了本刷写页面的标签页/窗口，再重新点“连接并烧录”）';
+    } else if (msg.includes('NotFoundError') || msg.includes('找不到')) {
+      tip = '（未找到设备：请确认设备已连接并处于下载模式）';
+    }
+    status.textContent = '❌ ' + msg + tip;
+    log('错误: ' + msg + tip);
   } finally {
+    try { if (transport) await transport.disconnect(); } catch (e) {}
+    try { if (port) await port.close(); } catch (e) {}
     btn.disabled = false;
     btn.classList.remove('busy');
-    btn.textContent = '连接设备并烧录';
+    btn.textContent = '连接并烧录';
   }
 });
 
@@ -145,10 +146,10 @@ document.querySelectorAll('input[name="src"]').forEach(r => {
       $('fileInput').click();
       $('fileInput').addEventListener('change', () => {
         const f = $('fileInput').files[0];
-        $('fwInfo').textContent = '已选本地文件: ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB)';
+        $('fwInfo').textContent = '本地文件 · ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MB)';
       });
     } else {
-      $('fwInfo').textContent = '已选：GitHub 仓库 V1.1 16MB 完整镜像（写入地址 0x0）';
+      $('fwInfo').textContent = r.value === 'github' ? 'GitHub Release v1.1 · 16MB 完整镜像' : '本网站固件 · 16MB 完整镜像';
     }
   });
 });

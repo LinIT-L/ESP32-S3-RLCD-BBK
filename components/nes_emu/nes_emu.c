@@ -75,7 +75,7 @@ typedef struct {
 static nes_emu_instance_t *s_instance = NULL;
 static bool s_core_inited = false;
 static bool s_task_running = false;
-static bool s_fullscreen = true;   /* NES 默认拉伸全屏 (菜单可切点对点) */
+static int s_fullscreen = 2;   /* NES 显示模式: 0=点对点, 1=全屏, 2=拉伸 (默认拉伸) */
 static uint32_t s_frame_us = NES_EMU_FRAME_US;   /* NTSC 60fps; PAL 卡带切 50fps */
 /* event_init() 会向 nesinput 注册 joypad, 重复调用会累积重复条目;
  * 参考 esp-box-emu init_nes 只做一次, 这里跨会话也只做一次. */
@@ -271,7 +271,7 @@ static void nes_emu_task(void *arg)
 
     nes_emu_set_joypad(0xFF);
     s_instance = NULL;
-    board_rlcd_set_nes_shade_source(NULL, 0, 0, false);
+    board_rlcd_set_nes_shade_source(NULL, 0, 0, 0);
     /* 恢复默认 30Hz 节流, 避免影响后续 GB/GBC 引擎 */
     board_rlcd_video_task_set_interval_us(66667);   /* 15Hz */
     board_rlcd_video_task_stop();
@@ -383,11 +383,14 @@ esp_err_t nes_emu_start(const char *path)
     nes_rom_size = (size_t)sz;
     /* 诊断: iNES 头制式字节 (byte10 bit0 / byte12 bit1=PAL), 用于判断卡带是否 PAL */
     if (sz >= 16) {
-        ESP_LOGI(TAG, "ROM header: b9=%02x b10=%02x b11=%02x b12=%02x b13=%02x",
-                 nes_rom_data[9], nes_rom_data[10], nes_rom_data[11],
+        ESP_LOGI(TAG, "ROM header: b4=%02x b5=%02x b6=%02x b7=%02x b8=%02x b9=%02x b10=%02x b11=%02x b12=%02x b13=%02x",
+                 nes_rom_data[4], nes_rom_data[5], nes_rom_data[6], nes_rom_data[7],
+                 nes_rom_data[8], nes_rom_data[9], nes_rom_data[10], nes_rom_data[11],
                  nes_rom_data[12], nes_rom_data[13]);
         s_frame_us = (nes_rom_data[12] & 0x02) ? 20000u : NES_EMU_FRAME_US;
     }
+    /* 先清屏再画进度条, 避免 progress_cb(50) 画的边框/文件名被后续 board_rlcd_clear 冲掉 */
+    board_rlcd_clear(BOARD_RLCD_COLOR_WHITE);
     if (s_progress_cb) s_progress_cb(50);
 
     if (nes_insertcart(path, nes_context) != 0) {
@@ -408,8 +411,6 @@ esp_err_t nes_emu_start(const char *path)
     nes_prep_emulation(NULL, nes_context);
     nes_reset(SOFT_RESET);
     nes_emu_load_sram();
-    /* 清屏: 避免菜单/上一局的残留叠在 NES 画面上 (1x 四周留白区尤其明显) */
-    board_rlcd_clear(BOARD_RLCD_COLOR_WHITE);
     if (s_progress_cb) s_progress_cb(100);
 
     nes_emu_instance_t *inst = heap_caps_calloc(1, sizeof(*inst), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -475,9 +476,11 @@ void nes_emu_resume(void)
     }
 }
 
-void nes_emu_set_fullscreen(bool fs)
+void nes_emu_set_fullscreen(int mode)
 {
-    s_fullscreen = fs;
+    if (mode < 0) mode = 0;
+    if (mode > 2) mode = 2;
+    s_fullscreen = mode;
     if (s_core_inited && nes_video_shade_packed) {
         board_rlcd_set_nes_shade_source(nes_video_shade_packed, NES_SCREEN_WIDTH,
                                         NES_VISIBLE_HEIGHT, s_fullscreen);

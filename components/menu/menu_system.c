@@ -4,6 +4,7 @@
  * - 3 键导航: 左/右/确认 + 退出
  */
 #include "menu_system.h"
+#include "app_meta.h"
 #include "wallpapers.h"
 #include "esp_timer.h"
 #include "favorites.h"
@@ -13,6 +14,8 @@
 #include "file_browser.h"
 #include "bt_manager.h"
 #include "bt_icon_png.h"   /* 状态栏蓝牙图标 (来自桌面图标文件夹 蓝牙.png) */
+#include "status_icons12.inc"   /* 状态栏12x12图标: 声音/数据传输 (来自桌面图标文件夹 声音.png/数据传输.png) */
+#include "cat_icons.inc"        /* 应用管理侧栏四分类专属图标: 引擎/独立游戏/工具/其他 (不放主菜单) */
 #if WIFI_SUPPORT
 #include "wifi_manager.h"
 #include "esp_http_client.h"
@@ -20,8 +23,10 @@
 #include "audio_player.h"
 #include "web_gamepad.h"
 #include "virtual_keys.h"
+#include "input.h"            /* V1.0.9x: 主菜单长按删除用 input_touch_hold_ms */
+bool input_touch_start_pos(int *x, int *y);   /* V1.0.9x: 触控按下起点 (防止头文件遮蔽) */
+static uint8_t vpet_aa_get(void);             /* V1.0.9x: 暴龙机独立抗锯齿 (定义在文件后部) */
 #include "gb_emu.h"
-#include "gbc_emu.h"
 #include "nes_emu.h"
 #include "arduboy_avr.h"
 #include "engine_manager.h"
@@ -29,6 +34,12 @@
 #include "book_reader.h"
 #include "tone_player.h"   /* V1.0.68: 方波直驱音调播放器 */
 #include "touch_panel.h"   /* V1.0.68: 禁用触摸屏 */
+#include "usb_hid.h"       /* V1.0.69: USB HID 键鼠 */
+#include "driver/usb_serial_jtag.h"   /* usb_serial_jtag_is_connected(): 串口数据线是否连接电脑 */
+#include "mini_apps.h"      /* V1.0.75: 迷你应用 (独立小工具/小游戏启动器) */
+#include "diagnosis.h"      /* V1.0.9x: 故障诊断应用 */
+#include "font_zh16.h"      /* V1.0.90: 应用管理左侧分类标题 16px 点阵宋体 */
+#include "font8x16_zh.h"    /* V1.0.93: 16px 中文内嵌的英文/数字/符号 8x16 标准点阵 */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,13 +64,85 @@
 extern void input_set_gamepad_nav_enabled(bool enabled);
 /* GB/GBC joypad 掩码 (低电平有效), 供 GB/GBC 模拟器每帧查询按键状态 */
 extern uint8_t input_get_held_gb_joypad(void);
+/* wqx 文曲星 (LavaX): 由 engine_manager 注册, 这里用 extern 接入启动/卸载 (见 lavax_emu.h) */
+extern esp_err_t lavax_emu_background_init(st7305_handle_t *lcd);
+extern esp_err_t lavax_emu_load_and_run(const char *lav_path);
+extern void lavax_emu_unload(void);
+extern bool lavax_emu_is_running(void);
+extern void lavax_set_exit_check(bool (*fn)(void));
+extern void lavax_set_exit_confirm_ui(void (*draw)(st7305_handle_t *lcd)); /* V1.0.9x: 文曲星退出确认浮层 */
+/* 暴龙机 (vpet-emu-zepp): 由 engine_manager 注册, 这里用 extern 接入启动/暂停/退出 */
+extern esp_err_t vpet_emu_background_init(st7305_handle_t *lcd);
+extern esp_err_t vpet_emu_start(const char *path);
+extern void vpet_emu_set_display(int mode, bool aa);   /* V1.0.9x: 暴龙机独立显示设置 */
+extern void vpet_emu_pause(void);
+extern void vpet_emu_resume(void);
+extern void vpet_emu_set_joypad(uint8_t joypad);
+extern esp_err_t vpet_emu_stop(void);
+extern void vpet_emu_unload(void);
 extern menu_action_t input_get_action(void);
 /* V1.0.68: 软关机键 GPIO1 长按 2 秒软关机轮询 */
 extern bool input_power_should_sleep(void);
 /* V1.0.68: 最近一次动作是否来自触摸 (确认框区分上滑确认/物理 BACK 取消) */
 extern bool input_touch_last_action(void);
+/* V1.0.69: USB HID 触控板每帧轮询触摸坐标 */
+extern bool input_get_touch_pos(int *x, int *y);
+/* V1.0.xx: 消费最近一次点击的屏幕坐标 (用于触摸确认弹窗区分点击区域) */
+extern bool input_consume_tap(int *x, int *y);
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
+
+/* wqx 文曲星游戏内退出检测回调 (注入 lavax_platform_poll 每帧调用).
+ * 返回 true → lavax 的 main_loop 检查到退出即返回, 游戏结束回二级菜单.
+ * 触发 (与 GB/BBK 游戏内退出交互一致):
+ *   - 物理键动作 BACK / LONG_LEFT / HOME / 软关机键 0.5s(POWER_RELEASE/LOCK)
+ *   - 手柄 F_EXIT (L2 返回菜单键)
+ *   注意: 仅当文曲星运行时才激活; 平时菜单用不到. */
+/* 文曲星退出确认浮层是否已弹出 (两步确认: 返回→浮层, 确定→退出, 返回→取消) */
+static bool s_wqx_exit_asked = false;
+static bool s_wqx_started = false;      /* 本次游戏是否已开始计数 */
+static int64_t s_wqx_start_us = 0;      /* 本次进入文曲星的时间戳 (入场宽限期用) */
+#define WQX_EXIT_GRACE_US 1500000       /* 进入游戏后 1.5s 忽略退出, 防入场误弹 */
+
+static bool wqx_exit_check(void)
+{
+    /* 首次调用即本次进入游戏开始; 用宽限期屏蔽入场瞬间残留的确认/返回键, 防误弹退出框 */
+    if (!s_wqx_started) {
+        s_wqx_started = true;
+        s_wqx_start_us = (int64_t)esp_timer_get_time();
+        s_wqx_exit_asked = false;
+    }
+    if ((int64_t)esp_timer_get_time() - s_wqx_start_us < WQX_EXIT_GRACE_US)
+        return false;
+
+    /* V1.0.9x: 两步退出确认 (与其它引擎一致): 第一次按返回 = 弹「退出游戏?」浮层,
+     * 不退出; 浮层期间再按确定(确认键) = 退出, 按返回/取消 = 关闭浮层继续游戏. */
+    menu_action_t a = input_get_action();
+    bool back = (a == MENU_ACTION_BACK || a == MENU_ACTION_LONG_LEFT ||
+                 a == MENU_ACTION_HOME || a == MENU_ACTION_POWER_RELEASE ||
+                 a == MENU_ACTION_POWER_LOCK);
+    bool fis = (bt_manager_is_connected() && bt_manager_is_key_pressed(F_EXIT)); /* 手柄L2=退出 */
+
+    if (s_wqx_exit_asked) {
+        if (a == MENU_ACTION_CONFIRM) return true;          /* 浮层中按确定 → 退出 */
+        if (back) { s_wqx_exit_asked = false; }              /* 浮层中按返回 → 取消 */
+        return false;
+    }
+    if (back || fis) {
+        s_wqx_exit_asked = true;                             /* 第一次按返回 → 弹确认浮层 */
+        return false;
+    }
+    return false;
+}
+
+/* 文曲星退出确认浮层绘制 (由 lavax 送屏后叠加调用) */
+static void wqx_confirm_draw(st7305_handle_t *lcd)
+{
+    if (s_wqx_exit_asked)
+        menu_draw_notice_popup(lcd, "\xe9\x80\x80\xe5\x87\xba\xe6\xb8\xb8\xe6\x88\x8f\xef\xbc\x9f"); /* 退出游戏？ */
+}
+/* 文曲星退出确认浮层是否激活 (供平台层判断是否需强制送屏) */
+bool menu_wqx_confirm_asked(void) { return s_wqx_exit_asked; }
 
 /* 赞助作者图片位图: 文件级 static const, 存于 .rodata (flash), 不占任务栈.
  * 注意: 必须放文件作用域, 绝不能放在函数内 (否则 11KB 数组会占 menu_render 的栈,
@@ -80,6 +163,8 @@ extern menu_state_t g_menu;
 
 /* XMB 图标数据 (由 generate_icons.py 生成) */
 #include "icons_data.inc"
+/* 主菜单专用图标 (昨天版本 96x96 SF 大图标, 与应用管理的 GB 复古 48x48 并存) */
+#include "icons_main.inc"
 /* 状态栏图标 (24x24) */
 #include "status_icons_data.inc"
 
@@ -115,13 +200,35 @@ static void draw_hline(st7305_handle_t *lcd, int x0, int x1, int y,
 /* V1.0.68: 启动失败等提示用迷你小框 (同"已收藏"提示), 不用大方框 */
 static void menu_show_fail_hint(menu_state_t *state, const char *msg) {
     snprintf(state->hint_text, sizeof(state->hint_text), "%s", msg);
-    state->hint_until_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 1500;
+    state->hint_until_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 1000;
     state->needs_redraw = true;
 }
 
 static void draw_vline(st7305_handle_t *lcd, int x, int y0, int y1,
                        st7305_color_t color) {
     for (int y = y0; y <= y1; y++) st7305_draw_pixel(lcd, x, y, color);
+}
+
+/* V1.0.9x: 画一个淡虚线框, 表示编辑模式下「预留的空白放置槽」(中间空位).
+ * 虚线比实线淡, 明确提示此处留空待放置, 而非图标被简单隐藏. */
+static void draw_slot_marker(st7305_handle_t *lcd, int cx, int cy, int size) {
+    int x0 = cx - size / 2, x1 = cx + size / 2;
+    int y0 = cy - size / 2, y1 = cy + size / 2;
+    /* 顶/底边: 每 4 点画 1 点 的虚线 */
+    for (int x = x0; x <= x1; x += 4)
+        st7305_draw_pixel(lcd, x, y0, ST7305_COLOR_BLACK);
+    for (int x = x0; x <= x1; x += 4)
+        st7305_draw_pixel(lcd, x, y1, ST7305_COLOR_BLACK);
+    /* 左/右边: 每 4 点画 1 点 的虚线 */
+    for (int y = y0; y <= y1; y += 4)
+        st7305_draw_pixel(lcd, x0, y, ST7305_COLOR_BLACK);
+    for (int y = y0; y <= y1; y += 4)
+        st7305_draw_pixel(lcd, x1, y, ST7305_COLOR_BLACK);
+    /* 虚线框中心 1px 十字准星, 提示「此处可放置」 */
+    st7305_draw_pixel(lcd, cx, cy - 2, ST7305_COLOR_BLACK);
+    st7305_draw_pixel(lcd, cx, cy + 2, ST7305_COLOR_BLACK);
+    st7305_draw_pixel(lcd, cx - 2, cy, ST7305_COLOR_BLACK);
+    st7305_draw_pixel(lcd, cx + 2, cy, ST7305_COLOR_BLACK);
 }
 
 static void draw_rect_outline(st7305_handle_t *lcd, int x0, int y0, int x1, int y1,
@@ -132,17 +239,68 @@ static void draw_rect_outline(st7305_handle_t *lcd, int x0, int y0, int x1, int 
     draw_vline(lcd, x1, y0, y1, color);
 }
 
+/* 画一个"单侧外缘圆角"的矩形描边. side 指定圆角方向 (触控板 L/R 鼠标键用):
+ *  - 'L': 左侧(外缘)圆角 (左上+左下), 右边缘(朝向中间分隔处)为直角;
+ *  - 'R': 右侧(外缘)圆角 (右上+右下), 左边缘(朝向中间分隔处)为直角.
+ * 即两个按键靠屏幕外侧的角加 r 角, 中间分隔处不加 r 角. */
+static void draw_rect_outline_side_round(st7305_handle_t *lcd, int x0, int y0, int x1, int y1,
+                                         st7305_color_t color, int r, char side) {
+    if (r < 1 || r >= (x1 - x0 + 1) / 2) r = 0;
+    if (r < 1 || r >= (y1 - y0 + 1) / 2) r = 0;
+    if (r < 1) { draw_rect_outline(lcd, x0, y0, x1, y1, color); return; }
+
+    if (side == 'R') {
+        /* 左侧(内侧)直角边 + 顶部/底部直线 */
+        draw_vline(lcd, x0, y0, y1, color);
+        draw_hline(lcd, x0, x1 - r, y0, color);
+        draw_hline(lcd, x0, x1 - r, y1, color);
+        /* 右侧外缘: 中段直线 + 右上/右下圆角 (圆心在 (x1-r, y0+r)/(x1-r, y1-r)) */
+        draw_vline(lcd, x1, y0 + r, y1 - r, color);
+        for (int px = x1 - r; px <= x1; px++) {
+            int dx = px - (x1 - r);                  /* 0..r */
+            int dy = r - (int)sqrtf((float)(r * r - dx * dx));
+            st7305_draw_pixel(lcd, px, y0 + dy, color);          /* 顶 */
+            st7305_draw_pixel(lcd, px, y1 - dy, color);          /* 底 */
+        }
+    } else { /* 'L' */
+        /* 右侧(内侧)直角边 + 顶部/底部直线 */
+        draw_vline(lcd, x1, y0, y1, color);
+        draw_hline(lcd, x0 + r, x1, y0, color);
+        draw_hline(lcd, x0 + r, x1, y1, color);
+        /* 左侧外缘: 中段直线 + 左上/左下圆角 (圆心在 (x0+r, y0+r)/(x0+r, y1-r)) */
+        draw_vline(lcd, x0, y0 + r, y1 - r, color);
+        for (int px = x0; px <= x0 + r; px++) {
+            int dx = px - (x0 + r);                  /* -r..0 */
+            int dy = r - (int)sqrtf((float)(r * r - dx * dx));
+            st7305_draw_pixel(lcd, px, y0 + dy, color);          /* 顶 */
+            st7305_draw_pixel(lcd, px, y1 - dy, color);          /* 底 */
+        }
+    }
+}
+
 /* ============ 前向声明 (供状态栏/屏保使用) ============ */
 static void draw_ascii_small(st7305_handle_t *lcd, int x, int y, char c, bool inverted);
 static void draw_ascii_medium(st7305_handle_t *lcd, int x, int y, char c, bool inverted);
+/* V1.0.78: 方向箭头 ↑↓←→ 独立字形 (UTF-8 多字节, 不走 ASCII 索引), 供键鼠标签居中绘制 */
+static const uint8_t ARROW_UP[12];
+static const uint8_t ARROW_DOWN[12];
+static const uint8_t ARROW_LEFT[12];
+static const uint8_t ARROW_RIGHT[12];
+static void draw_ascii_medium_bmp(st7305_handle_t *lcd, int x, int y, const uint8_t *bmp, bool inverted);
 static void draw_ascii(st7305_handle_t *lcd, int x, int y, char c, bool inverted);
+/* V1.0.80: 状态栏统一 16x16: ASCII 数字/字母与中文 16x16 渲染 */
+static void draw_ascii_sb(st7305_handle_t *lcd, int x, int y, char c, bool inverted);
+static void draw_zh_sb(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted);
 static void draw_zh(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted, int scale);
+static void draw_zh_small(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted);
 static void draw_icon_bitmap_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx);
 static void draw_text_centered(st7305_handle_t *lcd, int y, const char *str, bool inverted);
 /* V1.0.33: 紧凑提示弹窗模板 - 前向声明 (定义在文件下方) */
 static void draw_notice_popup(st7305_handle_t *lcd, const char *text);
 /* 确认弹窗前向声明 (游戏退出确认框使用, 定义在文件下方) */
 static void draw_confirm_dialog(menu_state_t *state);
+/* V1.0.9x: 返回主菜单时恢复选中+相机位置 (定义在文件下方) */
+static void menu_main_restore_position(menu_state_t *state);
 
 /* ============ 时间功能 (基于 ESP32-S3 RTC) ============ */
 
@@ -241,66 +399,42 @@ static void read_time_from_rtc(menu_settings_t *settings) {
     settings->second = (uint8_t)t->tm_sec;
 }
 
-/* ============ 苹果风格电池图标 (四态显示) ============ */
-/* V1.0.43: 参考电池电压 ADC 读取, 四档离散显示
- * 绘制苹果风格电池图标: 长方形主体 + 右上角小凸起 + 内部四档电量
- * 位置 x,y, 电池宽 28, 高 14, 正极帽 3x6
- * 四档: 0%(空) / 1-33%(低) / 34-66%(中) / 67-100%(满) */
+/* ============ 状态栏电池图标 (位图, 用完美图标 电池0-5/满) ============ */
+/* percent 0..100 映射到 7 档位图 (BAT_ICON_N=7: 电池0=空 ... 电池满=100%).
+ * 255 = 未检测到电池哨兵 -> 空心框 + "?" */
 static void draw_apple_battery(st7305_handle_t *lcd, int x, int y, uint8_t percent, bool charging) {
-    int bw = 28, bh = 14;
-    int cap_w = 3, cap_h = 6;
+    (void)charging;  /* 本硬件无充电检测引脚, 不叠加闪电 */
 
-    /* V1.0.68: 未检测到电池 (255 哨兵) -> 电池图标内画 "?" */
     if (percent == 255) {
-        draw_rect_outline(lcd, x, y, x + bw - 1, y + bh - 1, ST7305_COLOR_BLACK);
-        fill_rect(lcd, x + 2, y + 2, x + bw - 3, y + bh - 3, ST7305_COLOR_WHITE);
-        st7305_draw_text(lcd, x + 7, y - 1, "?");
+        draw_rect_outline(lcd, x, y, x + BAT_ICON_W - 1, y + BAT_ICON_H - 1, ST7305_COLOR_BLACK);
+        fill_rect(lcd, x + 2, y + 2, x + BAT_ICON_W - 3, y + BAT_ICON_H - 3, ST7305_COLOR_WHITE);
+        draw_ascii_sb(lcd, x + (BAT_ICON_W - 8) / 2, y, '?', false);
         return;
     }
 
-    /* 正极帽 (右上角小凸起) */
-    int cap_x = x + bw;
-    int cap_y = y + (bh - cap_h) / 2;
-    fill_rect(lcd, cap_x, cap_y, cap_x + cap_w - 1, cap_y + cap_h - 1, ST7305_COLOR_BLACK);
+    int idx = (int)(percent * BAT_ICON_N / 100);
+    if (idx >= BAT_ICON_N) idx = BAT_ICON_N - 1;
+    st7305_draw_bitmap_1bit(lcd, x, y, BAT_ICON_W, BAT_ICON_H, bat_icon[idx]);
+}
 
-    /* 电池外框 */
-    draw_rect_outline(lcd, x, y, x + bw - 1, y + bh - 1, ST7305_COLOR_BLACK);
-
-    /* 内部背景 (白色) */
-    fill_rect(lcd, x + 2, y + 2, x + bw - 3, y + bh - 3, ST7305_COLOR_WHITE);
-
-    /* V1.0.43: 四态离散填充 (内部可用宽度 = bw-6 = 22px, 分四档) */
-    /* 档位: 0=空(不填), 1=低(1/3≈7px), 2=中(2/3≈14px), 3=满(22px) */
-    int level = 0;
-    if (percent > 66)      level = 3;
-    else if (percent > 33) level = 2;
-    else if (percent > 0)  level = 1;
-
-    if (level > 0) {
-        int fill_w = (bw - 6) * level / 3;  /* 7, 14, 22 */
-        /* 20260812: 电量从左往右填充, 缺少(空)的部分在右边 (与常规电池图标一致).
-         * 之前从右往左填充, 空的部分显示在左边. */
-        fill_rect(lcd, x + 2, y + 2, x + 2 + fill_w - 1, y + bh - 3, ST7305_COLOR_BLACK);
-    }
-
-    /* 充电闪电图标 */
-    if (charging) {
-        int lx = x + bw / 2 - 3;
-        int ly = y + bh / 2 - 4;
-        /* 闪电形状 */
-        st7305_draw_pixel(lcd, lx + 1, ly, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 2, ly, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 1, ly + 1, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 2, ly + 1, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx, ly + 2, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 3, ly + 2, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 1, ly + 3, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 2, ly + 3, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 2, ly + 4, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 2, ly + 5, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 1, ly + 6, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 2, ly + 6, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, lx + 3, ly + 6, ST7305_COLOR_BLACK);
+/* ============ 状态栏图标拉伸绘制 (V1.0.9x) ============
+ * 把 1bpp 位图(srcW x srcH) 最近邻放大到目标尺寸 (tw x th).
+ * 长方形图标(迷你手柄/声音/数据传输, 源 24x12)拉伸为 32x16(=电池高16, 保持2:1);
+ * 正方形图标(WiFi 12x12)保持原样不拉伸. */
+#define STATUS_ICON_W   32
+#define STATUS_ICON_H   16
+static void draw_status_icon_stretch(st7305_handle_t *lcd, int x, int y,
+                                     int srcW, int srcH, int bytes_per_row,
+                                     int tw, int th, const uint8_t *bitmap) {
+    if (!lcd || !bitmap || srcW <= 0 || srcH <= 0 || tw <= 0 || th <= 0) return;
+    for (int dy = 0; dy < th; dy++) {
+        int sy = (dy * srcH) / th;
+        for (int dx = 0; dx < tw; dx++) {
+            int sx = (dx * srcW) / tw;
+            uint8_t byte = bitmap[sy * bytes_per_row + (sx >> 3)];
+            if (byte & (0x80u >> (sx & 7)))
+                st7305_draw_pixel(lcd, x + dx, y + dy, ST7305_COLOR_BLACK);
+        }
     }
 }
 
@@ -492,37 +626,47 @@ static void draw_gamepad_icon(st7305_handle_t *lcd, int x, int y) {
  * 高度: 24px */
 void menu_draw_status_bar(st7305_handle_t *lcd, const menu_settings_t *settings,
                           const char *center_text) {
-    int sb_h = 24;
-    int sb_y = 0;
+    const int sb_h = 24;          /* 状态栏整体高度 24px */
+    const int sb_y = 0;
+    const int M  = 4;             /* 四边留白 4px */
+    const int GAP = 4;            /* 右侧图标/文字之间间距 4px */
     (void)center_text;  /* 状态栏中间文字已弃用 (用户需求: 删除 "MP3" 等中间字) */
+
+    /* V1.0.80: 状态栏统一规范高度 16px. 24px 高 - 上下各 4px = 16px 内容带.
+     * 数字/中文/图标全部 16px 高, 特殊图标(电池)可加宽. */
+    const int text_y = sb_y + 3;  /* 数字 12x18 垂直居中: (24-18)/2=3, 与早期版本一致 */
 
     /* V1.0.46: 24小时制 (与设置里一致), 格式 "M-DD HH:MM" */
     time_t now_ts = time(NULL);
     struct tm *t = localtime(&now_ts);
 
-    /* 日期 "YYYY-MM-DD" (V1.0.68: 前面加年份) */
-    char date_str[48];
-    snprintf(date_str, sizeof(date_str), "%04d-%02d-%02d",
-             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday);
+    /* V1.0.78: 日期 "MM-DD 星期X" (V1.0.68 加的年份已删除, 追加中文星期) */
+    static const char *wd[] = {"\xe6\x97\xa5","\xe4\xb8\x80","\xe4\xba\x8c","\xe4\xb8\x89",
+                               "\xe5\x9b\x9b","\xe4\xba\x94","\xe5\x85\xad"};  /* 日/一/二/三/四/五/六 */
+    char date_str[16];
+    snprintf(date_str, sizeof(date_str), "%02d-%02d", t->tm_mon + 1, t->tm_mday);
     /* 时间 "HH:MM" (24小时制, 补零) */
     char time_str[16];
     snprintf(time_str, sizeof(time_str), "%02d:%02d", t->tm_hour, t->tm_min);
 
-    int text_y = 3;  /* 中字体12px, 垂直居中: (24-12)/2 = 6, 微调到3 */
-    int x = 3;
-
     /* 20260812 状态栏布局:
-     *  最左: 日期 "M-DD"
+     *  最左: 日期 "MM-DD 星期X"
      *  中:   时间 HH:MM 水平居中
      *  右:   电池 -> 蓝牙图标 -> 喇叭+音量 -> WiFi
      *  V1.0.68 fix: 蓝牙连接图标从左侧移到右侧 (电池左边, 音量右边) */
-    /* 最左侧: 日期 "M-DD" */
+    /* 最左侧: 日期 "MM-DD" (1.5x 中号 12x18, 与早期版本一致) */
+    int x = M;
     for (int i = 0; date_str[i]; i++) {
         draw_ascii_medium(lcd, x, text_y, date_str[i], false);
         x += 12;
     }
+    x += 2;   /* 日期与星期之间留一点间距 */
+    /* 中文星期 "星期X" (16x16) */
+    draw_zh_sb(lcd, x,       text_y + 1, "\xe6\x98\x9f", false);  /* 星 */
+    draw_zh_sb(lcd, x + 16,  text_y + 1, "\xe6\x9c\x9f", false);  /* 期 */
+    draw_zh_sb(lcd, x + 32,  text_y + 1, wd[t->tm_wday], false);  /* 日/一/.../六 */
 
-    /* 正中间: 时间 "HH:MM" 水平居中 */
+    /* 正中间: 时间 "HH:MM" 水平居中 (1.5x 中号 12x18) */
     int time_w = (int)strlen(time_str) * 12;
     int time_x = (SCREEN_W - time_w) / 2;
     for (int i = 0; time_str[i]; i++) {
@@ -530,46 +674,59 @@ void menu_draw_status_bar(st7305_handle_t *lcd, const menu_settings_t *settings,
         time_x += 12;
     }
 
-    /* 后台引擎预加载进度条: 在 render_select_game_two_cols 中专门绘制 (120x6 居中),
-     * 这里不再重复画. 只在游戏全屏等没有专门进度条的地方才画小进度条. */
+    /* 右侧从右到左: 电池(33x16) -> 蓝牙 -> 喇叭+音量 -> WiFi, 距右边缘 4px */
+    int right_x = SCREEN_W - M;         /* 396: 右侧内容右边界 */
+    /* 电池: 32x16 位图, 右对齐 */
+    draw_apple_battery(lcd, right_x - BAT_ICON_W, text_y, settings->battery, false);
+    right_x -= BAT_ICON_W + GAP;
 
-    /* 右侧从右到左: 电池 -> 蓝牙图标 -> 喇叭+音量 -> WiFi */
-    int right_x = SCREEN_W - 36;
-    int bat_y = sb_y + (sb_h - 14) / 2;
-    draw_apple_battery(lcd, right_x, bat_y, settings->battery, false);
-    right_x -= 20;
-
-    /* V1.0.68 fix: 蓝牙图标移到电池左边 (连接时显示), 未连接时不占位 */
+    /* 手柄图标 (蓝牙图标左侧) — V1.0.9x: 蓝牙连接的是 HID 手柄, 显示迷你手柄图标;
+     * 若仅连接普通蓝牙设备(耳机等)则显示蓝牙图标 (bt_connection 区分待扩展) */
     if (settings->bt_enabled && settings->bt_connected) {
-        st7305_draw_bitmap_1bit(lcd, right_x - 16, sb_y + (sb_h - BT_ICON_H) / 2,
-                                BT_ICON_W, BT_ICON_H, bt_icon_png);
-        right_x -= 20;   /* 图标 16px + 4px 间距 */
+        draw_status_icon_stretch(lcd, right_x - STATUS_ICON_W, text_y,
+                                 PAD_ICON_W, PAD_ICON_H, (PAD_ICON_W + 7) / 8,
+                                 STATUS_ICON_W, STATUS_ICON_H, pad12_icon);
+        right_x -= STATUS_ICON_W + GAP;
     }
 
-    /* 喇叭图标 + 音量数字 (蓝牙图标左侧), V1.0.67: 统一 0-10 档, 10 显示两位数 */
+    /* 喇叭图标 (蓝牙图标左侧), V1.0.8x: 状态栏不再显示音量数字
+     * V1.0.95: 音量=0 或静音时隐藏喇叭图标; 按音量分 4 档显示喇叭1-4 (喇叭1=最低, 喇叭4=最大) */
     int vol_level = settings->mute ? 0 : (int)settings->volume;
     if (vol_level > 10) vol_level = 10;
-    int vol_num_x = right_x - 12;          /* 数字最右 */
-    int vol_num_w = (vol_level == 10) ? 24 : 12;   /* 两位/一位宽度 */
-    int vol_icon_x = vol_num_x - vol_num_w - 2;    /* 图标在数字左边 */
-    int vol_icon_y = sb_y + (sb_h - 16) / 2;
-    if (vol_level == 10) {
-        draw_ascii_medium(lcd, vol_num_x - 12, text_y, '1', false);
-        draw_ascii_medium(lcd, vol_num_x, text_y, '0', false);
-    } else {
-        draw_ascii_medium(lcd, vol_num_x, text_y, (char)('0' + vol_level), false);
+    if (vol_level > 0) {
+        int snd_idx = (vol_level <= 3) ? 0 : (vol_level <= 6) ? 1 :
+                      (vol_level <= 9) ? 2 : 3;
+        draw_status_icon_stretch(lcd, right_x - STATUS_ICON_W, text_y,
+                                 SND_ICON_W, SND_ICON_H, (SND_ICON_W + 7) / 8,
+                                 STATUS_ICON_W, STATUS_ICON_H, snd12_icon[snd_idx]);
+        right_x -= STATUS_ICON_W + GAP;        /* 继续往左 */
     }
-    draw_speaker_icon(lcd, vol_icon_x, vol_icon_y, vol_level);
-    right_x = vol_icon_x - 6;              /* 继续往左 */
 
-    /* WiFi 图标 (V1.0.46: 连接成功才显示) */
+    /* 数据传输图标 (与电脑连接数据传输): 模拟键鼠 USB HID / MSC 枚举成功,
+     * 或 USB 串口数据线已连接电脑 (usb_serial_jtag_is_connected() 靠接收主机 SOF 判定 →
+     * 只插充电线无 SOF 不会误亮). */
+    extern bool usbh_msc_is_running(void);
+    bool data_active = (usb_hid_is_running() && usb_hid_connected()) || usbh_msc_is_running();
+    if (!data_active && usb_serial_jtag_is_connected()) data_active = true;
+    if (data_active) {
+        draw_status_icon_stretch(lcd, right_x - STATUS_ICON_W, text_y,
+                                 DATA_ICON_W, DATA_ICON_H, (DATA_ICON_W + 7) / 8,
+                                 STATUS_ICON_W, STATUS_ICON_H, data12_icon);
+        right_x -= STATUS_ICON_W + GAP;        /* 继续往左 */
+    }
+
+    /* WiFi 图标 (V1.0.46: 连接成功才显示) — V1.0.9x: 改用 完美图标 wifi.png 的 12x12 位图 */
 #if WIFI_SUPPORT
     if (settings->wifi_enabled && wifi_manager_is_connected()) {
-        draw_wifi_icon(lcd, right_x - 16, sb_y + (sb_h - 16) / 2);
+        st7305_draw_bitmap_1bit(lcd, right_x - WIFI_ICON_W, text_y,
+                                WIFI_ICON_W, WIFI_ICON_H, wifi12_icon);
+        right_x -= WIFI_ICON_W + GAP;
     }
 #else
     if (settings->wifi_enabled) {
-        draw_wifi_icon(lcd, right_x - 16, sb_y + (sb_h - 16) / 2);
+        st7305_draw_bitmap_1bit(lcd, right_x - WIFI_ICON_W, text_y,
+                                WIFI_ICON_W, WIFI_ICON_H, wifi12_icon);
+        right_x -= WIFI_ICON_W + GAP;
     }
 #endif
 
@@ -584,6 +741,7 @@ bool s_screensaver_preview = false;  /* 预览模式: 跳过倒计时 */
 static bool s_screensaver_test = false;       /* 测试壁纸: 不挂蓝牙, 30s 自动退出 */
 static uint32_t s_screensaver_test_ms = 0;    /* 测试壁纸进入时刻 */
 static bool s_bt_suspended = false;  /* 屏保期间蓝牙已关闭, 退出时恢复 */
+static uint32_t s_screensaver_start_ms = 0; /* 本次壁纸进入时刻 (自动软关机计时用) (V1.0.90) */
 
 /* 进入屏保: 挂起蓝牙 (断开连接 + 停止扫描, 协议栈保持存活)
  * 不采用完整 disable/enable: BBK 引擎占用内部内存时蓝牙重新初始化
@@ -609,8 +767,8 @@ static uint16_t s_wp_prev_keys = 0;
 
 /* ============ 壁纸 (V1.0.64) ============ */
 /* 壁纸类型 */
-/* TF 动态图: /sdcard/wallpaper 下的 BMP 帧序列, 按文件名排序循环播放 */
-#define WALLPAPER_BMP_DIR "/sdcard/wallpaper"
+/* 外置图片: /sdcard/images 下的 BMP 帧序列, 按文件名排序循环播放 (V1.0.95 更名) */
+#define WALLPAPER_BMP_DIR "/sdcard/images"
 #define WALLPAPER_BMP_MAX  48
 EXT_RAM_BSS_ATTR static char s_wp_bmp_files[WALLPAPER_BMP_MAX][64];
 static int s_wp_bmp_count = 0;
@@ -618,7 +776,7 @@ static int s_wp_bmp_index = 0;
 static uint8_t *s_wp_frame = NULL;          /* 400x300 1bpp 行序位图 (15KB, PSRAM) */
 static uint32_t s_wp_bmp_last_ms = 0;
 
-/* 退出壁纸时释放壁纸 PSRAM 缓冲 (内置程序 + TF 动态图), 下次进入再分配 */
+/* 退出壁纸时释放壁纸 PSRAM 缓冲 (内置程序 + 外置图片), 下次进入再分配 */
 static void screensaver_release_wallpaper_buffers(void) {
     if (s_wp_frame) {
         free(s_wp_frame);
@@ -845,7 +1003,7 @@ static void screensaver_render_builtin(st7305_handle_t *lcd, uint32_t now_ms) {
         wp_program_render(lcd, (int)g_menu.wallpaper_program, now_ms);
 }
 
-/* ==== TF 动态图 (BMP) ==== */
+/* ==== 外置图片 (BMP 帧) ==== */
 static int wp_bmp_scan(void) {
     if (sd_mount() != ESP_OK) return 0;
     int n = 0;
@@ -1155,14 +1313,25 @@ static void wallpaper_type_dialog_on_select(menu_state_t *state, int idx);
 static void wallpaper_prog_dialog_on_select(menu_state_t *state, int idx);
 static void wallpaper_speed_dialog_on_select(menu_state_t *state, int idx);
 static void wallpaper_min_dialog_on_select(menu_state_t *state, int idx);
+/* V1.0.95: 自动关机自定义弹窗 (分钟/小时/天数/永不 + 底部 返回/保存) */
+static void open_wallpaper_shutdown_dialog(menu_state_t *state);
+static void wallpaper_shutdown_on_select(menu_state_t *state, int idx);
+static void wallpaper_shutdown_on_key(menu_state_t *state, int idx, menu_action_t action);
+static void wallpaper_shutdown_render(menu_state_t *state, st7305_handle_t *lcd,
+                                      int cx, int cy, int cw, int ch);
+/* 本文件后部定义的静态绘制辅助 (下半区左右选项居中文本用) */
+static void draw_text(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted);
+static int  text_width(const char *str);
 
-/* 重建壁纸设置弹窗内容 (值变化后调用, 强制全量重绘) */
+/* 重建壁纸设置弹窗内容 (值变化后调用, 强制全量重绘)
+ * V1.0.95: 删除"触摸退出"项; "自动关机"不再显示开启/关闭状态 */
 static void wallpaper_dialog_rebuild(menu_state_t *state) {
     snprintf(state->list_dialog_items[0], 64, "壁纸类型");
     snprintf(state->list_dialog_items[1], 64, "休眠时间");
-    snprintf(state->list_dialog_items[2], 64, "测试壁纸");
-    snprintf(state->list_dialog_items[3], 64, "返回");
-    state->list_dialog_count = 4;
+    snprintf(state->list_dialog_items[2], 64, "自动关机");
+    snprintf(state->list_dialog_items[3], 64, "测试壁纸");
+    snprintf(state->list_dialog_items[4], 64, "返回");
+    state->list_dialog_count = 5;
     state->list_dialog_prev_active = false;
     state->list_dialog_prev_selected = -1;
     state->list_dialog_local_update = false;
@@ -1171,7 +1340,7 @@ static void wallpaper_dialog_rebuild(menu_state_t *state) {
 
 static void open_wallpaper_dialog(menu_state_t *state) {
     state->list_dialog_return_page = state->current_page;
-    list_dialog_open(state, "壁纸设置", 4, wallpaper_dialog_on_select);
+    list_dialog_open(state, "壁纸设置", 6, wallpaper_dialog_on_select);
     wallpaper_dialog_rebuild(state);
 }
 
@@ -1183,7 +1352,7 @@ static void wallpaper_dialog_on_select(menu_state_t *state, int idx) {
         snprintf(state->list_dialog_items[0], 64, "%s%s",
                  state->wallpaper_mode == WALLPAPER_MODE_STARS ? "* " : "", "内置壁纸");
         snprintf(state->list_dialog_items[1], 64, "%s%s",
-                 state->wallpaper_mode == WALLPAPER_MODE_BMP ? "* " : "", "TF动态图");
+                 state->wallpaper_mode == WALLPAPER_MODE_BMP ? "* " : "", "外置图片");
         snprintf(state->list_dialog_items[2], 64, "%s%s",
                  state->wallpaper_mode == WALLPAPER_MODE_GAME ? "* " : "", "游戏壁纸");
         snprintf(state->list_dialog_items[3], 64, "返回");
@@ -1202,7 +1371,10 @@ static void wallpaper_dialog_on_select(menu_state_t *state, int idx) {
         state->list_dialog_count = cnt + 1;
         return;
     }
-    case 2:  /* 测试壁纸: 立即进入 */
+    case 2:  /* 自动关机 → 自定义弹窗 (V1.0.95) */
+        open_wallpaper_shutdown_dialog(state);
+        return;
+    case 3:  /* 测试壁纸: 立即进入 (V1.0.95: 已删除"触摸退出"项, 此项前移) */
         s_screensaver_preview = true;
         s_screensaver_test = true;
         state->list_dialog_active = false;
@@ -1210,6 +1382,8 @@ static void wallpaper_dialog_on_select(menu_state_t *state, int idx) {
         state->list_dialog_prev_selected = -1;
         state->list_dialog_stack_top = 0;
         state->needs_redraw = true;
+        return;
+    case 4:  /* 返回 (V1.0.95) */
         return;
     default:
         return;
@@ -1219,8 +1393,8 @@ static void wallpaper_dialog_on_select(menu_state_t *state, int idx) {
 /* 壁纸类型子弹窗: 选中即设模式, 并按类型进入对应子窗口 */
 static void wallpaper_type_dialog_on_select(menu_state_t *state, int idx) {
     switch (idx) {
-    case 0: {  /* 内置壁纸 → 程序选择 (V1.0.67: 只保留星空) */
-        static const int progs[] = { WP_PROG_STARS, WP_PROG_WEATHER };
+    case 0: {  /* 内置壁纸 → 程序选择 (V1.0.95: 屏蔽天气时钟, 只有星空) */
+        static const int progs[] = { WP_PROG_STARS };
         int cnt = (int)(sizeof(progs) / sizeof(progs[0]));
         list_dialog_open(state, "选择壁纸程序", cnt + 1, wallpaper_prog_dialog_on_select);
         for (int i = 0; i < cnt; i++) {
@@ -1231,10 +1405,10 @@ static void wallpaper_type_dialog_on_select(menu_state_t *state, int idx) {
         state->list_dialog_count = cnt + 1;
         return;
     }
-    case 1: {  /* TF动态图 → 播放速度子窗口 */
+    case 1: {  /* 外置图片 (TF卡图片目录) → 播放速度子窗口 */
         state->wallpaper_mode = WALLPAPER_MODE_BMP;
         menu_config_save();
-        list_dialog_open(state, "TF动态图 播放速度", 4, wallpaper_speed_dialog_on_select);
+        list_dialog_open(state, "外置图片 播放速度", 4, wallpaper_speed_dialog_on_select);
         snprintf(state->list_dialog_items[0], 64, "慢 (5帧/秒)");
         snprintf(state->list_dialog_items[1], 64, "标准 (8帧/秒)");
         snprintf(state->list_dialog_items[2], 64, "快 (12帧/秒)");
@@ -1253,7 +1427,7 @@ static void wallpaper_type_dialog_on_select(menu_state_t *state, int idx) {
 }
 
 static void wallpaper_prog_dialog_on_select(menu_state_t *state, int idx) {
-    static const int progs[] = { WP_PROG_STARS, WP_PROG_WEATHER };
+    static const int progs[] = { WP_PROG_STARS };   /* V1.0.95: 屏蔽天气时钟 */
     int cnt = (int)(sizeof(progs) / sizeof(progs[0]));
     if (idx < 0 || idx >= cnt) return;
     state->wallpaper_mode = WALLPAPER_MODE_STARS;
@@ -1280,6 +1454,134 @@ static void wallpaper_min_dialog_on_select(menu_state_t *state, int idx) {
     menu_config_save();
     list_dialog_pop_parent(state);
     wallpaper_dialog_rebuild(state);
+}
+
+/* ==== V1.0.95: 自动关机自定义弹窗 ====
+ * 布局: 4 个单位 (分钟/小时/天数/永不关机) + 底部横杆下"返回/保存"左右两个按钮.
+ * 点击/确认单位仅选中(高亮), 永不关机=禁用; 按"保存"才真正写入配置并关闭,
+ * "返回"不保存直接关闭. 聚焦位置复用 list_dialog_selected:
+ *   0..2 = 分钟/小时/天数, 3 = 永不关机, 4 = 保存, 5 = 返回(count-1). */
+static const uint8_t s_shutdown_def_time[3] = { 30, 1, 1 };  /* 分钟/小时/天 默认时长 */
+
+static void open_wallpaper_shutdown_dialog(menu_state_t *state) {
+    /* 初始聚焦: 当前生效单位, 未开启则聚焦"永不关机" */
+    int focus;
+    if (state->wallpaper_auto_shutdown && state->wallpaper_shutdown_unit <= 2)
+        focus = state->wallpaper_shutdown_unit;
+    else
+        focus = 3;
+    list_dialog_open(state, "自动关机", 6, wallpaper_shutdown_on_select);
+    state->list_dialog_selected = focus;
+    snprintf(state->list_dialog_items[0], 64, "分钟");
+    snprintf(state->list_dialog_items[1], 64, "小时");
+    snprintf(state->list_dialog_items[2], 64, "天数");
+    snprintf(state->list_dialog_items[3], 64, "永不关机");
+    snprintf(state->list_dialog_items[4], 64, "保存");
+    snprintf(state->list_dialog_items[5], 64, "返回");
+    state->list_dialog_count = 6;
+    state->list_dialog_on_render = wallpaper_shutdown_render;
+    state->list_dialog_on_key    = wallpaper_shutdown_on_key;
+    state->list_dialog_on_close  = NULL;
+    state->list_dialog_content_dirty = true;
+    state->needs_redraw = true;
+}
+
+/* 关闭本次自动关机弹窗 */
+static void wallpaper_shutdown_close(menu_state_t *state, bool save) {
+    if (save) {
+        if (state->list_dialog_selected <= 2) {
+            state->wallpaper_auto_shutdown = true;
+            state->wallpaper_shutdown_unit = (uint8_t)state->list_dialog_selected;
+            state->wallpaper_shutdown_time = s_shutdown_def_time[state->list_dialog_selected];
+        } else {
+            state->wallpaper_auto_shutdown = false;
+        }
+        menu_config_save();
+        snprintf(state->hint_text, sizeof(state->hint_text), "已保存");
+        state->hint_until_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 500;
+    }
+    if (list_dialog_pop_parent(state)) {
+        wallpaper_dialog_rebuild(state);
+        return;
+    }
+    state->list_dialog_active = false;
+    state->list_dialog_prev_active = false;
+    state->list_dialog_prev_selected = -1;
+    wallpaper_dialog_rebuild(state);
+}
+
+static void wallpaper_shutdown_on_select(menu_state_t *state, int idx) {
+    /* idx0-2: 选中单位 (保持弹窗); idx3: 永不关机; idx4: 保存(写盘并关闭);
+     * idx5: 返回(不保存关闭) */
+    if (idx < 0 || idx > 5) return;
+    if (idx == 4) { wallpaper_shutdown_close(state, true); return; }
+    if (idx == 5) { wallpaper_shutdown_close(state, false); return; }
+    /* 选中单位/永不: 仅记录高亮, 待用户按保存写盘 */
+    state->list_dialog_selected = idx;
+    state->list_dialog_content_dirty = true;
+    state->needs_redraw = true;
+    state->list_dialog_local_update = false;
+}
+
+static void wallpaper_shutdown_on_key(menu_state_t *state, int idx, menu_action_t action) {
+    int sel = state->list_dialog_selected;
+    switch (action) {
+    case MENU_ACTION_UP:
+        sel = (sel <= 0) ? 5 : sel - 1;
+        break;
+    case MENU_ACTION_DOWN:
+        sel = (sel >= 5) ? 0 : sel + 1;
+        break;
+    case MENU_ACTION_LEFT:
+        if (sel == 5) sel = 4;      /* 返回 → 保存 */
+        break;
+    case MENU_ACTION_RIGHT:
+        if (sel == 4) sel = 5;      /* 保存 → 返回 */
+        break;
+    default:
+        return;
+    }
+    state->list_dialog_selected = sel;
+    state->list_dialog_content_dirty = true;
+    state->needs_redraw = true;
+    state->list_dialog_local_update = false;
+    (void)idx;
+}
+
+static void wallpaper_shutdown_render(menu_state_t *state, st7305_handle_t *lcd,
+                                      int cx, int cy, int cw, int ch) {
+    int sel = state->list_dialog_selected;
+    static const char *units[4] = { "分钟", "小时", "天数", "永不关机" };
+    int row_h = 36;
+    for (int i = 0; i < 4; i++) {
+        int ry = cy + i * row_h;
+        bool hi = (sel == i);
+        fill_rect(lcd, cx, ry, cx + cw - 1, ry + row_h - 1,
+                  hi ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+        draw_text_centered(lcd, ry + (row_h - 24) / 2, units[i], hi);
+    }
+    /* 横杆 (分隔线): 单位区与底部"返回/保存"之间 */
+    int div_y = cy + 4 * row_h + 1;
+    draw_hline(lcd, cx, cx + cw - 1, div_y, ST7305_COLOR_BLACK);
+
+    /* 底部: 左=返回(sel5), 右=保存(sel4), 与壁纸首页列表同风格(黑底白字高亮),
+     * 不用独立按键框, 只在一行内左右两个选项 + 中间细分隔线. */
+    int opt_y  = div_y + 6;
+    int opt_h  = 32;
+    int right0 = cx + cw / 2;
+    int text_y = opt_y + (opt_h - 24) / 2;
+    /* 左半: 返回 */
+    fill_rect(lcd, cx, opt_y, right0 - 1, opt_y + opt_h - 1,
+              (sel == 5) ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+    draw_text(lcd, cx + (right0 - cx - text_width("返回")) / 2, text_y, "返回", sel == 5);
+    /* 右半: 保存 */
+    fill_rect(lcd, right0, opt_y, cx + cw - 1, opt_y + opt_h - 1,
+              (sel == 4) ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+    draw_text(lcd, right0 + ((cx + cw - 1 - right0 + 1) - text_width("保存")) / 2, text_y,
+              "保存", sel == 4);
+    /* 左右选项之间的细分隔线 (非按键框) */
+    draw_vline(lcd, right0, opt_y, opt_y + opt_h - 1, ST7305_COLOR_BLACK);
+    (void)ch;
 }
 
 #if 0  /* 旧全屏子页 (已改为弹窗) */
@@ -1555,6 +1857,746 @@ static void open_pomodoro_remind_dialog(menu_state_t *state) {
              g_menu.pomo_reminder ? "开" : "关");
     snprintf(state->list_dialog_items[1], 64, "返回");
     state->list_dialog_count = 2;
+}
+
+/* ===================== USB HID 键鼠界面 =====================
+ * 全屏键盘(上半) + 触控板(下半).
+ *  - 键盘: 触摸点键 -> usb_hid_key_tap(); Ctrl/Alt/Shift/Caps 为开关键.
+ *  - 触控板: 单点=左键, 按住滑动=移鼠标, 按住不动 500ms=右键.
+ * 按物理 BACK (或状态栏提示) 退出, 停止 HID 并恢复串口.
+ * V1.0.69 */
+/* 键盘网格: 满宽无间隙, 6 列等宽槽 (slot=66), 列 x = 0/66/132/198/264/330 */
+#define HID_KW   66
+#define HID_KW_LAST 70  /* 最后一列(F6/F12)吃满右侧 4px, 使整宽正好 0..399 无缝隙 */
+#define HID_COL0 0
+#define HID_COL1 66
+#define HID_COL2 132
+#define HID_COL3 198
+#define HID_COL4 264
+#define HID_COL5 330
+#define HID_R0_Y 0
+#define HID_R1_Y 35
+#define HID_R2_Y 70
+#define HID_R3_Y 105
+#define HID_KH   35
+#define HID_ESC_H 70   /* ESC 纵跨 row2+row3 (y70..140) */
+#define HID_2W    136  /* 删除/回车: 2 格宽 (x264..399) */
+
+/* 触控板: 整宽 0..399, 顶部贴键盘下缘(y140), 底部中央左右箭头键 + 两侧鼠标键 */
+#define HID_TP_Y0 140
+#define HID_TP_Y1 299
+#define HID_MB_Y  273
+#define HID_MB_H  27
+#define HID_MB_W  96
+#define HID_MB_XL 4     /* V1.0.9x: L 鼠标键贴最左角落 */
+#define HID_MB_XR 300   /* V1.0.9x: R 鼠标键贴最右角落 */
+/* V1.0.9x: 触控板下方中央一对 ←→ 方向键 */
+#define HID_ARROW_Y  273
+#define HID_ARROW_H  27
+#define HID_ARROW_W  50
+#define HID_ARROW_XL 150   /* ← 键左框 */
+#define HID_ARROW_XR 203   /* → 键左框 */
+
+/* HID 键盘 usage code */
+#define HIDK_A  0x04
+#define HIDK_B  0x05
+#define HIDK_C  0x06
+#define HIDK_D  0x07
+#define HIDK_E  0x08
+#define HIDK_F  0x09
+#define HIDK_G  0x0A
+#define HIDK_H  0x0B
+#define HIDK_I  0x0C
+#define HIDK_J  0x0D
+#define HIDK_K  0x0E
+#define HIDK_L  0x0F
+#define HIDK_M  0x10
+#define HIDK_N  0x11
+#define HIDK_O  0x12
+#define HIDK_P  0x13
+#define HIDK_Q  0x14
+#define HIDK_R  0x15
+#define HIDK_S  0x16
+#define HIDK_T  0x17
+#define HIDK_U  0x18
+#define HIDK_V  0x19
+#define HIDK_W  0x1A
+#define HIDK_X  0x1B
+#define HIDK_Y  0x1C
+#define HIDK_Z  0x1D
+#define HIDK_1  0x1E
+#define HIDK_2  0x1F
+#define HIDK_3  0x20
+#define HIDK_4  0x21
+#define HIDK_5  0x22
+#define HIDK_6  0x23
+#define HIDK_7  0x24
+#define HIDK_8  0x25
+#define HIDK_9  0x26
+#define HIDK_0  0x27
+#define HIDK_ENTER     0x28
+#define HIDK_ESC       0x29
+#define HIDK_BS        0x2A
+#define HIDK_TAB       0x2B
+#define HIDK_SPACE     0x2C
+#define HIDK_MINUS     0x2D
+#define HIDK_EQUAL     0x2E
+#define HIDK_LBRACKET  0x2F
+#define HIDK_RBRACKET  0x30
+#define HIDK_BACKSLASH 0x31
+#define HIDK_SEMICOLON 0x33
+#define HIDK_QUOTE     0x34
+#define HIDK_BACKTICK  0x35
+#define HIDK_COMMA     0x36
+#define HIDK_PERIOD    0x37
+#define HIDK_SLASH     0x38
+#define HIDK_CAPS      0x39
+#define HIDK_LEFT      0x50
+#define HIDK_RIGHT     0x4F
+#define HIDK_UP        0x52
+#define HIDK_DOWN      0x51
+#define HIDK_MOD_CTRL  0xE0
+#define HIDK_MOD_SHIFT 0xE1
+#define HIDK_MOD_ALT   0xE2
+#define HIDK_F1   0x3A
+#define HIDK_F2   0x3B
+#define HIDK_F3   0x3C
+#define HIDK_F4   0x3D
+#define HIDK_F5   0x3E
+#define HIDK_F6   0x3F
+#define HIDK_F7   0x40
+#define HIDK_F8   0x41
+#define HIDK_F9   0x42
+#define HIDK_F10  0x43
+#define HIDK_F11  0x44
+#define HIDK_F12  0x45
+#define HIDK_DELETE 0x4C
+
+/* 修饰键位掩码 (与 TinyUSB / usb_hid 一致) */
+#define MOD_LCTRL  (1U << 0)
+#define MOD_LSHIFT (1U << 1)
+#define MOD_LALT   (1U << 2)
+
+/* 鼠标按键掩码 (USB HID button 位图) */
+#define HID_MOUSE_L 0x01
+#define HID_MOUSE_R 0x02
+#define HID_MOUSE_M 0x04
+
+/* 单个按键配置 (绝对网格坐标) */
+typedef struct {
+    const char *label;   /* 显示文本 (fn_key!=0 时, Fn 开启会动态显示 F 行标签) */
+    uint8_t     key;     /* HID usage (Fn 关闭时键码); HIDK_TOGGLE_* 为修饰/开关键 */
+    uint8_t     mod;     /* tap 时附加的修饰掩码 */
+    uint8_t     fn_key;  /* 非0: Fn 档1(F1-F12) 时转发此 HID 码 (如 HIDK_F1) */
+    uint16_t    x, y;    /* 左上角 (可 >255) */
+    uint16_t    w, h;    /* 尺寸 (可 >255) */
+    /* V1.0.77: Fn 三档 (0=数字 1=功能 2=符号) 的符号档字段 */
+    const char *sym_label; /* 符号档显示文本 (为 NULL 时符号档维持默认) */
+    uint8_t     sym_key;   /* 符号档 HID 码 */
+    uint8_t     sym_mod;   /* 符号档附加修饰掩码 */
+} hid_key_t;
+
+/* 修饰/开关按键伪键码 (与键盘 HID usage <=0xE7 不冲突) */
+#define HIDK_TOGGLE_CAPS  0xF1
+#define HIDK_TOGGLE_CTRL  0xF2
+#define HIDK_TOGGLE_ALT   0xF3
+#define HIDK_TOGGLE_SHIFT 0xF4
+#define HIDK_TOGGLE_FN    0xF5
+
+/* 键鼠布局枚举 (与二级菜单顺序一致) */
+typedef enum {
+    HID_LAYOUT_OP,        /* 0 运维键鼠: F区+光标+ESC/Del+回车, 下方触控板 */
+    HID_LAYOUT_28,        /* 1 28键紧凑键盘: 英文字母+空格+回车+删除+大小写(无触控板) */
+    HID_LAYOUT_76,        /* 2 52键全键盘+触控板: 标准QWERTY(数字行按Fn切F1-F12), 下方触控板 */
+    HID_LAYOUT_TOUCHPAD,  /* 3 纯触控板: 整屏触控板 */
+    HID_LAYOUT_MAX
+} hid_layout_t;
+
+/* ======== 运维键鼠布局 (保留原样) ======== */
+static const hid_key_t hid_row0[] = {   /* 第1排: F1-F6 */
+    { "F1", HIDK_F1,  0, 0, HID_COL0, HID_R0_Y, HID_KW, HID_KH },
+    { "F2", HIDK_F2,  0, 0, HID_COL1, HID_R0_Y, HID_KW, HID_KH },
+    { "F3", HIDK_F3,  0, 0, HID_COL2, HID_R0_Y, HID_KW, HID_KH },
+    { "F4", HIDK_F4,  0, 0, HID_COL3, HID_R0_Y, HID_KW, HID_KH },
+    { "F5", HIDK_F5,  0, 0, HID_COL4, HID_R0_Y, HID_KW, HID_KH },
+    { "F6", HIDK_F6,  0, 0, HID_COL5, HID_R0_Y, HID_KW_LAST, HID_KH },
+};
+static const hid_key_t hid_row1[] = {   /* 第2排: F7-F12 */
+    { "F7",  HIDK_F7,  0, 0, HID_COL0, HID_R1_Y, HID_KW, HID_KH },
+    { "F8",  HIDK_F8,  0, 0, HID_COL1, HID_R1_Y, HID_KW, HID_KH },
+    { "F9",  HIDK_F9,  0, 0, HID_COL2, HID_R1_Y, HID_KW, HID_KH },
+    { "F10", HIDK_F10, 0, 0, HID_COL3, HID_R1_Y, HID_KW, HID_KH },
+    { "F11", HIDK_F11, 0, 0, HID_COL4, HID_R1_Y, HID_KW, HID_KH },
+    { "F12", HIDK_F12, 0, 0, HID_COL5, HID_R1_Y, HID_KW_LAST, HID_KH },
+};
+static const hid_key_t hid_row2[] = {   /* 第3排: + / 上 / - / ESC(纵跨) / 删除 */
+    { "+",   HIDK_EQUAL,  0, 0, HID_COL0, HID_R2_Y, HID_KW, HID_KH },
+    { "^",   HIDK_UP,     0, 0, HID_COL1, HID_R2_Y, HID_KW, HID_KH },
+    { "-",   HIDK_MINUS,  0, 0, HID_COL2, HID_R2_Y, HID_KW, HID_KH },
+    { "Esc", HIDK_ESC,    0, 0, HID_COL3, HID_R2_Y, HID_KW, HID_ESC_H },
+    { "Del", HIDK_DELETE, 0, 0, HID_COL4, HID_R2_Y, HID_2W, HID_KH },
+};
+static const hid_key_t hid_row3[] = {   /* 第4排: 左 / 下 / 右 / 回车 */
+    { "<-",    HIDK_LEFT,  0, 0, HID_COL0, HID_R3_Y, HID_KW, HID_KH },
+    { "v",     HIDK_DOWN,  0, 0, HID_COL1, HID_R3_Y, HID_KW, HID_KH },
+    { "->",    HIDK_RIGHT, 0, 0, HID_COL2, HID_R3_Y, HID_KW, HID_KH },
+    { "Enter", HIDK_ENTER, 0, 0, HID_COL4, HID_R3_Y, HID_2W, HID_KH },
+};
+#define HID_R0_N (sizeof(hid_row0)/sizeof(hid_key_t))
+#define HID_R1_N (sizeof(hid_row1)/sizeof(hid_key_t))
+#define HID_R2_N (sizeof(hid_row2)/sizeof(hid_key_t))
+#define HID_R3_N (sizeof(hid_row3)/sizeof(hid_key_t))
+
+/* ======== 28键紧凑键盘 (整屏, 无触控板) ========
+ * 4 排: QWERTYUIOP / ASDFGHJKL / ZXCVBNM / 大小写·空格·删除·回车
+ * 每排横向铺满 400px, 按键 h=72 (整屏可放大). */
+#define K28_R0_Y 0
+#define K28_R1_Y 72
+#define K28_R2_Y 144
+#define K28_R3_Y 216
+#define K28_KH   72
+
+static const hid_key_t k28_row0[] = {   /* 第1排: Q W E R T Y U I O P */
+    { "Q", HIDK_Q, 0, 0, 0,   K28_R0_Y, 40, K28_KH },
+    { "W", HIDK_W, 0, 0, 40,  K28_R0_Y, 40, K28_KH },
+    { "E", HIDK_E, 0, 0, 80,  K28_R0_Y, 40, K28_KH },
+    { "R", HIDK_R, 0, 0, 120, K28_R0_Y, 40, K28_KH },
+    { "T", HIDK_T, 0, 0, 160, K28_R0_Y, 40, K28_KH },
+    { "Y", HIDK_Y, 0, 0, 200, K28_R0_Y, 40, K28_KH },
+    { "U", HIDK_U, 0, 0, 240, K28_R0_Y, 40, K28_KH },
+    { "I", HIDK_I, 0, 0, 280, K28_R0_Y, 40, K28_KH },
+    { "O", HIDK_O, 0, 0, 320, K28_R0_Y, 40, K28_KH },
+    { "P", HIDK_P, 0, 0, 360, K28_R0_Y, 40, K28_KH },
+};
+static const hid_key_t k28_row1[] = {   /* 第2排: A S D F G H J K L */
+    { "A", HIDK_A, 0, 0, 0,   K28_R1_Y, 44, K28_KH },
+    { "S", HIDK_S, 0, 0, 44,  K28_R1_Y, 44, K28_KH },
+    { "D", HIDK_D, 0, 0, 88,  K28_R1_Y, 44, K28_KH },
+    { "F", HIDK_F, 0, 0, 132, K28_R1_Y, 44, K28_KH },
+    { "G", HIDK_G, 0, 0, 176, K28_R1_Y, 44, K28_KH },
+    { "H", HIDK_H, 0, 0, 220, K28_R1_Y, 44, K28_KH },
+    { "J", HIDK_J, 0, 0, 264, K28_R1_Y, 44, K28_KH },
+    { "K", HIDK_K, 0, 0, 308, K28_R1_Y, 44, K28_KH },
+    { "L", HIDK_L, 0, 0, 352, K28_R1_Y, 48, K28_KH },
+};
+static const hid_key_t k28_row2[] = {   /* 第3排: Z X C V B N M Del(最后一个) */
+    { "Z",   HIDK_Z,      0, 0, 0,   K28_R2_Y, 50, K28_KH },
+    { "X",   HIDK_X,      0, 0, 50,  K28_R2_Y, 50, K28_KH },
+    { "C",   HIDK_C,      0, 0, 100, K28_R2_Y, 50, K28_KH },
+    { "V",   HIDK_V,      0, 0, 150, K28_R2_Y, 50, K28_KH },
+    { "B",   HIDK_B,      0, 0, 200, K28_R2_Y, 50, K28_KH },
+    { "N",   HIDK_N,      0, 0, 250, K28_R2_Y, 50, K28_KH },
+    { "M",   HIDK_M,      0, 0, 300, K28_R2_Y, 50, K28_KH },
+    { "Del", HIDK_DELETE, 0, 0, 350, K28_R2_Y, 50, K28_KH },
+};
+static const hid_key_t k28_row3[] = {   /* 第4排: 大小写 | 空格 | 回车 */
+    { "Caps",  HIDK_TOGGLE_CAPS, 0, 0, 0,   K28_R3_Y, 100, K28_KH },
+    { "Space", HIDK_SPACE,       0, 0, 100, K28_R3_Y, 150, K28_KH },
+    { "Enter", HIDK_ENTER,       0, 0, 250, K28_R3_Y, 150, K28_KH },
+};
+#define K28_R0_N (sizeof(k28_row0)/sizeof(hid_key_t))
+#define K28_R1_N (sizeof(k28_row1)/sizeof(hid_key_t))
+#define K28_R2_N (sizeof(k28_row2)/sizeof(hid_key_t))
+#define K28_R3_N (sizeof(k28_row3)/sizeof(hid_key_t))
+
+/* ======== 52键全键盘+触控板 (标准 QWERTY) ========
+ * 键盘 5 排占顶部 y0..150, 下方触控板 (起始 s_tp_top=156).
+ * V1.0.77: 数字行 1..+ 可按 Fn 三档切换 (0=数字 1=F1-F12 2=符号). */
+#define K76_KH   30
+#define K76_R0_Y 0
+#define K76_R1_Y 30
+#define K76_R2_Y 60
+#define K76_R3_Y 90
+#define K76_R4_Y 120
+
+static const hid_key_t k76_row0[] = {   /* 第1排: Esc 1 2 3 4 5 6 7 8 9 0 - + Bksp */
+    { .label="Esc",  .key=HIDK_ESC,     .x=0,   .y=K76_R0_Y, .w=28, .h=K76_KH },
+    { .label="1",    .key=HIDK_1,       .fn_key=HIDK_F1,  .sym_label="`", .sym_key=HIDK_BACKTICK,  .sym_mod=0,          .x=28,  .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="2",    .key=HIDK_2,       .fn_key=HIDK_F2,  .sym_label="~", .sym_key=HIDK_BACKTICK,  .sym_mod=MOD_LSHIFT, .x=59,  .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="3",    .key=HIDK_3,       .fn_key=HIDK_F3,  .sym_label="[", .sym_key=HIDK_LBRACKET,  .sym_mod=0,          .x=90,  .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="4",    .key=HIDK_4,       .fn_key=HIDK_F4,  .sym_label="]", .sym_key=HIDK_RBRACKET,  .sym_mod=0,          .x=121, .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="5",    .key=HIDK_5,       .fn_key=HIDK_F5,  .sym_label="{", .sym_key=HIDK_LBRACKET,  .sym_mod=MOD_LSHIFT, .x=152, .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="6",    .key=HIDK_6,       .fn_key=HIDK_F6,  .sym_label="}", .sym_key=HIDK_RBRACKET,  .sym_mod=MOD_LSHIFT, .x=183, .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="7",    .key=HIDK_7,       .fn_key=HIDK_F7,  .sym_label=";", .sym_key=HIDK_SEMICOLON, .sym_mod=0,          .x=214, .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="8",    .key=HIDK_8,       .fn_key=HIDK_F8,  .sym_label="'", .sym_key=HIDK_QUOTE,     .sym_mod=0,          .x=245, .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="9",    .key=HIDK_9,       .fn_key=HIDK_F9,  .sym_label=",", .sym_key=HIDK_COMMA,     .sym_mod=0,          .x=276, .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="0",    .key=HIDK_0,       .fn_key=HIDK_F10, .sym_label=".", .sym_key=HIDK_PERIOD,    .sym_mod=0,          .x=307, .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="-",    .key=HIDK_MINUS,   .fn_key=HIDK_F11, .sym_label="/", .sym_key=HIDK_SLASH,     .sym_mod=0,          .x=338, .y=K76_R0_Y, .w=31, .h=K76_KH },
+    { .label="+",    .key=HIDK_EQUAL,   .mod=MOD_LSHIFT,  .fn_key=HIDK_F12, .sym_label="?", .sym_key=HIDK_SLASH, .sym_mod=MOD_LSHIFT, .x=369, .y=K76_R0_Y, .w=31, .h=K76_KH },   /* V1.0.79: Bksp 移到第2排 */
+};
+static const hid_key_t k76_row1[] = {   /* 第2排: Tab Q W E R T Y U I O P Bksp  (V1.0.79: Bksp 移到最后) */
+    { .label="Tab", .key=HIDK_TAB, .x=0,   .y=K76_R1_Y, .w=34, .h=K76_KH },
+    { .label="Q",   .key=HIDK_Q,   .x=34,  .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="W",   .key=HIDK_W,   .x=67,  .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="E",   .key=HIDK_E,   .x=100, .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="R",   .key=HIDK_R,   .x=133, .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="T",   .key=HIDK_T,   .x=166, .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="Y",   .key=HIDK_Y,   .x=199, .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="U",   .key=HIDK_U,   .x=232, .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="I",   .key=HIDK_I,   .x=265, .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="O",   .key=HIDK_O,   .x=298, .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="P",   .key=HIDK_P,   .x=331, .y=K76_R1_Y, .w=33, .h=K76_KH },
+    { .label="Bksp",.key=HIDK_BS,  .x=364, .y=K76_R1_Y, .w=36, .h=K76_KH },
+};
+static const hid_key_t k76_row2[] = {   /* 第3排: Caps A S D F G H J K L Enter */
+    { .label="Caps",  .key=HIDK_TOGGLE_CAPS, .x=0,   .y=K76_R2_Y, .w=54, .h=K76_KH },
+    { .label="A", .key=HIDK_A, .x=54,  .y=K76_R2_Y, .w=33, .h=K76_KH },
+    { .label="S", .key=HIDK_S, .x=87,  .y=K76_R2_Y, .w=33, .h=K76_KH },
+    { .label="D", .key=HIDK_D, .x=120, .y=K76_R2_Y, .w=33, .h=K76_KH },
+    { .label="F", .key=HIDK_F, .x=153, .y=K76_R2_Y, .w=33, .h=K76_KH },
+    { .label="G", .key=HIDK_G, .x=186, .y=K76_R2_Y, .w=33, .h=K76_KH },
+    { .label="H", .key=HIDK_H, .x=219, .y=K76_R2_Y, .w=33, .h=K76_KH },
+    { .label="J", .key=HIDK_J, .x=252, .y=K76_R2_Y, .w=33, .h=K76_KH },
+    { .label="K", .key=HIDK_K, .x=285, .y=K76_R2_Y, .w=33, .h=K76_KH },
+    { .label="L", .key=HIDK_L, .x=318, .y=K76_R2_Y, .w=32, .h=K76_KH },
+    { .label="Enter", .key=HIDK_ENTER, .x=350, .y=K76_R2_Y, .w=50, .h=K76_KH * 2 },  /* V1.0.79: 与下方右方向键同宽(50) 顶到右缘, 两行高 */
+};
+static const hid_key_t k76_row3[] = {   /* 第4排: Shift Z X C V B N M ↑ (V1.0.78: 删除右端 Shift) */
+    { .label="Shift", .key=HIDK_TOGGLE_SHIFT, .x=0,   .y=K76_R3_Y, .w=70, .h=K76_KH },
+    { .label="Z", .key=HIDK_Z, .x=70,  .y=K76_R3_Y, .w=34, .h=K76_KH },
+    { .label="X", .key=HIDK_X, .x=104, .y=K76_R3_Y, .w=34, .h=K76_KH },
+    { .label="C", .key=HIDK_C, .x=138, .y=K76_R3_Y, .w=34, .h=K76_KH },
+    { .label="V", .key=HIDK_V, .x=172, .y=K76_R3_Y, .w=34, .h=K76_KH },
+    { .label="B", .key=HIDK_B, .x=206, .y=K76_R3_Y, .w=34, .h=K76_KH },
+    { .label="N", .key=HIDK_N, .x=240, .y=K76_R3_Y, .w=33, .h=K76_KH },
+    { .label="M", .key=HIDK_M, .x=273, .y=K76_R3_Y, .w=32, .h=K76_KH },
+    { .label="↑", .key=HIDK_UP, .x=305, .y=K76_R3_Y, .w=45, .h=K76_KH },   /* V1.0.79: 与下方 ↓ (x305) 对齐 */
+};
+static const hid_key_t k76_row4[] = {   /* 第5排: Fn Ctrl Alt Space ← ↓ → */
+    { .label="Fn",   .key=HIDK_TOGGLE_FN,   .x=0,   .y=K76_R4_Y, .w=50,  .h=K76_KH },
+    { .label="Ctrl", .key=HIDK_TOGGLE_CTRL, .x=50,  .y=K76_R4_Y, .w=50,  .h=K76_KH },
+    { .label="Alt",  .key=HIDK_TOGGLE_ALT,  .x=100, .y=K76_R4_Y, .w=50,  .h=K76_KH },
+    { .label="Space",.key=HIDK_SPACE,       .x=150, .y=K76_R4_Y, .w=110, .h=K76_KH },
+    { .label="←",    .key=HIDK_LEFT,        .x=260, .y=K76_R4_Y, .w=45,  .h=K76_KH },
+    { .label="↓",    .key=HIDK_DOWN,        .x=305, .y=K76_R4_Y, .w=45,  .h=K76_KH },
+    { .label="→",    .key=HIDK_RIGHT,       .x=350, .y=K76_R4_Y, .w=50,  .h=K76_KH },
+};
+#define K76_R0_N (sizeof(k76_row0)/sizeof(hid_key_t))
+#define K76_R1_N (sizeof(k76_row1)/sizeof(hid_key_t))
+#define K76_R2_N (sizeof(k76_row2)/sizeof(hid_key_t))
+#define K76_R3_N (sizeof(k76_row3)/sizeof(hid_key_t))
+#define K76_R4_N (sizeof(k76_row4)/sizeof(hid_key_t))
+
+/* 行集合: 供渲染与命中复用的通用结构 */
+typedef struct { const hid_key_t *keys; int count; } hid_rowarr_t;
+
+/* 键鼠界面静态状态: 当前布局 + 修饰开关键 + 触控板输入状态
+ * (菜单单页, 无并发渲染, 单任务访问, 无需加锁). */
+static hid_layout_t s_hid_layout = HID_LAYOUT_OP;   /* 当前布局 */
+static int  s_tp_top       = HID_TP_Y0;             /* 触控板起始 y (随布局切换) */
+static bool s_show_mbtn    = true;                  /* 是否显示底部左右鼠标键 (纯触控板不显示) */
+static bool s_hid_shift, s_hid_caps, s_hid_ctrl, s_hid_alt;
+static uint8_t s_hid_fn_mode = 0;   /* V1.0.77: Fn 三档 0=数字 1=F1-F12 2=符号 */
+static bool s_tp_active;            /* 手指在触控板区域按下 */
+static int  s_tp_start_x, s_tp_start_y;
+static int  s_tp_last_x, s_tp_last_y;
+static int  s_tp_accum_x, s_tp_accum_y;  /* 亚像素累计, 保证小幅度平滑移动 */
+static uint32_t s_tp_down_ms;
+static int  s_tp_moved;             /* 总位移, 判断是否拖动 */
+static bool s_tp_right_sent;        /* 长按右击是否已发送 */
+
+/* V1.0.74: 普通按键按击反馈 - 按下时该键短暂反黑高亮, 超时自动还原.
+ * V1.0.79: Caps/Shift 是开关键, 保持原有切换高亮, 不做瞬时反黑 (见 hid_key_press_exec). */
+#define PRESS_FLASH_MS  160
+static bool     s_press_active;
+static int      s_press_x0, s_press_y0, s_press_x1, s_press_y1;
+static const char *s_press_label;
+static const hid_key_t *s_press_key; /* 记录按下的键 (用于判断 Caps/Shift 不闪) */
+static uint32_t s_press_ms;         /* esp 毫秒时间戳 */
+
+static void hid_key_press_exec(const hid_key_t *k);
+static void hid_trackpad_poll(menu_state_t *state);
+static void open_hid_layout_switch(menu_state_t *state);
+
+void hid_ui_reset(void) {
+    /* 按当前布局刷新触控板/鼠标键几何参数 */
+    switch (s_hid_layout) {
+        case HID_LAYOUT_28:       s_tp_top = HID_TP_Y1 + 1;  s_show_mbtn = false; break; /* 无触控板 */
+        case HID_LAYOUT_76:       s_tp_top = 156;            s_show_mbtn = true;  break;
+        case HID_LAYOUT_TOUCHPAD: s_tp_top = 0;              s_show_mbtn = false; break; /* 整屏 */
+        case HID_LAYOUT_OP:
+        default:                  s_tp_top = HID_TP_Y0;      s_show_mbtn = true;  break;
+    }
+    s_hid_shift = s_hid_caps = s_hid_ctrl = s_hid_alt = false;
+    s_hid_fn_mode = 0;
+    usb_hid_key_release();
+    usb_hid_mouse_release(HID_MOUSE_L | HID_MOUSE_R | HID_MOUSE_M);
+    s_tp_active = false;
+    s_tp_moved = 0;
+    s_tp_accum_x = s_tp_accum_y = 0;
+    s_tp_last_x = s_tp_last_y = 0;
+    s_tp_down_ms = 0;
+    s_tp_right_sent = false;
+}
+
+/* 在 [x, x+w-1] x [y, y+h-1] 内居中画单行文本 (中号 12x18).
+ * V1.0.78: 支持 UTF-8 方向箭头 ↑↓←→ (E2 86 90-93) 按单个显示字符渲染,
+ *          不再把箭头误拆成多个 '?' 乱码. */
+static void hid_draw_label_centered(st7305_handle_t *lcd, int x, int w,
+                                    int y, int h, const char *s, bool inverted) {
+    /* 统计显示字符数: 每个 ASCII 或每个 UTF-8 箭头都算 1 个字符 */
+    int n = 0;
+    const char *p = s;
+    while (*p != '\0' && n < 8) {
+        if ((unsigned char)*p >= 0x80) p += 3; else p++;
+        n++;
+    }
+    int tw = n * 12;
+    if (tw > w) tw = w;
+    int tx = x + (w - tw) / 2;
+    int ty = y + (h - 18) / 2;
+    if (ty < 0) ty = 0;
+    const char *q = s;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *bmp = NULL;
+        int adv = 1;
+        unsigned char c0 = (unsigned char)q[0];
+        if (c0 >= 0x80 && q[1] != '\0' && q[2] != '\0' &&
+            (unsigned char)q[1] == 0x86 && (unsigned char)q[2] >= 0x90 && (unsigned char)q[2] <= 0x93) {
+            adv = 3;
+            switch (q[2]) {
+                case 0x90: bmp = ARROW_LEFT;  break;
+                case 0x91: bmp = ARROW_UP;    break;
+                case 0x92: bmp = ARROW_RIGHT; break;
+                case 0x93: bmp = ARROW_DOWN;  break;
+            }
+        }
+        if (bmp) {
+            draw_ascii_medium_bmp(lcd, tx + i * 12, ty, bmp, inverted);
+        } else {
+            draw_ascii_medium(lcd, tx + i * 12, ty, q[0], inverted);
+        }
+        q += adv;
+    }
+}
+
+/* Fn 三档时动态标签: 档1(F1-F12)=显示 "F<序号>", 档2(符号)=显示 sym_label */
+static const char *hid_key_label(const hid_key_t *k) {
+    if (s_hid_fn_mode == 1 && k->fn_key) {
+        static char buf[8];
+        int n = (int)k->fn_key - (int)HIDK_F1 + 1;
+        snprintf(buf, sizeof buf, "F%d", n);
+        return buf;
+    }
+    if (s_hid_fn_mode == 2 && k->sym_label) {
+        return k->sym_label;
+    }
+    /* V1.0.74: Caps 决定字母显示大小写. 默认小写, Caps 开=大写.
+     * 注意 label 存的是大写字母, 故转小写用 +32; 原先 -32 会把大写变数字符号, 造成
+     * "按 Caps 后所有字母变乱码" 的 bug (见 k28_row1 等, 标签本身就是大写). */
+    if (k->key >= HIDK_A && k->key <= HIDK_Z) {
+        static char c[2];
+        c[0] = s_hid_caps ? (char)k->label[0] : (char)(k->label[0] + 32);
+        c[1] = '\0';
+        return c;
+    }
+    return k->label;
+}
+
+/* 该键是否为激活状态的开关按键 (高亮显示) */
+static bool hid_key_toggled_on(const hid_key_t *k) {
+    switch (k->key) {
+        case HIDK_TOGGLE_CAPS:  return s_hid_caps;
+        case HIDK_TOGGLE_CTRL:  return s_hid_ctrl;
+        case HIDK_TOGGLE_ALT:   return s_hid_alt;
+        case HIDK_TOGGLE_SHIFT: return s_hid_shift;
+        case HIDK_TOGGLE_FN:    return s_hid_fn_mode != 0;   /* 任一非数字档都点亮 */
+        default:                return false;
+    }
+}
+
+/* 画一个按键, 按 k->x/y/w/h 绘制. on=true 键反白 (开关键激活态). */
+static void hid_draw_key(st7305_handle_t *lcd, const hid_key_t *k, bool on) {
+    int w = k->w, h = k->h;
+    if (on) {
+        fill_rect(lcd, k->x, k->y, k->x + w - 1, k->y + h - 1, ST7305_COLOR_BLACK);
+    } else {
+        draw_rect_outline(lcd, k->x, k->y, k->x + w - 1, k->y + h - 1, ST7305_COLOR_BLACK);
+    }
+    hid_draw_label_centered(lcd, k->x, w, k->y, h, hid_key_label(k), on);
+}
+
+/* 通用: 渲染一组行 */
+static void hid_draw_rows(st7305_handle_t *lcd, const hid_rowarr_t *rows, int n) {
+    for (int r = 0; r < n; r++) {
+        for (int i = 0; i < rows[r].count; i++) {
+            const hid_key_t *k = &rows[r].keys[i];
+            hid_draw_key(lcd, k, hid_key_toggled_on(k));
+        }
+    }
+}
+
+/* 取当前布局的键盘行集合 (返回行数; 无键盘返回 0) */
+static int hid_layout_rows(hid_rowarr_t *out, int max) {
+    int n = 0;
+    switch (s_hid_layout) {
+        case HID_LAYOUT_28:
+            { const hid_rowarr_t r[4] = {
+                { k28_row0, K28_R0_N }, { k28_row1, K28_R1_N },
+                { k28_row2, K28_R2_N }, { k28_row3, K28_R3_N } };
+              for (int i = 0; i < 4 && n < max; i++) out[n++] = r[i]; }
+            break;
+        case HID_LAYOUT_76:
+            { const hid_rowarr_t r[5] = {
+                { k76_row0, K76_R0_N }, { k76_row1, K76_R1_N },
+                { k76_row2, K76_R2_N }, { k76_row3, K76_R3_N },
+                { k76_row4, K76_R4_N } };
+              for (int i = 0; i < 5 && n < max; i++) out[n++] = r[i]; }
+            break;
+        case HID_LAYOUT_TOUCHPAD:
+            break;   /* 纯触控板: 无键盘 */
+        default: {  /* OP */
+            const hid_rowarr_t r[4] = {
+                { hid_row0, HID_R0_N }, { hid_row1, HID_R1_N },
+                { hid_row2, HID_R2_N }, { hid_row3, HID_R3_N } };
+            for (int i = 0; i < 4 && n < max; i++) out[n++] = r[i];
+            break;
+        }
+    }
+    return n;
+}
+
+/* 画触控板外框 + 底部: 两侧左右鼠标键 + 中间一对 ←→ 方向键. 纯触控板/28键无按键. */
+static void hid_draw_touchpad(st7305_handle_t *lcd) {
+    draw_rect_outline(lcd, 0, s_tp_top, SCREEN_W - 1, HID_TP_Y1, ST7305_COLOR_BLACK);
+    if (s_show_mbtn) {
+        /* L/R 鼠标键贴左右角落, 外侧圆角, 中间分隔处直角 */
+        draw_rect_outline_side_round(lcd, HID_MB_XL, HID_MB_Y,
+                                     HID_MB_XL + HID_MB_W - 1, HID_MB_Y + HID_MB_H - 1,
+                                     ST7305_COLOR_BLACK, 8, 'L');
+        draw_rect_outline_side_round(lcd, HID_MB_XR, HID_MB_Y,
+                                     HID_MB_XR + HID_MB_W - 1, HID_MB_Y + HID_MB_H - 1,
+                                     ST7305_COLOR_BLACK, 8, 'R');
+        hid_draw_label_centered(lcd, HID_MB_XL, HID_MB_W, HID_MB_Y, HID_MB_H, "L", false);
+        hid_draw_label_centered(lcd, HID_MB_XR, HID_MB_W, HID_MB_Y, HID_MB_H, "R", false);
+        /* 中间一对 ← → 方向键 */
+        draw_rect_outline_side_round(lcd, HID_ARROW_XL, HID_ARROW_Y,
+                                     HID_ARROW_XL + HID_ARROW_W - 1, HID_ARROW_Y + HID_ARROW_H - 1,
+                                     ST7305_COLOR_BLACK, 8, 'L');
+        draw_rect_outline_side_round(lcd, HID_ARROW_XR, HID_ARROW_Y,
+                                     HID_ARROW_XR + HID_ARROW_W - 1, HID_ARROW_Y + HID_ARROW_H - 1,
+                                     ST7305_COLOR_BLACK, 8, 'R');
+        hid_draw_label_centered(lcd, HID_ARROW_XL, HID_ARROW_W, HID_ARROW_Y, HID_ARROW_H, "\xe2\x86\x90", false); /* ← */
+        hid_draw_label_centered(lcd, HID_ARROW_XR, HID_ARROW_W, HID_ARROW_Y, HID_ARROW_H, "\xe2\x86\x92", false); /* → */
+    }
+}
+
+/* 渲染整页: 键盘 (按布局) + 触控板. 每帧调用, 同时轮询触控板上报鼠标. */
+static void render_usb_hid(menu_state_t *state) {
+    st7305_handle_t *lcd = state->lcd;
+    st7305_clear(lcd, ST7305_COLOR_WHITE);
+    /* 无英文标题栏, 键盘直接贴顶 (y0) */
+
+    hid_rowarr_t rows[5];
+    int rn = hid_layout_rows(rows, 5);
+    hid_draw_rows(lcd, rows, rn);
+    if (s_show_mbtn || s_hid_layout != HID_LAYOUT_28) {
+        hid_draw_touchpad(lcd);
+    }
+    /* V1.0.79: 普通按键按击反馈 - 按下后短暂反黑, 超时由 menu_render 还原 */
+    if (s_press_active && s_press_key &&
+        s_press_key->key != HIDK_TOGGLE_CAPS && s_press_key->key != HIDK_TOGGLE_SHIFT) {
+        fill_rect(lcd, s_press_x0, s_press_y0, s_press_x1, s_press_y1, ST7305_COLOR_BLACK);
+        int w = s_press_x1 - s_press_x0 + 1, h = s_press_y1 - s_press_y0 + 1;
+        hid_draw_label_centered(lcd, s_press_x0, w, s_press_y0, h, s_press_label, true);
+    }
+
+    st7305_flush(lcd);
+}
+
+/* 键盘/鼠标键点击命中测试: 返回 true 表示点到了某个键并已执行 HID 动作.
+ * 触控板滑动区不在此处理 (由 hid_trackpad_poll 处理), 返回 false. */
+static bool hid_ui_hit(menu_state_t *state, int x, int y) {
+    (void)state;
+    hid_rowarr_t rows[5];
+    int rn = hid_layout_rows(rows, 5);
+    for (int r = 0; r < rn; r++) {
+        for (int i = 0; i < rows[r].count; i++) {
+            const hid_key_t *k = &rows[r].keys[i];
+            if (x >= k->x && x < k->x + k->w && y >= k->y && y < k->y + k->h) {
+                /* V1.0.74: 记录按击反黑区域用于按下反馈 */
+                s_press_x0 = k->x; s_press_y0 = k->y;
+                s_press_x1 = k->x + k->w - 1; s_press_y1 = k->y + k->h - 1;
+                s_press_label = hid_key_label(k);
+                s_press_key = k;
+                s_press_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                s_press_active = true;
+                hid_key_press_exec(k);
+                return true;
+            }
+        }
+    }
+    /* 底部: 中央 ←→ 方向键 + 两侧左右鼠标键 (仅需显示的布局, 纯触控板整屏滑动由 poll 处理) */
+    if (s_show_mbtn && y >= HID_MB_Y && y < HID_MB_Y + HID_MB_H) {
+        if (x >= HID_ARROW_XL && x < HID_ARROW_XL + HID_ARROW_W) { usb_hid_key_tap(0, HIDK_LEFT); return true; }
+        if (x >= HID_ARROW_XR && x < HID_ARROW_XR + HID_ARROW_W) { usb_hid_key_tap(0, HIDK_RIGHT); return true; }
+        if (x >= HID_MB_XL && x < HID_MB_XL + HID_MB_W) { usb_hid_mouse_click(HID_MOUSE_L); return true; }
+        if (x >= HID_MB_XR && x < HID_MB_XR + HID_MB_W) { usb_hid_mouse_click(HID_MOUSE_R); return true; }
+    }
+    return false;
+}
+
+/* 由 hid_ui_hit 找到按键后执行对应 HID 动作 */
+static void hid_key_press_exec(const hid_key_t *k) {
+    /* 开关键: 切换状态 */
+    switch (k->key) {
+        case HIDK_TOGGLE_CAPS:  s_hid_caps  = !s_hid_caps;  return;
+        case HIDK_TOGGLE_CTRL:  s_hid_ctrl  = !s_hid_ctrl;  return;
+        case HIDK_TOGGLE_ALT:   s_hid_alt   = !s_hid_alt;   return;
+        case HIDK_TOGGLE_SHIFT: s_hid_shift = !s_hid_shift; return;
+        case HIDK_TOGGLE_FN:    s_hid_fn_mode = (s_hid_fn_mode + 1) % 3; return;  /* 三档循环 */
+        default: break;
+    }
+    /* 组合修饰掩码 (Shift 与 Caps 都产生 LShift 修饰) */
+    uint8_t mod = k->mod;
+    if (s_hid_ctrl)  mod |= MOD_LCTRL;
+    if (s_hid_alt)   mod |= MOD_LALT;
+    if (s_hid_shift || s_hid_caps) mod |= MOD_LSHIFT;
+    uint8_t code = k->key;
+    if (s_hid_fn_mode == 1 && k->fn_key) {            /* 档1: F1-F12 */
+        code = k->fn_key;
+    } else if (s_hid_fn_mode == 2 && k->sym_key) {    /* 档2: 符号 */
+        code = k->sym_key;
+        mod |= k->sym_mod;
+    }
+    usb_hid_key_tap(mod, code);
+}
+
+/* 触控板: 每帧轮询 input_get_touch_pos 并上报鼠标. 也响应长按右击.
+ * s_tp_top 随布局变化: 运维/76 下半屏, 纯触控板整屏, 28键无触控板 (直接跳过 mouse).
+ * 切键盘款式不通过触摸滑动 (已移除 V1.0.72 边缘手势), 只能按确认键弹出二级菜单选择. */
+static void hid_trackpad_poll(menu_state_t *state) {
+    (void)state;
+    int tx, ty;
+    bool down = input_get_touch_pos(&tx, &ty);
+
+    if (s_hid_layout == HID_LAYOUT_28) return;   /* 无触控板 */
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    /* 触控板滑动区: 整宽 [s_tp_top, HID_TP_Y1], 排除底部左右鼠标键区域 (由 hid_ui_hit 处理) */
+    bool in_tp = down && tx >= 0 && tx < SCREEN_W &&
+                 ty >= s_tp_top && ty <= HID_TP_Y1;
+    if (in_tp && s_show_mbtn && ty >= HID_MB_Y) {
+        bool on_btn =
+            (tx >= HID_MB_XL && tx < HID_MB_XL + HID_MB_W) ||
+            (tx >= HID_MB_XR && tx < HID_MB_XR + HID_MB_W) ||
+            (tx >= HID_ARROW_XL && tx < HID_ARROW_XL + HID_ARROW_W) ||
+            (tx >= HID_ARROW_XR && tx < HID_ARROW_XR + HID_ARROW_W);
+        if (on_btn) in_tp = false;
+    }
+    if (down && !s_tp_active) {
+        /* 按下(进入触控板) */
+        if (in_tp) {
+            s_tp_active = true;
+            s_tp_start_x = s_tp_last_x = tx;
+            s_tp_start_y = s_tp_last_y = ty;
+            s_tp_down_ms = now;
+            s_tp_moved = 0;
+            s_tp_accum_x = s_tp_accum_y = 0;
+            s_tp_right_sent = false;
+        }
+        return;
+    }
+    if (!s_tp_active) return;
+    if (down) {
+        if (in_tp) {
+            int dx = tx - s_tp_last_x;
+            int dy = ty - s_tp_last_y;
+            s_tp_last_x = tx; s_tp_last_y = ty;
+            if (dx != 0 || dy != 0) {
+                int sp = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+                s_tp_moved += sp;
+                /* 速度加速: 拖得越快, 手指位移到鼠标的倍数越大 (低速1:1平稳, 快速大跨越).
+                 * scale = 1 + 0.25*speed, 上限 6x, 防止单帧鼠标位移过大. */
+                float g = 1.0f + 0.25f * (float)sp;
+                if (g > 6.0f) g = 6.0f;
+                s_tp_accum_x += (int)(dx * g);
+                s_tp_accum_y += (int)(dy * g);
+                if (s_tp_accum_x || s_tp_accum_y) {
+                    int mx = s_tp_accum_x, my = s_tp_accum_y;
+                    if (mx > 127) mx = 127; else if (mx < -128) mx = -128;
+                    if (my > 127) my = 127; else if (my < -128) my = -128;
+                    usb_hid_mouse_move((int8_t)mx, (int8_t)my);
+                    s_tp_accum_x = 0; s_tp_accum_y = 0;
+                }
+            }
+            /* 长按不动 -> 右键 */
+            if (!s_tp_right_sent && s_tp_moved < 12 && now - s_tp_down_ms >= 500) {
+                usb_hid_mouse_click(HID_MOUSE_R);
+                s_tp_right_sent = true;
+            }
+        }
+    } else {
+        /* 松手: 短按且未拖动 -> 左键 */
+        if (s_tp_moved < 12 && !s_tp_right_sent) {
+            usb_hid_mouse_click(HID_MOUSE_L);
+        }
+        s_tp_active = false;
+        s_tp_moved = 0;
+    }
+}
+
+/* ===================== 键鼠布局二级菜单 =====================
+ * 主菜单"键鼠"项点击后弹出布局选择, 选中后启动 HID 进入对应全屏页.
+ * 末项"返回"由 list_dialog 通用 CONFIRM 分支处理, 不触发 on_select. */
+static void hid_layout_dialog_on_select(menu_state_t *state, int idx) {
+    if (idx < 0 || idx >= HID_LAYOUT_MAX) return;
+    s_hid_layout = (hid_layout_t)idx;
+    /* 关闭布局选择弹窗, 回到主菜单状态后再进入全屏键鼠页 */
+    state->list_dialog_active = false;
+    state->list_dialog_prev_active = false;
+    state->list_dialog_prev_selected = -1;
+    state->list_dialog_stack_top = 0;
+    esp_err_t hid_ret = usb_hid_start();
+    if (hid_ret == ESP_OK) {
+        hid_ui_reset();
+        state->current_page = MENU_PAGE_USB_HID;
+        state->needs_redraw = true;
+    } else {
+        ESP_LOGE(TAG, "USB HID 启动失败: %s", esp_err_to_name(hid_ret));
+        state->needs_redraw = true;
+    }
+}
+
+static void open_usb_hid_layout_dialog(menu_state_t *state) {
+    state->list_dialog_return_page = state->current_page;   /* 主菜单 */
+    list_dialog_open(state, "键鼠布局", 0, hid_layout_dialog_on_select);
+    int n = 0;
+    snprintf(state->list_dialog_items[n++], 64, "运维键鼠");
+    snprintf(state->list_dialog_items[n++], 64, "28键紧凑键盘");
+    snprintf(state->list_dialog_items[n++], 64, "52键全键盘+触控板");
+    snprintf(state->list_dialog_items[n++], 64, "纯触控板");
+    snprintf(state->list_dialog_items[n++], 64, "返回");
+    state->list_dialog_count = n;
+}
+
+/* V1.0.72: 键鼠全屏页内的"二级菜单"选中回调.
+ * 与主菜单弹窗区别: 已在 HID 页, 只切换布局并复位 UI, 不重启 HID. */
+static void hid_layout_switch_on_select(menu_state_t *state, int idx) {
+    if (idx < 0 || idx >= HID_LAYOUT_MAX) return;
+    s_hid_layout = (hid_layout_t)idx;
+    state->list_dialog_active = false;
+    state->list_dialog_prev_active = false;
+    state->list_dialog_prev_selected = -1;
+    state->list_dialog_stack_top = 0;
+    hid_ui_reset();
+    state->needs_redraw = true;
+}
+
+/* V1.0.72: 在键鼠全屏页内弹出布局二级菜单 (顶部下滑 / 确认键).
+ * V1.0.74: 末项"返回菜单"关闭弹窗并回到主菜单; 由 render 兜底 usb_hid_stop()
+ * 停止 HID 并切回 Serial/JTAG 串口 (无需重启). */
+static void open_hid_layout_switch(menu_state_t *state) {
+    if (!state) return;
+    state->list_dialog_return_page = MENU_PAGE_MAIN;   /* 选中"返回菜单"退出键鼠页 */
+    list_dialog_open(state, "键鼠布局", 0, hid_layout_switch_on_select);
+    int n = 0;
+    snprintf(state->list_dialog_items[n++], 64, "运维键鼠");
+    snprintf(state->list_dialog_items[n++], 64, "28键紧凑键盘");
+    snprintf(state->list_dialog_items[n++], 64, "52键全键盘+触控板");
+    snprintf(state->list_dialog_items[n++], 64, "纯触控板");
+    snprintf(state->list_dialog_items[n++], 64, "返回菜单");
+    state->list_dialog_count = n;
+    state->needs_redraw = true;
 }
 
 static void pomodoro_dialog_on_select(menu_state_t *state, int idx) {
@@ -2102,6 +3144,7 @@ static bool screensaver_enter(st7305_handle_t *lcd, uint32_t now_ms) {
     /* 20260812: 所有壁纸模式(含游戏壁纸)进入即挂起蓝牙, 退出时统一恢复.
      * 常驻的只有音频框架; 蓝牙在壁纸期间断开+停扫 (协议栈存活). */
     screensaver_bt_off();
+    s_screensaver_start_ms = now_ms;   /* 记录壁纸进入时刻 (自动软关机计时) */
     if (g_menu.wallpaper_mode == WALLPAPER_MODE_GAME) {
         wallpaper_games_load();
         if (s_wp_game_count <= 0) {
@@ -2175,6 +3218,21 @@ bool screensaver_check_and_render(st7305_handle_t *lcd, bool has_input) {
     }
     /* 屏保已激活: 持续渲染, 有输入时检查是否在忽略期内 */
     if (s_screensaver_active) {
+        /* V1.0.90: 自动软关机 (测试壁纸除外): 达到设定时长直接关机 */
+        if (g_menu.wallpaper_auto_shutdown && !s_screensaver_test) {
+            uint32_t to_ms;
+            switch (g_menu.wallpaper_shutdown_unit) {
+                case 0: to_ms = (uint32_t)g_menu.wallpaper_shutdown_time * 60 * 1000UL; break;      /* 分钟 */
+                case 1: to_ms = (uint32_t)g_menu.wallpaper_shutdown_time * 3600 * 1000UL; break;     /* 小时 */
+                default: to_ms = (uint32_t)g_menu.wallpaper_shutdown_time * 86400 * 1000UL; break;   /* 天 */
+            }
+            if (to_ms > 0 && (uint32_t)(now_ms - s_screensaver_start_ms) >= to_ms) {
+                ESP_LOGI(TAG, "壁纸自动软关机触发 (unit=%d time=%d)",
+                         g_menu.wallpaper_shutdown_unit, g_menu.wallpaper_shutdown_time);
+                menu_soft_power_off(lcd);   /* 不返回, 进入 deep sleep */
+                return false;
+            }
+        }
         if (s_screensaver_test && now_ms - s_screensaver_test_ms >= 30000) {
             ESP_LOGI(TAG, "测试壁纸: 30 秒到, 自动退出");
             screensaver_bt_on();   /* 自动退出也要恢复蓝牙 */
@@ -2354,6 +3412,41 @@ static const uint8_t FONT8X12[][12] = {
     {0x00,0x00,0x00,0x00,0x76,0x7E,0x1F,0x00,0x00,0x00,0x00,0x00}, /* '~' */
 };
 
+/* ============ V1.0.78: 方向箭头字形 (8x12, 与 FONT8X12 同规格, 绘制时 1.5x 缩放为 12x18) ============ */
+/* ↑ */
+static const uint8_t ARROW_UP[12] = {
+    0x18,0x3C,0x7E,0x7E,0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0x18,
+};
+/* ↓ */
+static const uint8_t ARROW_DOWN[12] = {
+    0x18,0x18,0x18,0x18,0x18,0x18,0x7E,0x7E,0x7E,0x3C,0x18,0x18,
+};
+/* ← */
+static const uint8_t ARROW_LEFT[12] = {
+    0x00,0x00,0x18,0x18,0x38,0xF8,0xF8,0x38,0x18,0x18,0x00,0x00,
+};
+/* → */
+static const uint8_t ARROW_RIGHT[12] = {
+    0x00,0x00,0x18,0x18,0x1C,0x1F,0x1F,0x1C,0x18,0x18,0x00,0x00,
+};
+
+/* 按位图绘制中号字符 (8x12 缩放 1.5x = 12x18)，用于方向箭头等非 ASCII 字形 */
+static void draw_ascii_medium_bmp(st7305_handle_t *lcd, int x, int y, const uint8_t *bmp, bool inverted) {
+    st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
+    st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
+    fill_rect(lcd, x, y, x + 11, y + 17, bg);
+    static const int col_map[12] = {0,0,1,2,2,3,4,4,5,6,6,7};
+    static const int row_map[18] = {0,0,1,2,2,3,4,4,5,6,6,7,8,8,9,10,10,11};
+    for (int dy = 0; dy < 18; dy++) {
+        uint8_t bits = bmp[row_map[dy]];
+        for (int dc = 0; dc < 12; dc++) {
+            int scol = col_map[dc];
+            st7305_color_t color = (bits & (1 << (7 - scol))) ? fg : bg;
+            st7305_draw_pixel(lcd, x + dc, y + dy, color);
+        }
+    }
+}
+
 /* 绘制小号 ASCII 字符 (8x12 不缩放, 用于状态栏小数字) */
 static void draw_ascii_small(st7305_handle_t *lcd, int x, int y, char c, bool inverted) {
     int idx;
@@ -2393,24 +3486,37 @@ static void draw_ascii_medium(st7305_handle_t *lcd, int x, int y, char c, bool i
     }
 }
 
-/* 绘制 ASCII 字符 (8x12 缩放 2x = 16x24) - 支持 inverted 反色 */
+/* 绘制 ASCII 字符 (优先用字库字形跟随粗/瘦, 回退 FONT8X12) - 支持 inverted 反色 */
 static void draw_ascii(st7305_handle_t *lcd, int x, int y, char c, bool inverted) {
-    int idx;
-    if (c >= 0x20 && c <= 0x7E) idx = c - 0x20;
-    else idx = '?' - 0x20;
-    const uint8_t *bmp = FONT8X12[idx];
     /* 背景色 */
     st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
     st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
     /* 填充背景方块 (16x24) */
     fill_rect(lcd, x, y, x + 15, y + 23, bg);
-    /* 绘制字符 (缩放 2x)
-       FONT8X12 位图: MSB(bit7)=最左像素 */
+    /* V1.0.92: 优先用字库中的 ASCII 字形 (冬青 W6/W3, 跟随字体粗细).
+     * 24x24 字形水平缩放到 16px 槽 (24->16), 垂直保持 24. */
+    int idx = font_zh_find_ascii((uint8_t)c);
+    const uint8_t *zb = (idx >= 0) ? font_zh_get_bitmap_by_index(idx) : NULL;
+    if (zb) {
+        for (int row = 0; row < 24; row++) {
+            for (int col = 0; col < 16; col++) {
+                int sc = col * 24 / 16;                 /* 24 -> 16 */
+                int bi = row * 3 + (sc >> 3);
+                st7305_color_t color = (zb[bi] & (1 << (7 - (sc & 7)))) ? fg : bg;
+                st7305_draw_pixel(lcd, x + col, y + row, color);
+            }
+        }
+        return;
+    }
+    /* 回退: FONT8X12 (粗, 保持原逻辑) */
+    int aidx;
+    if (c >= 0x20 && c <= 0x7E) aidx = c - 0x20;
+    else aidx = '?' - 0x20;
+    const uint8_t *bmp = FONT8X12[aidx];
     for (int row = 0; row < 12; row++) {
         uint8_t bits = bmp[row];
         for (int col = 0; col < 8; col++) {
             st7305_color_t color = (bits & (1 << (7 - col))) ? fg : bg;
-            /* 2x 缩放 */
             st7305_draw_pixel(lcd, x + col * 2,     y + row * 2,     color);
             st7305_draw_pixel(lcd, x + col * 2 + 1, y + row * 2,     color);
             st7305_draw_pixel(lcd, x + col * 2,     y + row * 2 + 1, color);
@@ -2457,6 +3563,77 @@ static void draw_zh(st7305_handle_t *lcd, int x, int y, const char *str, bool in
     }
 }
 
+/* V1.0.79: 中文小字 (12x12): 把 24x24 字库每个 2x2 块合并为 1 像素 (任一置位即置位),
+ * 用于状态栏"星期X"等需要小字的地方, 避免占满整条状态栏. */
+static void draw_zh_small(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted) {
+    int idx = font_zh_find_utf8(str);
+    st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
+    st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
+    fill_rect(lcd, x, y, x + 11, y + 11, bg);
+    if (idx < 0) return;   /* 找不到字画空白 */
+    const uint8_t *bmp = zh_font_data[idx];
+    int bytes_per_row = (ZH_FONT_W + 7) / 8;  /* 3 */
+    for (int r = 0; r < 12; r++) {
+        for (int c = 0; c < 12; c++) {
+            bool any = false;
+            for (int dy = 0; dy < 2 && !any; dy++) {
+                int row = r * 2 + dy;
+                for (int dx = 0; dx < 2 && !any; dx++) {
+                    int col = c * 2 + dx;
+                    int byte_idx = row * bytes_per_row + (col / 8);
+                    if (bmp[byte_idx] & (1 << (7 - (col % 8)))) any = true;
+                }
+            }
+            if (any) st7305_draw_pixel(lcd, x + c, y + r, fg);
+            else     st7305_draw_pixel(lcd, x + c, y + r, bg);
+        }
+    }
+}
+
+/* 状态栏 ASCII 数字/字母: 原样 8x12 点阵直绘 (不放大), 垂直居中于 16px 内容带.
+ * 8x12 高 12px, 内容带高 16px => 上下各留 2px. */
+static void draw_ascii_sb(st7305_handle_t *lcd, int x, int y, char c, bool inverted) {
+    int idx;
+    if (c >= 0x20 && c <= 0x7E) idx = c - 0x20;
+    else idx = '?' - 0x20;
+    const uint8_t *bmp = FONT8X12[idx];
+    st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
+    st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
+    fill_rect(lcd, x, y, x + 11, y + 15, bg);
+    int py = y + 2;   /* 垂直居中: (16-12)/2 */
+    for (int row = 0; row < 12; row++) {
+        uint8_t bits = bmp[row];
+        for (int col = 0; col < 8; col++) {
+            st7305_color_t color = (bits & (1 << (7 - col))) ? fg : bg;
+            st7305_draw_pixel(lcd, x + col, py + row, color);
+        }
+    }
+}
+
+/* 状态栏中文 (星期X): 把正文 24x24 格子里的字形压缩到 16x16 (最近邻采样).
+ * 注意: 字形是按 --font-size=22 生成、在 24x24 格内居中 (上/左偏移 1px),
+ *       因此必须按字形实际尺寸采样并补偿居中偏移, 否则满格采样会采到空白边缘导致错乱. */
+#define ZH_SB_GLYPH    22   /* 字形实际尺寸 (== 生成字号 22) */
+#define ZH_SB_OFFSET   ((ZH_FONT_H - ZH_SB_GLYPH) / 2)  /* 居中偏移 = 1 */
+static void draw_zh_sb(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted) {
+    int idx = font_zh_find_utf8(str);
+    st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
+    st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
+    fill_rect(lcd, x, y, x + 15, y + 15, bg);
+    if (idx < 0) return;   /* 找不到字画空白 */
+    const uint8_t *bmp = zh_font_data[idx];
+    int bytes_per_row = (ZH_FONT_W + 7) / 8;  /* 3 */
+    for (int dy = 0; dy < 16; dy++) {
+        int src_row = ZH_SB_OFFSET + (dy * ZH_SB_GLYPH) / 16;
+        for (int dx = 0; dx < 16; dx++) {
+            int src_col = ZH_SB_OFFSET + (dx * ZH_SB_GLYPH) / 16;
+            int byte_idx = src_row * bytes_per_row + (src_col / 8);
+            st7305_color_t color = (bmp[byte_idx] & (1 << (7 - (src_col % 8)))) ? fg : bg;
+            st7305_draw_pixel(lcd, x + dx, y + dy, color);
+        }
+    }
+}
+
 /* 绘制中英文混合字符串 (UTF-8, scale=1 默认 24x24 中文) */
 static void draw_text(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted) {
     int cursor_x = x;
@@ -2495,21 +3672,36 @@ static void draw_label(st7305_handle_t *lcd, int x, int y, const char *str, bool
     while (*str) {
         uint8_t c = (uint8_t)*str;
         if (c < 0x80) {
-            /* ASCII */
+            /* ASCII: V1.0.92 优先用字库字形 (冬青 W6/W3, 跟随字体粗细),
+             * 24x24 字形缩放到 16x16 槽 (保持原尺寸); 回退 FONT8X12 (粗). */
             char ch = c;
-            int idx = (ch >= 0x20 && ch <= 0x7E) ? (ch - 0x20) : ('?' - 0x20);
-            const uint8_t *bmp = FONT8X12[idx];
             st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
             st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
             fill_rect(lcd, cursor_x, y, cursor_x + ascii_w - 1, y + ascii_w - 1, bg);
-            for (int row = 0; row < 12; row++) {
-                uint8_t bits = bmp[row];
-                for (int col = 0; col < 8; col++) {
-                    st7305_color_t color = (bits & (1 << (7 - col))) ? fg : bg;
-                    st7305_draw_pixel(lcd, cursor_x + col * 2,     y + row * 2,     color);
-                    st7305_draw_pixel(lcd, cursor_x + col * 2 + 1, y + row * 2,     color);
-                    st7305_draw_pixel(lcd, cursor_x + col * 2,     y + row * 2 + 1, color);
-                    st7305_draw_pixel(lcd, cursor_x + col * 2 + 1, y + row * 2 + 1, color);
+            int aidx = font_zh_find_ascii((uint8_t)ch);
+            const uint8_t *zbmp = (aidx >= 0) ? font_zh_get_bitmap_by_index(aidx) : NULL;
+            if (zbmp) {
+                for (int row = 0; row < ascii_w; row++) {
+                    for (int col = 0; col < ascii_w; col++) {
+                        int sr = row * 24 / ascii_w;
+                        int sc = col * 24 / ascii_w;
+                        int bi = sr * 3 + (sc >> 3);
+                        st7305_color_t color = (zbmp[bi] & (1 << (7 - (sc & 7)))) ? fg : bg;
+                        st7305_draw_pixel(lcd, cursor_x + col, y + row, color);
+                    }
+                }
+            } else {
+                int idx = (ch >= 0x20 && ch <= 0x7E) ? (ch - 0x20) : ('?' - 0x20);
+                const uint8_t *bmp = FONT8X12[idx];
+                for (int row = 0; row < 12; row++) {
+                    uint8_t bits = bmp[row];
+                    for (int col = 0; col < 8; col++) {
+                        st7305_color_t color = (bits & (1 << (7 - col))) ? fg : bg;
+                        st7305_draw_pixel(lcd, cursor_x + col * 2,     y + row * 2,     color);
+                        st7305_draw_pixel(lcd, cursor_x + col * 2 + 1, y + row * 2,     color);
+                        st7305_draw_pixel(lcd, cursor_x + col * 2,     y + row * 2 + 1, color);
+                        st7305_draw_pixel(lcd, cursor_x + col * 2 + 1, y + row * 2 + 1, color);
+                    }
                 }
             }
             cursor_x += ascii_w;
@@ -2649,21 +3841,27 @@ static int draw_text_wrapped(st7305_handle_t *lcd, int x0, int x1, int y0,
 
 /* ============ 图标绘制 (使用位图) ============ */
 
-/* 绘制 1-bit 位图图标 (支持宽高不一致) - 先声明内部函数 */
+/* 主菜单模块 icon_idx (xmb 复古索引) -> 主菜单 SF 图标索引 (见 main_icon_index 定义) */
+static int main_icon_index(int icon_idx);
+/* 绘制 1-bit 位图图标 (支持宽高不一致) - 先声明内部函数.
+ * V1.0.9x 图标统一: 应用管理(模块/分类/弹窗)曾用 xmb_icons[](GB 复古), 主菜单用
+ * main_icons[](SF 大图标). 现统一以主菜单图标为准: 本函数改从 main_icons 经
+ * main_icon_index 取源, 使应用管理图标与主菜单一致; 其它需求方经 main_icon_index 映射. */
 static void draw_icon_bitmap_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx);
 static void draw_icon_bitmap(st7305_handle_t *lcd, int cx, int cy, int size, int icon_idx) {
     draw_icon_bitmap_stretched(lcd, cx, cy, size, size, icon_idx);
 }
 static void draw_icon_bitmap_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx) {
-    if (icon_idx < 0 || icon_idx >= XMB_ICON_COUNT) return;
-    const uint8_t *bmp = xmb_icons[icon_idx];
+    int mi = main_icon_index(icon_idx);
+    if (mi < 0 || mi >= MAIN_ICON_COUNT) return;
+    const uint8_t *bmp = main_icons[mi];
     int x0 = cx - size_w / 2;
     int y0 = cy - size_h / 2;
     for (int dy = 0; dy < size_h; dy++) {
         for (int dx = 0; dx < size_w; dx++) {
-            int src_x = (dx * XMB_ICON_W) / size_w;
-            int src_y = (dy * XMB_ICON_H) / size_h;
-            int byte_idx = src_y * ((XMB_ICON_W + 7) / 8) + (src_x / 8);
+            int src_x = (dx * MAIN_ICON_W) / size_w;
+            int src_y = (dy * MAIN_ICON_H) / size_h;
+            int byte_idx = src_y * ((MAIN_ICON_W + 7) / 8) + (src_x / 8);
             int bit = 7 - (src_x % 8);
             if (bmp[byte_idx] & (1 << bit)) {
                 st7305_draw_pixel(lcd, x0 + dx, y0 + dy, ST7305_COLOR_BLACK);
@@ -2672,70 +3870,438 @@ static void draw_icon_bitmap_stretched(st7305_handle_t *lcd, int cx, int cy, int
     }
 }
 
-/* 主菜单项定义 */
-typedef struct {
-    const char *title;        /* 标题 (顶部显示) */
-    const char *short_label;  /* 短标签 (图标下方) */
-    int         icon_idx;     /* 图标索引 */
-    menu_page_t sub_page;     /* 进入子页面 */
-} main_item_t;
+/* ============ 主菜单专用 96x96 图标绘制 (昨天版本 SF 大图标) ============
+ * 主菜单用 main_icons[]. */
+static void draw_main_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx) {
+    if (icon_idx < 0 || icon_idx >= MAIN_ICON_COUNT) return;
+    const uint8_t *bmp = main_icons[icon_idx];
+    int x0 = cx - size_w / 2;
+    int y0 = cy - size_h / 2;
+    for (int dy = 0; dy < size_h; dy++) {
+        for (int dx = 0; dx < size_w; dx++) {
+            int src_x = (dx * MAIN_ICON_W) / size_w;
+            int src_y = (dy * MAIN_ICON_H) / size_h;
+            int byte_idx = src_y * ((MAIN_ICON_W + 7) / 8) + (src_x / 8);
+            int bit = 7 - (src_x % 8);
+            if (bmp[byte_idx] & (1 << bit)) {
+                st7305_draw_pixel(lcd, x0 + dx, y0 + dy, ST7305_COLOR_BLACK);
+            }
+        }
+    }
+}
 
-static const main_item_t main_items[] = {
-    /* === 固定项: 词典 (游戏改名) === */
-    { "BBK",         "BBK",     0,  MENU_PAGE_SELECT_GAME },  /* icon_game */
-    /* === 彩蛋隐藏游戏模拟器 (解锁后显示, 紧排在"词典"之后) ===
-     * 默认被 menu_main_count() 隐藏, 仅在"请作者喝杯水"图界面连按 5 次确认解锁后
-     * 出现在主菜单. 各引擎的二级菜单在进入时由 engine_manager 后台加载.
-     * NES 与 FC 使用相同 .nes 文件, 已合并为一个 FC 引擎;
-     * GBC/FC/arduboy 引擎尚未实现, 暂统用 GB 图标并复用 GB 游戏页占位. */
-    { "GB",          "GB",      8,  MENU_PAGE_GB_GAME      },  /* icon_gb   */
-    { "GBC",         "GBC",     8,  MENU_PAGE_GB_GAME      },  /* 统一用 GB 图标 */
-    { "NES",         "NES",     8,  MENU_PAGE_GB_GAME      },  /* 统一用 GB 图标 */
-    { "arduboy",     "arduboy", 8,  MENU_PAGE_GB_GAME      },  /* 统一用 GB 图标 */
-    /* === 固定项: 其余功能 === */
-    { "阅读",        "阅读",     9,  MENU_PAGE_BOOK       },  /* icon_book */
-    { "手柄",        "手柄",    3,  MENU_PAGE_GAMEPAD      },  /* icon_pad  */
-    { "音乐",        "音乐",     7,  MENU_PAGE_MP3_PLAYER   },  /* icon_play */
-    { "壁纸",        "壁纸",    10, MENU_PAGE_WALLPAPER    },  /* icon_wall */
-    { "番茄钟",      "番茄钟",  11, MENU_PAGE_POMODORO     },  /* icon_pomo */
-    /* === 用户需求: 存储管理 (TF卡) 独立到一级菜单栏, 使用 TF 卡图标 (icon_sd=5) ===
-     * 原位置在 设置 -> 存储管理 弹窗, 现提升为独立一级菜单项, 选中直接弹出 SD 卡管理. */
-    { "存储",        "存储",     5,  MENU_PAGE_SETTINGS_SD  },  /* icon_sd   */
-    { "设置",        "设置",    6,  MENU_PAGE_SETTINGS     },  /* icon_info */
+/* 应用管理侧栏四分类专属图标绘制 (源: cat_icons[] 64x64, 不放主菜单) */
+static void draw_cat_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int cat_idx) {
+    if (cat_idx < 0 || cat_idx >= CAT_ICON_COUNT) return;
+    const uint8_t *bmp = cat_icons[cat_idx];
+    int x0 = cx - size_w / 2;
+    int y0 = cy - size_h / 2;
+    for (int dy = 0; dy < size_h; dy++) {
+        for (int dx = 0; dx < size_w; dx++) {
+            int src_x = (dx * CAT_ICON_W) / size_w;
+            int src_y = (dy * CAT_ICON_H) / size_h;
+            int byte_idx = src_y * ((CAT_ICON_W + 7) / 8) + (src_x / 8);
+            int bit = 7 - (src_x % 8);
+            if (bmp[byte_idx] & (1 << bit)) {
+                st7305_draw_pixel(lcd, x0 + dx, y0 + dy, ST7305_COLOR_BLACK);
+            }
+        }
+    }
+}
+
+/* 主菜单模块 icon_idx -> 主菜单 SF 图标索引 (0..23, 见 icons_main.inc) */
+static int main_icon_index(int icon_idx) {
+    static const int tbl[31] = {
+        /* 0 game*/ 0, /* 1 key*/ 1, /* 2 bt*/ 2, /* 3 pad*/ 3,
+        /* 4 vol*/ 4, /* 5 sd*/ 5, /* 6 info*/ 6, /* 7 play*/ 7,
+        /* 8 gb*/ 8, /* 9 book*/ 9, /*10 wall*/ 10, /*11 pomo*/ 11,
+        /*12 gbc*/ 12, /*13 nes*/ 13, /*14 arduboy*/ 14, /*15 mini_games*/ 15,
+        /*16 keyboard*/ 1, /*17 cat_engine*/ 3, /*18 cat_game*/ 8,
+        /*19 cat_tool*/ 6, /*20 cat_other*/ 6, /*21 app_store*/ 0,
+        /*22 net*/ 6,
+        /*23 wq(文曲星)*/ 16, /*24 cwj(暴龙机)*/ 17, /*25 theme(主题)*/ 18, /*26 net_tool(网络工具)*/ 19,
+        /*27 diag(故障诊断)*/ 20,
+        /*28 bbk(步步高)*/ 21,
+        /*29 alarm(闹钟,占位)*/ 22, /*30 terminal(终端,占位)*/ 23,
+    };
+    if (icon_idx < 0 || icon_idx >= 31) return 0;
+    return tbl[icon_idx];
+}
+
+/* ============ 模块注册表 (Phase A: 主菜单功能模块唯一数据源) ============
+ *
+ * s_modules[] 的物理索引 = 数组下标, 恒定等于历史 main_items 顺序 (0..12).
+ * 该顺序被 触摸 hit-test / 拖动吸附 / 引擎映射 (1=GB,2=GBC,3=FC,4=arduboy)
+ * 等直接引用, 禁止调整下标顺序.
+ *
+ * kind 记录"目标归属":
+ *   MANDATORY   = 内置强制 (设置/BBK/手柄/壁纸/存储), 未来不可关
+ *   SWITCHABLE  = 可开关    (阅读/音乐/番茄钟/仿真键鼠)
+ *   HIDDEN_GAME = 彩蛋隐藏游戏引擎 (GB/GBC/NES/arduboy): 内置+解锁显示,
+ *                未来经"扩展插件"移除/恢复, 故独立建模
+ *
+ * Phase A 仅做结构规范: in_feature_dialog 仍按现状(7 功能+词典)驱动
+ * "功能开关"弹窗, 保证当前行为不变; kind 作为接下来"强制/开关/扩展插件"
+ * 阶段的依据 (属性能状态, 不改写配置格式, 已存 feature_switch 位兼容). */
+
+/* 功能开关 bitmap 位定义 (物理索引 -> feature_switch 位, 见 menu_config) */
+#define MAINF_FEAT_GAME      (1u << 0)   /* 0: 词典/文曲星游戏 (+彩蛋游戏) */
+#define MAINF_FEAT_BOOK      (1u << 1)   /* 5: 阅读 */
+#define MAINF_FEAT_PAD       (1u << 2)   /* 6: 手柄 */
+#define MAINF_FEAT_MUSIC     (1u << 3)   /* 7: 音乐 */
+#define MAINF_FEAT_WALLPAPER (1u << 4)   /* 8: 壁纸 */
+#define MAINF_FEAT_POMODORO  (1u << 5)   /* 9: 番茄钟 */
+#define MAINF_FEAT_HID       (1u << 6)   /* 10: 仿真键鼠 */
+#define MAINF_FEAT_SD        (1u << 7)   /* 11: 存储 */
+#define MAINF_FEAT_ALL       0xFFFFFFFFu
+
+/* V1.0.95: 出厂默认在主菜单点亮的可管理模块位图 (物理索引逐位).
+ * 手柄(6)/壁纸(8)/存储(11) 默认显示, 可经应用管理隐藏.
+ * 其余可管理项 (阅读/音乐/番茄钟/仿真键鼠) 默认熄灭, 需应用管理点亮. */
+#define APP_DEFAULT_INSTALLED_MASK  ((1u << 6) | (1u << 8) | (1u << 11))
+
+/* 模块目标归属 (Phase A 元数据; 后续驱动 强制/开关/删除/扩展插件) */
+typedef enum {
+    BBK_MOD_MANDATORY = 0,  /* 内置强制: 设置/BBK/手柄/壁纸/存储 */
+    BBK_MOD_SWITCHABLE,     /* 可开关: 阅读/音乐/番茄钟/仿真键鼠 */
+    BBK_MOD_HIDDEN_GAME,    /* 彩蛋隐藏游戏引擎: 内置+解锁显示, 未来经扩展插件移除/恢复 */
+} bbk_module_kind_t;
+
+/* 应用管理(商店)分类: 左侧分类栏, 引擎/独立游戏/程序/运维
+ * 将来新增壁纸程序/电子白板/资源包等, 归入对应类或扩 APP_CAT_* */
+typedef enum {
+    APP_CAT_ENGINE = 0,  /* 引擎: 模拟器核心 (GB/GBC/NES/arduboy/文曲星/暴龙机/步步高 等) */
+    APP_CAT_GAME,        /* 独立游戏: 独立游戏类 */
+    APP_CAT_TOOL,        /* 程序: 阅读/音乐/番茄钟/闹钟/壁纸 等 */
+    APP_CAT_OPERATIONS,  /* 运维: 网络工具/仿真键鼠/电脑诊断/终端 等 */
+    APP_CAT_COUNT
+} app_category_t;
+
+/* 主菜单单个功能模块的注册表项 (合并原 main_items / s_feat_table / feat_enabled) */
+typedef struct {
+    const char      *id;         /* 稳定标识 ("bbk"/"book_reader"/"gb") */
+    const char      *title;      /* 标题 (顶部显示) */
+    const char      *short_label;/* 短标签 (图标下方) */
+    int             icon_idx;    /* 图标索引 */
+    menu_page_t     sub_page;    /* 进入子页面 */
+
+    bbk_module_kind_t kind;          /* 目标归属 (Phase A 元数据) */
+    app_category_t  category;       /* 应用管理分类 (引擎/游戏/工具/其他) */
+    uint32_t        switch_bit;      /* feature_switch 位; 0=无独立位(设置恒开) */
+    bool            in_feature_dialog; /* Phase A: 出现在"功能开关"弹窗 */
+    const char     *dialog_label;      /* 弹窗显示名; NULL=用 short_label (物理0 沿革显示"词典游戏") */
+    bool            is_hidden_game;    /* 彩蛋游戏: 解锁后才显示 */
+    bool            gated_by_audio;    /* 禁用音频时隐藏 (仅"音乐") */
+    bool            default_installed; /* 出厂默认在主菜单显示 (应用管理: 强制项恒真, 可管理项默认假) */
+    bool            app_only;          /* 仅应用管理可见: 不进主菜单 (如 运维工具/仿真键鼠) */
+    bool            dev_pending;       /* 未完成占位应用: 点击弹"开发中"提示, 不进入页面, 不加载核心 */
+    bool            hidden;            /* V1.0.9x: 临时屏蔽: 不进主菜单、不进应用管理 (不改用户安装数据) */
+    uint32_t        caps;              /* 需要的系统能力 (app_cap_t 组合, 见 app_meta.h) */
+} bbk_module_t;
+
+/* 注册表: 物理索引 = 数组下标, 顺序与历史 main_items 完全一致, 不可调整 */
+static const bbk_module_t s_modules[] = {
+    /* [0] BBK / 词典 (未来强制; 弹窗显示名沿用"词典游戏") */
+    { .id="bbk", .title="\xe6\xad\xa5\xe6\xad\xa5\xe9\xab\x98", .short_label="\xe6\xad\xa5\xe6\xad\xa5\xe9\xab\x98" /* 步步高 */, .icon_idx=28, .sub_page=MENU_PAGE_SELECT_GAME,
+      .kind=BBK_MOD_MANDATORY, .switch_bit=MAINF_FEAT_GAME, .in_feature_dialog=true,
+      .dialog_label="\xe8\xaf\x8d\xe5\x85\xb8\xe6\xb8\xb8\xe6\x88\x8f" /* 词典游戏 */,
+      .is_hidden_game=false, .gated_by_audio=false,
+      .default_installed=true, .caps=APP_CAP_SCREEN|APP_CAP_AUDIO|APP_CAP_INPUT|APP_CAP_STORAGE },
+    /* [1..4] 彩蛋隐藏游戏引擎 (内置+解锁显示, 不单独进开关弹窗; 位跟随词典) */
+    { .id="gb", .title="GB", .short_label="GB", .icon_idx=8, .sub_page=MENU_PAGE_GB_GAME,
+      .kind=BBK_MOD_HIDDEN_GAME, .category=APP_CAT_ENGINE, .switch_bit=MAINF_FEAT_GAME, .in_feature_dialog=false, .is_hidden_game=true,
+      .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_AUDIO|APP_CAP_INPUT|APP_CAP_STORAGE },
+    { .id="gbc", .title="GBC", .short_label="GBC", .icon_idx=12, .sub_page=MENU_PAGE_GB_GAME,
+      .kind=BBK_MOD_HIDDEN_GAME, .category=APP_CAT_ENGINE, .switch_bit=MAINF_FEAT_GAME, .in_feature_dialog=false, .is_hidden_game=true,
+      .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_AUDIO|APP_CAP_INPUT|APP_CAP_STORAGE },
+    { .id="nes", .title="NES", .short_label="NES", .icon_idx=13, .sub_page=MENU_PAGE_GB_GAME,
+      .kind=BBK_MOD_HIDDEN_GAME, .category=APP_CAT_ENGINE, .switch_bit=MAINF_FEAT_GAME, .in_feature_dialog=false, .is_hidden_game=true,
+      .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_AUDIO|APP_CAP_INPUT|APP_CAP_STORAGE },
+    { .id="arduboy", .title="arduboy", .short_label="arduboy", .icon_idx=14, .sub_page=MENU_PAGE_GB_GAME,
+      .kind=BBK_MOD_HIDDEN_GAME, .category=APP_CAT_ENGINE, .switch_bit=MAINF_FEAT_GAME, .in_feature_dialog=false, .is_hidden_game=true,
+      .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_AUDIO|APP_CAP_INPUT|APP_CAP_STORAGE },
+    /* [5] 阅读 (可开关) */
+    { .id="book_reader", .title="\xe9\x98\x85\xe8\xaf\xbb", .short_label="\xe9\x98\x85\xe8\xaf\xbb" /* 阅读 */,
+      .icon_idx=9, .sub_page=MENU_PAGE_BOOK,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_TOOL, .switch_bit=MAINF_FEAT_BOOK, .in_feature_dialog=true,
+      .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_INPUT|APP_CAP_STORAGE },
+    /* [6] 手柄 (V1.0.95: 由强制项改为可管理项, 经应用管理显示/隐藏, 默认点亮) */
+    { .id="gamepad", .title="\xe6\x89\x8b\xe6\x9f\x84", .short_label="\xe6\x89\x8b\xe6\x9f\x84" /* 手柄 */,
+      .icon_idx=3, .sub_page=MENU_PAGE_GAMEPAD,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_TOOL, .switch_bit=MAINF_FEAT_PAD, .in_feature_dialog=true,
+      .default_installed=true, .caps=APP_CAP_INPUT|APP_CAP_BT },
+    /* [7] 音乐 (可开关; 禁用音频时隐藏) */
+    { .id="mp3", .title="\xe9\x9f\xb3\xe4\xb9\x90", .short_label="\xe9\x9f\xb3\xe4\xb9\x90" /* 音乐 */,
+      .icon_idx=7, .sub_page=MENU_PAGE_MP3_PLAYER,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_TOOL, .switch_bit=MAINF_FEAT_MUSIC, .in_feature_dialog=true, .gated_by_audio=true,
+      .default_installed=false, .caps=APP_CAP_AUDIO|APP_CAP_SCREEN|APP_CAP_STORAGE },
+    /* [8] 壁纸 (V1.0.95: 由强制项改为可管理项, 经应用管理显示/隐藏, 默认点亮) */
+    { .id="wallpaper", .title="\xe5\xa3\x81\xe7\xba\xb8", .short_label="\xe5\xa3\x81\xe7\xba\xb8" /* 壁纸 */,
+      .icon_idx=10, .sub_page=MENU_PAGE_WALLPAPER,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_TOOL, .switch_bit=MAINF_FEAT_WALLPAPER, .in_feature_dialog=true,
+      .default_installed=true, .caps=APP_CAP_SCREEN|APP_CAP_TOUCH },
+    /* [9] 番茄钟 (可开关) */
+    { .id="pomodoro", .title="\xe7\x95\xaa\xe8\x8c\x84\xe9\x92\x9f", .short_label="\xe7\x95\xaa\xe8\x8c\x84\xe9\x92\x9f" /* 番茄钟 */,
+      .icon_idx=11, .sub_page=MENU_PAGE_POMODORO,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_TOOL, .switch_bit=MAINF_FEAT_POMODORO, .in_feature_dialog=true,
+      .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_AUDIO|APP_CAP_INPUT },
+    /* [10] 仿真键鼠 (可开关, 归运维分类) */
+    { .id="usb_hid", .title="\xe4\xbb\xbf\xe7\x9c\x9f\xe9\x94\xae\xe9\xbc\xa0", .short_label="\xe4\xbb\xbf\xe7\x9c\x9f\xe9\x94\xae\xe9\xbc\xa0" /* 仿真键鼠 */,
+      .icon_idx=1, .sub_page=MENU_PAGE_USB_HID, /* icon_idx=1 -> main_icon_key(仿真键鼠); 原为 2 误指向蓝牙图标 main_icon_bt */
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_OPERATIONS, .switch_bit=MAINF_FEAT_HID, .in_feature_dialog=true,
+      .default_installed=false, .app_only=false, .caps=APP_CAP_SCREEN|APP_CAP_TOUCH|APP_CAP_USB },
+    /* [11] 存储 (V1.0.95: 由强制项改为可管理项, 经应用管理显示/隐藏, 默认点亮)
+     * (沿用用户需求: 存储管理 (TF卡) 独立到一级菜单栏, 使用 TF 卡图标 (icon_sd=5)) */
+    { .id="storage", .title="\xe5\xad\x98\xe5\x82\xa8", .short_label="\xe5\xad\x98\xe5\x82\xa8" /* 存储 */,
+      .icon_idx=5, .sub_page=MENU_PAGE_SETTINGS_SD,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_TOOL, .switch_bit=MAINF_FEAT_SD, .in_feature_dialog=true,
+      .default_installed=true, .caps=APP_CAP_STORAGE|APP_CAP_USB },
+    /* [12] 设置 (强制, 无独立位, 恒开, 不进功能开关弹窗) */
+    { .id="settings", .title="\xe8\xae\xbe\xe7\xbd\xae", .short_label="\xe8\xae\xbe\xe7\xbd\xae" /* 设置 */,
+      .icon_idx=6, .sub_page=MENU_PAGE_SETTINGS,
+      .kind=BBK_MOD_MANDATORY, .switch_bit=0, .in_feature_dialog=false,
+      .default_installed=true, .caps=APP_CAP_SCREEN|APP_CAP_INPUT|APP_CAP_NETWORK|APP_CAP_BT|APP_CAP_USB|APP_CAP_STORAGE },
+    /* [13] 应用管理 (强制, 无独立位, 恒开): 统一管理固件内置模块的启用/停用/卸载 */
+    { .id="app_manager", .title="\xe5\xba\x94\xe7\x94\xa8\xe7\xae\xa1\xe7\x90\x86" /* 应用管理 */,
+      .short_label="\xe5\xba\x94\xe7\x94\xa8\xe7\xae\xa1\xe7\x90\x86", .icon_idx=0, .sub_page=MENU_PAGE_APP_MANAGER,
+      .kind=BBK_MOD_MANDATORY, .switch_bit=0, .in_feature_dialog=false,
+      .default_installed=true, .caps=0 },
+    /* [14] 网格工具/运维工具 已随迷你应用一并移除 (本就不进主菜单, 仅应用管理可见). */
+
+    /* V1.0.9x: 新增占位应用/已有应用接入应用管理 (默认不显示主菜单, 经应用管理点亮后可添加).
+     * 文曲星 / 暴龙机 / 主题 = 未完成占位 (dev_pending): 点击弹"开发中", 不加载任何核心. */
+    /* [14] 文曲星 (LavaX 引擎) */
+    { .id="wqx", .title="\xe6\x96\x87\xe6\x9b\xb2\xe6\x98\x9f" /* 文曲星 */, .short_label="\xe6\x96\x87\xe6\x9b\xb2\xe6\x98\x9f",
+      .icon_idx=23, .sub_page=MENU_PAGE_WQX,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_ENGINE, .switch_bit=0, .in_feature_dialog=false,
+      .dev_pending=false, .hidden=true, .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_INPUT|APP_CAP_STORAGE },
+    /* [15] 暴龙机 (引擎; vpet-emu-zepp E0C6200 虚拟宠物, ROM 在 /sdcard/vpet/) */
+    { .id="pethome", .title="\xe6\x9a\xb4\xe9\xbe\x99\xe6\x9c\xba" /* 暴龙机 */, .short_label="\xe6\x9a\xb4\xe9\xbe\x99\xe6\x9c\xba",
+      .icon_idx=24, .sub_page=MENU_PAGE_VPET,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_ENGINE, .switch_bit=0, .in_feature_dialog=false,
+      .dev_pending=false, .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_INPUT|APP_CAP_STORAGE },
+    /* [16] 主题 (占位, 工具) */
+    { .id="theme", .title="\xe4\xb8\xbb\xe9\xa2\x98" /* 主题 */, .short_label="\xe4\xb8\xbb\xe9\xa2\x98",
+      .icon_idx=25, .sub_page=MENU_PAGE_MAIN,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_TOOL, .switch_bit=0, .in_feature_dialog=false,
+      .dev_pending=true, .hidden=true, .default_installed=false, .caps=APP_CAP_SCREEN },
+    /* [17] 网络工具 (已有完整实现, 运维) */
+    { .id="net_tool", .title="\xe7\xbd\x91\xe7\xbb\x9c\xe5\xb7\xa5\xe5\x85\xb7" /* 网络工具 */, .short_label="\xe7\xbd\x91\xe7\xbb\x9c\xe5\xb7\xa5\xe5\x85\xb7",
+      .icon_idx=26, .sub_page=MENU_PAGE_NETTOOL,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_OPERATIONS, .switch_bit=0, .in_feature_dialog=false,
+      .default_installed=false, .hidden=true, .caps=APP_CAP_SCREEN|APP_CAP_NETWORK|APP_CAP_INPUT },
+    /* [18] 电脑诊断 (运维) */
+    { .id="diag", .title="\xe7\x94\xb5\xe8\x84\x91\xe8\xaf\x8a\xe6\x96\xad" /* 电脑诊断 */, .short_label="\xe7\x94\xb5\xe8\x84\x91\xe8\xaf\x8a\xe6\x96\xad",
+      .icon_idx=27, .sub_page=MENU_PAGE_DIAGNOSIS,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_OPERATIONS, .switch_bit=0, .in_feature_dialog=false,
+      .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_INPUT },
+    /* [19] 闹钟 (完美图标有, 暂无对应应用 -> 应用管理显示占位/开发中) */
+    { .id="alarm", .title="\xe9\x97\xb9\xe9\x92\x9f" /* 闹钟 */, .short_label="\xe9\x97\xb9\xe9\x92\x9f",
+      .icon_idx=29, .sub_page=MENU_PAGE_MAIN,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_TOOL, .switch_bit=0, .in_feature_dialog=false,
+      .dev_pending=true, .hidden=true, .default_installed=false, .caps=APP_CAP_SCREEN },
+    /* [20] 终端 (完美图标有, 暂无对应应用 -> 应用管理显示占位/开发中) */
+    { .id="terminal", .title="\xe7\xbb\x88\xe7\xab\xaf" /* 终端 */, .short_label="\xe7\xbb\x88\xe7\xab\xaf",
+      .icon_idx=30, .sub_page=MENU_PAGE_MAIN,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_OPERATIONS, .switch_bit=0, .in_feature_dialog=false,
+      .dev_pending=true, .default_installed=false, .caps=APP_CAP_SCREEN },
+    /* [21] 独立游戏 (完美图标有, 暂无对应应用 -> 应用管理显示占位/开发中) */
+    { .id="mini_games", .title="\xe7\x8b\xac\xe7\xab\x8b\xe6\xb8\xb8\xe6\x88\x8f" /* 独立游戏 */, .short_label="\xe7\x8b\xac\xe7\xab\x8b\xe6\xb8\xb8\xe6\x88\x8f",
+      .icon_idx=15, .sub_page=MENU_PAGE_MAIN,
+      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_GAME, .switch_bit=0, .in_feature_dialog=false,
+      .dev_pending=true, .default_installed=false, .caps=APP_CAP_SCREEN },
 };
-#define MAIN_ITEM_COUNT (sizeof(main_items) / sizeof(main_items[0]))
-/* 固定项数 (词典/阅读/手柄/音乐/壁纸/番茄钟/存储/设置) 与 彩蛋隐藏引擎项数.
- * 隐藏引擎物理索引区间 [MAIN_HIDDEN_FIRST, MAIN_HIDDEN_FIRST+MAIN_HIDDEN_COUNT) = 1..4,
- * 紧跟在"词典"(0) 之后; 固定项在物理索引 0 与 5..11.
- * V1.0.49: NES 已与 FC 合并, 隐藏引擎为 GB/GBC/FC/arduboy 共 4 个. */
-#define MAIN_FIXED_COUNT   8
-#define MAIN_HIDDEN_COUNT  4
-#define MAIN_HIDDEN_FIRST  1
-#define MAIN_MP3_PHYS      7   /* "音乐"(MP3) 在 main_items 里的物理索引 */
+#define BBK_MODULE_COUNT (sizeof(s_modules) / sizeof(s_modules[0]))
+
+/* 按物理索引取模块 (只读, 统一数据入口; 越界返回 NULL) */
+static const bbk_module_t *bbk_module(int phys) {
+    return (phys >= 0 && phys < (int)BBK_MODULE_COUNT) ? &s_modules[phys] : NULL;
+}
+
+/* 物理项是否"已安装/已点亮": 强制项恒真; 可管理项看 app_installed 位图 (物理索引逐位).
+ * V1.0.95: 手柄/壁纸/存储改为可管理项, 出厂默认点亮由 menu_init 初始位图
+ * (APP_DEFAULT_INSTALLED_MASK) 与 config 迁移保证, 用户经应用管理关闭后位清零即隐藏. */
+static bool app_installed(const menu_state_t *state, int phys) {
+    const bbk_module_t *m = bbk_module(phys);
+    if (!m) return false;
+    if (m->kind == BBK_MOD_MANDATORY) return true;
+    return ((state->settings.app_installed >> phys) & 1u) != 0;
+}
+
+/* 应用管理: 设置某物理项的安装位 (install=true 点亮点; false 关闭). 强制项不可变更. */
+static void app_set_installed(menu_state_t *state, int phys, bool install) {
+    const bbk_module_t *m = bbk_module(phys);
+    if (!m || m->kind == BBK_MOD_MANDATORY) return;
+    if (install)
+        state->settings.app_installed |= (1u << phys);
+    else
+        state->settings.app_installed &= ~(1u << phys);
+}
+
+/* app_meta.h: 能力位组合 -> 可读短描述 (应用管理 UI 展示) */
+const char *app_cap_describe(uint32_t caps) {
+    switch (caps) {
+    case APP_CAP_SCREEN:                  return "显示";
+    case APP_CAP_AUDIO:                   return "音频";
+    case APP_CAP_TOUCH:                   return "触控";
+    case APP_CAP_STORAGE:                 return "存储";
+    case APP_CAP_INPUT:                   return "输入";
+    case APP_CAP_BT:                      return "蓝牙";
+    case APP_CAP_NETWORK:                 return "联网";
+    case APP_CAP_USB:                     return "USB";
+    case APP_CAP_SCREEN|APP_CAP_AUDIO|APP_CAP_INPUT|APP_CAP_STORAGE:
+        return "游戏引擎";
+    case APP_CAP_SCREEN|APP_CAP_INPUT|APP_CAP_STORAGE:
+        return "阅读";
+    case APP_CAP_INPUT|APP_CAP_BT:
+        return "手柄";
+    case APP_CAP_AUDIO|APP_CAP_SCREEN|APP_CAP_STORAGE:
+        return "音乐";
+    case APP_CAP_SCREEN|APP_CAP_TOUCH:
+        return "壁纸";
+    case APP_CAP_STORAGE|APP_CAP_USB:
+        return "存储";
+    case APP_CAP_SCREEN|APP_CAP_AUDIO|APP_CAP_INPUT:
+        return "番茄钟";
+    case APP_CAP_SCREEN|APP_CAP_TOUCH|APP_CAP_USB:
+        return "键鼠";
+    case 0:                               return "系统";
+    default:                              return "多能力";
+    }
+}
+
 /* V1.0.68: 禁用音频时隐藏 MP3 菜单项 */
 static bool mp3_menu_visible(const menu_state_t *state) {
     return !state->settings.audio_disable;
 }
-/* 主菜单实际显示项数 (可见数): 固定项 + (解锁后) 隐藏引擎项 - (禁用音频时) MP3 */
-static int menu_main_count(const menu_state_t *state) {
-    int count = MAIN_FIXED_COUNT
-              + (state->show_hidden_menus ? MAIN_HIDDEN_COUNT : 0);
-    if (!mp3_menu_visible(state)) count--;
-    return count;
+/* 主菜单某一物理项是否启用 (功能开关过滤; 无独立位/设置恒真) */
+static bool feat_enabled(const menu_state_t *state, int phys) {
+    const bbk_module_t *m = bbk_module(phys);
+    if (!m || m->switch_bit == 0) return true;
+    return (state->settings.feature_switch & m->switch_bit) != 0;
 }
-/* 将"可见索引"映射回 main_items 物理索引.
- * 解锁时可见顺序 == 物理顺序; 隐藏时跳过 1..4 (GB/GBC/NES/arduboy);
- * 禁用音频时再跳过物理索引 7 (MP3). */
-static int menu_main_phys(const menu_state_t *state, int vis_idx) {
-    int phys;
-    if (state->show_hidden_menus) {
-        phys = vis_idx;
-    } else {
-        if (vis_idx == 0) return 0;  /* 词典 */
-        phys = vis_idx + MAIN_HIDDEN_COUNT;
+/* 主菜单某一物理项是否可见: 已安装 ∧ 功能开关开 ∧ (音频启用或非MP3) ∧ (解锁或非彩蛋项) */
+static bool main_item_visible(const menu_state_t *state, int phys) {
+    const bbk_module_t *m = bbk_module(phys);
+    if (!m) return false;
+    if (m->hidden) return false;               /* V1.0.9x: 临时屏蔽模块不进主菜单 */
+    /* 仅应用管理可见的模块 (运维工具/仿真键鼠): 永不出现在主菜单, 只在应用管理网格显示 */
+    if (m->app_only) return false;
+    /* 应用管理: 主菜单显示跟随彩蛋开关 (默认不显示; 与四个测试引擎一起经
+     * 设置"请作者喝杯水"连点 5 次解锁后显示). 它本身仍可从彩蛋进入. */
+    if (m->sub_page == MENU_PAGE_APP_MANAGER)
+        return state->show_hidden_menus;
+    /* 彩蛋游戏已显式解锁: 视为已安装 (老固件升级用户: 曾解锁过 GB/GBC/NES/arduboy 仍保留)
+     * 否则必须经应用管理点亮 (app_installed) 才出现. */
+    if (m->is_hidden_game && state->show_hidden_menus) {
+        /* 解锁即显示, 不受 app_installed 拦截 */
+    } else if (!app_installed(state, phys)) {
+        return false;
     }
-    if (!mp3_menu_visible(state) && phys >= MAIN_MP3_PHYS) phys++;
-    return phys;
+    if (!feat_enabled(state, phys)) return false;
+    if (m->is_hidden_game) return state->show_hidden_menus;
+    if (m->gated_by_audio) return mp3_menu_visible(state);
+    return true;
+}
+/* 主菜单图标顺序 (V1.0.9x: 拖动排序) ============
+ * s_main_order[vis_idx] = 物理 phys. 初始按 phys 自然序, 用户拖动排序后一直保持,
+ * 仅在"可见项数量变化"(安装/卸载)时重建. 持久化到 config. */
+static uint8_t s_main_order[BBK_MODULE_COUNT];
+static int     s_main_order_count = -1;   /* -1=尚未重建 */
+
+/* V1.0.9x: 编辑模式「拿起」状态: 拿起一个图标时, 轮盘临时排除它(留空), 左右滚动定位后可放回中间 */
+static bool s_reorder_active = false;   /* 是否处于编辑(排序)模式 */
+static int  s_reorder_slot   = -1;
+static bool s_hold_active = false;
+static int  s_hold_phys   = -1;
+static int  s_hold_from   = -1;    /* 拿起时的原槽位 (取消时还原) */
+
+static void menu_rebuild_order(const menu_state_t *state) {
+    int n = 0;
+    for (int i = 0; i < (int)BBK_MODULE_COUNT; i++)
+        if (main_item_visible(state, i)) s_main_order[n++] = (uint8_t)i;
+    if (n < (int)BBK_MODULE_COUNT) s_main_order[n] = 0xff;
+    s_main_order_count = n;
+}
+/* 可见项数变了才重建(保留用户排序); 返回当前可见项数.
+ * 拿起一个图标(编辑模式)时轮盘临时少一项, 不重建. */
+static int menu_main_ensure_order(const menu_state_t *state) {
+    if (s_hold_active) return s_main_order_count;   /* 拿起时保持现有轮盘(已含被移除项剔除) */
+    int n = 0;
+    for (int i = 0; i < (int)BBK_MODULE_COUNT; i++)
+        if (main_item_visible(state, i)) n++;
+    if (n != s_main_order_count) menu_rebuild_order(state);
+    return s_main_order_count;
+}
+/* 主菜单实际显示项数 (可见数) */
+static int menu_main_count(const menu_state_t *state) {
+    return menu_main_ensure_order(state);
+}
+/* 将"可见索引"映射回 s_modules 物理索引 (按用户排序 s_main_order) */
+static int menu_main_phys(const menu_state_t *state, int vis_idx) {
+    menu_main_ensure_order(state);
+    if (vis_idx >= 0 && vis_idx < s_main_order_count) return s_main_order[vis_idx];
+    return 0;
+}
+
+/* V1.0.9x: 编辑模式 — 拿起 vis_idx 处的图标 (从轮盘移除, 留空) */
+static void menu_hold_pick(menu_state_t *state, int vis_idx) {
+    if (s_hold_active) return;
+    if (vis_idx < 0 || vis_idx >= s_main_order_count) return;
+    s_reorder_active = true;               /* 长按拿起即进入编辑模式 */
+    s_hold_phys = s_main_order[vis_idx];
+    s_hold_from = vis_idx;
+    for (int i = vis_idx; i < s_main_order_count - 1; i++)
+        s_main_order[i] = s_main_order[i + 1];
+    s_main_order_count--;
+    if (s_main_order_count < (int)BBK_MODULE_COUNT) s_main_order[s_main_order_count] = 0xff;
+    s_hold_active = true;
+    /* 相机停在移除处(留空), 供左右滚动定位 */
+    state->selected_index = (vis_idx < s_main_order_count) ? vis_idx : (s_main_order_count - 1);
+    if (state->selected_index < 0) state->selected_index = 0;
+    state->main_cam_cur = (float)state->selected_index;
+    state->needs_redraw = true;
+    ESP_LOGI(TAG, "编辑: 拿起 phys=%d at slot %d", s_hold_phys, vis_idx);
+}
+
+/* V1.0.9x: 编辑模式 — 把拿起的图标放入当前中间槽 vis_idx (插入轮盘) */
+static void menu_hold_drop(menu_state_t *state) {
+    if (!s_hold_active) return;
+    int pos = state->selected_index;
+    if (pos < 0) pos = 0;
+    if (pos > s_main_order_count) pos = s_main_order_count;
+    for (int i = s_main_order_count; i > pos; i--)
+        s_main_order[i] = s_main_order[i - 1];
+    s_main_order[pos] = (uint8_t)s_hold_phys;
+    s_main_order_count++;
+    s_hold_active = false;
+    s_hold_phys = -1;
+    s_hold_from = -1;
+    /* s_reorder_active 保持编辑: 可继续点击其它图标拿起、左右滑动再放回, 直到按返回退出 */
+    menu_config_save();                              /* 落位后持久化排序 */
+    state->selected_index = pos;
+    state->main_cam_cur = (float)pos;
+    state->needs_redraw = true;
+    ESP_LOGI(TAG, "编辑: 放入中间槽 %d", pos);
+}
+
+/* V1.0.9x: 编辑模式 — 取消: 把拿起的图标放回原槽位, 退出编辑 (不保存排序) */
+static void menu_hold_cancel(menu_state_t *state) {
+    if (s_hold_active) {
+        int backpos = s_hold_from;
+        if (backpos < 0) backpos = 0;
+        if (backpos > s_main_order_count) backpos = s_main_order_count;
+        for (int i = s_main_order_count; i > backpos; i--)
+            s_main_order[i] = s_main_order[i - 1];
+        s_main_order[backpos] = (uint8_t)s_hold_phys;
+        s_main_order_count++;
+    }
+    s_hold_active = false;
+    s_hold_phys = -1;
+    s_hold_from = -1;
+    s_reorder_active = false;
+    state->needs_redraw = true;
+    ESP_LOGI(TAG, "编辑: 取消");
 }
 
 /* ============ 子页面定义 ============ */
@@ -2769,21 +4335,37 @@ static bool game_settings_on_lr(menu_state_t *state, int idx, bool is_right);
 #define MAX_FOLDER_NAMES   32     /* 最多缓存 32 个子文件夹名 */
 EXT_RAM_BSS_ATTR static char g_folder_names[MAX_FOLDER_NAMES][64];
 static int  g_folder_count = 0;
+/* V1.0.68+: 根目录是否含当前引擎的游戏 → 决定侧栏是否显示"全部"项 (根目录无游戏则隐藏) */
+static bool g_select_has_root = false;
+
+/* 侧栏总项数: 0=游戏设置, 1=收藏, [2=全部(仅当根目录有游戏)], 之后为真实子文件夹 */
+static int select_folder_total(void) {
+    return 2 + (g_select_has_root ? 1 : 0) + g_folder_count;
+}
+
 /* 侧栏索引含义:
  *   0 = "游戏设置" (特殊, 无对应文件夹)
  *   1 = "收藏" (特殊, 无对应文件夹)
- *   2..N+1 = 真实子文件夹 (g_folder_names[idx-2])
+ *   [2 = "全部" (仅当根目录有游戏) ]
+ *   之后 = 真实子文件夹 (g_folder_names[real])
  * 返回 NULL 表示"特殊项"或越界 */
 static const char *get_selected_folder_name(menu_state_t *state, int idx) {
-    if (idx == 2) return "";  /* "全部": 空 = 扫描根目录 */
-    if (idx < 3) return NULL;
-    int real = idx - 3;
+    (void)state;
+    if (idx < 0) return NULL;
+    if (idx == 0 || idx == 1) return NULL;                 /* 设置/收藏 特殊项 */
+    int real;
+    if (g_select_has_root) {
+        if (idx == 2) return "";                           /* "全部": 空 = 扫描根目录 */
+        real = idx - 3;
+    } else {
+        real = idx - 2;                                    /* 无"全部": 直接对应子文件夹 */
+    }
     if (real >= g_folder_count) return NULL;
     return g_folder_names[real];
 }
 
-/* 判断是否为侧栏特殊项 (0=游戏设置, 1=收藏, 2=全部) */
-static inline bool is_special_folder(int idx) { return idx >= 0 && idx < 3; }
+/* 判断是否为侧栏特殊项 (0=游戏设置, 1=收藏, [2=全部]) */
+static inline bool is_special_folder(int idx) { return idx >= 0 && idx < (g_select_has_root ? 3 : 2); }
 
 /* ============ 子页动作 (on_confirm) ============ */
 
@@ -2807,14 +4389,14 @@ typedef struct {
 static const game_run_engine_ops_t ops_engine_gb = {
     gb_emu_pause, gb_emu_resume, gb_emu_set_joypad, gb_emu_stop,
 };
-static const game_run_engine_ops_t ops_engine_gbc = {
-    gbc_emu_pause, gbc_emu_resume, gbc_emu_set_joypad, gbc_emu_stop,
-};
 static const game_run_engine_ops_t ops_engine_nes = {
     nes_emu_pause, nes_emu_resume, nes_emu_set_joypad, nes_emu_stop,
 };
 static const game_run_engine_ops_t ops_engine_arduboy = {
     arduboy_avr_pause, arduboy_avr_resume, arduboy_avr_set_joypad, arduboy_avr_stop,
+};
+static const game_run_engine_ops_t ops_engine_vpet = {
+    vpet_emu_pause, vpet_emu_resume, vpet_emu_set_joypad, vpet_emu_stop,
 };
 
 /* === V1.0.52: 统一加载进度条 (GB/GBC/电子词典共用布局) ===
@@ -2849,15 +4431,26 @@ static void loading_screen_draw(int percent, const char *text)
         s_loading_pct = 0;
     }
 
-    if (percent > s_loading_pct) {
+    /* 以传入的 percent 为目标, 逐分平滑渐进到目标值, 避免进度条从 5% 直接跳到
+     * 100% (引擎加载瞬时完成, 单次回调会把目标拉到 100). 每次加 1~2% 后短延时
+     * 并刷新 LCD, 让进度条像真实加载一样平滑爬升, 全程约 0.5s, 不影响秒开体验. */
+    while (s_loading_pct < percent) {
+        int step = 1;
+        /* 前 85% 走快一点, 收尾阶段放慢, 更接近真实加载曲线 */
+        if (s_loading_pct >= 85) step = 1;
+        else if (s_loading_pct >= 60) step = 2;
+        else step = 3;
+        int target = s_loading_pct + step;
+        if (target > percent) target = percent;
+
         int old_fill = (bar_w - 4) * s_loading_pct / 100;
-        int new_fill = (bar_w - 4) * percent / 100;
+        int new_fill = (bar_w - 4) * target / 100;
         for (int y = 2; y < bar_h - 2; y++) {
             for (int x = old_fill; x < new_fill; x++) {
                 st7305_draw_pixel(lcd, bar_x + 2 + x, bar_y + y, ST7305_COLOR_BLACK);
             }
         }
-        s_loading_pct = percent;
+        s_loading_pct = target;
         /* 清除旧百分比 (居中 40 宽区域) 并绘制新百分比 */
         for (int dy = 0; dy < 14; dy++) {
             for (int dx = 0; dx < 40; dx++) {
@@ -2865,9 +4458,10 @@ static void loading_screen_draw(int percent, const char *text)
             }
         }
         char pct[16];
-        snprintf(pct, sizeof(pct), "%d%%", percent);
+        snprintf(pct, sizeof(pct), "%d%%", target);
         draw_text_centered(lcd, 165, pct, false);
         st7305_flush(lcd);
+        vTaskDelay(pdMS_TO_TICKS(12));
     }
 }
 
@@ -2883,8 +4477,7 @@ static void loading_set_basename(const char *path)
     }
 }
 
-static void gb_load_progress_cb(int percent)  { loading_screen_draw(percent, s_loading_text); }
-static void gbc_load_progress_cb(int percent) { loading_screen_draw(percent, s_loading_text); }
+static void gb_load_progress_cb(int percent) { loading_screen_draw(percent, s_loading_text); }
 
 static game_exit_result_t game_exit_confirm_dialog(menu_state_t *state, const game_run_engine_ops_t *ops);
 static void game_run_loop(menu_state_t *state, const game_run_engine_ops_t *ops);
@@ -2939,7 +4532,28 @@ static bool select_game_on_confirm(menu_state_t *state, int idx) {
             }
         }
         if (p == NULL) {
-            ESP_LOGE(TAG, "无法找到游戏路径 (folder_idx=%d, idx=%d)", state->select_folder_idx, idx);
+            /* 诊断: 区分"收藏为空/未命中"与"文件夹扫描为空/越界"两种情况,
+             * 每种情况给出精确上下文 (引擎/模式/侧栏项/序号/目录/扩展名). */
+            if (state->select_folder_idx == 1) {
+                int fc = 0;
+                favorites_list(state_fav_engine(state), &fc);
+                if (fc <= 0) {
+                    /* V1.0.9x: 收藏为空时静默忽略, 不弹"无法定位游戏" */
+                    state->needs_redraw = true;
+                    return true;
+                }
+                ESP_LOGE(TAG, "无法定位游戏: 收藏为空或未命中 (engine=%d, fav_count=%d, idx=%d)",
+                         state->select_engine, fc, idx);
+            } else {
+                const char *folder = get_selected_folder_name(state, state->select_folder_idx);
+                ESP_LOGE(TAG, "无法定位游戏: 文件夹扫描为空/越界 (engine=%d, folder_idx=%d, folder=[%s], idx=%d, root=[%s], ext=[%s], has_root=%d, folders=%d)",
+                         state->select_engine, state->select_folder_idx,
+                         folder ? folder : "(null)",
+                         idx,
+                         platform_root_dir(state->select_engine),
+                         current_gb_ext(state),
+                         g_select_has_root, g_folder_count);
+            }
             menu_show_fail_hint(state, "无法定位游戏");
             return true;
         }
@@ -2947,6 +4561,44 @@ static bool select_game_on_confirm(menu_state_t *state, int idx) {
 
         /* V1.0.46: 按页面模式启动 (0=电子词典 gam4980, 1=console 页) */
         if (state->select_mode == 1) {
+            /* === wqx 文曲星 (LavaX): select_engine==4 ===
+             * 阻塞式: lavax_emu_load_and_run 内部跑 VM main_loop 直至用户退出.
+             * 退出键由 lavax_platform_poll 检测 (物理返回键/手柄 BACK/F_EXIT). */
+            if (state->select_engine == 4) {
+                ESP_LOGI(TAG, "启动文曲星: %s", p);
+                s_wqx_started = false; s_wqx_exit_asked = false;   /* V1.0.9x: 每局重置入场宽限期 */
+                esp_err_t ret = lavax_emu_load_and_run(p);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "文曲星运行失败: %s", esp_err_to_name(ret));
+                    menu_show_fail_hint(state, "文曲星加载失败");
+                }
+                /* V1.0.9x: 从应用管理进入则回应用管理; 否则回文曲星二级菜单继续选游戏 */
+                state->current_page = (state->module_return_page == MENU_PAGE_APP_MANAGER)
+                                      ? MENU_PAGE_APP_MANAGER : MENU_PAGE_WQX;
+                state->needs_redraw = true;
+                return true;
+            }
+            /* === 暴龙机 (vpet-emu-zepp): select_engine==5 ===
+             * task 型: vpet_emu_start 创建模拟任务后, game_run_loop 负责
+             * 每帧喂 joypad + 退出确认 (与 GB/NES 一致). */
+            if (state->select_engine == 5) {
+                ESP_LOGI(TAG, "启动暴龙机: %s", p);
+                /* V1.0.9x: 暴龙机独立显示模式 (点对点/放大/拉伸).
+                 * 抗锯齿仅当用户在暴龙机设置里显式开启才走 EPX; 此处不强制. */
+                uint8_t vpet_dm = (uint8_t)(state->game_display_mode % 3);
+                bool    vpet_aa_on = (vpet_aa_get() != 0);   /* 暴龙机独立抗锯齿, 默认关 */
+                vpet_emu_set_display((int)vpet_dm, vpet_aa_on);
+                esp_err_t ret = vpet_emu_start(p);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "暴龙机启动失败: %s", esp_err_to_name(ret));
+                    menu_show_fail_hint(state, "暴龙机加载失败");
+                    return true;
+                }
+                game_run_loop(state, &ops_engine_vpet);
+                ESP_LOGI(TAG, "暴龙机游戏退出, 返回菜单");
+                state->needs_redraw = true;
+                return true;
+            }
             /* V1.0.53: NES (nofrendo) — 从 /sdcard/nes 的 .nes 游戏加载并启动 */
             if (state->select_engine == 2) {
                 /* V1.0.52: 统一加载进度条 (文件名 + 进度条 + 百分比) */
@@ -2963,7 +4615,7 @@ static bool select_game_on_confirm(menu_state_t *state, int idx) {
                 }
                 /* 补满进度条 + 同步设置 */
                 loading_screen_draw(100, s_loading_text);
-                nes_emu_set_fullscreen(state->game_display_mode > 0);
+                nes_emu_set_fullscreen((int)state->game_display_mode);
                 /* 同步 NES 引擎独立的模拟灰度开关 (0=关/纯黑白, 1=开/灰度) */
                 board_shim_set_gb_gray(engine_gray_get(state->select_engine));
                 /* 运行循环 (阻塞直到退出) */
@@ -2987,27 +4639,38 @@ static bool select_game_on_confirm(menu_state_t *state, int idx) {
                 state->needs_redraw = true;
                 return true;
             }
-            /* V1.0.47: GBC 引擎 (gnuboy) — 走 gbc_emu_start 直接读 ROM 并启动任务 */
+            /* GBC 复用 GB (Peanut-GB) 核心, 存档独立到 /sdcard/dict/GBC (与 GB 分开) */
             if (state->select_engine == 1) {
                 /* V1.0.52: 统一加载进度条 (文件名 + 进度条 + 百分比) */
                 s_loading_lcd = state->lcd;
                 s_loading_pct = -1;
                 loading_set_basename(p);
-                gbc_emu_set_progress_cb(gbc_load_progress_cb);
-                esp_err_t ret = gbc_emu_start(p);
-                gbc_emu_set_progress_cb(NULL);
+                gb_emu_set_save_dir("/sdcard/dict/GBC");
+                gb_emu_set_progress_cb(gb_load_progress_cb);
+                loading_screen_draw(5, s_loading_text);
+                gb_emu_rom_t rom;
+                esp_err_t ret = gb_emu_load_rom(p, &rom);
+                gb_emu_set_progress_cb(NULL);
                 if (ret != ESP_OK) {
-                    ESP_LOGE(TAG, "GBC 启动失败: %s", esp_err_to_name(ret));
+                    ESP_LOGE(TAG, "GBC ROM 加载失败: %s", esp_err_to_name(ret));
+                    menu_show_fail_hint(state, "GBC ROM 加载失败");
+                    return true;
+                }
+                gb_emu_log_rom_info(&rom);
+                ret = gb_emu_start(&rom);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "GBC 模拟器启动失败: %s", esp_err_to_name(ret));
+                    gb_emu_free_rom(&rom);
                     menu_show_fail_hint(state, "GBC 启动失败");
                     return true;
                 }
-                /* 补满进度条 */
+                /* 补满进度条 + 同步 GBC 设置: 全屏 + 模拟灰度 */
                 loading_screen_draw(100, s_loading_text);
-                /* 同步 GBC 设置: 全屏 + 模拟灰度 + 音量 */
-                gbc_emu_set_fullscreen((int)state->game_display_mode);
+                gb_emu_set_fullscreen((int)state->game_display_mode);
                 board_shim_set_gb_gray(engine_gray_get(state->select_engine));
                 /* 运行循环 (阻塞直到退出) */
-                game_run_loop(state, &ops_engine_gbc);
+                game_run_loop(state, &ops_engine_gb);
+                gb_emu_free_rom(&rom);
                 ESP_LOGI(TAG, "GBC 游戏退出, 返回菜单");
                 state->needs_redraw = true;
                 return true;
@@ -3017,6 +4680,7 @@ static bool select_game_on_confirm(menu_state_t *state, int idx) {
             s_loading_lcd = state->lcd;
             s_loading_pct = -1;
             loading_set_basename(p);
+            gb_emu_set_save_dir("/sdcard/dict/GB");
             gb_emu_set_progress_cb(gb_load_progress_cb);
             loading_screen_draw(5, s_loading_text);
             gb_emu_rom_t rom;
@@ -3077,8 +4741,8 @@ static bool select_game_on_confirm(menu_state_t *state, int idx) {
         
         /* 传递状态栏信息给游戏 */
         gam4980_set_status_info(state->settings.battery, state->settings.pad_connected);
-        /* 同步游戏显示模式: 全屏 or 点对点 */
-        gam4980_set_fullscreen(state->game_display_mode > 0);
+        /* 同步游戏显示模式: 0=点对点, 1=全屏, 2=拉伸 */
+        gam4980_set_fullscreen((int)state->game_display_mode);
         /* V1.0.46: 同步画面优化开关 */
         gam4980_set_pic_opt(state->game_pic_opt);
         /* V1.0.68: 进入 BBK 游戏禁用手柄导航键 (与 GB 流程一致), 否则游戏内
@@ -3140,14 +4804,35 @@ static game_exit_result_t game_exit_confirm_dialog(menu_state_t *state, const ga
 
         menu_action_t action = input_get_action();
 
-        /* 物理键 (KEY 短按=CONFIRM, BOOT 短按=BACK), 不受 gamepad_nav 影响 */
+        /* 物理键 (KEY 短按=CONFIRM, BOOT 短按=BACK), 不受 gamepad_nav 影响
+         * V1.0.xx: 触摸 CONFIRM 区分点击区域 — 点击弹窗内=确认退出, 弹窗外=取消
+         * (用户需求: 点击任意位置确认 → 改为点击框外取消, 避免误触). */
         if (action == MENU_ACTION_CONFIRM) {
+            int tx, ty;
+            if (input_consume_tap(&tx, &ty)) {
+                /* 触摸 CONFIRM: 计算弹窗区域, 判断点击位置
+                 * 弹窗尺寸与 draw_notice_popup 一致: 边框3px, 内边距3px, 文字24px */
+                int tw = text_width("\xe9\x80\x80\xe5\x87\xba\xe6\xb8\xb8\xe6\x88\x8f\xef\xbc\x9f"); /* 退出游戏？ */
+                const int NOTICE_B = 3, NOTICE_P = 3, NOTICE_H = 3+3+3+3+24;
+                int W = NOTICE_B*2 + NOTICE_P*2 + tw;
+                int H = NOTICE_H;
+                int px = (SCREEN_W - W) / 2;
+                int py = (SCREEN_H - H) / 2;
+                if (tx >= px && tx < px + W && ty >= py && ty < py + H) {
+                    /* 点击弹窗内 → 确认退出 */
+                    return GAME_EXIT_CONFIRMED;
+                }
+                /* 点击弹窗外 → 取消恢复游戏 */
+                ops->resume();
+                return GAME_EXIT_CANCEL;
+            }
+            /* 物理键 CONFIRM: 直接退出 */
             return GAME_EXIT_CONFIRMED;
         }
         if (action == MENU_ACTION_BACK) {
-            /* V1.0.68: 触摸底部上滑再次出现 = 确认返回;
+            /* V1.0.69: 触摸底部上滑再次出现 = 强制退出回主菜单 (不等确认);
              * 物理 BACK 键 = 取消恢复游戏 */
-            if (input_touch_last_action()) return GAME_EXIT_CONFIRMED;
+            if (input_touch_last_action()) return GAME_EXIT_TIMEOUT;
             ops->resume();
             return GAME_EXIT_CANCEL;
         }
@@ -3195,12 +4880,30 @@ static game_exit_result_t game_exit_confirm_dialog(menu_state_t *state, const ga
     }
 }
 
+/* V1.0.71: 触屏是否可用 (硬件存在且未被"禁用触屏"设置关闭).
+ * 屏幕虚拟按键依赖触屏, 无触屏时强制关闭并隐藏设置项. */
+static bool touch_available(const menu_state_t *state) {
+    return touch_panel_is_present() && !state->settings.touch_disable;
+}
+
+/* V1.0.94: 虚拟按键三态生效判断 (0=关, 1=开, 2=自动).
+ * 无可用触屏一律关; 否则按用户选择:
+ *   - 自动: 有触屏→开, 连蓝牙手柄→关
+ *   - 开/关: 直接按选择. */
+bool menu_vkey_effective(const menu_state_t *state) {
+    if (!touch_available(state)) return false;
+    int vkey = (int)state->game_virtual_keys;
+    if (vkey < 0 || vkey > 2) vkey = 2;
+    if (vkey == 2) return !bt_manager_is_connected();
+    return vkey == 1;
+}
+
 static void game_run_loop(menu_state_t *state, const game_run_engine_ops_t *ops) {
     input_set_gamepad_nav_enabled(false);
     /* 游戏运行期间暂停 SD 扫描/重挂, 避免 SDMMC 重挂与游戏读 SD 并发崩溃 */
     sd_watcher_set_paused(true);
-    /* V1.0.68: 游戏内屏幕虚拟按键 (游戏设置里开启) */
-    virtual_keys_set_enabled(state->game_virtual_keys);
+    /* V1.0.94: 游戏内屏幕虚拟按键 (三态生效: menu_vkey_effective) */
+    virtual_keys_set_enabled(menu_vkey_effective(state));
 
     /* 处理退出动作: 先暂停游戏并弹出确认框, 用户确认后才真正退出.
      * 用 s_gb_exit_requested 标记"已请求退出", 在主循环统一处理,
@@ -3321,9 +5024,9 @@ static void start_wallpaper_game(menu_state_t *state, int engine, const char *pa
             if (ret == ESP_OK) {
                 loading_screen_draw(100, s_loading_text);
 #if WALLPAPER_TEST_1X
-                nes_emu_set_fullscreen(false);
+                nes_emu_set_fullscreen(0);
 #else
-                nes_emu_set_fullscreen(state->game_display_mode > 0);
+                nes_emu_set_fullscreen((int)state->game_display_mode);
 #endif
                 board_shim_set_gb_gray(engine_gray_get(engine));
                 game_run_loop(state, &ops_engine_nes);
@@ -3337,27 +5040,36 @@ static void start_wallpaper_game(menu_state_t *state, int engine, const char *pa
             if (arduboy_avr_start(path) == ESP_OK) {
                 game_run_loop(state, &ops_engine_arduboy);
             }
-        } else if (engine == 1) {  /* GBC */
+        } else if (engine == 1) {  /* GBC (复用 GB/Peanut-GB 核心, 存档独立到 /sdcard/dict/GBC) */
             s_loading_lcd = state->lcd;
             s_loading_pct = -1;
             loading_set_basename(path);
-            gbc_emu_set_progress_cb(gbc_load_progress_cb);
-            esp_err_t ret = gbc_emu_start(path);
-            gbc_emu_set_progress_cb(NULL);
+            gb_emu_set_save_dir("/sdcard/dict/GBC");
+            gb_emu_set_progress_cb(gb_load_progress_cb);
+            loading_screen_draw(5, s_loading_text);
+            gb_emu_rom_t gbc_rom;
+            esp_err_t ret = gb_emu_load_rom(path, &gbc_rom);
+            gb_emu_set_progress_cb(NULL);
             if (ret == ESP_OK) {
-                loading_screen_draw(100, s_loading_text);
+                ret = gb_emu_start(&gbc_rom);
+                if (ret == ESP_OK) {
+                    loading_screen_draw(100, s_loading_text);
 #if WALLPAPER_TEST_1X
-                gbc_emu_set_fullscreen(0);
+                    gb_emu_set_fullscreen(0);
 #else
-                gbc_emu_set_fullscreen((int)state->game_display_mode);
+                    gb_emu_set_fullscreen((int)state->game_display_mode);
 #endif
-                board_shim_set_gb_gray(engine_gray_get(engine));
-                game_run_loop(state, &ops_engine_gbc);
+                    board_shim_set_gb_gray(engine_gray_get(engine));
+                    game_run_loop(state, &ops_engine_gb);
+                }
+                gb_emu_free_rom(&gbc_rom);
             }
+            gb_emu_set_save_dir("/sdcard/dict/GB");
         } else {  /* GB */
             s_loading_lcd = state->lcd;
             s_loading_pct = -1;
             loading_set_basename(path);
+            gb_emu_set_save_dir("/sdcard/dict/GB");
             gb_emu_set_progress_cb(gb_load_progress_cb);
             loading_screen_draw(5, s_loading_text);
             gb_emu_rom_t rom;
@@ -3383,7 +5095,7 @@ static void start_wallpaper_game(menu_state_t *state, int engine, const char *pa
         gam4980_emu_init(state->lcd);
         if (gam4980_emu_load(path) == 0) {
             gam4980_set_status_info(state->settings.battery, state->settings.pad_connected);
-            gam4980_set_fullscreen(state->game_display_mode > 0);
+            gam4980_set_fullscreen((int)state->game_display_mode);
             gam4980_set_pic_opt(state->game_pic_opt);
             gam4980_set_wallpaper_mode(true);
             gam4980_emu_run();
@@ -3666,11 +5378,13 @@ static void draw_bt_scan_dialog(menu_state_t *state) {
  *   mapping_finish / mapping_cancel / bt_history_* 等旧实现, 统一到本区块内
  *   重新生成, 全部走 list_dialog 框架.
  *
- * 索引约定 (与 gamepad_list_build 严格对齐, 4 项):
+ * 索引约定 (与 gamepad_list_build 严格对齐, 6 项):
  *   0: 添加设备  - 扫描手柄, 点设备自动连接, 成功自动跳按键映射
  *   1: 按键映射  - 8 键顺序映射 (上下左右 / 确认 / 返回 / 回到菜单 / 多功能键)
  *   2: 连接记录  - 嵌套 list_dialog 列出已配对设备, 按确定直接删除
- *   3: 返回      - 关闭弹窗, 回到主菜单
+ *   3: WiFi 手柄 - 网页手柄开关
+ *   4: 自动虚拟按键 - 开关 (点击/左右键切换, 不关闭弹窗; V1.0.71)
+ *   5: 返回      - 关闭弹窗, 回到主菜单
  *
  * 蓝牙默认开启, 无开关选项; 整个手柄子菜单没有独立全屏页, 全部经 list_dialog
  * 弹窗, 不再经过 sub_pages[MENU_PAGE_GAMEPAD] 全屏入口. */
@@ -3714,7 +5428,6 @@ static int gamepad_list_build(menu_state_t *state, char buf[][64], int max) {
     snprintf(buf[n++], 64, "%sWiFi \xe6\x89\x8b\xe6\x9f\x84",                  /* WiFi 手柄 */
              web_gamepad_is_running() ? "* " : "");
     snprintf(buf[n++], 64, "\xe8\xbf\x94\xe5\x9b\x9e");                            /* 返回 */
-    (void)state;
     return n;
 }
 
@@ -3722,7 +5435,6 @@ static int gamepad_list_build(menu_state_t *state, char buf[][64], int max) {
  * - LEFT 长按 500ms → 直接触发 gamepad_act_add_device (跳过"按确定进添加设备"两步)
  * - 其他方向键 → 默认 wrap 行为 (与无 on_key 时一致) */
 static void gamepad_list_on_key(menu_state_t *state, int idx, menu_action_t action) {
-    (void)idx;
     if (action == MENU_ACTION_LONG_LEFT) {
         ESP_LOGI(TAG, "手柄配置: 长按LEFT 500ms → 直接扫描设备");
         /* 关闭弹窗 + 状态机重置 + 回到主菜单 (与 gamepad_list_on_select 一致) */
@@ -3732,13 +5444,14 @@ static void gamepad_list_on_key(menu_state_t *state, int idx, menu_action_t acti
         state->list_dialog_on_key = NULL;
         state->list_dialog_on_close = NULL;
         state->current_page = MENU_PAGE_MAIN;
-        state->selected_index = state->main_selected_index;
+        menu_main_restore_position(state);
         state->scroll_offset = 0;
         state->needs_redraw = true;
         /* 触发添加设备 (直接扫描) */
         gamepad_act_add_device(state);
         return;
     }
+    (void)idx;   /* idx 仅用于待删除的"自动虚拟按键"开关, 现已不在列表 */
     /* 默认 wrap: UP/LEFT 向上选, DOWN/RIGHT 向下选 */
     if (action == MENU_ACTION_UP || action == MENU_ACTION_LEFT) {
         if (state->list_dialog_selected > 0) {
@@ -3775,11 +5488,11 @@ static void gamepad_list_on_select(menu_state_t *state, int idx) {
     state->list_dialog_on_key = NULL;
     state->list_dialog_on_close = NULL;
     state->current_page = MENU_PAGE_MAIN;
-    state->selected_index = state->main_selected_index;
+    menu_main_restore_position(state);
     state->scroll_offset = 0;
     state->needs_redraw = true;
 
-    /* 触发对应动作: idx 0/1/2 = 动作, idx 3 = 返回 (弹窗已关) */
+    /* 触发对应动作: idx 0/1/2/3 = 动作, idx 4 = 返回 (弹窗已关) */
     switch (idx) {
     case 0: gamepad_act_add_device(state);  break;
     case 1: gamepad_act_keymap(state);      break;
@@ -3796,11 +5509,20 @@ static void gamepad_act_wifi(menu_state_t *state) {
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (web_gamepad_is_running()) {
         web_gamepad_stop();
+        /* V1.0.9x: 退出 WiFi 手柄后重新拉起蓝牙 (WiFi 期间为腾 DMA 已关掉蓝牙) */
+        bt_manager_enable();
         snprintf(state->hint_text, sizeof(state->hint_text), "WiFi \xe6\x89\x8b\xe6\x9f\x84\xe5\xb7\xb2\xe5\x85\xb3\xe9\x97\xad"); /* WiFi 手柄已关闭 */
     } else {
+        /* V1.0.9x: 蓝牙 BLE 控制器常驻占 ~34KB 内部 DMA, 与 WiFi softAP 的
+         * ~31KB 需求相加超过 ESP32-S3 内部 DMA 总量, 导致 softAP 的 HTTP server
+         * 分配失败. WiFi 手柄与蓝牙手柄不可能同时使用, 故启动 WiFi 前先
+         * bt_manager_disable() 释放蓝牙内部 DMA, 退出时再 bt_manager_enable() 恢复. */
+        bt_manager_disable();
         if (web_gamepad_start() == ESP_OK) {
             snprintf(state->hint_text, sizeof(state->hint_text), "\xe5\xb7\xb2\xe5\xbc\x80\xe5\x90\xaf WiFi \xe6\x89\x8b\xe6\x9f\x84"); /* 已开启 WiFi 手柄 */
         } else {
+            /* 启动失败: 恢复蓝牙, 避免误关 */
+            bt_manager_enable();
             snprintf(state->hint_text, sizeof(state->hint_text), "WiFi \xe6\x89\x8b\xe6\x9f\x84\xe5\x90\xaf\xe5\x8a\xa8\xe5\xa4\xb1\xe8\xb4\xa5"); /* WiFi 手柄启动失败 */
         }
     }
@@ -3842,7 +5564,7 @@ static void gamepad_act_keymap(menu_state_t *state) {
     state->confirm_active = false;
     state->connecting_popup_active = false;
     state->current_page = MENU_PAGE_MAIN;
-    state->selected_index = state->main_selected_index;
+    menu_main_restore_position(state);
     state->scroll_offset = 0;
     /* 启动映射 */
     state->key_mapping_idx = 0;
@@ -3899,7 +5621,7 @@ static void gamepad_act_sup_keymap(menu_state_t *state) {
     state->confirm_active = false;
     state->connecting_popup_active = false;
     state->current_page = MENU_PAGE_MAIN;
-    state->selected_index = state->main_selected_index;
+    menu_main_restore_position(state);
     state->scroll_offset = 0;
     state->sup_map_idx = 0;
     state->sup_map_captured = false;
@@ -4122,7 +5844,7 @@ static void gamepad_history_on_select(menu_state_t *state, int idx) {
         state->list_dialog_prev_active = false;
         state->list_dialog_prev_selected = -1;
         state->current_page = state->list_dialog_return_page;
-        state->selected_index = state->main_selected_index;
+        menu_main_restore_position(state);
         state->scroll_offset = 0;
         snprintf(state->confirm_title, sizeof(state->confirm_title), "\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xb0\xe5\xbd\x95");
         snprintf(state->confirm_msg, sizeof(state->confirm_msg), "\xe6\x9a\x82\xe6\x97\xa0\xe8\xae\xb0\xe5\xbd\x95");
@@ -4220,6 +5942,12 @@ static bool list_dialog_pop_parent(menu_state_t *state) {
     return true;
 }
 
+/* V1.0.9x: 应用管理双击打开"列表弹窗型"模块(如键鼠布局)后会紧接着触发一次
+ * main.c 的自动 CONFIRM, 命中刚弹出的列表弹窗 → 默认项被立即选中、弹窗"闪没".
+ * 该标志吞掉这一次确认, 让弹窗留在屏幕供用户选择 (与主菜单进入行为一致).
+ * 在 list_dialog_open 与 list_dialog CONFIRM 分支中读写. */
+static bool s_app_swallow_next_confirm = false;
+
 static void list_dialog_open(menu_state_t *state, const char *title,
                              int count, void (*on_select)(menu_state_t *, int)) {
     /* 嵌套: 若已有弹窗激活, 先压入父弹窗状态, 关闭子弹窗后恢复(含原位置) */
@@ -4236,6 +5964,8 @@ static void list_dialog_open(menu_state_t *state, const char *title,
     state->list_dialog_prev_active = false;
     state->list_dialog_prev_selected = -1;
     state->list_dialog_local_update = false;
+    /* 任何弹窗打开都会清掉"吞一次确认"标志, 防止残留标志误吞正常确认 */
+    s_app_swallow_next_confirm = false;
     /* 自定义渲染/内容脏: 默认为空, 由调用方按需设置 */
     state->list_dialog_on_render = NULL;
     state->list_dialog_content_dirty = false;
@@ -4335,6 +6065,11 @@ static int sd_build(menu_state_t *state, char buf[][64], int max) {
  *   - 选中返回/按 BACK -> 关闭弹窗, 通过 list_dialog_pop_parent 恢复 SD 管理弹窗
  *   - 结果 (成功/失败) 用 confirm 弹窗显示, 关闭后回到挂载弹窗 */
 static void sd_mount_dialog_on_select(menu_state_t *state, int idx);
+/* USB 存储挂载成功界面: 电脑可读写 + 传输数据图标 + 底部"退出挂载"菜单 */
+static void sd_msc_active_render(menu_state_t *state, st7305_handle_t *lcd,
+                                 int cx, int cy, int cw, int ch);
+static void sd_msc_active_on_select(menu_state_t *state, int idx);
+static void sd_msc_active_on_key(menu_state_t *state, int idx, menu_action_t action);
 static void open_sd_mount_dialog(menu_state_t *state) {
     state->list_dialog_return_page = state->current_page;  /* 跟随 SD 管理所在页 */
     /* V1.0.41: 先 list_dialog_open (压栈保存父弹窗 items), 再写入子弹窗 items */
@@ -4349,24 +6084,22 @@ static void open_sd_mount_dialog(menu_state_t *state) {
 /* 弹窗选中: 0=确定挂载, 1=返回 */
 static void sd_mount_dialog_on_select(menu_state_t *state, int idx) {
     if (idx == 0) {
-        /* 确定挂载: 真正执行 */
+        /* 确定挂载 */
         extern bool usbh_msc_is_running(void);
         if (usbh_msc_is_running()) {
-            /* 已经在挂载, 弹重启提示 (不重开 SD 管理, 即将重启) */
-            state->list_dialog_active = false;
-            state->list_dialog_prev_active = false;
-            state->list_dialog_prev_selected = -1;
-            state->list_dialog_on_close = NULL;
-            state->confirm_active = true;
-            state->confirm_notice = true;
-            state->confirm_no_hint = true;
-            snprintf(state->confirm_title, sizeof(state->confirm_title), "\xe9\x80\x80\xe5\x87\xba");
-            snprintf(state->confirm_msg, sizeof(state->confirm_msg), "\xe8\xae\xbe\xe5\xa4\x87\xe5\xb0\x86\xe9\x87\x8d\xe5\x90\xaf...");
-            state->needs_redraw = true;
-            menu_render(state);
-            vTaskDelay(pdMS_TO_TICKS(1500));
-            esp_restart();
-            return;
+            /* 已在挂载: 先停止 MSC 再重新挂载 (不再重启设备) */
+            extern void usbh_msc_stop(void);
+            extern int sd_remount_vfs_from_card(void);
+            extern void sd_watcher_set_paused(bool);
+            usbh_msc_stop();
+            sd_remount_vfs_from_card();
+            sd_watcher_set_paused(false);
+            /* 短暂提示"已退出, 重新挂载中" */
+            st7305_clear(state->lcd, ST7305_COLOR_WHITE);
+            menu_draw_notice_popup(state->lcd, "\xe9\x87\x8d\xe6\x96\xb0\xe6\x8c\x82\xe8\xbd\xbd"); /* 重新挂载 */
+            st7305_flush(state->lcd);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            /* 落到下方正常挂载流程 */
         }
         /* 真正执行挂载 */
         extern void sd_watcher_set_paused(bool);
@@ -4393,22 +6126,21 @@ static void sd_mount_dialog_on_select(menu_state_t *state, int idx) {
             extern int sd_remount_vfs_from_card(void);
             sd_remount_vfs_from_card();
             sd_watcher_set_paused(false);  /* MSC 启动失败: 恢复 watcher */
-            state->confirm_active = true;
-            state->confirm_notice = true;
-            state->confirm_no_hint = true;
-            snprintf(state->confirm_title, sizeof(state->confirm_title), "\xe5\xa4\xb1\xe8\xb4\xa5");
-            snprintf(state->confirm_msg, sizeof(state->confirm_msg), "USB\xe5\x90\xaf\xe5\x8a\xa8\xe5\xa4\xb1\xe8\xb4\xa5");
+            /* 失败: 收藏成功那种居中小弹窗 (hint 文字提示) */
+            snprintf(state->hint_text, sizeof(state->hint_text),
+                     "\xe6\x8c\x82\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5"); /* 挂载失败 */
+            state->hint_until_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 1500;
             state->needs_redraw = true;
             return;
         }
-        /* 成功: 保留 list_dialog_active=true, confirm 覆盖显示"已连接".
-         * 关闭 confirm 后会自然回到 SD 管理 list_dialog (弹窗优先级 confirm>list_dialog).
-         * 用户需求: 按返回键停留到上一步, 这里结果弹窗任意键关闭后也会回 SD 管理. */
-        state->confirm_active = true;
-        state->confirm_notice = true;
-        state->confirm_no_hint = true;
-        snprintf(state->confirm_title, sizeof(state->confirm_title), "\xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5");
-        snprintf(state->confirm_msg, sizeof(state->confirm_msg), "\xe7\x94\xb5\xe8\x84\x91\xe5\x8f\xaf\xe8\xaf\xbb\xe5\x86\x99");
+        /* 成功: 显示挂载界面 (电脑可读写 + 传输数据图标 + 底部"退出挂载"菜单) */
+        state->list_dialog_return_page = state->current_page;
+        list_dialog_open(state, "", 1, sd_msc_active_on_select);
+        snprintf(state->list_dialog_items[0], 64, "\xe9\x80\x80\xe5\x87\xba\xe6\x8c\x82\xe8\xbd\xbd"); /* 退出挂载 */
+        state->list_dialog_count = 1;
+        state->list_dialog_on_render = sd_msc_active_render;
+        state->list_dialog_on_key    = sd_msc_active_on_key;
+        state->list_dialog_content_dirty = true;
         state->needs_redraw = true;
         return;
     }
@@ -4424,6 +6156,73 @@ static void sd_mount_dialog_on_select(menu_state_t *state, int idx) {
         void (*cb)(menu_state_t *) = state->list_dialog_on_close;
         state->list_dialog_on_close = NULL;
         cb(state);
+    }
+}
+
+/* === USB 存储挂载成功界面 ===
+ * 内容区: "电脑可读写" 文字 + 传输数据图标 (64x64)
+ * 底部:   "退出挂载" 菜单项 (选中后停止 MSC 并重新挂载 TF) */
+static void sd_msc_active_render(menu_state_t *state, st7305_handle_t *lcd,
+                                 int cx, int cy, int cw, int ch) {
+    (void)ch;
+    /* 文字居中 (内容区上部) */
+    draw_text_centered(lcd, cy + 16, "\xe7\x94\xb5\xe8\x84\x91\xe5\x8f\xaf\xe8\xaf\xbb\xe5\x86\x99", false); /* 电脑可读写 */
+    /* 传输数据图标 64x64 居中 (文字下方) */
+    st7305_draw_bitmap_1bit(lcd, cx + (cw - 64) / 2, cy + 50, 64, 64, icon_transfer);
+
+    /* 底部"退出挂载"行: 黑底白字高亮 (与列表弹窗返回行同风格) */
+    int row_h = 40;
+    int ry = cy + ch - row_h - 4;
+    fill_rect(lcd, cx, ry, cx + cw - 1, ry + row_h - 1, ST7305_COLOR_BLACK);
+    draw_text_centered(lcd, ry + (row_h - 24) / 2,
+                       state->list_dialog_items[0], true);
+    (void)state;
+}
+
+/* 点击"退出挂载": 停止 USB MSC, 恢复 VFS, 回到 SD 管理弹窗 */
+static void sd_msc_active_on_select(menu_state_t *state, int idx) {
+    if (idx != 0) return;
+    /* 停止 MSC, 恢复 USB Serial/JTAG 串口 */
+    extern void usbh_msc_stop(void);
+    usbh_msc_stop();
+    /* 重新挂载 TF 卡 VFS (unmount_vfs_keep_card 时卡句柄保留, 这里重新挂回) */
+    extern int sd_remount_vfs_from_card(void);
+    sd_remount_vfs_from_card();
+    extern void sd_watcher_set_paused(bool);
+    sd_watcher_set_paused(false);
+    /* 关闭挂载界面, 回到 SD 管理弹窗 */
+    if (list_dialog_pop_parent(state)) {
+        return;
+    }
+    state->list_dialog_active = false;
+    state->list_dialog_prev_active = false;
+    state->list_dialog_prev_selected = -1;
+    state->current_page = state->list_dialog_return_page;
+    state->selected_index = 0;
+    state->scroll_offset = 0;
+    state->needs_redraw = true;
+}
+
+/* 方向键/确认键支持 (与标准列表弹窗一致) */
+static void sd_msc_active_on_key(menu_state_t *state, int idx, menu_action_t action) {
+    (void)idx;
+    switch (action) {
+    case MENU_ACTION_UP:
+    case MENU_ACTION_DOWN:
+    case MENU_ACTION_LEFT:
+    case MENU_ACTION_RIGHT:
+        state->list_dialog_selected = 0;   /* 只有"退出挂载"一项 */
+        state->needs_redraw = true;
+        state->list_dialog_local_update = true;
+        break;
+    case MENU_ACTION_BACK:
+    case MENU_ACTION_HOME:
+        /* BACK/HOME 也走"退出挂载"流程: 停止 MSC 并重新挂载 TF 卡,
+         * 避免弹窗关闭后 MSC 仍在后台运行 → 下次挂载误触发重启. */
+        sd_msc_active_on_select(state, 0);
+        break;
+    default:
+        break;
     }
 }
 
@@ -4563,7 +6362,7 @@ static int volume_step_to_percent(int vol) {
  *           读取优先级 TF > NVS > 默认. */
 #define BBK_CFG_PATH       "/sdcard/system/config.cfg"
 #define BBK_CFG_MAGIC      0x42424B43u   /* "BBKC" */
-#define BBK_CFG_VERSION    16  /* V1.0.68: 隐藏设置 (v16: +audio_scheme +touch_disable) */
+#define BBK_CFG_VERSION    26  /* V1.0.9x: 追加主菜单图标顺序 main_order */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -4594,7 +6393,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  book_lineh;      /* 0=紧凑 1=标准 2=宽松 */
     uint8_t  book_gap;        /* 0=标准 1=宽松 */
     uint8_t  book_font_family;/* 0=仿宋 1=黑体/菜单字体 (V1.0.69) */
-    uint8_t  wallpaper_mode;  /* 0=内置星空 1=TF动态图 2=游戏壁纸 (V1.0.64) */
+    uint8_t  wallpaper_mode;  /* 0=内置星空 1=外置图片 2=游戏壁纸 (V1.0.64) */
     uint8_t  wallpaper_program; /* 内置壁纸程序 0..10 (V1.0.64) */
     uint8_t  wallpaper_timeout_min; /* 休眠分钟 1..30 (V1.0.64) */
     uint8_t  wallpaper_bmp_fps; /* 0=慢 1=标准 2=快 (V1.0.64) */
@@ -4602,10 +6401,27 @@ typedef struct __attribute__((packed)) {
     uint8_t  pomo_rest_min;     /* 番茄钟休息分钟 (V1.0.64) */
     uint8_t  pomo_reminder;     /* 番茄钟完成提醒声音 0/1 (V1.0.65) */
     uint8_t  game_vkey;         /* 游戏内虚拟按键 0/1 (V1.0.68) */
+    uint8_t  game_vkey_auto;    /* 虚拟按键自动切换 0/1 (V1.0.71: 手柄"自动切换开关"). 1=自动(有触屏+连手柄→关, 仅触屏→开) 0=手动 */
     uint8_t  audio_disable;     /* 禁用音频 0/1 (V1.0.68) */
     uint8_t  audio_scheme;      /* 音频方案 0=解码 1=方波PWM 2=禁用 (V1.0.68) */
     uint8_t  touch_disable;     /* 禁用触摸屏 0/1 (V1.0.68) */
     uint8_t  tone_effect_sel;   /* 试听音效选择 0-5 (V1.0.68) */
+    uint8_t  feature_switch[4]; /* 主菜单功能开关 bitmap (V1.0.70, 小端 4 字节) */
+    uint8_t  app_installed[4];  /* 应用管理: 已安装模块位图 (V1.0.72, 小端 4 字节, 物理索引逐位) */
+    uint8_t  show_hidden;       /* 彩蛋隐藏游戏菜单显示 0/1 (V1.0.72, 随配置存 TF+NVS) */
+    /* V1.0.89: 菜单字重 0=粗 1=细 (v21) */
+    uint8_t  font_style;
+    /* V1.0.90: 壁纸自动软关机 + 触摸退出 (v23 追加到尾部, 保持 v21/v22 之前字段偏移不变) */
+    uint8_t  wallpaper_auto_shutdown; /* 壁纸自动软关机 0=关 1=开 (V1.0.90) */
+    uint8_t  wallpaper_shutdown_time; /* 自动软关机时间值 (V1.0.90) */
+    uint8_t  wallpaper_shutdown_unit; /* 自动软关机单位 0=分钟 1=小时 2=天 (V1.0.90) */
+    uint8_t  wallpaper_touch_exit; /* 壁纸触摸退出 0=禁止 1=允许 (V1.0.90) */
+    /* V1.0.9x: 暴龙机独立显示设置 (追加到尾部, 旧配置为 0 时走后置默认) */
+    uint8_t  vpet_display;  /* 0=点对点 1=放大 2=拉伸 */
+    uint8_t  vpet_aa;       /* 0=关, 1=EPX */
+    /* V1.0.9x: 主菜单图标显示顺序 (phys 数组 + 有效数) */
+    uint8_t  main_order[BBK_MODULE_COUNT];
+    uint8_t  main_order_count;
 } bbk_config_t;
 
 /* 确保 /sdcard/system 目录存在 (参考 favorites.c) */
@@ -4630,8 +6446,9 @@ static void engine_gray_set(int engine, uint8_t v) {
     s_engine_gray[engine] = v;
 }
 
-/* V1.0.60: 各引擎独立显示模式 (0=点对点, 1=全屏, 2=拉伸); BBK 单独一份 */
-static uint8_t s_engine_display[4] = { 1, 1, 1, 1 };
+/* V1.0.60: 各引擎独立显示模式 (0=点对点, 1=全屏, 2=拉伸); BBK 单独一份.
+ * 默认: GB/GBC/NES/arduboy 拉伸(2); BBK 全屏(1) 不拉伸但保留拉伸选项. */
+static uint8_t s_engine_display[4] = { 2, 2, 2, 2 };
 static uint8_t s_bbk_display = 1;
 
 static uint8_t engine_display_get(int engine) {
@@ -4644,6 +6461,15 @@ static void engine_display_set(int engine, uint8_t v) {
     if (v > 2) v = 2;
     s_engine_display[engine] = v;
 }
+
+/* V1.0.9x: 暴龙机独立显示设置 (不吃共享灰度/共享显示模式).
+ * display: 0=点对点, 1=放大(等比宽拉到最宽/置顶), 2=拉伸(强制全屏).
+ * aa:      0=关, 1=EPX 抗锯齿. */
+static uint8_t s_vpet_display = 0;
+static uint8_t s_vpet_aa       = 0;
+
+static uint8_t vpet_aa_get(void) { return s_vpet_aa; }
+static void    vpet_aa_set(uint8_t v) { s_vpet_aa = v ? 1 : 0; }
 
 /* 灰度开关显示名: 0=关(纯黑白), 1=开(灰度) */
 static const char *engine_gray_name(uint8_t mode) {
@@ -4670,6 +6496,14 @@ static void config_pack(bbk_config_t *c) {
     c->game_gray[2] = s_engine_gray[3];    /* arduboy */
     c->game_pic_opt = (uint8_t)g_menu.game_pic_opt;
     c->game_fullscreen = s_bbk_display;   /* BBK 显示模式 */
+    c->vpet_display = s_vpet_display;     /* 暴龙机独立显示模式 */
+    c->vpet_aa = s_vpet_aa;               /* 暴龙机独立抗锯齿 */
+    if (s_main_order_count > 0 && s_main_order_count <= (int)BBK_MODULE_COUNT) {
+        memcpy(c->main_order, s_main_order, (size_t)s_main_order_count);
+        c->main_order_count = (uint8_t)s_main_order_count;
+    } else {
+        c->main_order_count = 0;
+    }
     c->game_key_sound = g_menu.game_key_sound ? 1 : 0;
     c->game_display[0] = s_engine_display[0];   /* GB */
     c->game_display[1] = s_engine_display[1];   /* GBC */
@@ -4689,18 +6523,51 @@ static void config_pack(bbk_config_t *c) {
     c->wallpaper_program = g_menu.wallpaper_program;
     c->wallpaper_timeout_min = g_menu.wallpaper_timeout_min;
     c->wallpaper_bmp_fps = g_menu.wallpaper_bmp_fps;
+    c->wallpaper_auto_shutdown = g_menu.wallpaper_auto_shutdown ? 1 : 0;
+    c->wallpaper_shutdown_time = g_menu.wallpaper_shutdown_time;
+    c->wallpaper_shutdown_unit = g_menu.wallpaper_shutdown_unit;
+    c->wallpaper_touch_exit = g_menu.wallpaper_touch_exit ? 1 : 0;
     c->pomo_work_min = g_menu.pomo_work_min;
     c->pomo_rest_min = g_menu.pomo_rest_min;
     c->pomo_reminder = g_menu.pomo_reminder ? 1 : 0;
-    c->game_vkey = g_menu.game_virtual_keys ? 1 : 0;
+    c->game_vkey = (uint8_t)g_menu.game_virtual_keys;   /* V1.0.94: 0=关 1=开 2=自动 */
+    c->game_vkey_auto = g_menu.game_vkey_auto ? 1 : 0;
     c->audio_disable = g_menu.settings.audio_disable ? 1 : 0;
     c->audio_scheme = g_menu.settings.audio_scheme;
     c->touch_disable = g_menu.settings.touch_disable ? 1 : 0;
     c->tone_effect_sel = g_menu.settings.tone_effect_sel;
+    /* 主菜单功能开关 (小端 4 字节) */
+    c->feature_switch[0] = (g_menu.settings.feature_switch >> 0)  & 0xFF;
+    c->feature_switch[1] = (g_menu.settings.feature_switch >> 8)  & 0xFF;
+    c->feature_switch[2] = (g_menu.settings.feature_switch >> 16) & 0xFF;
+    c->feature_switch[3] = (g_menu.settings.feature_switch >> 24) & 0xFF;
+    /* 应用管理: 已安装模块位图 (小端 4 字节, 物理索引逐位) */
+    c->app_installed[0] = (g_menu.settings.app_installed >> 0)  & 0xFF;
+    c->app_installed[1] = (g_menu.settings.app_installed >> 8)  & 0xFF;
+    c->app_installed[2] = (g_menu.settings.app_installed >> 16) & 0xFF;
+    c->app_installed[3] = (g_menu.settings.app_installed >> 24) & 0xFF;
+    /* V1.0.72: 彩蛋隐藏游戏菜单显示状态 (随配置备份到 TF + NVS, 刷机后可恢复) */
+    c->show_hidden = g_menu.show_hidden_menus ? 1 : 0;
+    /* V1.0.89: 菜单字重持久化 */
+    c->font_style = (g_menu.settings.font_style > 1) ? 1 : g_menu.settings.font_style;
 }
+
+/* V1.0.72: 配置来源标记 (SD 晚挂载后补读 TF 配置用)
+ *  - true : 已成功从 TF 读到配置 (TF 优先原则已满足)
+ *  - false: 启动时来自 NVS/默认 (TF 不可用或无效), 等 SD 就绪后补读 */
+static bool s_cfg_from_tf = false;
+
+/* V1.0.72: 已加载配置是否携带隐藏游戏菜单状态 (v19+).
+ * 为 false (旧配置) 时, menu_init 回退读取旧 NVS key "show_hidden". */
+static bool s_cfg_has_hidden = false;
 
 /* 把结构体反序列化应用到 g_menu.settings (只改持久化字段) */
 static void config_unpack(const bbk_config_t *c) {
+    /* V1.0.90b: 兼容损坏的 v22 配置. 该版本把壁纸字段插在结构体中间,
+     * 导致 pomo_*. 之后的全部字段偏移错位 (开机误关触摸/应用位图损坏).
+     * 该版本字节不可信, 整体保持 menu_init 的出厂默认值 (不覆盖), 随后由
+     * menu_config_save 以 v23 干净重写. */
+    if (c->version == 22) return;
     g_menu.settings.volume = (c->volume > 10) ? 10 : c->volume;
     g_menu.settings.mute = c->mute ? true : false;
     g_menu.settings.low_power = c->low_power ? true : false;
@@ -4715,6 +6582,18 @@ static void config_unpack(const bbk_config_t *c) {
     s_engine_gray[3] = (c->game_gray[2]   > 1) ? 1 : c->game_gray[2];
     g_menu.game_gray_mode = s_engine_gray[0];  /* 当前激活引擎尚未确定, 先取 GB */
     g_menu.game_pic_opt = (c->game_pic_opt > 1) ? 1 : c->game_pic_opt;  /* 抗锯齿两态: 0=关, 1=EPX */
+    /* V1.0.9x: 暴龙机独立显示设置 (旧配置 version<25 无此字段, 走后置默认 0) */
+    if (c->version >= 25) {
+        s_vpet_display = (c->vpet_display > 2) ? 0 : c->vpet_display;
+        s_vpet_aa = (c->vpet_aa > 1) ? 0 : c->vpet_aa;
+    }
+    /* V1.0.9x: 主菜单图标顺序 (version>=26; 若数量与当前可见不符, 由 menu_main_ensure_order 重建) */
+    if (c->version >= 26 && c->main_order_count > 0 && c->main_order_count <= (int)BBK_MODULE_COUNT) {
+        memcpy(s_main_order, c->main_order, (size_t)c->main_order_count);
+        if (c->main_order_count < (int)BBK_MODULE_COUNT)
+            s_main_order[c->main_order_count] = 0xff;
+        s_main_order_count = c->main_order_count;
+    }
     /* V1.0.60: 各引擎独立显示模式; 旧配置 (version<5) 全部沿用原共享值 */
     s_bbk_display = (c->game_fullscreen > 2) ? 2 : c->game_fullscreen;
     for (int i = 0; i < 4; i++) {
@@ -4746,12 +6625,26 @@ static void config_unpack(const bbk_config_t *c) {
     g_menu.wallpaper_timeout_min = (c->version >= 10 && c->wallpaper_timeout_min >= 1
                                     && c->wallpaper_timeout_min <= 30) ? c->wallpaper_timeout_min : 3;
     g_menu.wallpaper_bmp_fps = (c->version >= 11 && c->wallpaper_bmp_fps <= 2) ? c->wallpaper_bmp_fps : 1;
+    /* V1.0.90: 壁纸自动软关机 + 触摸退出 (v22+; 旧配置默认 自动关机关闭 / 触摸不允许退出) */
+    g_menu.wallpaper_auto_shutdown = (c->version >= 22) ? (c->wallpaper_auto_shutdown != 0) : false;
+    g_menu.wallpaper_shutdown_time = (c->version >= 22 && c->wallpaper_shutdown_time >= 1
+                                      && c->wallpaper_shutdown_time <= 60) ? c->wallpaper_shutdown_time : 1;
+    g_menu.wallpaper_shutdown_unit = (c->version >= 22 && c->wallpaper_shutdown_unit <= 2)
+                                     ? c->wallpaper_shutdown_unit : 1; /* 默认 1 小时 */
+    g_menu.wallpaper_touch_exit = (c->version >= 22) ? (c->wallpaper_touch_exit != 0) : false;
     g_menu.pomo_work_min = (c->version >= 12 && c->pomo_work_min >= 1 && c->pomo_work_min <= 120)
                            ? c->pomo_work_min : 25;
     g_menu.pomo_rest_min = (c->version >= 12 && c->pomo_rest_min >= 1 && c->pomo_rest_min <= 60)
                            ? c->pomo_rest_min : 5;
     g_menu.pomo_reminder = (c->version >= 13) ? (c->pomo_reminder != 0) : true;
-    g_menu.game_virtual_keys = (c->version >= 14) ? (c->game_vkey != 0) : false;
+    /* V1.0.94: 虚拟按键三态 0关/1开/2自动, 默认自动 */
+    if (c->version >= 14) {
+        uint8_t vk = (uint8_t)c->game_vkey;
+        g_menu.game_virtual_keys = (vk > 2) ? 2 : vk;
+    } else {
+        g_menu.game_virtual_keys = 2;
+    }
+    g_menu.game_vkey_auto = (c->version >= 18) ? (c->game_vkey_auto != 0) : true; /* 默认自动 */
     g_menu.settings.audio_disable = (c->version >= 15) ? (c->audio_disable != 0) : false;
     /* V1.0.68: 音频方案 (0=解码输出 1=方波直驱 2=禁用); 禁用音频由此方案派生,
      * 忽略旧 v15 的独立 audio_disable 值 (已并入方案). */
@@ -4759,7 +6652,36 @@ static void config_unpack(const bbk_config_t *c) {
     g_menu.settings.touch_disable = (c->version >= 16) ? (c->touch_disable != 0) : false;
     g_menu.settings.tone_effect_sel = (c->version >= 16 && c->tone_effect_sel <= 5) ? c->tone_effect_sel : 0;
     g_menu.settings.audio_disable = (g_menu.settings.audio_scheme == 2);
+    /* V1.0.70: 主菜单功能开关 (v17+ 用持久化值; 旧配置默认全开) */
+    if (c->version >= 17) {
+        g_menu.settings.feature_switch = ((uint32_t)c->feature_switch[3] << 24)
+                                       | ((uint32_t)c->feature_switch[2] << 16)
+                                       | ((uint32_t)c->feature_switch[1] << 8)
+                                       | ((uint32_t)c->feature_switch[0]);
+        if (g_menu.settings.feature_switch == 0) g_menu.settings.feature_switch = MAINF_FEAT_ALL;
+    } else {
+        g_menu.settings.feature_switch = MAINF_FEAT_ALL;
+    }
+    /* V1.0.72: 应用管理已安装位图 (v20+ 用持久化值; 旧配置含默认强制项/内置引擎默认关闭)
+     * V1.0.95: 手柄/壁纸/存储改为可管理项, 旧配置迁移补默认点亮位 (原为强制项恒显示). */
+    if (c->version >= 20) {
+        g_menu.settings.app_installed = ((uint32_t)c->app_installed[3] << 24)
+                                      | ((uint32_t)c->app_installed[2] << 16)
+                                      | ((uint32_t)c->app_installed[1] << 8)
+                                      | ((uint32_t)c->app_installed[0]);
+    } else {
+        g_menu.settings.app_installed = 0;
+    }
+    /* V1.0.95: 迁移: 旧配置中手柄/壁纸/存储为强制项 (位图未管理), 升级后默认点亮 */
+    if (c->version < 24)
+        g_menu.settings.app_installed |= APP_DEFAULT_INSTALLED_MASK;
     g_menu.wallpaper_game_rot = 0;
+    /* V1.0.72: 彩蛋隐藏游戏菜单显示状态 (v19+ 随配置备份; 旧配置由 menu_init 回退读旧 NVS key) */
+    s_cfg_has_hidden = (c->version >= 19);
+    if (c->version >= 19) g_menu.show_hidden_menus = (c->show_hidden != 0);
+    /* V1.0.89: 菜单字重 (v21+; 旧配置默认粗体). 应用到字库. */
+    g_menu.settings.font_style = (c->version >= 21) ? ((c->font_style > 1) ? 1 : c->font_style) : 0;
+    font_zh_set_style(g_menu.settings.font_style != 0);
 }
 
 /* 校验结构体合法性 (magic/version 匹配, 字段范围合理) */
@@ -4827,6 +6749,7 @@ static int menu_config_load(void) {
             size_t cfg_min = sizeof(c) - 5;   /* 兼容 v3 (比当前结构少 5 字节) */
             if ((r >= cfg_min && r <= sizeof(c)) && config_valid(&c)) {
                 have = true; src = 1;
+                s_cfg_from_tf = true;   /* V1.0.72: 已从 TF 读到配置 */
             } else if (r < cfg_min || r > sizeof(c)) {
                 ESP_LOGW(TAG, "TF 配置文件大小不符 (%u/%u), 跳过", (unsigned)r, (unsigned)sizeof(c));
             } else {
@@ -4866,6 +6789,34 @@ static int menu_config_load(void) {
         ESP_LOGI(TAG, "无保存配置, 使用默认值");
     }
     return src;
+}
+
+/* V1.0.72: SD 晚挂载后的 TF 配置补读 (每帧主菜单空闲时调用, 一次性).
+ * 场景: 开机时 SD 挂载失败 -> 配置回退 NVS/默认; 之后 SD 补挂成功,
+ * 此时应优先补读 TF 配置并应用, 实现"开机优先读 TF, 读不到回退设备内".
+ * 仅当从未成功从 TF 读到配置、SD 已挂载、且处于主菜单空闲态时执行一次. */
+void menu_config_tf_reload_if_needed(void) {
+    if (s_cfg_from_tf) return;                       /* 已从 TF 加载, 无需补读 */
+    if (!sd_is_mounted()) return;                    /* SD 未就绪 */
+    if (g_menu.current_page != MENU_PAGE_MAIN) return; /* 仅主菜单空闲时 */
+    if (menu_modal_active(&g_menu)) return;
+
+    bbk_config_t c;
+    FILE *f = fopen(BBK_CFG_PATH, "rb");
+    if (!f) return;
+    size_t r = fread(&c, 1, sizeof(c), f);
+    fclose(f);
+    size_t cfg_min = sizeof(c) - 5;
+    if (!((r >= cfg_min && r <= sizeof(c)) && config_valid(&c))) return;
+
+    config_unpack(&c);
+    s_cfg_from_tf = true;
+    ESP_LOGI(TAG, "补读 TF 配置成功 (SD 晚挂载, v%u)", (unsigned)c.version);
+    menu_config_save();   /* 同步一份到 NVS (TF 已是该内容, 幂等) */
+    /* 菜单项数可能变化 (功能开关/隐藏游戏), 收敛选中项避免越界 */
+    if (g_menu.selected_index >= menu_main_count(&g_menu))
+        g_menu.selected_index = menu_main_count(&g_menu) - 1;
+    g_menu.needs_redraw = true;
 }
 
 /* 把当前 g_menu.settings.volume 同步到 audio_player.
@@ -5004,6 +6955,926 @@ static void open_volume_dialog(menu_state_t *state) {
     state->list_dialog_on_key = volume_dialog_on_key;
 }
 
+/* === 主菜单功能开关弹窗 (V1.0.70, Phase A 改由模块注册表 s_modules 驱动) ===
+ * 列出 in_feature_dialog=true 的模块 (物理顺序, 现为 词典/阅读/手柄/音乐/壁纸/番茄钟/仿真键鼠/存储),
+ * 每项右侧显示"开/关". 触摸选择/确认键/左右键均可切换;
+ * "返回"(最后一项) 或 BACK 关掉弹窗回到上级设置弹窗.
+ * 关闭某功能后对应主菜单图标立即隐藏; 下次开机由 menu_config 恢复该状态. */
+/* 弹窗第 idx 逻辑行对应的模块 (仅 in_feature_dialog 项, 按物理顺序; 越界返回 NULL) */
+static const bbk_module_t *feature_dlg_mod(int idx) {
+    int n = 0;
+    for (int i = 0; i < (int)BBK_MODULE_COUNT; i++)
+        if (s_modules[i].in_feature_dialog) {
+            if (n == idx) return &s_modules[i];
+            n++;
+        }
+    return NULL;
+}
+
+static int feature_switch_build(menu_state_t *state, char buf[][64], int max) {
+    int n = 0;
+    for (int i = 0; i < (int)BBK_MODULE_COUNT; i++) {
+        const bbk_module_t *m = &s_modules[i];
+        if (!m->in_feature_dialog) continue;
+        const char *label = m->dialog_label ? m->dialog_label : m->short_label;
+        bool on = (state->settings.feature_switch & m->switch_bit) != 0;
+        snprintf(buf[n++], 64, "%s: %s", label,
+                 on ? "\xe5\xbc\x80" : "\xe5\x85\xb3");   /* 开 / 关 */
+    }
+    if (n < max) snprintf(buf[n++], 64, "\xe8\xbf\x94\xe5\x9b\x9e");   /* 返回 */
+    return n;
+}
+/* 切换第 idx 个功能开关并持久化 */
+static void feature_switch_toggle(menu_state_t *state, int idx) {
+    const bbk_module_t *m = feature_dlg_mod(idx);
+    if (!m) return;
+    state->settings.feature_switch ^= m->switch_bit;
+    menu_config_save();
+    state->needs_redraw = true;
+}
+/* 选中某项 (触摸/确认): 切换功能; 选"返回"(逻辑行越界) 关闭回上级设置弹窗 */
+static void feature_switch_on_select(menu_state_t *state, int idx) {
+    if (feature_dlg_mod(idx)) {
+        feature_switch_toggle(state, idx);
+        /* 重建列表文本, 实时刷新"开/关" */
+        int cnt = feature_switch_build(state, state->list_dialog_items, 100);
+        state->list_dialog_count = cnt;
+        state->list_dialog_content_dirty = true;
+        state->needs_redraw = true;
+        return;
+    }
+    /* 返回: 关闭功能开关弹窗, 重开设置弹窗 (弹窗间返回保持原位置) */
+    state->list_dialog_active = false;
+    state->list_dialog_prev_active = false;
+    state->list_dialog_prev_selected = -1;
+    state->list_dialog_stack_top = 0;
+    open_settings_dialog(state);
+}
+/* 方向键: 左右键切换当前功能, 上下键移动选中 */
+static void feature_switch_on_key(menu_state_t *state, int idx, menu_action_t action) {
+    if (action == MENU_ACTION_LEFT || action == MENU_ACTION_RIGHT) {
+        if (feature_dlg_mod(idx)) {
+            feature_switch_toggle(state, idx);
+            int cnt = feature_switch_build(state, state->list_dialog_items, 100);
+            state->list_dialog_count = cnt;
+            state->list_dialog_content_dirty = true;
+            state->needs_redraw = true;
+        }
+        return;
+    }
+    /* 上下键: 在功能项与"返回"之间移动选中 */
+    if (action == MENU_ACTION_UP) {
+        if (state->list_dialog_selected > 0) state->list_dialog_selected--;
+        else state->list_dialog_selected = state->list_dialog_count - 1;
+    } else if (action == MENU_ACTION_DOWN) {
+        if (state->list_dialog_selected < state->list_dialog_count - 1) state->list_dialog_selected++;
+        else state->list_dialog_selected = 0;
+    } else {
+        return;
+    }
+    state->needs_redraw = true;
+}
+static void open_feature_switch_dialog(menu_state_t *state) {
+    state->list_dialog_return_page = MENU_PAGE_MAIN;
+    list_dialog_open(state, "\xe5\x8a\x9f\xe8\x83\xbd\xe5\xbc\x80\xe5\x85\xb3" /* 功能开关 */,
+                     0, feature_switch_on_select);
+    int cnt = feature_switch_build(state, state->list_dialog_items, 100);
+    state->list_dialog_count = cnt;
+    state->list_dialog_on_key = feature_switch_on_key;
+}
+
+/* === 字体设置弹窗 (V1.0.89): 粗体 / 细体 切换 ===
+ * 点选或按确认即切换并持久化; 左右键也可切换; "返回"关闭回设置弹窗. */
+static int font_style_build(menu_state_t *state, char buf[][64], int max) {
+    int n = 0;
+    snprintf(buf[n++], 64, "%s%s", "\xe7\xb2\x97\xe4\xbd\x93" /* 粗体 */,
+             state->settings.font_style == 0 ? " *" : "");
+    snprintf(buf[n++], 64, "%s%s", "\xe7\xbb\x86\xe4\xbd\x93" /* 细体 */,
+             state->settings.font_style != 0 ? " *" : "");
+    snprintf(buf[n++], 64, "\xe8\xbf\x94\xe5\x9b\x9e"); /* 返回 */
+    (void)max;
+    return n;
+}
+static void font_style_apply(menu_state_t *state, bool light) {
+    state->settings.font_style = light ? 1 : 0;
+    font_zh_set_style(light);
+    menu_config_save();
+    state->needs_redraw = true;
+}
+static void font_style_on_select(menu_state_t *state, int idx) {
+    if (idx >= 0 && idx <= 1) {
+        font_style_apply(state, idx == 1);
+        int cnt = font_style_build(state, state->list_dialog_items, 100);
+        state->list_dialog_count = cnt;
+        state->list_dialog_content_dirty = true;
+        state->needs_redraw = true;
+        return;
+    }
+    /* 返回: 关闭字体弹窗, 重开设置弹窗 */
+    state->list_dialog_active = false;
+    state->list_dialog_prev_active = false;
+    state->list_dialog_prev_selected = -1;
+    state->list_dialog_stack_top = 0;
+    open_settings_dialog(state);
+}
+static void font_style_on_key(menu_state_t *state, int idx, menu_action_t action) {
+    if (action == MENU_ACTION_LEFT || action == MENU_ACTION_RIGHT) {
+        if (idx >= 0 && idx <= 1) {
+            font_style_apply(state, idx == 1);
+            int cnt = font_style_build(state, state->list_dialog_items, 100);
+            state->list_dialog_count = cnt;
+            state->list_dialog_content_dirty = true;
+            state->needs_redraw = true;
+        }
+        return;
+    }
+    if (action == MENU_ACTION_UP) {
+        if (state->list_dialog_selected > 0) state->list_dialog_selected--;
+        else state->list_dialog_selected = state->list_dialog_count - 1;
+    } else if (action == MENU_ACTION_DOWN) {
+        if (state->list_dialog_selected < state->list_dialog_count - 1) state->list_dialog_selected++;
+        else state->list_dialog_selected = 0;
+    } else {
+        return;
+    }
+    state->needs_redraw = true;
+}
+static void open_font_style_dialog(menu_state_t *state) {
+    state->list_dialog_return_page = MENU_PAGE_MAIN;
+    list_dialog_open(state, "\xe5\xad\x97\xe4\xbd\x93" /* 字体 */, 0, font_style_on_select);
+    int cnt = font_style_build(state, state->list_dialog_items, 100);
+    state->list_dialog_count = cnt;
+    state->list_dialog_on_key = font_style_on_key;
+}
+
+/* === 应用管理:全屏商店页 (V1.3) ===
+ * 电子词典风格: 白底黑边 + 细描边高亮 + 细分隔线.
+ *  - V1.0.90: 外框上贴状态栏边界(24)、下拉到底(299); 左侧分类栏 64px, 四个分类 (48px 高)
+ *    在框内上下平均分布, 每行 = 顶部图标(24) + 下方标题 (距离够 22px 粗体 / 不够 16px);
+ *  - 右侧内容区 (x>=64) 网格 4 列 4 行展示当前分类下的可管理模块, 图标 48x48 + 名称;
+ *  - 点击图标 弹 200x100 详情抽屉: 左=图标+名称, 右=滑动开关(左右滑动切换 已安装/未安装).
+ * 返回(BACK/HOME) 关闭详情或回主菜单. 安装态持久化到 config (app_installed 位图). */
+#define APPMGR_CATBAR_W     64     /* 左侧分类栏宽度 */
+#define APPMGR_CAT_ROWS     4      /* 分类数: 引擎/游戏/工具/其他 */
+#define APPMGR_CAT_ROW_H    64     /* 分类行高 = 仅 64px 图标 (不显示名称, 平均分布) */
+#define APPMGR_CAT_Y0       24     /* 分类栏起始 y = 状态栏边界 (状态栏高 24) */
+#define APPMGR_ICON_SIZE    64     /* 右侧网格图标尺寸 (V1.0.92: 统一放大到 64px) */
+#define APPMGR_CAT_ICON_SZ  60     /* 分类栏图标尺寸 (占满 64px 栏, 各边留 2px 框内边距) */
+#define APPMGR_GRID_COLS    4      /* 右侧网格列数 (4 列) */
+#define APPMGR_GRID_ROWS    3      /* 右侧网格行数 (V1.0.91: 固定 4x3, 而非动态) */
+#define APPMGR_FRAME_R      5      /* 左/右外框圆角半径 (相接处为直角) */
+#define APPMGR_DETAIL_W     200    /* 详情抽屉宽 */
+#define APPMGR_DETAIL_H     150    /* 详情抽屉高 (V1.0.9x: 100→150 放大) */
+
+/* 分类侧栏图标改用应用管理专属四分类图标 cat_icons[] (见 draw_cat_icon_stretched),
+ * 顺序与 app_category_t 一致 (0引擎 1独立游戏 2工具 3其他), 不放主菜单.
+ * V1.0.9x 起不再复用主菜单图标. */
+
+/* 全屏商店页运行时状态 (页面内, 非持久化) */
+static int  s_app_cat = APP_CAT_ENGINE;     /* 当前分类 */
+static int  s_app_focus = 0;                /* 当前分类内焦点 (逻辑序号) */
+static bool s_app_detail = false;           /* 详情抽屉是否打开 */
+static int  s_app_detail_phys = -1;         /* 详情对应的物理模块索引 */
+/* V1.0.9x: 主菜单长按删除弹窗: 主菜单长按图标≥5s 弹「删除主菜单图标?」.
+ * 设置/应用管理等强制项(不可隐藏)忽略, 不弹窗. */
+static bool s_main_del_active = false;
+static int  s_main_del_phys   = -1;
+/* V1.0.9x: 删除后吞掉紧随其后的自动 CONFIRM, 防止触控穿透打开删除的图标 */
+static bool s_main_del_swallow = false;
+bool menu_main_reorder_active(void) { return s_reorder_active; }
+/* V1.0.74: 触摸点选刚移动过焦点时, 抑制紧随其后的自动 CONFIRM(不开详情).
+ * 对已选中图标再点一次才打开详情; 物理 确定 键不受此影响. */
+static bool s_app_tap_select = false;
+/* V1.0.9x: 管理弹窗(长按打开)的开关"草稿"值: 长按弹出时快照当前安装态,
+ * 确认(保存)才应用到 app_installed 并持久化; 返回(取消)则丢弃草稿还原. */
+static bool s_app_detail_draft = false;
+/* V1.0.9x: 网格双击记忆: 两次点击同一格且间隔 < APP_DBLTAP_MS 视为双击(打开). */
+static int32_t  s_app_last_tap_ms = INT32_MIN;   /* 最近一次单击时刻(ms) */
+static int      s_app_last_tap_idx = -1;         /* 最近一次单击的逻辑序号 */
+#define APP_DBLTAP_MS   350
+/* V1.0.9x: 打开某物理模块主页 (定义于本文件下方, 主菜单确认/应用管理双击共用) */
+static void menu_enter_module(menu_state_t *state, int phys, int main_idx);
+/* 应用管理: 分类统计/网格几何 (定义于本文件下方) */
+static int  app_cat_count(app_category_t cat);
+static int  app_cat_modcount(app_category_t cat);
+static int  app_grid_start_y(int cnt);
+static int  app_grid_step_y(void);
+
+/* V1.0.9x: 内容页上下滚动 (显示更多项): 已上卷行数 s_app_scroll + 拖动跟手像素偏移.
+ * 触控板拖动滚动逻辑在 main.c 主循环调用 app_manager_drag_* 处理. */
+static int  s_app_scroll = 0;         /* 已上卷的行数 (0..app_manager_max_scroll) */
+static bool s_app_drag_active = false;
+static int  s_app_drag_start_y = 0;
+static int  s_app_drag_moved = 0;
+static int  s_app_drag_scroll = 0;    /* 开始拖动时的行数 (拖动期间由它推算跟手位置) */
+static float s_app_view_px  = 0;      /* 当前内容滚动像素量 (网格整体上移量, 供渲染/命中测试共用) */
+static float s_app_view_tgt = 0;      /* 松手后要滑向的目标滚动像素量 (回弹动画) */
+static bool  s_app_settling = false;  /* 是否处于回弹滑动动画中 */
+
+/* 内容页可上卷的最大行数 (总行数 - 可见行数, 最小 0) */
+static int app_manager_max_scroll(void) {
+    int rows = (app_cat_count((app_category_t)s_app_cat) + APPMGR_GRID_COLS - 1)
+                / APPMGR_GRID_COLS;
+    int m = rows - APPMGR_GRID_ROWS;
+    return m < 0 ? 0 : m;
+}
+/* 切换分类 / 进入页面时强制卷回顶部, 并清空拖动与回弹动画残留:
+ * 若只清 s_app_scroll 而不置 s_app_view_px / s_app_view_tgt / s_app_settling,
+ * 上一分类回弹动画进行中被切走时 s_app_view_tgt 仍残留旧非零目标, 重新进入后
+ * app_current_view_px() 返回旧偏移, 导致新分类内容页整体上卷、看不到第一排. */
+static void app_manager_reset_scroll(void) {
+    s_app_scroll = 0;
+    s_app_view_px  = 0;
+    s_app_view_tgt = 0;
+    s_app_settling = false;
+    s_app_drag_active = false;
+}
+/* 把焦点项保持可见: 焦点所在行越过当前窗口上/下沿时, 卷动窗口跟随 (供按键导航) */
+static void app_manager_ensure_focus_visible(void) {
+    int cnt = app_cat_count((app_category_t)s_app_cat);
+    if (cnt <= 0) return;
+    int row = s_app_focus / APPMGR_GRID_COLS;
+    int max = app_manager_max_scroll();
+    if (row < s_app_scroll) s_app_scroll = row;
+    else if (row >= s_app_scroll + APPMGR_GRID_ROWS)
+        s_app_scroll = row - (APPMGR_GRID_ROWS - 1);
+    if (s_app_scroll < 0) s_app_scroll = 0;
+    if (s_app_scroll > max) s_app_scroll = max;
+}
+
+/* 当前内容网格的实际滚动像素量 (唯一真源):
+ *  - 拖动/回弹中: 用 s_app_view_px (手指跟手 / 缓动动画)
+ *  - 静止(含按键翻卷): 直接 = 已滚动行数 * 行距
+ * 渲染与命中测试都走它, 保证"显示在第几排"与"点到第几排"绝对一致. */
+static float app_current_view_px(void) {
+    if (s_app_drag_active || s_app_settling)
+        return s_app_view_px;
+    return (float)(s_app_scroll * app_grid_step_y());
+}
+
+/* 回弹缓动一步 (指数衰减): 不要瞬间吸附, 稍微慢一点回落 */
+static void app_manager_settle_step(void) {
+    if (!s_app_settling) return;
+    float diff = s_app_view_tgt - s_app_view_px;
+    if (diff > -0.6f && diff < 0.6f) {   /* 到位: 精确吸附 */
+        s_app_view_px = s_app_view_tgt;
+        s_app_settling = false;
+        return;
+    }
+    s_app_view_px += diff * 0.12f;       /* V1.0.9x: 指数缓动, 回落更慢更顺滑 */
+}
+
+/* V1.0.9x fix: 回弹动画必须逐帧推进才能真正落到位.
+ * 原实现只推进一次 (见 drag_end), s_app_settling 永远不置 false,
+ * app_current_view_px() 一直停在未到位的位置, 导致"点多排实际选下面一排".
+ * 主循环每帧调用本函数推进动画, 未到位时请求重绘; 静止时零开销. */
+void app_manager_tick(menu_state_t *state) {
+    if (!s_app_settling) return;
+    app_manager_settle_step();
+    if (s_app_settling) state->needs_redraw = true;
+}
+
+/* V1.0.92: 分类侧栏仅显示图标 (不显示名称), 原分类中文标签数组 s_app_cat_labels 已删除.
+ * V1.0.9x: 分类图标用应用管理专属 cat_icons[]; 分类定义见 app_category_t. */
+
+/* 是否应把某物理项放进应用管理分类. V1.0.9x: 步步高(词典游戏, 强制项)也放进「引擎」分类 */
+static bool app_cat_module_ok(int i, app_category_t cat) {
+    if (s_modules[i].hidden) return false;   /* V1.0.9x: 临时屏蔽模块不进应用管理 */
+    if (s_modules[i].category != cat) return false;
+    if (s_modules[i].kind != BBK_MOD_MANDATORY) return true;
+    return i == 0;   /* 步步高适用于主菜单强制显示, 但用户也要在应用管理引擎分类里看到并打开 */
+}
+
+/* 某分类下的可管理模块物理索引列表 (kind != MANDATORY, 按物理顺序; 步步高除外) */
+static int app_cat_phys(app_category_t cat, int idx) {
+    int n = 0;
+    for (int i = 0; i < (int)BBK_MODULE_COUNT; i++)
+        if (app_cat_module_ok(i, cat)) {
+            if (n == idx) return i;
+            n++;
+        }
+    return -1;
+}
+/* 某分类下可管理模块数量 (不含迷你应用) */
+static int app_cat_modcount(app_category_t cat) {
+    int n = 0;
+    for (int i = 0; i < (int)BBK_MODULE_COUNT; i++)
+        if (app_cat_module_ok(i, cat))
+            n++;
+    return n;
+}
+/* 某分类下的迷你应用数量 (已移除迷你应用, 恒为 0) */
+static int app_cat_minicount(app_category_t cat) {
+    (void)cat;
+    return 0;
+}
+/* 应用管理右网格总项数 = 模块 (+ 迷你应用, 已移除) */
+static int app_cat_count(app_category_t cat) {
+    return app_cat_modcount(cat) + app_cat_minicount(cat);
+}
+/* 网格第 idx 项是否为迷你应用 (已移除迷你应用, 恒为 false) */
+static bool app_item_is_mini(app_category_t cat, int idx) {
+    (void)cat; (void)idx;
+    return false;
+}
+/* 网格第 idx 项是迷你应用时, 其全局索引 (已移除迷你应用, 恒返回 -1) */
+static int app_item_mini_gi(app_category_t cat, int idx) {
+    (void)cat; (void)idx;
+    return -1;
+}
+
+/* V1.0.74: 左侧分类栏第 r 行的起始 y (4 行在可用区域内上下居中, 渲染/触摸共用) */
+static int app_cat_row_y(int r) {
+    int band = SCREEN_H - APPMGR_CAT_Y0;
+    int off = (band - APPMGR_CAT_ROW_H * APPMGR_CAT_ROWS) / 2;
+    if (off < 0) off = 0;
+    return APPMGR_CAT_Y0 + off + r * APPMGR_CAT_ROW_H;
+}
+/* V1.0.91: 右侧网格: 内嵌 4 行不越界, 固定整屏 4 行 */
+static int app_grid_step_y(void) {
+    return (SCREEN_H - APPMGR_CAT_Y0) / APPMGR_GRID_ROWS;
+}
+/* V1.0.91: 右侧网格起始 y (固定 4x3 格子, 应用少也从第一个格子开始排, 不居中) */
+static int app_grid_start_y(int cnt) {
+    (void)cnt;
+    return APPMGR_CAT_Y0 + 5;                        /* V1.0.93: 顶部留 5px 边距 (整体上移 3px) */
+}
+
+/* V1.0.92: 迷你应用图标绘制已随迷你应用一并移除, 不再需要 draw_mini_icon_scaled(). */
+
+/* V1.0.9x: 管理弹窗 (200x150, 长按 3 秒打开) 几何与命中 -----------------------------------
+ * 用户需求(简化): 长按应用弹「是否添加到菜单」提醒, 下方左右各一框选 取消/确定.
+ *   - 上部: 居中提醒文字「是否添加到菜单」
+ *   - 底部: 取消(左) / 确定(右) 两枚方框按钮 (放大 1.5x 框 + 2x 字体)
+ *   - 确定 = 添加到主菜单(改 app_installed)并关闭; 取消/窗外 = 不添加并关闭; 窗内空白=无操作. */
+#define APP_POP_BTN_Y      112  /* 底部按钮顶 y */
+#define APP_POP_BTN_H      33   /* V1.0.9x: 按钮放大 */
+#define APP_POP_BTN_W      90   /* V1.0.9x: 按钮放大 */
+#define APP_POP_BTN_LEFT   50   /* 取消按钮中心 x */
+#define APP_POP_BTN_RIGHT  150  /* 确定按钮中心 x */
+#define APP_POP_MSG_Y      48   /* 居中提醒文字顶 y */
+#define APP_POP_MSG_BTN_GAP 28  /* 提醒文字与按钮之间的最小间距 */
+
+/* 命中: 底部按钮; 返回 ret<0=未命中, 0=取消, 1=确定 */
+static int app_pop_hit_button(int x, int y) {
+    int dx = (SCREEN_W - APPMGR_DETAIL_W) / 2;
+    int dy = (SCREEN_H - APPMGR_DETAIL_H) / 2;
+    int y0 = dy + APP_POP_BTN_Y, y1 = dy + APP_POP_BTN_Y + APP_POP_BTN_H - 1;
+    if (y < y0 || y > y1) return -1;
+    if (abs(x - (dx + APP_POP_BTN_LEFT)) <= APP_POP_BTN_W / 2) return 0;   /* 取消 */
+    if (abs(x - (dx + APP_POP_BTN_RIGHT)) <= APP_POP_BTN_W / 2) return 1;  /* 确定 */
+    return -1;
+}
+
+/* 打开当前焦点项: 可管理模块=进入其主页 (迷你应用已移除) */
+static void app_manager_open_focus(menu_state_t *state) {
+    int phys = app_cat_phys((app_category_t)s_app_cat, s_app_focus);
+    if (phys >= 0) {
+        /* 用户需求: 从应用管理打开任意模块即自动"点亮/安装"到主菜单,
+         * 方便在主菜单直接确认. 强制项/占位项不在此列 (无需安装). */
+        const bbk_module_t *mod = bbk_module(phys);
+        if (mod && mod->kind != BBK_MOD_MANDATORY && !mod->dev_pending &&
+            !app_installed(state, phys)) {
+            app_set_installed(state, phys, true);
+            menu_config_save();
+            ESP_LOGI(TAG, "应用管理: 自动点亮模块 [%d] %s 到主菜单", phys, mod->id);
+        }
+        menu_enter_module(state, phys, -1);   /* 进入模块主页/主页弹窗 */
+        state->needs_redraw = true;
+    }
+}
+
+/* 管理弹窗触摸: 确定=添加到主菜单并关闭; 取消/窗外=关闭; 窗内空白=无操作 */
+static bool app_manager_handle_detail_touch(menu_state_t *state, int x, int y) {
+    /* V1.0.9x: 触摸点过弹窗(确认/取消/窗外/空白)后, main.c 会紧随再调一次
+     * menu_handle_action(CONFIRM)。若不抑制, 弹窗刚关闭就会落到"打开后方程序"。
+     * 置 s_app_tap_select 由 app_manager_handle_action 吞掉这次多余的 CONFIRM。 */
+    s_app_tap_select = true;
+    int dx = (SCREEN_W - APPMGR_DETAIL_W) / 2;
+    int dy = (SCREEN_H - APPMGR_DETAIL_H) / 2;
+    if (x < dx || x >= dx + APPMGR_DETAIL_W || y < dy || y >= dy + APPMGR_DETAIL_H) {
+        /* 窗外 = 取消(不添加) */
+        s_app_detail = false;
+        s_app_detail_phys = -1;
+        s_app_detail_draft = false;
+        state->needs_redraw = true;
+        return true;
+    }
+    int btn = app_pop_hit_button(x, y);
+    if (btn == 1) {
+        /* 确定: 未添加→添加; 已添加→删除 */
+        if (s_app_detail_phys >= 0 && s_app_detail_phys < (int)BBK_MODULE_COUNT &&
+            s_modules[s_app_detail_phys].kind != BBK_MOD_MANDATORY) {
+            app_set_installed(state, s_app_detail_phys, !s_app_detail_draft);
+            menu_config_save();
+        }
+        s_app_detail = false;
+        s_app_detail_phys = -1;
+        s_app_detail_draft = false;
+        state->needs_redraw = true;
+        return true;
+    }
+    if (btn == 0) {
+        /* 取消: 不添加 */
+        s_app_detail = false;
+        s_app_detail_phys = -1;
+        s_app_detail_draft = false;
+        state->needs_redraw = true;
+        return true;
+    }
+    /* 窗内空白: 无操作 */
+    state->needs_redraw = true;
+    return true;
+}
+
+/* 全屏商店页按键/触摸逻辑统一入口 (current_page==APP_MANAGER 时调用) */
+void app_manager_handle_action(menu_state_t *state, menu_action_t action) {
+    if (s_app_detail) {
+        /* V1.0.9x: 触摸刚点过弹窗(s_app_tap_select)时, 吞掉随后多余的 CONFIRM,
+         * 防止弹窗关闭瞬间误打开弹窗后方的模块/程序. */
+        if (s_app_tap_select) {
+            s_app_tap_select = false;
+            state->needs_redraw = true;
+            return;
+        }
+        /* 管理弹窗: CONFIRM=确定(添加到主菜单), BACK/HOME=取消 */
+        if (action == MENU_ACTION_CONFIRM) {
+            if (s_app_detail_phys >= 0 && s_app_detail_phys < (int)BBK_MODULE_COUNT &&
+                s_modules[s_app_detail_phys].kind != BBK_MOD_MANDATORY) {
+                app_set_installed(state, s_app_detail_phys, !s_app_detail_draft);
+                menu_config_save();
+            }
+            s_app_detail = false;
+            s_app_detail_phys = -1;
+            s_app_detail_draft = false;
+            state->needs_redraw = true;
+            return;
+        }
+        if (action == MENU_ACTION_BACK || action == MENU_ACTION_HOME) {
+            s_app_detail = false;
+            s_app_detail_phys = -1;
+            s_app_detail_draft = false;
+            s_app_tap_select = false;
+            state->needs_redraw = true;
+            return;
+        }
+        return;
+    }
+    switch (action) {
+    case MENU_ACTION_CONFIRM: {
+        /* V1.0.9x: 触摸单击=仅选中(由 handle_touch 置 s_app_tap_select 抑制本循环),
+         * 双击/物理确认 才打开. */
+        if (s_app_tap_select) { s_app_tap_select = false; state->needs_redraw = true; break; }
+        app_manager_open_focus(state);
+        break;
+    }
+    case MENU_ACTION_UP: {
+        int cnt = app_cat_count((app_category_t)s_app_cat);
+        s_app_focus = (s_app_focus - 1 + cnt) % cnt;
+        s_app_tap_select = false;
+        app_manager_ensure_focus_visible();
+        state->needs_redraw = true;
+        break;
+    }
+    case MENU_ACTION_DOWN: {
+        int cnt = app_cat_count((app_category_t)s_app_cat);
+        s_app_focus = (s_app_focus + 1) % cnt;
+        s_app_tap_select = false;
+        app_manager_ensure_focus_visible();
+        state->needs_redraw = true;
+        break;
+    }
+    case MENU_ACTION_LEFT:
+        s_app_tap_select = false;
+        if (s_app_focus == 0) {
+            s_app_cat = (s_app_cat - 1 + APPMGR_CAT_ROWS) % APPMGR_CAT_ROWS;
+            s_app_focus = 0;
+            app_manager_reset_scroll();
+            s_app_last_tap_idx = -1;   /* 切分类清双击记忆 */
+        } else {
+            s_app_focus--;
+        }
+        app_manager_ensure_focus_visible();
+        state->needs_redraw = true;
+        break;
+    case MENU_ACTION_RIGHT:
+        s_app_tap_select = false;
+        if (s_app_focus == APPMGR_GRID_COLS - 1) {
+            s_app_cat = (s_app_cat + 1) % APPMGR_CAT_ROWS;
+            s_app_focus = 0;
+            app_manager_reset_scroll();
+            s_app_last_tap_idx = -1;   /* 切分类清双击记忆 */
+        } else {
+            s_app_focus++;
+        }
+        app_manager_ensure_focus_visible();
+        state->needs_redraw = true;
+        break;
+    case MENU_ACTION_BACK:
+    case MENU_ACTION_HOME:
+        s_app_tap_select = false;
+        state->current_page = MENU_PAGE_MAIN;
+        menu_main_restore_position(state);
+        state->needs_redraw = true;
+        break;
+    default:
+        break;
+    }
+}
+
+/* 全屏商店页触摸命中 (current_page==APP_MANAGER 时调用; 返回 true=消费)
+ * V1.0.9x: 单击=仅选中(移动焦点/高亮, 不打开不弹窗);
+ *           双击同一项(350ms内)=打开(迷你应用启动 / 模块进主页);
+ *           长按(另行投递 menu_touch_long_press)=弹管理弹窗. */
+bool app_manager_handle_touch(menu_state_t *state, int x, int y) {
+    if (s_app_detail)
+        return app_manager_handle_detail_touch(state, x, y);
+
+    /* 左侧分类栏 (x<64): 点选分类 */
+    if (x < APPMGR_CATBAR_W) {
+        int base = app_cat_row_y(0);
+        int row = (y - base) / APPMGR_CAT_ROW_H;
+        if (row >= 0 && row < APPMGR_CAT_ROWS) {
+            s_app_cat = row;
+            s_app_focus = 0;
+            s_app_tap_select = true;   /* 切分类算"选择", 抑制本次自动 CONFIRM */
+            app_manager_reset_scroll();  /* 切分类内容页回到顶部并清动画残留 */
+            s_app_last_tap_idx = -1;   /* 清双击记忆 */
+            state->needs_redraw = true;
+            return true;
+        }
+        return true;
+    }
+    /* 右侧网格 */
+    int grid_x0 = APPMGR_CATBAR_W;
+    if (x >= grid_x0) {
+        int cnt = app_cat_count((app_category_t)s_app_cat);
+        if (cnt > 0) {
+            int cell_w = (SCREEN_W - grid_x0 - 8) / APPMGR_GRID_COLS;
+            int gsx = grid_x0 + 4;
+            int gsy = app_grid_start_y(cnt) - (int)app_current_view_px();
+            int step_y = app_grid_step_y();
+            int col = (x - gsx) / cell_w;
+            int row = (y - gsy) / step_y;   /* 绝对行号 (gsy 已含滚动), 勿再加 s_app_scroll */
+            if (col >= 0 && col < APPMGR_GRID_COLS &&
+                row >= s_app_scroll && row < s_app_scroll + APPMGR_GRID_ROWS) {
+                int idx = row * APPMGR_GRID_COLS + col;
+                if (idx >= 0 && idx < cnt) {
+                    s_app_focus = idx;                 /* 单击: 仅选中 */
+                    if (idx == s_app_last_tap_idx) {
+                        /* V1.0.9x: 第二次点击同一个图标, 无论间隔多长都直接打开 */
+                        app_manager_open_focus(state);
+                        /* 吞掉紧随其后的自动 CONFIRM: 弹窗型模块(如键鼠布局)刚打开
+                         * 列表弹窗, main.c 会再补一条 CONFIRM 命中弹窗立即选中默认项,
+                         * 必须吞掉才能让弹窗停留显示 (与主菜单进入一致). */
+                        s_app_swallow_next_confirm = true;
+                        s_app_last_tap_idx = -1;       /* 打开后清记忆, 避免三连点再开 */
+                        s_app_last_tap_ms = INT32_MIN;
+                    } else {
+                        s_app_last_tap_idx = idx;      /* 记录本次选中, 供下次同图标判定 */
+                        s_app_last_tap_ms = 0;
+                    }
+                    s_app_tap_select = true;           /* 抑制紧随的自动 CONFIRM */
+                    state->needs_redraw = true;
+                    return true;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/* ==== 内容页上下拖动 (V1.0.9x): main.c 主循环每帧调用, 供触摸屏跟手滚动 ============
+ * 拖动滚动的是"行窗口" (s_app_scroll), 拖动期间用 s_app_drag_offset 做像素跟手偏移,
+ * 松手时把滑动行差换算回 s_app_scroll, 不回弹吸附到整行. */
+
+/* 拖动开始: 记录起点, 并按下即把焦点移到手指所在行 (列保持) */
+void app_manager_drag_begin(int tx, int ty) {
+    /* V1.0.9x fix: 按下点落在左侧分类栏 (x<APPMGR_CATBAR_W) 时不启动本栏拖动,
+     * 避免点选分类图标时误把同 y 行的内容页项选中并后续回跳第一项. */
+    s_app_drag_active = false;
+    s_app_settling = false;
+    if (tx < APPMGR_CATBAR_W) return;
+    s_app_drag_active = true;
+    s_app_drag_start_y = ty;
+    s_app_drag_moved = 0;
+    s_app_drag_scroll = s_app_scroll;
+    s_app_view_px = (float)(s_app_scroll * app_grid_step_y());
+    int cnt = app_cat_count((app_category_t)s_app_cat);
+    int gsy = app_grid_start_y(cnt) - (int)app_current_view_px();
+    int row = (ty - gsy) / app_grid_step_y();   /* 绝对行号, 勿再加 s_app_scroll */
+    if (row >= s_app_scroll && row < s_app_scroll + APPMGR_GRID_ROWS) {
+        int idx = row * APPMGR_GRID_COLS + (s_app_focus % APPMGR_GRID_COLS);
+        if (idx >= 0 && idx < cnt) s_app_focus = idx;
+    }
+    s_app_tap_select = false;
+}
+/* 拖动中实时选中手指所在的图标 (不打开, 仅切换高亮/焦点).
+ * 用与渲染/命中完全一致的 app_current_view_px() 定位, 保证手指指到谁就高亮谁. */
+static void app_manager_focus_at(int tx, int ty) {
+    int cnt = app_cat_count((app_category_t)s_app_cat);
+    if (cnt <= 0 || s_app_detail) return;
+    if (tx < APPMGR_CATBAR_W) return;                       /* 左侧分类栏不选中 */
+    int cell_w = (SCREEN_W - APPMGR_CATBAR_W - 8) / APPMGR_GRID_COLS;
+    int gsy = app_grid_start_y(cnt) - (int)app_current_view_px();
+    int col = (tx - (APPMGR_CATBAR_W + 4)) / cell_w;
+    int row = (ty - gsy) / app_grid_step_y();               /* 绝对行号 */
+    if (col < 0 || col >= APPMGR_GRID_COLS) return;
+    if (row < s_app_scroll || row >= s_app_scroll + APPMGR_GRID_ROWS) return;
+    int idx = row * APPMGR_GRID_COLS + col;
+    if (idx < 0 || idx >= cnt) return;
+    if (idx != s_app_focus) s_app_focus = idx;             /* 仅切换选中, 不打开 */
+}
+/* 拖动更新: 跟手位移 (沿滚动累计成像素, 分段钳制在可滚范围内), 并实时选中手指下的图标 */
+void app_manager_drag_update(int tx, int ty) {
+    if (!s_app_drag_active) return;
+    int step = app_grid_step_y();
+    int max_px = app_manager_max_scroll() * step;
+    int offset = ty - s_app_drag_start_y;
+    float v = (float)(s_app_drag_scroll * step) - offset;   /* 手指下拖(offset>0)=内容下移=卷回上排 */
+    if (v < 0) v = 0;
+    if (v > max_px) v = max_px;
+    s_app_view_px = v;
+    int m = offset < 0 ? -offset : offset;
+    if (m > s_app_drag_moved) s_app_drag_moved = m;
+    app_manager_focus_at(tx, ty);                            /* V1.0.9x: 拖动选中手指下图标 */
+}
+/* 拖动结束: 松手, 吸附到最近整行并进入回弹动画 (慢速回落). 返回 true 表示真实拖动, 应抑制 CONFIRM */
+bool app_manager_drag_end(void) {
+    if (!s_app_drag_active) return false;
+    s_app_drag_active = false;
+    bool moved = (s_app_drag_moved >= 12);
+    if (!moved) {
+        s_app_view_px = (float)(s_app_scroll * app_grid_step_y());   /* 点按: 回原位 */
+        return false;
+    }
+    int step = app_grid_step_y();
+    int cur = (int)llroundf(s_app_view_px / (float)step);   /* 吸附到最近行 */
+    /* 距离不足半格但确实拖动过: 按拖动方向至少移动一行, 避免松手"返回原位" */
+    if (cur == s_app_scroll) {
+        if (s_app_view_px > (float)s_app_scroll * step) cur = s_app_scroll + 1;
+        else                                            cur = s_app_scroll - 1;
+    }
+    int max = app_manager_max_scroll();
+    if (cur < 0) cur = 0;
+    if (cur > max) cur = max;
+    s_app_scroll = cur;
+    s_app_view_tgt = (float)(cur * step);
+    s_app_settling = true;
+    app_manager_settle_step();            /* 推进首帧, 避免原地停留 */
+    app_manager_ensure_focus_visible();
+    return true;
+}
+/* 当前是否有内容页拖动在进行 (供 main.c 判活) */
+bool app_manager_drag_is_active(void) {
+    return s_app_drag_active;
+}
+
+/* 电子词典平直面板: 白底填充 + 2px 直角黑描边 (V1.0.75: 全局统一直角/2px 边框,
+ * 供详情抽屉/开关/各类弹窗复用) */
+static void app_panel(st7305_handle_t *lcd, int x0, int y0, int x1, int y1) {
+    fill_rect(lcd, x0, y0, x1, y1, ST7305_COLOR_WHITE);
+    for (int k = 0; k < 2; k++) {
+        for (int dx = x0 + k; dx <= x1 - k; dx++) {
+            st7305_draw_pixel(lcd, dx, y0 + k, ST7305_COLOR_BLACK);
+            st7305_draw_pixel(lcd, dx, y1 - k, ST7305_COLOR_BLACK);
+        }
+        for (int dy = y0 + k; dy <= y1 - k; dy++) {
+            st7305_draw_pixel(lcd, x0 + k, dy, ST7305_COLOR_BLACK);
+            st7305_draw_pixel(lcd, x1 - k, dy, ST7305_COLOR_BLACK);
+        }
+    }
+}
+
+/* 圆形填充 (开关滑块). 用 fill_rect 近似: 逐行按圆宽填充 */
+static void app_fill_circle(st7305_handle_t *lcd, int cx, int cy, int radius, st7305_color_t c) {
+    for (int dy = -radius; dy <= radius; dy++) {
+        int d = (int)sqrtf((float)(radius * radius - dy * dy));
+        fill_rect(lcd, cx - d, cy + dy, cx + d, cy + dy, c);
+    }
+}
+
+/* V1.0.90: 16px 点阵宋体绘制 UTF-8 中文串 (分类标题 22px 空间不足时回退) */
+static void draw_zh16_text_color(st7305_handle_t *lcd, int x, int y, const char *str, st7305_color_t color);
+static void draw_zh16_text(st7305_handle_t *lcd, int x, int y, const char *str) {
+    draw_zh16_text_color(lcd, x, y, str, ST7305_COLOR_BLACK);
+}
+
+/* V1.0.91: 16px 中文文本, 指定前景色 (用于应用管理选中项 黑底白字 名称) */
+static void draw_zh16_text_color(st7305_handle_t *lcd, int x, int y, const char *str, st7305_color_t color) {
+    int cx = x;
+    while (*str) {
+        uint8_t b = (uint8_t)*str;
+        if (b < 0x80) {                 /* ASCII: 用 8x16 标准点阵 (V1.0.93, 替代原 FONT8X12 横向 2x 放大的粗大字形) */
+            int idx = (b >= 0x20 && b <= 0x7E) ? (b - 0x20) : ('?' - 0x20);
+            const uint8_t *abmp = font8x16_zh[idx];
+            for (int row = 0; row < ZH16_FONT_H; row++)
+                for (int cc = 0; cc < 8; cc++)
+                    if (abmp[row] & (1 << (7 - cc)))
+                        st7305_draw_pixel(lcd, cx + cc, y + row, color);
+            cx += 8; str++; continue;
+        }
+        if ((b & 0xF0) == 0xE0) {
+            int idx = font_zh16_find_utf8(str);
+            const uint8_t *bmp = (idx >= 0) ? font_zh16_get_bitmap_by_index(idx) : NULL;
+            if (bmp) {
+                for (int row = 0; row < ZH16_FONT_H; row++) {
+                    for (int cc = 0; cc < ZH16_FONT_W; cc++) {
+                        int bi = row * (ZH16_FONT_BYTES_PER_CHAR / ZH16_FONT_H) + (cc / 8);
+                        if (bmp[bi] & (0x80 >> (cc & 7)))
+                            st7305_draw_pixel(lcd, cx + cc, y + row, color);
+                    }
+                }
+            }
+            cx += ZH16_FONT_W;
+            str += 3;
+        } else {
+            str++;
+        }
+    }
+}
+
+/* 16px 文本宽度 (V1.0.93: ASCII 各 8px, 中文 16px, 与 draw_zh16_text 对齐) */
+static int zh16_text_width(const char *str) {
+    int w = 0;
+    while (str && *str) {
+        uint8_t b = (uint8_t)*str;
+        if ((b & 0xF0) == 0xE0) str += 3;
+        else str++;
+        w += (b < 0x80) ? 8 : 16;
+    }
+    return w;
+}
+
+/* V1.0.9x: 16px 字体的 2x 放大绘制 (每个字形像素画成 2x2 块), 用于管理弹窗底部按钮.
+ * 2 个汉字的放大宽度 = 64px, 可放进 90px 宽的按钮. */
+static int zh16_text_width_s2(const char *str) { return zh16_text_width(str) * 2; }
+static void draw_zh16_text_s2_color(st7305_handle_t *lcd, int x, int y, const char *str, st7305_color_t color) {
+    int cx = x;
+    while (*str) {
+        uint8_t b = (uint8_t)*str;
+        int gw = 0;
+        const uint8_t *abmp = NULL;
+        if (b < 0x80) {
+            int idx = (b >= 0x20 && b <= 0x7E) ? (b - 0x20) : ('?' - 0x20);
+            abmp = font8x16_zh[idx];
+            gw = 8;
+        } else if ((b & 0xF0) == 0xE0) {
+            int idx = font_zh16_find_utf8(str);
+            abmp = (idx >= 0) ? font_zh16_get_bitmap_by_index(idx) : NULL;
+            gw = 16;
+            str += 3;
+        } else {
+            str++;
+            continue;
+        }
+        if (abmp) {
+            for (int row = 0; row < ZH16_FONT_H; row++)
+                for (int cc = 0; cc < gw; cc++) {
+                    int bi = row * (ZH16_FONT_BYTES_PER_CHAR / ZH16_FONT_H) + (cc / 8);
+                    if (!(abmp[bi] & (0x80 >> (cc & 7)))) continue;
+                    for (int dy = 0; dy < 2; dy++)
+                        for (int dx = 0; dx < 2; dx++)
+                            st7305_draw_pixel(lcd, cx + cc * 2 + dx, y + row * 2 + dy, color);
+                }
+        }
+        cx += gw * 2;
+    }
+}
+static void draw_zh16_text_s2(st7305_handle_t *lcd, int x, int y, const char *str) {
+    draw_zh16_text_s2_color(lcd, x, y, str, ST7305_COLOR_BLACK);
+}
+
+/* 填充圆角矩形 (半径 r, 用 4 个圆角 + 横竖两条矩形拼接) */
+static void app_fill_round_rect(st7305_handle_t *lcd, int x0, int y0, int x1, int y1,
+                                int r, st7305_color_t c) {
+    if (r < 0) r = 0;
+    fill_rect(lcd, x0 + r, y0, x1 - r, y1, c);
+    fill_rect(lcd, x0, y0 + r, x1, y1 - r, c);
+    app_fill_circle(lcd, x0 + r, y0 + r, r, c);
+    app_fill_circle(lcd, x1 - r, y0 + r, r, c);
+    app_fill_circle(lcd, x0 + r, y1 - r, r, c);
+    app_fill_circle(lcd, x1 - r, y1 - r, r, c);
+}
+
+/* 管理弹窗底部按钮: 直角描边框 (放大 1.5x) + 居中 2x 字体文字 */
+static void app_draw_pop_button(st7305_handle_t *lcd, int cx, int cy, const char *text) {
+    int x0 = cx - APP_POP_BTN_W / 2, x1 = cx + APP_POP_BTN_W / 2 - 1;
+    int y0 = cy,                          y1 = cy + APP_POP_BTN_H - 1;
+    app_panel(lcd, x0, y0, x1, y1);
+    int tw = zh16_text_width_s2(text);
+    draw_zh16_text_s2(lcd, cx - tw / 2, cy + (APP_POP_BTN_H - ZH16_FONT_H * 2) / 2, text);
+}
+
+/* 全屏应用商店页渲染 (电子词典风格 V1.3) */
+static void render_app_manager(menu_state_t *state) {
+    st7305_handle_t *lcd = state->lcd;
+    st7305_clear(lcd, ST7305_COLOR_WHITE);
+    menu_draw_status_bar(lcd, &state->settings, NULL);
+
+    int grid_x0 = APPMGR_CATBAR_W;
+
+    /* V1.0.93: 不再绘制整体方框; 仅保留侧栏与内容页之间的 2px 竖直分隔线 (上贴状态栏、下拉到底) */
+    int bar_top = APPMGR_CAT_Y0;                 /* 紧贴状态栏边界 */
+    int bar_bot = SCREEN_H - 1;                  /* 拉到底 */
+    fill_rect(lcd, APPMGR_CATBAR_W - 1, bar_top, APPMGR_CATBAR_W, bar_bot,
+              ST7305_COLOR_BLACK);
+
+    /* === 右侧网格: 当前分类下的可管理模块 + 迷你应用 (4 列, 图标 64 + 下方名称) ===
+     * V1.0.9x: 支持内容上下拖动 (行窗口滚动), 只绘制当前可见窗口内的项. */
+    int cnt = app_cat_count((app_category_t)s_app_cat);
+    int modcnt = app_cat_modcount((app_category_t)s_app_cat);
+    app_category_t cat = (app_category_t)s_app_cat;
+    int cell_w = (SCREEN_W - grid_x0 - 8) / APPMGR_GRID_COLS;   /* 每格宽 */
+    int step_x = cell_w;
+    int step_y = app_grid_step_y();                             /* 每格高 (内嵌 3 行不越界) */
+    int grid_start_x = grid_x0 + 4;
+    /* V1.0.9x fix: 基础起点用与命中测试完全一致的 app_current_view_px():
+     *  - 拖动中: 网格像素跟手平移 (顺滑预载, 不再"闪一下才固定")
+     *  - 回弹中: 网格随缓动平滑回落
+     *  - 静止: = s_scroll*step
+     * 渲染与命中同源, 杜绝"看到第 2 排, 点到第 3 排"的错位. */
+    int grid_start_y = app_grid_start_y(cnt) - (int)app_current_view_px();
+    /* 提前加载: 按网格实际像素位置求可见行窗口 (含拖动时向上下滑入的相邻行),
+     * 避免拖动过程上下方应用空白闪一下才算固定, 实现跟手平滑预载. */
+    int first_vis_row = (APPMGR_CAT_Y0 - grid_start_y) / step_y;  /* 上沿首次可见行 */
+    int last_vis_row  = (SCREEN_H - 1 - grid_start_y) / step_y + 1; /* 下沿 + 额外 1 行缓冲 */
+    if (first_vis_row < 0) first_vis_row = 0;
+    for (int i = 0; i < cnt; i++) {
+        int row = i / APPMGR_GRID_COLS;
+        if (row < first_vis_row || row > last_vis_row) continue;   /* 窗口外不绘制 */
+        int col = i % APPMGR_GRID_COLS;
+        int cx = grid_start_x + col * step_x + cell_w / 2;
+        int cy = grid_start_y + row * step_y + APPMGR_ICON_SIZE / 2;
+        int size = APPMGR_ICON_SIZE;
+        bool focused = (i == s_app_focus && !s_app_detail);
+        /* V1.0.93: 不再绘制选中项外框 (选中态仅靠名称黑底白字区分) */
+        if (i < modcnt) {
+            /* 模块: 48x48 图标 + 中文名称 */
+            int phys = app_cat_phys(cat, i);
+            if (phys < 0) continue;
+            const bbk_module_t *m = &s_modules[phys];
+            draw_icon_bitmap(lcd, cx, cy, size, m->icon_idx);
+            int label_tw = zh16_text_width(m->short_label);
+            int label_y = cy + size/2 + 4;
+            if (focused) {          /* V1.0.91: 选中项名称 黑底白字 */
+                fill_rect(lcd, cx - label_tw/2, label_y, cx + label_tw/2 - 1, label_y + ZH16_FONT_H - 1, ST7305_COLOR_BLACK);
+                draw_zh16_text_color(lcd, cx - label_tw/2, label_y, m->short_label, ST7305_COLOR_WHITE);
+            } else {
+                draw_zh16_text(lcd, cx - label_tw / 2, label_y, m->short_label);
+            }
+        }
+    }
+
+    /* 当前分类无内容: 提示 */
+    if (cnt == 0) {
+        draw_text(lcd, grid_x0 + 40, APPMGR_CAT_Y0 + 60,
+                  "\xe8\xaf\xa5\xe5\x88\x86\xe7\xb1\xbb\xe6\x9a\x82\xe6\x97\xa0\xe5\xba\x94\xe7\x94\xa8", false);
+        /* 该分类暂无应用 */
+    }
+
+    /* === 左侧分类栏 (宽 64): V1.0.92 仅显示 64px 图标 (不显示名称), 4 个图标上下平均分布.
+     * 选中样式 = 图标下方 2 像素粗横线 (不用方框) === */
+    for (int r = 0; r < APPMGR_CAT_ROWS; r++) {
+        int y0 = app_cat_row_y(r);
+        int icon_size = APPMGR_CAT_ICON_SZ;
+        int icon_cx = APPMGR_CATBAR_W / 2;
+        int icon_cy = y0 + icon_size / 2;
+        /* 图标 (仅图标, 无名称) — V1.0.9x: 用应用管理专属四分类图标 cat_icons[] */
+        draw_cat_icon_stretched(lcd, icon_cx, icon_cy, icon_size, icon_size, r);
+        /* 选中: 图标正下方 2 像素实心横线 (与图标同宽), 不用方框 */
+        if (r == s_app_cat) {
+            int lx0 = icon_cx - icon_size / 2;
+            int lx1 = icon_cx + icon_size / 2;
+            int ly  = icon_cy + icon_size / 2;          /* 图标下沿 */
+            fill_rect(lcd, lx0, ly, lx1, ly + 1, ST7305_COLOR_BLACK);
+        }
+    }
+
+    /* === 管理弹窗 (200x150, 长按 3 秒打开) 居中 ===
+     * 居中提醒「是否添加到菜单」 + 底部 取消/确定 两框按钮. */
+    if (s_app_detail && s_app_detail_phys >= 0 &&
+        s_app_detail_phys < (int)BBK_MODULE_COUNT) {
+        int dx = (SCREEN_W - APPMGR_DETAIL_W) / 2;
+        int dy = (SCREEN_H - APPMGR_DETAIL_H) / 2;
+        /* 弹窗背景 + 2px 直角描边 */
+        app_panel(lcd, dx, dy, dx + APPMGR_DETAIL_W - 1, dy + APPMGR_DETAIL_H - 1);
+        /* 居中提醒文字: 未添加→「添加图标到主菜单?」, 已添加→「删除主菜单图标?」 */
+        {
+            const char *msg = s_app_detail_draft
+                ? "\xe5\x88\xa0\xe9\x99\xa4\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95\xe5\x9b\xbe\xe6\xa0\x87?" /* 删除主菜单图标? */
+                : "\xe6\xb7\xbb\xe5\x8a\xa0\xe5\x9b\xbe\xe6\xa0\x87\xe5\x88\xb0\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95?"; /* 添加图标到主菜单? */
+            int mw = zh16_text_width(msg);
+            draw_zh16_text(lcd, dx + (APPMGR_DETAIL_W - mw) / 2, dy + APP_POP_MSG_Y, msg);
+        }
+        /* 底: 取消 / 确定 两枚方框按钮 */
+        app_draw_pop_button(lcd, dx + APP_POP_BTN_LEFT, dy + APP_POP_BTN_Y,
+                            "\xe5\x8f\x96\xe6\xb6\x88");                                    /* 取消 */
+        app_draw_pop_button(lcd, dx + APP_POP_BTN_RIGHT, dy + APP_POP_BTN_Y,
+                            "\xe7\xa1\xae\xe5\xae\x9a");                                    /* 确定 */
+    }
+}
+
 /* 时间设置 - 弹窗 (用户需求: 改成弹窗, 并增加年/月/日) */
 static int time_build(menu_state_t *state, char buf[][64], int max) {
     int n = 0;
@@ -5121,7 +7992,7 @@ static void time_dialog_close(menu_state_t *state) {
     state->list_dialog_prev_active = false;
     state->list_dialog_prev_selected = -1;
     state->current_page = state->list_dialog_return_page;
-    state->selected_index = state->main_selected_index;
+    menu_main_restore_position(state);
     state->scroll_offset = 0;
     state->needs_redraw = true;
     if (state->list_dialog_on_close) {
@@ -5336,7 +8207,7 @@ static void time_dialog_render(menu_state_t *state, st7305_handle_t *lcd,
 /* 系统信息 */
 static int sysinfo_build(menu_state_t *state, char buf[][64], int max) {
     int n = 0;
-    snprintf(buf[n++], 64, "固件: 1.1");
+    snprintf(buf[n++], 64, "固件: 1.2");
     snprintf(buf[n++], 64, "LCD: ST7305 400x300");
     snprintf(buf[n++], 64, "Flash: 16MB");
     snprintf(buf[n++], 64, "PSRAM: 8MB");
@@ -5469,6 +8340,8 @@ static const char *platform_root_dir(int engine) {
         case 1: return "/sdcard/gbc";
         case 2: return "/sdcard/nes";
         case 3: return "/sdcard/AB";
+        case 4: return "/sdcard/lavaXOS";   /* wqx 文曲星 LavaX */
+        case 5: return "/sdcard/vpet";      /* vpet 暴龙机 */
         default: return "/sdcard/gb";
     }
 }
@@ -5478,6 +8351,8 @@ static const char *platform_ext(int engine) {
         case 1: return ".gbc";
         case 2: return ".nes";   /* FC 使用 NES 文件 */
         case 3: return ".hex";
+        case 4: return ".lav";   /* wqx 文曲星 LavaX 字节码 */
+        case 5: return ".bin";   /* vpet 暴龙机 ROM */
         default: return ".gb";
     }
 }
@@ -5488,6 +8363,8 @@ static const char *platform_title(int engine) {
         case 1: return "GBC \xe6\xb8\xb8\xe6\x88\x8f";                /* GBC 游戏 */
         case 2: return "NES \xe6\xb8\xb8\xe6\x88\x8f";                /* NES 游戏 */
         case 3: return "arduboy \xe6\xb8\xb8\xe6\x88\x8f";            /* arduboy 游戏 */
+        case 4: return "wqx \xe6\x96\x87\xe6\x9b\xb2\xe6\x98\x9f";   /* wqx 文曲星 */
+        case 5: return "vpet \xe6\x9a\xb4\xe9\xbe\x99\xe6\x9c\xba"; /* vpet 暴龙机 */
         default: return "GB \xe6\xb8\xb8\xe6\x88\x8f";                /* GB 游戏 */
     }
 }
@@ -5502,6 +8379,8 @@ static fav_engine_t state_fav_engine(const menu_state_t *state) {
         case 2: return FAV_ENGINE_FC;   /* FC (NES+FC 合并) */
         case 3:
         default: return FAV_ENGINE_AB;
+        case 4: return FAV_ENGINE_WQX;   /* wqx 文曲星 */
+        case 5: return FAV_ENGINE_VPET;  /* vpet 暴龙机 */
     }
 }
 
@@ -5533,14 +8412,20 @@ static int select_game_build(menu_state_t *state, char buf[][64], int max) {
         g_folder_count = (state->select_mode == 1)
             ? scan_platform_folders(platform_root_dir(state->select_engine), g_folder_names, MAX_FOLDER_NAMES)
             : scan_bbk_folders(g_folder_names, MAX_FOLDER_NAMES);
-        state->select_loaded = true;
-        /* V1.0.68: 进入页面默认焦点在右栏(内容页), 选中第一个游戏 */
-        state->select_focus = 1;
-        int max_idx = 2 + g_folder_count - 1;  /* 0=设置, 1=收藏, 2=全部, 3..N+2=文件夹 */
-        if (state->select_folder_idx < 0 || state->select_folder_idx > max_idx) {
-            state->select_folder_idx = 1;  /* 默认收藏 */
+        /* V1.0.68+: 根目录是否有当前引擎游戏 → 决定"全部"项是否显示 */
+        {
+            char tmp[8][64];
+            int root_n = (state->select_mode == 1)
+                ? scan_platform_games(platform_root_dir(state->select_engine), "",
+                                      current_gb_ext(state), tmp, 8)
+                : scan_bbk_games_in_folder("", tmp, 8);
+            g_select_has_root = (root_n > 0);
         }
-        /* 不再强制把焦点拉回左栏: "游戏设置"项的右栏也有 4 个设置项, 可正常切换焦点 */
+        state->select_loaded = true;
+        /* V1.0.9x: 进入页面默认只显示收藏栏: 焦点留在左栏并选中「收藏」,
+         * 不默认选中右栏第一个收藏项, 避免空收藏时误触发"无法定位游戏". */
+        state->select_focus = 0;
+        state->select_folder_idx = 1;  /* 默认收藏 (0=设置, 1=收藏, [2=全部], 之后=文件夹) */
         state->select_folder_scroll = 0;
         state->select_game_idx = 0;
         state->select_game_scroll = 0;
@@ -5570,6 +8455,8 @@ static int select_game_build(menu_state_t *state, char buf[][64], int max) {
         if (state->select_folder_idx == 1) {
             /* 收藏: 列出所有收藏路径, 取文件名显示 (按页面模式过滤: GB 只看 .gb, 电子词典只看 .gam)
              * 不再添加"返回"项: 左右键切换侧栏即可回到文件夹列表 */
+            /* V1.0.9x: 打开收藏栏时自动清理已不存在(改名/删除)的失效收藏 */
+            favorites_prune_missing();
             int fav_count = 0;
             const char *const *favs = favorites_list(state_fav_engine(state), &fav_count);
             for (int i = 0; i < fav_count && n < max; i++) {
@@ -5640,8 +8527,8 @@ static void draw_folder_pane(st7305_handle_t *lcd, menu_state_t *state) {
     int x1 = x0 + SELECT_LEFT_W - 4;  /* 右边 4 像素留给中间分隔线 */
     int y  = SELECT_LIST_Y;
 
-    /* 总数 = 3 特殊项(设置/收藏/全部) + g_folder_count 个真实子文件夹 */
-    int total = 3 + g_folder_count;
+    /* 总数 = 特殊项(设置/收藏[/全部]) + g_folder_count 个真实子文件夹 */
+    int total = select_folder_total();
     int sel = state->select_folder_idx;
     if (sel < 0) sel = 0;
     if (sel >= total) sel = total - 1;
@@ -5670,18 +8557,18 @@ static void draw_folder_pane(st7305_handle_t *lcd, menu_state_t *state) {
             /* 收藏栏 */
             const char *name = "\xe6\x94\xb6\xe8\x97\x8f\xe6\xa0\x8f";  /* 收藏栏 */
             truncate_name(trunc, sizeof(trunc), name, 6);
-        } else if (idx == 2) {
+        } else if (g_select_has_root && idx == 2) {
             /* 全部 (根目录) */
             const char *name = "\xe5\x85\xa8\xe9\x83\xa8";  /* 全部 */
             truncate_name(trunc, sizeof(trunc), name, 6);
         } else {
-            const char *name = g_folder_names[idx - 3];
+            const char *name = g_folder_names[g_select_has_root ? (idx - 3) : (idx - 2)];
             truncate_name(trunc, sizeof(trunc), name, 6);
         }
         int tw = text_width(trunc);
         int tx = x0 + (SELECT_LEFT_W - 4 - tw) / 2;
         if (tx < x0) tx = x0;
-        draw_text(lcd, tx, yy + 8, trunc, false);
+        draw_text(lcd, tx, yy + 4, trunc, false);
 
         /* 选中项下方画 2px 横线 (画在文字之后, 贴行底缘) */
         if (is_sel) {
@@ -5801,7 +8688,7 @@ static void draw_game_pane(st7305_handle_t *lcd, menu_state_t *state) {
             tx = x0 + ((x1 - x0) - tw) / 2;
         }
         if (tx < x0) tx = x0;
-        draw_text(lcd, tx, yy + 8, trunc, is_sel && focus_right);
+        draw_text(lcd, tx, yy + 4, trunc, is_sel && focus_right);
     }
 }
 
@@ -5815,7 +8702,9 @@ static void render_select_game_two_cols(menu_state_t *state) {
     st7305_clear(lcd, ST7305_COLOR_WHITE);
 
     /* 状态栏 - 显示二级菜单名称 (V1.0.48: 各平台显示对应名称) */
-    const char *title = (state->current_page == MENU_PAGE_GB_GAME)
+    const char *title = (state->current_page == MENU_PAGE_GB_GAME ||
+                         state->current_page == MENU_PAGE_WQX ||
+                         state->current_page == MENU_PAGE_VPET)
         ? platform_title(state->select_engine)
         : "\xe7\x94\xb5\xe5\xad\x90\xe8\xaf\x8d\xe5\x85\xb8";  /* 电子词典 */
     menu_draw_status_bar(lcd, &state->settings, title);
@@ -5905,7 +8794,7 @@ static void draw_book_folder_pane(st7305_handle_t *lcd, menu_state_t *state) {
         truncate_name(trunc, sizeof(trunc), name, 6);
         int tw = text_width(trunc);
         int tx = x0 + ((x1 - x0) - tw) / 2;
-        draw_text(lcd, tx, yy + 8, trunc, false);
+        draw_text(lcd, tx, yy + 4, trunc, false);
         /* V1.0.68: 统一选中样式: 下方 2px 横线 (与游戏列表一致) */
         if (is_sel) {
             draw_hline(lcd, x0, x1, yy + SELECT_ITEM_H - 1, ST7305_COLOR_BLACK);
@@ -5977,12 +8866,12 @@ static void draw_book_game_pane(st7305_handle_t *lcd, menu_state_t *state) {
                 if (ln > 23) ln = 23;
                 memcpy(label, text, (size_t)ln);
                 label[ln] = '\0';
-                draw_text(lcd, x0 + 8 + 48, yy + 8, label, is_sel && focus_right);
+                draw_text(lcd, x0 + 8 + 48, yy + 4, label, is_sel && focus_right);
                 const char *val = pipe + 1;
                 int vw = text_width(val);
                 int vx = x1 - 4 - vw;
                 if (vx < x0 + 8 + 48) vx = x0 + 8 + 48;
-                draw_text(lcd, vx, yy + 8, val, is_sel && focus_right);
+                draw_text(lcd, vx, yy + 4, val, is_sel && focus_right);
                 continue;
             }
         }
@@ -5996,7 +8885,7 @@ static void draw_book_game_pane(st7305_handle_t *lcd, menu_state_t *state) {
             tx = x0 + ((x1 - x0) - tw) / 2;
         }
         if (tx < x0) tx = x0;
-        draw_text(lcd, tx, yy + 8, trunc, is_sel && focus_right);
+        draw_text(lcd, tx, yy + 4, trunc, is_sel && focus_right);
     }
 }
 
@@ -6069,7 +8958,7 @@ static int mpfb_draw_zh24(uint8_t *fb, int x, int y, const char *str, bool inv) 
     return cx - x;
 }
 
-/* 画单个 ASCII 字符 8x12 (竖屏菜单), 返回像素宽 */
+/* 画单个 ASCII 字符 8x12 (竖屏菜单), 2x 放大为 16x24 与中文同规格, 顶部对齐, 返回像素宽 */
 static int mpfb_draw_ascii8(uint8_t *fb, int x, int y, uint8_t c, bool inv) {
     int idx = (c >= 0x20 && c <= 0x7E) ? (c - 0x20) : ('?' - 0x20);
     const uint8_t *bmp = FONT8X12[idx];
@@ -6077,10 +8966,14 @@ static int mpfb_draw_ascii8(uint8_t *fb, int x, int y, uint8_t c, bool inv) {
         uint8_t bits = bmp[row];
         for (int col = 0; col < 8; col++) {
             bool bit = ((bits >> (7 - col)) & 1u) != 0;
-            mpfb_px(fb, x + col, y + row, inv ? !bit : bit);
+            /* 2x 放大, 每点铺 2x2 */
+            mpfb_px(fb, x + col * 2,     y + row * 2,     inv ? !bit : bit);
+            mpfb_px(fb, x + col * 2 + 1, y + row * 2,     inv ? !bit : bit);
+            mpfb_px(fb, x + col * 2,     y + row * 2 + 1, inv ? !bit : bit);
+            mpfb_px(fb, x + col * 2 + 1, y + row * 2 + 1, inv ? !bit : bit);
         }
     }
-    return 8;
+    return 16;
 }
 
 /* 混合文本 (中文 24px + ASCII 8x12), 返回像素宽 (竖屏菜单) */
@@ -6089,7 +8982,7 @@ static int mpfb_draw_text(uint8_t *fb, int x, int y, const char *str, bool inv) 
     const uint8_t *p = (const uint8_t *)str;
     while (*p) {
         if (*p < 0x80) {
-            cx += mpfb_draw_ascii8(fb, cx, y + 6, *p, inv);
+            cx += mpfb_draw_ascii8(fb, cx, y, *p, inv);   /* ASCII 已是 24px 高, 与中文顶部对齐 */
             p++;
         } else if ((*p & 0xF0) == 0xE0) {
             int idx = font_zh_find_utf8((const char *)p);
@@ -6116,7 +9009,7 @@ static int mpfb_text_width(const char *str) {
     int w = 0;
     const uint8_t *p = (const uint8_t *)str;
     while (*p) {
-        if (*p < 0x80) { w += 8; p++; }
+        if (*p < 0x80) { w += 16; p++; }
         else if ((*p & 0xF0) == 0xE0) { w += 24; p += 3; }
         else p++;
     }
@@ -6286,11 +9179,17 @@ static void render_book_two_cols_portrait(menu_state_t *state) {
 }
 
 static const sub_page_def_t sub_pages[MENU_PAGE_COUNT];  /* 前向声明 */
+/* V1.0.69: 按"离中央的分数距离"算图标尺寸 (连续过渡, 拖动时中央掠过即平滑放大).
+ * ad = |(i - sel) + drag_offset/spacing|, 单位格. */
+static int main_icon_size_cont(float ad) {
+    /* 用户指定显示效果: 中央 100px, 其余 64px (无过渡缩放) */
+    if (ad <= 0.5f) return 100;
+    return 64;
+}
 static void render_main(menu_state_t *state) {
     st7305_handle_t *lcd = state->lcd;
     st7305_clear(lcd, ST7305_COLOR_WHITE);
 
-    int sel = state->selected_index;
     int total = menu_main_count(state);
 
     /* === 状态栏 (复用函数) === */
@@ -6300,83 +9199,112 @@ static void render_main(menu_state_t *state) {
     int icon_center_y = SCREEN_H / 2;
     int icon_spacing = 100;
     int center_x = SCREEN_W / 2;
+    int DRAW_SLOT_MARKER_SIZE = 64;   /* 中间预留槽标记与图标同宽: 100px 槽内框出 64px 虚框 */
 
-    /* === 切换动画 === */
+    /* === V1.0.97: 统一小数相机渲染 ===
+     * 整排图标行位置用单一相机 cam(单位:格, 可小数) 描述:
+     *   - 拖动中: cam = main_cam_base + 拖动像素/格间距 (跟手)
+     *   - 吸附/按键切换动画: cam 从 from 向 to(取最近同余以走 wrap 最短路径) 缓动
+     *   - 静止:   cam = selected_index
+     * 图标位置 px = center_x + (g - cam)*spacing, 索引 g 取模回绕 →
+     * 拖动与松手首帧共享同一个 cam, 像素级衔接, 彻底消除"双锚点叠加"造成的回弹跳变. */
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    int dir = state->anim_direction;
-    int prev = state->prev_selected;
-    /* V1.0.68 fix: 惯性甩动 — 移动格数越多动画滑行越久; 缓出(快起慢停)接手指速度 */
-    int move_steps = (dir != 0) ? (sel - prev) : 0;
-    if (move_steps > 0 && move_steps > total / 2) move_steps -= total;
-    else if (move_steps < 0 && -move_steps > total / 2) move_steps += total;
-    if (move_steps < 0) move_steps = -move_steps;
-    uint32_t anim_duration = 240 + (uint32_t)move_steps * 70;
-    if (anim_duration > 700) anim_duration = 700;
-    float t = 1.0f;
-    if (state->anim_start_ms > 0 && (now_ms - state->anim_start_ms) < anim_duration) {
-        t = (float)(now_ms - state->anim_start_ms) / (float)anim_duration;
-    } else if (state->anim_start_ms > 0) {
-        state->anim_start_ms = 0;
-        state->anim_direction = 0;
-        state->prev_selected = sel;
-        state->main_drag_offset = 0;   /* 动画结束, 拖动偏移归零 */
+    float cam;
+    if (state->main_drag_active) {
+        cam = state->main_cam_base - (float)state->main_drag_offset / (float)icon_spacing;
+    } else if (state->main_cam_anim_start > 0) {
+        /* 守卫: 动画进行中若选中已在外部被改(如进出子页), 直接作废动画对齐选中 */
+        if (state->selected_index != state->main_cam_anim_sel) {
+            state->main_cam_anim_start = 0;
+            cam = (float)state->selected_index;
+        } else {
+            uint32_t d = now_ms - state->main_cam_anim_start;
+            float tt = d < state->main_cam_anim_dur ? (float)d / (float)state->main_cam_anim_dur : 1.0f;
+            float ease = 1.0f - (float)pow(1.0f - tt, 3.0f);   /* 缓出: 快速起步, 慢停 */
+            cam = state->main_cam_anim_from +
+                  (state->main_cam_anim_to - state->main_cam_anim_from) * ease;
+            if (tt >= 1.0f) {
+                state->main_cam_anim_start = 0;
+                cam = state->main_cam_anim_to;
+            }
+        }
+    } else {
+        cam = (float)state->selected_index;
     }
-    /* 缓出 easeOutCubic: 快速起步(接手指速度) 逐渐减速到目标, 甩动更自然 */
-    float ease = 1.0f - (float)pow(1.0f - t, 3.0f);
+    state->main_cam_cur = cam;
 
-    /* 计算每个图标的位置和尺寸 (循环滚动: 取到选中项的最短距离) */
-    for (int i = 0; i < total; i++) {
-        /* 计算目标偏移 (考虑循环, 取最短路径) */
-        int diff_target = i - sel;
-        if (diff_target > total / 2) diff_target -= total;
-        else if (diff_target < -total / 2) diff_target += total;
-        int target_offset = diff_target * icon_spacing;
+    /* 中央图标(环绕取模) — 供文字标签用 */
+    int sel = ((lroundf(cam) % total) + total) % total;
 
-        /* 计算起始偏移 (动画开始时的位置, 也考虑循环) */
-        int diff_start = diff_target;
-        if (state->anim_start_ms > 0 && dir != 0) {
-            diff_start = i - prev;
-            if (diff_start > total / 2) diff_start -= total;
-            else if (diff_start < -total / 2) diff_start += total;
-            /* V1.0.68: 目标相对起点取最短环绕路径. 原来起点/目标各自独立环绕,
-             * 环绕切换时图标会横穿整个屏幕经过中央 (看起来像一堆小图标弹出/重叠),
-             * 改为只走最近距离, 松手吸附更平滑. */
-            if (diff_target - diff_start > total / 2) diff_target -= total;
-            else if (diff_target - diff_start < -total / 2) diff_target += total;
-            target_offset = diff_target * icon_spacing;
+    /* 遍历相机附件的整数格: 屏幕内即绘制 (索引随相机取模回绕, 两侧滚动项预先入位) */
+    if (s_reorder_active && s_hold_active && s_main_order_count > 0) {
+        /* V1.0.9x: 拿起时中间真空缺口 + 随相机连续定位 — 每个图标按与相机的连续偏移摆放,
+         * 中间(±0.5 内)不画, 滚动顺滑不闪格 */
+        int n = s_main_order_count;
+        float c = cam;
+        for (int i = 0; i < n; i++) {
+            float rel = (float)i - c;
+            rel = fmodf(rel, (float)n);
+            if (rel < 0) rel += n;
+            if (rel > n * 0.5f) rel -= n;            /* 归到 (-n/2, n/2] */
+            int o = (int)floorf(rel + 0.5f);         /* 整数槽位: 空位严格在屏幕正中 */
+            if (o == 0) continue;                    /* 中间真空缺口 */
+            int cx = (int)roundf((float)center_x + (float)o * (float)icon_spacing);
+            int size = 64;   /* 拿起时: 所有非中间图标统一 64×64 (中间为真空缺口) */
+            if (cx + size <= 0 || cx - size >= SCREEN_W) continue;
+            const bbk_module_t *m = bbk_module(menu_main_phys(state, i));
+            draw_main_icon_stretched(lcd, cx, icon_center_y, size, size, main_icon_index(m ? m->icon_idx : 0));
         }
-        int start_offset = diff_start * icon_spacing;
-
-        /* 插值位置 */
-        int cx = start_offset + (int)((target_offset - start_offset) * ease);
-        cx += center_x;
-        /* V1.0.66: 拖动中跟手平移; 松手吸附动画期间把残留偏移衰减到 0 (无缝过渡) */
-        if (state->main_drag_active) {
-            cx += state->main_drag_offset;
-        } else if (state->anim_start_ms > 0) {
-            cx += (int)(state->main_drag_offset * (1.0f - ease));
-        }
-
-        /* 尺寸: 中央最大, 两边逐渐变小. V1.0.67: 动画期间按起止 distance 插值,
-         * 避免松手瞬间按新选中项直接算 size 导致图标突然变小(闪过小图标). */
-        int d_start = abs(diff_start);
-        int d_target = abs(diff_target);
-        int size_start = (d_start == 0) ? 100 : (d_start == 1) ? 70 : (d_start == 2) ? 50 : 40;
-        int size_target = (d_target == 0) ? 100 : (d_target == 1) ? 70 : (d_target == 2) ? 50 : 40;
-        int size = size_start + (int)((size_target - size_start) * ease);
-
-        /* 只绘制屏幕内的图标 */
-        if (cx >= -size && cx <= SCREEN_W + size) {
-            draw_icon_bitmap(lcd, cx, icon_center_y, size, main_items[menu_main_phys(state, i)].icon_idx);
+        /* V1.0.9x+: 中间预留 100px 槽位: 画淡虚线框标记, 让「腾出的空间」清晰可辨 */
+        draw_slot_marker(lcd, center_x, icon_center_y, DRAW_SLOT_MARKER_SIZE);
+    } else {
+        int g0 = (int)floorf(cam) - 3;
+        int g1 = (int)ceilf(cam) + 3;
+        for (int g = g0; g <= g1; g++) {
+            int idx = ((g % total) + total) % total;
+            int cx = (int)roundf((float)center_x + ((float)g - cam) * (float)icon_spacing);
+            float dist = fabsf((float)g - cam);
+            int size = main_icon_size_cont(dist);
+            if (cx + size > 0 && cx - size < SCREEN_W) {
+                const bbk_module_t *m = bbk_module(menu_main_phys(state, idx));
+                draw_main_icon_stretched(lcd, cx, icon_center_y, size, size, main_icon_index(m ? m->icon_idx : 0));
+            }
         }
     }
 
     /* 文字标签: 选中图标下方 (V1.0.68: 下移 10px) */
     int label_y = icon_center_y + 68;
     if (label_y > SCREEN_H - 28) label_y = SCREEN_H - 28;
-    draw_label_centered_at(lcd, center_x, label_y, main_items[menu_main_phys(state, sel)].short_label, false);
+
+    /* V1.0.9x: 编辑模式 — 下方显示被抬起的图标(64x64, 无方框, 点击放回中间); 中间图标闪烁 */
+    if (s_reorder_active) {
+        if (s_hold_active && s_hold_phys >= 0 && s_hold_phys < (int)BBK_MODULE_COUNT) {
+            const bbk_module_t *hm = &s_modules[s_hold_phys];
+            int hs = 64, hcx = center_x, hcy = SCREEN_H - 72;   /* 上移20px, 避免太靠下 */
+            draw_main_icon_stretched(lcd, hcx - 1, hcy - 1, hs - 2, hs - 2, main_icon_index(hm->icon_idx));
+            /* 被抬起图标名称 (闪烁提示可点击放回) */
+            if ((now_ms / 400) & 1)
+                draw_label_centered_at(lcd, hcx, hcy + hs / 2 + 4, hm->short_label, true);
+        }
+        return;   /* 编辑中不再画中间(空位)名称, 避免叠在右侧图标上 */
+    }
+    draw_label_centered_at(lcd, center_x, label_y, bbk_module(menu_main_phys(state, sel))->short_label, false);
 
     /* 后台存档状态: 仅在状态栏左上角显示 SD 卡图标, 此处不再画文字提示 */
+
+    /* V1.0.9x: 主菜单长按删除弹窗 (居中「删除主菜单图标?」+ 取消/确定) */
+    if (s_main_del_active) {
+        int dx = (SCREEN_W - APPMGR_DETAIL_W) / 2;
+        int dy = (SCREEN_H - APPMGR_DETAIL_H) / 2;
+        app_panel(lcd, dx, dy, dx + APPMGR_DETAIL_W - 1, dy + APPMGR_DETAIL_H - 1);
+        {
+            const char *msg = "\xe5\x88\xa0\xe9\x99\xa4\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95\xe5\x9b\xbe\xe6\xa0\x87?"; /* 删除主菜单图标? */
+            int mw = zh16_text_width(msg);
+            draw_zh16_text(lcd, dx + (APPMGR_DETAIL_W - mw) / 2, dy + APP_POP_MSG_Y, msg);
+        }
+        app_draw_pop_button(lcd, dx + APP_POP_BTN_LEFT, dy + APP_POP_BTN_Y, "\xe5\x8f\x96\xe6\xb6\x88");   /* 取消 */
+        app_draw_pop_button(lcd, dx + APP_POP_BTN_RIGHT, dy + APP_POP_BTN_Y, "\xe7\xa1\xae\xe5\xae\x9a");  /* 确定 */
+    }
 
     /* 刷新由 menu_render 末尾统一处理, 避免弹窗叠加时的双 flush 闪烁 */
 }
@@ -6441,13 +9369,13 @@ void menu_draw_notice_popup(st7305_handle_t *lcd, const char *text) {
     draw_notice_popup(lcd, text);
 }
 
-/* V1.0.68: 软关机流程 — 显示"正在关机" → 清空屏幕 → 进入 deep sleep.
+/* V1.0.68: 软关机流程 — 清理一切外设后进入 deep sleep, 模拟真正关机.
  * 反射式 LCD 掉电后会保持最后一帧画面, 所以关机前必须清屏, 否则黑屏/花屏残留.
  * esp_deep_sleep_start() 不会返回; 之后按下电源键(GPIO1)唤醒复位开机. */
 void menu_soft_power_off(st7305_handle_t *lcd) {
     if (!lcd) return;
     extern menu_state_t g_menu;
-    ESP_LOGI(TAG, "软关机: 显示正在关机 -> 清屏 -> deep sleep");
+    ESP_LOGI(TAG, "软关机: 清理外设 -> 清屏 -> deep sleep");
     /* V1.0.68: 方波直驱方案下播放关机下行音 */
     if (g_menu.settings.audio_scheme == 1 && tone_player_ready()) {
         tone_play_effect(TONE_EFFECT_SHUTDOWN);
@@ -6455,7 +9383,28 @@ void menu_soft_power_off(st7305_handle_t *lcd) {
     st7305_clear(lcd, ST7305_COLOR_WHITE);
     menu_draw_notice_popup(lcd, "\xe6\xad\xa3\xe5\x9c\xa8\xe5\x85\xb3\xe6\x9c\xba"); /* 正在关机 */
     st7305_flush(lcd);
-    vTaskDelay(pdMS_TO_TICKS(900));
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* ---- 退出一切可能干扰的 USB 状态: HID 键鼠 + USB U盘 ---- */
+    usb_hid_stop();                          /* 卸载 TinyUSB, 电脑正常断开 */
+    extern void usbh_msc_stop(void);
+    usbh_msc_stop();                         /* 卸载 MSC, 并恢复 Serial/JTAG */
+    extern void sd_watcher_set_paused(bool);
+    sd_watcher_set_paused(true);             /* 暂停 SD 卡监控, 避免后台拔插扫描 */
+
+    /* ---- 停音频, 释放 PCM 输出任务 ---- */
+    audio_player_stop();
+
+    /* ---- 关蓝牙: 断开连接 + deinit Bluedroid/控制器, 关射频/释放内存 ---- */
+    bt_manager_disable();
+    bt_manager_stop_scan();
+
+    /* ---- 卸载 SD 卡: 刷新 FAT 缓存, 防止关机瞬间掉电损坏 ---- */
+    extern void sd_unmount(void);
+    sd_unmount();
+
+    /* ---- 清空 LCD: 反射屏掉电后保持最后一帧, 必须清空避免残留 ---- */
+    vTaskDelay(pdMS_TO_TICKS(300));
     st7305_clear(lcd, ST7305_COLOR_WHITE);
     st7305_flush(lcd);
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -6538,8 +9487,8 @@ static void draw_confirm_dialog(menu_state_t *state) {
             st7305_draw_pixel(lcd, x + dx, y + dy, ST7305_COLOR_WHITE);
         }
     }
-    /* 3px 粗黑边框 */
-    for (int k = 0; k < 3; k++) {
+    /* 2px 直角黑边框 (V1.0.75: 全局统一 2px) */
+    for (int k = 0; k < 2; k++) {
         for (int dx = 0; dx < w; dx++) {
             st7305_draw_pixel(lcd, x + dx, y + k, ST7305_COLOR_BLACK);
             st7305_draw_pixel(lcd, x + dx, y + h - 1 - k, ST7305_COLOR_BLACK);
@@ -6954,15 +9903,16 @@ static void draw_cd(st7305_handle_t *lcd, int cx, int cy, int r, int angle_deg) 
 /* MP3 播放界面渲染 (新版: 光盘+名称+进度+左菜单) */
 /* 设置页面 (容器)
  * 用户需求: 删除"显示设置", "存储管理"(已提升到一级菜单), "声音设置", "蓝牙设备", "Wi-Fi".
- * 保留: 时间设置, 音量调节, 系统信息, 返回. */
+ * 保留/新增: 时间设置, 字体设置, 连接设置, 系统信息, 请作者喝杯水, 返回.
+ * V1.0.89: 删除"功能开关"(改由应用管理开关), 新增"字体设置"(粗/细切换). */
 static int settings_build(menu_state_t *state, char buf[][64], int max) {
     int n = 0;
-    snprintf(buf[n++], 64, "\xe6\x97\xb6\xe9\x97\xb4\xe8\xae\xbe\xe7\xbd\xae"); /* 时间设置 */
-    snprintf(buf[n++], 64, "\xe9\x9f\xb3\xe9\x87\x8f\xe8\xb0\x83\xe8\x8a\x82"); /* 音量调节 */
-    snprintf(buf[n++], 64, "\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xbe\xe7\xbd\xae");   /* 连接设置 */
-    snprintf(buf[n++], 64, "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xbf\xa1\xe6\x81\xaf");   /* 系统信息 */
-    snprintf(buf[n++], 64, "\xe8\xaf\xb7\xe4\xbd\x9c\xe8\x80\x85\xe5\x96\x9d\xe6\x9d\xaf\xe6\xb0\xb4"); /* 请作者喝杯水 */
-    snprintf(buf[n++], 64, "\xe8\xbf\x94\xe5\x9b\x9e");                           /* 返回 */
+    snprintf(buf[n++], 64, "日期时间");      /* 原: 时间设置 */
+    snprintf(buf[n++], 64, "字体风格");      /* 原: 字体设置 */
+    snprintf(buf[n++], 64, "无线连接");      /* 原: 连接设置 */
+    snprintf(buf[n++], 64, "系统信息");
+    snprintf(buf[n++], 64, "请作者喝杯水");
+    snprintf(buf[n++], 64, "返回");
     (void)state;
     (void)max;
     return n;
@@ -6995,10 +9945,10 @@ static bool settings_on_confirm(menu_state_t *state, int idx) {
         open_connection_dialog(state);
         return true;
     }
-    /* 进入对应子页面: idx 0=时间设置, idx 1=音量设置, idx 3=系统信息 */
+    /* 进入对应子页面: idx 0=时间设置, idx 3=系统信息 (idx 1=字体设置走弹窗) */
     menu_page_t target = MENU_PAGE_MAIN;
     if (idx == 0)      target = MENU_PAGE_SETTINGS_TIME;
-    else if (idx == 1) target = MENU_PAGE_VOLUME;
+    else if (idx == 1) { open_font_style_dialog(state); return true; }
     else if (idx == 3) target = MENU_PAGE_SETTINGS_INFO;
     else return false;
     state->current_page = target;
@@ -7030,9 +9980,9 @@ static void settings_dialog_on_select(menu_state_t *state, int idx) {
         open_time_dialog(state);
         return;
     }
-    /* idx 1 = 音量调节: list_dialog 弹窗 */
+    /* idx 1 = 字体设置: list_dialog 弹窗 (V1.0.89: 粗体/细体切换) */
     if (idx == 1) {
-        open_volume_dialog(state);
+        open_font_style_dialog(state);
         return;
     }
     /* idx 2 = 连接设置: 蓝牙/Wi-Fi 开关弹窗 */
@@ -7846,15 +10796,24 @@ static void book_handle_action(menu_state_t *state, menu_action_t action) {
                 state->select_game_idx = 0;
                 state->select_game_scroll = 0;
             }
+            ESP_LOGI(TAG, "[DBG] book CONFIRM focus0->1 fold=%d gsub=%d", state->select_folder_idx, g_sub_count);
         } else {
-            book_on_confirm_item(state, state->select_game_idx);
+            /* V1.0.9x: 应用管理双击打开「阅读」后会再补一次自动 CONFIRM,
+             * 若不吞掉会在刚进入书架瞬间直接打开第一本书(跳到上次阅读处)。
+             * s_app_swallow_next_confirm 仅在应用管理打开模块时置位. */
+            if (s_app_swallow_next_confirm) {
+                s_app_swallow_next_confirm = false;
+                ESP_LOGI(TAG, "book: swallow post-open auto confirm");
+            } else {
+                book_on_confirm_item(state, state->select_game_idx);
+            }
         }
         state->needs_redraw = true;
         return;
     case MENU_ACTION_BACK:
     case MENU_ACTION_HOME:
         state->current_page = MENU_PAGE_MAIN;
-        state->selected_index = state->main_selected_index;
+        menu_main_restore_position(state);
         state->scroll_offset = 0;
         state->book_loaded = false;   /* 下次进入重新扫描书单 */
         state->needs_redraw = true;
@@ -7909,20 +10868,21 @@ static void gs_pad_name(char *buf, size_t len, int target, const char *name) {
     snprintf(buf + pos, len - (size_t)pos, "%s:", name);
 }
 
-/* 显示模式名: 0=点对点, 1=全屏, 2=拉伸 */
-static const char *display_mode_name(uint8_t m) {
+/* 显示模式名: 0=点对点, 1=全屏(暴龙机=放大), 2=拉伸 */
+static const char *display_mode_name_engine(uint8_t m, int engine) {
+    if (engine == 5 && m == 1) return "\xe6\x94\xbe\xe5\xa4\xa7";               /* 放大 */
     switch (m) {
     case 0:  return "\xe7\x82\xb9\xe5\xaf\xb9\xe7\x82\xb9";  /* 点对点 */
     case 2:  return "\xe6\x8b\x89\xe4\xbc\xb8";               /* 拉伸 */
     default: return "\xe5\x85\xa8\xe5\xb1\x8f";               /* 全屏 */
     }
 }
+static const char *display_mode_name(uint8_t m) { return display_mode_name_engine(m, -1); }
 
-/* 显示模式档位数-1: BBK/NES 两档 (0/1), GB/GBC/AB 三档 (0/1/2) */
+/* 显示模式档位数-1: 所有引擎均为三档 (0=点对点, 1=全屏, 2=拉伸) */
 static int display_mode_max(const menu_state_t *state) {
-    if (state->select_mode == 0) return 1;      /* BBK */
-    if (state->select_engine == 2) return 1;    /* NES */
-    return 2;                                   /* GB/GBC/AB */
+    (void)state;
+    return 2;   /* NES/BBK/GB/GBC/AB 均可选拉伸档 */
 }
 
 /* 按动作生成设置项 label; 返回 true 表示成功生成 */
@@ -7953,7 +10913,7 @@ static bool game_settings_make_label(const menu_state_t *state, int action,
             "\xe5\x85\xb3",            /* 关 */
             "EPX",
         };
-        int p = (int)state->game_pic_opt;
+        int p = (state->select_engine == 5) ? (int)vpet_aa_get() : (int)state->game_pic_opt;
         if (p < 0) p = 0;
         if (p > 1) p = 1;
         snprintf(buf + strlen(buf), len - strlen(buf), " %s", nm[p]);
@@ -7962,13 +10922,21 @@ static bool game_settings_make_label(const menu_state_t *state, int action,
     case GS_DISPLAY:
         gs_pad_name(buf, len, pad, "\xe6\x98\xbe\xe7\xa4\xba\xe6\xa8\xa1\xe5\xbc\x8f");  /* 显示模式 */
         snprintf(buf + strlen(buf), len - strlen(buf), " %s",
-                 display_mode_name(state->game_display_mode));
+                 display_mode_name_engine(state->game_display_mode, state->select_engine));
         return true;
-    case GS_VKEY:
+    case GS_VKEY: {
         gs_pad_name(buf, len, pad, "\xe8\x99\x9a\xe6\x8b\x9f\xe6\x8c\x89\xe9\x94\xae");  /* 虚拟按键 */
-        snprintf(buf + strlen(buf), len - strlen(buf), " %s",
-                 state->game_virtual_keys ? "\xe5\xbc\x80" : "\xe5\x85\xb3"); /* 开/关 */
+        static const char *nm[] = {
+            "\xe5\x85\xb3",            /* 关 */
+            "\xe5\xbc\x80",            /* 开 */
+            "\xe8\x87\xaa\xe5\x8a\xa8", /* 自动 */
+        };
+        int v = (int)g_menu.game_virtual_keys;
+        if (v < 0) v = 0;
+        if (v > 2) v = 2;
+        snprintf(buf + strlen(buf), len - strlen(buf), " %s", nm[v]);
         return true;
+    }
     case GS_RESETMAP:
         snprintf(buf, len, "\xe8\xbf\x98\xe5\x8e\x9f\xe6\x98\xa0\xe5\xb0\x84");  /* 还原映射 */
         return true;
@@ -7980,20 +10948,22 @@ static int game_settings_build(menu_state_t *state, char buf[][64], int max) {
     /* 固定顺序 (不随文字数量重排, 冒号已通过对齐补齐) */
     int base[8];
     int m = 0;
+    /* V1.0.71: 无可用触屏时隐藏"虚拟按键"项 (虚拟按键无法操作) */
+    bool show_vkey = touch_available(state);
     if (state->select_mode == 1) {
         /* V1.0.68: GB/GBC 设置: 显示模式 / 虚拟按键 / 模拟灰度 / 音量 / 还原映射
-         * (已删除补充按键映射) */
+         * (已删除补充按键映射). V1.0.9x: 暴龙机独立设置 — 用「抗锯齿:EPX」替代「模拟灰度」 */
         base[m++] = GS_DISPLAY;
-        base[m++] = GS_VKEY;
-        base[m++] = GS_GRAY;
+        if (show_vkey) base[m++] = GS_VKEY;
+        if (state->select_engine == 5) base[m++] = GS_AA;   /* 暴龙机: 抗锯齿 EPX */
+        else                            base[m++] = GS_GRAY; /* GB/GBC: 模拟灰度 */
         base[m++] = GS_VOLUME;
-        base[m++] = GS_RESETMAP;
     } else {
         /* 电子词典/BBK 设置: 状态栏设置 / 显示模式 / 虚拟按键 / 抗锯齿 / 音量
          * (V1.0.68: 已删除 BBK 补充按键映射 + 还原映射, 保留 GB 的辅助键映射) */
         base[m++] = GS_STATUSBAR;
         base[m++] = GS_DISPLAY;
-        base[m++] = GS_VKEY;
+        if (show_vkey) base[m++] = GS_VKEY;
         base[m++] = GS_AA;
         base[m++] = GS_VOLUME;
     }
@@ -8050,40 +11020,53 @@ static bool game_settings_on_confirm(menu_state_t *state, int idx) {
         ESP_LOGI(TAG, "状态栏设置 -> %s", state->game_show_statusbar ? "显示" : "隐藏");
         return true;
     case GS_AA:
-        /* 抗锯齿: 单击两态循环: 关→EPX→关 (V1.0.58+) */
-        state->game_pic_opt = (uint8_t)((state->game_pic_opt + 1) % 2);
-        gam4980_set_pic_opt((int)state->game_pic_opt);
+        /* 抗锯齿: 单击两态循环: 关→EPX→关 (V1.0.58+); 暴龙机独立存储 */
+        if (state->select_engine == 5) {
+            vpet_aa_set((uint8_t)((vpet_aa_get() + 1) % 2));
+            ESP_LOGI(TAG, "暴龙机抗锯齿 -> %s", vpet_aa_get() ? "EPX" : "关");
+        } else {
+            state->game_pic_opt = (uint8_t)((state->game_pic_opt + 1) % 2);
+            gam4980_set_pic_opt((int)state->game_pic_opt);
+            ESP_LOGI(TAG, "BBK 抗锯齿 -> %s", state->game_pic_opt ? "EPX" : "关");
+        }
         menu_config_save();  /* 配置变更, 持久化 (TF + NVS) */
         state->editing_index = -1;
         select_game_invalidate_cache();
         state->needs_redraw = true;
-        {
-            static const char *nm[] = {"关", "EPX"};
-            ESP_LOGI(TAG, "BBK 抗锯齿 -> %s", nm[state->game_pic_opt]);
-        }
         return true;
     case GS_DISPLAY:
-        /* 显示模式: 点对点 -> 全屏 -> 拉伸 循环 (按引擎档位) */
+        /* 显示模式: 点对点 -> 全屏/放大 -> 拉伸 循环 (按引擎档位) */
         state->game_display_mode = (uint8_t)((state->game_display_mode + 1) %
                                              (display_mode_max(state) + 1));
-        if (state->select_mode == 1)
+        if (state->select_engine == 5) {
+            if (state->game_display_mode > 2) state->game_display_mode = 0;
+            s_vpet_display = state->game_display_mode;   /* 暴龙机独立存储 */
+        } else if (state->select_mode == 1) {
             engine_display_set(state->select_engine, state->game_display_mode);
-        else
+        } else {
             s_bbk_display = state->game_display_mode;
+        }
         menu_config_save();  /* 配置变更, 持久化 (TF + NVS) */
         state->editing_index = -1;
         select_game_invalidate_cache();
         state->needs_redraw = true;
-        ESP_LOGI(TAG, "显示模式 -> %s", display_mode_name(state->game_display_mode));
+        ESP_LOGI(TAG, "显示模式 -> %s",
+                 display_mode_name_engine(state->game_display_mode, state->select_engine));
         return true;
     case GS_VKEY:
-        /* V1.0.68: 游戏内屏幕虚拟按键开关 */
-        state->game_virtual_keys = !state->game_virtual_keys;
+        /* V1.0.94: 虚拟按键三态循环 关->开->自动->关.
+         * 直接操作全局 g_menu.game_virtual_keys, 确保与 config 打包/渲染用的是同一对象,
+         * 消除 state 参数可能指向副本导致的"切换后又被覆盖"问题. */
+        switch ((int)g_menu.game_virtual_keys) {
+            case 0: g_menu.game_virtual_keys = 1; break;  /* 关 -> 开 */
+            case 1: g_menu.game_virtual_keys = 2; break;  /* 开 -> 自动 */
+            default: g_menu.game_virtual_keys = 0; break; /* 自动 -> 关 */
+        }
+        ESP_LOGI(TAG, "虚拟按键 -> %d", (int)g_menu.game_virtual_keys);
         menu_config_save();
         state->editing_index = -1;
         select_game_invalidate_cache();
         state->needs_redraw = true;
-        ESP_LOGI(TAG, "虚拟按键 -> %s", state->game_virtual_keys ? "开" : "关");
         return true;
     case GS_RESETMAP:
         /* V1.0.68: 还原 8 键按键映射 (上下左右/A/B/返回菜单/多功能键) */
@@ -8132,8 +11115,13 @@ static bool game_settings_on_lr(menu_state_t *state, int idx, bool is_right) {
         state->needs_redraw = true;
         return true;
     case GS_VKEY:
-        /* V1.0.68: 虚拟按键开关 (左右循环) */
-        state->game_virtual_keys = !state->game_virtual_keys;
+        /* V1.0.94: 虚拟按键三态 左右切换 关<->开<->自动 */
+        {
+            int v = (int)g_menu.game_virtual_keys;
+            if (is_right) { v++;  if (v > 2) v = 0; }
+            else          { v--;  if (v < 0) v = 2; }
+            g_menu.game_virtual_keys = (uint8_t)v;
+        }
         menu_config_save();
         state->needs_redraw = true;
         return true;
@@ -8155,7 +11143,7 @@ static bool game_settings_on_lr(menu_state_t *state, int idx, bool is_right) {
 static const sub_page_def_t sub_pages[MENU_PAGE_COUNT] = {
     [MENU_PAGE_SELECT_GAME]       = { "电子词典游戏", select_game_build, select_game_on_confirm, NULL },
     /* [MENU_PAGE_GAMEPAD] 已删除: V1.0.18 重构后, 手柄配置不再走全屏子页,
-     * 全部走 list_dialog 弹窗 (gamepad_list_open), 由 main_items[MENU_PAGE_GAMEPAD]
+     * 全部走 list_dialog 弹窗 (gamepad_list_open), 由注册表 s_modules[6](手柄).sub_page
      * 在 MENU_ACTION_CONFIRM 时直接调用 gamepad_list_open. */
     [MENU_PAGE_VOLUME]            = { "音量调节",   volume_build,      volume_on_confirm,      volume_on_lr },
     [MENU_PAGE_SETTINGS]          = { "设置",       settings_build,    settings_on_confirm,    NULL },
@@ -8166,6 +11154,8 @@ static const sub_page_def_t sub_pages[MENU_PAGE_COUNT] = {
     [MENU_PAGE_MP3_PLAYER]        = { "MP3 播放器", mp3_build,         mp3_on_confirm,         NULL },
     [MENU_PAGE_GAME_SETTINGS]     = { "游戏设置",   game_settings_build, game_settings_on_confirm, game_settings_on_lr },
     [MENU_PAGE_GB_GAME]           = { "GB 游戏",    select_game_build, select_game_on_confirm, NULL },
+    [MENU_PAGE_WQX]               = { "wqx \xe6\x96\x87\xe6\x9b\xb2\xe6\x98\x9f", select_game_build, select_game_on_confirm, NULL },
+    [MENU_PAGE_VPET]              = { "vpet \xe6\x9a\xb4\xe9\xbe\x99\xe6\x9c\xba", select_game_build, select_game_on_confirm, NULL },
     [MENU_PAGE_BOOK]              = { "电子书",     NULL,              NULL,                   NULL },
 };
 
@@ -8344,7 +11334,7 @@ static void bt_connect_progress_cb(const char *stage) {
  * 多功能键 (F_FAV): 短按添加游戏到收藏栏
  * 不跨组件依赖: 直接调 gpio_get_level + bt_manager_is_key_pressed */
 #include "driver/gpio.h"
-#define FAV_COOLDOWN_MS    500     /* 触发后 0.5s 冷却, 防止重复 (提示也持续 0.5s) */
+#define FAV_COOLDOWN_MS    1000    /* V1.0.9x: 收藏/取消收藏提示与冷却均为 1s */
 static bool is_key_held(void) {
     if (gpio_get_level(GPIO_NUM_18) == 0) return true;
     if (bt_manager_is_connected() && bt_manager_is_key_pressed(F_CONFIRM)) return true;
@@ -8353,8 +11343,10 @@ static bool is_key_held(void) {
 /* 多功能键 (收藏) 是否被按住 */
 static bool is_space_held(void) {
     if (bt_manager_is_connected() && bt_manager_is_key_pressed(F_FAV)) return true;
-    /* 物理 KEY 按钮 (GPIO18) 按下 = 多功能键的兜底支持, 方便无手柄场景 */
-    if (gpio_get_level(GPIO_NUM_18) == 0) return true;
+    /* 物理 KEY 按钮 (GPIO18) 按下 = 多功能键的兜底, 方便无手柄场景.
+     * V1.0.69: 有触摸机型把它从"边沿收藏"里排除, 收藏改由物理 KEY 长按(KEY_FAV)
+     * 触发, 避免"按一下 KEY 就同时确认+收藏"的冲突. 无触摸机型保留边沿收藏兜底. */
+    if (!touch_panel_is_present() && gpio_get_level(GPIO_NUM_18) == 0) return true;
     return false;
 }
 
@@ -8389,7 +11381,127 @@ static bool get_current_selected_path(menu_state_t *state, char *path, int path_
     return p != NULL;
 }
 
+/* V1.0.69: 有触摸机型物理 KEY 长按 = 收藏/取消收藏当前项.
+ * 电子书书架与游戏列表(右栏焦点)都可收藏, 与边沿收藏同一套逻辑. */
+static void fav_toggle_current(menu_state_t *state) {
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    char path[256];
+    bool done = false;
+
+    if (state->current_page == MENU_PAGE_BOOK && !book_reader_is_open()
+        && state->select_focus == 1 && state->select_folder_idx != 0
+        && book_get_current_path(state, path, sizeof(path))) {
+        bool was = favorites_contains(FAV_ENGINE_BOOK, path);
+        if (was) favorites_remove(FAV_ENGINE_BOOK, path);
+        else favorites_add(FAV_ENGINE_BOOK, path);
+        snprintf(state->hint_text, sizeof(state->hint_text),
+                 was ? "\xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88\xe6\x94\xb6\xe8\x97\x8f\xe4\xb9\xa6\xe6\x9e\xb6"
+                     : "\xe5\xb7\xb2\xe6\xb7\xbb\xe5\x8a\xa0\xe6\x94\xb6\xe8\x97\x8f\xe4\xb9\xa6\xe6\x9e\xb6");
+        done = true;
+    } else if ((state->current_page == MENU_PAGE_SELECT_GAME
+                || state->current_page == MENU_PAGE_GB_GAME)
+               && state->select_focus == 1 && g_sub_count > 0
+               && get_current_selected_path(state, path, sizeof(path))) {
+        fav_engine_t fe = favorites_engine_for_path(path);
+        bool was = favorites_contains(fe, path);
+        if (was) favorites_remove(fe, path);
+        else favorites_add(fe, path);
+        snprintf(state->hint_text, sizeof(state->hint_text),
+                 was ? "\xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88\xe6\x94\xb6\xe8\x97\x8f"
+                     : "\xe5\xb7\xb2\xe6\xb7\xbb\xe5\x8a\xa0\xe6\x94\xb6\xe8\x97\x8f");
+        select_game_invalidate_cache();
+        done = true;
+    }
+    if (!done) return;
+    state->hint_until_ms = now + FAV_COOLDOWN_MS;
+    state->space_cooldown_until_ms = now + FAV_COOLDOWN_MS;
+    state->needs_redraw = true;
+}
+
 void menu_poll_long_press(menu_state_t *state) {
+    /* V1.0.9x: 应用管理网格长按满 2s (按住期间实时触发, 无需松手) 即弹管理确认框. */
+    if (state->current_page == MENU_PAGE_APP_MANAGER) {
+        if (s_app_detail) return;
+        uint32_t hold = input_touch_hold_ms();
+        if (hold >= 2000) {
+            int sx, sy;
+            if (input_touch_start_pos(&sx, &sy) && sx >= APPMGR_CATBAR_W) {
+                int cnt = app_cat_count((app_category_t)s_app_cat);
+                if (cnt > 0) {
+                    int cell_w = (SCREEN_W - APPMGR_CATBAR_W - 8) / APPMGR_GRID_COLS;
+                    int gsy = app_grid_start_y(cnt) - (int)app_current_view_px();
+                    int col = (sx - (APPMGR_CATBAR_W + 4)) / cell_w;
+                    int row = (sy - gsy) / app_grid_step_y();
+                    if (col >= 0 && col < APPMGR_GRID_COLS &&
+                        row >= 0 && row < APPMGR_GRID_ROWS) {
+                        int idx = (s_app_scroll + row) * APPMGR_GRID_COLS + col;
+                        app_category_t cat = (app_category_t)s_app_cat;
+                        if (idx >= 0 && idx < cnt && !app_item_is_mini(cat, idx)) {
+                            int phys = app_cat_phys(cat, idx);
+                            if (phys >= 0 && phys < (int)BBK_MODULE_COUNT &&
+                                s_modules[phys].kind != BBK_MOD_MANDATORY) {
+                                s_app_focus = idx;
+                                s_app_detail = true;
+                                s_app_detail_phys = phys;
+                                s_app_detail_draft = app_installed(state, phys);
+                                state->needs_redraw = true;
+                                ESP_LOGI(TAG, "应用管理长按2s: 弹管理框 phys=%d", phys);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;   /* 应用管理由本分支处理, 不进入下方主菜单长按逻辑 */
+    }
+
+    /* V1.0.9x: 主菜单长按图标 ≥5s → 弹「删除主菜单图标?」.
+     * 命中不可删除(强制项: 设置/应用管理等)忽略; 弹窗打开后不再重复触发. */
+    if (state->current_page == MENU_PAGE_MAIN && !s_main_del_active &&
+        !s_reorder_active &&           /* 编辑模式中: 由拿/放交互接管, 不再触发进入/删除 */
+        !state->list_dialog_active && !state->confirm_active) {
+        uint32_t hold = input_touch_hold_ms();
+        /* V1.0.9x: 主菜单编辑(排序)模式整体屏蔽: 不再长按3秒进入排序,
+         * 仅保留长按 5 秒 → 删除图标弹窗. (长按3秒自拍/未移动忽略.) */
+        if (hold >= 5000) {
+            /* 长按不动 ≥5s → 删除弹窗 */
+            int tx, ty;
+            if (input_get_touch_pos(&tx, &ty)) {
+                int total = menu_main_count(state);
+                if (total > 0) {
+                    int icenter = ((lroundf(state->main_cam_cur) % total) + total) % total;
+                    const int spacing = 100, cy = SCREEN_H / 2;
+                    int best = -1, best_d = 1 << 30;
+                    for (int i = 0; i < total; i++) {
+                        int diff = i - icenter;
+                        if (diff > total / 2) diff -= total;
+                        else if (diff < -total / 2) diff += total;
+                        int cx = SCREEN_W / 2 + diff * spacing;
+                        int ad = diff < 0 ? -diff : diff;
+                        int size = (ad == 0) ? 100 : 64;
+                        if (cx < -size || cx > SCREEN_W + size) continue;
+                        int dx = tx - cx, dy = ty - cy;
+                        int r = size / 2 + 15;
+                        if (dx * dx + dy * dy <= r * r) {
+                            int d = dx * dx + dy * dy;
+                            if (best < 0 || d < best_d) { best_d = d; best = i; }
+                        }
+                    }
+                    if (best >= 0) {
+                        int phys = menu_main_phys(state, best);
+                        const bbk_module_t *mod = (phys >= 0 && phys < (int)BBK_MODULE_COUNT)
+                                                  ? &s_modules[phys] : NULL;
+                        if (mod && mod->kind != BBK_MOD_MANDATORY) {
+                            s_main_del_active = true;
+                            s_main_del_phys = phys;
+                            state->needs_redraw = true;
+                            ESP_LOGI(TAG, "主菜单长按≥5s: 删除弹窗 phys=%d(%s)", phys, mod->id);
+                        }
+                    }
+                }
+            }
+        }
+    }
     /* 壁纸游戏选择器 (游戏列表层): 多功能键 (F_FAV/KEY) 按下 = 加入/移出游戏壁纸列表 */
     if (state->list_dialog_active && state->list_dialog_on_select == wp_picker_on_select) {
         uint32_t wpnow = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -8558,8 +11670,9 @@ void menu_check_dialog_timeout(void) {
         g_menu.needs_redraw = true;
     }
 
-    /* V1.0.40: 连接弹窗看门狗 — 5 秒硬超时, 不再宽限循环.
-     * 正常 3 秒内连上, 超过 5 秒视为失败, 强制取消连接并清理状态. */
+    /* V1.0.40: 连接弹窗看门狗 — 硬超时, 不再宽限循环.
+     * connect_task 每次尝试最多 5s, 共 CONNECT_MAX_ATTEMPTS(现在为 3) 次自动重试,
+     * 因此这里放宽到 15s, 给自动重试留足时间, 避免底层重连在后台时被误取消. */
     if (g_menu.connecting_popup_active && !g_menu.connecting_popup_success &&
         g_menu.connecting_popup_started_at_ms > 0) {
         uint32_t elapsed = now - g_menu.connecting_popup_started_at_ms;
@@ -8570,8 +11683,8 @@ void menu_check_dialog_timeout(void) {
             g_menu.connecting_popup_until_ms = 0;
             g_menu.connecting_popup_started_at_ms = 0;
             g_menu.needs_redraw = true;
-        } else if (elapsed > 5000) {
-            /* 5 秒超时: 取消连接任务, 清理所有连接状态, 提示失败 */
+        } else if (elapsed > 15000) {
+            /* 15 秒超时: 取消连接任务, 清理所有连接状态, 提示失败 */
             ESP_LOGW(TAG, "[5s 超时] 连接弹窗显示 %u ms, 强制取消并清理", (unsigned)elapsed);
             if (bt_manager_is_connecting()) bt_manager_cancel_connect();
             g_menu.bt_connect_awaiting = false;
@@ -8646,8 +11759,14 @@ extern bool bt_manager_is_ready(void);
  * 每 5 秒尝试连接一次 (静默: 不弹"正在连接"窗, 失败也不提示; 连上后由
  * bt_connect_callback 弹 1.2s "已连接" 提示)。
  * 多条历史记录时按最近使用顺序轮流尝试。 */
-#define BT_RETRY_INTERVAL_MS 5000
-#define BT_RETRY_SCAN_DURATION_MS 4000
+/* V1.0.xx(蓝牙提速): 早期版本连接很快, 后期改为"先扫描确认在线再连"(为避免崩溃).
+ * 扫描窗口不足 + 轮询间隔偏长是"连得慢/要多次"主因, 这里:
+ *   - 首次尝试提前: 200ms 后就立刻进入扫描, 不再干等 5s
+ *   - 缩短轮询周期 5s→3s, 延长单次扫描窗口 4s→6s,
+ *     让在线设备有更充分的时间被广播捕捉, 减少"一轮扫不到就作废"的情况 */
+#define BT_RETRY_INTERVAL_MS 3000
+#define BT_RETRY_SCAN_DURATION_MS 6000
+#define BT_RETRY_FIRST_DELAY_MS 200
 static void menu_poll_bt_history_retry(menu_state_t *state) {
     if (!state->settings.bt_enabled) return;
     if (bt_manager_is_suspended()) return;   /* 屏保挂起期间不自动重连 */
@@ -8677,8 +11796,8 @@ static void menu_poll_bt_history_retry(menu_state_t *state) {
     }
 
     if (state->bt_retry_next_ms == 0) {
-        /* 首次排期: 5 秒后开始第一次尝试 */
-        state->bt_retry_next_ms = now + BT_RETRY_INTERVAL_MS;
+        /* 首次排期: 提前到 200ms 后立即开始 (不再干等一个周期) */
+        state->bt_retry_next_ms = now + BT_RETRY_FIRST_DELAY_MS;
         return;
     }
     if (now < state->bt_retry_next_ms) return;
@@ -8766,6 +11885,12 @@ void menu_init(menu_state_t *state, st7305_handle_t *lcd) {
     state->settings.wifi_enabled = false;
     state->settings.battery = 100;
     state->settings.game_status_bar = true; /* 默认显示游戏状态栏 */
+    state->settings.feature_switch = MAINF_FEAT_ALL; /* 主菜单功能全部启用 */
+    /* V1.0.95: 应用管理: 出厂默认点亮 手柄/壁纸/存储 (可经应用管理隐藏);
+     * 其余可管理项 (阅读/音乐/番茄钟/仿真键鼠) 由应用管理点亮后再显示 */
+    state->settings.app_installed = APP_DEFAULT_INSTALLED_MASK;
+    state->settings.font_style = 0;                /* V1.0.89: 菜单字体默认粗体 */
+    font_zh_set_style(false);
     state->key_mapping_idx = -1;
     state->sup_map_idx = -1;
     state->gb_aux_prompt = false;
@@ -8778,14 +11903,15 @@ void menu_init(menu_state_t *state, st7305_handle_t *lcd) {
     state->select_game_idx = 0;
     state->select_game_scroll = 0;
     state->select_loaded = false;  /* 进入页面时再扫描子文件夹 */
-    /* 游戏设置默认: 全屏(1), 状态栏显示开, BBK 按键音效开 */
-    state->game_display_mode = 1;
+    /* 游戏设置默认: 拉伸(2), 状态栏显示开, BBK 按键音效开 */
+    state->game_display_mode = 2;
     state->game_key_sound = true;
     state->game_show_statusbar = true;
     /* V1.0.46+: GB 默认 4级点聚灰度 (1); 画面优化 (圆角平滑) 默认关闭 */
     state->game_gray_mode = 1;
     state->game_pic_opt = 1;  /* BBK 抗锯齿默认开启 (V1.0.53) */
-    state->game_virtual_keys = false;  /* V1.0.68: 虚拟按键默认关闭 */
+    state->game_virtual_keys = 2;  /* V1.0.94: 虚拟按键默认'自动' (0=关 1=开 2=自动) */
+    state->game_vkey_auto = true;      /* V1.0.71: 兼容残留, 已无设置入口 */
     /* 电子书设置默认: 敲击翻页开, 灵敏度中, 夜间模式关, 显示页码开 */
     state->book_loaded = false;
     state->book_knock = false;   /* 暂时停用敲击翻页 */
@@ -8804,6 +11930,10 @@ void menu_init(menu_state_t *state, st7305_handle_t *lcd) {
     state->wallpaper_timeout_min = 3;
     state->wallpaper_bmp_fps = 1;
     state->wallpaper_game_rot = 0;
+    state->wallpaper_auto_shutdown = false;   /* 默认自动关机: 关 (永不关机) */
+    state->wallpaper_shutdown_time = 1;       /* 默认 1 小时 */
+    state->wallpaper_shutdown_unit = 1;       /* 默认单位: 小时 */
+    state->wallpaper_touch_exit = false;      /* 默认触摸退出: 禁止 */
     state->pomo_work_min = 25;
     state->pomo_rest_min = 5;
     state->pomo_reminder = true;
@@ -8836,21 +11966,25 @@ void menu_init(menu_state_t *state, st7305_handle_t *lcd) {
         touch_panel_deinit();
         ESP_LOGI(TAG, "开机: 触摸屏已禁用 (配置)");
     }
-    /* === 彩蛋: 恢复隐藏游戏菜单显示状态 (默认隐藏) === */
+    /* === 彩蛋: 恢复隐藏游戏菜单显示状态 (默认隐藏) ===
+     * V1.0.72: v19+ 配置已由 menu_config_load 从 TF/NVS 恢复 show_hidden_menus;
+     * 仅旧配置 (s_cfg_has_hidden=false) 回退读取旧 NVS key "show_hidden". */
     state->sponsor_confirm_count = 0;
     state->sponsor_notice_active = false;
-    state->show_hidden_menus = false;
-    {
-        nvs_handle_t h;
-        if (nvs_open("menu_settings", NVS_READONLY, &h) == ESP_OK) {
-            uint8_t v = 0;
-            if (nvs_get_u8(h, "show_hidden", &v) == ESP_OK)
-                state->show_hidden_menus = (v != 0);
-            nvs_close(h);
+    if (!s_cfg_has_hidden) {
+        state->show_hidden_menus = false;
+        {
+            nvs_handle_t h;
+            if (nvs_open("menu_settings", NVS_READONLY, &h) == ESP_OK) {
+                uint8_t v = 0;
+                if (nvs_get_u8(h, "show_hidden", &v) == ESP_OK)
+                    state->show_hidden_menus = (v != 0);
+                nvs_close(h);
+            }
         }
-        if (state->show_hidden_menus)
-            ESP_LOGW(TAG, "彩蛋: 上次已解锁隐藏游戏菜单 (测试功能, 可能闪退)");
     }
+    if (state->show_hidden_menus)
+        ESP_LOGW(TAG, "彩蛋: 上次已解锁隐藏游戏菜单 (测试功能, 可能闪退)");
     /* V1.0.46: 恢复 NVS 保存的时间; 无记录且时间无效时默认 2026-08-01 */
     time_load_from_nvs();
     /* 时间: 从 RTC 读取 */
@@ -8861,10 +11995,14 @@ void menu_init(menu_state_t *state, st7305_handle_t *lcd) {
 
     /* 用户需求: 图标全部内置, 不从 SD 卡加载主题图标 */
 
-    /* 注册蓝牙连接状态回调 (用于自动更新状态栏图标) */
+    /* 注册蓝牙连接回调 (用于自动更新状态栏图标) */
     bt_manager_set_connect_callback(bt_connect_callback);
     /* 注册蓝牙连接进度回调 (用于显示连接阶段) */
     bt_manager_set_connect_progress_cb(bt_connect_progress_cb);
+    /* wqx 文曲星: 注入退出检测回调 (游戏内物理返回键/手柄 BACK/F_EXIT 触发退出) */
+    lavax_set_exit_check(wqx_exit_check);
+    /* V1.0.9x: 注入退出确认浮层绘制 (文曲星两步退出确认, 与步步高一致) */
+    lavax_set_exit_confirm_ui(wqx_confirm_draw);
 }
 
 /* ============ 渲染 ============ */
@@ -9330,7 +12468,7 @@ void menu_render(menu_state_t *state) {
         pomodoro_render(state->lcd);
         return;
     }
-    if (state->current_page == MENU_PAGE_MAIN && state->anim_start_ms > 0) {
+    if (state->current_page == MENU_PAGE_MAIN && state->main_cam_anim_start > 0) {
         state->needs_redraw = true;
     }
     /* V1.0.42: 时间弹窗编辑模式下, 字段闪烁需要周期性重绘 (每 500ms) */
@@ -9364,8 +12502,45 @@ void menu_render(menu_state_t *state) {
             state->needs_redraw = true;
         }
     }
+    /* USB 键鼠页: 触控板必须每帧轮询 (即使无重绘也要持续上报鼠标移动/点击),
+     * 否则静态画面下 hid_trackpad_poll 被下方 needs_redraw 门控, 触控板完全失灵.
+     * V1.0.73: 键盘布局二级菜单打开时不轮询, 避免在菜单上点选时被当触控板
+     * 上报到主机鼠标. */
+    if (state->current_page == MENU_PAGE_USB_HID && !state->list_dialog_active) {
+        hid_trackpad_poll(state);
+    }
+    /* V1.0.79: 按击反馈超时自动还原 (触发一次重绘, 让按键恢复描边) */
+    if (s_press_active) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now_ms - s_press_ms >= PRESS_FLASH_MS) {
+            s_press_active = false;
+            state->needs_redraw = true;
+        }
+    }
     if (!state->needs_redraw) return;
     state->needs_redraw = false;
+
+    /* 兜底: 返回主菜单时强制退出所有 USB 状态 (任意离开路径, 含断电重启后导航):
+     *  - 不在键鼠页但 HID 仍在运行 -> 软重启 (退干净并恢复 USB Serial/JTAG 串口;
+     *    同一引导内 OTG 卸载后无法切回 Serial/JTAG, 全新引导由 bootloader 重建串口)
+     *  - 回到干净主菜单(无弹窗)但 U盘(MSC) 仍运行 -> 停止 MSC 并重新挂载 TF 卡
+     * 二者只触发一次: 因停止后 *_is_running() 立即为 false. */
+    if (state->current_page != MENU_PAGE_USB_HID && usb_hid_is_running()) {
+        usb_hid_stop();
+        ESP_LOGI(TAG, "兜底: HID 残留, 已停止并切回 Serial/JTAG 串口 (无需重启)");
+    }
+    {
+        extern bool usbh_msc_is_running(void);
+        extern void usbh_msc_stop(void);
+        extern int sd_remount_vfs_from_card(void);
+        extern void sd_watcher_set_paused(bool);
+        if (state->current_page == MENU_PAGE_MAIN && !state->list_dialog_active &&
+            !state->confirm_active && usbh_msc_is_running()) {
+            usbh_msc_stop();
+            sd_remount_vfs_from_card();
+            sd_watcher_set_paused(false);
+        }
+    }
 
     /* === 弹窗内仅选项变化: 跳过整页重绘, 仅更新弹窗两行 ===
      * 帧缓冲中仍保留上一帧的"底页+旧弹窗"内容, 这里只重绘变化的行.
@@ -9399,6 +12574,24 @@ void menu_render(menu_state_t *state) {
         } else if (state->current_page == MENU_PAGE_GB_GAME) {
             /* V1.0.46: GB 复用电子词典分栏模板 (左栏 设置/收藏/文件夹, 右栏游戏) */
             render_select_game_two_cols(state);
+        } else if (state->current_page == MENU_PAGE_WQX) {
+            /* wqx 文曲星: 复用 console 分栏模板 (左栏 收藏/文件夹, 右栏 .lav) */
+            render_select_game_two_cols(state);
+        } else if (state->current_page == MENU_PAGE_VPET) {
+            /* vpet 暴龙机: 复用 console 分栏模板 (左栏 收藏/文件夹, 右栏 .bin) */
+            render_select_game_two_cols(state);
+        } else if (state->current_page == MENU_PAGE_USB_HID) {
+            /* USB HID 键鼠: 全屏键盘 + 触控板页 */
+            render_usb_hid(state);
+        } else if (state->current_page == MENU_PAGE_APP_MANAGER) {
+            /* 应用管理: 全屏商店页 (电子词典风格: 左分类栏 + 右图标网格 + 详情抽屉) */
+            render_app_manager(state);
+        } else if (state->current_page == MENU_PAGE_NETTOOL) {
+            /* V1.0.9x: 网络工具独立主菜单页 */
+            nettool_render(state);
+        } else if (state->current_page == MENU_PAGE_DIAGNOSIS) {
+            /* V1.0.9x: 故障诊断独立主菜单页 */
+            diag_render(state);
         } else {
             render_sub(state);
         }
@@ -9740,6 +12933,35 @@ bool menu_handle_touch(menu_state_t *state, int x, int y) {
         return true;   /* 消费点击, 不穿透 */
     }
 
+    /* USB 键鼠: 键盘点击 / 触控板点击都直接执行 HID 动作.
+     * 触控板滑动在 render_usb_hid 里每帧轮询 input_get_touch_pos 处理.
+     * V1.0.73: 若"键盘布局"二级菜单打开, 触摸必须落到下方列表弹窗行 hit-test,
+     * 不能被 hid_ui_hit 当底层键盘/触控板消费 (否则点菜单任一项只触发底层
+     * 重绘"闪烁", 永远无法选中/返回). */
+    if (state->current_page == MENU_PAGE_USB_HID) {
+        if (!state->list_dialog_active) {
+            if (hid_ui_hit(state, x, y)) {
+                state->needs_redraw = true;
+            }
+            return false;   /* 消费, 不触发额外 CONFIRM */
+        }
+        /* 弹窗打开: 不在此消费, 落到下方列表弹窗行 hit-test */
+    }
+
+    /* 应用管理: 全屏商店页自绘, 由页面内部 hit-test 处理 (分类点选/格子/详情开关) */
+    if (state->current_page == MENU_PAGE_APP_MANAGER) {
+        return app_manager_handle_touch(state, x, y);
+    }
+
+    /* V1.0.9x: 网络工具独立主菜单页: 由页面内部 hit-test 处理 */
+    if (state->current_page == MENU_PAGE_NETTOOL) {
+        return nettool_touch(state, x, y);
+    }
+    /* V1.0.9x: 故障诊断独立主菜单页: 由页面内部 hit-test 处理 */
+    if (state->current_page == MENU_PAGE_DIAGNOSIS) {
+        return diag_touch(state, x, y);
+    }
+
     /* V1.0.68: 电子书阅读器打开时按区域翻页/进设置 (上半=上页, 下半=下页, 中间=设置),
      * 触摸坐标已含旋转映射. 返回 false 避免再触发一次 CONFIRM. */
     if (state->current_page == MENU_PAGE_BOOK && book_reader_is_open()) {
@@ -9752,9 +12974,11 @@ bool menu_handle_touch(menu_state_t *state, int x, int y) {
     /* 列表弹窗: 行 hit-test */
     if (state->list_dialog_active) {
         /* V1.0.68: 番茄钟弹窗行布局与标准一致 (content_y0=29, line_h=40),
-         * 支持触摸点选; 其他自定义弹窗(时间等单行多字段)不做行定位. */
+         * 支持触摸点选; 其他自定义弹窗(时间等单行多字段)不做行定位.
+         * USB 存储挂载界面 (sd_msc_active_on_key) 同样支持: 整窗内容区点选. */
         if (state->list_dialog_on_render &&
-            state->list_dialog_on_key != pomodoro_dialog_on_key) {
+            state->list_dialog_on_key != pomodoro_dialog_on_key &&
+            state->list_dialog_on_key != sd_msc_active_on_key) {
             return false;
         }
         list_dialog_geom_t g;
@@ -9763,7 +12987,11 @@ bool menu_handle_touch(menu_state_t *state, int x, int y) {
             return false;   /* 点在弹窗外 */
         }
         int target = -1;
-        if (g.footer_y >= 0 && y >= g.footer_y && y < g.footer_y + g.line_h) {
+        /* USB 存储挂载界面: 整窗内容区点选"退出挂载" (单选项) */
+        if (state->list_dialog_on_render &&
+            state->list_dialog_on_key == sd_msc_active_on_key) {
+            target = 0;
+        } else if (g.footer_y >= 0 && y >= g.footer_y && y < g.footer_y + g.line_h) {
             target = state->list_dialog_count - 1;   /* 底部固定"返回"行 */
         } else {
             int vis = (y - g.content_y0) / g.line_h;
@@ -9783,19 +13011,61 @@ bool menu_handle_touch(menu_state_t *state, int x, int y) {
 
     /* 主菜单桌面: 图标 hit-test (与 render_main 布局一致) */
     if (state->current_page == MENU_PAGE_MAIN) {
+        /* V1.0.9x: 编辑模式 — 只点中间图标可拿起; 点下方被抬起图标=放回中间; 左右滑动切菜单 */
+        if (s_reorder_active) {
+            if (s_hold_active && y >= 180) {
+                menu_hold_drop(state);                 /* 点下方被抬起的图标 → 放回中间 */
+            } else if (!s_hold_active) {
+                /* 只允许点中间(选中)图标拿起, 左/右图标不可点 */
+                int btotal = menu_main_count(state);
+                if (btotal > 0 && x >= SCREEN_W / 2 - 50 && x <= SCREEN_W / 2 + 50 &&
+                    y >= SCREEN_H / 2 - 50 && y <= SCREEN_H / 2 + 50) {
+                    int selidx = ((lroundf(state->main_cam_cur) % btotal) + btotal) % btotal;
+                    if (selidx >= 0 && selidx < btotal) menu_hold_pick(state, selidx);
+                }
+            }
+            return true;
+        }
+        /* V1.0.9x: 删除弹窗打开时, 消费弹窗内交互 (确定=删除, 取消/窗外=关闭) */
+        if (s_main_del_active) {
+            int dx = (SCREEN_W - APPMGR_DETAIL_W) / 2;
+            int dy = (SCREEN_H - APPMGR_DETAIL_H) / 2;
+            if (x < dx || x >= dx + APPMGR_DETAIL_W || y < dy || y >= dy + APPMGR_DETAIL_H) {
+                s_main_del_active = false; s_main_del_phys = -1;
+                state->needs_redraw = true; return true;
+            }
+            int btn = app_pop_hit_button(x, y);
+            if (btn == 1) {
+                if (s_main_del_phys >= 0 && s_main_del_phys < (int)BBK_MODULE_COUNT &&
+                    s_modules[s_main_del_phys].kind != BBK_MOD_MANDATORY) {
+                    app_set_installed(state, s_main_del_phys, false);
+                    menu_config_save();
+                    menu_main_restore_position(state);
+                }
+                s_main_del_active = false; s_main_del_phys = -1;
+                s_main_del_swallow = true;          /* 吞掉后续自动 CONFIRM 防穿透 */
+                state->needs_redraw = true; return true;
+            }
+            if (btn == 0) {
+                s_main_del_active = false; s_main_del_phys = -1;
+                state->needs_redraw = true; return true;
+            }
+            state->needs_redraw = true; return true;
+        }
         int total = menu_main_count(state);
         if (total <= 0) return false;
-        int sel = state->selected_index;
+        /* V1.0.97: 命中以当前相机中心为依据, 与 render_main 布局一致 (含动画/拖动中) */
+        int icenter = ((lroundf(state->main_cam_cur) % total) + total) % total;
         const int spacing = 100;          /* 与 render_main 的 icon_spacing 一致 */
         const int cy = SCREEN_H / 2;      /* icon_center_y */
         int best = -1, best_d = 1 << 30;
         for (int i = 0; i < total; i++) {
-            int diff = i - sel;
+            int diff = i - icenter;
             if (diff > total / 2) diff -= total;
             else if (diff < -total / 2) diff += total;
             int cx = SCREEN_W / 2 + diff * spacing;
             int ad = diff < 0 ? -diff : diff;
-            int size = (ad == 0) ? 100 : (ad == 1) ? 70 : (ad == 2) ? 50 : 40;
+            int size = (ad == 0) ? 100 : 64;
             if (cx < -size || cx > SCREEN_W + size) continue;  /* 屏幕外 */
             int dx = x - cx, dy = y - cy;
             int r = size / 2 + 15;        /* 15px 触屏容差 */
@@ -9806,7 +13076,8 @@ bool menu_handle_touch(menu_state_t *state, int x, int y) {
         }
         if (best >= 0) {
             state->selected_index = best;
-            state->anim_start_ms = 0;     /* 直接定位, 不播滑动动画(马上进入子页) */
+            state->main_cam_anim_start = 0;   /* 直接定位, 不播滑动动画(马上进入子页) */
+            state->main_cam_cur = (float)best;
             state->needs_redraw = true;
             ESP_LOGI(TAG, "触摸点击主菜单图标 %d", best);
             return true;
@@ -9819,6 +13090,8 @@ bool menu_handle_touch(menu_state_t *state, int x, int y) {
      * 行高 32, 起点 y=30. 左栏命中=切焦点到右栏, 右栏命中=触发对应项 (启动/设置). */
     if (state->current_page == MENU_PAGE_SELECT_GAME ||
         state->current_page == MENU_PAGE_GB_GAME ||
+        state->current_page == MENU_PAGE_WQX ||
+        state->current_page == MENU_PAGE_VPET ||
         (state->current_page == MENU_PAGE_BOOK && !book_reader_is_open())) {
         /* V1.0.68: 电子书竖屏二级菜单 (选文件夹/选小说) 触摸命中, 物理坐标旋转到逻辑竖屏 */
         if (state->current_page == MENU_PAGE_BOOK &&
@@ -9861,7 +13134,7 @@ bool menu_handle_touch(menu_state_t *state, int x, int y) {
         }
         int left_total = (state->current_page == MENU_PAGE_BOOK)
                              ? book_sidebar_total()
-                             : (3 + g_folder_count);   /* 设置/收藏/全部 + 文件夹 */
+                             : select_folder_total();   /* 设置/收藏[/全部] + 文件夹 */
         int right_total = g_sub_count;
 
         /* V1.0.68 fix: 电子书横屏 rot=1(下) 时菜单渲染走 flush_rotated 180° 翻转,
@@ -9962,20 +13235,52 @@ bool menu_handle_touch(menu_state_t *state, int x, int y) {
     return false;
 }
 
-/* V1.0.66: 主菜单拖动松手吸附 (支持跨多格). */
-void menu_drag_settle(menu_state_t *state, int steps) {
-    if (!state || steps == 0) return;
+/* V1.0.97: 主菜单相机吸附/切换动画. from 为当前相机(格, 可小数), to_idx 为目标
+ * 索引; 相机插值到 to_idx 的最近同余位置(保证 wrap 走最短路径), 从而任意拖动距离
+ * 松手都"停在指下"且无像素跳变回弹. selected_index 立即置 to_idx(逻辑选中). */
+void menu_main_cam_animate(menu_state_t *state, float from, int to_idx, uint32_t dur_ms) {
+    if (!state) return;
     int total = menu_main_count(state);
-    if (total <= 0) return;
-    int prev = state->selected_index;
-    int sel = ((prev + steps) % total + total) % total;   /* 循环 wrap */
-    if (sel == prev) return;   /* 整圈回到原位, 不切换 */
-    state->prev_selected = prev;
-    state->anim_direction = (steps > 0) ? -1 : 1;   /* 与按键 RIGHT/LEFT 动画方向一致 */
-    state->anim_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    state->selected_index = sel;
+    if (total <= 0) { state->selected_index = to_idx; return; }
+    int to = to_idx % total;
+    if (to < 0) to += total;
+    float from_c = from;
+    float to_c = (float)to;
+    /* 在同余位置里选离 from 最近的一个, 保证循环 wrap 只走最短路径 */
+    float half = (float)total / 2.0f;
+    while (to_c - from_c >  half) to_c -= (float)total;
+    while (from_c - to_c >  half) to_c += (float)total;
+    /* 近乎未移动: 直接定档, 不过动画 */
+    if (fabsf(to_c - from_c) < 0.05f) {
+        state->selected_index = to;
+        state->main_cam_anim_start = 0;
+        state->main_cam_cur = to_c;
+        state->needs_redraw = true;
+        return;
+    }
+    state->selected_index = to;
+    state->main_cam_anim_from = from_c;
+    state->main_cam_anim_to   = to_c;
+    state->main_cam_anim_start = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    state->main_cam_anim_dur   = dur_ms ? dur_ms : 1;
+    state->main_cam_anim_sel   = to;
+    state->main_drag_active = false;
     state->needs_redraw = true;
-    ESP_LOGI(TAG, "拖动吸附 steps=%d %d->%d", steps, prev, sel);
+    ESP_LOGI(TAG, "主菜单相机动画 %.2f->%.2f (sel=%d)", from_c, to_c, to);
+}
+
+/* V1.0.9x: 从任何弹窗/设置/程序返回主菜单时, 立即恢复"启动该页前的位置":
+ * 同步逻辑选中 selected_index + 视觉相机 main_cam_cur, 并清除可能残留的
+ * 滑动动画/拖动态 (否则返回瞬间相机可能从上次小数位置续播动画或跳动, 造成
+ * "没有停在上一次位置"的感觉). */
+static void menu_main_restore_position(menu_state_t *state) {
+    if (!state) return;
+    int restore_idx = state->main_selected_index;
+    state->selected_index = restore_idx;
+    state->main_cam_cur = (float)restore_idx;
+    state->main_cam_anim_start = 0;
+    state->main_cam_anim_sel = restore_idx;
+    state->main_drag_active = false;
 }
 
 /* V1.0.68: 游戏二级菜单右栏拖动松手吸附. steps 正=选中下移, 负=选中上移.
@@ -10014,7 +13319,15 @@ void menu_select_game_touch_track(menu_state_t *state, int ty, int off) {
  * 的 scroll 钳制自动滚动). 自定义渲染弹窗(时间等单行多字段)不做行定位. */
 void menu_list_dialog_touch_track(menu_state_t *state, int ty) {
     if (!state || !state->list_dialog_active || state->list_dialog_count <= 0) return;
-    if (state->list_dialog_on_render) return;
+    if (state->list_dialog_on_render) {
+        /* USB 存储挂载界面: 整窗按下即选中"退出挂载" */
+        if (state->list_dialog_on_key == sd_msc_active_on_key &&
+            state->list_dialog_selected != 0) {
+            state->list_dialog_selected = 0;
+            state->needs_redraw = true;
+        }
+        return;
+    }
     list_dialog_geom_t g;
     list_dialog_calc_geom(state, &g);
     int sel = -1;
@@ -10045,8 +13358,47 @@ void menu_list_dialog_release(menu_state_t *state) {
     state->needs_redraw = true;
 }
 
+/* V1.0.90: 列表弹窗当前内容是否可滚动.
+ * 仅当内容项数超过可见行数时才允许跟手拖动滚动; 全部显示得下时返回 false,
+ * 使设置等短列表屏蔽"滑动拖动"动作 (点击选中/确认仍正常, 走 hit-test). */
+bool menu_list_dialog_scrollable(const menu_state_t *state) {
+    if (!state || !state->list_dialog_active || state->list_dialog_count <= 0) return false;
+    if (state->list_dialog_on_render) return false;   /* 自定义渲染弹窗(时间等)不做拖动 */
+    list_dialog_geom_t g;
+    list_dialog_calc_geom(state, &g);
+    return g.content_count > g.content_visible;
+}
+
 void menu_touch_long_press(menu_state_t *state, int x, int y) {
     if (!state) return;
+    /* V1.0.9x: 应用管理网格长按 = 弹「管理弹窗」(仅可管理非强制模块).
+     * 迷你应用/强制模块没有主菜单显隐开关, 不弹窗. */
+    if (state->current_page == MENU_PAGE_APP_MANAGER) {
+        if (s_app_detail) return;                       /* 弹窗已开, 忽略长按 */
+        if (x < APPMGR_CATBAR_W) return;                /* 左侧分类栏不弹 */
+        int grid_x0 = APPMGR_CATBAR_W;
+        int cnt = app_cat_count((app_category_t)s_app_cat);
+        if (cnt <= 0) return;
+        int cell_w = (SCREEN_W - grid_x0 - 8) / APPMGR_GRID_COLS;
+        int gsy = app_grid_start_y(cnt) - (int)app_current_view_px();
+        int step_y = app_grid_step_y();
+        int col = (x - (grid_x0 + 4)) / cell_w;
+        int row = (y - gsy) / step_y;
+        if (col < 0 || col >= APPMGR_GRID_COLS || row < 0 || row >= APPMGR_GRID_ROWS) return;
+        int idx = (s_app_scroll + row) * APPMGR_GRID_COLS + col;
+        if (idx < 0 || idx >= cnt) return;
+        app_category_t cat = (app_category_t)s_app_cat;
+        if (app_item_is_mini(cat, idx)) return;         /* 迷你应用无主菜单显隐开关 */
+        int phys = app_cat_phys(cat, idx);
+        if (phys < 0 || phys >= (int)BBK_MODULE_COUNT) return;
+        if (s_modules[phys].kind == BBK_MOD_MANDATORY) return;  /* 强制模块无可管理开关 */
+        s_app_focus = idx;
+        s_app_detail = true;
+        s_app_detail_phys = phys;
+        s_app_detail_draft = app_installed(state, phys);
+        state->needs_redraw = true;
+        return;
+    }
     if (state->current_page != MENU_PAGE_SELECT_GAME && state->current_page != MENU_PAGE_GB_GAME) return;
     if (x < SELECT_RIGHT_X || x > SCREEN_W - 4) return;
     if (g_sub_count <= 0) return;
@@ -10092,7 +13444,193 @@ bool menu_modal_active(const menu_state_t *state) {
     return s_pomo_active;   /* 番茄钟倒计时全屏覆盖 */
 }
 
+/* V1.0.9x: 打开某个物理模块的主页/主页弹窗 (主菜单确认 与 应用管理双击 共用).
+ * phys = 模块注册表物理索引; main_idx = 主菜单中被选中项索引 (用于返回恢复;
+ * 应用管理双击进入时传 -1, 不扰动主菜单选中). */
+static void menu_enter_module(menu_state_t *state, int phys, int main_idx) {
+    const bbk_module_t *mod = bbk_module(phys);
+    menu_page_t target = mod ? mod->sub_page : MENU_PAGE_MAIN;
+    if (target == MENU_PAGE_RETURN_GAME) { return; }   /* TODO: 返回游戏 */
+    /* V1.0.9x: 未完成占位应用: 弹"开发中"提示, 不进入页面, 不加载任何核心 */
+    if (mod && mod->dev_pending) {
+        if (main_idx >= 0) state->main_selected_index = main_idx;
+        state->hint_text[0] = '\0';
+        strncpy(state->hint_text, "\xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad", sizeof(state->hint_text) - 1); /* 开发中 */
+        state->hint_until_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 1000; /* V1.0.9x: "开发中"提示 1 秒自动关闭 */
+        state->needs_redraw = true;
+        return;
+    }
+    /* 网络工具: 全屏独立主菜单页 */
+    if (target == MENU_PAGE_NETTOOL) {
+        if (main_idx >= 0) state->main_selected_index = main_idx;
+        state->module_return_page = (state->current_page == MENU_PAGE_APP_MANAGER) ? MENU_PAGE_APP_MANAGER : MENU_PAGE_MAIN;
+        nettool_reset(state);
+        state->current_page = MENU_PAGE_NETTOOL;
+        state->selected_index = 0;
+        state->scroll_offset = 0;
+        state->needs_redraw = true;
+        return;
+    }
+    /* 故障诊断: 全屏独立主菜单页 */
+    if (target == MENU_PAGE_DIAGNOSIS) {
+        if (main_idx >= 0) state->main_selected_index = main_idx;
+        state->module_return_page = (state->current_page == MENU_PAGE_APP_MANAGER) ? MENU_PAGE_APP_MANAGER : MENU_PAGE_MAIN;
+        diag_reset(state);
+        state->current_page = MENU_PAGE_DIAGNOSIS;
+        state->selected_index = 0;
+        state->scroll_offset = 0;
+        state->needs_redraw = true;
+        return;
+    }
+    /* 弹窗式入口 (手柄/设置/存储/壁纸/番茄钟/USB键鼠): 不管从主菜单还是应用管理进,
+     * 都弹对应弹窗, 关闭后返回前一个页面 (应用管理即回到商店). */
+    if (target == MENU_PAGE_GAMEPAD)          { if (main_idx >= 0) state->main_selected_index = main_idx; gamepad_list_open(state); return; }
+    if (target == MENU_PAGE_SETTINGS)         { if (main_idx >= 0) state->main_selected_index = main_idx; open_settings_dialog(state); return; }
+    if (target == MENU_PAGE_SETTINGS_SD)      { if (main_idx >= 0) state->main_selected_index = main_idx; open_sd_dialog(state); return; }
+    if (target == MENU_PAGE_WALLPAPER)        { if (main_idx >= 0) state->main_selected_index = main_idx; open_wallpaper_dialog(state); return; }
+    if (target == MENU_PAGE_POMODORO)         { if (main_idx >= 0) state->main_selected_index = main_idx; open_pomodoro_dialog(state); return; }
+    /* USB 键鼠: 布局弹窗必须在"非应用管理"页面上下文打开, 否则弹窗触摸会被
+     * 应用管理网格 (app_manager_handle_touch) 拦截 → 点击穿透, 无法选择布局.
+     * 从应用管理进入时: 先把 current_page 切到 MAIN, 弹窗关闭后经
+     * list_dialog_return_page 回应用管理. 与主菜单进入行为一致. */
+    if (target == MENU_PAGE_USB_HID) {
+        if (main_idx >= 0) state->main_selected_index = main_idx;
+        if (state->current_page == MENU_PAGE_APP_MANAGER) {
+            /* 记住返回页 (应用管理), 切到 MAIN 打开布局弹窗避免触摸穿透 */
+            menu_page_t ret = state->current_page;
+            state->current_page = MENU_PAGE_MAIN;
+            open_usb_hid_layout_dialog(state);
+            state->list_dialog_return_page = ret;   /* 弹窗关闭后回应用管理 */
+        } else {
+            open_usb_hid_layout_dialog(state);
+        }
+        return;
+    }
+    /* 应用管理: 全屏商店页 (左侧分类栏 + 右图标网格 + 弹窗开关) */
+    if (target == MENU_PAGE_APP_MANAGER) {
+        if (main_idx >= 0) state->main_selected_index = main_idx;
+        s_app_cat = APP_CAT_ENGINE;   /* 进入默认定位引擎分类首位 */
+        s_app_focus = 0;
+        s_app_detail = false;
+        s_app_detail_phys = -1;
+        s_app_tap_select = false;
+        app_manager_reset_scroll();      /* 进入内容页卷回顶部并清动画残留 */
+        s_app_drag_active = false;
+        s_app_last_tap_idx = -1;      /* 清双击记忆 */
+        s_app_last_tap_ms = INT32_MIN;
+        state->current_page = MENU_PAGE_APP_MANAGER;
+        state->selected_index = 0;
+        state->scroll_offset = 0;
+        state->needs_redraw = true;
+        return;
+    }
+    /* 保存当前主菜单位置, 二级菜单返回时恢复 */
+    if (main_idx >= 0) state->main_selected_index = main_idx;
+    /* V1.0.9x: 从应用管理进入全屏模块时, 记录返回页为应用管理,
+     * 退出该模块(BACK/返回项)时回到应用管理而非主菜单. */
+    state->module_return_page = (state->current_page == MENU_PAGE_APP_MANAGER) ? MENU_PAGE_APP_MANAGER : MENU_PAGE_MAIN;
+    state->current_page = target;
+    state->selected_index = 0;
+    state->scroll_offset = 0;
+    state->needs_redraw = true;
+    if (target == MENU_PAGE_BOOK) {
+        state->book_loaded = false;   /* 每次进入重新扫描书单 */
+        /* V1.0.9x: 打开「阅读」应先进入书架, 而非直接落回上次阅读位置:
+         * 关闭残留打开的阅读器, 焦点回到左栏书单. */
+        if (book_reader_is_open()) book_reader_close();
+        state->select_focus = 0;
+        state->select_game_idx = 0;
+        state->select_game_scroll = 0;
+        ESP_LOGI(TAG, "[DBG] enter BOOK (menu_enter_module) focus=%d fold=%d isopen=%d",
+                 state->select_focus, state->select_folder_idx, (int)book_reader_is_open());
+    }
+
+    /* 进入对应二级菜单后立马后台加载该菜单的引擎核心 (按需加载, 释放主菜单时的内存压力)
+     * - 电子词典: 触发 gam4980 后台初始化 (libretro core + ROM 预读)
+     * - GB:       预分配 instance (含 struct gb_s ~17KB) 到内部 RAM
+     * 引擎后台加载为幂等操作, 重复进入不会重复加载. */
+    if (target == MENU_PAGE_SELECT_GAME) {
+        state->select_mode = 0;  /* 电子词典 */
+        state->game_display_mode = s_bbk_display;
+        engine_manager_load(ENGINE_GAM4980, state->lcd);
+    } else if (target == MENU_PAGE_GB_GAME) {
+        state->select_mode = 1;  /* console 使用电子词典分栏菜单 */
+        /* 平台按主菜单物理索引映射 (1=GB,2=GBC,3=FC,4=arduboy)
+         * select_engine: 0=GB, 1=GBC, 2=FC(NES 合并), 3=arduboy */
+        state->select_engine = phys - 1;
+        /* 同步当前引擎的独立灰度/显示设置 */
+        state->game_gray_mode = engine_gray_get(state->select_engine);
+        state->game_display_mode = engine_display_get(state->select_engine);
+        if (state->select_engine == 0 || state->select_engine == 1) engine_manager_load(ENGINE_GB, state->lcd);
+        else if (state->select_engine == 2) engine_manager_load(ENGINE_NES, state->lcd);
+        else if (state->select_engine == 3) engine_manager_load(ENGINE_ARDUBOY, state->lcd);
+    } else if (target == MENU_PAGE_WQX) {
+        state->select_mode = 1;  /* console 分栏菜单 */
+        state->select_engine = 4;  /* wqx 文曲星 LavaX */
+        state->game_gray_mode = 0;
+        state->game_display_mode = 2;
+        engine_manager_load(ENGINE_LAVAX, state->lcd);
+    } else if (target == MENU_PAGE_VPET) {
+        state->select_mode = 1;  /* console 分栏菜单 */
+        state->select_engine = 5;  /* vpet 暴龙机 E0C6200 */
+        state->game_gray_mode = 0;
+        state->game_display_mode = s_vpet_display;   /* 暴龙机独立显示模式 */
+        state->game_pic_opt = vpet_aa_get();         /* 暴龙机独立抗锯齿 */
+        engine_manager_load(ENGINE_VPET, state->lcd);
+    }
+    /* 切换页面必须重置分栏缓存,
+     * 否则 GB/电子词典共用 select_loaded + 文件夹/游戏缓存导致内容串页 */
+    state->select_loaded = false;
+    state->select_focus = 1;
+    state->select_folder_idx = 1;   /* 默认收藏 */
+    state->select_folder_scroll = 0;
+    state->select_game_idx = 0;
+    state->select_game_scroll = 0;
+    s_cached_folder_idx = -1;
+    s_cached_game_count = 0;
+    s_cache_dirty = true;
+}
+
 void menu_handle_action(menu_state_t *state, menu_action_t action) {
+    /* V1.0.9x: 主菜单编辑模式: 只有返回/Home 退出; 确定=若拿起则放回中间, 否则忽略; LEFT/RIGHT 滚动 */
+    if (s_reorder_active && state->current_page == MENU_PAGE_MAIN) {
+        if (action == MENU_ACTION_CONFIRM) {
+            if (s_hold_active) menu_hold_drop(state);   /* 放回中间 */
+            /* 未拿起时确定=忽略 (不退出编辑、不进入任何应用) */
+            state->needs_redraw = true;
+            return;
+        }
+        if (action == MENU_ACTION_BACK || action == MENU_ACTION_HOME) {
+            menu_hold_cancel(state);
+            state->needs_redraw = true;
+            return;
+        }
+        /* 左右: 落到下方正常主菜单选中切换 (编辑中保留滚动); 不产生打开/退出 */
+    }
+    /* V1.0.9x: 主菜单删除弹窗: CONFIRM=删除, BACK/HOME=取消 */
+    if (s_main_del_active && state->current_page == MENU_PAGE_MAIN) {
+        if (action == MENU_ACTION_CONFIRM) {
+            if (s_main_del_phys >= 0 && s_main_del_phys < (int)BBK_MODULE_COUNT &&
+                s_modules[s_main_del_phys].kind != BBK_MOD_MANDATORY) {
+                app_set_installed(state, s_main_del_phys, false);
+                menu_config_save();
+                menu_main_restore_position(state);
+            }
+            s_main_del_active = false; s_main_del_phys = -1;
+            s_main_del_swallow = true;          /* 吞掉后续自动 CONFIRM 防穿透 */
+            state->needs_redraw = true;
+        } else if (action == MENU_ACTION_BACK || action == MENU_ACTION_HOME) {
+            s_main_del_active = false; s_main_del_phys = -1;
+            state->needs_redraw = true;
+        }
+        return;
+    }
+    /* V1.0.9x: 删除图标后吞掉紧随的 CONFIRM, 避免触控穿透打开删除的图标 */
+    if (s_main_del_swallow && state->current_page == MENU_PAGE_MAIN && action == MENU_ACTION_CONFIRM) {
+        s_main_del_swallow = false;
+        state->needs_redraw = true;
+        return;
+    }
     /* 番茄钟运行中: 任意按键返回 */
     if (s_pomo_active) {
         if (action != MENU_ACTION_NONE) {
@@ -10124,7 +13662,9 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
             if (state->sponsor_confirm_count >= 5) {
                 state->sponsor_confirm_count = 0;
                 state->show_hidden_menus = !state->show_hidden_menus;
-                /* 持久化到 NVS */
+                /* V1.0.72: 持久化到 TF + NVS (随配置备份, 刷机后可从 TF 恢复) */
+                menu_config_save();
+                /* 兼容旧版: 旧 NVS key "show_hidden" 也写一份 (旧固件回退读取用) */
                 nvs_handle_t h;
                 if (nvs_open("menu_settings", NVS_READWRITE, &h) == ESP_OK) {
                     nvs_set_u8(h, "show_hidden", (uint8_t)state->show_hidden_menus);
@@ -10135,21 +13675,53 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 if (state->selected_index >= menu_main_count(state))
                     state->selected_index = menu_main_count(state) - 1;
                 if (state->show_hidden_menus) {
-                    ESP_LOGW(TAG, "彩蛋: 已解锁测试游戏引擎");
+                    ESP_LOGW(TAG, "彩蛋: 已解锁测试游戏引擎与应用管理");
                     snprintf(state->hint_text, sizeof(state->hint_text),
-                             "\xe5\xb7\xb2\xe8\xa7\xa3\xe9\x94\x81\xe6\xb5\x8b\xe8\xaf\x95\xe6\xb8\xb8\xe6\x88\x8f\xe5\xbc\x95\xe6\x93\x8e");
-                    /* 已解锁测试游戏引擎 */
+                             "\xe5\xb7\xb2\xe8\xa7\xa3\xe9\x94\x81\xe9\x9a\x90\xe8\x97\x8f\xe5\xba\x94\xe7\x94\xa8\xe5\x8f\x8a\xe5\xbc\x95\xe6\x93\x8e");
+                    /* 已解锁隐藏应用及引擎 */
                 } else {
-                    ESP_LOGI(TAG, "彩蛋: 已关闭测试游戏引擎");
+                    ESP_LOGI(TAG, "彩蛋: 已关闭测试游戏引擎与应用管理");
                     snprintf(state->hint_text, sizeof(state->hint_text),
-                             "\xe5\xb7\xb2\xe5\x85\xb3\xe9\x97\xad\xe6\xb5\x8b\xe8\xaf\x95\xe6\xb8\xb8\xe6\x88\x8f\xe5\xbc\x95\xe6\x93\x8e");
-                    /* 已关闭测试游戏引擎 */
+                             "\xe5\xb7\xb2\xe9\x9a\x90\xe8\x97\x8f\xe5\xba\x94\xe7\x94\xa8\xe7\xae\xa1\xe7\x90\x86\xe5\x8f\x8a\xe5\xbc\x95\xe6\x93\x8e");
+                    /* 已隐藏应用管理及引擎 */
                 }
                 state->sponsor_notice_active = true;
                 state->needs_redraw = true;
             }
         }
         return;
+    }
+    /* V1.0.69: 有触摸机型物理 KEY 长按 —— 按页面分流:
+     *  - 主菜单桌面: 直接进入"添加设备"扫描页面 (用户偏好: 主菜单长按确认键直达配对),
+     *               而非手柄配置弹窗; 其他页面长按仍是收藏 */
+    if (action == MENU_ACTION_KEY_FAV) {
+        if (state->current_page == MENU_PAGE_MAIN && !state->list_dialog_active && !state->confirm_active) {
+            ESP_LOGI(TAG, "主菜单 KEY 长按 → 直接扫描添加蓝牙设备");
+            gamepad_act_add_device(state);
+            state->needs_redraw = true;
+        } else {
+            fav_toggle_current(state);
+        }
+        return;
+    }
+    /* 应用管理: 全屏商店页按键统一走页面内处理器 */
+    if (state->current_page == MENU_PAGE_APP_MANAGER) {
+        app_manager_handle_action(state, action);
+        return;
+    }
+    /* V1.0.9x: 网络工具页按键统一走页面内处理器 */
+    if (state->current_page == MENU_PAGE_NETTOOL) {
+        nettool_action(state, action);
+        return;
+    }
+    /* V1.0.9x: 故障诊断页按键统一走页面内处理器 (HOME 放行给下方统一退出逻辑) */
+    if (state->current_page == MENU_PAGE_DIAGNOSIS) {
+        if (action != MENU_ACTION_HOME) {
+            diag_action(state, action);
+            state->needs_redraw = true;
+            return;
+        }
+        /* HOME: 不拦截, 落到下方统一退出处理回主菜单 */
     }
     /* === 电子书页面: 阅读器打开时模态, 否则双栏菜单 === */
     if (state->current_page == MENU_PAGE_BOOK) {
@@ -10158,7 +13730,7 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
         if (action == MENU_ACTION_HOME) {
             if (book_reader_is_open()) book_reader_close();
             state->current_page = MENU_PAGE_MAIN;
-            state->selected_index = state->main_selected_index;
+            menu_main_restore_position(state);
             state->scroll_offset = 0;
             state->book_loaded = false;   /* 下次进入重新扫描书单 */
             state->needs_redraw = true;
@@ -10265,7 +13837,7 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
         state->connecting_popup_until_ms = 0;
         state->connecting_popup_started_at_ms = 0;
         state->current_page = MENU_PAGE_MAIN;
-        state->selected_index = state->main_selected_index;
+        menu_main_restore_position(state);
         state->scroll_offset = 0;
         state->needs_redraw = true;
         /* 触发添加设备 (直接扫描) */
@@ -10476,6 +14048,12 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 break;
             case MENU_ACTION_CONFIRM: {
                 int idx = state->list_dialog_selected;
+                /* 应用管理双击刚打开的本弹窗: main.c 补发的自动 CONFIRM 直接吞掉,
+                 * 避免默认项被立即选中导致弹窗"闪没"/直接进全屏页. */
+                if (s_app_swallow_next_confirm) {
+                    s_app_swallow_next_confirm = false;
+                    break;
+                }
                 if (idx == state->list_dialog_count - 1) {
                     /* "返回"项: 若处于嵌套弹窗, 恢复父弹窗(保持原选中位置);
                      * 否则关闭弹窗回到 list_dialog_return_page.
@@ -10488,7 +14066,7 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                     state->list_dialog_prev_selected = -1;
                     state->current_page = state->list_dialog_return_page;
                     if (state->list_dialog_return_page == MENU_PAGE_MAIN) {
-                        state->selected_index = state->main_selected_index;
+                        menu_main_restore_position(state);
                     } else {
                         state->selected_index = 0;
                     }
@@ -10516,7 +14094,7 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 state->list_dialog_prev_selected = -1;
                 state->current_page = state->list_dialog_return_page;
                 if (state->list_dialog_return_page == MENU_PAGE_MAIN) {
-                    state->selected_index = state->main_selected_index;
+                    menu_main_restore_position(state);
                 } else {
                     state->selected_index = 0;
                 }
@@ -10562,62 +14140,41 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
     }
 
     if (state->current_page == MENU_PAGE_MAIN) {
-        /* 主菜单: 左/右导航
-         * 方向定义 (用户偏好):
-         *   按右键 → 旧图标往左退, 新图标从右边进  (dir=-1)
-         *   按左键 → 旧图标往右退, 新图标从左边进  (dir=+1)
-         * Wrap 情况 (5→0 或 0→5) 走 cover-flow 动画, 旧选中从中央缩到邻居, 新选中从对侧进入 */
+        /* 主菜单: 左/右导航 → 让相机做 cover-flow 动画 (单一相机, wrap 短路径) */
         switch (action) {
-            case MENU_ACTION_LEFT:
-                if (state->selected_index > 0) {
-                    state->prev_selected = state->selected_index;
-                    state->anim_direction = 1;  /* 旧图标向右退 */
-                    state->anim_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                    state->selected_index--;
-                } else {
-                    /* wrap: 0 -> total-1 (按左键从 0 到末尾)
-                     * 走 cover-flow 动画: dir=+1 让 dock 向右滑
-                     * 但因为是 wrap, prev=0 (旧选中) sel=total-1 (新选中)
-                     * 视觉: 0 从中央缩到左邻居, total-1 从右进入中央 */
-                    state->prev_selected = state->selected_index;  /* 0 (旧) */
-                    state->anim_direction = 1;
-                    state->anim_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                    state->selected_index = menu_main_count(state) - 1;
-                }
-                state->needs_redraw = true;
+            case MENU_ACTION_LEFT: {
+                int to = (state->selected_index > 0)
+                             ? state->selected_index - 1
+                             : menu_main_count(state) - 1;
+                menu_main_cam_animate(state, state->main_cam_cur, to, 310);
                 break;
-            case MENU_ACTION_RIGHT:
-                if (state->selected_index < menu_main_count(state) - 1) {
-                    state->prev_selected = state->selected_index;
-                    state->anim_direction = -1;  /* 旧图标向左退 (用户偏好) */
-                    state->anim_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                    state->selected_index++;
-                } else {
-                    /* wrap: total-1 -> 0 (按右键从末尾到 0)
-                     * 走 cover-flow 动画: dir=-1 让 dock 向左滑
-                     * 视觉: total-1 从中央缩到右邻居, 0 从左进入中央 */
-                    state->prev_selected = state->selected_index;  /* total-1 (旧) */
-                    state->anim_direction = -1;
-                    state->anim_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                    state->selected_index = 0;
-                }
-                state->needs_redraw = true;
+            }
+            case MENU_ACTION_RIGHT: {
+                int to = (state->selected_index < menu_main_count(state) - 1)
+                             ? state->selected_index + 1
+                             : 0;
+                menu_main_cam_animate(state, state->main_cam_cur, to, 310);
                 break;
+            }
             case MENU_ACTION_BACK:
-                /* MSC 模式中, BACK 也走优雅重启 */
+                /* MSC 模式中, BACK 退出存储: 停止 MSC 并恢复 Serial/JTAG 串口, 重挂载 TF */
                 {
                     extern bool usbh_msc_is_running(void);
+                    extern void usbh_msc_stop(void);
+                    extern int sd_remount_vfs_from_card(void);
+                    extern void sd_watcher_set_paused(bool);
                     if (usbh_msc_is_running()) {
-                        state->confirm_active = true;
-                        state->confirm_notice = true;
-                        state->confirm_no_hint = true;
-                        snprintf(state->confirm_title, sizeof(state->confirm_title), "正在退出");
-                        snprintf(state->confirm_msg, sizeof(state->confirm_msg),
-                                 "设备将重启...");
+                        /* 有闪烁提示"正在退出", 让用户意识到是计划性退出而非闪退 */
+                        st7305_clear(state->lcd, ST7305_COLOR_WHITE);
+                        menu_draw_notice_popup(state->lcd, "\xe6\xad\xa3\xe5\x9c\xa8\xe9\x80\x80\xe5\x87\xba"); /* 正在退出 */
+                        st7305_flush(state->lcd);
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        usbh_msc_stop();            /* 切回 Serial/JTAG, 恢复串口与 GPIO */
+                        sd_remount_vfs_from_card(); /* 重新挂载 TF 卡 */
+                        sd_watcher_set_paused(false);
+                        state->current_page = MENU_PAGE_MAIN;
                         state->needs_redraw = true;
                         menu_render(state);
-                        vTaskDelay(pdMS_TO_TICKS(1500));
-                        esp_restart();
                         return;
                     }
                 }
@@ -10625,7 +14182,8 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
             case MENU_ACTION_CONFIRM: {
                 int idx = state->selected_index;
                 int phys = menu_main_phys(state, idx);
-                menu_page_t target = main_items[phys].sub_page;
+                const bbk_module_t *mod = bbk_module(phys);
+                menu_page_t target = mod ? mod->sub_page : MENU_PAGE_MAIN;
                 if (target == MENU_PAGE_RETURN_GAME) {
                     /* TODO: 返回游戏 */
                     return;
@@ -10668,6 +14226,49 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                     open_pomodoro_dialog(state);
                     break;
                 }
+                /* === USB 键鼠: 弹出布局选择, 选中后再启动 TinyUSB HID 复合设备 === */
+                if (target == MENU_PAGE_USB_HID) {
+                    state->main_selected_index = idx;
+                    open_usb_hid_layout_dialog(state);
+                    break;
+                }
+                /* === 应用管理: 全屏商店页 (左侧分类栏 + 右图标网格 + 详情开关) === */
+                if (target == MENU_PAGE_APP_MANAGER) {
+                    state->main_selected_index = idx;
+                    s_app_cat = APP_CAT_ENGINE;   /* 进入默认定位引擎分类首位 */
+                    s_app_focus = 0;
+                    s_app_detail = false;
+                    s_app_detail_phys = -1;
+                    s_app_tap_select = false;
+                    app_manager_reset_scroll();   /* V1.0.9x: 进入内容页卷回顶部 */
+                    state->current_page = MENU_PAGE_APP_MANAGER;
+                    state->selected_index = 0;
+                    state->scroll_offset = 0;
+                    state->needs_redraw = true;
+                    break;
+                }
+                /* === 故障诊断: 全屏独立主菜单页, 进入一律重置到初始(现象)态 === */
+                if (target == MENU_PAGE_DIAGNOSIS) {
+                    state->main_selected_index = idx;
+                    state->module_return_page = (state->current_page == MENU_PAGE_APP_MANAGER) ? MENU_PAGE_APP_MANAGER : MENU_PAGE_MAIN;
+                    diag_reset(state);
+                    state->current_page = MENU_PAGE_DIAGNOSIS;
+                    state->selected_index = 0;
+                    state->scroll_offset = 0;
+                    state->needs_redraw = true;
+                    break;
+                }
+                /* === 网络工具: 全屏独立主菜单页, 进入一律重置 === */
+                if (target == MENU_PAGE_NETTOOL) {
+                    state->main_selected_index = idx;
+                    state->module_return_page = (state->current_page == MENU_PAGE_APP_MANAGER) ? MENU_PAGE_APP_MANAGER : MENU_PAGE_MAIN;
+                    nettool_reset(state);
+                    state->current_page = MENU_PAGE_NETTOOL;
+                    state->selected_index = 0;
+                    state->scroll_offset = 0;
+                    state->needs_redraw = true;
+                    break;
+                }
                 /* 保存当前主菜单位置, 二级菜单返回时恢复 */
                 state->main_selected_index = idx;
                 state->current_page = target;
@@ -10676,6 +14277,12 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 state->needs_redraw = true;
                 if (target == MENU_PAGE_BOOK) {
                     state->book_loaded = false;   /* 每次进入重新扫描书单 */
+                    /* V1.0.9x: 打开「阅读」应先进入书架, 而非直接落回上次阅读位置 */
+                    if (book_reader_is_open()) book_reader_close();
+                    state->select_focus = 0;
+                    state->select_folder_idx = 1;   /* 默认收藏书架 */
+                    state->select_game_idx = 0;
+                    state->select_game_scroll = 0;
                 }
 
                 /* 进入对应二级菜单后立马后台加载该菜单的引擎核心 (按需加载, 释放主菜单时的内存压力)
@@ -10695,12 +14302,24 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                     state->game_gray_mode = engine_gray_get(state->select_engine);
                     /* V1.0.60: 同步当前引擎的独立显示模式 */
                     state->game_display_mode = engine_display_get(state->select_engine);
-                    if (state->select_engine == 1) engine_manager_load(ENGINE_GBC, state->lcd);
-                    else if (state->select_engine == 0) engine_manager_load(ENGINE_GB, state->lcd);
+                    if (state->select_engine == 0 || state->select_engine == 1) engine_manager_load(ENGINE_GB, state->lcd);
                     else if (state->select_engine == 2) engine_manager_load(ENGINE_NES, state->lcd);
                     else if (state->select_engine == 3) engine_manager_load(ENGINE_ARDUBOY, state->lcd);
                     /* V1.0.67: 进入 GB 游戏菜单不再自动弹辅助键映射提示/自动映射,
                      * 用户需要时自行到手柄设置里映射 (见 gamepad_act_gb_auxmap 入口). */
+                } else if (target == MENU_PAGE_WQX) {
+                    state->select_mode = 1;
+                    state->select_engine = 4;   /* wqx 文曲星 LavaX */
+                    state->game_gray_mode = 0;
+                    state->game_display_mode = 2;
+                    engine_manager_load(ENGINE_LAVAX, state->lcd);
+                } else if (target == MENU_PAGE_VPET) {
+                    state->select_mode = 1;
+                    state->select_engine = 5;   /* vpet 暴龙机 E0C6200 */
+                    state->game_gray_mode = 0;
+                    state->game_display_mode = s_vpet_display;   /* 暴龙机独立显示模式 */
+                    state->game_pic_opt = vpet_aa_get();         /* 暴龙机独立抗锯齿 */
+                    engine_manager_load(ENGINE_VPET, state->lcd);
                 }
                 /* V1.0.46: 切换页面必须重置分栏缓存,
                  * 否则 GB/电子词典共用 select_loaded + 文件夹/游戏缓存导致内容串页 */
@@ -10723,6 +14342,36 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
 
     /* 子页处理 */
     const sub_page_def_t *page = &sub_pages[state->current_page];
+
+    /* USB 键鼠: 全屏页, 只有 BACK 有效 (物理键退出), 其余动作忽略.
+     *
+     * 退出键鼠 = 停止 HID 并切回 Serial/JTAG 串口. ESP32-S3 的 USB OTG(键鼠)
+     * 与 USB Serial/JTAG 共用同一 USB PHY/GPIO19/20; usb_hid_stop() 会先
+     * tusb_stop_task()+tinyusb_driver_uninstall() 释放 OTG PHY (内部 usb_del_phy),
+     * 再重装 Serial/JTAG 驱动, 同一引导内即可让主机重新枚举出 /dev/cu.usbmodem*,
+     * 无需重启. 不再手动 usb_new_phy 切 PHY (esp-idf #9826/#15912). */
+    if (state->current_page == MENU_PAGE_USB_HID) {
+        /* V1.0.72: 确认键在键盘界面 = 弹出键鼠二级菜单 (方便切换款式/退出). */
+        if (action == MENU_ACTION_CONFIRM) {
+            open_hid_layout_switch(state);
+            return;
+        }
+        if (action == MENU_ACTION_BACK || action == MENU_ACTION_HOME) {
+            /* 用户需求: 返回先回键鼠布局二级菜单, 不直接退出键鼠.
+             * 从二级菜单选"返回菜单"才真正停止 HID 回主菜单. */
+            if (!state->list_dialog_active) {
+                open_hid_layout_switch(state);
+            } else {
+                ESP_LOGI(TAG, "退出仿真键鼠: 停止 HID 并恢复 Serial/JTAG 串口 (无需重启)");
+                usb_hid_stop();
+                state->current_page = MENU_PAGE_MAIN;
+                menu_main_restore_position(state);
+                state->needs_redraw = true;
+                menu_render(state);
+            }
+        }
+        return;
+    }
     /* 诊断: GB 页面按键到达子页处理 */
     if (state->current_page == MENU_PAGE_GB_GAME) {
         ESP_LOGI(TAG, "[GB] action=%d page=%d focus=%d sub_count=%d game_idx=%d",
@@ -10735,9 +14384,11 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
     switch (action) {
         case MENU_ACTION_UP:
             /* 电子词典: 左右分栏, 上下键在当前焦点列内选择 */
-            if (state->current_page == MENU_PAGE_SELECT_GAME) {
+            if (state->current_page == MENU_PAGE_SELECT_GAME ||
+                state->current_page == MENU_PAGE_WQX ||
+                state->current_page == MENU_PAGE_VPET) {
                 if (state->select_focus == 0) {
-                    int max_left = 2 + g_folder_count;
+                    int max_left = select_folder_total() - 1;
                     if (state->select_folder_idx > 0) state->select_folder_idx--;
                     else state->select_folder_idx = max_left;  /* 循环到末尾 */
                     /* 切换文件夹后重置右栏选中与滚动, 避免旧文件夹的偏移导致新列表只显示底部 */
@@ -10756,7 +14407,7 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
             if (state->current_page == MENU_PAGE_GB_GAME) {
                 if (state->select_focus == 0) {
                     /* 左栏: 按页面模式 */
-                    int max_left = 2 + g_folder_count;
+                    int max_left = select_folder_total() - 1;
                     if (state->select_folder_idx > 0) state->select_folder_idx--;
                     else state->select_folder_idx = max_left;
                     /* 切换文件夹后重置右栏选中与滚动 */
@@ -10775,9 +14426,11 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
             break;
         case MENU_ACTION_DOWN:
             /* 电子词典: 左右分栏, 上下键在当前焦点列内选择 */
-            if (state->current_page == MENU_PAGE_SELECT_GAME) {
+            if (state->current_page == MENU_PAGE_SELECT_GAME ||
+                state->current_page == MENU_PAGE_WQX ||
+                state->current_page == MENU_PAGE_VPET) {
                 if (state->select_focus == 0) {
-                    int max_left = 2 + g_folder_count;
+                    int max_left = select_folder_total() - 1;
                     if (state->select_folder_idx < max_left) state->select_folder_idx++;
                     else state->select_folder_idx = 0;
                     /* 切换文件夹后重置右栏选中与滚动 */
@@ -10795,7 +14448,7 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
             if (state->current_page == MENU_PAGE_GB_GAME) {
                 if (state->select_focus == 0) {
                     /* 左栏: 按页面模式 */
-                    int max_left = 2 + g_folder_count;
+                    int max_left = select_folder_total() - 1;
                     if (state->select_folder_idx < max_left) state->select_folder_idx++;
                     else state->select_folder_idx = 0;
                     /* 切换文件夹后重置右栏选中与滚动 */
@@ -10833,7 +14486,9 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 break;
             }
             /* 电子词典: 左右键切换分栏焦点 (左=文件夹, 右=游戏) */
-            if (state->current_page == MENU_PAGE_SELECT_GAME) {
+            if (state->current_page == MENU_PAGE_SELECT_GAME ||
+                state->current_page == MENU_PAGE_WQX ||
+                state->current_page == MENU_PAGE_VPET) {
                 state->select_focus = 0;
                 state->needs_redraw = true;
                 break;
@@ -10871,7 +14526,9 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 break;
             }
             /* 电子词典: 左右键切换分栏焦点 (左=文件夹, 右=游戏) */
-            if (state->current_page == MENU_PAGE_SELECT_GAME) {
+            if (state->current_page == MENU_PAGE_SELECT_GAME ||
+                state->current_page == MENU_PAGE_WQX ||
+                state->current_page == MENU_PAGE_VPET) {
                 /* 右栏没游戏时不允许切过去 (避免空列表) */
                 if (g_sub_count > 0) {
                     state->select_focus = 1;
@@ -10908,7 +14565,9 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 break;
             }
             /* 电子词典: 按当前焦点列发送对应索引到 on_confirm */
-            if (state->current_page == MENU_PAGE_SELECT_GAME) {
+            if (state->current_page == MENU_PAGE_SELECT_GAME ||
+                state->current_page == MENU_PAGE_WQX ||
+                state->current_page == MENU_PAGE_VPET) {
                 /* 左栏: 单击切换焦点到右栏 (右栏均有内容: 设置/收藏/文件夹游戏)
                  * 与"游戏文件夹"风格一致: 点左即显右, 不再跳转独立子页 */
                 if (state->select_focus == 0) {
@@ -10968,10 +14627,14 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 }
                 break;
             }
-            /* 返回项: 直接返回主菜单 */
+            /* 返回项: 返回主菜单 (从应用管理进入则回应用管理) */
             if (idx == g_sub_count - 1) {
-                state->current_page = MENU_PAGE_MAIN;
-                state->selected_index = state->main_selected_index;
+                menu_page_t __mret = state->module_return_page;
+                state->module_return_page = MENU_PAGE_MAIN;   /* 一次性 */
+                state->current_page = (__mret == MENU_PAGE_MAIN) ? MENU_PAGE_MAIN : __mret;
+                if (state->current_page == MENU_PAGE_MAIN) {
+                    menu_main_restore_position(state);
+                }
                 state->scroll_offset = 0;
                 state->needs_redraw = true;
                 break;
@@ -10996,10 +14659,16 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
                 state->needs_redraw = true;
                 break;
             }
-            /* 电子词典: 在分栏中按 BACK 回到主菜单, 并重置分栏状态 */
-            if (state->current_page == MENU_PAGE_SELECT_GAME) {
-                state->current_page = MENU_PAGE_MAIN;
-                state->selected_index = state->main_selected_index;
+            /* 电子词典: 在分栏中按 BACK 回到主菜单(应用管理则回应用管理), 并重置分栏状态 */
+            if (state->current_page == MENU_PAGE_SELECT_GAME ||
+                state->current_page == MENU_PAGE_WQX ||
+                state->current_page == MENU_PAGE_VPET) {
+                menu_page_t __mret = state->module_return_page;
+                state->module_return_page = MENU_PAGE_MAIN;   /* 一次性 */
+                state->current_page = (__mret == MENU_PAGE_MAIN) ? MENU_PAGE_MAIN : __mret;
+                if (state->current_page == MENU_PAGE_MAIN) {
+                    menu_main_restore_position(state);
+                }
                 state->scroll_offset = 0;
                 state->select_loaded = false;
                 state->select_focus = 1;
@@ -11015,8 +14684,12 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
             /* GB/GBC: BACK 返回主菜单, 重置分栏状态, 释放引擎核心内存 */
             if (state->current_page == MENU_PAGE_GB_GAME) {
                 bool was_gb = (state->current_page == MENU_PAGE_GB_GAME);
-                state->current_page = MENU_PAGE_MAIN;
-                state->selected_index = state->main_selected_index;
+                menu_page_t __mret = state->module_return_page;
+                state->module_return_page = MENU_PAGE_MAIN;   /* 一次性 */
+                state->current_page = (__mret == MENU_PAGE_MAIN) ? MENU_PAGE_MAIN : __mret;
+                if (state->current_page == MENU_PAGE_MAIN) {
+                    menu_main_restore_position(state);
+                }
                 state->scroll_offset = 0;
                 state->select_focus = 0;
                 state->select_game_idx = 0;
@@ -11031,9 +14704,13 @@ void menu_handle_action(menu_state_t *state, menu_action_t action) {
             if (state->current_page == MENU_PAGE_MP3_PLAYER) {
                 mp3_exit_cleanup();
             }
-            /* 返回主菜单, 恢复之前的主菜单位置 */
-            state->current_page = MENU_PAGE_MAIN;
-            state->selected_index = state->main_selected_index;
+            /* 返回主菜单(从应用管理进入则回应用管理), 恢复之前的主菜单位置 */
+            menu_page_t __mret = state->module_return_page;
+            state->module_return_page = MENU_PAGE_MAIN;   /* 一次性 */
+            state->current_page = (__mret == MENU_PAGE_MAIN) ? MENU_PAGE_MAIN : __mret;
+            if (state->current_page == MENU_PAGE_MAIN) {
+                menu_main_restore_position(state);
+            }
             state->scroll_offset = 0;
             state->needs_redraw = true;
             break;

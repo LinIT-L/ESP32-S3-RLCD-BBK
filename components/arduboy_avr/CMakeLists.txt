@@ -42,7 +42,7 @@ idf_component_register(
         "avr/simavr/cores"
         "avr/simavr/cores/avr"
         "avr/simavr/parts"
-    PRIV_REQUIRES "st7305" "freertos" "esp_timer" "driver" "audio_player"
+    PRIV_REQUIRES "st7305" "freertos" "esp_timer" "driver" "audio_player" "virtual_keys"
 )
 
 # 启用未用外设的 stub 实现 (见 *_stub.c), 关闭其真实实现
@@ -64,8 +64,8 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wno-char-subscripts
     -Wno-builtin-macro-redefined
     -O3
-    # 强制 simavr 的 malloc/calloc/realloc/free 优先指向 PSRAM (见 simavr_mem_override.h),
-    # 避免 ~35-40KB 的 AVR 模拟内存占满内部 SRAM. 与 gbc_mem_override.h 同机制.
+    # simavr 的 malloc/calloc/realloc/free 优先指向内部 SRAM/DMA (见 simavr_mem_override.h),
+    # AVR 解释器每条指令随机读 flash/data, PSRAM 延迟太高导致卡顿; 核心仅 ~40KB 内部放得下.
     -include simavr_mem_override.h
 )
 

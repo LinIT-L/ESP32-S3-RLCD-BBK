@@ -72,6 +72,10 @@ void touch_panel_request_recover(void);
 /* 返回当前检测到的芯片类型 (调试/日志用). */
 tp_chip_t touch_panel_get_chip(void);
 
+/* V1.0.69: 是否检测到触摸屏 (有触摸机型 = true, 无触摸机型 = false).
+ * 供 input.c 按机型分支物理键语义用. */
+bool touch_panel_is_present(void);
+
 /* 返回面板分辨率 (原始坐标最大值), 用于把触摸点映射到屏幕坐标.
  * GT911 从寄存器读出; 其它芯片返回 TP_DEFAULT_RES_X/Y. */
 void touch_panel_get_resolution(int *max_x, int *max_y);

@@ -7,7 +7,20 @@ import os
 import re
 import subprocess
 import sys
+import argparse
+import struct
 from PIL import Image, ImageDraw, ImageFont
+
+# 命令行参数: 默认 24x24 PingFang; 传 --cell/--font 可改字号与字体(用于低像素字体测试)
+ap = argparse.ArgumentParser()
+ap.add_argument("--cell", type=int, default=24, help="格子尺寸(如 16)")
+ap.add_argument("--font", default="", help="字体 TTF 绝对路径(默认用系统 PingFang)")
+ap.add_argument("--out", default="components/menu/font_zh.bin", help="输出文件")
+ap.add_argument("--font-size", type=int, default=22,
+                help="实际渲染字号(须 <= --cell, 保证汉字在格子内完整显示不超界; 默认 22)")
+ap.add_argument("--weight", default="bold",
+                help="字重: bold=粗(W6, 默认) / light=细(W3); 用于生成可切换的细字库 font_zh_light.bin")
+ARGS = ap.parse_args()
 
 # 扫描目录
 SRC_DIRS = [
@@ -651,88 +664,184 @@ for c in all_chars:
     if c not in unique:
         unique += c
 
-# === 过滤: 跳过 ASCII (1 字节) 和 2 字节字符 ===
-# 原因: zh_chars 必须每字符 3 字节 UTF-8 槽位, font_zh_find_utf8 按 i*3 索引
-# 1 字节字符 (ASCII) 走独立 FONT8X12 字体
-# 2 字节字符 (如希腊字母) 当前不支持
-ascii_count = sum(1 for c in unique if len(c.encode('utf-8')) == 1)
+# === 过滤: 保留 ASCII (1 字节, 英文/数字/符号) 和 3 字节中文; 剔除 2 字节字符 ===
+# V1.0.92: ASCII 不再过滤, 一并纳入字库(存储时补 2x0x00 前缀成 3 字节槽), 让英文/数字/符号
+# 也走字库、跟随粗(冬青W6)/细(冬青W3)样式, 取代固定粗的 FONT8X12.
+# 仅剔除 2 字节字符 (如希腊字母, 无法塞进 3 字节槽).
 short_count = sum(1 for c in unique if len(c.encode('utf-8')) == 2)
-if ascii_count or short_count:
-    print(f"过滤: 跳过 {ascii_count} 个 ASCII 字符, {short_count} 个 2 字节字符")
-unique = ''.join(c for c in unique if len(c.encode('utf-8')) == 3)
+if short_count:
+    print(f"过滤: 跳过 {short_count} 个 2 字节字符")
+unique = ''.join(c for c in unique if len(c.encode('utf-8')) != 2)
+
+# V1.0.92: 追加 ASCII 英文(大小写)/数字/常用符号 (0x20-0x7E 共 95 个), 确保字库不缺英数符
+_ascii_all = ''.join(chr(i) for i in range(0x20, 0x7F))
+_ascii_add = ''.join(c for c in _ascii_all if c not in unique)
+if _ascii_add:
+    unique += _ascii_add
+    print(f"[扩充] 追加 ASCII 英文/数字/符号 {len(_ascii_add)} 个, 去重后总: {len(unique)}")
 
 print(f"基础字: {len(COMMON_CHARS)}")
 print(f"源码扫描到: {len(extra_chars)}")
 print(f"去重后总: {len(unique)}")
 
-# === 字体渲染 ===
-FONT_SIZE = 26  # 稍大些确保 24x24 格子内字形完整
-CELL_W = 24
-CELL_H = 24
-FONT_PATH = "/System/Library/Fonts/PingFang.ttc"
-FONT_PATH2 = "/System/Library/Fonts/STHeiti Medium.ttc"
-FONT_PATH3 = "/Library/Fonts/Songti.ttc"
-
-font = None
-for p in [FONT_PATH, FONT_PATH2, FONT_PATH3]:
-    if os.path.exists(p):
+# 字库覆盖报告: 用 fontTools 对照渲染字体 cmap, 找出缺字形字
+if ARGS.font and os.path.exists(ARGS.font):
+    try:
+        from fontTools.ttLib import TTFont
         try:
-            font = ImageFont.truetype(p, FONT_SIZE)
-            print(f"使用字体: {p}")
+            fontobj = TTFont(ARGS.font, fontNumber=0)
+        except TypeError:
+            fontobj = TTFont(ARGS.font)
+        cmap = fontobj.getBestCmap()
+        missing = [c for c in unique if ord(c) not in cmap]
+        if missing:
+            print(f"[覆盖] 缺字形 {len(missing)} 个: {''.join(missing[:40])}")
+            if len(missing) > 40:
+                print(f"[覆盖] (其余 {len(missing)-40} 个略)...")
+        else:
+            print(f"[覆盖] 渲染字体完整覆盖 {len(unique)} 个字符")
+    except Exception as e:
+        print(f"[覆盖] 无法检查字库覆盖: {e}")
+
+# === 字体渲染 (正文字库) ===
+if True:
+    CELL_W = ARGS.cell
+    CELL_H = ARGS.cell
+    # 渲染字号 (默认 22px 冬青黑体贴图进 24px 格子). 字号须 <= 格子,
+    # 否则汉字顶/底笔画被格子边缘裁掉(顶部少一截 / 偏下). V1.0.82 起字号不再必须=格子。
+    FONT_SIZE = ARGS.font_size
+    if FONT_SIZE > CELL_W:
+        FONT_SIZE = CELL_W
+    FONT_PATH = "/System/Library/Fonts/Hiragino Sans GB.ttc"
+    FONT_PATH2 = "/System/Library/Fonts/STHeiti Medium.ttc"
+    FONT_PATH3 = "/System/Library/Fonts/PingFang.ttc"
+    FONT_PATH4 = "/Library/Fonts/Songti.ttc"
+    # V1.0.87: 追加一个系统粗体候选 + ttc 里的粗体面索引.
+    # 冬青黑体 Hiragino Sans GB.ttc: face2 = W6 (weight 600, 粗感), face0 = W3(细).
+    # 只把 "粗" 版本用作正文/标题字库, 满足"菜单字体要更粗"的需求.
+    FONT_PATH_BOLD = "/System/Library/Fonts/Hiragino Sans GB.ttc"
+    FONT_BOLD_IDX = 2   # W6 粗面
+
+    def _load_font(p, index=None, size=FONT_SIZE):
+        try:
+            if p and p.lower().endswith('.ttc') and index is not None:
+                return ImageFont.truetype(p, size, index=index)
+            return ImageFont.truetype(p, size)
+        except Exception:
+            return None
+
+    font = None
+    if ARGS.font and os.path.exists(ARGS.font):
+        font = _load_font(ARGS.font)
+        if font:
+            print(f"使用字体: {ARGS.font} (cell={CELL_W}, size={FONT_SIZE})")
+    # 默认用粗体 W6 (冬青黑体粗面), 找不到再回退其它.
+    # V1.0.89: --weight light 生成细体 W3 (face0), 配合设置里"字体设置"切换粗细.
+    if font is None:
+        if ARGS.weight == "light":
+            font = _load_font(FONT_PATH_BOLD, 0)   # face0 = W3 细面
+            if font:
+                print(f"使用细体字体: {FONT_PATH_BOLD} face0 (W3, weight=300, cell={CELL_W}, size={FONT_SIZE})")
+        else:
+            font = _load_font(FONT_PATH_BOLD, FONT_BOLD_IDX)
+            if font:
+                print(f"使用粗体字体: {FONT_PATH_BOLD} face{FONT_BOLD_IDX} (W6, weight=600, cell={CELL_W}, size={FONT_SIZE})")
+    for p in [FONT_PATH, FONT_PATH2, FONT_PATH3, FONT_PATH4]:
+        if font is not None:
             break
+        if os.path.exists(p):
+            font = _load_font(p)
+            if font:
+                print(f"使用字体: {p} (cell={CELL_W}, size={FONT_SIZE})")
+                break
+    if font is None:
+        # 降级: 用默认字体 (会显示成方块)
+        font = ImageFont.load_default()
+        print("警告: 未找到中文字体, 使用默认字体")
+
+    # === V1.0.8x: 全量 GB2312 简体汉字扩充 (直接枚举, 不过滤) ===
+    # 用户要求: GB2312 全量, 不精简. 直接枚举 6763 个简体汉字, 不依赖 cmap 过滤,
+    # 确保所有 GB2312 字符 (含 "仿" 等) 都进字库, 不因 cmap 差异而遗漏.
+    _add = []
+    for _code in range(0x4E00, 0x9FFF + 1):
+        ch = chr(_code)
+        if ch in unique:
+            continue
+        try:
+            ch.encode('gb2312')
+            if len(ch.encode('utf-8')) == 3:
+                _add.append(ch)
         except Exception:
             pass
-if font is None:
-    # 降级: 用默认字体 (会显示成方块)
-    font = ImageFont.load_default()
-    print("警告: 未找到中文字体, 使用默认字体")
+    if _add:
+        unique += ''.join(_add)
+        print(f"[扩充] 追加 GB2312 全量简体字 {len(_add)} 个, 去重后总: {len(unique)}")
+    # 验证关键字符是否在字库中
+    for _test in ['仿', '选', '设', '键', '蓝', '音', '量', '卡', '系', '统']:
+        if _test in unique:
+            pass
+        else:
+            print(f"[警告] 关键字符 '{_test}' 不在字库中!")
+    print(f"[验证] '仿' 在字库中: {'仿' in unique}")
 
-# 渲染每个字符
-# PIL mode "1" 中: 0=白, 1=黑. draw.text(fill=1) 写黑字
-# 我们的字库约定: 位 1 = 字 (黑), 位 0 = 背景 (白)
-# 正好和 PIL getdata() 一致, 不需要翻转
-bitmap_bytes = []
-for c in unique:
-    # 先获取字符的 bbox, 居中绘制
-    img = Image.new("1", (CELL_W, CELL_H), 0)  # 白底
-    draw = ImageDraw.Draw(img)
-    try:
-        # 用 anchor='lt' 明确左上角, 然后用 bbox 居中
-        bbox = draw.textbbox((0, 0), c, font=font)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        # 居中
-        x = (CELL_W - text_w) // 2 - bbox[0]
-        y = (CELL_H - text_h) // 2 - bbox[1]
-        draw.text((x, y), c, font=font, fill=1)  # 黑字
-    except Exception:
-        pass
-    pixels = list(img.getdata())  # 0=白(背景), 1=黑(字)
-    bytes_ = []
-    for row in range(CELL_H):
-        for col_byte in range(CELL_W // 8):
-            b = 0
-            for bit in range(8):
-                x = col_byte * 8 + bit
-                if pixels[row * CELL_W + x]:
-                    b |= (1 << (7 - bit))
-            bytes_.append(b)
-    bitmap_bytes.append(bytes_)
+    # 渲染每个字符
+    # PIL mode "1" 中: 0=白, 1=黑. draw.text(fill=1) 写黑字
+    # 我们的字库约定: 位 1 = 字 (黑), 位 0 = 背景 (白)
+    # 正好和 PIL getdata() 一致, 不需要翻转
+    bitmap_bytes = []
+    for c in unique:
+        # 先绘制, 再用实际墨迹 bbox 居中, 确保小字号(22px)在其所属 24px 格子里
+        # 精确居中、顶/底笔画都不被裁、也不再整体偏下。
+        img = Image.new("1", (CELL_W, CELL_H), 0)  # 白底
+        draw = ImageDraw.Draw(img)
+        try:
+            # 先在左上角粗糙绘制, 后用 ink bbox 重新定位
+            draw.text((0, 0), c, font=font, fill=1)  # 黑字
+            ink = img.getbbox()  # 实际非白区域的紧致包围盒
+        except Exception:
+            ink = None
+        if ink and ink[2] > ink[0] and ink[3] > ink[1]:
+            # ink = (x0, y0, x1, y1) (右/下不含)
+            ink_w = ink[2] - ink[0]
+            ink_h = ink[3] - ink[1]
+            if ink_w <= CELL_W and ink_h <= CELL_H:
+                dx = (CELL_W - ink_w) // 2 - ink[0]
+                dy = (CELL_H - ink_h) // 2 - ink[1]
+                img2 = Image.new("1", (CELL_W, CELL_H), 0)
+                img2.paste(img, (dx, dy))
+                img = img2
+        pixels = list(img.getdata())  # 0=白(背景), 1=黑(字)
+        bytes_ = []
+        for row in range(CELL_H):
+            for col_byte in range(CELL_W // 8):
+                b = 0
+                for bit in range(8):
+                    x = col_byte * 8 + bit
+                    if pixels[row * CELL_W + x]:
+                        b |= (1 << (7 - bit))
+                bytes_.append(b)
+        bitmap_bytes.append(bytes_)
 
-# V1.0.64: 输出紧凑二进制 (原 C 源码 hex 文本 1.67MB -> 二进制 ~252KB, 省 Flash)
-# 布局: [8B magic "ZH1FNT01"][u32 count][字符表 count*3 UTF-8][字形 count*72]
-out_path = "components/menu/font_zh.bin"
-import struct
-magic = b"ZH1FNT01"
-count = len(unique)
-char_tbl = b"".join(c.encode('utf-8') for c in unique)
-glyph_blob = b"".join(bytes(b) for b in bitmap_bytes)
-assert len(char_tbl) == count * 3
-assert len(glyph_blob) == count * 72
-with open(out_path, "wb") as f:
-    f.write(magic)
-    f.write(struct.pack("<I", count))
-    f.write(char_tbl)
-    f.write(glyph_blob)
-print(f"Generated: {out_path}")
-print(f"Chars: {count}, Bytes/char: {72}, Total: {len(glyph_blob)} bytes, File: {os.path.getsize(out_path)} bytes")
+    # V1.0.64: 输出紧凑二进制 (原 C 源码 hex 文本 1.67MB -> 二进制 ~252KB, 省 Flash)
+    # 布局: [8B magic "ZH1FNT01"][u32 count][字符表 count*3 UTF-8][字形 count*cell*(cell/8)]
+    out_path = ARGS.out
+    bpc = CELL_W * (CELL_W // 8)      # 每字字节数 (24->72, 16->32)
+    magic = b"ZH1FNT01"
+    count = len(unique)
+    char_tbl = b""
+    for c in unique:
+        u = c.encode('utf-8')
+        if len(u) == 1:
+            char_tbl += b'\x00\x00' + u    # ASCII: 补 2 个 0x00 前缀成 3 字节槽, 查找时识别
+        else:
+            char_tbl += u
+    glyph_blob = b"".join(bytes(b) for b in bitmap_bytes)
+    assert len(char_tbl) == count * 3
+    assert len(glyph_blob) == count * bpc
+    with open(out_path, "wb") as f:
+        f.write(magic)
+        f.write(struct.pack("<I", count))
+        f.write(char_tbl)
+        f.write(glyph_blob)
+    print(f"Generated: {out_path}")
+    print(f"Chars: {count}, Bytes/char: {bpc}, Total: {len(glyph_blob)} bytes, File: {os.path.getsize(out_path)} bytes")

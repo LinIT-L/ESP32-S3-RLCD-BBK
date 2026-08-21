@@ -141,6 +141,8 @@ esp_err_t sd_mount(void) {
                 "/sdcard/nes",   /* NES 模拟器 ROM 目录 */
                 "/sdcard/AB",    /* arduboy ROM 目录 */
                 "/sdcard/books", /* 电子书目录 */
+                "/sdcard/lavaXOS", /* 文曲星 .lav 目录 (wqx) */
+                "/sdcard/vpet",    /* 暴龙机 .bin ROM 目录 (vpet) */
                 NULL
             };
             for (int i = 0; need_dirs[i]; i++) {

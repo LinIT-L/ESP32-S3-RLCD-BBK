@@ -41,6 +41,20 @@
 /* PPU access */
 #define  PPU_MEM(x)           ppu->page[(x) >> 10][(x)]
 
+/* 安全 PPU 访问: 页指针为 NULL 时返回/跳过, 防止 StoreProhibited 崩溃.
+ * 某些 mapper/ROM 在初始化阶段页表未映射完整, 直接解引用会写 0x0. */
+#define  PPU_PAGE_VALID(x)    (ppu->page[(x) >> 10] != NULL)
+
+/* 限频诊断: 页表空指针命中时打印 (每 256 次一条), 便于定位问题 mapper/ROM.
+ * 正常运行的 ROM 不会触发; 若日志反复出现某地址, 说明该 mapper 页表映射有缺陷. */
+static void ppu_nullpage_diag(uint32 addr, const char *op)
+{
+   static uint32 s_cnt = 0;
+   if ((s_cnt++ & 0xFF) == 0)
+      log_printf("PPU null-page %s addr=$%04X page=%d (hit #%u)\n",
+                 op, addr, (int)(addr >> 10), (unsigned)s_cnt);
+}
+
 /* Background (color 0) and solid sprite pixel flags */
 #define  BG_TRANS             0x80
 #define  SP_PIXEL             0x40
@@ -385,7 +399,11 @@ uint8 ppu_read(uint32 address)
          uint32 addr = ppu->vaddr;
          if (addr >= 0x3000)
             addr -= 0x1000;
-         ppu->vdata_latch = PPU_MEM(addr);
+         /* 防御: 页未映射时读 0xFF, 避免读 0x0 崩溃 */
+         if (PPU_PAGE_VALID(addr))
+            ppu->vdata_latch = PPU_MEM(addr);
+         else
+            ppu->vdata_latch = 0xFF;
       }
 
       ppu->vaddr += ppu->vaddr_inc;
@@ -492,7 +510,8 @@ void ppu_write(uint32 address, uint8 value)
          {
             log_printf("VRAM write to $%04X, scanline %d\n",
                        ppu->vaddr, nes_getcontextptr()->scanline);
-            PPU_MEM(ppu->vaddr) = 0xFF; /* corrupt */
+            if (PPU_PAGE_VALID(ppu->vaddr))
+               PPU_MEM(ppu->vaddr) = 0xFF; /* corrupt */
          }
          else
          {
@@ -501,7 +520,11 @@ void ppu_write(uint32 address, uint8 value)
             if (false == ppu->vram_present && addr >= 0x3000)
                ppu->vaddr -= 0x1000;
 
-            PPU_MEM(addr) = value;
+            /* 防御: 页未映射时跳过写入, 避免写 0x0 崩溃 (部分 mapper 初始化期页表不全) */
+            if (PPU_PAGE_VALID(addr))
+               PPU_MEM(addr) = value;
+            else
+               ppu_nullpage_diag(addr, "write");
          }
       }
       else
@@ -706,6 +729,14 @@ static void ppu_renderbg(uint8 *vidbuf)
       return;
    }
 
+   /* 防御: 背景图案表页 (bg_base 位于 $0000/$1000) 未映射时整行画背景色,
+   ** 避免循环内逐 tile 解引用 0x0 崩溃 (部分 mapper 初始化期页表不全). */
+   if (!PPU_PAGE_VALID(ppu->bg_base))
+   {
+      memset(vidbuf, FULLBG, NES_SCREEN_WIDTH);
+      return;
+   }
+
    bmp_ptr = vidbuf - ppu->tile_xofs; /* scroll x */
    refresh_vaddr = 0x2000 + (ppu->vaddr & 0x0FE0); /* mask out x tile */
    x_tile = ppu->vaddr & 0x1F;
@@ -847,6 +878,9 @@ static void ppu_renderoam(uint8 *vidbuf, int scanline)
          vram_adr = vram_offset + (tile_index << 4);
 
       /* Get the address of the tile */
+      /* 防御: 图案表页未映射时跳过该精灵, 避免解引用 0x0 */
+      if (!PPU_PAGE_VALID(vram_adr))
+         continue;
       data_ptr = &PPU_MEM(vram_adr);
 
       /* Calculate offset (line within the sprite) */
@@ -929,6 +963,9 @@ static void ppu_fakeoam(int scanline)
    else
       vram_adr = ppu->obj_base + (tile_index << 4);
 
+   /* 防御: 图案表页未映射时跳过 strike 检测, 避免解引用 0x0 */
+   if (!PPU_PAGE_VALID(vram_adr))
+      return;
    data_ptr = &PPU_MEM(vram_adr);
 
    /* Calculate offset (line within the sprite) */
@@ -1136,6 +1173,9 @@ static void draw_sprite(bitmap_t *bmp, int x, int y, uint8 tile_num, uint8 attri
    else
       vram_adr = ppu->obj_base + (tile_num << 4);
 
+   /* 防御: 图案表页未映射时跳过, 避免解引用 0x0 */
+   if (!PPU_PAGE_VALID(vram_adr))
+      return;
    data_ptr = &PPU_MEM(vram_adr);
 
    for (line = 0; line < height; line++)

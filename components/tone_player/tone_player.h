@@ -24,6 +24,10 @@ void tone_stop(void);
 /* 是否已就绪 (可发声) */
 bool tone_player_ready(void);
 
+/* 持续音: 立即以 freq Hz 发声, 不阻塞 (不自动停止). 由 tone_stop() 关闭.
+ * 用于模拟器蜂鸣器等需要"按下持续响、松开停"的连续音效 (V1.0.9x 暴龙机). */
+void tone_tone_on(int freq_hz);
+
 /* 单音: 播放 freq Hz 方波 ms 毫秒 (阻塞调用者 ms 时间) */
 void tone_beep(int freq_hz, int ms);
 

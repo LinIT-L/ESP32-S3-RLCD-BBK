@@ -22,7 +22,10 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # gam4980 需要 6MB PSRAM -> 分配失败 -> 进游戏 5% 时写空指针崩溃重启.
 # 现在字库按需从 Flash 缓存读取, PSRAM 堆恢复到 ~7.4MB, BBK 正常.
 # CONFIG_SPIRAM_RODATA=y
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# 非必要数据尽量放 PSRAM: ALWAYSINTERNAL 阈值调小 (≤此值才保留内部), 内部预留调小
+# 以腾出 ≥32KB 连续内部块给 BBK 引擎 sys_ram (动态分配).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=24576
 # 允许 FreeRTOS 任务栈放 PSRAM (音频解码任务栈 60KB, 蓝牙任务栈也需要)
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 
@@ -66,6 +69,30 @@ CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
 # 只需 2 条 ACL 连接 (1手柄+1耳机), 减少内部 RAM 占用 (默认4条浪费内存)
 CONFIG_BT_ACL_CONNECTIONS=2
 
+# === V1.0.9x: 深度精简蓝牙内存 (只连 BLE HID 手柄) ===
+# 手柄是标准 BLE 4.0/4.2 设备, BLE 5.0 扩展广播/周期广播/扩展扫描/扩展同步/
+# DTM 测试模式全部用不到. 这些会给控制器固件分配额外的内部 RAM buffer,
+# 关闭后显著降低控制器 DRAM 占用, 为 WiFi softAP 腾出 DMA.
+# BLE 5.0 扩展功能关闭 (HID 手柄不需要)
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
+# CONFIG_BT_BLE_50_EXTEND_ADV_EN is not set
+# CONFIG_BT_BLE_50_PERIODIC_ADV_EN is not set
+# CONFIG_BT_BLE_50_EXTEND_SCAN_EN is not set
+# CONFIG_BT_BLE_50_EXTEND_SYNC_EN is not set
+# CONFIG_BT_BLE_50_DTM_TEST_EN is not set
+# BLE 4.2 DTM 测试模式也用不到
+CONFIG_BT_BLE_42_DTM_TEST_EN=n
+# SMP 绑定数: 15 是为修复"主动连接最大绑定数超限/首次连接失败"专门定的,
+# 不要降回 2 (会重新出现 Exceeded the maximum number of bonded devices)
+CONFIG_BT_SMP_MAX_BONDS=15
+# GATTC 缓存: HID 服务属性很少, 40 个缓存条目过多
+CONFIG_BT_GATTC_MAX_CACHE_CHAR=16
+CONFIG_BT_GATTC_NOTIF_REG_MAX=4
+# 广播去重过滤缓存降低 (内部 RAM)
+CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10
+# 禁掉用不到的 BLE 5.0 periodic ADV 相关
+CONFIG_BT_BLE_FEAT_CREATE_SYNC_RETRY_MAX=2
+
 # 禁用 secure boot (避免依赖 micro-ecc submodule)
 CONFIG_SECURE_BOOT=n
 CONFIG_SECURE_BOOT_V2_ENABLED=n
@@ -73,8 +100,8 @@ CONFIG_SECURE_BOOT_V2_ENABLED=n
 # lwip 已从 gitee 镜像克隆, 启用网络栈 (esp_http_server 等组件依赖)
 # CONFIG_LWIP_ENABLE 默认为 y (SOC_WIFI_SUPPORTED)
 
-# 关闭 mbedTLS 证书包 (避免依赖 mbedtls submodule 的 esp_crt_bundle)
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+# 启用 mbedTLS 证书包 (V1.0.68 天气时钟 HTTPS 需要 esp_crt_bundle)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 
 # 关闭 mbedTLS 硬件加速 (上游 mbedtls 不含 espressif 的 soft fallback 类型)
 CONFIG_MBEDTLS_HARDWARE_AES=n
@@ -86,6 +113,8 @@ CONFIG_MBEDTLS_HARDWARE_ECDSA_SIGN=n
 CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY=n
 CONFIG_MBEDTLS_GCM_SUPPORT_NON_AES_CIPHER=n
 CONFIG_TINYUSB_MSC_ENABLED=y
+# USB HID 复合设备: 2 个 HID 接口 (键盘 + 鼠标)
+CONFIG_TINYUSB_HID_COUNT=2
 
 # CPU 频率: 240MHz (默认 160MHz, 提升 50% 性能)
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
@@ -102,3 +131,20 @@ CONFIG_ESP_COEX_ENABLED=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
+# main 任务栈: 默认 3584 对引擎启动/加载链(在 main 任务上运行)太浅,
+# 打开任意引擎会触发 "stack overflow in task main" 重启。
+# 调到 12288, 为 NES/GB/Arduboy start 与 gam4980 libretro 初始化链提供充足栈。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
+
+# === V1.0.9x: 精简 WiFi 内存 ===
+# WiFi 目前只两个用途: ①STA 联网(天气/同步) ②softAP 开热点当网页手柄.
+# 都是小数据量, 默认 16 动态收发缓冲/32 管理短缓冲对我们是浪费,
+# 下发后可腾出数千字节内部 DMA, 避免 WiFi 手柄启动时与蓝牙争 DMA 失败.
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
+CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=3
+# IEEE802.11 接收去重共缓存降到 256 (小热点场景够用, 省 DMA)
+CONFIG_ESP32_WIFI_RX_BA_WIN=6
+CONFIG_ESP_WIFI_RX_BA_WIN=6

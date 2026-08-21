@@ -2,8 +2,12 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+
+static const char *TAG = "font_book";
 
 /* 由 CMake target_add_binary_data 生成:
  * assets/book16.fnt -> _binary_book16_fnt_start/_end */
@@ -46,6 +50,11 @@ static const uint8_t *s_uni;        /* u16 cp, u16 idx 交替, 按 cp 升序 */
 static const char *s_error = "未初始化";
 static bool s_compressed = false;        /* 字形是否 RLE 压缩 (flags bit0) */
 static uint8_t s_glyph_scratch[160];     /* 压缩字形解码缓冲 (32px 最大 128B) */
+
+/* V1.0.88: TF 卡字库支持 */
+static bool s_sd_active = false;         /* 当前是否使用 TF 卡字库 */
+static uint8_t *s_sd_buf = NULL;         /* TF 卡字库 PSRAM 缓冲 */
+static size_t s_sd_buf_size = 0;
 
 #define FONT_FLAG_RLE 1
 
@@ -134,7 +143,19 @@ void font_book_select(int style, int size_id) {
         else if (sz == 2) { d = book32_fs_fnt_start; len = (size_t)(book32_fs_fnt_end - book32_fs_fnt_start); }
         else              { d = book24_fs_fnt_start; len = (size_t)(book24_fs_fnt_end - book24_fs_fnt_start); }
     }
+    /* 释放旧 SD 缓冲 (切回内嵌) */
+    if (s_sd_buf) {
+        free(s_sd_buf);
+        s_sd_buf = NULL;
+        s_sd_buf_size = 0;
+    }
+    s_sd_active = false;
     font_bind(d, len);
+}
+
+/* V1.0.88: 切回内嵌字库 (退出 SD 字库模式) */
+void font_book_select_embedded(int style, int size_id) {
+    font_book_select(style, size_id);
 }
 
 const char *font_book_error(void) {
@@ -198,4 +219,106 @@ bool font_book_glyph_unicode(uint32_t cp, book_glyph_t *out) {
         else hi = mid - 1;
     }
     return false;
+}
+
+/* ============ V1.0.88: TF 卡字库加载 ============ */
+
+#define SD_FONT_DIR "/sdcard/fonts"
+
+bool font_book_select_file(const char *path) {
+    if (!path || !path[0]) return false;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        ESP_LOGW(TAG, "无法打开字库: %s", path);
+        s_error = "无法打开字库文件";
+        return false;
+    }
+
+    /* 获取文件大小 */
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize < (long)sizeof(book_font_header_t) || fsize > 4 * 1024 * 1024) {
+        ESP_LOGW(TAG, "字库文件大小异常: %ld", fsize);
+        fclose(f);
+        s_error = "字库文件大小异常";
+        return false;
+    }
+
+    /* 分配 PSRAM 缓冲 */
+    uint8_t *buf = heap_caps_malloc((size_t)fsize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        ESP_LOGE(TAG, "PSRAM 分配失败 (%ld bytes)", fsize);
+        fclose(f);
+        s_error = "内存不足";
+        return false;
+    }
+
+    size_t got = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    if ((long)got != fsize) {
+        ESP_LOGW(TAG, "读取不完整: %zu/%ld", got, fsize);
+        free(buf);
+        s_error = "读取不完整";
+        return false;
+    }
+
+    /* 校验 magic */
+    if (memcmp(buf, FONT_MAGIC, 8) != 0) {
+        ESP_LOGW(TAG, "字库魔数错误: %s", path);
+        free(buf);
+        s_error = "字库魔数错误";
+        return false;
+    }
+
+    /* 释放旧缓冲 */
+    if (s_sd_buf) {
+        free(s_sd_buf);
+    }
+
+    s_sd_buf = buf;
+    s_sd_buf_size = (size_t)fsize;
+    s_sd_active = true;
+
+    if (!font_bind(buf, s_sd_buf_size)) {
+        ESP_LOGW(TAG, "字库绑定失败: %s", path);
+        s_sd_active = false;
+        /* 不立即释放, 让错误信息可查; 下次加载会替换 */
+        s_error = "字库绑定失败";
+        return false;
+    }
+
+    ESP_LOGI(TAG, "TF 卡字库加载成功: %s (%ld bytes, cell=%dx%d)",
+             path, fsize, s_hdr ? s_hdr->cell_w : 0, s_hdr ? s_hdr->cell_h : 0);
+    return true;
+}
+
+int font_book_scan_sd(char names[][64], int max) {
+    if (!names || max <= 0) return 0;
+
+    DIR *dir = opendir(SD_FONT_DIR);
+    if (!dir) {
+        ESP_LOGI(TAG, "字体目录不存在: %s", SD_FONT_DIR);
+        return 0;
+    }
+
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && count < max) {
+        /* 只收集 .fnt 文件 */
+        const char *dot = strrchr(ent->d_name, '.');
+        if (dot && strcasecmp(dot, ".fnt") == 0) {
+            strncpy(names[count], ent->d_name, 63);
+            names[count][63] = '\0';
+            count++;
+        }
+    }
+    closedir(dir);
+    ESP_LOGI(TAG, "扫描到 %d 个 TF 卡字体", count);
+    return count;
+}
+
+bool font_book_is_sd_active(void) {
+    return s_sd_active;
 }
