@@ -91,14 +91,14 @@ static void main_anim_to(ui_ctx_t *ctx, int target) {
     ctx->needs_redraw = true;
 }
 
-/* 图标尺寸: 按离相机的距离平滑缩放 (中间 100px, 越远越小到 64px).
- * ad = |图标格 - 相机| (格). 平滑插值, 拖动/切换时图标平滑放大缩小. */
+/* 图标尺寸: 中间图标 100px, 其余固定 64px.
+ * 只在"进入/离开中间位置"的 0.5~1.0 格内做缩放过渡 (放大/缩小的动画效果);
+ * 静止时仅正中间 100, 其余全部严格 64. */
 static int main_icon_size(float ad) {
     if (ad <= 0.5f) return 100;
-    if (ad >= 1.6f) return 64;
-    float t = (ad - 0.5f) / 1.1f;              /* 0..1 */
-    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
-    float ease = t * t * (3.0f - 2.0f * t);    /* smoothstep: 起步缓, 中间快, 收尾缓 */
+    if (ad >= 1.0f) return 64;
+    float t = (ad - 0.5f) / 0.5f;              /* 0..1 */
+    float ease = t * t * (3.0f - 2.0f * t);    /* smoothstep */
     return 100 - (int)(36.0f * ease);
 }
 
@@ -190,6 +190,8 @@ static void p_main_action(ui_ctx_t *ctx, os_action_t a)
 /* ============ 触摸 ============ */
 static bool p_main_touch(ui_ctx_t *ctx, int x, int y)
 {
+    /* 拖动松手后的点击抑制: 防止回弹瞬间误触进入页面 */
+    if (input_suppressed()) return false;
     /* 命中检测: 点中某个图标 -> 选中并进入 */
     if (y < 0 || y >= UI_SCREEN_H) return false;
     int total = (int)MAIN_MOD_COUNT;
