@@ -4,6 +4,7 @@ idf_component_register(
     REQUIRES
         st7305
         menu
+        sd_scan
         input
         nvs_flash
         esp_event

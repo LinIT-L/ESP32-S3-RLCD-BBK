@@ -1,8 +1,8 @@
-set(SOURCES "menu_system.c" "sd_scan.c" "file_browser.c" "favorites.c" "diagnosis_v2.c" "whiteboard.c" "terminal.c" "app_cleanup.c"
+set(SOURCES "menu_system.c" "file_browser.c" "favorites.c" "diagnosis_v2.c" "whiteboard.c" "terminal.c" "app_cleanup.c"
             "esp_hid_gap.c" "bt_core.c" "bt_map.c" "bt_manager.c")
 
-# V1.x: 壁纸/wifi_manager/fonts(中文字库)/kbd_lib(52键键盘) 已拆为独立组件.
-set(REQUIRES_LIST st7305 driver fatfs esp_driver_gpio sdmmc usbh_msc usb_hid gam4980 arduboy_avr audio_player gb_emu nes_emu board_shim engine_manager book_reader web_gamepad virtual_keys esp_http_client tone_player touch_panel mbedtls input vpet vibrator wallpapers wifi_manager fonts kbd_lib)
+# V1.x: 壁纸/wifi_manager/fonts/kbd_lib/sd_scan 已拆为独立组件.
+set(REQUIRES_LIST st7305 driver fatfs esp_driver_gpio sdmmc usbh_msc usb_hid gam4980 arduboy_avr audio_player gb_emu nes_emu board_shim engine_manager book_reader web_gamepad virtual_keys esp_http_client tone_player touch_panel mbedtls input vpet vibrator wallpapers wifi_manager fonts kbd_lib sd_scan)
 # V1.x: 方案还原 — 使用官方 esp_hid(Bluedroid BLE HID Host), 不再引用 bluepad32/btstack.
 set(PRIV_REQUIRES_LIST bt esp_hid nvs_flash spi_flash esp_system esp_timer esp_netif lwip)
 
