@@ -26,7 +26,7 @@ idf_component_register(
          "pages/page_wb.c"
          "pages/page_diag.c"
     INCLUDE_DIRS "include"
-    REQUIRES st7305 ui_common input audio_player vibrator engine_manager gam4980 book_reader wallpapers usb_hid wifi_manager fonts kbd_lib sd_scan board_battery esp_netif lwip spi_flash esp_system
+    REQUIRES st7305 ui_common input audio_player vibrator engine_manager gam4980 book_reader wallpapers usb_hid wifi_manager fonts kbd_lib sd_scan board_battery esp_netif lwip spi_flash esp_system bt_ctl web_gamepad
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
