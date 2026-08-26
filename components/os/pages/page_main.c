@@ -87,6 +87,7 @@ static void main_anim_to(ui_ctx_t *ctx, int target) {
     int steps = dt < 0 ? -dt : dt;
     uint32_t dur = 300 + (uint32_t)steps * 90;   /* 慢速, 放大缩小动画清晰可见 */
     if (dur > 800) dur = 800;
+    s_main.anim_spring = true;                  /* 按键导航: 弹簧回弹 */
     main_cam_animate(target, dur);
     ctx->needs_redraw = true;
 }
@@ -162,10 +163,10 @@ static void p_main_render(ui_ctx_t *ctx)
         } else {
             uint32_t d = now - s_main.cam_anim_start;
             float tt = d < s_main.cam_anim_dur ? (float)d / (float)s_main.cam_anim_dur : 1.0f;
-            /* 惯性甩动: 缓动 1-(1-t)^2.2 (前面快、后面利落收尾, 不拖沓);
-             * 短距离归位: 弹簧回弹. */
+            /* 惯性/归位: 抛物线减速 1-(1-t)^2 (速度线性衰减自然停);
+             * 按键导航(anim_spring): 弹簧回弹. */
             float ease = s_main.anim_spring ? spring_ease(tt)
-                       : (1.0f - (float)pow(1.0f - tt, 2.2f));
+                       : (1.0f - (float)pow(1.0f - tt, 2.0f));
             cam = s_main.cam_anim_from +
                   (s_main.cam_anim_to - s_main.cam_anim_from) * ease;
             if (tt >= 1.0f) {
@@ -289,49 +290,52 @@ static void p_main_poll(ui_ctx_t *ctx)
                 s_main.v_t[4]   = now_ms();
             }
         } else {
-            /* 松手: 归位吸附到最近槽位, 并叠加惯性 (苹果式: 前面快后面降速).
-             * 释放速度越快 → 滑得越远 (快速甩动 5-7 格); 慢速就近停. */
+            /* 松手: 释放速度 → 惯性 (抛物线减速); 缓慢滑动不甩直接归位.
+             *   vel < 0.25   → 0 格 (直接归位, 不甩)
+             *   vel 0.4-0.6  → 1-2 格 (用力一点)
+             *   vel 0.9-1.2  → 5-7 格 (速度快, 甩得远) */
             s_main.drag_active = false;
-            if (s_main.drag_moved >= 40) {
+            if (s_main.drag_moved >= 10) {
                 s_main.suppress_until = now_ms() + 150;
                 const int spacing = 100;
                 float cur = s_main.cam_base - (float)s_main.drag_offset / (float)spacing;
 
-                /* 释放速度 (px/ms): 取最近两个"偏移不同"的采样, 排除触摸未更新的
-                 * 同值样本, 避免被拖尾稀释 → 快甩能测到真实末速. */
+                /* 释放速度 (px/ms): 取最近一段 >=60ms 窗口内的平均速度.
+                 * 窗口足够长 → 慢拖平均值低(不甩), 快甩平均值高(甩得远);
+                 * 同时避免 16ms 瞬时抖动被误判为高速. */
                 float vel = 0.0f;
                 if (s_main.v_n >= 2) {
                     int last = s_main.v_n - 1;
-                    while (last > 0) {
-                        int j = last - 1;
-                        while (j > 0 && s_main.v_t[last] == s_main.v_t[j]) j--;
-                        if (s_main.v_off[last] != s_main.v_off[j] &&
-                            s_main.v_t[last] > s_main.v_t[j]) {
-                            vel = (float)(s_main.v_off[last] - s_main.v_off[j]) /
-                                  (float)(s_main.v_t[last] - s_main.v_t[j]);
-                            break;
-                        }
-                        last = j;
+                    int j = last - 1;
+                    while (j >= 0 && (int)(s_main.v_t[last] - s_main.v_t[j]) < 60) j--;
+                    if (j >= 0 && s_main.v_t[last] > s_main.v_t[j]) {
+                        vel = (float)(s_main.v_off[last] - s_main.v_off[j]) /
+                              (float)(s_main.v_t[last] - s_main.v_t[j]);
                     }
                 }
-                /* 苹果式惯性: 减速时间常数 ~800ms, 释放速度→滑行距离 (不设距离上限,
-                 * 由速度与封顶 7 格决定; 阈值 0.15px/ms: 特别慢才不甩). */
+
+                /* 速度→格数: 二次曲线 (低区缓增→用力甩 1-2 格, 高区陡增→快甩 5-7 格) */
+                int sign = vel < 0 ? -1 : 1;
+                float av = fabsf(vel);
                 int extra = 0;
-                if (fabsf(vel) >= 0.15f) {
-                    float glide_px = vel * 800.0f;              /* 速度→滑行距离 */
-                    extra = (int)lroundf(glide_px / (float)spacing);
-                    if (extra > 7) extra = 7; else if (extra < -7) extra = -7;
+                if (av >= 0.25f) {
+                    float d = av - 0.25f;
+                    float slots = d * 4.0f + d * d * 6.0f;
+                    extra = (int)lroundf(slots);
+                    if (extra > 7) extra = 7;
+                    extra *= sign;
                 }
                 int base_target = lroundf(cur);
-                int target = base_target - extra;              /* 惯性方向与拖动一致 */
+                int target = base_target - extra;   /* 惯性方向与拖动一致 */
 
-                /* 惯性甩动: 平滑减速停 (利落收尾); 无惯性(extra=0): 弹簧回弹归位 */
-                s_main.anim_spring = (extra == 0);
+                /* 动画: 抛物线减速 1-(1-t)^2 (速度线性衰减, 自然停下, 无过冲).
+                 * 缓慢归位同曲线 → 平滑回落到槽位, 不甩不弹. */
+                s_main.anim_spring = false;
                 int steps = (int)(target - lroundf(s_main.cam_base));
                 if (steps < 0) steps = -steps;
-                uint32_t dur = 220 + (uint32_t)steps * 70;      /* 甩得远稍久, 但收尾快 */
-                if (dur > 650) dur = 650;
-                s_main.cam_cur = cur;                          /* 动画起点 = 松手位置 */
+                uint32_t dur = 220 + (uint32_t)steps * 50;
+                if (dur > 550) dur = 550;
+                s_main.cam_cur = cur;
                 main_cam_animate(target, dur);
                 ctx->needs_redraw = true;
                 ESP_LOGI("MAIN", "归位: cur=%.2f vel=%.2f extra=%d target=%d moved=%d",
