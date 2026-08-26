@@ -162,10 +162,10 @@ static void p_main_render(ui_ctx_t *ctx)
         } else {
             uint32_t d = now - s_main.cam_anim_start;
             float tt = d < s_main.cam_anim_dur ? (float)d / (float)s_main.cam_anim_dur : 1.0f;
-            /* 惯性甩动: 强减速缓动 1-(1-t)^4 (前面快后面降速, 苹果式);
+            /* 惯性甩动: 缓动 1-(1-t)^2.2 (前面快、后面利落收尾, 不拖沓);
              * 短距离归位: 弹簧回弹. */
             float ease = s_main.anim_spring ? spring_ease(tt)
-                       : (1.0f - (float)pow(1.0f - tt, 4.0f));
+                       : (1.0f - (float)pow(1.0f - tt, 2.2f));
             cam = s_main.cam_anim_from +
                   (s_main.cam_anim_to - s_main.cam_anim_from) * ease;
             if (tt >= 1.0f) {
@@ -290,47 +290,47 @@ static void p_main_poll(ui_ctx_t *ctx)
             }
         } else {
             /* 松手: 归位吸附到最近槽位, 并叠加惯性 (苹果式: 前面快后面降速).
-             * 释放速度越快 → 滑得越远 (快+远 5-7 格); 短而快也甩; 慢速就近停. */
+             * 释放速度越快 → 滑得越远 (快速甩动 5-7 格); 慢速就近停. */
             s_main.drag_active = false;
             if (s_main.drag_moved >= 40) {
                 s_main.suppress_until = now_ms() + 150;
                 const int spacing = 100;
                 float cur = s_main.cam_base - (float)s_main.drag_offset / (float)spacing;
 
-                /* 释放速度: 用最近两段采样 (松手瞬间) 估算 px/ms */
+                /* 释放速度 (px/ms): 取最近两个"偏移不同"的采样, 排除触摸未更新的
+                 * 同值样本, 避免被拖尾稀释 → 快甩能测到真实末速. */
                 float vel = 0.0f;
                 if (s_main.v_n >= 2) {
                     int last = s_main.v_n - 1;
-                    int j = last - 1;
-                    while (j >= 0 && s_main.v_t[last] == s_main.v_t[j]) j--;
-                    if (j >= 0) {
-                        vel = (float)(s_main.v_off[last] - s_main.v_off[j]) /
-                              (float)(s_main.v_t[last] - s_main.v_t[j]);
+                    while (last > 0) {
+                        int j = last - 1;
+                        while (j > 0 && s_main.v_t[last] == s_main.v_t[j]) j--;
+                        if (s_main.v_off[last] != s_main.v_off[j] &&
+                            s_main.v_t[last] > s_main.v_t[j]) {
+                            vel = (float)(s_main.v_off[last] - s_main.v_off[j]) /
+                                  (float)(s_main.v_t[last] - s_main.v_t[j]);
+                            break;
+                        }
+                        last = j;
                     }
                 }
-                /* 苹果式惯性: 减速时间常数 ~650ms, 释放速度→滑行距离.
-                 * 阈值 0.12px/ms: 短而快的甩动也会滑, 只有特别慢才不甩. */
+                /* 苹果式惯性: 减速时间常数 ~800ms, 释放速度→滑行距离 (不设距离上限,
+                 * 由速度与封顶 7 格决定; 阈值 0.15px/ms: 特别慢才不甩). */
                 int extra = 0;
-                if (fabsf(vel) >= 0.12f) {
-                    float glide_px = vel * 650.0f;              /* 速度→滑行距离 */
-                    int by_vel = (int)lroundf(glide_px / (float)spacing);
-                    /* 距离上限放宽: 最多拖动距离的 2 倍 + 1 格 (短快可甩, 但不过分离谱) */
-                    float max_extra = ((float)s_main.drag_moved / (float)spacing) * 2.0f + 1.0f;
-                    float ex = (float)by_vel;
-                    if (ex > max_extra) ex = max_extra;
-                    else if (ex < -max_extra) ex = -max_extra;
-                    extra = (int)lroundf(ex);
+                if (fabsf(vel) >= 0.15f) {
+                    float glide_px = vel * 800.0f;              /* 速度→滑行距离 */
+                    extra = (int)lroundf(glide_px / (float)spacing);
                     if (extra > 7) extra = 7; else if (extra < -7) extra = -7;
                 }
                 int base_target = lroundf(cur);
                 int target = base_target - extra;              /* 惯性方向与拖动一致 */
 
-                /* 惯性甩动: 平滑减速停; 无惯性(extra=0): 弹簧回弹归位 */
+                /* 惯性甩动: 平滑减速停 (利落收尾); 无惯性(extra=0): 弹簧回弹归位 */
                 s_main.anim_spring = (extra == 0);
                 int steps = (int)(target - lroundf(s_main.cam_base));
                 if (steps < 0) steps = -steps;
-                uint32_t dur = 300 + (uint32_t)steps * 95;      /* 甩得越远减速越久 */
-                if (dur > 1000) dur = 1000;
+                uint32_t dur = 220 + (uint32_t)steps * 70;      /* 甩得远稍久, 但收尾快 */
+                if (dur > 650) dur = 650;
                 s_main.cam_cur = cur;                          /* 动画起点 = 松手位置 */
                 main_cam_animate(target, dur);
                 ctx->needs_redraw = true;
