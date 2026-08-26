@@ -162,8 +162,10 @@ static void p_main_render(ui_ctx_t *ctx)
         } else {
             uint32_t d = now - s_main.cam_anim_start;
             float tt = d < s_main.cam_anim_dur ? (float)d / (float)s_main.cam_anim_dur : 1.0f;
-            /* 惯性甩动=平滑减速停; 短距离归位=弹簧回弹 */
-            float ease = s_main.anim_spring ? spring_ease(tt) : (1.0f - (float)pow(1.0f - tt, 3.0f));
+            /* 惯性甩动: 强减速缓动 1-(1-t)^4 (前面快后面降速, 苹果式);
+             * 短距离归位: 弹簧回弹. */
+            float ease = s_main.anim_spring ? spring_ease(tt)
+                       : (1.0f - (float)pow(1.0f - tt, 4.0f));
             cam = s_main.cam_anim_from +
                   (s_main.cam_anim_to - s_main.cam_anim_from) * ease;
             if (tt >= 1.0f) {
@@ -287,8 +289,8 @@ static void p_main_poll(ui_ctx_t *ctx)
                 s_main.v_t[4]   = now_ms();
             }
         } else {
-            /* 松手: 归位吸附到最近槽位, 并叠加惯性 (甩动速度 → 继续滑几格).
-             * 快+远=惯性远; 轻滑(距离短)/慢速=就近停, 不误甩. */
+            /* 松手: 归位吸附到最近槽位, 并叠加惯性 (苹果式: 前面快后面降速).
+             * 释放速度越快 → 滑得越远 (快+远 5-7 格); 短而快也甩; 慢速就近停. */
             s_main.drag_active = false;
             if (s_main.drag_moved >= 40) {
                 s_main.suppress_until = now_ms() + 150;
@@ -306,19 +308,19 @@ static void p_main_poll(ui_ctx_t *ctx)
                               (float)(s_main.v_t[last] - s_main.v_t[j]);
                     }
                 }
-                /* 惯性: 速度超阈值才甩; 甩动格数受速度与拖动距离双重约束.
-                 * 阈值 0.35px/ms (约 21px/60ms): 轻滑/慢速不甩, 只归位. */
+                /* 苹果式惯性: 减速时间常数 ~650ms, 释放速度→滑行距离.
+                 * 阈值 0.12px/ms: 短而快的甩动也会滑, 只有特别慢才不甩. */
                 int extra = 0;
-                if (fabsf(vel) >= 0.35f) {
-                    float glide_px = vel * 240.0f;              /* 速度→滑行距离 */
+                if (fabsf(vel) >= 0.12f) {
+                    float glide_px = vel * 650.0f;              /* 速度→滑行距离 */
                     int by_vel = (int)lroundf(glide_px / (float)spacing);
-                    /* 距离上限: 惯性不超过拖动距离的 1.5 倍 (轻滑距离短→惯性小) */
-                    float max_extra = ((float)s_main.drag_moved / (float)spacing) * 1.5f;
+                    /* 距离上限放宽: 最多拖动距离的 2 倍 + 1 格 (短快可甩, 但不过分离谱) */
+                    float max_extra = ((float)s_main.drag_moved / (float)spacing) * 2.0f + 1.0f;
                     float ex = (float)by_vel;
                     if (ex > max_extra) ex = max_extra;
                     else if (ex < -max_extra) ex = -max_extra;
                     extra = (int)lroundf(ex);
-                    if (extra > 3) extra = 3; else if (extra < -3) extra = -3;
+                    if (extra > 7) extra = 7; else if (extra < -7) extra = -7;
                 }
                 int base_target = lroundf(cur);
                 int target = base_target - extra;              /* 惯性方向与拖动一致 */
@@ -327,8 +329,8 @@ static void p_main_poll(ui_ctx_t *ctx)
                 s_main.anim_spring = (extra == 0);
                 int steps = (int)(target - lroundf(s_main.cam_base));
                 if (steps < 0) steps = -steps;
-                uint32_t dur = 280 + (uint32_t)steps * 90;
-                if (dur > 900) dur = 900;
+                uint32_t dur = 300 + (uint32_t)steps * 95;      /* 甩得越远减速越久 */
+                if (dur > 1000) dur = 1000;
                 s_main.cam_cur = cur;                          /* 动画起点 = 松手位置 */
                 main_cam_animate(target, dur);
                 ctx->needs_redraw = true;
