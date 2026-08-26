@@ -60,8 +60,8 @@ typedef struct {
     uint32_t suppress_until;  /* 拖动松手后短暂抑制 swipe 方向键/确认 (ms) */
     bool    anim_spring;      /* 本次动画用弹簧回弹 (false=惯性减速平滑停) */
     /* 惯性速度采样: 最近 N 个 (偏移, 时间) 对 */
-    int      v_off[5];
-    uint32_t v_t[5];
+    int      v_off[16];
+    uint32_t v_t[16];
     int      v_n;
     int     selected;         /* 选中显示索引 (0..MAIN_MOD_COUNT-1) */
 } main_state_t;
@@ -261,7 +261,9 @@ static void p_main_poll(ui_ctx_t *ctx)
 
     int tx, ty;
     bool down = input_get_touch_pos(&tx, &ty);
-    if (down && !s_main.drag_active) {
+    /* 抑制窗口内禁止开启新拖拽: 用力甩动松手后手指反弹接触会被误认为新拖拽,
+     * 把相机基点重置到动画中途 → 图标瞬间后跳 ("甩完后移"感). */
+    if (down && !s_main.drag_active && now_ms() >= s_main.suppress_until) {
         s_main.drag_active   = true;
         s_main.drag_start_x  = tx;
         s_main.drag_offset   = 0;
@@ -279,15 +281,15 @@ static void p_main_poll(ui_ctx_t *ctx)
             s_main.drag_offset = off;
             int m = off < 0 ? -off : off;
             if (m > s_main.drag_moved) s_main.drag_moved = m;
-            /* 速度采样: 记录最近 5 个 (偏移,时间) */
-            if (s_main.v_n < 5) {
+            /* 速度采样: 记录最近 16 个 (偏移,时间) */
+            if (s_main.v_n < 16) {
                 s_main.v_off[s_main.v_n] = off;
                 s_main.v_t[s_main.v_n]   = now_ms();
                 s_main.v_n++;
             } else {
-                for (int i = 1; i < 5; i++) { s_main.v_off[i-1] = s_main.v_off[i]; s_main.v_t[i-1] = s_main.v_t[i]; }
-                s_main.v_off[4] = off;
-                s_main.v_t[4]   = now_ms();
+                for (int i = 1; i < 16; i++) { s_main.v_off[i-1] = s_main.v_off[i]; s_main.v_t[i-1] = s_main.v_t[i]; }
+                s_main.v_off[15] = off;
+                s_main.v_t[15]   = now_ms();
             }
         } else {
             /* 松手: 释放速度 → 惯性 (抛物线减速); 缓慢滑动不甩直接归位.
@@ -300,17 +302,21 @@ static void p_main_poll(ui_ctx_t *ctx)
                 const int spacing = 100;
                 float cur = s_main.cam_base - (float)s_main.drag_offset / (float)spacing;
 
-                /* 释放速度 (px/ms): 取最近一段 >=60ms 窗口内的平均速度.
-                 * 窗口足够长 → 慢拖平均值低(不甩), 快甩平均值高(甩得远);
-                 * 同时避免 16ms 瞬时抖动被误判为高速. */
+                /* 释放速度 (px/ms): 取松手前 ~80ms 窗口的平均速度 (从最新样本往回找
+                 * 第一个时间差>=80ms 的样本). 之前误用了整个 200ms 跨度 → 快甩峰值
+                 * 被稀释. 80ms 窗口: 后面变慢→末速低(及时停), 快甩→末速高(甩得远). */
                 float vel = 0.0f;
+                int vel_span = 0;
                 if (s_main.v_n >= 2) {
                     int last = s_main.v_n - 1;
-                    int j = last - 1;
-                    while (j >= 0 && (int)(s_main.v_t[last] - s_main.v_t[j]) < 60) j--;
-                    if (j >= 0 && s_main.v_t[last] > s_main.v_t[j]) {
-                        vel = (float)(s_main.v_off[last] - s_main.v_off[j]) /
-                              (float)(s_main.v_t[last] - s_main.v_t[j]);
+                    int first = 0;
+                    for (int i = last; i >= 1; i--) {
+                        if ((int)(s_main.v_t[last] - s_main.v_t[i]) >= 80) { first = i; break; }
+                    }
+                    if (s_main.v_t[last] > s_main.v_t[first]) {
+                        vel_span = (int)(s_main.v_t[last] - s_main.v_t[first]);
+                        vel = (float)(s_main.v_off[last] - s_main.v_off[first]) /
+                              (float)vel_span;
                     }
                 }
 
@@ -338,8 +344,8 @@ static void p_main_poll(ui_ctx_t *ctx)
                 s_main.cam_cur = cur;
                 main_cam_animate(target, dur);
                 ctx->needs_redraw = true;
-                ESP_LOGI("MAIN", "归位: cur=%.2f vel=%.2f extra=%d target=%d moved=%d",
-                         cur, vel, extra, target, s_main.drag_moved);
+                ESP_LOGI("MAIN", "归位: cur=%.2f vel=%.2f span=%d n=%d extra=%d target=%d moved=%d",
+                         cur, vel, vel_span, s_main.v_n, extra, target, s_main.drag_moved);
             }
         }
     }
