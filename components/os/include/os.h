@@ -117,6 +117,8 @@ struct ui_ctx {
     int  current_page;         /* 当前模块 id (OS_PAGE_*) */
     bool needs_redraw;         /* 脏标记 */
     bool modal_active;         /* 当前是否为模态覆盖页 */
+    bool fullscreen;           /* 运行时全屏覆盖 (模块 render 内设置, 帧末复位;
+                                * 阅读器/游戏等需隐藏状态栏的应用页用) */
     /* 内部(不应被模块直接触碰) */
     const os_module_t *cur;    /* 当前激活模块 */
     /* 模块私有状态一律放各自 .c, 不放这里 */

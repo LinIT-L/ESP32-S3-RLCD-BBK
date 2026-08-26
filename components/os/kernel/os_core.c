@@ -33,6 +33,7 @@ void os_init(ui_ctx_t *ctx, st7305_handle_t *lcd)
     ctx->current_page = -1;
     ctx->needs_redraw = true;
     ctx->modal_active = false;
+    ctx->fullscreen   = false;
     ctx->cur          = NULL;
     s_stack_top       = -1;
     s_cur_mod         = NULL;
@@ -149,10 +150,12 @@ void os_render(ui_ctx_t *ctx)
     if (!ctx->lcd) return;
 
     const os_module_t *m = os_cur_mod();
-    bool fullscreen = m && m->fullscreen;
 
     if (m && m->render) m->render(ctx);
 
+    /* 全屏: 模块静态 fullscreen 或模块在 render 内设置的运行时覆盖 */
+    bool fullscreen = m && (m->fullscreen || ctx->fullscreen);
+    ctx->fullscreen = false;   /* 帧末复位运行时覆盖 */
     if (!fullscreen) {
         for (int i = 0; i < s_service_count; i++)
             if (s_services[i]->render) s_services[i]->render(ctx);
