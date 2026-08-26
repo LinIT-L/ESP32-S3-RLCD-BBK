@@ -98,20 +98,33 @@ Launcher（菜单应用页）扫描 `/sdcard/apps/*/app.wasm`，依 manifest 展
 
 ## 5. Host API（wasm import / 宿主 native）
 
+> V2 定稿（2026-08-26）：系统为全自研、信任度高，**全套接口均暴露给 WASM 应用**，仅排除「重启 / 擦写分区」两项危险操作。
+
 应用导出（wasm export，供宿主调用以控制帧节奏）：
 ```
 app_init()
-app_tick()          # 每 16.67ms 被调用一次
+app_tick(dt)          # 每帧被调用一次
+app_exit()
 ```
-宿主注册的 import（wasm 侧 `import "env"..."`）：
+宿主注册的 import（wasm 侧 `import "env"..."`）—— 全集：
 ```
-显示:  wdraw(w, h, 像素缓冲) / wflip()
-输入:  wbtn(i) / wbtnp(i) / wtouch() -> {x,y,down}
-音频:  wbeep(freq, dur)
-文件:  wfile_read("/assets/...", buf, len) -> int
-       wfile_write("/save/...", buf, len) -> int   # 仅本应用目录
-时间:  wmillis()
-共享:  wshared_get(ns, key, buf, len) / wshared_set / wshared_del / wshared_list(ns)
+显示:    wdraw(x,y,w,h,像素缓冲) / wflip() / wclear()
+输入:    wbtn(i) / wbtnp(i) / wtouch() -> {x,y,down}
+音频:    wbeep(freq, dur) / wfeed_pcm(buf, len, sr)
+震动:    wvib(dur, strength)
+Wi-Fi:   wwifi_connect(ssid,pass) / wwifi_status() / wwifi_scan()
+蓝牙:    wbt_status() / wbt_pad_state()              # 只读查询
+文件:    wfile_read(path, buf, len) -> int
+         wfile_write(path, buf, len) -> int          # 仅本应用目录
+         wdir(path) -> 列表
+数据库:  wshared_get(ns, key, buf, len) / wshared_set / wshared_del / wshared_list(ns)
+时间:    wmillis() / wdate()
+系统信息: wsys_battery() / wsys_mem()
+HTTP:    whttp_get(url) / whttp_post(url, body)
+弹窗:    wtoast(msg)                                 # 调系统统一弹窗 os_dialog
+应用协作: wlaunch(app_id) / wexit()
+音量:    wvolume_get() / wvolume_set(v)
+随机:    wrand(max)
 ```
 
 ### 像素格式说明

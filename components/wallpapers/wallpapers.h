@@ -8,18 +8,9 @@
 extern "C" {
 #endif
 
-/* 内置壁纸程序 id (0=星空由 menu_system 自带, 1..7 在此实现)
- * V3: 删除板块漂移/赫尔曼栅格/腐蚀重生, 重做其余 7 个 */
+/* 内置壁纸程序 id (V4: 仅保留星空, 由 menu_system 屏保实现; 其余动态壁纸已删除) */
 #define WP_PROG_STARS    0
-#define WP_PROG_STAIRS   1
-#define WP_PROG_CLOCK    2
-#define WP_PROG_BINARY   3
-#define WP_PROG_LIFE     4
-#define WP_PROG_CTHULHU  5
-#define WP_PROG_PCB      6
-#define WP_PROG_WHEAT    7
-#define WP_PROG_WEATHER  8   /* V1.0.67: 天气时钟 (在 menu_system.c 实现) */
-#define WP_PROG_COUNT    9
+#define WP_PROG_COUNT    1
 
 const char *wp_prog_name(int id);
 

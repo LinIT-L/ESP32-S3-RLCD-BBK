@@ -1013,13 +1013,11 @@ static void weather_clock_render(st7305_handle_t *lcd, uint32_t now_ms) {
     draw_text_centered(lcd, 190, buf, false);
 }
 
-/* 渲染当前选中的内置壁纸程序 (0=星空, 8=天气时钟, 其余旧程序) */
+/* 渲染当前选中的内置壁纸程序 (V4: 仅星空) */
 static void screensaver_render_builtin(st7305_handle_t *lcd, uint32_t now_ms) {
     extern menu_state_t g_menu;
     if (g_menu.wallpaper_program == WP_PROG_STARS)
         screensaver_render_stars(lcd, now_ms);
-    else if (g_menu.wallpaper_program == WP_PROG_WEATHER)
-        weather_clock_render(lcd, now_ms);
     else
         wp_program_render(lcd, (int)g_menu.wallpaper_program, now_ms);
 }
@@ -6665,9 +6663,8 @@ static void config_unpack(const bbk_config_t *c) {
     g_menu.book_font_family = (c->version >= 9 && c->book_font_family <= 20) ? c->book_font_family : 0;
     g_menu.wallpaper_mode = (c->version >= 10 && c->wallpaper_mode <= 2) ? c->wallpaper_mode : 0;
     g_menu.wallpaper_program = (c->version >= 12 &&
-                                (c->wallpaper_program == WP_PROG_STARS ||
-                                 c->wallpaper_program == WP_PROG_WEATHER))
-                               ? c->wallpaper_program : 0;   /* V1.0.67: 只保留星空 + 天气时钟 */
+                                c->wallpaper_program == WP_PROG_STARS)
+                               ? c->wallpaper_program : 0;   /* V4: 仅保留星空 */
     g_menu.wallpaper_timeout_min = (c->version >= 10 && c->wallpaper_timeout_min >= 1
                                     && c->wallpaper_timeout_min <= 30) ? c->wallpaper_timeout_min : 3;
     g_menu.wallpaper_bmp_fps = (c->version >= 11 && c->wallpaper_bmp_fps <= 2) ? c->wallpaper_bmp_fps : 1;

@@ -341,12 +341,14 @@ static void p_main_poll(ui_ctx_t *ctx)
 
                 /* 动画: 抛物线减速 1-(1-t)^2 (速度线性衰减, 自然停下, 无过冲).
                  * 缓慢归位同曲线 → 平滑回落到槽位, 不甩不弹.
-                 * 甩动用 main_cam_fling: 保持方向不回绕 (修"用力甩后瞬间后移"). */
+                 * 甩动用 main_cam_fling: 保持方向不回绕 (修"用力甩后瞬间后移").
+                 * 2026-08-26: 甩动滑行时长加长 (上限 550→1000ms, 每格 50→90ms),
+                 * 快速甩动"慢慢停"更跟手; 甩动格数(前面速度)保持不变. */
                 s_main.anim_spring = false;
                 int steps = (int)(target - lroundf(s_main.cam_base));
                 if (steps < 0) steps = -steps;
-                uint32_t dur = 220 + (uint32_t)steps * 50;
-                if (dur > 550) dur = 550;
+                uint32_t dur = 240 + (uint32_t)steps * 90;
+                if (dur > 1000) dur = 1000;
                 s_main.cam_cur = cur;
                 main_cam_fling(cur, (float)target, dur);
                 ctx->needs_redraw = true;
