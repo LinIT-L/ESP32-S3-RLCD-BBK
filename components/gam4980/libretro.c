@@ -865,10 +865,11 @@ static void sys_init(const char *romdir)
         { 0, 0, 0, 0, NULL },
     };
 
-    /* === 直接从 flash system 分区读取 ROM, 跳过 SD 卡 (速度快 10-20x) ===
-     * subtype 0x40 (0x90 在 IDF5.5 被 tee_ota 占用, 与 partitions.csv/system_rom.c 一致) */
+    /* === 直接从 flash appdata 分区读取 ROM, 跳过 SD 卡 (速度快 10-20x) ===
+     * 2026-08-26: 分区合并, 步步高 8.BIN/E.BIN 在 appdata 分区偏移 0/2MB.
+     * subtype 0x40 (0x90 在 IDF5.5 被 tee_ota 占用, 与 partitions.csv 一致) */
     const esp_partition_t *sys_part = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, "system");
+        ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, "appdata");
     
     if (sys_part && sys_part->size >= 4 * 1024 * 1024) {
         /* flash 读取: 8.BIN 在偏移 0, E.BIN 在偏移 2MB, 各 2MB */

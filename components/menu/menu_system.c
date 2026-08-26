@@ -31,7 +31,6 @@ static uint8_t vpet_aa_get(void);             /* V1.0.9x: 暴龙机独立抗锯�
 #include "nes_emu.h"
 #include "arduboy_avr.h"
 #include "engine_manager.h"
-#include "boot_switch.h"   /* 双系统: Meshtastic 快捷方式 = 重启切 ota_0 */
 #include "board_rlcd.h"    /* board_shim: GB/GBC 显示/音频适配层 */
 #include "book_reader.h"
 #include "tone_player.h"   /* V1.0.68: 方波直驱音调播放器 */
@@ -3888,7 +3887,6 @@ static int main_icon_index(int icon_idx) {
         /*27 diag(故障诊断)*/ 20,
         /*28 bbk(步步高)*/ 21,
         /*29 alarm(闹钟,占位)*/ 22, /*30 terminal(终端,占位)*/ 23,
-        /*31 meshtastic(双系统快捷方式)*/ 24,
     };
     if (icon_idx < 0 || icon_idx >= 32) return 0;
     return tbl[icon_idx];
@@ -4047,12 +4045,6 @@ static const bbk_module_t s_modules[] = {
       .icon_idx=24, .sub_page=MENU_PAGE_VPET,
       .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_ENGINE, .switch_bit=0, .in_feature_dialog=false,
       .dev_pending=false, .default_installed=false, .caps=APP_CAP_SCREEN|APP_CAP_INPUT|APP_CAP_STORAGE },
-    /* [15b] Meshtastic 双系统快捷方式 (原 meshtasic 模拟器废弃:
-     * 不在系统内跑 LVGL, 而是点击 → 重启切到独立 Meshtastic 固件 ota_0) */
-    { .id="meshtasic", .title="\x4d\x65\x73\x68\x74\x61\x73\x74\x69\x63" /* Meshtastic */, .short_label="Meshtasic",
-      .icon_idx=31, .sub_page=MENU_PAGE_MESHTASIC,
-      .kind=BBK_MOD_SWITCHABLE, .category=APP_CAT_OPERATIONS, .switch_bit=0, .in_feature_dialog=false,
-      .dev_pending=false, .hidden=false, .default_installed=true, .caps=APP_CAP_SCREEN|APP_CAP_INPUT|APP_CAP_NETWORK },
     /* [16] 白板 (画图, 工具) */
     { .id="theme", .title="\xe7\x99\xbd\xe6\x9d\xbf" /* 白板 */, .short_label="\xe7\x99\xbd\xe6\x9d\xbf",
       .icon_idx=25, .sub_page=MENU_PAGE_WHITEBOARD,
@@ -13746,30 +13738,6 @@ static void menu_enter_module(menu_state_t *state, int phys, int main_idx) {
         strncpy(state->hint_text, "\xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad", sizeof(state->hint_text) - 1); /* 开发中 */
         state->hint_until_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 1000; /* V1.0.9x: "开发中"提示 1 秒自动关闭 */
         state->needs_redraw = true;
-        return;
-    }
-    /* 双系统: Meshtastic 快捷方式 (废弃原 meshtasic 模拟器) —
-     * 确认 = 先弹加载进度条(快速 0→10% 后停住), 再重启切到独立 Meshtastic 固件 (ota_0).
-     * 未烧入独立固件时只提示不跳转. */
-    if (mod && mod->id && strcmp(mod->id, "meshtasic") == 0) {
-        if (main_idx >= 0) state->main_selected_index = main_idx;
-        /* 与打开游戏一致的统一加载进度条: 0→10% 平滑爬升后停住, 再直接进入 Meshtastic */
-        s_loading_lcd = state->lcd;
-        s_loading_pct = -1;
-        s_loading_text[0] = '\0';
-        snprintf(s_loading_text, sizeof(s_loading_text), "Meshtastic");
-        loading_screen_draw(10, s_loading_text);       /* 快速 0→10% 后停住 */
-        vTaskDelay(pdMS_TO_TICKS(400));                 /* 让进度条停留片刻 */
-        esp_err_t bs_e = boot_switch_to_meshtastic();   /* 成功会在内部 esp_restart, 不返回 */
-        if (bs_e != ESP_OK) {
-            state->hint_text[0] = '\0';
-            /* 未烧录 Meshtastic 固件 */
-            strncpy(state->hint_text,
-                    "\xe6\x9c\xaa\xe7\x83\xa7\xe5\xbd\x95 Meshtastic \xe5\x9b\xba\xe4\xbb\xb6",
-                    sizeof(state->hint_text) - 1);
-            state->hint_until_ms = xTaskGetTickCount() * portTICK_PERIOD_MS + 1500;
-            state->needs_redraw = true;
-        }
         return;
     }
     /* 故障诊断: 全屏独立主菜单页 */

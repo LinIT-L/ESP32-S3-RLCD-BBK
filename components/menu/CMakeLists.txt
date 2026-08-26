@@ -2,7 +2,7 @@ set(SOURCES "menu_system.c" "font_zh.c" "font_zh16.c" "sd_scan.c" "file_browser.
             "esp_hid_gap.c" "bt_core.c" "bt_map.c" "bt_manager.c")
 
 # V1.x: 壁纸程序已拆为独立组件 components/wallpapers; WiFi 管理已拆为 components/wifi_manager.
-set(REQUIRES_LIST st7305 driver fatfs esp_driver_gpio sdmmc usbh_msc usb_hid gam4980 arduboy_avr audio_player gb_emu nes_emu board_shim engine_manager book_reader web_gamepad virtual_keys esp_http_client tone_player touch_panel mbedtls input vpet vibrator boot_switch wallpapers wifi_manager)
+set(REQUIRES_LIST st7305 driver fatfs esp_driver_gpio sdmmc usbh_msc usb_hid gam4980 arduboy_avr audio_player gb_emu nes_emu board_shim engine_manager book_reader web_gamepad virtual_keys esp_http_client tone_player touch_panel mbedtls input vpet vibrator wallpapers wifi_manager)
 # V1.x: 方案还原 — 使用官方 esp_hid(Bluedroid BLE HID Host), 不再引用 bluepad32/btstack.
 set(PRIV_REQUIRES_LIST bt esp_hid nvs_flash spi_flash esp_system esp_timer esp_netif lwip)
 
