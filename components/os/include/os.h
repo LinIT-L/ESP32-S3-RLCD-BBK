@@ -176,6 +176,27 @@ void os_dialog_list(ui_ctx_t *ctx, const char *title,
 void os_dialog_confirm(ui_ctx_t *ctx, const char *msg, os_dialog_cb_t cb, void *ud);
 void os_dialog_toast(ui_ctx_t *ctx, const char *msg);   /* 1s 自动关闭 */
 
+/* ==== 弹窗栈 (settings/list_dialog 嵌套弹窗支持) ====
+ * os_dialog 内部维护一层弹窗栈: 开子弹窗压栈, 返回弹栈恢复父弹窗原选中位.
+ * 自定义渲染/按键 (时间编辑等复杂弹窗) 通过 on_render/on_key 挂接. */
+typedef struct os_dlg_stack os_dlg_stack_t;
+typedef bool (*os_dlg_render_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);
+typedef bool (*os_dlg_key_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud);
+struct os_dlg_stack {
+    char  title[24];
+    char  items[8][30];
+    int   count;
+    int   sel;
+    os_dialog_cb_t cb;
+    void *ud;
+    os_dlg_render_t on_render;   /* 可选: 自定义整层渲染, true=已消费 */
+    os_dlg_key_t    on_key;      /* 可选: 自定义按键, true=已消费 */
+};
+void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg);  /* 压入弹窗栈 (栈空自动开弹窗页) */
+void os_dialog_pop(ui_ctx_t *ctx);                              /* 弹栈; 栈空则关闭弹窗页 */
+int  os_dialog_depth(void);
+const os_dlg_stack_t *os_dialog_top(void);
+
 /* ==== 应用注册表 (主菜单/应用管理共用; 为应用商店动态安装预留) ==== */
 typedef struct os_app os_app_t;
 struct os_app {
