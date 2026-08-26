@@ -258,21 +258,26 @@ static void p_main_poll(ui_ctx_t *ctx)
             int m = off < 0 ? -off : off;
             if (m > s_main.drag_moved) s_main.drag_moved = m;
         } else {
-            /* 松手: 归位吸附到最近槽位 (参照原 menu_main_cam_animate 语义).
-             * 相机 from=拖动当前位置 -> to=最近整数槽, 插值归位, 无像素跳变. */
+            /* 松手: 仅"真实拖动"(位移≥40px, 与 input 滑动判定一致)才做归位吸附.
+             * 点击(tap, 位移<40px)不做归位也不抑制, 让 CONFIRM 触摸命中正常打开应用. */
+            bool real_drag = (s_main.drag_moved >= 40);
             s_main.drag_active = false;
-            s_main.suppress_until = now_ms() + 200;   /* 抑制松手 swipe 方向/确认 */
-            const int spacing = 100;
-            float cur = s_main.cam_base - (float)s_main.drag_offset / (float)spacing;
-            int target = lroundf(cur);
-            int steps = (int)(target - lroundf(s_main.cam_base));
-            if (steps < 0) steps = -steps;
-            uint32_t dur = 240 + (uint32_t)steps * 70;
-            if (dur > 700) dur = 700;
-            s_main.cam_cur = cur;                    /* 归位动画的起点 = 松手位置 */
-            main_cam_animate(target, dur);
-            ctx->needs_redraw = true;
-            ESP_LOGI("MAIN", "归位: cur=%.2f target=%d moved=%d", cur, target, s_main.drag_moved);
+            if (real_drag) {
+                s_main.suppress_until = now_ms() + 200;   /* 防松手瞬间残余动作 */
+                /* 归位吸附到最近槽位 (参照原 menu_main_cam_animate 语义):
+                 * 相机 from=拖动当前位置 -> to=最近整数槽, 插值归位, 无像素跳变. */
+                const int spacing = 100;
+                float cur = s_main.cam_base - (float)s_main.drag_offset / (float)spacing;
+                int target = lroundf(cur);
+                int steps = (int)(target - lroundf(s_main.cam_base));
+                if (steps < 0) steps = -steps;
+                uint32_t dur = 240 + (uint32_t)steps * 70;
+                if (dur > 700) dur = 700;
+                s_main.cam_cur = cur;                    /* 归位动画的起点 = 松手位置 */
+                main_cam_animate(target, dur);
+                ctx->needs_redraw = true;
+                ESP_LOGI("MAIN", "归位: cur=%.2f target=%d moved=%d", cur, target, s_main.drag_moved);
+            }
         }
     }
 }
