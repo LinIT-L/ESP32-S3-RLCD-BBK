@@ -160,6 +160,9 @@ bool os_is_main(const ui_ctx_t *ctx);
 /* 是否有模态弹窗/覆盖 (弹窗期间禁止背景拖动等). */
 bool os_modal_active(const ui_ctx_t *ctx);
 
+/* 当前壁纸程序 id (page_wallpaper 保存; 桌面/屏保渲染用; 0=星空默认). */
+int os_wallpaper_get_program(void);
+
 /* ==== 平台状态挂钩 (由外壳 main.c 注入, 解耦 os 与具体硬件组件) ====
  * 状态栏/服务不直接引用 bt_manager/wifi_manager/board_battery 等实现,
  * 而是通过这组 getter 读取系统状态, 避免 os 依赖旧 menu 巨石组件. */

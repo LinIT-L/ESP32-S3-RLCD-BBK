@@ -23,7 +23,7 @@ idf_component_register(
          "pages/page_wb.c"
          "pages/page_diag.c"
     INCLUDE_DIRS "include"
-    REQUIRES st7305 ui_common input audio_player vibrator engine_manager gam4980 book_reader
+    REQUIRES st7305 ui_common input audio_player vibrator engine_manager gam4980 book_reader wallpapers
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
