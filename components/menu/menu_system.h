@@ -2,12 +2,36 @@
 #define MENU_SYSTEM_H
 
 #include "st7305.h"
-#include "bt_manager.h"
 #include <stdint.h>
 #include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* bt_device_t 自足定义 (与 bt_ctl/bt_manager.h 同构, 带保护宏避免重复定义).
+ * 使本公开头不依赖 bt_ctl, 任何 include menu_system.h 的组件无需直接 REQUIRES bt_ctl. */
+#ifndef BT_DEVICE_T_DEFINED
+#define BT_DEVICE_T_DEFINED
+typedef struct {
+    uint8_t bd_addr[6];
+    uint8_t addr_type;
+    char name[32];
+    int8_t rssi;
+    bool has_name;
+} bt_device_t;
+#endif
+
+/* phys_t 自足定义 (与 bt_ctl/bt_manager.h 同构, 带保护宏避免重复定义) */
+#ifndef PHYS_T_DEFINED
+#define PHYS_T_DEFINED
+typedef enum {
+    P_HAT_UP = 0, P_HAT_DOWN, P_HAT_LEFT, P_HAT_RIGHT,  /* 方向 0..3 */
+    P_BTN_1 = 4, P_BTN_2, P_BTN_3, P_BTN_4, P_BTN_5,
+    P_BTN_6, P_BTN_7, P_BTN_8, P_BTN_9, P_BTN_10,
+    P_BTN_11, P_BTN_12, P_BTN_13, P_BTN_14, P_BTN_15, P_BTN_16,
+    PHYS_MAX = 20
+} phys_t;
 #endif
 
 /* 菜单页面 */

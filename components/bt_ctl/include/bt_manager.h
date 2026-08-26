@@ -42,6 +42,8 @@ typedef enum {
 /* 物理输入: 4 方向 + 通用按钮 1~N.
  * 通用化原因: 不同手柄按钮数/布局各异, 不绑定 A/B/X/Y 等固定命名,
  * 按钮按每台手柄 report descriptor 的按钮序号统一编号, 兼容任意手柄. */
+#ifndef PHYS_T_DEFINED
+#define PHYS_T_DEFINED
 typedef enum {
     P_HAT_UP = 0, P_HAT_DOWN, P_HAT_LEFT, P_HAT_RIGHT,  /* 方向 0..3 */
     P_BTN_1 = 4, P_BTN_2, P_BTN_3, P_BTN_4, P_BTN_5,    /* 通用按钮 4.. */
@@ -49,6 +51,7 @@ typedef enum {
     P_BTN_11, P_BTN_12, P_BTN_13, P_BTN_14, P_BTN_15, P_BTN_16,
     PHYS_MAX = 20
 } phys_t;
+#endif
 
 /* 物理输入的人类可读名称 (用于 UI 显示) */
 extern const char *bt_manager_phys_name(phys_t p);
@@ -129,6 +132,8 @@ const char *bt_manager_gb_func_name(int idx);
 /* ========================================================================
  *  蓝牙基础 API
  * ======================================================================== */
+#ifndef BT_DEVICE_T_DEFINED
+#define BT_DEVICE_T_DEFINED
 typedef struct {
     uint8_t bd_addr[6];
     uint8_t addr_type;
@@ -136,6 +141,7 @@ typedef struct {
     int8_t rssi;
     bool has_name;
 } bt_device_t;
+#endif
 
 typedef void (*bt_scan_callback_t)(bt_device_t *results, int count);
 typedef void (*bt_device_found_cb_t)(bt_device_t *results, int count, bool updated);
