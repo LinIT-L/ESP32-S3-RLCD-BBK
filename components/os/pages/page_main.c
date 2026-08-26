@@ -72,26 +72,55 @@ static int mod_wrap(int v) {
     return v;
 }
 
-/* 动画: 相机 from -> to (to 取与 from 最近的同余, 走 wrap 最短路径) */
+static void main_cam_animate(int to_idx, uint32_t dur_ms);   /* 前向声明 (定义见下) */
+
+/* 导航/触摸: 动画到目标索引 (wrap 最短路径, 时长随距离) */
 static void main_anim_to(ui_ctx_t *ctx, int target) {
-    int total = (int)MAIN_MOD_COUNT;
-    /* 把 target 归到与当前相机同余的最近值 */
-    float cur = s_main.cam_cur;
-    int curi = lroundf(cur);
+    int curi = lroundf(s_main.cam_cur);
     int dt = mod_wrap(target - curi);
-    if (dt > total / 2) dt -= total;
-    float to = (float)(curi + dt);
-    s_main.cam_anim_sel  = target;
-    s_main.cam_anim_from = cur;
-    s_main.cam_anim_to   = to;
-    s_main.cam_anim_start = now_ms();
-    s_main.cam_anim_dur   = 260 + (uint32_t)(abs(dt) < 0 ? 0 : abs(dt)) * 60;
-    if (s_main.cam_anim_dur > 700) s_main.cam_anim_dur = 700;
-    s_main.selected = target;
+    if (dt > (int)MAIN_MOD_COUNT / 2) dt -= (int)MAIN_MOD_COUNT;
+    int steps = dt < 0 ? -dt : dt;
+    uint32_t dur = 260 + (uint32_t)steps * 60;
+    if (dur > 700) dur = 700;
+    main_cam_animate(target, dur);
     ctx->needs_redraw = true;
 }
 
-/* 图标尺寸: 中央放大图标固定 100px, 其余固定 64px (见 render 内钉中央逻辑). */
+/* 图标尺寸: 其他图标固定 64px, 只在进入/离开中央位置(0.5~1.0 格)做缩放过渡.
+ * 静止时仅正中间 100, 其余严格 64. */
+static int main_icon_size(float ad) {
+    if (ad <= 0.5f) return 100;
+    if (ad >= 1.0f) return 64;
+    float t = (ad - 0.5f) / 0.5f;
+    float ease = t * t * (3.0f - 2.0f * t);
+    return 100 - (int)(36.0f * ease);
+}
+
+/* 相机归位/切换动画 (参照原 menu_main_cam_animate 语义):
+ * from = 当前相机(可小数), to_idx = 目标索引.
+ * to 取与 from 最近的同余位置 (wrap 走最短路径); 几乎未移动则直接定档. */
+static void main_cam_animate(int to_idx, uint32_t dur_ms) {
+    int total = (int)MAIN_MOD_COUNT;
+    int to = to_idx % total;
+    if (to < 0) to += total;
+    float from_c = s_main.cam_cur;
+    float to_c = (float)to;
+    float half = (float)total / 2.0f;
+    while (to_c - from_c >  half) to_c -= (float)total;
+    while (from_c - to_c >  half) to_c += (float)total;
+    if (fabsf(to_c - from_c) < 0.05f) {
+        s_main.selected = to;
+        s_main.cam_anim_start = 0;
+        s_main.cam_cur = to_c;
+        return;
+    }
+    s_main.selected = to;
+    s_main.cam_anim_sel   = to;
+    s_main.cam_anim_from  = from_c;
+    s_main.cam_anim_to    = to_c;
+    s_main.cam_anim_start = now_ms();
+    s_main.cam_anim_dur   = dur_ms ? dur_ms : 1;
+}
 
 /* ============ 渲染 ============ */
 static void p_main_render(ui_ctx_t *ctx)
@@ -132,32 +161,16 @@ static void p_main_render(ui_ctx_t *ctx)
     s_main.cam_cur = cam;
 
     int sel = mod_wrap(lroundf(cam));
-    int pinned = lroundf(cam);           /* 放大图标槽位 (固定在中央) */
 
     /* 遍历相机附件的整数格, 屏内即绘制 (索引取模回绕).
-     * 中央放大图标(round(cam))始终钉在 center_x; 其余图标连续滑动,
-     * 相邻图标被推开防止与中央 100px 图标重叠. */
+     * 图标连续滑动; 尺寸: 中央 100, 其余 64 (进入/离开时平滑缩放). */
     int g0 = (int)floorf(cam) - 3;
     int g1 = (int)ceilf(cam) + 3;
-    const int big_half = 50, small_half = 32, gap = 2;   /* 半宽 50/32 + 间距 */
     for (int g = g0; g <= g1; g++) {
         int idx = mod_wrap(g);
-        int cx, size;
-        if (g == pinned) {
-            cx = center_x;               /* 固定中央 200px */
-            size = 100;
-        } else {
-            cx = center_x + (int)roundf(((float)g - cam) * (float)icon_spacing);
-            size = 64;
-            /* 推开相邻图标, 避免与中央放大图标重叠 */
-            if (g == pinned + 1) {
-                int minc = center_x + big_half + small_half + gap;
-                if (cx < minc) cx = minc;
-            } else if (g == pinned - 1) {
-                int maxc = center_x - big_half - small_half - gap;
-                if (cx > maxc) cx = maxc;
-            }
-        }
+        int cx = center_x + (int)roundf(((float)g - cam) * (float)icon_spacing);
+        float dist = fabsf((float)g - cam);
+        int size = main_icon_size(dist);
         if (cx + size > 0 && cx - size < UI_SCREEN_W) {
             draw_main_icon_stretched(lcd, cx, icon_center_y, size, size,
                                      s_main_mods[idx].icon_idx);
@@ -203,24 +216,10 @@ static bool p_main_touch(ui_ctx_t *ctx, int x, int y)
     /* 命中检测: 点中某个图标 -> 选中并进入 */
     if (y < 0 || y >= UI_SCREEN_H) return false;
     int total = (int)MAIN_MOD_COUNT;
-    int pinned = lroundf(s_main.cam_cur);
-    const int big_half = 50, small_half = 32, gap = 2;
     for (int g = (int)floorf(s_main.cam_cur) - 3; g <= (int)ceilf(s_main.cam_cur) + 3; g++) {
         int idx = mod_wrap(g);
-        int cx, size;
-        if (g == pinned) {
-            cx = UI_SCREEN_W / 2;   size = 100;
-        } else {
-            cx = (int)roundf((float)(UI_SCREEN_W / 2) + ((float)g - s_main.cam_cur) * 100.0f);
-            size = 64;
-            if (g == pinned + 1) {
-                int minc = UI_SCREEN_W / 2 + big_half + small_half + gap;
-                if (cx < minc) cx = minc;
-            } else if (g == pinned - 1) {
-                int maxc = UI_SCREEN_W / 2 - big_half - small_half - gap;
-                if (cx > maxc) cx = maxc;
-            }
-        }
+        int cx = (int)roundf((float)(UI_SCREEN_W / 2) + ((float)g - s_main.cam_cur) * 100.0f);
+        int size = main_icon_size(fabsf((float)g - s_main.cam_cur));
         if (x >= cx - size / 2 - 8 && x <= cx + size / 2 + 8 &&
             y >= UI_SCREEN_H / 2 - 50 && y <= UI_SCREEN_H / 2 + 70) {
             if (idx != s_main.selected) {
@@ -259,7 +258,8 @@ static void p_main_poll(ui_ctx_t *ctx)
             int m = off < 0 ? -off : off;
             if (m > s_main.drag_moved) s_main.drag_moved = m;
         } else {
-            /* 松手: 吸附到最近格, 相机 from=当前位置 -> to=吸附位, 像素级衔接 */
+            /* 松手: 归位吸附到最近槽位 (参照原 menu_main_cam_animate 语义).
+             * 相机 from=拖动当前位置 -> to=最近整数槽, 插值归位, 无像素跳变. */
             s_main.drag_active = false;
             s_main.suppress_until = now_ms() + 200;   /* 抑制松手 swipe 方向/确认 */
             const int spacing = 100;
@@ -269,14 +269,10 @@ static void p_main_poll(ui_ctx_t *ctx)
             if (steps < 0) steps = -steps;
             uint32_t dur = 240 + (uint32_t)steps * 70;
             if (dur > 700) dur = 700;
-            s_main.cam_anim_sel   = mod_wrap(target);
-            s_main.cam_anim_from  = cur;
-            s_main.cam_anim_to    = (float)target;
-            s_main.cam_anim_start = now_ms();
-            s_main.cam_anim_dur   = dur;
-            s_main.selected       = mod_wrap(target);
+            s_main.cam_cur = cur;                    /* 归位动画的起点 = 松手位置 */
+            main_cam_animate(target, dur);
             ctx->needs_redraw = true;
-            ESP_LOGI("MAIN", "松手: cur=%.2f target=%d moved=%d", cur, target, s_main.drag_moved);
+            ESP_LOGI("MAIN", "归位: cur=%.2f target=%d moved=%d", cur, target, s_main.drag_moved);
         }
     }
 }
