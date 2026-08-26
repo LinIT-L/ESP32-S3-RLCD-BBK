@@ -1,0 +1,13 @@
+# components/os — 标准化模块化 OS 内核
+menu "LinTOS 模块化 OS"
+    config OS
+        bool "启用新模块化 OS 内核 (components/os)"
+        default n
+        help
+            启用全新的标准化模块化 OS 内核 (components/os):
+            内核只负责页面栈/事件路由/输入分发/内存生命周期,
+            状态栏/音量/电量/蓝牙为全局 service, 每个应用页为独立模块。
+
+            关闭 (默认) 时回退到旧版 components/menu/menu_system 巨石菜单系统。
+            迁移阶段建议: 新内核逐页验证通过后再长期开启。
+endmenu

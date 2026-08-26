@@ -37,23 +37,11 @@ static const os_module_t s_mod_main = {
 
 /* ========== 全局服务 ========== */
 
-/* ---- P1 起迁入: 状态栏 ---- */
-static void svc_status_render(ui_ctx_t *ctx)
-{
-    /* P1 迁移: menu_draw_status_bar 语义 */
-    st7305_handle_t *lcd = ctx->lcd;
-    if (!lcd) return;
-    for (int x = 0; x < ST7305_WIDTH; x++) st7305_draw_pixel(lcd, x, 0, ST7305_COLOR_BLACK);
-    st7305_draw_text(lcd, 2, 2, "OS");
-}
-static const os_service_t s_svc_status = {
-    .name = "statusbar",
-    .render = svc_status_render,
-};
+/* ---- 状态栏: 实现见 services/svc_statusbar.c ---- */
 
 /* ========== 装配 ========== */
 void os_register_all_internal(void)
 {
     os_register(&s_mod_main);
-    os_register_service(&s_svc_status);
+    os_svc_statusbar_register();
 }

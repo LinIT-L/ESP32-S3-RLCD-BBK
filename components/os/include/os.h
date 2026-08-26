@@ -157,6 +157,28 @@ bool os_is_main(const ui_ctx_t *ctx);
 /* 是否有模态弹窗/覆盖 (弹窗期间禁止背景拖动等). */
 bool os_modal_active(const ui_ctx_t *ctx);
 
+/* ==== 平台状态挂钩 (由外壳 main.c 注入, 解耦 os 与具体硬件组件) ====
+ * 状态栏/服务不直接引用 bt_manager/wifi_manager/board_battery 等实现,
+ * 而是通过这组 getter 读取系统状态, 避免 os 依赖旧 menu 巨石组件. */
+typedef struct os_platform_ops {
+    uint8_t (*get_battery)(void);   /* 0..100, 255=未检测到电池 */
+    int     (*get_volume)(void);    /* 0..100 */
+    bool    (*is_muted)(void);
+    bool    (*bt_enabled)(void);
+    bool    (*bt_connected)(void);
+    bool    (*wifi_enabled)(void);
+    bool    (*wifi_connected)(void);
+    bool    (*usb_data_active)(void);
+} os_platform_ops_t;
+
+/* 注入平台状态挂钩 (可多次调用, 覆盖生效). */
+void os_platform_set(const os_platform_ops_t *ops);
+
+/* ==== 内建全局服务 (components/os/services 目录) ==== */
+
+/* 状态栏: 由 os_register_all_internal() 自动注册; 此声明仅供需要手动注册/调试时使用. */
+void os_svc_statusbar_register(void);
+
 #ifdef __cplusplus
 }
 #endif
