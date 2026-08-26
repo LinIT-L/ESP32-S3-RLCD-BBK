@@ -136,11 +136,10 @@ static void p_main_render(ui_ctx_t *ctx)
     const int icon_center_y = UI_SCREEN_H / 2;
     uint32_t now = now_ms();
 
-    /* 相机: 拖动跟手 / 动画缓动 / 静止=选中 */
+    /* 相机: 磁性格步进 — 图标始终吸附在格子位置.
+     * 拖动/静止时 cam = 选中槽位(整数); 仅槽位切换时有短滑动动画. */
     float cam;
-    if (s_main.drag_active) {
-        cam = s_main.cam_base - (float)s_main.drag_offset / (float)icon_spacing;
-    } else if (s_main.cam_anim_start > 0) {
+    if (s_main.cam_anim_start > 0) {
         if (s_main.selected != s_main.cam_anim_sel) {
             s_main.cam_anim_start = 0;
             cam = (float)s_main.selected;
@@ -232,10 +231,13 @@ static bool p_main_touch(ui_ctx_t *ctx, int x, int y)
     return false;
 }
 
-/* ============ 每帧轮询: 拖动 ============ */
+/* ============ 每帧轮询: 拖动 (磁性格步进) ============ */
 static void p_main_poll(ui_ctx_t *ctx)
 {
     if (os_modal_active(ctx)) return;   /* 弹窗/覆盖期间禁止背景拖动 */
+
+    /* 滑动动画进行中: 每帧请求重绘, 驱动动画帧 (os 仅在 needs_redraw 时渲染) */
+    if (s_main.cam_anim_start > 0) ctx->needs_redraw = true;
 
     int tx, ty;
     bool down = input_get_touch_pos(&tx, &ty);
@@ -251,32 +253,30 @@ static void p_main_poll(ui_ctx_t *ctx)
     if (s_main.drag_active) {
         if (down) {
             int off = tx - s_main.drag_start_x;
-            if (off != s_main.drag_offset) {
-                s_main.drag_offset = off;
-                ctx->needs_redraw = true;
-            }
+            s_main.drag_offset = off;
             int m = off < 0 ? -off : off;
             if (m > s_main.drag_moved) s_main.drag_moved = m;
-        } else {
-            /* 松手: 仅"真实拖动"(位移≥40px, 与 input 滑动判定一致)才做归位吸附.
-             * 点击(tap, 位移<40px)不做归位也不抑制, 让 CONFIRM 触摸命中正常打开应用. */
-            bool real_drag = (s_main.drag_moved >= 40);
-            s_main.drag_active = false;
-            if (real_drag) {
-                s_main.suppress_until = now_ms() + 200;   /* 防松手瞬间残余动作 */
-                /* 归位吸附到最近槽位 (参照原 menu_main_cam_animate 语义):
-                 * 相机 from=拖动当前位置 -> to=最近整数槽, 插值归位, 无像素跳变. */
+            /* 真实拖动(位移≥40px): 磁性格步进 — 手指越过半格才切到下一格,
+             * 图标始终吸附在格子位置, 不自由跟手、不任意停. */
+            if (m >= 40) {
                 const int spacing = 100;
-                float cur = s_main.cam_base - (float)s_main.drag_offset / (float)spacing;
-                int target = lroundf(cur);
-                int steps = (int)(target - lroundf(s_main.cam_base));
-                if (steps < 0) steps = -steps;
-                uint32_t dur = 240 + (uint32_t)steps * 70;
-                if (dur > 700) dur = 700;
-                s_main.cam_cur = cur;                    /* 归位动画的起点 = 松手位置 */
-                main_cam_animate(target, dur);
+                float raw = s_main.cam_base - (float)off / (float)spacing;
+                int target = lroundf(raw);
+                if (target != s_main.selected) {
+                    main_cam_animate(target, 150);   /* 快速滑入新槽位 (吸附) */
+                }
+            }
+        } else {
+            /* 松手: 归位吸附 — 相机回到最近整数槽, 图标必然回格. */
+            s_main.drag_active = false;
+            if (s_main.drag_moved >= 40) {
+                s_main.suppress_until = now_ms() + 150;
+                const int spacing = 100;
+                float raw = s_main.cam_base - (float)s_main.drag_offset / (float)spacing;
+                int target = lroundf(raw);
+                main_cam_animate(target, 200);
                 ctx->needs_redraw = true;
-                ESP_LOGI("MAIN", "归位: cur=%.2f target=%d moved=%d", cur, target, s_main.drag_moved);
+                ESP_LOGI("MAIN", "归位: raw=%.2f target=%d moved=%d", raw, target, s_main.drag_moved);
             }
         }
     }
