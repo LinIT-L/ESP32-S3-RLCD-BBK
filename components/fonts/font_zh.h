@@ -18,6 +18,9 @@ extern const uint8_t (*zh_font_data)[72];    /* 字形表 (每字 72 字节) */
 #define ZH_FONT_BYTES_PER_CHAR 72
 int font_zh_count(void);                     /* 字库字符数 */
 
+/* ASCII 8x12 等宽点阵 (font_ascii.c, 0x20-0x7E; keyboard/ui_common/terminal 共用) */
+extern const uint8_t FONT8X12[][12];
+
 /* 通过 UTF-8 字节序列查找字符索引 (正确做法: 比较 3 字节)
  * str: 指向 UTF-8 字符首字节
  * 返回: 索引 (0..ZH_FONT_COUNT-1), 找不到返回 -1
