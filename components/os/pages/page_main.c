@@ -91,16 +91,7 @@ static void main_anim_to(ui_ctx_t *ctx, int target) {
     ctx->needs_redraw = true;
 }
 
-/* 图标尺寸: 中间图标 100px, 其余固定 64px.
- * 只在"进入/离开中间位置"的 0.5~1.0 格内做缩放过渡 (放大/缩小的动画效果);
- * 静止时仅正中间 100, 其余全部严格 64. */
-static int main_icon_size(float ad) {
-    if (ad <= 0.5f) return 100;
-    if (ad >= 1.0f) return 64;
-    float t = (ad - 0.5f) / 0.5f;              /* 0..1 */
-    float ease = t * t * (3.0f - 2.0f * t);    /* smoothstep */
-    return 100 - (int)(36.0f * ease);
-}
+/* 图标尺寸: 中央放大图标固定 100px, 其余固定 64px (见 render 内钉中央逻辑). */
 
 /* ============ 渲染 ============ */
 static void p_main_render(ui_ctx_t *ctx)
@@ -141,15 +132,32 @@ static void p_main_render(ui_ctx_t *ctx)
     s_main.cam_cur = cam;
 
     int sel = mod_wrap(lroundf(cam));
+    int pinned = lroundf(cam);           /* 放大图标槽位 (固定在中央) */
 
-    /* 遍历相机附件的整数格, 屏内即绘制 (索引取模回绕) */
+    /* 遍历相机附件的整数格, 屏内即绘制 (索引取模回绕).
+     * 中央放大图标(round(cam))始终钉在 center_x; 其余图标连续滑动,
+     * 相邻图标被推开防止与中央 100px 图标重叠. */
     int g0 = (int)floorf(cam) - 3;
     int g1 = (int)ceilf(cam) + 3;
+    const int big_half = 50, small_half = 32, gap = 2;   /* 半宽 50/32 + 间距 */
     for (int g = g0; g <= g1; g++) {
         int idx = mod_wrap(g);
-        int cx = (int)roundf((float)center_x + ((float)g - cam) * (float)icon_spacing);
-        float dist = fabsf((float)g - cam);
-        int size = main_icon_size(dist);   /* 平滑缩放: 中央 100, 越远越小 */
+        int cx, size;
+        if (g == pinned) {
+            cx = center_x;               /* 固定中央 200px */
+            size = 100;
+        } else {
+            cx = center_x + (int)roundf(((float)g - cam) * (float)icon_spacing);
+            size = 64;
+            /* 推开相邻图标, 避免与中央放大图标重叠 */
+            if (g == pinned + 1) {
+                int minc = center_x + big_half + small_half + gap;
+                if (cx < minc) cx = minc;
+            } else if (g == pinned - 1) {
+                int maxc = center_x - big_half - small_half - gap;
+                if (cx > maxc) cx = maxc;
+            }
+        }
         if (cx + size > 0 && cx - size < UI_SCREEN_W) {
             draw_main_icon_stretched(lcd, cx, icon_center_y, size, size,
                                      s_main_mods[idx].icon_idx);
@@ -195,10 +203,24 @@ static bool p_main_touch(ui_ctx_t *ctx, int x, int y)
     /* 命中检测: 点中某个图标 -> 选中并进入 */
     if (y < 0 || y >= UI_SCREEN_H) return false;
     int total = (int)MAIN_MOD_COUNT;
+    int pinned = lroundf(s_main.cam_cur);
+    const int big_half = 50, small_half = 32, gap = 2;
     for (int g = (int)floorf(s_main.cam_cur) - 3; g <= (int)ceilf(s_main.cam_cur) + 3; g++) {
         int idx = mod_wrap(g);
-        int cx = (int)roundf((float)(UI_SCREEN_W / 2) + ((float)g - s_main.cam_cur) * 100.0f);
-        int size = main_icon_size(fabsf((float)g - s_main.cam_cur));
+        int cx, size;
+        if (g == pinned) {
+            cx = UI_SCREEN_W / 2;   size = 100;
+        } else {
+            cx = (int)roundf((float)(UI_SCREEN_W / 2) + ((float)g - s_main.cam_cur) * 100.0f);
+            size = 64;
+            if (g == pinned + 1) {
+                int minc = UI_SCREEN_W / 2 + big_half + small_half + gap;
+                if (cx < minc) cx = minc;
+            } else if (g == pinned - 1) {
+                int maxc = UI_SCREEN_W / 2 - big_half - small_half - gap;
+                if (cx > maxc) cx = maxc;
+            }
+        }
         if (x >= cx - size / 2 - 8 && x <= cx + size / 2 + 8 &&
             y >= UI_SCREEN_H / 2 - 50 && y <= UI_SCREEN_H / 2 + 70) {
             if (idx != s_main.selected) {
