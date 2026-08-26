@@ -1,0 +1,10 @@
+void G16Refresh();
+void G16DrawRect(int x,int y,int w,int h,word color);
+void G16DrawAlpha(int x,int y,int w,int h,int alpha);
+void G16Locate(int y,int x);
+void G16SetFgColor(word color);
+void G16SetBgColor(word color);
+void G16Printf(char *format, ...);
+void G16DPrintf(char *format, ...);
+int G16LoadBmp(char *fname,word *gbuf,int w,int h);
+int G16LoadWallPaper(char *fname);

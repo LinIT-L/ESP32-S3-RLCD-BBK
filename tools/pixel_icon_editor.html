@@ -1,0 +1,1169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>像素图标编辑器 (黑白)</title>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --card: #ffffff;
+    --fg: #1d1d1f;
+    --muted: #6e6e73;
+    --line: #d2d2d7;
+    --accent: #007aff;
+    --shadow: 0 1px 2px rgba(0,0,0,.05);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 14px 22px 10px;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  header h1 { font-size: 17px; font-weight: 600; margin: 0; }
+  header .tag { font-size: 12px; color: var(--muted); }
+  .toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg);
+    padding: 4px 22px 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    align-items: center;
+    border-bottom: 1px solid var(--line);
+  }
+  .group { display: flex; align-items: center; gap: 8px; }
+  .group-label { font-size: 12px; color: var(--muted); }
+  button {
+    font: inherit;
+    font-size: 13px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    color: var(--fg);
+    border-radius: 7px;
+    padding: 5px 12px;
+    cursor: pointer;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  button:hover { background: #f0f0f3; }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #0079f0; }
+  .tool-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .swatch {
+    width: 16px; height: 16px; border-radius: 4px;
+    display: inline-block; vertical-align: middle; margin-right: 4px;
+    border: 1px solid rgba(0,0,0,.2);
+  }
+  input[type=range] { width: 140px; }
+  label.chk { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; cursor: pointer; }
+  .main {
+    flex: 1;
+    overflow: auto;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 18px;
+    touch-action: none;
+  }
+  #wrap { position: relative; }
+  canvas {
+    display: block;
+    background: #ffffff;
+    box-shadow: 0 1px 4px rgba(0,0,0,.12);
+    cursor: crosshair;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  #dropHint {
+    position: absolute; inset: 0;
+    display: none; align-items: center; justify-content: center;
+    background: rgba(255,255,255,.7);
+    border: 2px dashed var(--accent);
+    font-size: 15px; color: var(--accent);
+    pointer-events: none;
+  }
+  #status {
+    padding: 8px 22px;
+    font-size: 12px;
+    color: var(--muted);
+    min-height: 20px;
+  }
+  .zabs { font-variant-numeric: tabular-nums; }
+  input[type=file] { display: none; }
+  .mats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 26px;
+    padding: 12px 22px;
+    border-bottom: 1px solid var(--line);
+    background: var(--card);
+    align-items: center;
+  }
+  .matGroup { display: flex; align-items: center; gap: 8px; }
+  .matGroup select {
+    font: inherit; font-size: 13px;
+    border: 1px solid var(--line); border-radius: 7px;
+    padding: 4px 6px; background: #fff; color: var(--fg);
+  }
+  input[type=text] { box-sizing: border-box; }
+  /* 导入预览对话框 */
+  .overlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,.35);
+    display: none; align-items: center; justify-content: center;
+  }
+  .overlay.show { display: flex; }
+  .modal {
+    background: var(--card);
+    border-radius: 12px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.25);
+    padding: 18px 20px;
+    width: min(680px, 94vw);
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .modal h2 { font-size: 15px; font-weight: 600; margin: 0; }
+  .previewRow {
+    display: flex; gap: 14px; align-items: flex-start; justify-content: center;
+  }
+  .previewCol { display: flex; flex-direction: column; align-items: center; gap: 5px; flex: 1; min-width: 0; }
+  .previewCol .cap { font-size: 12px; color: var(--muted); }
+  .previewBox {
+    position: relative;
+    width: 100%; aspect-ratio: 1 / 1;
+    background: repeating-conic-gradient(#fff 0 25%, #eee 0 50%) 0 0/16px 16px;
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  }
+  .previewBox canvas {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    image-rendering: pixelated; background: #fff;
+  }
+  .prow { display: flex; align-items: center; gap: 10px; }
+  .prow label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .prow input[type=range] { flex: 1; }
+  .modal .modalBtns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
+  .modal .warning { font-size: 12px; color: var(--muted); }
+  /* 三栏：左原图 / 中预览 / 右调节 */
+  .cols3 { display: flex; gap: 16px; align-items: stretch; }
+  .colPanel { flex: 0 0 130px; display: flex; flex-direction: column; justify-content: center; gap: 6px; min-width: 0; }
+  .colPanel .cap { font-size: 11px; color: var(--muted); text-align: center; margin-top: 3px; }
+  .colPrev { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center; gap: 6px; min-width: 0; }
+  .colPrev .previewBox { aspect-ratio: 1 / 1; }
+  .colControls { flex: 0 0 180px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+  .ctl { display: flex; flex-direction: column; gap: 4px; }
+  .ctl > label { font-size: 12px; color: var(--muted); }
+  .ctl .row { display: flex; align-items: center; gap: 8px; }
+  .ctl .row .range { flex: 1; }
+  .ctl .val { font-size: 12px; font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
+  .ctl select {
+    font: inherit; font-size: 12px; border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 6px; background: #fff; color: var(--fg);
+  }
+  .ctl .chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; cursor: pointer; }
+  .ctlBtns { display: flex; flex-direction: column; gap: 8px; margin-top: auto; }
+  .ctlBtns button { width: 100%; }
+  button .kbd {
+    display: inline-block;
+    margin-left: 6px;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+    color: inherit;
+    opacity: .55;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    padding: 2px 4px;
+    vertical-align: middle;
+  }
+  label .kbd, .chk .kbd { margin-left: 5px; font-size: 10px; opacity: .5; border: 1px solid currentColor; border-radius: 4px; padding: 1px 3px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>像素图标编辑器</h1>
+    <span class="tag" id="headerTag">仅黑白 · 无灰度 · 等比例缩放</span>
+  </header>
+
+  <div class="toolbar">
+    <div class="group">
+      <span class="group-label">尺寸</span>
+      <select id="canvasSize">
+        <option value="64x64">64×64 大图标</option>
+        <option value="12x12">12×12 状态栏</option>
+        <option value="12x24">12×24 状态栏 (横向)</option>
+      </select>
+    </div>
+    <div class="group">
+      <span class="group-label">工具</span>
+      <button id="toolBlack" class="tool-btn active"><span class="swatch" style="background:#000"></span>涂黑</button>
+      <button id="toolWhite" class="tool-btn"><span class="swatch" style="background:#fff"></span>涂白</button>
+      <button id="toolSquare" class="tool-btn">方形</button>
+      <button id="toolCircle" class="tool-btn">圆形</button>
+      <button id="toolTriangle" class="tool-btn">三角</button>
+      <button id="toolText" class="tool-btn">文字</button>
+    </div>
+    <div class="group">
+      <span class="group-label">笔刷</span>
+      <select id="brush">
+        <option value="1">1×1</option>
+        <option value="2">2×2</option>
+        <option value="3" selected>3×3</option>
+      </select>
+    </div>
+    <div class="group">
+      <button id="btnUndo">返回上一步</button>
+      <button id="btnRedo">重复下一步</button>
+    </div>
+    <div class="group">
+      <button id="btnClear">清空</button>
+      <button id="btnFill">全黑</button>
+      <button id="btnInvert">反色</button>
+    </div>
+    <div class="group">
+      <span class="group-label">缩放</span>
+      <button id="btnZoomOut">−</button>
+      <input type="range" id="zoom" min="2" max="48" step="1" value="8">
+      <button id="btnZoomIn">+</button>
+      <span class="zabs" id="zoomVal">×8</span>
+      <button id="btnFit">适应窗口</button>
+    </div>
+    <div class="group">
+      <label class="chk" for="grid"><input type="checkbox" id="grid" checked>网格</label>
+    </div>
+    <div class="group" style="margin-left:auto">
+      <label for="file" class="primary" id="btnImport" style="font-size:13px;border:1px solid var(--accent);background:var(--accent);color:#fff;border-radius:7px;padding:5px 12px;cursor:pointer">导入 PNG</label>
+      <input type="file" id="file" accept="image/png,image/*">
+      <button id="btnExport">导出 PNG</button>
+      <button id="btnExportBig">导出放大版</button>
+    </div>
+  </div>
+
+  <div class="mats">
+    <div class="matGroup">
+      <span class="group-label">填充</span>
+      <select id="pattern">
+        <option value="solid">实心黑</option>
+        <option value="hline" selected>横线</option>
+        <option value="vline">竖线</option>
+        <option value="diagL">左斜线</option>
+        <option value="diagR">右斜线</option>
+        <option value="grid">十字网格</option>
+        <option value="dots">点阵</option>
+      </select>
+      <span class="group-label">密度</span>
+      <input type="range" id="density" min="10" max="100" step="5" value="50">
+      <span class="zabs" id="densityVal">50%</span>
+      <button id="btnPatternFill">填充画布</button>
+    </div>
+    <div class="matGroup">
+      <span class="group-label">形状线宽</span>
+      <select id="shapeThick">
+        <option value="1">1</option>
+        <option value="2">2</option>
+        <option value="3" selected>3</option>
+      </select>
+      <label class="chk" for="shapeFill"><input type="checkbox" id="shapeFill">实心</label>
+    </div>
+    <div class="matGroup">
+      <span class="group-label">文字工具</span>
+      <input type="text" id="textInput" placeholder="输入文字" maxlength="20" style="width:150px;border:1px solid var(--line);border-radius:7px;padding:4px 8px;font:inherit;font-size:13px">
+      <button id="btnTextApply">确认</button>
+      <span class="group-label">字号</span>
+      <select id="textSize">
+        <option value="3">小</option>
+        <option value="5" selected>中</option>
+        <option value="8">大</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="main" id="main">
+    <div id="wrap">
+      <canvas id="canvas" width="512" height="512"></canvas>
+      <div id="dropHint">松开以载入图片</div>
+    </div>
+  </div>
+
+  <div id="status">点击或拖动绘制 · 方形/圆形/三角：按下拖拽拉伸、放手定型 · 文字：输入后框选放置 · 滚轮缩放 · 边缘纯黑白无灰度</div>
+
+  <!-- 导入转换预览对话框 -->
+  <div class="overlay" id="importOverlay">
+    <div class="modal">
+      <h2>导入图片 · 调整转换与规整</h2>
+      <div class="cols3">
+        <div class="colPanel">
+          <div class="previewBox"><canvas id="origPrev" width="160" height="160"></canvas></div>
+          <div class="cap">原图</div>
+        </div>
+        <div class="colPrev">
+          <div class="previewBox"><canvas id="biPrev" width="160" height="160"></canvas></div>
+          <div class="cap">转换效果（实时预览）</div>
+        </div>
+        <div class="colControls">
+          <div class="ctl">
+            <label>灰度模拟强度</label>
+            <div class="row">
+              <input type="range" class="range" id="grayscale" min="0" max="100" step="1" value="0">
+              <span class="val" id="grayscaleVal">0</span>
+            </div>
+            <label class="hint">0=硬切 · 1~50=点阵(Bayer) · 51~100=误差扩散(FS) 细腻</label>
+          </div>
+          <div class="ctl">
+            <label>转换强度（明暗）</label>
+            <div class="row">
+              <input type="range" class="range" id="thresh" min="0" max="255" step="1" value="128">
+              <span class="val" id="threshVal">128</span>
+            </div>
+          </div>
+          <div class="ctl">
+            <label>规整（横平竖直）</label>
+            <div class="row">
+              <input type="range" class="range" id="sharpen" min="0" max="100" step="1" value="0">
+              <span class="val" id="sharpenVal">0</span>
+            </div>
+          </div>
+          <div class="ctl">
+            <label class="chk"><input type="checkbox" id="denoise">去噪（清孤立点/填小洞）</label>
+          </div>
+          <div class="ctl">
+            <label class="chk"><input type="checkbox" id="invertBw">反相（黑白互换）</label>
+          </div>
+          <div class="ctlBtns">
+            <button id="btnApplyImport" class="primary">应用</button>
+            <button id="btnCancelImport">取消</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const main = document.getElementById('main');
+const wrap = document.getElementById('wrap');
+const K = 0.08; // 网格对比度
+
+let CW = 64, CH = 64;
+let cells = new Uint8Array(CW * CH); // 1=黑, 0=白
+function resizeCanvas(w, h) {
+  const next = new Uint8Array(w * h);   // 切换尺寸时清空画布
+  CW = w; CH = h;
+  cells = next;
+  undoStack.length = 0;   // 尺寸不同，历史已失效
+  redoStack.length = 0;
+  updateHistoryBtns();
+  setZoom(8);
+  main.scrollLeft = 0;
+  main.scrollTop = 0;
+  render();
+}
+let tool = 'black';
+let zoom = 8;
+let showGrid = true;
+let drawing = false;
+
+/* ---------- 历史栈（撤销/重做） ---------- */
+const MAX_HISTORY = 60;
+let undoStack = [];   // 快照数组（操作前的内容）
+let redoStack = [];
+function snapCells() { return cells.slice(); }
+function updateHistoryBtns() {
+  document.getElementById('btnUndo').disabled = undoStack.length === 0;
+  document.getElementById('btnRedo').disabled = redoStack.length === 0;
+}
+function pushHistory() {
+  undoStack.push(snapCells());
+  if (undoStack.length > MAX_HISTORY) undoStack.shift();
+  redoStack.length = 0;
+  updateHistoryBtns();
+}
+function undoStep() {
+  if (!undoStack.length) return;
+  redoStack.push(snapCells());
+  cells = undoStack.pop();
+  render();
+  updateHistoryBtns();
+}
+function redoStep() {
+  if (!redoStack.length) return;
+  undoStack.push(snapCells());
+  cells = redoStack.pop();
+  render();
+  updateHistoryBtns();
+}
+document.getElementById('btnUndo').addEventListener('click', undoStep);
+document.getElementById('btnRedo').addEventListener('click', redoStep);
+
+/* ================= 快捷键系统 =================
+ * 每个按钮/工具绑定一个快捷键，并在按钮上显示徽标。
+ */
+function addKbd(id, label) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.querySelector('.kbd')) return;
+  const span = document.createElement('span');
+  span.className = 'kbd';
+  span.textContent = label;
+  el.appendChild(span);
+}
+
+// 快捷键徽标：给各按钮/标签标注键位
+addKbd('toolBlack', 'B');
+addKbd('toolWhite', 'W');
+addKbd('toolSquare', 'S');
+addKbd('toolCircle', 'C');
+addKbd('toolTriangle', 'T');
+addKbd('toolText', 'T字');
+addKbd('btnUndo', '⌘Z');
+addKbd('btnRedo', '⌘Y');
+addKbd('btnClear', '⌘⌫');
+addKbd('btnFill', '⌘D');
+addKbd('btnInvert', '⌘I');
+addKbd('btnZoomOut', '⌘−');
+addKbd('btnZoomIn', '⌘+');
+addKbd('btnFit', '⌘0');
+addKbd('grid', 'G');
+addKbd('btnImport', '⌘O');
+addKbd('btnExport', '⌘E');
+addKbd('btnExportBig', '⌘⇧E');
+addKbd('btnPatternFill', '⌘P');
+addKbd('btnTextApply', '↵');
+
+// 组合键：通过触发对应按钮 click 保持逻辑一致
+const shortcuts = {
+  '⌘z': () => undoStep(),
+  '⌘shift+z': () => redoStep(),
+  '⌘y': () => redoStep(),
+  '⌘backspace': () => document.getElementById('btnClear').click(),
+  '⌘delete': () => document.getElementById('btnClear').click(),
+  '⌘d': () => document.getElementById('btnFill').click(),
+  '⌘i': () => document.getElementById('btnInvert').click(),
+  '⌘-': () => document.getElementById('btnZoomOut').click(),
+  '⌘=': () => document.getElementById('btnZoomIn').click(),
+  '⌘0': () => document.getElementById('btnFit').click(),
+  '⌘o': () => document.getElementById('file').click(),
+  '⌘e': () => document.getElementById('btnExport').click(),
+  '⌘shift+e': () => document.getElementById('btnExportBig').click(),
+  '⌘p': () => document.getElementById('btnPatternFill').click(),
+  'enter': () => document.getElementById('btnTextApply').click(),
+  // 工具单选键（无修饰）
+  'b': () => setTool('black'),
+  'w': () => setTool('white'),
+  's': () => setTool('square'),
+  'c': () => setTool('circle'),
+  't': () => setTool('triangle'),
+  'g': () => { document.getElementById('grid').click(); },
+};
+
+function isTypingTarget(el) {
+  return el && (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+}
+
+document.addEventListener('keydown', (e) => {
+  const active = document.activeElement;
+  const typing = isTypingTarget(active);
+  const mod = e.metaKey || e.ctrlKey;
+  const key = e.key.toLowerCase();
+  let action = null;
+
+  if (mod) {
+    const combo = (e.shiftKey ? '⌘shift+' + key : '⌘' + key);
+    action = shortcuts[combo];
+  } else if (!typing) {
+    // 无修饰键时，仅当不在输入框才触发工具切换/网格
+    if (key === 'enter') action = shortcuts['enter'];
+    else action = shortcuts[key];
+  }
+
+  if (action) {
+    // 在输入框内打字时，B/W/S/C/T/G 等单键不触发（避免打不出字母）
+    if (typing && !mod && (key==='b'||key==='w'||key==='s'||key==='c'||key==='t'||key==='g')) {
+      return;
+    }
+    // 但 Enter 用于确认文字，即使光标在文字输入框也要触发；画布上 Enter 同样应用文字
+    if (key === 'enter' && (!typing || (active && active.id === 'textInput'))) {
+      e.preventDefault();
+      action();
+      return;
+    }
+    e.preventDefault();
+    action();
+  }
+});
+let draggingShape = false;
+let dragStart = { x: 0, y: 0 };
+let dragCur = { x: 0, y: 0 };
+
+/* ---------- 渲染 ---------- */
+function render() {
+  const pxW = Math.round(CW * zoom);
+  const pxH = Math.round(CH * zoom);
+  canvas.width = pxW;
+  canvas.height = pxH;
+  canvas.style.width = pxW + 'px';
+  canvas.style.height = pxH + 'px';
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, pxW, pxH);
+
+  const cell = zoom;
+  ctx.fillStyle = '#000000';
+  for (let y = 0; y < CH; y++) {
+    for (let x = 0; x < CW; x++) {
+      if (cells[y * CW + x]) ctx.fillRect(x * cell, y * cell, cell, cell);
+    }
+  }
+
+  if (showGrid && cell >= 6) {
+    ctx.strokeStyle = 'rgba(0,0,0,0.10)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i <= CW; i++) {
+      ctx.moveTo(i * cell + 0.5, 0); ctx.lineTo(i * cell + 0.5, pxH);
+    }
+    for (let j = 0; j <= CH; j++) {
+      ctx.moveTo(0, j * cell + 0.5); ctx.lineTo(pxW, j * cell + 0.5);
+    }
+    ctx.stroke();
+  }
+
+  // 拖动中的形状/文字框预览（虚线覆盖）
+  if (draggingShape) {
+    drawPreviewOverlay();
+  }
+  document.getElementById('zoomVal').textContent = '×' + Math.round(zoom);
+  document.getElementById('zoom').value = zoom;
+}
+
+/* 实时预览：拖动形状时直接渲染当前拉伸出的形状轮廓，放手即定型 */
+function drawPreviewOverlay() {
+  const rect = dragRect();
+  if (tool === 'text') {
+    ctx.strokeStyle = 'rgba(0,122,255,0.9)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([Math.max(2, zoom * 0.4), Math.max(2, zoom * 0.4)]);
+    ctx.strokeRect(rect.x * zoom, rect.y * zoom, rect.w * zoom, rect.h * zoom);
+    ctx.setLineDash([]);
+    return;
+  }
+  const thick = Math.max(1, shapeThickness());
+  // 在单元格层面画半透明蓝色，实时显示拉伸出的形状（实心或描边）
+  ctx.fillStyle = 'rgba(0,122,255,0.5)';
+  const yy0 = Math.max(0, rect.y), yy1 = Math.min(CH - 1, rect.y + rect.h);
+  const xx0 = Math.max(0, rect.x), xx1 = Math.min(CW - 1, rect.x + rect.w);
+  for (let y = yy0; y <= yy1; y++)
+    for (let x = xx0; x <= xx1; x++)
+      if (isShapeFilled()
+          ? shapeInShape(x, y, 0, rect)
+          : (shapeInShape(x, y, 0, rect) && !shapeInShape(x, y, thick, rect)))
+        ctx.fillRect(x * zoom, y * zoom, zoom, zoom);
+}
+
+/* ---------- 拖拽矩形与形状/文字提交 ---------- */
+// 形状工具：按下点为图形中心，向四周拉伸；文字工具：拖拽角点范围框
+function dragRect() {
+  if (tool === 'text') {
+    const x0 = Math.min(dragStart.x, dragCur.x);
+    const y0 = Math.min(dragStart.y, dragCur.y);
+    const w = Math.max(dragStart.x, dragCur.x) - x0;
+    const h = Math.max(dragStart.y, dragCur.y) - y0;
+    return { x: x0, y: y0, w, h };
+  }
+  // 中心生长：半径 = 从按下中心到当前点的距离
+  const dx = Math.round(Math.abs(dragCur.x - dragStart.x));
+  const dy = Math.round(Math.abs(dragCur.y - dragStart.y));
+  const w = Math.max(1, 2 * dx + 1);
+  const h = Math.max(1, 2 * dy + 1);
+  return {
+    x: dragStart.x - dx,
+    y: dragStart.y - dy,
+    w, h,
+    cx: dragStart.x,
+    cy: dragStart.y,
+  };
+}
+
+const THICK = document.getElementById('shapeThick');
+const SHAPE_FILL = document.getElementById('shapeFill');
+function shapeThickness() { return Number(THICK.value); }
+function isShapeFilled() { return SHAPE_FILL.checked; }
+function toolColor() { return tool === 'white' ? 0 : 1; }
+
+/* 根据像素判定函数 inside(x,y) 绘制形状。filled=false 时描边（线宽）。
+   采用"实心填充 + 挖掉内部"实现描边，保证轮廓圆滑。 */
+// 统一的形状判定（供绘制与实时预览复用）
+function shapeInShape(x, y, shrink, rect) {
+  const x0 = rect.x, y0 = rect.y, x1 = rect.x + rect.w, y1 = rect.y + rect.h;
+  const cx = rect.cx != null ? rect.cx : (x0 + x1) / 2;
+  const cy = rect.cy != null ? rect.cy : (y0 + y1) / 2;
+  const hrx = rect.w / 2, hry = rect.h / 2;
+  const rw = Math.max(1, hrx - shrink), rh = Math.max(1, hry - shrink);
+  const nx = (x - cx) / rw, ny = (y - cy) / rh;
+  switch (tool) {
+    case 'square':   return Math.abs(nx) <= 1 && Math.abs(ny) <= 1;
+    case 'circle':   return nx * nx + ny * ny <= 1;
+    case 'triangle': { // 中心生长：等腰三角，顶点朝上（槽口居中）
+      const py = (y - cy) / Math.max(1, hry - shrink) * 0.5 + 0.5; // 0..1 自顶点往下
+      const halfW = Math.max(0, (rw) * (1 - py));
+      return Math.abs(nx) <= 1 && Math.abs(x - cx) <= halfW;
+    }
+  }
+  return false;
+}
+
+function commitShape(rect) {
+  if (rect.w < 3 || rect.h < 3) { status('拉伸太小，无法绘制形状'); return; }
+  const v = toolColor();
+  const filled = isShapeFilled();
+  const thick = Math.max(1, shapeThickness());
+
+  const y0 = Math.max(0, rect.y), y1 = Math.min(CH - 1, rect.y + rect.h);
+  const x0 = Math.max(0, rect.x), x1 = Math.min(CW - 1, rect.x + rect.w);
+
+  if (filled || thick === 0) {
+    for (let y = y0; y <= y1; y++)
+      for (let x = x0; x <= x1; x++)
+        if (shapeInShape(x, y, 0, rect)) cells[y * CW + x] = v;
+  } else {
+    // 描边: 主体 - 内部(shrunk by thick)
+    for (let y = y0; y <= y1; y++)
+      for (let x = x0; x <= x1; x++)
+        if (shapeInShape(x, y, 0, rect) && !shapeInShape(x, y, thick, rect)) cells[y * CW + x] = v;
+  }
+  status((tool === 'square' ? '方形' : tool === 'circle' ? '圆形' : '三角') +
+    ' 已绘制（拉伸手放手定型）');
+}
+
+/* ---------- 文字工具 ---------- */
+const TEXT_INPUT = document.getElementById('textInput');
+const TEXT_SIZE = document.getElementById('textSize');
+function textToCommit() { return TEXT_INPUT.value; }
+function placeText(left, top, right, bottom) {
+  const str = textToCommit();
+  if (!str) { status('请先在顶部输入文字，再框选放置'); return; }
+  const x0 = Math.min(left, right), x1 = Math.max(left, right);
+  const y0 = Math.min(top, bottom), y1 = Math.max(top, bottom);
+  const boxW = Math.max(1, x1 - x0 + 1), boxH = Math.max(1, y1 - y0 + 1);
+
+  // 用离屏 canvas 渲染文字，再阈值二值化到 cells（仅纯黑/纯白）
+  const sc = document.createElement('canvas');
+  const sctx = sc.getContext('2d', { willReadFrequently: true });
+  const fontPx = Number(TEXT_SIZE.value) * 12; // 基础字号，按框高自适应缩放
+  // 先估算：渲染一次确定实际 bit 数量以决定缩放
+  sc.width = Math.max(1, boxW * 8); sc.height = Math.max(1, boxH * 8);
+  sctx.fillStyle = '#fff'; sctx.fillRect(0, 0, sc.width, sc.height);
+  sctx.fillStyle = '#000';
+  sctx.font = '900 ' + fontPx + 'px sans-serif';
+  sctx.textBaseline = 'middle'; sctx.textAlign = 'center';
+  sctx.fillText(str, sc.width / 2, sc.height / 2);
+
+  // 计算文字实际包围盒（黑色像素范围），据以缩放放入目标框
+  const data = sctx.getImageData(0, 0, sc.width, sc.height).data;
+  let minX = sc.width, minY = sc.height, maxX = -1, maxY = -1;
+  for (let p = 0; p < sc.width * sc.height; p++) {
+    if (data[p * 4 + 3] > 0 && (data[p*4]*0.3+data[p*4+1]*0.59+data[p*4+2]*0.11) < 128) {
+      const px = p % sc.width, py = (p / sc.width) | 0;
+      if (px < minX) minX = px; if (px > maxX) maxX = px;
+      if (py < minY) minY = py; if (py > maxY) maxY = py;
+    }
+  }
+  if (maxX < 0) { status('文字渲染为空'); return; }
+  const tw = maxX - minX + 1, th = maxY - minY + 1;
+  const scale = Math.min(boxW / tw, boxH / th, 1.6); // 不放大太多，避免模糊
+  const dstW = Math.max(1, Math.round(tw * scale));
+  const dstH = Math.max(1, Math.round(th * scale));
+  const ox = x0 + Math.round((boxW - dstW) / 2);
+  const oy = y0 + Math.round((boxH - dstH) / 2);
+  const v = toolColor();
+  for (let dy2 = 0; dy2 < dstH; dy2++) {
+    const sy = Math.min(th - 1, Math.floor(dy2 / scale));
+    for (let dx2 = 0; dx2 < dstW; dx2++) {
+      const sx = Math.min(tw - 1, Math.floor(dx2 / scale));
+      const srcP = ((minY + sy) * sc.width) + (minX + sx);
+      const g = data[srcP*4]*0.3+data[srcP*4+1]*0.59+data[srcP*4+2]*0.11;
+      const gx = ox + dx2, gy = oy + dy2;
+      if (gx >= 0 && gx < CW && gy >= 0 && gy < CH && g < 128) cells[gy * CW + gx] = v;
+    }
+  }
+}
+function commitText(rect) {
+  placeText(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
+  const str = textToCommit();
+  if (str) status('已放入文字「' + str + '」（框内居中）');
+}
+document.getElementById('btnTextApply').addEventListener('click', () => {
+  if (!textToCommit()) { status('请先输入文字'); return; }
+  // 未框选时在画布中央放入
+  pushHistory();
+  placeText(Math.round(CW*0.2), Math.round(CH*0.3), Math.round(CW*0.8), Math.round(CH*0.7));
+  render();
+});
+
+/* ---------- 编辑 ---------- */
+const brushSel = document.getElementById('brush');
+let brush = Number(brushSel.value);
+brushSel.addEventListener('change', () => { brush = Number(brushSel.value); });
+
+function paintCell(cx, cy) {
+  const v = tool === 'black' ? 1 : 0;
+  const startX = Math.floor(cx - (brush - 1) / 2);
+  const startY = Math.floor(cy - (brush - 1) / 2);
+  for (let y = 0; y < brush; y++)
+    for (let x = 0; x < brush; x++) {
+      const gx = startX + x, gy = startY + y;
+      if (gx >= 0 && gy >= 0 && gx < CW && gy < CH) cells[gy * CW + gx] = v;
+    }
+}
+
+function cellFromEvent(e) {
+  const r = canvas.getBoundingClientRect();
+  const x = Math.floor((e.clientX - r.left) / r.width * CW);
+  const y = Math.floor((e.clientY - r.top) / r.height * CH);
+  return [x, y];
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  canvas.setPointerCapture(e.pointerId);
+  const [x, y] = cellFromEvent(e);
+  if (tool === 'square' || tool === 'circle' || tool === 'triangle' || tool === 'text') {
+    pushHistory();
+    drawing = true;
+    dragStart = { x, y };
+    dragCur = { x, y };
+    draggingShape = true;
+    render();
+  } else {
+    pushHistory();
+    drawing = true;
+    paintCell(x, y);
+    render();
+  }
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (draggingShape) {
+    const [x, y] = cellFromEvent(e);
+    dragCur = { x, y };
+    render();
+    return;
+  }
+  if (!drawing) return;
+  const [x, y] = cellFromEvent(e);
+  paintCell(x, y);
+  render();
+});
+['pointerup', 'pointercancel'].forEach(ev =>
+  canvas.addEventListener(ev, () => {
+    if (draggingShape) {
+      const r = dragRect();
+      draggingShape = false;
+      drawing = false;
+      if (tool === 'text') commitText(r);
+      else commitShape(r);
+      render();
+      return;
+    }
+    drawing = false;
+  }));
+
+/* ---------- 缩放 (以指针位置为锚点等比例) ---------- */
+function setZoom(z) {
+  z = Math.max(2, Math.min(48, Math.round(z)));
+  if (z === zoom) return;
+  zoom = z;
+  render();
+}
+function clampScroll() {
+  main.scrollLeft = Math.max(0, Math.min(main.scrollLeft, canvas.width - main.clientWidth));
+  main.scrollTop = Math.max(0, Math.min(main.scrollTop, canvas.height - main.clientHeight));
+}
+main.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const crect = main.getBoundingClientRect();
+  const vx = e.clientX - crect.left;   // 指针在视口内的偏移
+  const vy = e.clientY - crect.top;
+  const contentX = vx + main.scrollLeft; // 未缩放的图内像素偏移
+  const contentY = vy + main.scrollTop;
+  const ix = contentX / zoom;           // 图标坐标
+  const iy = contentY / zoom;
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  const old = zoom;
+  setZoom(zoom * factor);
+  const scale = zoom / old;
+  main.scrollLeft = contentX * scale - vx;
+  main.scrollTop = contentY * scale - vy;
+  clampScroll();
+}, { passive: false });
+
+document.getElementById('zoom').addEventListener('input', (e) => setZoom(Number(e.target.value)));
+document.getElementById('btnZoomIn').addEventListener('click', () => setZoom(zoom + 2));
+document.getElementById('btnZoomOut').addEventListener('click', () => setZoom(zoom - 2));
+document.getElementById('btnFit').addEventListener('click', () => {
+  const avail = Math.max(6, Math.min((main.clientWidth - 16) / CW, (main.clientHeight - 16) / CH));
+  setZoom(avail);
+  main.scrollLeft = 0;
+  main.scrollTop = 0;
+});
+
+/* ---------- 工具 (涂黑/涂白/方形/圆形/三角/文字) ---------- */
+function setTool(t) {
+  tool = t;
+  document.getElementById('toolBlack').classList.toggle('active', t === 'black');
+  document.getElementById('toolWhite').classList.toggle('active', t === 'white');
+  document.getElementById('toolSquare').classList.toggle('active', t === 'square');
+  document.getElementById('toolCircle').classList.toggle('active', t === 'circle');
+  document.getElementById('toolTriangle').classList.toggle('active', t === 'triangle');
+  document.getElementById('toolText').classList.toggle('active', t === 'text');
+}
+document.getElementById('toolBlack').addEventListener('click', () => setTool('black'));
+document.getElementById('toolWhite').addEventListener('click', () => setTool('white'));
+document.getElementById('toolSquare').addEventListener('click', () => setTool('square'));
+document.getElementById('toolCircle').addEventListener('click', () => setTool('circle'));
+document.getElementById('toolTriangle').addEventListener('click', () => setTool('triangle'));
+document.getElementById('toolText').addEventListener('click', () => setTool('text'));
+document.getElementById('btnClear').addEventListener('click', () => { pushHistory(); cells.fill(0); render(); });
+document.getElementById('btnFill').addEventListener('click', () => { pushHistory(); cells.fill(1); render(); });
+document.getElementById('btnInvert').addEventListener('click', () => {
+  pushHistory();
+  for (let i = 0; i < cells.length; i++) cells[i] = cells[i] ? 0 : 1;
+  render();
+});
+document.getElementById('grid').addEventListener('change', (e) => { showGrid = e.target.checked; render(); });
+
+/* ---------- 导入（带阈值转换预览） ---------- */
+const importOverlay = document.getElementById('importOverlay');
+const origPrev = document.getElementById('origPrev');
+const biPrev = document.getElementById('biPrev');
+const threshSlider = document.getElementById('thresh');
+const threshVal = document.getElementById('threshVal');
+const grayscaleSlider = document.getElementById('grayscale');
+const grayscaleVal = document.getElementById('grayscaleVal');
+const sharpenSlider = document.getElementById('sharpen');
+const sharpenVal = document.getElementById('sharpenVal');
+const denoiseChk = document.getElementById('denoise');
+const invertChk = document.getElementById('invertBw');
+const origPrevCtx = origPrev.getContext('2d');
+const biPrevCtx = biPrev.getContext('2d');
+let importGraymap = null;   // 缩放后的灰度图数据
+
+// 由“灰度模拟强度”(0-100) 推导算法模式
+function modeFromGrayscale() {
+  const g = Number(grayscaleSlider.value);
+  if (g <= 0) return 'threshold';
+  if (g < 51) return 'dither';
+  return 'fs';
+}
+
+function buildGraymap(img) {
+  const c = document.createElement('canvas');
+  c.width = CW; c.height = CH;
+  const cx = c.getContext('2d', { willReadFrequently: true });
+  cx.imageSmoothingEnabled = false;
+  cx.fillStyle = '#fff'; cx.fillRect(0, 0, CW, CH);
+  cx.drawImage(img, 0, 0, CW, CH);
+  const d = cx.getImageData(0, 0, CW, CH).data;
+  const gm = new Uint8Array(CW * CH);
+  for (let i = 0; i < CW * CH; i++)
+    gm[i] = Math.round(d[i*4] * 0.299 + d[i*4+1] * 0.587 + d[i*4+2] * 0.114);
+  return gm;
+}
+
+/* 8x8 Bayer 有序抖动矩阵：值 0..63 */
+const BAYER8 = [
+  0,32, 8,40, 2,34,10,42,
+ 48,16,56,24,50,18,58,26,
+ 12,44, 4,36,14,46, 6,38,
+ 60,28,52,20,62,30,54,22,
+  3,35,11,43, 1,33, 9,41,
+ 51,19,59,27,49,17,57,25,
+ 15,47, 7,39,13,45, 5,37,
+ 63,31,55,23,61,29,53,21,
+];
+
+// 转换模式: 把灰度图(0暗..255亮)转成 cells(1黑/0白)
+//  mode: 'threshold' | 'dither'(Bayer) | 'fs'(Floyd-Steinberg)
+//  opts: { invert:boolean } 反相可在最后统一做
+function graymapToCells(gm, threshold, mode) {
+  const t = Math.max(0, Math.min(255, threshold));
+  const out = new Uint8Array(CW * CH);
+
+  if (mode === 'fs') {
+    // Floyd–Steinberg 误差扩散：把量化误差按比例扩散到相邻像素，效果细腻
+    // 复制一份工作数组避免污染原始灰度
+    const w = new Float32Array(gm);
+    for (let y = 0; y < CH; y++) {
+      for (let x = 0; x < CW; x++) {
+        const i = y * CW + x;
+        // 强度作为亮度偏移：强度越高，白/黑判定越想黑方向偏
+        const old = w[i] - (255 - t);   // t=255 时不动原亮度；t 越低越偏黑
+        const black = old < 128;
+        out[i] = black ? 1 : 0;
+        const err = old - (black ? 0 : 255); // 黑=0, 白=255 的量化误差
+        // 误差扩散权重 7:16 * (3/5,5/5,1/5)
+        const apply = (nx, ny, wgt) => {
+          if (nx >= 0 && nx < CW && ny >= 0 && ny < CH) w[ny * CW + nx] += err * wgt / 16;
+        };
+        if (x + 1 < CW)   apply(x + 1, y,     7);
+        if (y + 1 < CH) { apply(x - 1, y + 1, 3); apply(x,     y + 1, 5); apply(x + 1, y + 1, 1); }
+      }
+    }
+    return out;
+  }
+
+  for (let y = 0; y < CH; y++) {
+    for (let x = 0; x < CW; x++) {
+      const g = gm[y * CW + x];
+      let black;
+      if (mode === 'dither') {
+        const level = t * 63 / 255;
+        const d = BAYER8[(y & 7) * 8 + (x & 7)];
+        black = (g * 63 / 255) + d <= level;
+      } else { // threshold
+        black = g < t;
+      }
+      out[y * CW + x] = black ? 1 : 0;
+    }
+  }
+  return out;
+}
+
+/* ---------- 去噪：清除孤立黑点/白点、填补细小空洞 ---------- */
+function denoiseBits(bits) {
+  const out = bits.slice();
+  for (let y = 0; y < CH; y++) {
+    for (let x = 0; x < CW; x++) {
+      const i = y * CW + x;
+      if (bits[i] === 0) continue;   // 白点无需处理（中值倾向黑？仍要处理小空洞）
+      // 统计 4 邻域黑点数
+      let n = 0;
+      if (x > 0     && bits[i-1]) n++;
+      if (x < CW-1  && bits[i+1]) n++;
+      if (y > 0     && bits[i-CW]) n++;
+      if (y < CH-1  && bits[i+CW]) n++;
+      if (n === 0) out[i] = 0;      // 孤立点清除
+    }
+  }
+  // 填补孤立白洞：被黑包围的单个白像素变黑（避免细线断）
+  for (let y = 1; y < CH-1; y++) {
+    for (let x = 1; x < CW-1; x++) {
+      const i = y * CW + x;
+      if (bits[i] === 0) {
+        if (bits[i-1] && bits[i+1] && bits[i-CW] && bits[i+CW])
+          out[i] = 1;                 // 上下左右全黑 → 填洞
+      }
+    }
+  }
+  return out;
+}
+
+/* ---------- 规整：让斜边/锯齿更横平竖直（多数投票式平滑，迭代） ---------- */
+function regularizeBits(bits, strength) {
+  // strength 0..100
+  const passes = Math.round(strength / 15);   // 0 时不做；100 → 约7次
+  if (passes <= 0) return bits;
+  let cur = bits.slice();
+  for (let p = 0; p < passes; p++) {
+    const nxt = cur.slice();
+    for (let y = 1; y < CH-1; y++) {
+      for (let x = 1; x < CW-1; x++) {
+        let black = 0;
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++)
+            if (cur[(y+dy)*CW + (x+dx)]) black++;
+        nxt[y*CW + x] = black >= 5 ? 1 : 0;  // 3x3 多数票：趋向平直规整
+      }
+    }
+    cur = nxt;
+  }
+  return cur;
+}
+
+function invertBits(bits) {
+  const out = new Uint8Array(bits);
+  for (let i = 0; i < out.length; i++) out[i] = bits[i] ? 0 : 1;
+  return out;
+}
+
+/* 完整导入管线：灰度 → 二值 → (去噪) → (规整) → (反相) */
+function processImport(gm, threshold, mode) {
+  let bits = graymapToCells(gm, threshold, mode);
+  if (denoiseChk.checked) bits = denoiseBits(bits);
+  const s = Number(sharpenSlider.value);
+  if (s > 0) bits = regularizeBits(bits, s);
+  if (invertChk.checked) bits = invertBits(bits);
+  return bits;
+}
+
+function drawBiCanvas() {
+  const t = Number(threshSlider.value);
+  const mode = modeFromGrayscale();
+  // 用固定逻辑尺寸绘制，避免依赖尚未布局完的 clientWidth(可能为0)
+  const Wpx = 160, Hpx = 160;
+  biPrev.width = Wpx; biPrev.height = Hpx;
+  biPrevCtx.fillStyle = '#fff';
+  biPrevCtx.fillRect(0, 0, Wpx, Hpx);
+  const sx = Wpx / CW, sy = Hpx / CH;
+  const bits = processImport(importGraymap, t, mode);
+  for (let y = 0; y < CH; y++)
+    for (let x = 0; x < CW; x++)
+      if (bits[y * CW + x]) biPrevCtx.fillRect(Math.floor(x * sx), Math.floor(y * sy), Math.ceil(sx), Math.ceil(sy));
+  threshVal.textContent = t;
+  sharpenVal.textContent = Number(sharpenSlider.value);
+  grayscaleVal.textContent = Number(grayscaleSlider.value);
+}
+
+function renderBiPreview() {
+  if (importGraymap) drawBiCanvas();
+}
+
+function openImportDialog(file) {
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    importGraymap = buildGraymap(img);
+    // 原图预览：固定逻辑尺寸，铺满显示由 CSS 处理
+    const ow = 160, oh = 160;
+    origPrev.width = ow; origPrev.height = oh;
+    origPrevCtx.fillStyle = '#fff'; origPrevCtx.fillRect(0, 0, ow, oh);
+    origPrevCtx.imageSmoothingEnabled = false;
+    origPrevCtx.drawImage(img, 0, 0, ow, oh);
+    renderBiPreview();
+    importOverlay.classList.add('show');
+    status('已载入「' + file.name + '」，拖动滑块调整转换后点【应用】');
+  };
+  img.onerror = () => status('图片载入失败');
+  img.src = url;
+}
+
+threshSlider.addEventListener('input', renderBiPreview);
+grayscaleSlider.addEventListener('input', renderBiPreview);
+sharpenSlider.addEventListener('input', renderBiPreview);
+denoiseChk.addEventListener('change', renderBiPreview);
+invertChk.addEventListener('change', renderBiPreview);
+document.getElementById('btnCancelImport').addEventListener('click', () => {
+  importOverlay.classList.remove('show');
+  importGraymap = null;
+  status('已取消导入');
+});
+document.getElementById('btnApplyImport').addEventListener('click', () => {
+  const t = Number(threshSlider.value);
+  const mode = modeFromGrayscale();
+  const g = Number(grayscaleSlider.value);
+  pushHistory();
+  cells = processImport(importGraymap, t, mode);
+  importOverlay.classList.remove('show');
+  importGraymap = null;
+  render();
+  const modeName = mode === 'fs' ? '误差扩散(FS)' : mode === 'dither' ? '点阵抖动(Bayer)' : '阈值';
+  const extra = [];
+  if (g > 0) extra.push('模拟' + g);
+  if (sharpenSlider.value > 0) extra.push('规整' + sharpenSlider.value);
+  if (denoiseChk.checked) extra.push('去噪');
+  if (invertChk.checked) extra.push('反相');
+  status('已按' + modeName + (extra.length ? '(' + extra.join('+') + ')' : '') + ' 导入，转为 ' + CW + '×' + CH + ' 纯黑白');
+});
+
+function loadImageFile(file) {
+  if (!file) return;
+  openImportDialog(file);
+}
+document.getElementById('file').addEventListener('change', (e) => {
+  loadImageFile(e.target.files[0]);
+  e.target.value = '';
+});
+
+let dragDepth = 0;
+document.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; hint(true); });
+document.addEventListener('dragleave', (e) => { e.preventDefault(); if (--dragDepth <= 0) hint(false); });
+document.addEventListener('dragover', (e) => { e.preventDefault(); });
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  hint(false);
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f) loadImageFile(f);
+});
+function hint(on) { document.getElementById('dropHint').style.display = on ? 'flex' : 'none'; }
+
+/* ---------- 导出 ---------- */
+function exportPNG(scale) {
+  const c = document.createElement('canvas');
+  c.width = CW * scale; c.height = CH * scale;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#fff'; cx.fillRect(0, 0, c.width, c.height);
+  cx.fillStyle = '#000';
+  for (let y = 0; y < CH; y++)
+    for (let x = 0; x < CW; x++)
+      if (cells[y * CW + x]) cx.fillRect(x * scale, y * scale, scale, scale);
+  const a = document.createElement('a');
+  a.download = 'icon_' + CW + 'x' + CH + '.png';
+  a.href = c.toDataURL('image/png');
+  a.click();
+}
+document.getElementById('btnExport').addEventListener('click', () => { exportPNG(1); status('已导出 ' + CW + '×' + CH + ' PNG'); });
+document.getElementById('btnExportBig').addEventListener('click', () => { exportPNG(Math.max(8, Math.floor(256 / Math.max(CW, CH)))); status('已导出放大版 PNG'); });
+
+function status(msg) { document.getElementById('status').textContent = msg; }
+
+/* ---------- 一键填充 (图案 + 可调密度) ---------- */
+const PATTERNS = {
+  solid: () => 1,
+  hline: (x, y, d) => ((y % 8) / 8) < d,
+  vline: (x, y, d) => ((x % 8) / 8) < d,
+  diagL: (x, y, d) => (((x + y) % 8) / 8) < d,
+  diagR: (x, y, d) => (((x - y + 128) % 8) / 8) < d,
+  grid:  (x, y, d) => ((y % 8) / 8) < d || ((x % 8) / 8) < d,
+  dots:  (x, y, d) => { const S = Math.max(2, Math.round(10 - 8 * d)); return (x % S) <= 1 && (y % S) <= 1; },
+};
+const denSlider = document.getElementById('density');
+const denVal = document.getElementById('densityVal');
+function showDen() { denVal.textContent = denSlider.value + '%'; }
+denSlider.addEventListener('input', showDen);
+showDen();
+document.getElementById('btnPatternFill').addEventListener('click', () => {
+  const p = PATTERNS[document.getElementById('pattern').value];
+  const d = Number(denSlider.value) / 100;
+  pushHistory();
+  for (let y = 0; y < CH; y++)
+    for (let x = 0; x < CW; x++)
+      cells[y * CW + x] = p(x, y, d) ? 1 : 0;
+  render();
+  status('已按所选图案与密度填充画布');
+});
+
+/* ---------- 画布尺寸切换 ---------- */
+const sizeSel = document.getElementById('canvasSize');
+const headerTag = document.getElementById('headerTag');
+sizeSel.addEventListener('change', () => {
+  const [w, h] = sizeSel.value.split('x').map(Number);
+  resizeCanvas(w, h);
+  headerTag.textContent = '当前 ' + w + '×' + h + ' · 仅黑白 · 无灰度 · 等比例缩放';
+  status('已切换到 ' + w + '×' + h + ' 画布（原内容已清空）');
+});
+
+render();
+updateHistoryBtns();
+</script>
+</body>
+</html>
