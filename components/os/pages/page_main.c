@@ -58,6 +58,11 @@ typedef struct {
     int     drag_offset;
     int     drag_moved;
     uint32_t suppress_until;  /* 拖动松手后短暂抑制 swipe 方向键/确认 (ms) */
+    bool    anim_spring;      /* 本次动画用弹簧回弹 (false=惯性减速平滑停) */
+    /* 惯性速度采样: 最近 N 个 (偏移, 时间) 对 */
+    int      v_off[5];
+    uint32_t v_t[5];
+    int      v_n;
     int     selected;         /* 选中显示索引 (0..MAIN_MOD_COUNT-1) */
 } main_state_t;
 static main_state_t s_main;
@@ -157,8 +162,10 @@ static void p_main_render(ui_ctx_t *ctx)
         } else {
             uint32_t d = now - s_main.cam_anim_start;
             float tt = d < s_main.cam_anim_dur ? (float)d / (float)s_main.cam_anim_dur : 1.0f;
+            /* 惯性甩动=平滑减速停; 短距离归位=弹簧回弹 */
+            float ease = s_main.anim_spring ? spring_ease(tt) : (1.0f - (float)pow(1.0f - tt, 3.0f));
             cam = s_main.cam_anim_from +
-                  (s_main.cam_anim_to - s_main.cam_anim_from) * spring_ease(tt);
+                  (s_main.cam_anim_to - s_main.cam_anim_from) * ease;
             if (tt >= 1.0f) {
                 s_main.cam_anim_start = 0;
                 cam = s_main.cam_anim_to;
@@ -258,6 +265,7 @@ static void p_main_poll(ui_ctx_t *ctx)
         s_main.drag_moved    = 0;
         s_main.cam_base      = s_main.cam_cur;
         s_main.cam_anim_start = 0;
+        s_main.v_n = 0;                       /* 惯性采样清零 */
         ctx->needs_redraw = true;
     }
     if (s_main.drag_active) {
@@ -268,22 +276,64 @@ static void p_main_poll(ui_ctx_t *ctx)
             s_main.drag_offset = off;
             int m = off < 0 ? -off : off;
             if (m > s_main.drag_moved) s_main.drag_moved = m;
+            /* 速度采样: 记录最近 5 个 (偏移,时间) */
+            if (s_main.v_n < 5) {
+                s_main.v_off[s_main.v_n] = off;
+                s_main.v_t[s_main.v_n]   = now_ms();
+                s_main.v_n++;
+            } else {
+                for (int i = 1; i < 5; i++) { s_main.v_off[i-1] = s_main.v_off[i]; s_main.v_t[i-1] = s_main.v_t[i]; }
+                s_main.v_off[4] = off;
+                s_main.v_t[4]   = now_ms();
+            }
         } else {
-            /* 松手: 归位吸附到最近槽位 (弹簧回弹, 明显弹回), 图标停在格上. */
+            /* 松手: 归位吸附到最近槽位, 并叠加惯性 (甩动速度 → 继续滑几格).
+             * 快+远=惯性远; 轻滑(距离短)/慢速=就近停, 不误甩. */
             s_main.drag_active = false;
             if (s_main.drag_moved >= 40) {
                 s_main.suppress_until = now_ms() + 150;
                 const int spacing = 100;
                 float cur = s_main.cam_base - (float)s_main.drag_offset / (float)spacing;
-                int target = lroundf(cur);
+
+                /* 释放速度: 用最近两段采样 (松手瞬间) 估算 px/ms */
+                float vel = 0.0f;
+                if (s_main.v_n >= 2) {
+                    int last = s_main.v_n - 1;
+                    int j = last - 1;
+                    while (j >= 0 && s_main.v_t[last] == s_main.v_t[j]) j--;
+                    if (j >= 0) {
+                        vel = (float)(s_main.v_off[last] - s_main.v_off[j]) /
+                              (float)(s_main.v_t[last] - s_main.v_t[j]);
+                    }
+                }
+                /* 惯性: 速度超阈值才甩; 甩动格数受速度与拖动距离双重约束.
+                 * 阈值 0.35px/ms (约 21px/60ms): 轻滑/慢速不甩, 只归位. */
+                int extra = 0;
+                if (fabsf(vel) >= 0.35f) {
+                    float glide_px = vel * 240.0f;              /* 速度→滑行距离 */
+                    int by_vel = (int)lroundf(glide_px / (float)spacing);
+                    /* 距离上限: 惯性不超过拖动距离的 1.5 倍 (轻滑距离短→惯性小) */
+                    float max_extra = ((float)s_main.drag_moved / (float)spacing) * 1.5f;
+                    float ex = (float)by_vel;
+                    if (ex > max_extra) ex = max_extra;
+                    else if (ex < -max_extra) ex = -max_extra;
+                    extra = (int)lroundf(ex);
+                    if (extra > 3) extra = 3; else if (extra < -3) extra = -3;
+                }
+                int base_target = lroundf(cur);
+                int target = base_target - extra;              /* 惯性方向与拖动一致 */
+
+                /* 惯性甩动: 平滑减速停; 无惯性(extra=0): 弹簧回弹归位 */
+                s_main.anim_spring = (extra == 0);
                 int steps = (int)(target - lroundf(s_main.cam_base));
                 if (steps < 0) steps = -steps;
-                uint32_t dur = 260 + (uint32_t)steps * 80;
-                if (dur > 800) dur = 800;
-                s_main.cam_cur = cur;                /* 归位动画起点 = 松手位置 */
+                uint32_t dur = 280 + (uint32_t)steps * 90;
+                if (dur > 900) dur = 900;
+                s_main.cam_cur = cur;                          /* 动画起点 = 松手位置 */
                 main_cam_animate(target, dur);
                 ctx->needs_redraw = true;
-                ESP_LOGI("MAIN", "归位: cur=%.2f target=%d moved=%d", cur, target, s_main.drag_moved);
+                ESP_LOGI("MAIN", "归位: cur=%.2f vel=%.2f extra=%d target=%d moved=%d",
+                         cur, vel, extra, target, s_main.drag_moved);
             }
         }
     }

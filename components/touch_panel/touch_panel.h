@@ -59,6 +59,11 @@ tp_chip_t touch_panel_init(void);
 /* 读取一个触摸点 (每帧轮询一次). 返回 false 表示读取失败/无有效数据. */
 bool touch_panel_read(tp_point_t *pt);
 
+/* 读取多点触摸 (最多 2 点, 向后兼容: touch_panel_read 等价于取 pts[0]).
+ * pts[0..1] 各点 (未按压的置 pressed=false), count 返回实际点数 (0..2).
+ * 返回 false 表示读取失败/无有效数据. */
+bool touch_panel_read_points(tp_point_t pts[2], int *count);
+
 /* V1.0.68: 禁用触摸屏: 卸载 I2C 驱动(释放内存), 之后 read 恒 false. 可重新 init. */
 void touch_panel_deinit(void);
 

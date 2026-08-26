@@ -164,6 +164,8 @@ static int  s_touch_sx = 0, s_touch_sy = 0;
 /* V1.0.68: 每 tick 只读一次触摸芯片并缓存, 供 touch_gesture_poll 与
  * input_poll_touch 共用, 避免 GT911 读后清状态被两次读互相偷走事件. */
 static tp_point_t s_touch_cached;
+static tp_point_t s_touch_cached2;      /* 第二触点 (多点触控) */
+static int        s_touch_cached_count = 0;   /* 实际触点数量 (0..2) */
 static bool       s_touch_cached_valid = false;
 static uint32_t   s_touch_cache_tick = 0;
 /* V1.0.68 fix: 连续读失败计数 — 触摸芯片挂死/总线卡住时触发自动恢复 */
@@ -184,11 +186,15 @@ static void touch_read_once(tp_point_t *pt) {
      * 避免每帧 touch_panel_read 恒返回 false 被误判为连续读失败狂刷日志/请求恢复. */
     if (!touch_panel_is_present()) {
         s_touch_cached.pressed = false;
+        s_touch_cached2.pressed = false;
+        s_touch_cached_count = 0;
         s_touch_fail_count = 0;
         *pt = s_touch_cached;
         return;
     }
-    if (!touch_panel_read(&s_touch_cached)) {
+    tp_point_t pts[2];
+    int cnt = 0;
+    if (!touch_panel_read_points(pts, &cnt)) {
         /* V1.0.68 fix: 读失败时**保留上一帧状态**(不伪造"松开").
          * 旧代码把失败当成"手指已松开", 飞线 I2C 一个误码就会打断进行中的
          * 手势 → 触摸跳变/误触/只能慢慢拖; 连续失败则是芯片挂死需重启.
@@ -199,6 +205,8 @@ static void touch_read_once(tp_point_t *pt) {
         s_touch_fail_count++;
         if (s_touch_fail_count >= 3) {
             s_touch_cached.pressed = false;
+            s_touch_cached2.pressed = false;
+            s_touch_cached_count = 0;
             ESP_LOGW("INPUT", "触摸连续 %d 次读失败, 强制释放触摸状态",
                      (int)s_touch_fail_count);
         }
@@ -210,6 +218,10 @@ static void touch_read_once(tp_point_t *pt) {
         }
     } else {
         s_touch_fail_count = 0;
+        s_touch_cached = pts[0];
+        s_touch_cached2 = (cnt > 1) ? pts[1] : pts[0];
+        s_touch_cached2.pressed = (cnt > 1);
+        s_touch_cached_count = (cnt > 2) ? 2 : cnt;
         touch_jump_filter(&s_touch_cached, s_touch_cached.pressed);
     }
     *pt = s_touch_cached;
@@ -698,6 +710,35 @@ bool input_get_touch_pos(int *x, int *y) {
     s_o_armed = true;
     s_o_zone  = false;
     return false;
+}
+
+/* V1.0.xx: 多点触控 — 返回当前触摸点 (最多 2 点, 已映射屏幕坐标).
+ * 复用触摸缓存 (touch_read_once), 须与 input_get_touch_pos/input_get_action 同帧读取. */
+void input_get_touch_multi(tp_point_t pts[2], int *count) {
+    if (count) *count = 0;
+    if (!pts) return;
+    tp_point_t p0;
+    touch_read_once(&p0);   /* 确保本帧已刷新缓存 (含第二触点) */
+    pts[0] = s_touch_cached;
+    int c = s_touch_cached_count;
+    if (c > 0 && s_touch_cached.pressed) {
+        if (c > 1 && s_touch_cached2.pressed) {
+            /* 第二触点映射到屏幕坐标 */
+            int sx = s_touch_cached2.x, sy = s_touch_cached2.y;
+            touch_map_screen(sx, sy, &sx, &sy);
+            rotate_screen_coord(&sx, &sy);
+            pts[1].pressed = true;
+            pts[1].x = (int16_t)sx;
+            pts[1].y = (int16_t)sy;
+            if (count) *count = 2;
+        } else {
+            pts[1].pressed = false;
+            if (count) *count = 1;
+        }
+    } else {
+        pts[0].pressed = false;
+        pts[1].pressed = false;
+    }
 }
 
 /* V1.0.99: 只读查询"当前手指按下 且 本次手势起点落在底部屏蔽带" (不消费任何状态).

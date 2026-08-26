@@ -2,6 +2,7 @@
 #define INPUT_H
 
 #include "menu_system.h"
+#include "touch_panel.h"   /* V1.0.xx: tp_point_t (多点触控) */
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -30,6 +31,11 @@ bool input_consume_tap(int *x, int *y);
 /* V1.0.66: 返回当前触摸的实时屏幕坐标 (400x300), 供主菜单跟手拖动.
  * 返回 false 表示当前无手指按下. */
 bool input_get_touch_pos(int *x, int *y);
+
+/* V1.0.xx: 多点触控 — 返回当前触摸点 (最多 2 点, 已映射到屏幕坐标).
+ * pts[0..1] 各点 (未按下的置 pressed=false), count 返回实际点数 (0..2).
+ * 调用方需在 input_get_action/input_get_touch_pos 同帧读取 (依赖同一触摸缓存). */
+void input_get_touch_multi(tp_point_t pts[2], int *count);
 
 /* V1.0.9x: 返回本次手势按下的起点屏幕坐标 (供主菜单拖动排序判定"是否已移动").
  * 未按住或无手势时返回 false. 必须与 input_get_touch_pos 同帧/之后调用. */
