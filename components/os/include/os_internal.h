@@ -32,6 +32,7 @@ void os_page_wifi_kb_register(void);       /* WiFi 虚拟键盘 */
 void os_page_term_register(void);          /* 终端 (P4) */
 void os_page_wb_register(void);            /* 白板 (P4) */
 void os_page_diag_register(void);          /* 故障诊断 (P4) */
+void os_page_dialog_register(void);        /* 通用弹窗 (modal 覆盖页) */
 
 #ifdef __cplusplus
 }

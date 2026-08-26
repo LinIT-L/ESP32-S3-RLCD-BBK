@@ -76,8 +76,10 @@ bool os_push(ui_ctx_t *ctx, os_page_t page)
     }
     const os_module_t *m = s_modules[page];
 
-    /* 退出旧模块(若有) */
-    if (s_cur_mod && s_cur_mod->on_exit) s_cur_mod->on_exit(ctx);
+    /* 模态覆盖页 (弹窗): 不退出底层, 底层保持活动状态 (pop 时也不重新 on_enter).
+     * 非模态页: 正常退出旧模块 (push 时 on_exit / pop 时父 on_enter). */
+    bool overlay = m->modal;
+    if (s_cur_mod && !overlay && s_cur_mod->on_exit) s_cur_mod->on_exit(ctx);
     /* 父页入返回链 */
     if (s_stack_top < OS_STACK_MAX - 1) {
         s_back_stack[++s_stack_top] = (os_page_t)ctx->current_page;
@@ -106,7 +108,10 @@ void os_pop(ui_ctx_t *ctx)
     ctx->cur         = pm;
     ctx->current_page = pm ? (int)parent : -1;
     ctx->modal_active = pm ? pm->modal : false;
-    if (pm && pm->on_enter) pm->on_enter(ctx);
+    /* 仅当被 pop 的是非模态页时, 父才需要重新 on_enter (其 push 时父已被 on_exit);
+     * 被 pop 的是模态覆盖页则父未退出, 保持原状即可. */
+    bool was_overlay = m && m->modal;
+    if (pm && !was_overlay && pm->on_enter) pm->on_enter(ctx);
     ctx->needs_redraw = true;
     ESP_LOGI(TAG, "pop -> page %d", (int)parent);
 }

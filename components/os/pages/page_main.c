@@ -19,30 +19,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ============ 模块注册表 (主菜单显示的应用) ============
- * 迁移规则: 每新增/点亮一个应用, 在此加一行; 私有实现留在各自 pages 目录.
+/* ============ 应用来源: 统一走 os_app 注册表 ============
+ * 内置应用在 os_pages.c 静态注册; 商店安装的 WASM 应用运行时注册后主菜单自动出现.
  * icon_idx = 主菜单 SF 图标索引 (见 icons_main.inc 的 main_icons[] 表). */
-typedef struct {
-    const char *label;     /* 图标下方短标签 (UTF-8) */
-    int         icon_idx;  /* SF 图标索引 */
-    os_page_t   page;      /* 进入的目标页 */
-} os_main_mod_t;
-
-static const os_main_mod_t s_main_mods[] = {
-    { "\xe6\xad\xa5\xe6\xad\xa5\xe9\xab\x98", 21, OS_PAGE_SELECT_GAME },  /* 步步高 */
-    { "\xe9\x98\x85\xe8\xaf\xbb",              9, OS_PAGE_BOOK },          /* 阅读 */
-    { "\xe9\x9f\xb3\xe4\xb9\x90",              7, OS_PAGE_MP3_PLAYER },    /* 音乐 */
-    { "\xe6\x89\x8b\xe6\x9f\x84",              3, OS_PAGE_GAMEPAD },       /* 手柄 */
-    { "\xe5\xa3\x81\xe7\xba\xb8",             10, OS_PAGE_WALLPAPER },     /* 壁纸 */
-    { "\xe7\x95\xaa\xe8\x8c\x84\xe9\x92\x9f", 11, OS_PAGE_POMODORO },      /* 番茄钟 */
-    { "\xe4\xbb\xbf\xe7\x9c\x9f\xe9\x94\xae\xe9\xbc\xa0", 1, OS_PAGE_USB_HID }, /* 仿真键鼠 */
-    { "\xe5\xad\x98\xe5\x82\xa8",              5, OS_PAGE_SETTINGS },       /* 存储 */
-    { "\xe8\xae\xbe\xe7\xbd\xae",              6, OS_PAGE_SETTINGS },       /* 设置 */
-    { "\xe5\xba\x94\xe7\x94\xa8\xe7\xae\xa1\xe7\x90\x86", 0, OS_PAGE_APP_MANAGER }, /* 应用管理 */
-    { "\xe7\x99\xbd\xe6\x9d\xbf",             18, OS_PAGE_WHITEBOARD },    /* 白板 */
-    { "\xe7\xbb\x88\xe7\xab\xaf",             23, OS_PAGE_TERMINAL },      /* 终端 */
-};
-#define MAIN_MOD_COUNT (sizeof(s_main_mods) / sizeof(s_main_mods[0]))
+#define MAIN_MOD_COUNT  os_app_count()
+static const os_app_t *main_app(int idx) { return os_app_get(idx); }
 
 /* ============ 私有状态 (相机/拖动/动画/选中) ============ */
 typedef struct {
@@ -214,14 +195,14 @@ static void p_main_render(ui_ctx_t *ctx)
         int size = main_icon_size(dist);
         if (cx + size > 0 && cx - size < UI_SCREEN_W) {
             draw_main_icon_stretched(lcd, cx, icon_center_y, size, size,
-                                     s_main_mods[idx].icon_idx);
+                                     main_app(idx)->icon_idx);
         }
     }
 
     /* 选中图标下方短标签 */
     int label_y = icon_center_y + 68;
     if (label_y > UI_SCREEN_H - 28) label_y = UI_SCREEN_H - 28;
-    draw_label_centered_at(lcd, center_x, label_y, s_main_mods[sel].label, false);
+    draw_label_centered_at(lcd, center_x, label_y, main_app(sel)->label, false);
 }
 
 /* ============ 按键 ============ */
@@ -240,7 +221,7 @@ static void p_main_action(ui_ctx_t *ctx, os_action_t a)
         break;
     case OS_ACTION_CONFIRM:
         if (input_suppressed()) break;
-        os_push(ctx, s_main_mods[s_main.selected].page);
+        os_push(ctx, main_app(s_main.selected)->page);
         break;
     case OS_ACTION_BACK:
     case OS_ACTION_HOME:
@@ -268,7 +249,7 @@ static bool p_main_touch(ui_ctx_t *ctx, int x, int y)
             if (idx != s_main.selected) {
                 main_anim_to(ctx, idx);   /* 先选中动画, 再进入 */
             }
-            os_push(ctx, s_main_mods[idx].page);
+            os_push(ctx, main_app(idx)->page);
             return true;
         }
     }

@@ -78,6 +78,7 @@ typedef enum {
     OS_PAGE_WHITEBOARD,        /* 白板 */
     OS_PAGE_TERMINAL,          /* 终端 */
     OS_PAGE_WIFI_KB,           /* WiFi 虚拟键盘 (终端内独立模块) */
+    OS_PAGE_DIALOG,            /* 通用弹窗 (modal 覆盖页, 由 os_dialog 驱动) */
     OS_PAGE_COUNT
 } os_page_t;
 
@@ -162,6 +163,33 @@ bool os_modal_active(const ui_ctx_t *ctx);
 
 /* 当前壁纸程序 id (page_wallpaper 保存; 桌面/屏保渲染用; 0=星空默认). */
 int os_wallpaper_get_program(void);
+
+/* ==== 通用弹窗 (modal 覆盖页) ====
+ * 供各页面复用统一弹窗: 列表选择 / 确认框 / 提示 toast.
+ * 打开后压入 OS_PAGE_DIALOG (modal), 不退出底层页面; 关闭后自动恢复底层.
+ * 回调 result: -1=取消/BACK, >=0 选中索引 (确认框: 0=确定 1=取消). */
+typedef void (*os_dialog_cb_t)(ui_ctx_t *ctx, int result, void *ud);
+
+void os_dialog_list(ui_ctx_t *ctx, const char *title,
+                    const char *const *items, int count, int sel,
+                    os_dialog_cb_t cb, void *ud);
+void os_dialog_confirm(ui_ctx_t *ctx, const char *msg, os_dialog_cb_t cb, void *ud);
+void os_dialog_toast(ui_ctx_t *ctx, const char *msg);   /* 1s 自动关闭 */
+
+/* ==== 应用注册表 (主菜单/应用管理共用; 为应用商店动态安装预留) ==== */
+typedef struct os_app os_app_t;
+struct os_app {
+    const char *id;        /* 唯一 id, 如 "settings" / "wasm:snake" */
+    const char *label;     /* 显示名 (UTF-8) */
+    int         icon_idx;  /* 主菜单 SF 图标索引 */
+    os_page_t   page;      /* 启动进入的页面 */
+    bool        hidden;    /* true=不在主菜单/应用管理显示 (内部页) */
+};
+
+/* 编译期/运行期注册应用 (商店安装后运行时注册, 主菜单自动出现). */
+void os_app_register(const os_app_t *app);
+int  os_app_count(void);
+const os_app_t *os_app_get(int idx);
 
 /* ==== 平台状态挂钩 (由外壳 main.c 注入, 解耦 os 与具体硬件组件) ====
  * 状态栏/服务不直接引用 bt_manager/wifi_manager/board_battery 等实现,

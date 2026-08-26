@@ -6,6 +6,8 @@
 idf_component_register(
     SRCS "kernel/os_core.c"
          "kernel/os_pages.c"
+         "kernel/os_dialog.c"
+         "kernel/os_app.c"
          "services/svc_statusbar.c"
          "pages/page_main.c"
          "pages/page_select_game.c"

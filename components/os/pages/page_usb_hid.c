@@ -358,10 +358,6 @@ static const char *s_press_label;
 static const hid_key_t *s_press_key;
 static uint32_t s_press_ms;
 
-/* 布局切换二级菜单 (内部状态机) */
-static bool s_menu_active = false;
-static int  s_menu_sel    = 0;
-
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 /* ============ 基础功能 ============ */
@@ -654,13 +650,8 @@ static void hid_trackpad_poll(ui_ctx_t *ctx) {
     (void)ctx;
 }
 
-/* ============ 布局二级菜单 ============ */
-#define MENU_ITEMS 5
-#define MENU_X0    60
-#define MENU_X1    (UI_SCREEN_W - 60)
-#define MENU_Y0    40
-#define MENU_ROW   34
-static const char *const s_menu_names[MENU_ITEMS] = {
+/* ============ 布局切换 (统一 os_dialog) ============ */
+static const char *const s_layout_names[5] = {
     "\xe8\xbf\x90\xe7\xbb\xb4\xe9\x94\xae\xe9\xbc\xa0",            /* 运维键鼠 */
     "28\xe9\x94\xae\xe7\xb4\xa7\xe5\x87\x91\xe9\x94\xae\xe7\x9b\x98", /* 28键紧凑键盘 */
     "52\xe9\x94\xae\xe5\x85\xa8\xe9\x94\xae\xe7\x9b\x98+\xe8\xa7\xa6\xe6\x8e\xa7\xe6\x9d\xbf", /* 52键全键盘+触控板 */
@@ -668,35 +659,15 @@ static const char *const s_menu_names[MENU_ITEMS] = {
     "\xe8\xbf\x94\xe5\x9b\x9e\xe8\x8f\x9c\xe5\x8d\x95",            /* 返回菜单 */
 };
 
-static void hid_menu_render(ui_ctx_t *ctx) {
-    st7305_handle_t *lcd = ctx->lcd;
-    /* 覆盖一层白底黑框 (覆盖键盘区域) */
-    fill_rect(lcd, MENU_X0, MENU_Y0, MENU_X1, MENU_Y0 + 20 + MENU_ITEMS * MENU_ROW + 8, ST7305_COLOR_WHITE);
-    draw_rect_outline(lcd, MENU_X0, MENU_Y0, MENU_X1, MENU_Y0 + 20 + MENU_ITEMS * MENU_ROW + 8, ST7305_COLOR_BLACK);
-    draw_text_centered(lcd, MENU_Y0 + 2, "\xe9\x94\xae\xe9\xbc\xa0\xe5\xb8\x83\xe5\xb1\x80", false); /* 键鼠布局 */
-    for (int i = 0; i < MENU_ITEMS; i++) {
-        int y = MENU_Y0 + 22 + i * MENU_ROW;
-        bool sel = (i == s_menu_sel);
-        if (sel) fill_rect(lcd, MENU_X0 + 2, y, MENU_X1 - 2, y + MENU_ROW - 2, ST7305_COLOR_BLACK);
-        draw_text(lcd, MENU_X0 + 14, y + (MENU_ROW - 16) / 2, s_menu_names[i], sel);
+static void hid_layout_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result < 0) return;               /* 取消 */
+    if (result == 4) { os_pop(ctx); return; }   /* 返回菜单: 退出键鼠页 */
+    if (result < HID_LAYOUT_MAX) {
+        s_hid_layout = (hid_layout_t)result;
+        hid_ui_reset();
+        ctx->needs_redraw = true;
     }
-    ctx->needs_redraw = true;
-}
-
-static void hid_menu_open(void) {
-    s_menu_active = true;
-    s_menu_sel = (s_hid_layout < HID_LAYOUT_MAX) ? (int)s_hid_layout : 0;
-}
-
-static void hid_menu_confirm(ui_ctx_t *ctx) {
-    s_menu_active = false;
-    if (s_menu_sel == 4) {           /* 返回菜单: 退出键鼠页 */
-        os_pop(ctx);
-        return;
-    }
-    s_hid_layout = (hid_layout_t)s_menu_sel;
-    hid_ui_reset();
-    ctx->needs_redraw = true;
 }
 
 /* ============ 模块接口 ============ */
@@ -707,7 +678,6 @@ static void p_hid_enter(ui_ctx_t *ctx) {
         os_pop(ctx);
         return;
     }
-    s_menu_active = false;
     hid_ui_reset();
     ESP_LOGI(TAG, "USB HID 已启动");
 }
@@ -731,15 +701,6 @@ static void p_hid_render(ui_ctx_t *ctx) {
     }
 
     st7305_clear(lcd, ST7305_COLOR_WHITE);
-    if (s_menu_active) {
-        /* 布局菜单: 也画底层键盘, 弹窗覆盖其上 (保持一致观感) */
-        hid_rowarr_t rows[5];
-        int rn = hid_layout_rows(rows, 5);
-        hid_draw_rows(lcd, rows, rn);
-        if (s_show_mbtn || s_hid_layout != HID_LAYOUT_28) hid_draw_touchpad(lcd);
-        hid_menu_render(ctx);
-        return;
-    }
 
     hid_rowarr_t rows[5];
     int rn = hid_layout_rows(rows, 5);
@@ -757,32 +718,11 @@ static void p_hid_render(ui_ctx_t *ctx) {
 }
 
 static void p_hid_action(ui_ctx_t *ctx, os_action_t a) {
-    if (s_menu_active) {
-        switch (a) {
-        case OS_ACTION_UP:
-            if (s_menu_sel > 0) s_menu_sel--;
-            ctx->needs_redraw = true;
-            break;
-        case OS_ACTION_DOWN:
-            if (s_menu_sel < MENU_ITEMS - 1) s_menu_sel++;
-            ctx->needs_redraw = true;
-            break;
-        case OS_ACTION_CONFIRM:
-            hid_menu_confirm(ctx);
-            break;
-        case OS_ACTION_BACK:
-            s_menu_active = false;
-            ctx->needs_redraw = true;
-            break;
-        default:
-            break;
-        }
-        return;
-    }
     switch (a) {
     case OS_ACTION_CONFIRM:
-        hid_menu_open();
-        ctx->needs_redraw = true;
+        /* 布局切换: 统一弹窗 (0..3 布局 + 4 返回菜单) */
+        os_dialog_list(ctx, "\xe9\x94\xae\xe9\xbc\xa0\xe5\xb8\x83\xe5\xb1\x80", /* 键鼠布局 */
+                       s_layout_names, 5, s_hid_layout, hid_layout_cb, NULL);
         break;
     case OS_ACTION_BACK:
         os_pop(ctx);
@@ -793,23 +733,12 @@ static void p_hid_action(ui_ctx_t *ctx, os_action_t a) {
 }
 
 static bool p_hid_touch(ui_ctx_t *ctx, int x, int y) {
-    if (s_menu_active) {
-        if (x < MENU_X0 || x > MENU_X1) return false;
-        int rel = y - (MENU_Y0 + 22);
-        if (rel < 0) return false;
-        int idx = rel / MENU_ROW;
-        if (idx >= 0 && idx < MENU_ITEMS) {
-            s_menu_sel = idx;
-            hid_menu_confirm(ctx);
-            return true;
-        }
-        return false;
-    }
     return hid_ui_hit(ctx, x, y);
 }
 
 static void p_hid_poll(ui_ctx_t *ctx) {
-    if (!s_menu_active) hid_trackpad_poll(ctx);
+    if (os_modal_active(ctx)) return;   /* 弹窗打开时暂停触控板 */
+    hid_trackpad_poll(ctx);
 }
 
 static const os_module_t s_mod_usb_hid = {
