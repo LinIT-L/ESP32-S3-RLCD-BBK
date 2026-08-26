@@ -3,9 +3,20 @@
  * 纯绘制: 不依赖 menu_state_t, 仅依赖 st7305 + font_zh 字库 + 内置图标位图.
  */
 #include "ui_common.h"
-#include "icons_main.inc"   /* main_icons[]: 主菜单 SF 大图标 */
-#include "cat_icons.inc"    /* cat_icons[]:  应用管理四分类图标 */
 #include <math.h>
+
+/* 图标位图数据由 menu 组件定义 (menu_system.c 包含 icons_main.inc / cat_icons.inc).
+ * ui_common 仅 extern 引用, 避免与 menu 重复定义全局数组 (链接冲突). */
+#define MAIN_ICON_W 64
+#define MAIN_ICON_H 64
+#define MAIN_ICON_BYTES ((64*64)/8)
+#define MAIN_ICON_COUNT 25
+extern const uint8_t *main_icons[MAIN_ICON_COUNT];
+#define CAT_ICON_W 64
+#define CAT_ICON_H 64
+#define CAT_ICON_BYTES ((64*64)/8)
+#define CAT_ICON_COUNT 4
+extern const uint8_t *cat_icons[CAT_ICON_COUNT];
 
 /* FONT8X12 (8x12 ASCII) 由 menu 组件全局定义 (ui_common.h extern 引用, 见头文件). */
 

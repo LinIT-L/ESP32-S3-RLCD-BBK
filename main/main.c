@@ -130,6 +130,99 @@ static bool touch_shield_blocks_drag(void) {
     return input_touch_in_bottom_zone();
 }
 
+#if CONFIG_OS
+/* ============================================================================
+ * 新模块化 OS 启动路径 (components/os)
+ * 硬约束: CONFIG_OS=1 走新 os 内核, 否则 (默认) 回退旧 menu_system.
+ * 本路径只做"外壳"职责: 平台状态挂钩注入 + 硬件延后初始化 + 主循环喂 input.
+ * ========================================================================== */
+#include "os.h"
+#include "bt_manager.h"
+#include "wifi_manager.h"
+#include "usb_hid.h"
+#include "driver/usb_serial_jtag.h"
+
+/* ---- 平台状态挂钩 (os 全局服务经此读取系统状态, 解耦 os 与具体组件) ---- */
+static uint8_t os_plat_battery(void) {
+    board_battery_status_t bat;
+    if (board_battery_read(&bat) == ESP_OK) return bat.percent;
+    return 255;   /* 未检测到电池哨兵 -> 状态栏显示 "?" */
+}
+static int  os_plat_volume(void)      { return audio_player_get_volume(); }
+static bool os_plat_muted(void)       { return audio_player_is_muted(); }
+static bool os_plat_bt_enabled(void)  { return bt_manager_is_ready(); }
+static bool os_plat_bt_connected(void){ return bt_manager_is_connected(); }
+static bool os_plat_wifi_enabled(void){ return wifi_manager_is_enabled(); }
+static bool os_plat_wifi_connected(void){ return wifi_manager_is_connected(); }
+static bool os_plat_usb_data(void) {
+    extern bool usbh_msc_is_running(void);
+    return (usb_hid_is_running() && usb_hid_connected()) ||
+           usbh_msc_is_running() || usb_serial_jtag_is_connected();
+}
+static const os_platform_ops_t s_os_platform = {
+    .get_battery      = os_plat_battery,
+    .get_volume       = os_plat_volume,
+    .is_muted         = os_plat_muted,
+    .bt_enabled       = os_plat_bt_enabled,
+    .bt_connected     = os_plat_bt_connected,
+    .wifi_enabled     = os_plat_wifi_enabled,
+    .wifi_connected   = os_plat_wifi_connected,
+    .usb_data_active  = os_plat_usb_data,
+};
+
+/* 新 OS 主循环: input -> os 内核分发(action/touch) -> 渲染 */
+static void os_shell_loop(ui_ctx_t *ctx) {
+    ESP_LOGI(TAG, "OS 主循环 (60 FPS 模式)");
+    uint32_t last_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    while (1) {
+        log_drain();   /* 每帧把缓存日志追加写入 TF 卡 */
+        os_tick(ctx);  /* 服务 tick + 当前模块 poll */
+        os_action_t action = (os_action_t)input_get_action();
+        if (action != OS_ACTION_NONE) {
+            if (action == OS_ACTION_CONFIRM) {
+                /* 触摸点击: 先走 hit-test (点哪进哪); 未命中忽略 */
+                int tx, ty;
+                if (input_consume_tap(&tx, &ty)) {
+                    os_handle_touch(ctx, tx, ty);
+                } else {
+                    os_handle_action(ctx, action);   /* 物理键/手柄确认 */
+                }
+            } else {
+                os_handle_action(ctx, action);
+            }
+        }
+        os_render(ctx);
+        vTaskDelay(pdMS_TO_TICKS(2));
+        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now_ms - last_ms >= 1000) {
+            ESP_LOGI(TAG, "STACK main_free=%u 内部=%u PSRAM=%u",
+                     (unsigned)uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            last_ms = now_ms;
+        }
+    }
+}
+
+/* 新 OS 启动 (初始化 + 进桌面 + 主循环, 不返回) */
+static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
+    ui_ctx_t ctx;
+    os_init(&ctx, lcd);
+    os_platform_set(&s_os_platform);
+    os_push(&ctx, OS_PAGE_MAIN);
+    ESP_LOGI("MEM", "[MEM] OS 桌面基线: 内部空闲=%u PSRAM空闲=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    /* 延后初始化 (避免抢占内部 DMA RAM): 蓝牙 -> 音频 -> 电池 */
+    app_board_init_bt();
+    app_board_init_audio(board);
+    app_board_init_battery(board);
+    /* 开机音 (方波直驱方案就绪时播放) */
+    if (tone_player_ready()) tone_play_theme(TONE_THEME_BOOT_UP);
+    os_shell_loop(&ctx);
+}
+#endif /* CONFIG_OS */
+
 void app_main(void)
 {
     /* V1.0.90: 自动保存日志到 TF (串口照常打印, 同时缓存进 /sdcard/log/bbk.log) */
@@ -168,6 +261,11 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
+#if CONFIG_OS
+    /* ===== 新模块化 OS: 启动并进入主循环 (不返回) ===== */
+    os_boot_shell(&g_lcd, &board);
+#else
+    /* ===== 旧菜单系统 (CONFIG_OS=0 回退路径, 保持原样) ===== */
     /* 进入主菜单 */
     menu_init(&g_menu, &g_lcd);
     menu_render(&g_menu);
@@ -596,4 +694,6 @@ void app_main(void)
             render_total_us = 0;
             fps_last_ms = now_ms;
         }
-    }}
+    }
+#endif /* !CONFIG_OS */
+}

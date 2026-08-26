@@ -10,6 +10,7 @@ idf_component_register(
         app_board
         st7305
         menu
+        os
         driver
         esp_timer
         nvs_flash
