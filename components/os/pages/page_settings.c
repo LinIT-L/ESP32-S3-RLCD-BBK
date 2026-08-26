@@ -5,6 +5,7 @@
  * 私有 state 全部 static 留本文件.
  */
 #include "os.h"
+#include "os_theme.h"
 #include "ui_common.h"
 #include "font_zh.h"
 #include "esp_timer.h"
@@ -20,11 +21,12 @@
 #define TAG "PSET"
 
 /* 主菜单项 (UTF-8) */
-static const char *const s_set_items[6] = {
+static const char *const s_set_items[7] = {
     "\xe6\x97\xa5\xe6\x9c\x9f\xe6\x97\xb6\xe9\x97\xb4",  /* 日期时间 */
     "\xe5\xad\x97\xe4\xbd\x93\xe9\xa3\x8e\xe6\xa0\xbc",  /* 字体风格 */
     "\xe6\x97\xa0\xe7\xba\xbf\xe8\xbf\x9e\xe6\x8e\xa5",  /* 无线连接 */
     "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xbf\xa1\xe6\x81\xaf",  /* 系统信息 */
+    "\xe4\xb8\xbb\xe9\xa2\x98",                          /* 主题 */
     "\xe8\xaf\xb7\xe4\xbd\x9c\xe8\x80\x85\xe5\x96\x9d\xe6\x9d\xaf\xe6\xb0\xb4", /* 请作者喝杯水 */
     "\xe8\xbf\x94\xe5\x9b\x9e",                          /* 返回 */
 };
@@ -118,10 +120,18 @@ static bool info_dlg_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     return true;
 }
 
+/* 主题选择回调 */
+static void on_theme_select(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result < 0 || result >= os_theme_count()) return;
+    os_theme_set(result);
+    os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x88\x87\xe6\x8d\xa2\xe4\xb8\xbb\xe9\xa2\x98"); /* 已切换主题 */
+}
+
 /* 主菜单选中回调: 开对应子弹窗 */
 static void on_settings_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
-    if (result < 0 || result >= 6) return;
+    if (result < 0 || result >= 7) return;
     switch (result) {
     case 0: {  /* 日期时间 */
         os_dlg_stack_t dlg;
@@ -145,14 +155,25 @@ static void on_settings_select(ui_ctx_t *ctx, int result, void *ud) {
         os_dialog_push(ctx, &dlg);
         break;
     }
+    case 4: {  /* 主题: 弹窗列出可选主题 */
+        int n = os_theme_count();
+        static char names[8][24];
+        static const char *ptrs[8];
+        for (int i = 0; i < n && i < 8; i++) {
+            snprintf(names[i], sizeof(names[i]), "%s", os_theme_name(i));
+            ptrs[i] = names[i];
+        }
+        os_dialog_list(ctx, "\xe4\xb8\xbb\xe9\xa2\x98", ptrs, n, os_theme_current(), on_theme_select, NULL);
+        break;
+    }
     case 1:  /* 字体风格: 占位提示 */
     case 2:  /* 无线连接: 占位提示 */
         os_dialog_toast(ctx, "\xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad"); /* 开发中 */
         break;
-    case 4:  /* 请作者喝杯水: 占位 */
+    case 5:  /* 请作者喝杯水: 占位 */
         os_dialog_toast(ctx, "\xe8\xb0\xa2\xe8\xb0\xa2\xe6\x94\xaf\xe6\x8c\x81"); /* 谢谢支持 */
         break;
-    case 5:  /* 返回 */
+    case 6:  /* 返回 */
         os_pop(ctx);
         break;
     default: break;

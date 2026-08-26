@@ -10,6 +10,7 @@
  * 依赖: ui_common 绘制原语 + input (触摸坐标拖动).
  */
 #include "os.h"
+#include "os_theme.h"
 #include "ui_common.h"
 #include "input.h"
 #include "esp_timer.h"
@@ -76,11 +77,13 @@ static void main_anim_to(ui_ctx_t *ctx, int target) {
 /* 图标尺寸: 其他图标固定 64px, 只在进入/离开中央位置(0.5~1.0 格)做缩放过渡.
  * 静止时仅正中间 100, 其余严格 64. */
 static int main_icon_size(float ad) {
-    if (ad <= 0.5f) return 100;
-    if (ad >= 1.0f) return 64;
+    const os_theme_t *th = os_theme_get();
+    int big = th->icon_center, sml = th->icon_normal;
+    if (ad <= 0.5f) return big;
+    if (ad >= 1.0f) return sml;
     float t = (ad - 0.5f) / 0.5f;
     float ease = t * t * (3.0f - 2.0f * t);
-    return 100 - (int)(36.0f * ease);
+    return big - (int)((float)(big - sml) * ease);
 }
 
 /* 弹簧回弹缓动 (easeOutBack): 过冲约 8% 再回落到目标, 让归位吸附有明显"弹回"感 */
@@ -147,11 +150,15 @@ static void p_main_render(ui_ctx_t *ctx)
     if (!lcd) return;
     int total = (int)MAIN_MOD_COUNT;
 
-    st7305_clear(lcd, ST7305_COLOR_WHITE);
+    const os_theme_t *th = os_theme_get();
 
-    const int icon_spacing = 100;
+    /* 背景: 主题钩子或默认白底 */
+    if (th->draw_bg) th->draw_bg(ctx, lcd);
+    else             st7305_clear(lcd, th->bg_color);
+
+    const int icon_spacing = th->icon_spacing;
     const int center_x = UI_SCREEN_W / 2;
-    const int icon_center_y = UI_SCREEN_H / 2;
+    const int icon_center_y = th->icon_center_y;
     uint32_t now = now_ms();
 
     /* 相机: 拖动平滑跟手 (cam=基点-偏移/间距, 有过渡感);
@@ -194,15 +201,22 @@ static void p_main_render(ui_ctx_t *ctx)
         float dist = fabsf((float)g - cam);
         int size = main_icon_size(dist);
         if (cx + size > 0 && cx - size < UI_SCREEN_W) {
-            draw_main_icon_stretched(lcd, cx, icon_center_y, size, size,
-                                     main_app(idx)->icon_idx);
+            if (th->draw_icon)
+                th->draw_icon(ctx, lcd, main_app(idx)->icon_idx, cx, icon_center_y,
+                              size, (idx == sel));
+            else
+                draw_main_icon_stretched(lcd, cx, icon_center_y, size, size,
+                                         main_app(idx)->icon_idx);
         }
     }
 
-    /* 选中图标下方短标签 */
-    int label_y = icon_center_y + 68;
+    /* 选中图标下方短标签 (位置由主题指定) */
+    int label_y = icon_center_y + th->label_dy;
     if (label_y > UI_SCREEN_H - 28) label_y = UI_SCREEN_H - 28;
-    draw_label_centered_at(lcd, center_x, label_y, main_app(sel)->label, false);
+    if (th->draw_label)
+        th->draw_label(ctx, lcd, main_app(sel)->label, center_x, label_y, true);
+    else
+        draw_label_centered_at(lcd, center_x, label_y, main_app(sel)->label, false);
 }
 
 /* ============ 按键 ============ */
