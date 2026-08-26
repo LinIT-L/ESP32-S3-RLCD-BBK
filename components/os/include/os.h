@@ -77,6 +77,7 @@ typedef enum {
     OS_PAGE_MESHTASIC,         /* Meshtasic 网络面板 */
     OS_PAGE_WHITEBOARD,        /* 白板 */
     OS_PAGE_TERMINAL,          /* 终端 */
+    OS_PAGE_WIFI_KB,           /* WiFi 虚拟键盘 (终端内独立模块) */
     OS_PAGE_COUNT
 } os_page_t;
 
