@@ -135,6 +135,28 @@ static void main_cam_animate(int to_idx, uint32_t dur_ms) {
     s_main.cam_anim_to    = to_c;
     s_main.cam_anim_start = now_ms();
     s_main.cam_anim_dur   = dur_ms ? dur_ms : 1;
+    ESP_LOGI("MAIN", "anim: from=%.2f to=%.2f sel=%d spring=%d dur=%u",
+             from_c, to_c, to, s_main.anim_spring, (unsigned)dur_ms);
+}
+
+/* 惯性甩动动画: 保持甩动方向, 直接动画到原始相机位置 to_cam (可越界).
+ * 不能用 main_cam_animate(最短回绕): 用力甩动 extra>=半圈时最短路径会反向,
+ * 图标瞬间朝反方向移动 ("甩完后瞬间后移"). 渲染用 mod_wrap 处理越界相机. */
+static void main_cam_fling(float from_cam, float to_cam, uint32_t dur_ms) {
+    if (fabsf(to_cam - from_cam) < 0.05f) {
+        s_main.cam_anim_start = 0;
+        s_main.cam_cur = to_cam;
+        s_main.selected = mod_wrap(lroundf(to_cam));
+        return;
+    }
+    s_main.selected = mod_wrap(lroundf(to_cam));
+    s_main.cam_anim_sel   = s_main.selected;
+    s_main.cam_anim_from  = from_cam;
+    s_main.cam_anim_to    = to_cam;
+    s_main.cam_anim_start = now_ms();
+    s_main.cam_anim_dur   = dur_ms ? dur_ms : 1;
+    ESP_LOGI("MAIN", "fling: from=%.2f to=%.2f sel=%d dur=%u",
+             from_cam, to_cam, s_main.selected, (unsigned)dur_ms);
 }
 
 /* ============ 渲染 ============ */
@@ -207,10 +229,12 @@ static void p_main_action(ui_ctx_t *ctx, os_action_t a)
 {
     switch (a) {
     case OS_ACTION_LEFT:
+        ESP_LOGI("MAIN", "act L suppressed=%d", input_suppressed());
         if (input_suppressed()) break;
         main_anim_to(ctx, mod_wrap(s_main.selected - 1));
         break;
     case OS_ACTION_RIGHT:
+        ESP_LOGI("MAIN", "act R suppressed=%d", input_suppressed());
         if (input_suppressed()) break;
         main_anim_to(ctx, mod_wrap(s_main.selected + 1));
         break;
@@ -335,14 +359,15 @@ static void p_main_poll(ui_ctx_t *ctx)
                 int target = base_target - extra;   /* 惯性方向与拖动一致 */
 
                 /* 动画: 抛物线减速 1-(1-t)^2 (速度线性衰减, 自然停下, 无过冲).
-                 * 缓慢归位同曲线 → 平滑回落到槽位, 不甩不弹. */
+                 * 缓慢归位同曲线 → 平滑回落到槽位, 不甩不弹.
+                 * 甩动用 main_cam_fling: 保持方向不回绕 (修"用力甩后瞬间后移"). */
                 s_main.anim_spring = false;
                 int steps = (int)(target - lroundf(s_main.cam_base));
                 if (steps < 0) steps = -steps;
                 uint32_t dur = 220 + (uint32_t)steps * 50;
                 if (dur > 550) dur = 550;
                 s_main.cam_cur = cur;
-                main_cam_animate(target, dur);
+                main_cam_fling(cur, (float)target, dur);
                 ctx->needs_redraw = true;
                 ESP_LOGI("MAIN", "归位: cur=%.2f vel=%.2f span=%d n=%d extra=%d target=%d moved=%d",
                          cur, vel, vel_span, s_main.v_n, extra, target, s_main.drag_moved);
