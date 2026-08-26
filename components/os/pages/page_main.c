@@ -91,6 +91,17 @@ static void main_anim_to(ui_ctx_t *ctx, int target) {
     ctx->needs_redraw = true;
 }
 
+/* 图标尺寸: 按离相机的距离平滑缩放 (中间 100px, 越远越小到 64px).
+ * ad = |图标格 - 相机| (格). 平滑插值, 拖动/切换时图标平滑放大缩小. */
+static int main_icon_size(float ad) {
+    if (ad <= 0.5f) return 100;
+    if (ad >= 1.6f) return 64;
+    float t = (ad - 0.5f) / 1.1f;              /* 0..1 */
+    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+    float ease = t * t * (3.0f - 2.0f * t);    /* smoothstep: 起步缓, 中间快, 收尾缓 */
+    return 100 - (int)(36.0f * ease);
+}
+
 /* ============ 渲染 ============ */
 static void p_main_render(ui_ctx_t *ctx)
 {
@@ -138,7 +149,7 @@ static void p_main_render(ui_ctx_t *ctx)
         int idx = mod_wrap(g);
         int cx = (int)roundf((float)center_x + ((float)g - cam) * (float)icon_spacing);
         float dist = fabsf((float)g - cam);
-        int size = (dist <= 0.5f) ? 100 : 64;   /* 中央 100px, 其余 64px */
+        int size = main_icon_size(dist);   /* 平滑缩放: 中央 100, 越远越小 */
         if (cx + size > 0 && cx - size < UI_SCREEN_W) {
             draw_main_icon_stretched(lcd, cx, icon_center_y, size, size,
                                      s_main_mods[idx].icon_idx);
@@ -185,7 +196,7 @@ static bool p_main_touch(ui_ctx_t *ctx, int x, int y)
     for (int g = (int)floorf(s_main.cam_cur) - 3; g <= (int)ceilf(s_main.cam_cur) + 3; g++) {
         int idx = mod_wrap(g);
         int cx = (int)roundf((float)(UI_SCREEN_W / 2) + ((float)g - s_main.cam_cur) * 100.0f);
-        int size = (fabsf((float)g - s_main.cam_cur) <= 0.5f) ? 100 : 64;
+        int size = main_icon_size(fabsf((float)g - s_main.cam_cur));
         if (x >= cx - size / 2 - 8 && x <= cx + size / 2 + 8 &&
             y >= UI_SCREEN_H / 2 - 50 && y <= UI_SCREEN_H / 2 + 70) {
             if (idx != s_main.selected) {
