@@ -81,6 +81,11 @@ size_t audio_player_feed_pcm(const int16_t *data, size_t frames, int sample_rate
 /* 立即清空 PCM 环形缓冲 (释放按键时切断连续音尾音) */
 void audio_player_flush_pcm(void);
 
+/* V1.0.71: 音频振幅表 (峰值 0..1000 千分比, attack 立即/decay 10% 平滑).
+ * MP3 解码任务与 PCM 环形缓冲两条 I2S 写入路径均更新.
+ * 供"随音乐震动"等实时响应功能按响度采样. */
+int32_t audio_player_get_meter(void);
+
 /* 诊断: 当前实际配置的 I2S 采样率 */
 int audio_player_get_i2s_rate(void);
 

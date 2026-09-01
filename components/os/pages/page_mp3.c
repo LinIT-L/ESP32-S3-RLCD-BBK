@@ -16,11 +16,13 @@
 #include "os.h"
 #include "ui_common.h"
 #include "audio_player.h"
+#include "vibrator.h"       /* V1.4.x: 随音乐震动开关 */
 #include "input.h"          /* input_get_touch_multi: 循环按钮"按下即触发" */
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
+#include "nvs_flash.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -52,6 +54,10 @@ static int     s_logged_count  = -1;
 #define MP3_LOOP_RANDOM 2
 #define MP3_LOOP_N      3
 static int  s_loop_mode = MP3_LOOP_LIST;
+
+/* V1.4.x: 随音乐震动开关 (NVS mp3/vib_music 持久化, 首次渲染懒加载) */
+static bool s_vib_music = false;
+static bool s_vib_music_loaded = false;
 /* 循环模式按钮: 三枚 20x20 1bpp 图标 (MSB-first, 位=1 黑) 替代文字.
  * 图标后续可随时更换 (用户保留替换权): 替换下方位图数组即可.
  * 切换提示 (toast) 仍用文字 */
@@ -144,8 +150,13 @@ static const char *s_loop_toast[MP3_LOOP_N] = {
 #define MP3_LOOP_BTN_X      10
 #define MP3_LOOP_BTN_Y      (MP3_BAR_Y + MP3_BAR_H / 2 - MP3_LOOP_BTN_H / 2)
 #define MP3_LOOP_GAP        6
-/* 进度条左端让位给循环模式按钮 */
-#define MP3_BAR_X0          (MP3_LOOP_BTN_X + MP3_LOOP_BTN_W + MP3_LOOP_GAP)
+/* V1.4.x: 随音乐震动按钮: 紧邻循环按钮右侧 (几何与触摸热区共用) */
+#define MP3_VIB_BTN_W       24
+#define MP3_VIB_BTN_H       24
+#define MP3_VIB_BTN_X       (MP3_LOOP_BTN_X + MP3_LOOP_BTN_W + MP3_LOOP_GAP)
+#define MP3_VIB_BTN_Y       MP3_LOOP_BTN_Y
+/* 进度条左端让位给两个按钮 */
+#define MP3_BAR_X0          (MP3_VIB_BTN_X + MP3_VIB_BTN_W + MP3_LOOP_GAP)
 /* 播放列表: 底部止于循环按钮上方 (留 4px). 原先按"屏幕底 -5"算会排到第 10 行,
  * 末行文字延伸到 y≈290, 与按钮 (y 274..297) 重叠被白底盖掉一角. */
 #define MP3_LIST_BOTTOM     (MP3_LOOP_BTN_Y - 4)
@@ -374,6 +385,117 @@ static void mp3_draw_loop_btn(st7305_handle_t *lcd)
                         MP3_LOOP_ICON_W, MP3_LOOP_ICON_H, s_loop_icon[s_loop_mode]);
 }
 
+/* ============ V1.4.x: 随音乐震动按钮 ============
+ * 20x20 1bpp 波纹图标 (位=1 前景色). 开=黑底白波纹, 关=白底黑波纹. */
+#define MP3_VIB_ICON_W 20
+#define MP3_VIB_ICON_H 20
+static const uint8_t s_icon_vib[MP3_VIB_ICON_H * 3] = {
+    0x00, 0x00, 0x00,
+    0x00, 0x60, 0x00,
+    0x00, 0xF0, 0x00,
+    0x01, 0x98, 0x00,
+    0x02, 0x04, 0x00,
+    0x06, 0x06, 0x00,
+    0x08, 0x02, 0x00,
+    0x18, 0x03, 0x00,
+    0x20, 0x00, 0x80,
+    0x60, 0x00, 0xC0,
+    0x20, 0x00, 0x80,
+    0x18, 0x03, 0x00,
+    0x08, 0x02, 0x00,
+    0x06, 0x06, 0x00,
+    0x02, 0x04, 0x00,
+    0x01, 0x98, 0x00,
+    0x00, 0xF0, 0x00,
+    0x00, 0x60, 0x00,
+    0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00,
+};
+/* 1bpp 位图画到 (x0,y0), 支持指定颜色 (1bpp 屏反白显示用) */
+static void mp3_blit_1bpp_color(st7305_handle_t *lcd, int x0, int y0,
+                                int w, int h, const uint8_t *src, uint8_t color) {
+    int bpr = (w + 7) >> 3;
+    for (int dy = 0; dy < h; dy++) {
+        for (int dx = 0; dx < w; dx++) {
+            if (src[dy * bpr + (dx >> 3)] & (0x80u >> (dx & 7)))
+                st7305_draw_pixel(lcd, x0 + dx, y0 + dy, color);
+        }
+    }
+}
+static void mp3_draw_vib_btn(st7305_handle_t *lcd)
+{
+    int x0 = MP3_VIB_BTN_X, y0 = MP3_VIB_BTN_Y;
+    int x1 = x0 + MP3_VIB_BTN_W - 1, y1 = y0 + MP3_VIB_BTN_H - 1;
+    if (s_vib_music) {
+        fill_rect(lcd, x0, y0, x1, y1, ST7305_COLOR_BLACK);   /* 开: 黑底 */
+        mp3_blit_1bpp_color(lcd, x0 + 2, y0 + 2, MP3_VIB_ICON_W, MP3_VIB_ICON_H,
+                            s_icon_vib, ST7305_COLOR_WHITE);  /* 白波纹 */
+    } else {
+        fill_rect(lcd, x0, y0, x1, y1, ST7305_COLOR_WHITE);
+        draw_rect_outline(lcd, x0, y0, x1, y1, ST7305_COLOR_BLACK);
+        mp3_blit_1bpp_color(lcd, x0 + 2, y0 + 2, MP3_VIB_ICON_W, MP3_VIB_ICON_H,
+                            s_icon_vib, ST7305_COLOR_BLACK);  /* 黑波纹 */
+    }
+}
+/* 命中: 随音乐震动按钮 (热区与循环按钮一致: 四周外扩 6px) */
+static bool mp3_in_vib_btn(int x, int y)
+{
+    return (x >= MP3_VIB_BTN_X - 6 && x < MP3_VIB_BTN_X + MP3_VIB_BTN_W + 6 &&
+            y >= MP3_VIB_BTN_Y - 6 && y < MP3_VIB_BTN_Y + MP3_VIB_BTN_H + 6);
+}
+/* 切换随音乐震动: 应用 + 存 NVS + toast */
+static void mp3_vib_toggle(ui_ctx_t *ctx)
+{
+    s_vib_music = !s_vib_music;
+    vibrator_music_mode(s_vib_music);
+    nvs_handle_t h;
+    if (nvs_open("mp3", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "vib_music", s_vib_music ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    os_dialog_toast(ctx, s_vib_music ? "\xe9\x9a\x8f\xe9\x9f\xb3\xe4\xb9\x90\xe9\x9c\x87\xe5\x8a\xa8\xef\xbc\x9a\xe5\xbc\x80"   /* 随音乐震动：开 */
+                                     : "\xe9\x9a\x8f\xe9\x9f\xb3\xe4\xb9\x90\xe9\x9c\x87\xe5\x8a\xa8\xef\xbc\x9a\xe5\x85\xb3"); /* 随音乐震动：关 */
+    ctx->needs_redraw = true;
+}
+/* 首次渲染懒加载 NVS 开关值 (模块无 on_enter 钩子, 用标志位保证只读一次) */
+static void mp3_vib_load(void)
+{
+    if (s_vib_music_loaded) return;
+    s_vib_music_loaded = true;
+    nvs_handle_t h;
+    if (nvs_open("mp3", NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, "vib_music", &v) == ESP_OK && v) {
+            s_vib_music = true;
+            vibrator_music_mode(true);
+        }
+        nvs_close(h);
+    }
+}
+/* 随音乐震动按钮"按下即触发" (与循环按钮同策略, 绕开 input 手势判定) */
+static bool     s_vib_btn_down = false;
+static uint32_t s_vib_btn_t_ms = 0;
+static void mp3_poll_vib_btn(ui_ctx_t *ctx)
+{
+    tp_point_t pts[TP_MAX_POINTS];
+    int n = 0;
+    input_get_touch_multi(pts, &n);
+    bool in = false;
+    for (int i = 0; i < n; i++) {
+        if (pts[i].pressed && mp3_in_vib_btn(pts[i].x, pts[i].y)) { in = true; break; }
+    }
+    if (in && !s_vib_btn_down) {
+        s_vib_btn_down = true;
+        s_vib_btn_t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        mp3_vib_toggle(ctx);
+    } else if (!in) {
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_vib_btn_down && (int32_t)(now - s_vib_btn_t_ms) > 500)
+            s_vib_btn_down = false;   /* 兜底: 点击被手势吞掉时超时复位 */
+    }
+}
+
 /* ============ 渲染 ============ */
 static void p_mp3_render(ui_ctx_t *ctx)
 {
@@ -382,6 +504,7 @@ static void p_mp3_render(ui_ctx_t *ctx)
     const int SCREEN_W = UI_SCREEN_W;
 
     mp3_scan_files();
+    mp3_vib_load();           /* V1.4.x: 首次渲染懒加载"随音乐震动"开关 */
     st7305_clear(lcd, ST7305_COLOR_WHITE);
 
     audio_state_t astate = audio_player_get_state();
@@ -503,6 +626,7 @@ static void p_mp3_render(ui_ctx_t *ctx)
     fill_rect(lcd, bar_x0, bar_y, bar_x0, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
     fill_rect(lcd, bar_x1, bar_y, bar_x1, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
     mp3_draw_loop_btn(lcd);   /* 循环模式按钮: 进度条左侧, 点击切换 单曲/列表/随机 */
+    mp3_draw_vib_btn(lcd);    /* V1.4.x: 随音乐震动按钮: 循环按钮右侧, 黑底=开 */
 }
 
 /* ============ 按键 ============ */
@@ -611,6 +735,8 @@ static void p_mp3_poll(ui_ctx_t *ctx)
 
     /* 循环模式按钮: 按下即触发 (绕开 input 手势判定, 修"多点几次才切换") */
     mp3_poll_loop_btn(ctx);
+    /* V1.4.x: 随音乐震动按钮: 同策略按下即触发 */
+    mp3_poll_vib_btn(ctx);
 
     /* 自然播完 → 按循环模式自动切下一首.
      * audio_player_track_ended() 为一次性消费标志, 仅"自然播完"置位,
@@ -648,6 +774,15 @@ static bool p_mp3_touch(ui_ctx_t *ctx, int x, int y)
             mp3_loop_mode_next();
             os_dialog_toast(ctx, s_loop_toast[s_loop_mode]);
             ctx->needs_redraw = true;
+        }
+        return true;
+    }
+    /* V1.4.x: 随音乐震动按钮 (与循环按钮同策略: poll 按下沿已切换, 这里消费 tap 复位) */
+    if (mp3_in_vib_btn(x, y)) {
+        if (s_vib_btn_down) {
+            s_vib_btn_down = false;
+        } else {
+            mp3_vib_toggle(ctx);   /* 兜底: poll 漏掉按下沿时补切换 */
         }
         return true;
     }

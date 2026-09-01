@@ -78,6 +78,25 @@
   - 原 SCL=GPIO47 空置
 - 强度：`out_set(0~100)` → 占空比 0~255（VIB_RES_MAX）
 
+### V1.4.x 触发方式（三档互斥，后发起停前者）
+1. **单次 tap**（`vibrator_tap`）：按键/菜单导航/拖动反馈，保持快速响应。
+2. **预设花样**（`vibrator_play_pattern`）：段式序列（时长+强度），非阻塞定时器逐段推进。
+   内置花样库（`vibrator.h` 直接引用）：
+   | 花样 | 内容 | 用途 |
+   |---|---|---|
+   | `VIB_PAT_TICK` | 60ms 短促 | 轻反馈 |
+   | `VIB_PAT_DOUBLE` | 50+60+50ms 双敲 | 确认 |
+   | `VIB_PAT_HEARTBEAT` | 90+60+140ms 强弱心跳 | 提示 |
+   | `VIB_PAT_SUCCESS` | 三连渐强 | 番茄钟完成 |
+   | `VIB_PAT_ERROR` | 低鸣两下+长震 | 报错 |
+   | `VIB_PAT_SOS` | 摩尔斯 SOS（3短3长3短） | 求救演示 |
+   | `VIB_PAT_RAMP_UP/DOWN` | 5 段渐强/渐弱 | 音量/特效 |
+   | `VIB_PAT_ALARM` | 300+180ms **无限循环** | 闹钟（关铃即停） |
+3. **随音乐震动**（`vibrator_music_mode`）：MP3/游戏 PCM 两路喂振幅表
+   （`audio_player_get_meter`，0..1000），内部任务每 20ms 采样，死区 6% 后
+   线性映射 PWM 强度——听歌/游戏时马达随节奏震动。
+   MP3 播放页新增"随音乐震动"按钮（循环按钮右侧，黑底=开，NVS `mp3/vib_music` 持久化）。
+
 ## 两板接线对照（一份固件，两板通吃）
 | 信号 | 官方板（微雪） | 自制板 |
 |---|---|---|

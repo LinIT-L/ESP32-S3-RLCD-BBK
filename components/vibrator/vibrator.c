@@ -1,6 +1,6 @@
 /**
  * @file vibrator.c
- * @brief 震动马达驱动 (V1.3.x: TM6604 线性驱动, PWM 直驱 LRA)
+ * @brief 震动马达驱动 (V1.4.x: TM6604 线性驱动, PWM 直驱 LRA)
  *
  * TM6604 为国产线性马达驱动 IC (SOT23-6, PWM 输入, 差动桥式输出).
  * 输入 PWM 频率应等于 LRA 谐振频率 (常见 150~250Hz), 占空比控制输出强度;
@@ -14,9 +14,13 @@
  *   Pin6 EN   ── GPIO48 (原 EN IO, 保持不变)
  * 注: 原 SCL=GPIO47 空置; 原 GPIO6/LEDC 兜底路径已并入 PWM 主路径.
  *
- * 提供非阻塞的单次震动 vibrator_tap(ms, strength) 供按键/闹钟/计时器调用.
+ * V1.4.x: 触发分三档, 互斥仲裁 (后发起停前者):
+ *   - 单次 tap  (vibrator_tap): 按键/菜单/拖动反馈
+ *   - 预设花样 (vibrator_play_pattern): 段式序列定时器逐段推进
+ *   - 随音乐震动 (vibrator_music_mode): 内部任务采样音频振幅表实时映射
  */
 #include "vibrator.h"
+#include "audio_player.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
@@ -46,6 +50,11 @@ static bool       s_enabled = true;   /* 硬件总开关: ui||game 任一开则�
 static bool       s_vib_ui   = true;  /* UI 震动开关 (拖拉/菜单导航/设置调整) */
 static bool       s_vib_game = true;  /* 游戏震动开关 (游戏内按键) */
 static TimerHandle_t s_tap_timer = NULL;
+static TimerHandle_t s_pat_timer = NULL;
+
+/* V1.4.x 前向声明: 花样/音乐震动实现位于文件后部, init/set_enabled 先引用 */
+static void pat_timer_cb(TimerHandle_t t);
+static volatile bool s_music_on;
 
 /* ================= TM6604 EN (GPIO48, 保持原 IO) ================= */
 /* 引脚有效性防护: 仅操作本模组(ESP32-S3-WROOM-1)引出的普通 IO.
@@ -113,6 +122,7 @@ void vibrator_init(void) {
     }
     s_mode = VIB_TM6604;
     s_tap_timer = xTimerCreate("vib_tap", pdMS_TO_TICKS(50), pdFALSE, NULL, tap_timer_cb);
+    s_pat_timer = xTimerCreate("vib_pat", pdMS_TO_TICKS(50), pdFALSE, NULL, pat_timer_cb);
     ESP_LOGI(TAG, "震动驱动就绪: TM6604 PWM=GPIO%d(%dHz) EN=GPIO%d", (int)VIB_PWM_PIN,
              VIB_RES_FREQ, (int)VIB_EN_PIN);
 }
@@ -123,6 +133,8 @@ bool vibrator_ready(void) { return s_mode != VIB_NONE; }
 void vibrator_set_enabled(bool en) {
     s_enabled = en;
     if (!en) {
+        s_music_on = false;            /* 音乐震动任务下个循环退出 */
+        vibrator_stop_pattern();
         out_off();
         drv_enable(false);   /* 关震动开关: 一并拉低 TM6604 EN, 省电 */
     } else {
@@ -156,6 +168,7 @@ void vibrator_set(uint8_t strength) {
 void vibrator_stop(void) {
     if (s_mode == VIB_NONE) return;
     if (s_tap_timer) xTimerStop(s_tap_timer, 0);
+    vibrator_stop_pattern();
     out_off();
 }
 
@@ -170,6 +183,7 @@ void vibrator_buzz(uint16_t ms) {
 /* V1.1.0: 非阻塞单次震动: ms 时长, strength 0~100 强度 */
 void vibrator_tap(uint16_t ms, uint8_t strength) {
     if (s_mode == VIB_NONE || !s_enabled) return;
+    vibrator_stop_pattern();   /* 单次震动停掉在播花样 */
     out_set(strength);
     if (s_tap_timer) {
         xTimerStop(s_tap_timer, 0);
@@ -180,3 +194,130 @@ void vibrator_tap(uint16_t ms, uint8_t strength) {
         out_off();
     }
 }
+
+/* ================= V1.4.x: 预设花样 (段式序列) =================
+ * 状态机: 播放时立即输出段[0], 软件定时器到时推进下一段; 播满 repeat 遍后停.
+ * repeat=0 无限循环, 由调用方 vibrator_stop_pattern 显式停止 (闹铃用). */
+static const vib_pattern_t *s_pat = NULL;
+static uint8_t s_pat_idx = 0;
+static uint8_t s_pat_rep = 0;
+
+static void pat_apply_seg(void) {
+    const vib_seg_t *seg = &s_pat->segs[s_pat_idx];
+    if (seg->strength) out_set(seg->strength);
+    else out_off();
+}
+static void pat_timer_cb(TimerHandle_t t) {
+    (void)t;
+    if (!s_pat) return;
+    s_pat_idx++;                       /* 推进到下一段 */
+    if (s_pat_idx >= s_pat->n) {
+        s_pat_idx = 0;
+        s_pat_rep++;
+        if (s_pat->repeat != 0 && s_pat_rep >= s_pat->repeat) {
+            s_pat = NULL;              /* 播放完成 */
+            out_off();
+            return;
+        }
+    }
+    pat_apply_seg();
+    xTimerChangePeriod(s_pat_timer, pdMS_TO_TICKS(s_pat->segs[s_pat_idx].ms), 0);
+    xTimerStart(s_pat_timer, 0);
+}
+
+void vibrator_play_pattern(const vib_pattern_t *pat) {
+    if (s_mode == VIB_NONE || !s_enabled) return;
+    if (!pat || pat->n == 0) return;
+    vibrator_music_mode(false);        /* 花样优先于音乐震动 */
+    if (s_tap_timer) xTimerStop(s_tap_timer, 0);   /* 停掉在途 tap */
+    s_pat = pat; s_pat_idx = 0; s_pat_rep = 0;
+    pat_apply_seg();
+    if (s_pat_timer) {
+        xTimerChangePeriod(s_pat_timer, pdMS_TO_TICKS(s_pat->segs[0].ms), 0);
+        xTimerStart(s_pat_timer, 0);
+    }
+}
+
+void vibrator_stop_pattern(void) {
+    if (!s_pat) return;
+    s_pat = NULL;
+    if (s_pat_timer) xTimerStop(s_pat_timer, 0);
+    out_off();
+}
+
+bool vibrator_pattern_active(void) { return s_pat != NULL; }
+
+/* ================= V1.4.x: 随音乐震动 =================
+ * 内部任务每 20ms 采样 audio_player 振幅表 (0..1000), 超过死区后
+ * 线性映射到 PWM 强度 1..100; 振幅回落即停. 开启时停掉在播花样. */
+#define VIB_MUSIC_DEADZONE  60    /* 振幅千分比死区: 低于此不震 (静音/低噪) */
+#define VIB_MUSIC_PERIOD_MS 20
+static TaskHandle_t s_music_task = NULL;
+static volatile bool s_music_on = false;
+
+static void music_task(void *arg) {
+    (void)arg;
+    int32_t last = -1;
+    for (;;) {
+        if (!s_music_on) break;
+        int32_t m = audio_player_get_meter();
+        int32_t s = 0;
+        if (m > VIB_MUSIC_DEADZONE) {
+            s = (m - VIB_MUSIC_DEADZONE) * 100 / (1000 - VIB_MUSIC_DEADZONE);
+            if (s > 100) s = 100;
+            if (s < 1)   s = 1;
+        }
+        if (s != last) {
+            last = s;
+            if (s > 0) out_set((uint8_t)s);
+            else       out_off();
+        }
+        vTaskDelay(pdMS_TO_TICKS(VIB_MUSIC_PERIOD_MS));
+    }
+    s_music_task = NULL;
+    vTaskDelete(NULL);
+}
+
+void vibrator_music_mode(bool en) {
+    if (s_mode == VIB_NONE) return;
+    if (en == (s_music_on && s_music_task != NULL)) return;
+    s_music_on = en;
+    if (en) {
+        vibrator_stop_pattern();
+        if (s_music_task == NULL) {
+            if (xTaskCreate(music_task, "vib_music", 2048, NULL, 3, &s_music_task) != pdPASS) {
+                s_music_on = false;
+                ESP_LOGE(TAG, "音乐震动任务创建失败");
+            }
+        }
+    } else {
+        out_off();   /* 任务在下个循环自检 s_music_on=false 退出 */
+    }
+}
+
+bool vibrator_music_active(void) { return s_music_on && s_music_task != NULL; }
+
+/* ================= V1.4.x: 内置花样库 ================= */
+static const vib_seg_t s_seg_tick[]   = { { 60, 80 } };
+static const vib_seg_t s_seg_double[] = { { 50, 75 }, { 60, 0 }, { 50, 75 } };
+static const vib_seg_t s_seg_heart[]  = { { 90, 60 }, { 60, 0 }, { 140, 95 } };
+static const vib_seg_t s_seg_succ[]   = { { 80, 70 }, { 70, 0 }, { 80, 70 }, { 70, 0 }, { 90, 90 } };
+static const vib_seg_t s_seg_err[]    = { { 160, 45 }, { 130, 0 }, { 160, 45 }, { 130, 0 }, { 300, 75 } };
+static const vib_seg_t s_seg_sos[]    = {
+    /* 3 短 */ { 120, 80 }, { 120, 0 }, { 120, 80 }, { 120, 0 }, { 120, 80 }, { 240, 0 },
+    /* 3 长 */ { 420, 80 }, { 240, 0 }, { 420, 80 }, { 240, 0 }, { 420, 80 }, { 240, 0 },
+    /* 3 短 */ { 120, 80 }, { 120, 0 }, { 120, 80 }, { 120, 0 }, { 120, 80 },
+};
+static const vib_seg_t s_seg_up[]     = { { 60, 15 }, { 60, 35 }, { 60, 55 }, { 60, 75 }, { 60, 95 } };
+static const vib_seg_t s_seg_down[]   = { { 60, 95 }, { 60, 75 }, { 60, 55 }, { 60, 35 }, { 60, 15 } };
+static const vib_seg_t s_seg_alarm[]  = { { 300, 100 }, { 180, 0 } };
+
+const vib_pattern_t VIB_PAT_TICK      = { s_seg_tick,   1, 1 };
+const vib_pattern_t VIB_PAT_DOUBLE    = { s_seg_double, 3, 1 };
+const vib_pattern_t VIB_PAT_HEARTBEAT = { s_seg_heart,  3, 2 };
+const vib_pattern_t VIB_PAT_SUCCESS   = { s_seg_succ,   5, 1 };
+const vib_pattern_t VIB_PAT_ERROR     = { s_seg_err,    5, 1 };
+const vib_pattern_t VIB_PAT_SOS       = { s_seg_sos,   17, 1 };
+const vib_pattern_t VIB_PAT_RAMP_UP   = { s_seg_up,     5, 1 };
+const vib_pattern_t VIB_PAT_RAMP_DOWN = { s_seg_down,   5, 1 };
+const vib_pattern_t VIB_PAT_ALARM     = { s_seg_alarm,  2, 0 };   /* 无限循环 */

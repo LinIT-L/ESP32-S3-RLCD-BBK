@@ -107,6 +107,25 @@ static volatile uint32_t s_ring_tail = 0;  /* 消费者读取位置 */
 static TaskHandle_t s_audio_out_task = NULL;
 static volatile bool s_audio_out_running = false;
 static volatile bool s_pcm_flush_requested = false;   /* 按键音效释放时立即断音 */
+
+/* V1.0.71: 音频振幅表 (峰值 0..1000, 千分比).
+ * MP3 解码任务与 audio_out_task 两条 I2S 写入路径都喂数据,
+ * attack 立即跟上 / decay 每帧回落 10%. 供"随音乐震动"实时采样. */
+static volatile int32_t s_meter_peak = 0;
+static void audio_meter_feed(const int16_t *buf, uint32_t n) {
+    if (!buf || n == 0) return;
+    int32_t pk = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        int32_t v = buf[i];
+        if (v < 0) v = -v;
+        if (v > pk) pk = v;
+    }
+    pk = (pk * 1000) / 32768;
+    int32_t cur = s_meter_peak;
+    if (pk > cur) s_meter_peak = pk;             /* attack: 立即跟上 */
+    else          s_meter_peak = (cur * 9 + pk) / 10;  /* decay: 10% 回落 */
+}
+int32_t audio_player_get_meter(void) { return s_meter_peak; }
 static uint32_t s_last_underrun_ms = 0;   /* 欠载日志: 上次欠载时刻 (区分偶发/持续) */
 
 /* V1.0.53: PCM 输出任务栈改 PSRAM 静态, 不再占内部 RAM.
@@ -230,6 +249,9 @@ static void audio_out_task(void *arg) {
         for (uint32_t i = 0; i < avail * 2; i++) {
             local_buf[i] = (int16_t)(local_buf[i] * vol_scale);
         }
+        
+        /* V1.0.71: 喂振幅表 (游戏/音效 PCM 路径) */
+        audio_meter_feed(local_buf, avail * 2);
         
         size_t bytes = avail * 2 * sizeof(int16_t);
         size_t written = 0;
@@ -708,6 +730,9 @@ static void audio_play_task(void *arg) {
                     pcm_out[i] = (int16_t)(pcm_out[i] * vol);
                 }
             }
+
+            /* V1.0.71: 喂振幅表 (MP3 路径) */
+            audio_meter_feed(pcm_out, (uint32_t)samples * 2);
 
             /* \u5199\u5165 I2S */
             size_t bytes_written = 0;

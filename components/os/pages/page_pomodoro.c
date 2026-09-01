@@ -108,7 +108,8 @@ static void ring_start(void) {
         s_ring = true;
         s_ring_pos = 0;
     }
-    if (s_vib && vibrator_ready()) vibrator_tap(300, 100);
+    /* V1.4.x: 完成提醒改"成功三连"花样 (80+70+80+70+90ms 渐强) */
+    if (s_vib && vibrator_ready()) vibrator_play_pattern(&VIB_PAT_SUCCESS);
 }
 
 static void ring_update(void) {

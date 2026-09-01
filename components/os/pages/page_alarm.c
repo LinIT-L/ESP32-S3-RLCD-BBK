@@ -53,7 +53,8 @@ static void ring_start(void) {
     if (s_ringing) return;
     s_ringing = true;
     s_ring_pos = 0;
-    if (vibrator_ready()) vibrator_tap(500, 200);
+    /* V1.4.x: 闹钟震动改无限循环花样 (300ms 强震 + 180ms 停), 关铃时显式停止 */
+    if (vibrator_ready()) vibrator_play_pattern(&VIB_PAT_ALARM);
     ESP_LOGI(TAG, "闹钟响铃!");
 }
 
@@ -73,6 +74,7 @@ static void ring_update(void) {
     s_ring_pos += (uint32_t)wr;
     if (s_ring_pos >= ALM_RING_LEN && wr >= chunk) {
         s_ringing = false;
+        vibrator_stop_pattern();   /* 闹铃音自然结束: 停无限震动花样 */
         audio_player_stop();
     }
 }
@@ -138,12 +140,12 @@ static void p_alarm_action(ui_ctx_t *ctx, os_action_t a) {
     case OS_ACTION_LEFT: s_field = 0; break;
     case OS_ACTION_RIGHT: s_field = 1; break;
     case OS_ACTION_CONFIRM:
-        if (s_ringing) { s_ringing = false; audio_player_stop(); }
+        if (s_ringing) { s_ringing = false; vibrator_stop_pattern(); audio_player_stop(); }
         else s_enabled = !s_enabled;
         break;
     case OS_ACTION_BACK:
     case OS_ACTION_HOME:
-        if (s_ringing) { s_ringing = false; audio_player_stop(); }
+        if (s_ringing) { s_ringing = false; vibrator_stop_pattern(); audio_player_stop(); }
         os_pop(ctx);
         break;
     default: break;
