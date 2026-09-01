@@ -145,3 +145,10 @@ CONFIG_ESP_WIFI_RX_BA_WIN=6
 # V1.1.x: 精简 WiFi: WiFi 仅 STA(天气/同步) + softAP(网页手柄), 无企业/证书登录
 CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 CONFIG_WPA_MBEDTLS_TLS_CLIENT=n
+
+# === V1.5.x: 省电 — PM 自动降频 (DFS) ===
+# 开启电源管理: 空闲时 CPU 自动降到 XTAL(40MHz), 忙时升回 240MHz.
+# PM_DFS_INIT_AUTO 默认 n, 须显式开启让启动代码自动配置 DFS (max=240, min=40).
+# 游戏/模拟器运行期间由 input.c 用 esp_pm_lock(CPU_FREQ_MAX) 锁 240MHz 防掉帧.
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y

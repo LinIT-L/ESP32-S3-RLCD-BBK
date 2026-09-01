@@ -65,15 +65,19 @@ static bool vib_pin_supported(int pin) {
     if (pin >= 33 && pin <= 37) return false;
     return true;
 }
+static bool s_en_cfg = false;   /* EN 引脚仅配置一次, 电平随用随切 */
 static void drv_enable(bool on) {
     if (!vib_pin_supported(VIB_EN_PIN)) return;
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << VIB_EN_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = false, .pull_down_en = false,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io);
+    if (!s_en_cfg) {
+        gpio_config_t io = {
+            .pin_bit_mask = (1ULL << VIB_EN_PIN),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = false, .pull_down_en = false,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io);
+        s_en_cfg = true;
+    }
     gpio_set_level(VIB_EN_PIN, on ? 1 : 0);
 }
 
@@ -102,11 +106,13 @@ static void out_set(uint8_t strength01) {   /* strength 0..100 */
     if (duty > VIB_RES_MAX) duty = VIB_RES_MAX;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
+    drv_enable(duty > 0);   /* V1.5.x 省电: EN 随输出开关, 有输出才使能, 空闲拉低 */
 }
 static void out_off(void) {
     if (s_mode == VIB_NONE) return;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
+    drv_enable(false);      /* V1.5.x 省电: 停震立即拉低 TM6604 EN */
 }
 
 /* 定时到点关闭震动 (非阻塞 tap 用) */
@@ -115,7 +121,7 @@ static void tap_timer_cb(TimerHandle_t t) { (void)t; out_off(); }
 /* ================= 对外接口 ================= */
 void vibrator_init(void) {
     if (s_mode != VIB_NONE) return;
-    drv_enable(true);      /* TM6604 EN 高使能 (GPIO48) */
+    drv_enable(false);     /* V1.5.x 省电: EN 默认拉低, 震动输出时才拉起 (GPIO48) */
     if (!ledc_init()) {
         ESP_LOGE(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)VIB_PWM_PIN);
         return;
@@ -135,10 +141,9 @@ void vibrator_set_enabled(bool en) {
     if (!en) {
         s_music_on = false;            /* 音乐震动任务下个循环退出 */
         vibrator_stop_pattern();
-        out_off();
-        drv_enable(false);   /* 关震动开关: 一并拉低 TM6604 EN, 省电 */
+        out_off();                     /* 停震: 内部已拉低 EN */
     } else {
-        drv_enable(true);    /* 开: 使能 TM6604 */
+        /* V1.5.x 省电: 开开关不立即拉高 EN, 等首次震动输出时再使能 */
     }
 }
 
@@ -311,7 +316,7 @@ static const vib_seg_t s_seg_sos[]    = {
 static const vib_seg_t s_seg_up[]     = { { 60, 15 }, { 60, 35 }, { 60, 55 }, { 60, 75 }, { 60, 95 } };
 static const vib_seg_t s_seg_down[]   = { { 60, 95 }, { 60, 75 }, { 60, 55 }, { 60, 35 }, { 60, 15 } };
 static const vib_seg_t s_seg_alarm[]  = { { 300, 100 }, { 180, 0 } };
-static const vib_seg_t s_seg_click[]  = { { 18, 100 }, { 22, 0 }, { 16, 100 } };  /* 按下+释放 */
+static const vib_seg_t s_seg_click[]  = { { 18, 100 } };  /* V1.5.x: 单段短脉冲 (修复"震好多下") */
 
 const vib_pattern_t VIB_PAT_TICK      = { s_seg_tick,   1, 1 };
 const vib_pattern_t VIB_PAT_DOUBLE    = { s_seg_double, 3, 1 };
@@ -322,11 +327,13 @@ const vib_pattern_t VIB_PAT_SOS       = { s_seg_sos,   17, 1 };
 const vib_pattern_t VIB_PAT_RAMP_UP   = { s_seg_up,     5, 1 };
 const vib_pattern_t VIB_PAT_RAMP_DOWN = { s_seg_down,   5, 1 };
 const vib_pattern_t VIB_PAT_ALARM     = { s_seg_alarm,  2, 0 };   /* 无限循环 */
-const vib_pattern_t VIB_PAT_CLICK     = { s_seg_click,  3, 1 };   /* 按键模拟 */
+const vib_pattern_t VIB_PAT_CLICK     = { s_seg_click,  1, 1 };   /* 按键模拟: 一次=一下短震 */
 
 /* ================= V1.4.x: 按键模拟 (触摸点击反馈) =================
- * 苹果触控板式: 无实体按键, 用"按下(18ms强)+释放(16ms强)"双脉冲让触摸点击
- * 有机械按键的段落感. 开关由设置页持久化 (NVS vib_key), 内存态默认开. */
+ * 苹果触控板式: 无实体按键, 用单段 18ms 短脉冲模拟机械按键"哒"一下.
+ * V1.5.x: 去掉"按下+释放"双脉冲 (一次手势 4 个脉冲是"震好多下"根因).
+ * 长按(>0.5s)松手补震由 input.c 释放分支再调一次 vibrator_click (按下1次+弹起1次).
+ * 开关由设置页持久化 (NVS vib_key), 内存态默认开. */
 static bool s_key_sim = true;
 
 void vibrator_set_key_sim(bool en) { s_key_sim = en; }

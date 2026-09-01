@@ -2,11 +2,12 @@
  * page_wallpaper.c — 壁纸 页面模块 (3.3 版壁纸设置弹窗树复刻).
  *
  * 弹窗树 (3.3 一致):
- *   壁纸设置: 壁纸类型 / 休眠时间 / 测试壁纸 / 返回
+ *   壁纸设置: 壁纸类型 / 壁纸时间 / 测试壁纸 / 返回
  *   壁纸类型: 内置壁纸 / TF动态图 / 游戏壁纸 / 返回
  *     内置壁纸 → 选择壁纸程序: 星空(带*) / 返回
  *     TF动态图 → 播放速度: 慢/标准/快 / 返回
- *   休眠时间: 1..30分钟 / 返回
+ *   壁纸时间: 1..30分钟 / 返回
+ * 壁纸时间 = 动态壁纸(屏保)运行时长, 默认 10 分钟; 运行满时长后软关机(任意按键唤醒).
  * 当前 OS 仅支持星空程序, TF动态图/游戏壁纸/测试壁纸暂以"开发中"提示.
  * 私有 state 全部 static 留在本文件.
  */
@@ -22,7 +23,7 @@
 #define WP_NS "os_wp"
 
 static int s_wp_program = 0;      /* 当前壁纸程序 (0=星空) */
-static int s_wp_min     = 3;      /* 休眠时间 (0=未设置; 默认 3 分钟) */
+static int s_wp_min     = 10;     /* 壁纸时间 (0=未设置; 默认 10 分钟) */
 
 int os_wallpaper_get_program(void) { return s_wp_program; }
 
@@ -43,7 +44,7 @@ static bool wp_main_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *u
     case 2: /* 游戏壁纸 */
         os_dialog_toast(ctx, "\xe6\xb8\xb8\xe6\x88\x8f\xe5\xa3\x81\xe7\xba\xb8: \xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad"); /* 游戏壁纸: 开发中 */
         break;
-    case 3: wp_open_min(ctx); break;         /* 休眠时间 */
+    case 3: wp_open_min(ctx); break;         /* 壁纸时间 */
     case 4: /* 测试壁纸 */
         os_dialog_toast(ctx, "\xe6\xb5\x8b\xe8\xaf\x95\xe5\xa3\x81\xe7\xba\xb8: \xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad"); /* 测试壁纸: 开发中 */
         break;
@@ -60,7 +61,7 @@ static void wp_open_main(ui_ctx_t *ctx) {
         "\xe5\x86\x85\xe7\xbd\xae\xe5\xa3\x81\xe7\xba\xb8",   /* 内置壁纸 */
         "TF\xe5\x9b\xbe\xe7\x89\x87",                          /* TF图片 */
         "\xe6\xb8\xb8\xe6\x88\x8f\xe5\xa3\x81\xe7\xba\xb8",   /* 游戏壁纸 */
-        "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4",   /* 休眠时间 */
+        "\xe5\xa3\x81\xe7\xba\xb8\xe6\x97\xb6\xe9\x97\xb4",   /* 壁纸时间 */
         "\xe6\xb5\x8b\xe8\xaf\x95\xe5\xa3\x81\xe7\xba\xb8",   /* 测试壁纸 */
     };
     os_dlg_stack_t dlg;
@@ -124,7 +125,7 @@ static void wp_open_speed(ui_ctx_t *ctx) {
     os_dialog_push(ctx, &dlg);
 }
 
-/* ============ 休眠时间 ============ */
+/* ============ 壁纸时间 (屏保运行时长, 超时软关机) ============ */
 static const int wp_mins[] = { 1, 2, 3, 5, 10, 15, 20, 30 };
 #define WP_MINS_N (int)(sizeof(wp_mins) / sizeof(wp_mins[0]))
 static void wp_open_min(ui_ctx_t *ctx);
@@ -132,11 +133,11 @@ static void wp_min_save(int v) {
     s_wp_min = v;
     nvs_handle_t h;
     if (nvs_open(WP_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, "min", v);
+        nvs_set_i32(h, "wp_run", v);
         nvs_commit(h);
         nvs_close(h);
     }
-    wp_screensaver_set_delay_ms((v <= 0) ? UINT32_MAX : ((uint32_t)v * 60000UL));
+    wp_screensaver_set_run_ms((v <= 0) ? UINT32_MAX : ((uint32_t)v * 60000UL));
 }
 static bool wp_min_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
     (void)ud;
@@ -145,7 +146,7 @@ static bool wp_min_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud
     if (d->sel < WP_MINS_N) wp_min_save(wp_mins[d->sel]);
     os_dialog_pop(ctx);
     wp_open_min(ctx);
-    os_dialog_toast(ctx, "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4\xe5\xb7\xb2\xe8\xae\xbe\xe7\xbd\xae"); /* 休眠时间已设置 */
+    os_dialog_toast(ctx, "\xe5\xa3\x81\xe7\xba\xb8\xe6\x97\xb6\xe9\x97\xb4\xe5\xb7\xb2\xe8\xae\xbe\xe7\xbd\xae"); /* 壁纸时间已设置 */
     return true;
 }
 static void wp_open_min(ui_ctx_t *ctx) {
@@ -163,11 +164,11 @@ static void wp_open_min(ui_ctx_t *ctx) {
 
 /* ============ 模块契约 ============ */
 static void p_wp_enter(ui_ctx_t *ctx) {
-    /* 读 NVS (休眠时间; 程序固定星空) */
+    /* 读 NVS (壁纸时间; 程序固定星空) */
     nvs_handle_t h;
     if (nvs_open(WP_NS, NVS_READONLY, &h) == ESP_OK) {
         int32_t v = 0;
-        if (nvs_get_i32(h, "min", &v) == ESP_OK) s_wp_min = (int)v;
+        if (nvs_get_i32(h, "wp_run", &v) == ESP_OK) s_wp_min = (int)v;
         nvs_close(h);
     }
     s_wp_program = WP_PROG_STARS;

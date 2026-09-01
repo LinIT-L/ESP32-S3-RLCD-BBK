@@ -30,6 +30,10 @@ void os_screensaver_force_enter(void);
 void wp_screensaver_poll(uint32_t now_ms, uint32_t last_input_ms, bool in_dialog);
 /* 运行中更新息屏延时缓存 (设置休眠时间后调用; ms 为息屏空闲延时) */
 void wp_screensaver_set_delay_ms(uint32_t ms);
+/* 运行中更新壁纸(屏保)运行时长缓存 (壁纸时间设置后调用; ms 为壁纸运行时长, 超时软关机) */
+void wp_screensaver_set_run_ms(uint32_t ms);
+/* 壁纸运行时长已耗尽, 主循环应执行软关机 (清屏 + deep sleep) */
+bool wp_screensaver_shutdown_requested(void);
 
 
 #ifdef __cplusplus

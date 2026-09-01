@@ -265,7 +265,7 @@ static void scan_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
 }
 static void open_scan_dialog(ui_ctx_t *ctx) {
     s_scan_n = 0;
-    os_hw_request(OS_HW_BT);   /* 蓝牙默认开机启动: 确保已启用再扫 (走 os_hw 引用计数) */
+    os_hw_request(OS_HW_BT);   /* V1.5.x 蓝牙按需开启: 进手柄页才首次启用再扫 (走 os_hw 引用计数) */
     bt_manager_start_scan_continuous(gp_on_scan);
     s_scan_active = true;
     os_dlg_stack_t dlg;

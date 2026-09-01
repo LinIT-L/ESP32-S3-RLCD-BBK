@@ -182,16 +182,18 @@ static const os_platform_ops_t s_os_platform = {
     .usb_data_active  = os_plat_usb_data,
 };
 
+/* 软关机: 清屏后 deep sleep (任意按键经 ext1 唤醒后重新开机) */
+static void do_soft_shutdown(ui_ctx_t *ctx) {
+    ESP_LOGI(TAG, "软关机: 清屏并 deep sleep");
+    if (ctx->lcd) { st7305_clear(ctx->lcd, ST7305_COLOR_WHITE); st7305_flush(ctx->lcd); }
+    esp_deep_sleep_start();
+}
 /* 软关机确认: 长按关机键弹出, 确认=关机 / 10秒超时自动关机 / 返回=取消 */
 static bool s_pwr_dlg_open = false;
 static void on_power_confirm(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     s_pwr_dlg_open = false;
-    if (result == 0) {
-        ESP_LOGI(TAG, "确认关机, 清屏并 deep sleep");
-        if (ctx->lcd) { st7305_clear(ctx->lcd, ST7305_COLOR_WHITE); st7305_flush(ctx->lcd); }
-        esp_deep_sleep_start();
-    }
+    if (result == 0) do_soft_shutdown(ctx);
 }
 
 /* 新 OS 主循环: input -> os 内核分发(action/touch) -> 管家 -> 渲染 */
@@ -199,6 +201,7 @@ static void os_shell_loop(ui_ctx_t *ctx) {
     ESP_LOGI(TAG, "OS 主循环 (60 FPS 模式)");
     uint32_t last_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     uint32_t last_input_ms = 0;   /* 最近输入时间 (管家空闲检测用) */
+    uint32_t last_log_ms = 0;     /* V1.5.x: 日志写 TF 节流 (每 3 秒一次, 省电+延长卡寿命) */
     os_mgr_init();
     while (1) {
         /* 软关机键 GPIO1 长按 2 秒 → 弹出确认关机弹窗 (确认/10秒自动/返回取消) */
@@ -207,8 +210,11 @@ static void os_shell_loop(ui_ctx_t *ctx) {
             os_dialog_confirm_ex(ctx, "\xe5\x85\xb3\xe6\x9c\xba?", 10000, 0, /* 关机? */
                                  on_power_confirm, NULL);
         }
-        log_drain();   /* 每帧把缓存日志追加写入 TF 卡 */
         uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now_ms - last_log_ms >= 3000) {
+            last_log_ms = now_ms;
+            log_drain();   /* 缓存日志每 3 秒追加写入 TF 卡一次 */
+        }
         os_tick(ctx);  /* 服务 tick + 当前模块 poll */
         os_action_t action = (os_action_t)input_get_action();
         if (action != OS_ACTION_NONE) {
@@ -235,10 +241,12 @@ static void os_shell_loop(ui_ctx_t *ctx) {
         }
         /* 屏保: 任意界面空闲超过设置延时进入星空 (状态机归 wallpapers) */
         wp_screensaver_poll(now_ms, last_input_ms, os_modal_active(ctx));
+        /* 壁纸运行时长耗尽 → 软关机 (任意按键唤醒); 本帧有输入唤醒时标志已被清除 */
+        if (wp_screensaver_shutdown_requested()) do_soft_shutdown(ctx);
         /* 管家: 内存/生命周期/电源/健康 (低频节流, 内部裁剪) */
         os_mgr_poll(ctx, now_ms, last_input_ms, os_modal_active(ctx));
         os_render(ctx);
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(16));   /* V1.5.x: 轮询 500Hz→62Hz (省电, 触摸/按键走事件判定) */
         if (now_ms - last_ms >= 1000) {
             extern int font_zh_count(void);   /* 每秒带字体绑定状态 (0=绑定失败) */
             sdmmc_card_t *sd = sd_get_card(); /* SD 卡型号/容量 (确认挂载与卡型) */
@@ -273,8 +281,8 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
     ESP_LOGI("MEM", "[MEM] OS 桌面基线: 内部空闲=%u PSRAM空闲=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    /* 延后初始化 (避免抢占内部 DMA RAM): 蓝牙 -> 音频 -> 电池 */
-    app_board_init_bt();
+    /* 延后初始化 (避免抢占内部 DMA RAM): 音频 -> 电池.
+     * V1.5.x 省电: 蓝牙按需开启 — 开机不再初始化蓝牙 (进蓝牙/手柄设置页时由 os_hw 触发). */
     app_board_init_audio(board);
     app_board_init_battery(board);
     if (usb_bt_is_active()) {
@@ -289,11 +297,10 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
         usb_net_start();
         ESP_LOGI(TAG, "USB 网卡共享模式已启动");
     } else {
-        /* V1.1.1 用户需求: 蓝牙默认开机就启动 (添加设备/连接直接可用).
-         * 走 os_hw_request 而非直接 bt_manager_enable, 让 os_hw 状态同步,
-         * 设置界面"无线连接 → 蓝牙:开"才能正确显示 (之前直接启动导致界面显示关). */
-        os_hw_request(OS_HW_BT);
-        ESP_LOGI(TAG, "蓝牙已默认启动 (开机)");
+        /* V1.5.x 省电: 蓝牙按需开启 — 开机不再启动蓝牙 (省去常开扫描/回连功耗).
+         * 用户进 设置-无线连接 或 游戏-手柄 页时 os_hw_request(OS_HW_BT) 才首次初始化;
+         * 界面"蓝牙:开/关"由 os_hw 引用计数与 bt_manager_is_ready() 同步显示. */
+        ESP_LOGI(TAG, "蓝牙按需开启: 开机不启动 (进蓝牙/手柄设置页时启用)");
     }
     /* V1.0.72: 开机不播旋律, 改为震动一下提示.
      * 原因: tone_mel 任务栈(8KB)在首次 feed_pcm → audio_out_start →

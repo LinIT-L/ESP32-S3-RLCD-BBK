@@ -12,6 +12,7 @@
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_sleep.h"
+#include "esp_pm.h"          /* V1.5.x: 游戏锁频 (PM 降频下锁 240MHz 防卡顿) */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -89,10 +90,20 @@ void input_set_gamepad_nav_enabled(bool enabled) {
  * 详情见 input.h. 区分"nav 关闭"的两种场景: 游戏中(允许返回/退出键) 与 按键映射中
  * (返回键应被当作被映射的键捕获, 不能误触发退出). */
 static bool s_gamepad_gamemode = false;
+/* V1.5.x: 游戏 CPU 锁频句柄 — PM 自动降频下, 进入游戏锁 240MHz 防引擎掉帧 */
+static esp_pm_lock_handle_t s_pm_lock = NULL;
 /* V1.3.x: 游戏模式变化回调 (暗黑UI模式等按游戏态切换反色用, 游戏阻塞主循环需即时通知) */
 static input_gamemode_cb_t s_gamemode_cb = NULL;
 void input_set_gamepad_gamemode(bool enabled) {
     if (s_gamepad_gamemode == enabled) return;
+    /* V1.5.x: 锁频跟随游戏态 — 进游戏锁 240MHz, 退出释放让 PM 降频省电.
+     * PM 未开启时 esp_pm_lock_create 返回不支持, s_pm_lock 保持 NULL 自动跳过. */
+    if (enabled) {
+        if (!s_pm_lock) esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "bbk_game", &s_pm_lock);
+        if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);
+    } else {
+        if (s_pm_lock) esp_pm_lock_release(s_pm_lock);
+    }
     s_gamepad_gamemode = enabled;
     if (s_gamemode_cb) s_gamemode_cb(enabled);
 }
@@ -151,9 +162,12 @@ void input_init(void) {
      * 长按 2s 的软关机由 input_power_should_sleep 独立轮询. */
     s_btns[2] = (btn_ctx_t){ BTN_GPIO_PWR, ST_IDLE, 0, 0, MENU_ACTION_POWER_LOCK, MENU_ACTION_NONE, "PWR" };
 
-    /* V1.0.68: 软关机键 GPIO1 同时配置 deep sleep 唤醒 (长按2s软关机后按下唤醒) */
+    /* V1.0.68: 软关机键 GPIO1 同时配置 deep sleep 唤醒 (长按2s软关机后按下唤醒)
+     * V1.5.x: 任意物理键唤醒 — 三颗键都加入 ext1 掩码 (按键按下=低电平, 已统一上拉) */
     rtc_gpio_pullup_en(BTN_GPIO_PWR);
-    esp_sleep_enable_ext1_wakeup_io(1ULL << BTN_GPIO_PWR, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_sleep_enable_ext1_wakeup_io(
+        (1ULL << BTN_GPIO_PWR) | (1ULL << BTN_GPIO_LEFT) | (1ULL << BTN_GPIO_RIGHT),
+        ESP_EXT1_WAKEUP_ANY_LOW);
 }
 
 static menu_action_t tick(btn_ctx_t *b) {

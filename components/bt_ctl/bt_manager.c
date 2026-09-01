@@ -18,6 +18,9 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"   /* V1.5.x: enable 同步等待初始化任务完成 */
 
 static const char *TAG = "bt_manager";
 
@@ -106,6 +109,10 @@ static bt_connect_cb_t         s_connect_cb = NULL;
 static bt_connect_progress_cb_t s_prog_cb = NULL;
 
 static bool s_inited = false;   /* bt_core 是否已初始化 */
+/* V1.5.x 省电: 蓝牙按需开启 — 完整初始化(映射/NVS/核心/回连任务)是否完成.
+ * 开机不再初始化; 首次 bt_manager_enable (进蓝牙/手柄设置页) 时触发. */
+static volatile bool s_full_init_done = false;
+static SemaphoreHandle_t s_init_done_sem = NULL;   /* enable 同步等待初始化完成 */
 
 /* ========================================================================
  *  默认映射
@@ -674,9 +681,16 @@ static bool core_ensure_init(void)
 /* ========================================================================
  *  生命周期 / 扫描 / 连接 / 状态
  * ======================================================================== */
-void bt_manager_init(void)
+/* ========================================================================
+ *  完整初始化 (V1.5.x 拆出, 供 bt_manager_init 任务入口 与 enable 惰性触发共用)
+ *  幂等: 只执行一次; disable 后再次 enable 由 core_ensure_init 重新初始化核心.
+ * ======================================================================== */
+static void bt_full_init(void)
 {
-    ESP_LOGI(TAG, "bt_manager_init enter (bt_init task)");
+    if (s_full_init_done) return;
+    s_full_init_done = true;   /* 先置位防重入 (初始化任务/主循环并发) */
+    ESP_LOGI(TAG, "bt_full_init: 首次启用, 载入配置并初始化核心");
+
     /* 默认映射 */
     memcpy(s_map, k_default_map, sizeof(s_map));
     memcpy(s_sup, k_default_sup, sizeof(s_sup));
@@ -721,8 +735,15 @@ void bt_manager_init(void)
     /* 常驻自动回连任务 (低优先级, 省电直连上次手柄). 栈须够大: 回连会走 esp_hid/Bluedroid
      * 连接与错误处理, 2048 过小会在 HID open 失败/重连时爆栈重启 (实测 bt_rec stack overflow). */
     xTaskCreate(bt_reconnect_task, "bt_rec", 8192, NULL, 2, NULL);
+}
 
-    /* 本函数被 app_board 作为 "bt_init" 任务入口运行. FreeRTOS 任务函数禁止返回,
+void bt_manager_init(void)
+{
+    ESP_LOGI(TAG, "bt_manager_init enter (bt_init task)");
+    bt_full_init();
+    if (s_init_done_sem) xSemaphoreGive(s_init_done_sem);   /* 通知 enable 等待方 */
+
+    /* 本函数被 bt_manager_enable 作为 "bt_init" 任务入口运行. FreeRTOS 任务函数禁止返回,
      * 完成初始化后必须删除自身 (否则报 "Task should not return" abort 重启). */
     vTaskDelete(NULL);
 }
@@ -916,7 +937,21 @@ void bt_manager_enable(void)
 {
     s_power_off = false;   /* 显式开蓝牙: 允许自动回连 */
     s_suspended = false;
-    (void)core_ensure_init();
+    /* V1.5.x 省电: 蓝牙按需开启 — 首次 enable 才做完整初始化 (映射/NVS/核心/回连任务).
+     * 初始化任务用内部 RAM 静态栈 (esp_bt_controller_init 期间禁 cache, PSRAM 栈会断言),
+     * 这里同步等待其完成 (蓝牙栈启动约 1~2 秒), 避免上层紧接着扫描时核心未就绪. */
+    if (!s_full_init_done) {
+        int words = 0;
+        StackType_t *stack = bt_manager_get_init_stack(&words);
+        static StaticTask_t bt_task_buf;
+        if (stack && xTaskCreateStatic((TaskFunction_t)bt_manager_init, "bt_init",
+                                       words, NULL, 1, stack, &bt_task_buf)) {
+            if (!s_init_done_sem) s_init_done_sem = xSemaphoreCreateBinary();
+            if (s_init_done_sem) xSemaphoreTake(s_init_done_sem, pdMS_TO_TICKS(20000));
+        }
+        if (!s_full_init_done) ESP_LOGW(TAG, "蓝牙完整初始化未完成 (超时/失败), 下次 enable 重试核心");
+    }
+    (void)core_ensure_init();   /* disable→enable 再启用时核心重新初始化 */
 }
 
 void bt_manager_disable(void)
@@ -935,10 +970,11 @@ void bt_manager_disable(void)
 }
 
 /* ========================================================================
- *  自动回连 (省电: 直连上次地址, 不空转扫描; 退避 5s→10s→20s→封顶30s)
+ *  自动回连 (省电: 直连上次地址, 不空转扫描; 退避 60s→120s→240s→封顶300s)
+ *  V1.5.x 省电: 回连扫描间隔 5s→60s, 大幅降低空闲期无效重试功耗.
  * ======================================================================== */
-#define BT_RECONNECT_POLL_MS   5000
-#define BT_RECONNECT_MAX_MS    30000
+#define BT_RECONNECT_POLL_MS   60000
+#define BT_RECONNECT_MAX_MS    300000
 static uint32_t s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;
 
 /* 直连最近一次手柄 (esp_hidh_dev_open 按已知地址, 无需扫描, 无线电占用极低) */
