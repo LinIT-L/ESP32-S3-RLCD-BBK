@@ -34,7 +34,7 @@
 
 ## 外设映射（user_config.h）
 - I2C：SDA=13、SCL=14
-- 震动：DRV2605L(SDA=GPIO42,SCL=GPIO47) 未检测到 → 回退 GPIO6/LEDC
+- 震动：TM6604 线性驱动（SOT23-6）PWM=GPIO42（原 DRV2605L SDA 焊盘，LEDC 190Hz）、EN=GPIO48（保持原 EN IO），OUT± 接 LRA；原 SCL=GPIO47 空置
 - 电池 ADC：GPIO4（ADC1_CH3，200K/100K 分压）
 
 ## 分区与存储布局（partitions.csv，16MB）

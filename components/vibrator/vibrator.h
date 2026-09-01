@@ -1,11 +1,12 @@
 /**
  * @file vibrator.h
- * @brief 震动马达驱动 (V1.1.0: DRV2605L 驱动 LRA 首选, GPIO6/LEDC 兜底)
+ * @brief 震动马达驱动 (V1.3.x: TM6604 线性驱动, PWM 直驱 LRA)
  *
- * 硬件:
- *  - DRV2605L (I2C 0x5A, 独立软件I2C) -> OUT+/OUT- -> LRA 线性马达.
- *    SDA=GPIO42 SCL=GPIO47 (见 vibrator.c, 避开 strapping/ADC 脚), EN 接高.
- *  - 兜底: GPIO6 --LEDC PWM--> N-MOS --> 裸 LRA (未接 DRV2605L 时自动回退).
+ * 硬件 (TM6604 SOT23-6):
+ *  - Pin5 PWM <- GPIO42 (LEDC 190Hz 方波, 频率= LRA 谐振点)
+ *  - Pin6 EN  <- GPIO48 (原 EN IO, 保持不变; 高使能)
+ *  - Pin1/3 OUT+/OUT- -> LRA 线性马达; Pin2 GND; Pin4 VDD=3.3V
+ *  - 原 SCL=GPIO47 空置; 原 GPIO6/LEDC 兜底路径已并入 PWM 主路径.
  *
  * 提供阻塞 vibrator_buzz 与非阻塞 vibrator_tap 两种触发; 上层可通过
  * vibrator_set_enabled 总开关在设置里统一关闭震动.
@@ -20,11 +21,21 @@
 extern "C" {
 #endif
 
-/* 初始化: 优先探测 DRV2605L (软件I2C), 检测不到回退 GPIO6/LEDC. 幂等. */
+/* 初始化: 配置 TM6604 (EN 使能 + LEDC PWM). 幂等. */
 void vibrator_init(void);
 
-/* 总开关 (由「震动反馈」设置调用; false 立即停止震动). */
+/* 总开关 (由「震动反馈」设置调用; false 立即停止震动).
+ * 注意: 设置页请改用 vibrator_set_ui_enabled / vibrator_set_game_enabled. */
 void vibrator_set_enabled(bool en);
+
+/* UI 震动开关 (拖拉/菜单导航/设置调整). 任一通道开 → 硬件总开关开. */
+void vibrator_set_ui_enabled(bool en);
+/* 游戏震动开关 (游戏内按键). 任一通道开 → 硬件总开关开. */
+void vibrator_set_game_enabled(bool en);
+/* UI 震动: 仅当 UI 震动开启时触发一次 (ms 时长, strength 0~100). */
+void vibrator_tap_ui(uint16_t ms, uint8_t strength);
+/* 游戏震动: 仅当游戏震动开启时触发一次 (ms 时长, strength 0~100). */
+void vibrator_tap_game(uint16_t ms, uint8_t strength);
 
 /* 设置输出强度 strength=0~100 (实时). 0 静止. */
 void vibrator_set(uint8_t strength);
