@@ -504,7 +504,9 @@ esp_err_t gbc_emu_start(const char *path)
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 8 * 1024 * 1024) {
+    /* 下限 0x150: ROM 头需 0x149 字节, 过小文件会让 gnuboy rom_load 越界读 header
+     * (与 gbc_emu_start_data 的 size < 0x150 校验保持一致, 防损坏小文件喂垃圾头) */
+    if (sz < 0x150 || sz > 8 * 1024 * 1024) {
         ESP_LOGE(TAG, "ROM 大小异常: %ld", sz);
         fclose(f);
         return ESP_FAIL;

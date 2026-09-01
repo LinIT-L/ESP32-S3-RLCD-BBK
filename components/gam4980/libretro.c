@@ -1479,6 +1479,14 @@ uint8_t *gam4980_retro_rom_target(void)
     return sys_flash + 0x8000 + 0xd000;
 }
 
+/* V1.1.x: 目标区可用容量上限 (字节). 与 retro_load_game 的 size 拒绝阈值 0x1e0000 保持一致.
+ * 供 gam4980_emu_load 预检使用: 原 4MB 预检过宽, 1.92MB~4MB 的文件会被流式 fread
+ * 越过 sys_flash 缓冲尾部写坏 PSRAM 堆, 之后才被 retro_load_game 拒绝. */
+size_t gam4980_retro_rom_capacity(void)
+{
+    return 0x1e0000;   /* 1920KB */
+}
+
 void retro_set_controller_port_device(unsigned port, unsigned device)
 {
 }

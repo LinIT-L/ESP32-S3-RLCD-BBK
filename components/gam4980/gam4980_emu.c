@@ -304,6 +304,8 @@ void gam4980_flash_read_save(uint8_t *buf, size_t size);
 void gam4980_flash_write_save(const uint8_t *buf, size_t size);
 /* V1.0.52: 返回游戏数据在 PSRAM 中的目标区指针 */
 uint8_t *gam4980_retro_rom_target(void);
+/* V1.1.x: 目标区可用容量上限 (与 retro_load_game 拒绝阈值一致, 防预检过宽越界写) */
+size_t gam4980_retro_rom_capacity(void);
 /* 游戏请求关机/退出 (halt) 检测: 选「退出游戏」时核心进入 halt 状态 */
 bool gam4980_retro_halt_requested(void);
 /* V1.0.53: halt 位实时状态 (帧末仍置位才判定关机) */
@@ -1353,8 +1355,11 @@ int gam4980_emu_load(const char *path) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 4 * 1024 * 1024) {
-        ESP_LOGE(TAG, "文件大小异常: %ld", sz);
+    /* V1.1.x: 上限改用目标区容量 (0x1e0000), 与 retro_load_game 拒绝阈值一致.
+     * 原 4MB 预检过宽: 超容文件会被下方流式 fread 越过 sys_flash 缓冲写坏 PSRAM. */
+    long max_gam = (long)gam4980_retro_rom_capacity();
+    if (sz <= 0 || sz > max_gam) {
+        ESP_LOGE(TAG, "文件大小异常: %ld (上限 %ld)", sz, max_gam);
         fclose(f);
         return -1;
     }
@@ -1433,88 +1438,13 @@ int gam4980_emu_load(const char *path) {
     return 0;
 }
 
-/* 退出确认弹窗: 冻结游戏画面, 叠加"收藏提示"同款小弹窗.
- * 返回: GAME_EXIT_CONFIRMED=确认退出, GAME_EXIT_CANCEL=取消(恢复游戏继续),
- *       GAME_EXIT_TIMEOUT=无操作超时退出.
- * 交互: CONFIRM=退出, BACK/HOME=取消, 手柄 F_BACK 长按=取消,
- *       无按键 10s 超时=自动退出到桌面. */
+/* 退出确认弹窗: 冻结游戏画面, 叠加统一退出确认框.
+ * 已融合到统一模块 os_confirm_exit_blocking (与其它引擎外观/交互完全一致):
+ * 标题"退出程序?"在上, 左"确定"右"取消", 四边黑框全画齐全;
+ * 手柄 LEFT/RIGHT 黑块选择, CONFIRM=当前选中项, BACK=取消, 触摸弹窗内左=确定 右=取消.
+ * 返回: GAME_EXIT_CONFIRMED=确认退出, GAME_EXIT_CANCEL=取消(恢复游戏继续). */
 static game_exit_result_t gam4980_exit_confirm_dialog(void) {
-    bool back_pressed = false;
-    uint32_t back_press_start_ms = 0;
-    extern uint32_t esp_log_timestamp(void);
-    uint32_t start_ms = (uint32_t)esp_log_timestamp();
-
-    /* === 关键修复: 返回主菜单键(F_EXIT)与返回键(F_BACK)是不同按键.
-     * 但输入层把 F_EXIT 也映射成了 HOME/返回动作, 弹窗打开时 F_EXIT 若仍被按住,
-     * 防抖之后会把弹窗当成"取消"而闪退、游戏也不暂停.
-     * 因此这里取消动作只认返回键 (MENU_ACTION_BACK / F_BACK 长按), 不认 HOME. */
-    bool back_trigger_held = bt_manager_is_key_pressed(F_BACK); /* F_BACK 长按触发时是否仍按着 */
-
-    /* V1.0.68 fix: 游戏内禁用了手柄导航键, input_get_action() 收不到 BT F_CONFIRM,
-     * 玩家按确认无效只能等 10s 超时 (日志实锤 233702 请求 → 234182 确认无反应 → 243710 超时).
-     * 这里直接轮询 F_CONFIRM 上升沿 (与 GB 退出弹窗一致). */
-    bool confirm_prev = bt_manager_is_key_pressed(F_CONFIRM);
-
-    while (1) {
-        /* 每轮强制重绘+刷新, 使弹窗保持可见 (弹窗优先级最高),
-         * 避免被游戏帧 flush 覆盖后一闪而过. */
-        ui_draw_notice_popup(g_lcd, "\xe9\x80\x80\xe5\x87\xba\xe6\xb8\xb8\xe6\x88\x8f\xef\xbc\x9f"); /* 退出游戏？ */
-        st7305_flush(g_lcd);
-
-        /* 触发键已松开 → 之后 F_BACK 长按才当作真正的取消 */
-        if (back_trigger_held && !bt_manager_is_key_pressed(F_BACK)) back_trigger_held = false;
-
-        menu_action_t action = input_get_action();
-
-        /* V1.0.xx: 触摸 CONFIRM 区分点击区域 — 点击弹窗外=取消, 内=确认 */
-        if (action == MENU_ACTION_CONFIRM) {
-            int tx, ty;
-            if (input_consume_tap(&tx, &ty)) {
-                /* 计算弹窗区域 (与 draw_notice_popup 一致) */
-                const int NOTICE_B = 3, NOTICE_P = 3, NOTICE_H = 3+3+3+3+24;
-                int tw = 5 * 12; /* "退出游戏？" 5字 * 12px */
-                int W = NOTICE_B*2 + NOTICE_P*2 + tw;
-                int H = NOTICE_H;
-                int px = (ST7305_WIDTH - W) / 2;
-                int py = (ST7305_HEIGHT - H) / 2;
-                if (tx >= px && tx < px + W && ty >= py && ty < py + H) {
-                    return GAME_EXIT_CONFIRMED;  /* 点击弹窗内 → 确认 */
-                }
-                return GAME_EXIT_CANCEL;          /* 点击弹窗外 → 取消 */
-            }
-            return GAME_EXIT_CONFIRMED;  /* 物理键 CONFIRM → 确认 */
-        }
-        /* V1.0.68 fix: 手柄确认键 (F_CONFIRM) 上升沿 → 立即退出 */
-        bool now_confirm = bt_manager_is_key_pressed(F_CONFIRM);
-        if (now_confirm && !confirm_prev) {
-            ESP_LOGI(TAG, "退出确认: 手柄确认键退出");
-            return GAME_EXIT_CONFIRMED;
-        }
-        confirm_prev = now_confirm;
-
-        if (action == MENU_ACTION_BACK) {
-            return GAME_EXIT_CANCEL;
-        }
-        /* MENU_ACTION_HOME(=F_EXIT 返回主菜单键) 不再作为取消, 只负责请求退出. */
-        /* 手柄 F_BACK 长按 500ms → 取消恢复游戏 (仅当 F_BACK 非本次触发键时有效). */
-        bool now_back = bt_manager_is_key_pressed(F_BACK);
-        uint32_t now_ms = (uint32_t)esp_log_timestamp();
-        if (now_back && !back_pressed) {
-            back_pressed = true;
-            back_press_start_ms = now_ms;
-        } else if (!now_back) {
-            back_pressed = false;
-        } else if (!back_trigger_held && back_pressed && (uint32_t)(now_ms - back_press_start_ms) >= 500) {
-            return GAME_EXIT_CANCEL;
-        }
-
-        /* 超时 (无按键) → 自动退出到桌面 */
-        if ((uint32_t)(now_ms - start_ms) >= 10000) {
-            return GAME_EXIT_TIMEOUT;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(16));
-    }
+    return os_confirm_exit_blocking(g_lcd) ? GAME_EXIT_CONFIRMED : GAME_EXIT_CANCEL;
 }
 
 game_exit_result_t gam4980_emu_run(void) {
@@ -1586,24 +1516,28 @@ game_exit_result_t gam4980_emu_run(void) {
          * 短按保留给 BBK "跳出" 键 (joypad B = KEY_EXIT), 长按不再退出 (与 GB 流程一致). */
 
         /* V1.0.68: 每帧轮询设备物理键 + 触摸手势 (手柄导航键在游戏内已禁用):
-         *  - HOME / POWER_RELEASE (软关机键0.5s后松手 / 状态栏长按3s) → 立即返回主菜单
-         *  - POWER_LOCK (软关机键点按) → 退出游戏回主菜单
-         *  - BACK (BOOT 长按 / 底部中间上滑) → 弹确认框退出 */
+         *  - 软关机键(POWER_LOCK/POWER_RELEASE) 是系统级锁屏/关机动作, 不经游戏循环,
+         *    不充当退出回桌面通道, 此处一律忽略.
+         *  - HOME = 手柄退出到菜单(F_EXIT) 的重复路径 → 统一弹确认退出
+         *  - BACK (实体返回/底部上滑) → 统一弹确认退出 */
         menu_action_t action = input_get_action();
-        if (action == MENU_ACTION_HOME || action == MENU_ACTION_POWER_RELEASE ||
-            action == MENU_ACTION_POWER_LOCK) {
-            ESP_LOGI(TAG, "HOME/电源键 -> 返回主菜单");
-            exit_result = GAME_EXIT_TIMEOUT;
-            break;
-        }
-        if (action == MENU_ACTION_BACK || action == MENU_ACTION_LONG_LEFT) {
-            ESP_LOGI(TAG, "BACK -> 请求退出游戏");
+        if (action == MENU_ACTION_HOME ||
+            action == MENU_ACTION_BACK || action == MENU_ACTION_LONG_LEFT) {
+            ESP_LOGI(TAG, "退出键 -> 请求退出游戏(弹确认)");
             exit_requested = true;
         }
         if (virtual_keys_is_enabled()) {
-            int tx = 0, ty = 0;
-            bool down = input_get_touch_pos(&tx, &ty);
-            virtual_keys_poll(tx, ty, down);
+            /* 多点触控: 第一指控方向/摇杆, 第二指只控 A/B/SEL/STA (与通用模拟器一致) */
+            tp_point_t pts[TP_MAX_POINTS];
+            int c = 0;
+            input_get_touch_multi(pts, &c);
+            bool d0 = (c >= 1) && pts[0].pressed;
+            bool d1 = (c >= 2) && pts[1].pressed;
+            int x0 = d0 ? pts[0].x : 0;
+            int y0 = d0 ? pts[0].y : 0;
+            int x1 = d1 ? pts[1].x : 0;
+            int y1 = d1 ? pts[1].y : 0;
+            virtual_keys_poll_multi(x0, y0, d0, x1, y1, d1);
         }
 
         /* V1.0.47: 请求退出 → 弹确认框, 确认才退出, 取消则恢复游戏继续 */
