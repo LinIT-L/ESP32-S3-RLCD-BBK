@@ -69,20 +69,21 @@ static void drv_enable(bool on) {
 }
 
 /* ================= PWM 输出 (LEDC) ================= */
-static void ledc_init(void) {
+static bool ledc_init(void) {
     /* 先复位引脚为纯输出, 清除原 SDA 焊盘可能残留的 OD/上拉配置 */
     gpio_reset_pin(VIB_PWM_PIN);
     ledc_timer_config_t tc = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = VIB_TIMER,
         .duty_resolution = VIB_RES, .freq_hz = VIB_RES_FREQ, .clk_cfg = LEDC_AUTO_CLK,
     };
-    if (ledc_timer_config(&tc) != ESP_OK) return;
+    if (ledc_timer_config(&tc) != ESP_OK) return false;
     ledc_channel_config_t ch = {
         .gpio_num = VIB_PWM_PIN, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = VIB_CHANNEL,
         .timer_sel = VIB_TIMER, .duty = 0, .hpoint = 0,
     };
-    if (ledc_channel_config(&ch) != ESP_OK) return;
+    if (ledc_channel_config(&ch) != ESP_OK) return false;
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
+    return true;
 }
 
 /* ================= 实际输出 ================= */
@@ -106,7 +107,10 @@ static void tap_timer_cb(TimerHandle_t t) { (void)t; out_off(); }
 void vibrator_init(void) {
     if (s_mode != VIB_NONE) return;
     drv_enable(true);      /* TM6604 EN 高使能 (GPIO48) */
-    ledc_init();
+    if (!ledc_init()) {
+        ESP_LOGE(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)VIB_PWM_PIN);
+        return;
+    }
     s_mode = VIB_TM6604;
     s_tap_timer = xTimerCreate("vib_tap", pdMS_TO_TICKS(50), pdFALSE, NULL, tap_timer_cb);
     ESP_LOGI(TAG, "震动驱动就绪: TM6604 PWM=GPIO%d(%dHz) EN=GPIO%d", (int)VIB_PWM_PIN,
