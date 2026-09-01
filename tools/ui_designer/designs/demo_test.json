@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "name": "demo"
+  },
+  "els": [
+    {
+      "id": 1,
+      "type": "text",
+      "text": "hi"
+    }
+  ],
+  "_saved": true
+}

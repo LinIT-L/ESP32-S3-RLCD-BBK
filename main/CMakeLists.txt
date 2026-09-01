@@ -23,4 +23,6 @@ idf_component_register(
         engine_manager
         board_shim
         sd_scan
+        usb_bt
+        usb_net
 )

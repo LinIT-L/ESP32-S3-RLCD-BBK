@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LinTOS UI 设计器 · 400×300 单色屏</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <!-- ============ 顶栏 ============ -->
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo">▣</span>
+      <span>LinTOS UI 设计器</span>
+      <span class="sub">400×300 · 单色</span>
+    </div>
+    <div class="top-actions">
+      <span id="zoom-grp" class="grp">
+        <button data-zoom="1">100%</button>
+        <button data-zoom="2" class="active">200%</button>
+        <button data-zoom="3">300%</button>
+      </span>
+      <span class="grp">
+        <button id="btn-new" title="清空画布">新建</button>
+        <button id="btn-load">载入</button>
+        <button id="btn-save" class="primary">保存方案</button>
+        <button id="btn-export-c" class="ghost" title="导出 C 代码片段">导出 C</button>
+        <button id="btn-preview" class="ghost" title="全屏预览">预览</button>
+      </span>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- ============ 左侧: 元件库 ============ -->
+    <aside id="pallery">
+      <h3>元件库</h3>
+      <div class="pal-cat">
+        <div class="cat-title">结构 · 信息栏</div>
+        <div class="pal-items" id="pal-struct"></div>
+      </div>
+      <div class="pal-cat">
+        <div class="cat-title">文字 · 数字</div>
+        <div class="pal-items" id="pal-text"></div>
+      </div>
+      <div class="pal-cat">
+        <div class="cat-title">控件 · 输入</div>
+        <div class="pal-items" id="pal-ctrl"></div>
+      </div>
+      <div class="pal-cat">
+        <div class="cat-title">几何 · 装饰</div>
+        <div class="pal-items" id="pal-shape"></div>
+      </div>
+      <div class="pal-cat">
+        <div class="cat-title">高级组件</div>
+        <div class="pal-items" id="pal-adv"></div>
+      </div>
+    </aside>
+
+    <!-- ============ 中间: 画布 ============ -->
+    <section id="canvas-wrap">
+      <div id="screen-inner">
+        <canvas id="screen" width="400" height="300"></canvas>
+        <div id="canvas-tip">↑↑ 从左侧点选元件，拖到画布上；在画布中拖动/缩放/点选元件 ↑↑</div>
+      </div>
+      <div id="statusbar">
+        <span id="stats-info">元件: 0</span>
+        <span id="stats-pos">坐标: -</span>
+        <span id="stats-info2">拖动: 空白处框选 / 元件上移动 · 选中按 Del 删除</span>
+      </div>
+    </section>
+
+    <!-- ============ 右侧: 属性面板 ============ -->
+    <aside id="props">
+      <h3>属性</h3>
+      <div id="prop-body">
+        <div class="prop-empty">← 在画布中点选元件<br>或从左侧拖入元件</div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- ============ 载入弹窗 ============ -->
+  <div id="modal-load" class="modal" hidden>
+    <div class="modal-box">
+      <h3>载入已保存方案</h3>
+      <div id="load-list" class="load-list"></div>
+      <div class="modal-actions"><button id="ml-cancel">取消</button></div>
+    </div>
+  </div>
+
+  <!-- ============ 预览弹窗 ============ -->
+  <div id="modal-preview" class="modal" hidden>
+    <div class="modal-box preview-box">
+      <h3>全屏预览 (4× 放大)</h3>
+      <canvas id="screen-preview" width="1600" height="1200" style="image-rendering:pixelated;"></canvas>
+      <div class="modal-actions"><button id="mp-close">关闭</button></div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

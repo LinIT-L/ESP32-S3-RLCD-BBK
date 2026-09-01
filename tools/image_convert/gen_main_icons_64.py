@@ -40,45 +40,41 @@ import os
 from PIL import Image
 
 SRC = "/Users/linit/Desktop/完美图标"
-DST = os.path.join(os.path.dirname(__file__), "../../components/menu/icons_main.inc")
+DST = os.path.join(os.path.dirname(__file__), "../../components/ui_common/icons_main.inc")
 W = H = 64
 THRESHOLD = 128
 
 # USB 数据传输图标 (64x64), 独立数组, 供挂载/键鼠界面引用
 TRANSFER_PNG = "状态栏/数据传输.png"
-# 仿真键鼠图标: 用户放在桌面, 以该文件为准
-KEY_PNG = "/Users/linit/Desktop/仿真键鼠.png"
+# 仿真键鼠图标
+KEY_PNG = "应用管家/运维/仿真键鼠.png"
 
-# (var_name, png_relative_to_SRC)
+# (var_name, png_relative_to_SRC)  —— 顺序必须与 icons_main.inc 现有变量一致
 MAP = [
-    ("main_icon_game",      "应用管理.png"),
+    ("main_icon_game",      "应用管家.png"),
     ("main_icon_key",       KEY_PNG),
     ("main_icon_bt",        "状态栏/蓝牙.png"),
-    ("main_icon_pad",       "应用管理/程序/手柄.png"),
+    ("main_icon_pad",       "应用管家/独立游戏/手柄.png"),
     ("main_icon_vol",       "状态栏/声音/喇叭2.png"),
-    ("main_icon_sd",        "应用管理/程序/存储.png"),
+    ("main_icon_sd",        "应用管家/应用/存储.png"),
     ("main_icon_info",      "设置.png"),
-    ("main_icon_play",      "应用管理/程序/音乐.png"),
-    ("main_icon_gb",        "应用管理/引擎/GB.png"),
-    ("main_icon_book",      "应用管理/程序/阅读.png"),
-    ("main_icon_wall",      "应用管理/程序/壁纸.png"),
-    ("main_icon_pomo",      "应用管理/程序/番茄钟.png"),
-    ("main_icon_gbc",       "应用管理/引擎/GBC.png"),
-    ("main_icon_nes",       "应用管理/引擎/NES.png"),
-    ("main_icon_arduboy",   "应用管理/引擎/ArduBoy.png"),
-    ("main_icon_mini_games","应用管理/独立游戏/独立游戏1.png"),
-# V1.0.9x: 应用管理可添加的新应用占位图标 (默认不进主菜单)
-    ("main_icon_wq",        "应用管理/引擎/文曲星.png"),
-    ("main_icon_cwj",       "应用管理/引擎/暴龙机.png"),
-    ("main_icon_theme",     "应用管理/程序/白板.png"),
-    ("main_icon_net",       "应用管理/运维/网络工具.png"),
-# V1.0.9x: 故障诊断 (运维分类, 默认不进主菜单)
-    ("main_icon_diag",      "应用管理/运维/电脑诊断.png"),
-# V1.0.9x: 步步高 (主菜单独立图标)
-    ("main_icon_bbk",       "应用管理/引擎/步步高.png"),
-# 占位应用 (完美图标有, 暂无对应应用 -> 应用管理显示"未完成/开发中")
-    ("main_icon_alarm",     "应用管理/程序/闹钟.png"),
-    ("main_icon_terminal",  "应用管理/运维/终端.png"),
+    ("main_icon_play",      "应用管家/应用/音乐.png"),
+    ("main_icon_gb",        "应用管家/引擎/GB.png"),
+    ("main_icon_book",      "应用管家/应用/阅读.png"),
+    ("main_icon_wall",      "应用管家/应用/壁纸.png"),
+    ("main_icon_pomo",      "应用管家/应用/番茄钟.png"),
+    ("main_icon_gbc",       "应用管家/引擎/GBC.png"),
+    ("main_icon_nes",       "应用管家/引擎/NES.png"),
+    ("main_icon_arduboy",   "应用管家/引擎/ArduBoy.png"),
+    ("main_icon_mini_games","应用管家/独立游戏.png"),
+    ("main_icon_wq",        "应用管家/引擎/文曲星.png"),
+    ("main_icon_cwj",       "应用管家/引擎/暴龙机.png"),
+    ("main_icon_theme",     "应用管家/应用/白板.png"),
+    ("main_icon_net",       "应用管家/运维/USB网卡.png"),   # 网络工具: 源无"网络工具.png", 用 USB网卡
+    ("main_icon_diag",      "应用管家/运维/电脑诊断.png"),
+    ("main_icon_bbk",       "应用管家/引擎/步步高.png"),
+    ("main_icon_alarm",     "应用管家/应用/闹钟.png"),
+    ("main_icon_terminal",  "应用管家/运维/终端.png"),
 ]
 
 
@@ -117,25 +113,42 @@ for var, png in MAP:
     var_names.append(var)
     arrays.append(f"const uint8_t {var}[MAIN_ICON_BYTES] = {{\n{fmt(data)}\n}};")
 
+# 脚本生成的图标数 (纯完美图标库来源)
+N_GEN = len(MAP)
+# 额外手工图标 (Meshtastic/USB蓝牙/USB网卡/运维助手/编程), 位于 icons_main_extra.inc
+EXTRA = ["main_icon_meshtastic", "main_icon_usbbt", "main_icon_usbnet",
+         "main_icon_winassist", "main_icon_code"]
+N_EXTRA = len(EXTRA)
+N_TOTAL = N_GEN + N_EXTRA
+
 header = f"""/* ============================================================
  * 主菜单专用图标 (64x64 1bpp, MSB first)  由脚本批量生成
  * 来源: 桌面「完美图标」 (见 tools/image_convert/gen_main_icons_64.py)
  * 原生 64x64 嵌入, 不缩放.
+ * 前 {N_GEN} 个由脚本从「完美图标」生成; 后 {N_EXTRA} 个 (Meshtastic/
+ * USB蓝牙/USB网卡/运维助手/编程) 为手工图标, 定义见 icons_main_extra.inc.
  * ============================================================
  */
 #define MAIN_ICON_W {W}
 #define MAIN_ICON_H {H}
 #define MAIN_ICON_BYTES (({W}*{H})/8)
-#define MAIN_ICON_COUNT {len(MAP)}
+#define MAIN_ICON_COUNT {N_TOTAL}
 
 """
 
 body = "\n\n".join(arrays)
-icon_list = "\n".join(f"    {v}," for v in var_names)
+icon_list = "\n".join(f"    {v}," for v in var_names + EXTRA)
 footer = f"""
 const uint8_t *main_icons[MAIN_ICON_COUNT] = {{
 {icon_list}
 }};
+"""
+
+# 手工图标定义 (外部 .inc, 由 #include 引入, 脚本不重新生成).
+# 必须位于 main_icons[] 表之前, 否则表引用不到这些变量.
+extra_arr = f"""
+/* ===== 手工图标 (icons_main_extra.inc, 非脚本生成) ===== */
+#include "icons_main_extra.inc"
 """
 
 # USB 数据传输图标: 独立数组 (不进入 main_icons, 供挂载/键鼠界面直接引用)
@@ -147,5 +160,5 @@ transfer_arr = (
 )
 
 with open(DST, "w") as f:
-    f.write(header + body + "\n\n" + footer + "\n\n" + transfer_arr + "\n")
-print(f"Wrote {DST}: {W}x{H}, {len(MAP)} icons, {bytes_per_icon} B each")
+    f.write(header + extra_arr + "\n" + body + "\n\n" + footer + "\n\n" + transfer_arr + "\n")
+print(f"Wrote {DST}: {W}x{H}, {N_TOTAL} icons ({N_GEN} 脚本 + {N_EXTRA} 手工), {bytes_per_icon} B each")

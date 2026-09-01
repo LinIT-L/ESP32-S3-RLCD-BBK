@@ -28,6 +28,9 @@ third_party_gbemu_firmware/
 # 原始 Zepp 参考源(本地参考, 构建不需要, 不入库)
 third_party/vpet-emu-zepp/
 
+# 第三方参考源码(527MB, 本地查阅用, 不入库): bluepad32 / 乐鑫方案 / 阅读器开源项目等
+reference/
+
 # ===== 主程序调试历史 / 替代实现 =====
 main/main.c.backup
 main/main_diagnostic.c

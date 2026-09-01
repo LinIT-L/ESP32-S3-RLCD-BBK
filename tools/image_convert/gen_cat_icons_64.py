@@ -13,15 +13,15 @@ import os
 from PIL import Image
 
 SRC = "/Users/linit/Desktop/完美图标"
-DST = os.path.join(os.path.dirname(__file__), "../../components/menu/cat_icons.inc")
+DST = os.path.join(os.path.dirname(__file__), "../../components/ui_common/cat_icons.inc")
 W = H = 64
 THRESHOLD = 128
 
 MAP = [
-    ("cat_icon_engine",   "应用管理/引擎/引擎.png"),
-    ("cat_icon_game",     "应用管理/独立游戏/独立游戏1.png"),
-    ("cat_icon_tool",     "应用管理/程序/程序.png"),
-    ("cat_icon_other",    "应用管理/运维/运维.png"),
+    ("cat_icon_engine",   "应用管家/引擎.png"),
+    ("cat_icon_game",     "应用管家/独立游戏.png"),
+    ("cat_icon_tool",     "应用管家/应用.png"),
+    ("cat_icon_other",    "应用管家/运维.png"),
 ]
 
 
