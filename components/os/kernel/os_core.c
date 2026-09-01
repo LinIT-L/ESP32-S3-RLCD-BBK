@@ -238,6 +238,14 @@ bool os_handle_touch(ui_ctx_t *ctx, int x, int y)
 
 void os_tick(ui_ctx_t *ctx)
 {
+    /* V1.4.x: 每帧同步"按键模拟"上下文屏蔽 — 主菜单/软件管家页直接内容不震
+     * (拖动图标/管理列表保持干净), 弹窗覆盖时 modal_active=true → 不拦截,
+     * 弹窗内点击仍有按键手感; 二级页面/软件程序照常震动. */
+    input_set_key_sim_ctx_block(
+        !ctx->modal_active &&
+        (ctx->current_page == OS_PAGE_MAIN ||
+         ctx->current_page == OS_PAGE_APP_MANAGER));
+
     for (int i = 0; i < s_service_count; i++)
         if (s_services[i]->tick) s_services[i]->tick(ctx);
     /* 屏保: 触摸长按1秒立即唤醒 (不松手); 该手势遗留动作标 pending 不穿透 */

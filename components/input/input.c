@@ -49,6 +49,11 @@
  * 无触摸:  BOOT=下一步/返回上级,  KEY=确认/直达蓝牙映射 */
 static bool s_has_touch = false;
 
+/* V1.4.x: 上下文屏蔽按键模拟震动 (按下/松手). 由 os_core 每帧驱动:
+ * 主菜单/软件管家页 = true (拖动图标/管理列表不咔哒), 弹窗/二级页/程序 = false. */
+static bool s_key_sim_ctx_block = false;
+void input_set_key_sim_ctx_block(bool block) { s_key_sim_ctx_block = block; }
+
 /* V1.1.0: 是否允许底部上滑=返回 (白板等全屏绘图页屏蔽, 避免误退) */
 static bool s_back_swipe = true;
 
@@ -463,8 +468,9 @@ static menu_action_t touch_gesture_poll(void) {
             s_tg_long_fired = false;
             /* V1.4.x: 按键模拟 — 按下瞬间立即震动 ("点击立马震", 无需等松手判定);
              * 按住 >0.5s 松手时再补一下"弹起"震动 (见释放分支). 覆盖所有触摸
-             * 按下 (页面/弹窗按钮/主菜单图标/拖动起点), os_core 导航震动跳过触摸来源. */
-            vibrator_click();
+             * 按下 (页面/弹窗按钮/主菜单图标/拖动起点), os_core 导航震动跳过触摸来源.
+             * 主菜单/软件管家页由 os_core 置 ctx_block=true 屏蔽此震动. */
+            if (!s_key_sim_ctx_block) vibrator_click();
         }
         break;
 
@@ -581,8 +587,9 @@ static menu_action_t touch_gesture_poll(void) {
             }
             /* V1.0.8x: 已删除左右/上下滑动 -> 方向键. 打开仅靠点击确定位置. */
             /* V1.4.x: 按住 >0.5s 松手 → 补一次"弹起"震动 (机械按键按下去/放上来
-             * 的段落感; 快速点击按下时已震, 此处 <0.5s 不补, 保证一次点击一声). */
-            if (dt > TOUCH_HOLD_VIB_MS) vibrator_click();
+             * 的段落感; 快速点击按下时已震, 此处 <0.5s 不补, 保证一次点击一声).
+             * 主菜单/软件管家页 (os_core 置 ctx_block) 不补. */
+            if (!s_key_sim_ctx_block && dt > TOUCH_HOLD_VIB_MS) vibrator_click();
             s_tg_state = TG_IDLE;
         }
         break;

@@ -100,6 +100,11 @@ void input_set_swipe_back(bool enable);
 /* 阅读器横滑翻页开关: 仅阅读器打开时启用, 横向滑动 -> LEFT/RIGHT 翻页 */
 void input_set_swipe_turn(bool enable);
 
+/* V1.4.x: 上下文屏蔽按键模拟震动 (按下即震 / 按住>0.5s松手补震).
+ * 主菜单/软件管家页在 os_tick 每帧置 true (拖动图标/管理列表不咔哒);
+ * 弹窗/二级页面/软件程序置 false (保持触控按键手感). 由 os_core 驱动. */
+void input_set_key_sim_ctx_block(bool block);
+
 /* V1.0.95: 返回当前触摸按住时长(ms); 未按住返回 0.
  * 供壁纸屏保"触摸需长按 1 秒才退出"判定. */
 uint32_t input_touch_hold_ms(void);
