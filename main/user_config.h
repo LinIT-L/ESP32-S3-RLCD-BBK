@@ -18,7 +18,8 @@
 /* 按键 GPIO
  * 已被 LCD 占用: 5(DC),11(SCK),12(MOSI),40(CS),41(RST)
  * 已被 I2C 占用: 13(SDA),14(SCL)
- * 已被声音占用: 6(tone_player 方波→功放, V1.0.69 起; 原 GPIO48 让给震动 EN)
+ * V1.0.70: tone_player 改走 I2S(PCM 合成→ES8311/NS4168), GPIO6 释放为闲置
+ * (旧: 6 曾为 tone_player 方波输出, 原 GPIO48 与震动 EN 冲突已移脚, 现 48 归震动)
  *
  * 板载按键 (来自 Waveshare ESP32-S3-RLCD-4.2 官方文档):
  *   BOOT = GPIO0 (输入, 上拉) → RIGHT

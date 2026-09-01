@@ -17,6 +17,11 @@ static bool s_started = false;
  * 此时所有寄存器读写都应跳过, 避免报错刷屏. */
 static bool s_present = false;
 
+/* V1.0.70: 探测结果查询. 供 audio_player 区分平台:
+ *   有 ES8311 → 官方板 (GPIO46=PA 功放使能, 静音走软静音)
+ *   无 ES8311 → 自制板 NS4168 I2S 数字功放 (GPIO46=CTRL 硬静音) */
+bool es8311_is_present(void) { return s_present; }
+
 static esp_err_t es8311_write_reg(uint8_t reg, uint8_t val) {
     if (!s_present) return ESP_OK;   /* 芯片不存在, 静默跳过 */
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();

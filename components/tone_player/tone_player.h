@@ -1,12 +1,13 @@
 /**
  * @file tone_player.h
- * @brief 简易音调播放器 (V1.0.69): LEDC PWM → GPIO6 → AXS2005B 功放 → 喇叭
+ * @brief 简易音调播放器 (V1.0.70): PCM 合成 → I2S → ES8311/NS4168 功放 → 喇叭
  *
- * V1.0.69: 输出脚 GPIO48 → GPIO6. 原 GPIO48 与震动 TM6604 EN 同脚,
- * 暴龙机启动时 tone_player_init 会抢占 LEDC 导致震动使能失效; 换至空闲 GPIO6.
+ * V1.0.70: 改为两板通用 I2S 方案 — 合成音调 PCM 经 audio_player_feed_pcm 输出,
+ * 官方板(ES8311)与自制板(NS4168 I2S 数字功放)共用同一路 I2S, 零判断.
+ * (旧版 LEDC PWM → GPIO6 方波直驱已废弃, GPIO6 释放为闲置 IO)
  * 生成常见电子声音 (开机/关机/确认/错误/闹铃) 和简单旋律, 无需解码芯片.
  * 用法:
- *   tone_player_init();              // 初始化 (幂等, 仅在音频方案=方波直驱时调用)
+ *   tone_player_init();              // 初始化 (幂等, 全局调用, 不绑定任何引擎)
  *   tone_play_effect(TONE_EFFECT_BOOT);
  *   tone_beep(880, 100);             // 单音 (阻塞 100ms)
  *   tone_play_melody(notes, n);      // 旋律 (后台任务非阻塞播放, notes 需为静态数组)
@@ -19,7 +20,7 @@
 extern "C" {
 #endif
 
-/* 初始化 LEDC PWM (GPIO6), 幂等; 返回是否就绪 */
+/* 初始化 (PCM→I2S 通道), 幂等; 全局调用, 不绑定任何引擎 */
 void tone_player_init(void);
 /* 立即静音 */
 void tone_stop(void);

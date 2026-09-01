@@ -1,13 +1,25 @@
 /**
  * @file tone_player.c
- * @brief 简易音调播放器: LEDC PWM 方波 → 功放 → 喇叭 (V1.0.68)
+ * @brief 简易音调播放器 (V1.0.70): PCM 合成 → I2S → 功放 → 喇叭
  *
- * 用 ESP32-S3 LEDC 定时器产生方波音调. 占空比控制音量 (8bit, ~10%),
- * 频率 = 音调. 功放 (AXS2005B) 输入为模拟差分口, 方波经功放后声音偏"电子音",
- * 适合提示音/按键音/简单旋律.
+ * V1.0.70 起改为"两板一固件"方案:
+ *   之前用 LEDC PWM 方波 → GPIO6 → 功放 IN+ 飞线 (仅官方板 AAXS2005 模拟功放可用,
+ *   且 V1.0.69 因 GPIO48 与震动 EN 冲突移脚到 GPIO6, 接线受限).
+ *   现在统一: 合成音调 PCM → audio_player_feed_pcm() → I2S 输出.
+ *     官方板: I2S → ES8311 → AAXS2005 功放
+ *     自制板: I2S → NS4168 (I2S 数字输入功放) 直接放大
+ *   两板同固件零判断, GPIO6 完全闲置 (释放给其它用途).
+ *
+ * 生成常见电子声音 (开机/关机/确认/错误/闹铃) 和简单旋律.
+ * 用法:
+ *   tone_player_init();              // 初始化 (幂等, 全局调用, 不绑定任何引擎)
+ *   tone_play_effect(TONE_EFFECT_BOOT);
+ *   tone_beep(880, 100);             // 单音 (阻塞 100ms)
+ *   tone_play_melody(notes, n);      // 旋律 (后台任务非阻塞播放, notes 需为静态数组)
  */
 #include "tone_player.h"
-#include "driver/ledc.h"
+#include "audio_player.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -15,71 +27,98 @@
 
 #define TAG "TONE"
 
-#define TONE_GPIO   6    /* V1.0.69: 方波输出 GPIO (飞线到功放 IN+).
-                          * 原 GPIO48 与震动 TM6604 EN 同脚冲突(暴龙机启动时
-                          * tone_player_init 抢占 LEDC, 震动使能失效),
-                          * 换至空闲 GPIO6 (user_config.h 标注 TE 线不接, 全仓无引用) */
-#define TONE_DUTY   25   /* 8bit 分辨率: ~10% 占空比 (控制音量, 避免过响削波) */
+/* PCM 采样率: 与 MP3/游戏音频同用 44100, feed_pcm 内部会重配 I2S */
+#define TONE_SR      44100
+/* 方波幅值 (int16), 避免过响削波 */
+#define TONE_AMP     6000
 
 static bool s_ready = false;
 
 void tone_player_init(void) {
     if (s_ready) return;
-    ledc_timer_config_t tc = {
-        .speed_mode     = LEDC_LOW_SPEED_MODE,
-        .timer_num      = LEDC_TIMER_0,
-        .duty_resolution = LEDC_TIMER_8_BIT,
-        .freq_hz        = 880,
-        .clk_cfg        = LEDC_AUTO_CLK,
-    };
-    if (ledc_timer_config(&tc) != ESP_OK) {
-        ESP_LOGE(TAG, "LEDC 定时器配置失败");
-        return;
-    }
-    ledc_channel_config_t ch = {
-        .gpio_num   = TONE_GPIO,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = LEDC_CHANNEL_0,
-        .timer_sel  = LEDC_TIMER_0,
-        .duty       = 0,
-        .hpoint     = 0,
-    };
-    if (ledc_channel_config(&ch) != ESP_OK) {
-        ESP_LOGE(TAG, "LEDC 通道配置失败");
-        return;
-    }
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    /* 无需硬件初始化: PCM 经 audio_player_feed_pcm 输出, 由 audio_player 管理 I2S/功放 */
     s_ready = true;
-    ESP_LOGI(TAG, "PWM 音调就绪: GPIO%d", TONE_GPIO);
+    ESP_LOGI(TAG, "音调播放器就绪 (PCM→I2S, 两板通用: ES8311/NS4168)");
 }
 
 bool tone_player_ready(void) { return s_ready; }
 
+/* 合成方波 PCM (立体声, L/R 相同) 并喂给 I2S */
+static void tone_feed(int freq_hz, int ms) {
+    if (!s_ready || ms <= 0) return;
+    int frames = TONE_SR * ms / 1000;
+    if (frames <= 0) frames = 1;
+    int16_t *buf = heap_caps_malloc((size_t)frames * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc((size_t)frames * 2 * sizeof(int16_t));
+    if (!buf) return;
+    int half = TONE_SR / (2 * freq_hz);   /* 半周期采样数 */
+    if (half < 1) half = 1;
+    for (int i = 0; i < frames; i++) {
+        int16_t v = ((i / half) & 1) ? -TONE_AMP : TONE_AMP;
+        buf[i * 2] = v;
+        buf[i * 2 + 1] = v;
+    }
+    audio_player_feed_pcm(buf, (size_t)frames, TONE_SR);
+    free(buf);
+}
+
+/* ============ 持续音 (tone_tone_on / tone_stop) ============
+ * "按下持续响、松开停"语义: 后台任务循环合成方波 PCM 喂给 I2S,
+ * 直到 tone_stop() 置 0 退出并 flush 清空环形缓冲. */
+static TaskHandle_t s_cont_task = NULL;
+static volatile int  s_cont_freq = 0;
+
 void tone_stop(void) {
     if (!s_ready) return;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    if (s_cont_freq != 0 || s_cont_task) {
+        s_cont_freq = 0;                       /* 让持续音任务退出 */
+        for (int i = 0; i < 20 && s_cont_task; i++)
+            vTaskDelay(pdMS_TO_TICKS(5));      /* 最多等 100ms */
+    }
+    audio_player_flush_pcm();   /* 清空环形缓冲, 切断尾音 */
+}
+
+static void tone_cont_task(void *arg) {
+    (void)arg;
+    /* 每块 50ms 立体声 PCM (PSRAM) */
+    int frames = TONE_SR / 20;   /* 50ms @44100 */
+    int16_t *buf = heap_caps_malloc((size_t)frames * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!buf) { s_cont_task = NULL; vTaskDelete(NULL); return; }
+    while (s_cont_freq > 0) {
+        int freq = s_cont_freq;
+        int half = TONE_SR / (2 * freq);
+        if (half < 1) half = 1;
+        for (int i = 0; i < frames; i++) {
+            int16_t v = ((i / half) & 1) ? -TONE_AMP : TONE_AMP;
+            buf[i * 2] = v;
+            buf[i * 2 + 1] = v;
+        }
+        audio_player_feed_pcm(buf, (size_t)frames, TONE_SR);
+        vTaskDelay(pdMS_TO_TICKS(45));   /* 略短于块时长, 保持连续不断音 */
+    }
+    free(buf);
+    s_cont_task = NULL;
+    vTaskDelete(NULL);
 }
 
 void tone_tone_on(int freq_hz) {
     if (!s_ready) return;
     if (freq_hz < 40) freq_hz = 40;
     if (freq_hz > 20000) freq_hz = 20000;
-    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, (uint32_t)freq_hz);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, TONE_DUTY);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    if (s_cont_freq == freq_hz && s_cont_task) return;  /* 同频持续中, 幂等 */
+    tone_stop();
+    s_cont_freq = freq_hz;
+    if (xTaskCreate(tone_cont_task, "tone_cont", 2048, NULL, 5, &s_cont_task) != pdPASS) {
+        s_cont_freq = 0;
+    }
 }
 
 void tone_beep(int freq_hz, int ms) {
     if (!s_ready || ms <= 0) return;
     if (freq_hz < 40) freq_hz = 40;
     if (freq_hz > 20000) freq_hz = 20000;
-    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, (uint32_t)freq_hz);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, TONE_DUTY);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    vTaskDelay(pdMS_TO_TICKS((uint32_t)ms));
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    tone_feed(freq_hz, ms);
+    vTaskDelay(pdMS_TO_TICKS((uint32_t)ms));   /* 保持阻塞语义: 播放完再返回 */
 }
 
 void tone_play_effect(tone_effect_t e) {

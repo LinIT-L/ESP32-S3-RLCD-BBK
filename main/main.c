@@ -342,6 +342,10 @@ void app_main(void)
     /* V1.0.76: 震动马达 LEDC 初始化 (幂等, 无硬件也不影响运行) */
     vibrator_init();
 
+    /* V1.0.70: 音调播放器全局初始化 (PCM→I2S, 两板通用).
+     * 声音是固件全局功能, 不绑定任何引擎; 开机音/按键音/闹铃随时可播. */
+    tone_player_init();
+
     /* USB-BT 重启: 不清屏画 logo, 保留当前画面直接进桌面 (视作无感重启).
      * 正常启动才显示开机 Logo (1.5秒, 按 A 键跳过). */
     if (!usb_bt_is_active() && !usb_net_is_active()) {

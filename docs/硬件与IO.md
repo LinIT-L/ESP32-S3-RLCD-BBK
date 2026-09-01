@@ -34,13 +34,41 @@
 | PWR | 1 | 软关机键/锁屏 |
 | 其它方向键 | NC | 未物理连接 |
 
-## 音频（⚠️ 官方板同款 ES8311 方案）
-- **audio_player（I2S → ES8311 功放 → 喇叭）**：
-  `BCLK=GPIO9`、`WS=GPIO45`、`DOUT=GPIO8`、`MCLK=GPIO16`、`PA_EN/NS=GPIO46`
+## 音频（两板一固件：同一路 I2S，零判断）
+
+> V1.0.70 起：官方板 ES8311 与自制板 NS4168 **都吃 I2S 数字信号**，
+> 固件按 `es8311_is_present()` 自动识别平台，数据路径完全一致，无需硬件跳线。
+
+### 官方板（微雪 ESP32-S3-RLCD-4.2）
+- **audio_player（I2S → ES8311 codec → AAXS2005 功放 → 喇叭）**：
+  `BCLK=GPIO9`、`WS=GPIO45`、`DOUT=GPIO8`、`MCLK=GPIO16`、`PA_EN=GPIO46`（高=功放开）
 - **ES7210 双麦克风阵列**（I2S RX）：`DIN=GPIO10`
-- **tone_player（LEDC 方波 → 功放 IN+ 飞线，暴龙机音效）**：`GPIO6`
-  - ⚠️ V1.0.69 由 GPIO48 改为 GPIO6：原 GPIO48 与震动 TM6604 EN 同脚，
-    暴龙机启动时 tone_player_init 抢占 LEDC 导致震动使能失效，故移脚。
+
+### 自制板（NS4168 I2S 数字功放，⚠️ 本次新增接线）
+- **audio_player（I2S → NS4168 直接放大，零配置）**：与官方板**同一路 I2S**
+  `BCLK=GPIO9`→NS4168 BCLK、`WS=GPIO45`→NS4168 LRCLK、`DOUT=GPIO8`→NS4168 SDATA
+  `CTRL=GPIO46`（高=工作/右声道，低=关断静音）
+- ⚠️ NS4168 为 **I2S 数字输入**功放（ESOP8），**无需 MCLK**（GPIO16 可不接）、无输入耦合电容；
+  数据直接来自 ESP32 I2S DOUT，芯片自动提取 BCLK/LRCLK/SDATA 解码。
+- ⚠️ VDD（Pin6）直接接**电池 3.7V**（NS4168 工作范围 3.0~5.5V，3.7V 约出 1.3W@4Ω；如需最大 2.5W 可改接 5V）
+
+**NS4168 ESOP8 引脚接线表（自制板）：**
+| NS4168 引脚 | 接法 | 说明 |
+|---|---|---|
+| Pin1 CTRL | ← GPIO46 | 高=工作（右声道），低=关断（静音省电） |
+| Pin2 LRCLK | ← GPIO45 (I2S_WS) | I2S 帧时钟 = 采样率 |
+| Pin3 BCLK | ← GPIO9 (I2S_BCLK) | I2S 位时钟 |
+| Pin4 SDATA | ← GPIO8 (I2S_DOUT) | I2S 数据（2's 补码） |
+| Pin5 VoN | → 喇叭 - | 输出负端 |
+| Pin6 VDD | ← 电池 3.7V | 电源（3.0~5.5V） |
+| Pin7 GND | → GND | 地 |
+| Pin8 VoP | → 喇叭 + | 输出正端 |
+
+- **tone_player（按键音/开机音/暴龙机音效）**：V1.0.70 改走 **PCM 合成 → I2S**，
+  不再用 GPIO6 方波飞线（GPIO6 已释放为**闲置 IO**）。
+  官方板经 ES8311、自制板经 NS4168，同一路 I2S 均出声，不绑定任何引擎。
+- ⚠️ V1.0.69 曾把 tone_player 从 GPIO48 移到 GPIO6（因 48 与震动 EN 同脚冲突）；
+  V1.0.70 起 tone 走 I2S 后 GPIO6 空闲、GPIO48 归震动 EN 专用。
 
 ## 震动（⚠️ 自制板新增，官方板无此功能）
 - **TM6604 线性驱动**（SOT23-6，PWM 直驱 LRA，无寄存器上电即用）：
@@ -49,6 +77,19 @@
   - OUT±（Pin1/3）接 LRA；Pin2 GND、Pin4 VDD=3.3V
   - 原 SCL=GPIO47 空置
 - 强度：`out_set(0~100)` → 占空比 0~255（VIB_RES_MAX）
+
+## 两板接线对照（一份固件，两板通吃）
+| 信号 | 官方板（微雪） | 自制板 |
+|---|---|---|
+| 音频数据 | I2S → ES8311 → AAXS2005 功放 | I2S → NS4168 数字功放（同路 I2S） |
+| BCLK / WS / DOUT | 9 / 45 / 8 | 9 / 45 / 8（直连 NS4168） |
+| MCLK | GPIO16（ES8311 需要） | 可不接（NS4168 无 MCLK 脚） |
+| GPIO46 | PA_EN 功放使能 | NS4168 CTRL（高=工作/右声道） |
+| GPIO42 | 空闲 | TM6604 PWM（震动） |
+| GPIO48 | 空闲 | TM6604 EN（震动） |
+| GPIO6 | 闲置（tone 已改走 I2S） | 闲置（同左） |
+| 触摸 | 无 | 飞线面板（SDA=15/SCL=7/INT=17/RST=2） |
+| 麦克风 | ES7210（GPIO10 I2S RX） | 可选接 INMP441 直读（代码已支持） |
 
 ## 其它
 - I2C_NUM_0（官方板 SHTC3 温湿度 / PCF85063 RTC 预留）：`SDA=GPIO13`、`SCL=GPIO14`
@@ -71,13 +112,13 @@
 | 38 | SD CLK | 39 | SD D0 |
 | 40 | LCD CS | 41 | LCD RST |
 | 42 | 震动 PWM | 45 | I2S WS |
-| 46 | 功放 PA/NS | 48 | 震动 EN |
+| 46 | 功放 PA/NS CTRL | 48 | 震动 EN |
 
 ## GPIO 空闲清单（自制板可复用）
 以下 IO 当前**未被占用**，可自由飞线扩展：
 | GPIO | 说明 |
 |---|---|
-| **6** | ⚠️ 已被 tone_player 占用（V1.0.69 起，声音飞线） |
+| **6** | ✅ V1.0.70 起闲置（旧 tone_player 方波脚已废弃，tone 改走 I2S） |
 | 3 | 空闲（strapping 引脚，上电需拉高，慎用作输出） |
 | 19/20 | USB-OTG D-/D+（Type-C 物理脚，复用会占 USB） |
 | 43/44 | 空闲（UART0 默认 TX/RX，console 走 USB 故未用） |

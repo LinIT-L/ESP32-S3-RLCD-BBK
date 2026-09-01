@@ -349,7 +349,7 @@ static void vpet_emu_task(void *arg) {
 
 esp_err_t vpet_emu_background_init(st7305_handle_t *lcd) {
     if (lcd) s_lcd = lcd;
-    tone_player_init();
+    /* V1.0.70: tone_player 已全局初始化 (main.c), 此处不再重复初始化 */
     if (!s_rom) {
         s_rom = heap_caps_malloc(VPET_ROM_MAX_BYTES / 2 * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
         if (!s_rom) {

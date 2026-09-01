@@ -1,11 +1,17 @@
 /* MP3 音频播放器
- * - I2S 输出到 ES8311 codec
+ * - I2S 输出: 官方板 → ES8311 codec → AAXS2005 功放; 自制板 → NS4168 I2S 数字功放直驱
  * - minimp3 解码 MP3 文件
  * - 后台 FreeRTOS 任务持续解码播放
  *
- * 硬件引脚 (微雪 ESP32-S3-RLCD-4.2):
+ * 两板一固件 (V1.0.70):
+ *   官方板 (微雪 ESP32-S3-RLCD-4.2): I2S → ES8311 (I2C 配置) → 功放. GPIO46=PA_EN(高=开).
+ *   自制板 (参考官方重打 PCB): 无 ES8311 → I2S 直接喂 NS4168 (I2S 数字输入功放, 零配置).
+ *       GPIO46=NS4168 CTRL (高=工作/右声道, 低=关断静音). 数据路径同一路 I2S.
+ *   平台自动探测: es8311_is_present() 有芯片=官方板, 无=NS4168 平台.
+ *
+ * 硬件引脚:
  *   I2S_BCLK = GPIO9, I2S_WS = GPIO45, I2S_DOUT = GPIO8
- *   I2S_MCLK = GPIO16, PA_ENABLE = GPIO46
+ *   I2S_MCLK = GPIO16, PA_ENABLE/NS_CTRL = GPIO46
  *   I2C_SDA = GPIO13, I2C_SCL = GPIO14
  */
 
@@ -759,14 +765,16 @@ int audio_player_init(void) {
     }
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    if (es8311_init(I2C_SDA, I2C_SCL) != 0) {
-        /* V1.1.0: 支持"外接 NS4168 (I2S 数字功放)"方案 —— 探不到 ES8311 时不中断,
-         * 仍让 I2S 输出跑起来 (NS4168 零配置直接放大). ES8311 寄存器读写已按
-         * s_present 静默跳过, 旧板(有 ES8311)行为不变. */
-        ESP_LOGW(TAG, "ES8311 未探测到: 按外接 I2S 功放(NS4168)直驱输出");
-        s_use_ns4168_ctrl = true;   /* NS4168 平台: GPIO46 作 CTRL 静音 */
+    /* V1.0.70: 平台探测 — 有 ES8311 = 官方板; 无 ES8311 = 自制板 NS4168.
+     * 注意: es8311_init() 未检测到芯片时也返回 0, 必须用 es8311_is_present() 判断!
+     * (旧逻辑 if(es8311_init()!=0) 永不成立 → NS4168 平台的 CTRL 硬静音从未生效,
+     *  静音时只能靠 ES8311 软静音(芯片不存在被跳过) → 自制板静音无效) */
+    es8311_init(I2C_SDA, I2C_SCL);
+    if (!es8311_is_present()) {
+        ESP_LOGW(TAG, "未探测到 ES8311: 按 NS4168 I2S 数字功放直驱 (CTRL=GPIO46)");
+        s_use_ns4168_ctrl = true;   /* NS4168 平台: GPIO46 作 CTRL 硬静音 (高=工作, 低=关断) */
     } else {
-        s_use_ns4168_ctrl = false;  /* 旧板 ES8311: GPIO46 仍归功放使能 */
+        s_use_ns4168_ctrl = false;  /* 官方板 ES8311: GPIO46 仍归功放使能, 静音走软静音 */
     }
 
     /* 探测板载/外接麦克风 ADC(ES7210), 仅日志; 无 ES7210 时麦克风走 INMP441 直读 I2S(GPIO10) */
@@ -933,7 +941,7 @@ static bool ns_ctrl_pin_ok(int pin) {
     if (pin >= 33 && pin <= 37) return false;
     return true;
 }
-/* NS4168 CTRL (GPIO48): 高=工作, 低=硬件静音. 校验不过则跳过, 不触碰硬件. */
+/* NS4168 CTRL (GPIO46): 高=工作(右声道), 低=关断(静音省电). 校验不过则跳过, 不触碰硬件. */
 static void ns_ctrl_enable(bool on) {
     if (!ns_ctrl_pin_ok(NS_CTRL_PIN)) return;
     gpio_config_t io = {

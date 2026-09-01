@@ -9,8 +9,12 @@
 
 /* 初始化 ES8311 codec (I2C + DAC 输出)
  * sda/scl: I2C 引脚
- * 返回 0=成功 */
+ * 返回 0=成功 (注意: 未检测到芯片时也返回 0, 用 es8311_is_present 判断芯片是否存在) */
 int es8311_init(int sda, int scl);
+
+/* 芯片是否真实存在 (I2C 探测结果).
+ * 用于区分平台: 有 ES8311=官方板, 无 ES8311=自制板(NS4168 I2S 数字功放直驱) */
+bool es8311_is_present(void);
 
 /* 启动播放配置 (在 I2S MCLK 启动后调用!)
  * 必须在 es8311_init() 之后、I2S 时钟就绪之后调用 */
