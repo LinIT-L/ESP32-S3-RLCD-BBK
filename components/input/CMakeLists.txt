@@ -7,4 +7,5 @@ idf_component_register(
         web_gamepad
         virtual_keys
         bt_ctl
+        vibrator
 )

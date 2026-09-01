@@ -10,6 +10,8 @@
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "bt_manager.h"
+#include "usb_bt.h"
+#include "usb_net.h"
 #include "audio_player.h"
 #include "board_battery.h"
 
@@ -61,6 +63,12 @@ esp_err_t app_board_init(app_board_t *board)
 
 void app_board_init_bt(void)
 {
+    /* USB-BT / USB网卡 激活时: 蓝牙控制器让出 (BT 供适配器独占 / 网卡避免与 WiFi 争用),
+     * 不初始化手柄蓝牙 */
+    if (usb_bt_is_active() || usb_net_is_active()) {
+        ESP_LOGI(TAG, "USB-BT/USB网卡激活: 跳过手柄蓝牙初始化 (控制器让出)");
+        return;
+    }
     /* 蓝牙栈必须在内部 RAM: esp_bt_controller_init 期间 cache 禁用,
      * PSRAM 栈会触发 esp_task_stack_is_sane_cache_disabled 断言.
      * V1.0.96: 复用 bt_manager 的初始化栈 (内部 RAM 16KB), 避免再占一份. */

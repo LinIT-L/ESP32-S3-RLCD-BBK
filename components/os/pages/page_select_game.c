@@ -13,12 +13,14 @@
 #include "gam4980_emu.h"
 #include "engine_manager.h"
 #include "input.h"
+#include "favorites.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include <string.h>
 #include <stdio.h>
+#include <dirent.h>
 
 #define TAG "PGAME"
 
@@ -39,26 +41,74 @@ static bool is_gam(const char *name) {
     return (len > 4) && (strcasecmp(name + len - 4, ".gam") == 0);
 }
 
+/* ==== 步步高: 某些分类(如"益智休闲")里的游戏放在子文件夹内, 需把"含 .gam 的文件夹"也当作一项 ==== */
+static bool gam_ends_gam(const char *s) {
+    size_t len = strlen(s);
+    return (len > 4) && (strcasecmp(s + len - 4, ".gam") == 0);
+}
+/* 在 dir 及其两层子目录内查找第一个 .gam, 找到写入 out 返回 true */
+static bool gam_find_in(const char *dir, char *out, size_t osz, int depth) {
+    DIR *d = opendir(dir);
+    if (!d) return false;
+    struct dirent *e;
+    bool found = false;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        if (gam_ends_gam(e->d_name)) { snprintf(out, osz, "%s/%s", dir, e->d_name); found = true; break; }
+    }
+    if (!found && depth < 2) {
+        rewinddir(d);
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            if (e->d_type == DT_DIR) {
+                char sub[256];
+                snprintf(sub, sizeof(sub), "%s/%s", dir, e->d_name);
+                if (gam_find_in(sub, out, osz, depth + 1)) { found = true; break; }
+            }
+        }
+    }
+    closedir(d);
+    return found;
+}
+/* 带路径过滤: 直接 .gam 文件, 或内含 .gam 的文件夹 (含子目录) */
+static bool gam_is_game_dir(const char *path, const char *name) {
+    if (gam_ends_gam(name)) return true;
+    if (name[0] == '.') return false;
+    char full[256], tmp[256];
+    snprintf(full, sizeof(full), "%s/%s", path, name);
+    return gam_find_in(full, tmp, sizeof(tmp), 0);
+}
+
 /* 右栏确认: 启动游戏 (对齐旧版 3.3 模板: init → load → run). */
 static void on_game_select(ui_ctx_t *ctx, os_pane_t *p,
                            const char *path, const char *name) {
     (void)p; (void)name;
-    ESP_LOGI(TAG, "启动: %s", path);
+    /* 步步高: 若选中项是"含 .gam 的文件夹", 先解析出内部的 .gam 再运行 */
+    char resolved[256];
+    const char *run = path;
+    if (!gam_ends_gam(path)) {
+        if (gam_find_in(path, resolved, sizeof(resolved), 0)) run = resolved;
+        else { ESP_LOGW(TAG, "未找到 .gam: %s", path); return; }
+    }
+    ESP_LOGI(TAG, "启动: %s", run);
     esp_err_t r = gam4980_emu_init(ctx->lcd);
     if (r != ESP_OK) {
         ESP_LOGE(TAG, "emu 初始化失败: %s", esp_err_to_name(r));
         return;
     }
-    if (gam4980_emu_load(path) != 0) {
-        ESP_LOGE(TAG, "游戏加载失败: %s", path);
+    if (gam4980_emu_load(run) != 0) {
+        ESP_LOGE(TAG, "游戏加载失败: %s", run);
         return;
     }
-    /* 引擎优化应用到引擎 (显示模式/虚拟按键/游戏内状态栏) */
+    /* 引擎优化应用到引擎 (显示模式/虚拟按键/游戏内状态栏/抗锯齿) */
     gam4980_set_fullscreen((int)s_gs.display_mode);
     gam4980_set_vkey((int)s_gs.vkey);
     gam4980_set_status_bar(s_gs.statusbar != 0);
+    gam4980_set_pic_opt((int)s_gs.pic_opt);   /* 抗锯齿 (0=关 1=EPX) */
     input_set_gamepad_nav_enabled(false);
+    input_set_gamepad_gamemode(true);   /* V1.3.x: 步步高也是"游戏" — 暗黑UI模式(除游戏外反色)进入时恢复不反色 */
     gam4980_emu_run();
+    input_set_gamepad_gamemode(false);  /* V1.3.x: 退出步步高, 结束游戏模式标志 (暗黑UI恢复反色) */
     input_set_gamepad_nav_enabled(true);
     ctx->needs_redraw = true;   /* 游戏退出后重绘列表 */
 }
@@ -117,20 +167,23 @@ static const char *gs_aa_name(void) { return s_gs.pic_opt ? "EPX" : "\xe5\x85\xb
 
 /* 引擎优化右栏渲染 (3.3: 左对齐, 全角空格对齐冒号, 选中行反色) */
 static void p_game_settings_render(ui_ctx_t *ctx, os_pane_t *p,
-                                   int rx0, int rx1, int y) {
-    (void)rx1;
+                                   int rx0, int rx1,
+                                   int list_y, int list_bottom, int top_row, int off_mod) {
+    (void)rx1; (void)list_bottom;
     st7305_handle_t *lcd = ctx->lcd;
     if (!lcd) return;
     char buf[64];
     for (int i = 0; i < p->settings_count; i++) {
-        switch (i) {
+        int idx = top_row + i;
+        if (idx >= p->settings_count) break;
+        switch (idx) {
         case 0: gs_pad_label(buf, sizeof(buf), 5, "\xe7\x8a\xb6\xe6\x80\x81\xe6\xa0\x8f\xe8\xae\xbe\xe7\xbd\xae", gs_sb_name()); break; /*状态栏设置*/
         case 1: gs_pad_label(buf, sizeof(buf), 5, "\xe6\x98\xbe\xe7\xa4\xba\xe6\xa8\xa1\xe5\xbc\x8f", gs_dm_name()); break; /*显示模式*/
         case 2: gs_pad_label(buf, sizeof(buf), 5, "\xe8\x99\x9a\xe6\x8b\x9f\xe6\x8c\x89\xe9\x94\xae", gs_vk_name()); break; /*虚拟按键*/
         default: gs_pad_label(buf, sizeof(buf), 5, "\xe6\x8a\x97\xe9\x94\xaf\xe9\xbd\xbf", gs_aa_name()); break; /*抗锯齿*/
         }
-        int row_y = y + i * 32;
-        bool sel = (p->focus == 1 && i == p->sel_item);
+        int row_y = list_y + i * 32 - off_mod;
+        bool sel = (p->focus == 1 && idx == p->sel_item);
         if (sel) fill_rect(lcd, rx0, row_y, rx1, row_y + 30, ST7305_COLOR_BLACK);
         draw_text(lcd, rx0 + 8, row_y + 4, buf, sel);   /* 文字垂直居中 */
     }
@@ -162,6 +215,9 @@ static void p_select_game_enter(ui_ctx_t *ctx) {
         s_gp.is_item = is_gam;
         s_gp.on_select = on_game_select;
         s_gp.all_label = NULL;
+        /* 步步高收藏栏 (与其它引擎一致: 长按收藏/取消收藏) */
+        s_gp.fav_enabled = true;
+        s_gp.fav_engine = FAV_ENGINE_BBK;
         /* 引擎优化合并进左栏最上方 (3.3: 选中后右栏内联设置项, 不弹窗) */
         s_gp.settings_label = "\xe5\xbc\x95\xe6\x93\x8e\xe4\xbc\x98\xe5\x8c\x96"; /* 引擎优化 */
         s_gp.settings_count = 4;
@@ -170,6 +226,7 @@ static void p_select_game_enter(ui_ctx_t *ctx) {
         s_gp.list_y = 30;   /* 3.3: 状态栏(24)下方 */
         os_pane_reset(&s_gp);
     }
+    s_gp.is_item_d = gam_is_game_dir;   /* 把含 .gam 的子文件夹也当右栏一项 (益智休闲等) */
     os_pane_build_right(&s_gp);
 }
 

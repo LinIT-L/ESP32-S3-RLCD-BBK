@@ -90,9 +90,6 @@ void bt_manager_set_key_map(func_t f, phys_t p);
 phys_t bt_manager_get_key_map(func_t f);
 /* 当前是否有任意物理输入处于按下状态 (映射启动时等待松开用). */
 bool bt_manager_any_phys_down(void);
-/* 物理键 p 是否已被其它核心功能/补充键/GB 键占用 (排除当前正在映射的 cur_f).
- * 用于核心 8 键映射时拒绝重复按键. */
-bool bt_manager_core_phys_used(phys_t p, func_t cur_f);
 
 /* ========================================================================
  *  补充按键映射 (4 个功能 → 物理输入, 独立持久化)
@@ -104,8 +101,6 @@ void bt_manager_set_sup_map(int idx, phys_t p);
 phys_t bt_manager_get_sup_map(int idx);
 void bt_manager_save_sup_map(void);
 void bt_manager_reset_sup_map(void);
-/* 物理键 p 是否已被占用 (核心映射 或 其它补充键). 用于映射时"已占用的按键无效". */
-bool bt_manager_sup_phys_used(phys_t p, int cur_idx);
 
 /* ========================================================================
  *  GB 辅助按键映射 (2 个功能: SELECT/START → 物理输入, 独立持久化)
@@ -123,8 +118,6 @@ void bt_manager_set_gb_map(int idx, phys_t p);
 phys_t bt_manager_get_gb_map(int idx);
 void bt_manager_save_gb_map(void);
 void bt_manager_reset_gb_map(void);
-/* 物理键 p 是否已被占用 (核心映射 或 其它 GB 辅助键). */
-bool bt_manager_gb_phys_used(phys_t p, int cur_idx);
 /* SELECT 或 START 是否已有任一映射 (用于进入 GB 菜单时判断是否提示映射). */
 bool bt_manager_gb_map_set(void);
 const char *bt_manager_gb_func_name(int idx);
@@ -183,6 +176,11 @@ const char *bt_manager_get_device_name(const bt_device_t *dev);
 const char *bt_manager_get_connected_device_name(void);
 bool bt_manager_connect_device(const bt_device_t *dev);
 void bt_manager_disconnect(void);
+/* 连接前清理: 删除与该设备同名/同地址的历史记录, 重置其按键配置为默认并保存,
+ * 并清除输入残留状态 (防"不按任何键映射就自动完成"的幽灵输入). */
+void bt_manager_reset_pad_clean(const bt_device_t *dev);
+/* 清除手柄输入残留状态 (虚拟按键/方向/按下锁/差分基线) */
+void bt_manager_reset_input_state(void);
 /* 设备信息页: 取当前已连接设备信息. 返回 NULL 表示无连接. */
 const btm_conn_info_t *bt_manager_get_conn_info(void);
 void bt_manager_set_connect_callback(bt_connect_cb_t cb);

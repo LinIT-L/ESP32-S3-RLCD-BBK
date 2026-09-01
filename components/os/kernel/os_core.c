@@ -7,6 +7,7 @@
  */
 #include "os.h"
 #include "os_internal.h"
+#include "vibrator.h"   /* V1.2.x: UI 震动 (菜单导航/确认) */
 #include "wallpapers.h"
 #include "favorites.h"
 #include "input.h"         /* input_touch_hold_ms: 屏保触摸长按1秒唤醒 */
@@ -47,6 +48,7 @@ void os_init(ui_ctx_t *ctx, st7305_handle_t *lcd)
     ctx->modal_active = false;
     ctx->fullscreen   = false;
     ctx->cur          = NULL;
+    ctx->map_touch    = NULL;   /* 页面级触摸映射钩子: 进入页时由模块设置, 初始必为 NULL */
     s_stack_top       = -1;
     s_cur_mod         = NULL;
     s_bg_dirty        = false;
@@ -174,6 +176,13 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
     /* 其余屏保专用动作在非屏保态下可直接忽略 */
     if (a == OS_ACTION_POWER_HINT || a == OS_ACTION_POWER_RELEASE)
         return;
+    /* 长按硬件确认键 2s → 任意页面进入蓝牙搜索模式.
+     * 例外: 应用管家 用确认键长按 3s 切换 网格/列表 视图, 此时不进入蓝牙搜索. */
+    const os_module_t *cur_m = os_cur_mod();
+    if (a == OS_ACTION_BT_SEARCH && !(cur_m && cur_m->page_id == OS_PAGE_APP_MANAGER)) {
+        os_page_gamepad_open_scan(ctx);
+        return;
+    }
 
     const os_module_t *m = os_cur_mod();
     if (!m) { ESP_LOGW(TAG, "action: no active module"); return; }
@@ -183,8 +192,22 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
         os_pop_to_main(ctx);        /* 回主菜单 (page_main static 状态保留 → 原位置) */
         return;
     }
-    /* 全屏应用按返回 → 退出确认弹窗 (确认退出 / 10秒自动退出 / 返回取消) */
-    if (a == OS_ACTION_BACK && m->fullscreen && !m->modal && !s_full_back_dlg) {
+    /* V1.2.x: UI 震动 — 非游戏态下, 方向导航 / 确认键触发单次 UI 反馈.
+     * 覆盖主菜单/设置/弹窗/应用管家/番茄钟滚轮等所有 UI 导航 (弹窗键也经此处).
+     * 游戏态不在此触发 (游戏内按键走 input 层 joypad 边沿游戏震动). */
+    if (!input_is_game_mode() &&
+        (a == OS_ACTION_UP || a == OS_ACTION_DOWN ||
+         a == OS_ACTION_LEFT || a == OS_ACTION_RIGHT ||
+         a == OS_ACTION_CONFIRM)) {
+        vibrator_tap_ui(25, 110);
+    }
+    /* 全屏应用按返回 → 退出确认弹窗 (确认退出 / 10秒自动退出 / 返回取消).
+     * 门控: 仅"游戏(分类引擎)"拦截弹"退出程序?"——引擎进 eng_task_run_loop 时
+     * input_set_gamepad_gamemode(true) 使 input_is_game_mode() 为真; 普通应用程序
+     * (如虚拟键鼠)不在此拦截, 改由各自页面 p_action 处理返回(如先弹选择菜单).
+     * 用户规范: 游戏中只有分类引擎游戏才弹"退出程序?", 应用程序不需要. */
+    if (a == OS_ACTION_BACK && m->fullscreen && !m->modal && !s_full_back_dlg
+        && input_is_game_mode()) {
         s_full_back_dlg = true;
         os_dialog_confirm_ex(ctx, "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?", /* 退出程序? */
                              10000, 0, on_full_back_confirm, NULL);
@@ -205,6 +228,8 @@ bool os_handle_touch(ui_ctx_t *ctx, int x, int y)
     }
     /* 屏保中: 轻触不唤醒 (需长按1秒), 也不穿透给底层模块 */
     if (os_screensaver_active()) return true;
+    /* 页面级触摸映射 (书架竖屏/180°): 分发前统一换算, 弹窗层与页面层同享 */
+    if (ctx->map_touch) ctx->map_touch(&x, &y);
     const os_module_t *m = os_cur_mod();
     if (!m) return false;
     if (m->touch) return m->touch(ctx, x, y);

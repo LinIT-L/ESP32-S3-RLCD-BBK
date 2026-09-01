@@ -68,6 +68,10 @@ static bool s_connected = false;
 static bool s_scanning = false;
 static bool s_suspended = false;
 static bool s_connecting = false;
+/* 蓝牙"电源开关": disable() 置真(彻底关栈), enable() 清假.
+ * 用于锁屏/屏保省电 —— 关电后自动回连任务必须停手, 不能偷偷把栈再拉起来. */
+static bool s_power_off = false;
+static void bt_reconnect_task(void *arg);   /* 前向声明: init 里启动, 定义在自动回连小节 */
 static bool s_last_connect_was_new = false;
 static bool s_pending_new = false;   /* 发起连接时判定"是否新设备", 连接成功后在 on_connected 消费 */
 
@@ -226,25 +230,6 @@ void bt_manager_poll_auto_reconnect(void)
     bt_core_scan(5);
 }
 
-/* 物理键 p 是否已被其它核心功能/补充键/GB 键占用 (排除当前正在映射的 cur_f). */
-bool bt_manager_core_phys_used(phys_t p, func_t cur_f)
-{
-    if (p < 0 || p >= PHYS_MAX) return true;
-    /* 其它核心功能占用检查 (排除自身) */
-    for (int i = 0; i < FUNC_MAX; i++) {
-        if (i != cur_f && s_map[i] == p) return true;
-    }
-    /* 补充键占用检查 */
-    for (int i = 0; i < SUP_MAX; i++) {
-        if (s_sup[i] == p) return true;
-    }
-    /* GB 辅助键占用检查 */
-    for (int i = 0; i < GB_MAP_MAX; i++) {
-        if (s_gb[i] == p) return true;
-    }
-    return false;
-}
-
 /* 当前是否有任意物理输入处于按下状态 (映射启动时等待松开用) */
 bool bt_manager_any_phys_down(void)
 {
@@ -252,7 +237,8 @@ bool bt_manager_any_phys_down(void)
 }
 
 /* 取一帧新物理按键边沿并写入 s_map[f].
- * 返回: 1=已映射, 0=无新按键, -1=按键已被其它功能占用(重复映射, 拒绝). */
+ * 返回: 1=已映射, 0=无新按键.
+ * 按用户要求: 不再做任何"按键占用/重复"阻止 —— 任意键都允许干净绑定. */
 int bt_manager_poll_new_press(func_t f)
 {
     if (f < 0 || f >= FUNC_MAX) return 0;
@@ -260,12 +246,6 @@ int bt_manager_poll_new_press(func_t f)
     if (raw < 0) return 0;
     phys_t p = raw_to_phys(raw);
     if (p == (phys_t)-1) return 0;
-    /* 已映射的物理键拒绝重复映射 */
-    if (bt_manager_core_phys_used(p, f)) {
-        ESP_LOGE(TAG, "按键映射拒绝: [%s] 物理键 %s 已被占用",
-                 bt_manager_func_name(f), bt_manager_phys_name(p));
-        return -1;
-    }
     s_map[f] = p;
     return 1;
 }
@@ -335,20 +315,6 @@ void bt_manager_reset_sup_map(void)
     memcpy(s_sup, k_default_sup, sizeof(s_sup));
 }
 
-bool bt_manager_sup_phys_used(phys_t p, int cur_idx)
-{
-    if (p < 0 || p >= PHYS_MAX) return true;
-    /* 核心映射占用检查 */
-    for (int i = 0; i < FUNC_MAX; i++) {
-        if (s_map[i] == p) return true;
-    }
-    /* 其它补充键占用检查 (排除自身) */
-    for (int i = 0; i < SUP_MAX; i++) {
-        if (i != cur_idx && s_sup[i] == p) return true;
-    }
-    return false;
-}
-
 /* ========================================================================
  *  GB 辅助映射 (SELECT/START → phys)
  * ======================================================================== */
@@ -389,20 +355,6 @@ void bt_manager_save_gb_map(void)
 void bt_manager_reset_gb_map(void)
 {
     memcpy(s_gb, k_default_gb, sizeof(s_gb));
-}
-
-bool bt_manager_gb_phys_used(phys_t p, int cur_idx)
-{
-    if (p < 0 || p >= PHYS_MAX) return true;
-    /* 核心映射占用检查 */
-    for (int i = 0; i < FUNC_MAX; i++) {
-        if (s_map[i] == p) return true;
-    }
-    /* 其它 GB 键占用检查 (排除自身) */
-    for (int i = 0; i < GB_MAP_MAX; i++) {
-        if (i != cur_idx && s_gb[i] == p) return true;
-    }
-    return false;
 }
 
 bool bt_manager_gb_map_set(void)
@@ -748,10 +700,14 @@ void bt_manager_init(void)
         memset(s_history, 0, sizeof(s_history));
     }
     s_history_count = 0;
-    uint8_t hcnt_blob = 0;
+    /* 修复: hcnt 是以 nvs_set_blob(4字节) 保存的, 若用 nvs_get_u8 读则类型不匹配,
+     * 重启后永远读不到条数 → 连接记录为空、自动回连找不到设备. 改用 blob 读取. */
+    int hcnt = 0;
+    size_t hcnt_len = sizeof(hcnt);
     nvs_init_handle();
-    if (s_nvs_open && nvs_get_u8(s_nvs, NVS_KEY_HCNT, &hcnt_blob) == ESP_OK) {
-        s_history_count = hcnt_blob;
+    if (s_nvs_open && nvs_get_blob(s_nvs, NVS_KEY_HCNT, &hcnt, &hcnt_len) == ESP_OK) {
+        s_history_count = hcnt;
+        if (s_history_count < 0) s_history_count = 0;
         if (s_history_count > BT_HISTORY_MAX) s_history_count = BT_HISTORY_MAX;
     }
 
@@ -761,6 +717,10 @@ void bt_manager_init(void)
 
     nvs_init_handle();
     (void)core_ensure_init();
+
+    /* 常驻自动回连任务 (低优先级, 省电直连上次手柄). 栈须够大: 回连会走 esp_hid/Bluedroid
+     * 连接与错误处理, 2048 过小会在 HID open 失败/重连时爆栈重启 (实测 bt_rec stack overflow). */
+    xTaskCreate(bt_reconnect_task, "bt_rec", 8192, NULL, 2, NULL);
 
     /* 本函数被 app_board 作为 "bt_init" 任务入口运行. FreeRTOS 任务函数禁止返回,
      * 完成初始化后必须删除自身 (否则报 "Task should not return" abort 重启). */
@@ -847,6 +807,33 @@ const char *bt_manager_get_connected_device_name(void)
     return s_conn_info.name;
 }
 
+void bt_manager_reset_input_state(void)
+{
+    bt_map_calibrate_start();
+}
+
+void bt_manager_reset_pad_clean(const bt_device_t *dev)
+{
+    if (!dev) return;
+    /* 删除与该设备同名/同地址的历史记录 */
+    for (int i = s_history_count - 1; i >= 0; i--) {
+        bool same_addr = memcmp(s_history[i].bd_addr, dev->bd_addr, 6) == 0;
+        bool same_name = (dev->has_name && s_history[i].has_name &&
+                          strncmp(s_history[i].name, dev->name, 32) == 0);
+        if (same_addr || same_name) bt_manager_remove_history_at(i);
+    }
+    /* 重置其按键配置为默认并保存 (清掉旧手柄可能带进来的脏配置) */
+    bt_manager_reset_key_map();
+    bt_manager_reset_sup_map();
+    bt_manager_reset_gb_map();
+    bt_manager_save_key_map();
+    bt_manager_save_sup_map();
+    bt_manager_save_gb_map();
+    /* 清除输入残留状态: 防"不按任何键映射就自动完成"的幽灵输入 */
+    bt_map_calibrate_start();
+    ESP_LOGI(TAG, "[clean] 已清理同名[%s]历史记录与配置", dev->name[0] ? dev->name : "?");
+}
+
 bool bt_manager_connect_device(const bt_device_t *dev)
 {
     if (!dev) return false;
@@ -927,12 +914,14 @@ void bt_manager_cancel_connect(void)
 
 void bt_manager_enable(void)
 {
+    s_power_off = false;   /* 显式开蓝牙: 允许自动回连 */
     s_suspended = false;
     (void)core_ensure_init();
 }
 
 void bt_manager_disable(void)
 {
+    s_power_off = true;    /* 彻底关蓝牙: 自动回连任务停手, 不再偷偷初始化 */
     bt_core_disconnect();
     bt_core_stop_scan();
     s_connected = false;
@@ -943,6 +932,53 @@ void bt_manager_disable(void)
     s_conn_info.available = false;
     s_inited = false;
     bt_core_deinit();
+}
+
+/* ========================================================================
+ *  自动回连 (省电: 直连上次地址, 不空转扫描; 退避 5s→10s→20s→封顶30s)
+ * ======================================================================== */
+#define BT_RECONNECT_POLL_MS   5000
+#define BT_RECONNECT_MAX_MS    30000
+static uint32_t s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;
+
+/* 直连最近一次手柄 (esp_hidh_dev_open 按已知地址, 无需扫描, 无线电占用极低) */
+static bool bt_try_reconnect_now(void)
+{
+    if (s_history_count <= 0) return false;
+    const bt_device_t *d = &s_history[0];   /* s_history[0] = 最近连接 */
+    esp_hid_scan_result_t fake;
+    memset(&fake, 0, sizeof(fake));
+    memcpy(fake.bda, d->bd_addr, 6);
+    fake.transport = ESP_HID_TRANSPORT_BLE;
+    fake.ble.addr_type = d->addr_type;
+    s_connecting = true;
+    if (!bt_core_connect(&fake)) {
+        s_connecting = false;   /* 立即失败(设备不在): 复位连接中状态 */
+        return false;
+    }
+    return true;   /* 成功: 状态由 on_connected 回调收敛 */
+}
+
+static void bt_reconnect_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(s_reconnect_delay_ms));
+        /* 条件: 已连接/正在连/在扫/被挂起/关电/无历史 → 都不自动回连 */
+        if (s_connected || s_connecting || s_suspended || s_power_off ||
+            bt_manager_is_scanning() || s_history_count <= 0) {
+            s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;   /* 恢复基础间隔 */
+            continue;
+        }
+        if (!core_ensure_init()) continue;
+        if (bt_try_reconnect_now()) {
+            s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;   /* 连上/连上中 → 回基础间隔 */
+        } else {
+            /* 失败 → 指数退避, 封顶, 减少无效重试功耗 */
+            s_reconnect_delay_ms *= 2;
+            if (s_reconnect_delay_ms > BT_RECONNECT_MAX_MS) s_reconnect_delay_ms = BT_RECONNECT_MAX_MS;
+        }
+    }
 }
 
 bool bt_manager_is_ready(void)

@@ -1,24 +1,18 @@
 /*
- *  bt_map.c - 通用 HID 解码 + 差分回退 (全新重写, v3)
+ *  bt_map.c - 通用 HID 解码 (Bluepad32 路线, 全新重写)
  *  ---------------------------------------------------------------------------
  *  目标: 任意 HID 蓝牙手柄都能被识别、解析、映射, 不硬编码任何品牌/款式。
  *
- *  采用被广泛验证的三层策略 (参考本源, 均为真实开源实现而非自创猜想):
- *    L1 描述符解析 : 严格复刻 BTstack 的 btstack_hid_parser 算法
- *                    (刚读的源码 docs/.../external/btstack/src/btstack_hid_parser.c),
- *                    把 report descriptor 逐项提取为 (report_id, usage_page, usage,
- *                    bit_pos, bit_size, logical_min/max)。比 v2 的 ad-hoc 解析更贴近
- *                    HID 规范, 修掉了位对齐/常量(padding)位/usage 分配偏差点。
- *   L2 语义映射  : 采用 Bluepad32 的 uni_hid_parser_generic.c 语义: 轴按 logical
- *                    范围自动居中并归一化 -512..511 (max==-1 无符号修正), 十字按
- *                    logical 范围映射 8 向, 按钮按 usage 0x01.. 编号。
- *   L3 差分回退  : 很多廉价手柄(如 Q36)实际发送的报告与它自己的 descriptor 不符,
- *                    导致"按描述符"永远读不到按键。以连接后的静止帧为基准, 任何相对
- *                    基准发生变化的原始 bit 都视为一个按键, 自动分配按钮索引。该机制
- *                    不依赖任何描述符/品牌, 是真正的"任意 HID 兜底"。
- *
- *  关键: 描述符按键有效就用描述符, 若干帧都按下无效则自动切差分。轴/十字始终用
- *  描述符解码(摇杆就算报告布局不同, 归一化后也能工作)。
+ *  采用 Bluepad32 的主线策略 (参考其 uni_hid_parser_generic.c, 真实开源实现):
+ *    L1 描述符解析 : 严格复刻 BTstack 的 btstack_hid_parser 算法, 把 report descriptor
+ *                    逐项提取为 (report_id, usage_page, usage, bit_pos, bit_size,
+ *                    logical_min/max), 贴近 HID 规范, 修掉位对齐/常量位/usage 偏差。
+ *    语义映射      : 采用 Bluepad32 uni_hid_parser_generic 语义 —— 每帧全量状态:
+ *                    轴按 logical 范围自动居中并归一化 (-512..511, max==-1 无符号修正),
+ *                    十字按 logical 范围映射 8 向, 按钮按 usage 0x01..0x10 顺次解码到
+ *                    逻辑按钮 0..15。
+ *    不用差分基线 : 差分(以静止帧变化位当按钮)曾因基线采到半动帧而产生幽灵常驻按键,
+ *                    导致"任何键都提示已被占用"。现按 Bluepad32 纯描述符解码, 取消差分。
  */
 
 #include <string.h>
@@ -87,34 +81,47 @@ typedef struct {
 static map_cap_t s_caps[MAP_MAX_CAPS];
 static int s_cap_count = 0;
 
-/* 差分回退: 静止基线 + 变化位 -> 按钮索引 映射表 */
-#define DIFF_MAX_BTNS  16                       /* 与 PHYS 按钮通道上限一致 */
-static uint8_t  s_base[64];                     /* 基线帧(连接后第一个静止帧) */
-static uint8_t  s_base_len = 0;
-static bool     s_base_valid = false;
-static uint16_t s_diff_bitmap[DIFF_MAX_BTNS];   /* 每个逻辑按钮对应的 bit_index (uint16: 长报告 >32 字节不截断) */
-static int      s_diff_count = 0;
-
 /* 当前帧状态 */
-static uint8_t s_virtual_buttons[4] = {0};      /* 统一按钮位(描述符或差分) */
+static uint8_t s_virtual_buttons[4] = {0};      /* 统一按钮位(按描述符 usage 解码) */
+
+/* 统一数字方向按键 (参考 Bluepad32: 每种输入都归一化为独立数字量, 绝无共享锁)。
+ * 摇杆/十字最终都合成一个 final_hat, 再落成 4 个独立方向位 (bit0上 bit1右 bit2下 bit3左)。
+ * 每位方向都是一个"数字按钮": down=当前按下, prev=该方向自己的边沿锁。
+ * 每个方向只在自己"上升沿"上报一次, 上报后置位 prev 锁住, 直到该方向松开(回中)才回落、
+ * 才允许下一次上报 —— 四个方向互不干扰:
+ *   - 修复"摇杆只能按一次/换方向没反应": 不再用全局单锁(旧 s_locked_raw/s_armed_hat_repeat),
+ *     a 方向上完斜坡回中, b 方向立刻能触发; 摇杆回中(hat==8)即清零 s_dir_down, 全部解锁。 */
+static uint8_t s_dir_down = 0;    /* 当前按下的方向位 */
+static uint8_t s_dir_prev = 0;    /* 各方向独立的边沿/锁 */
+
 static uint8_t s_pad_hat_state = 8;
 static int s_pad_axis_raw[BT_AXIS_MAX] = {0};
 
-/* 边沿探测 */
+/* 按钮边沿探测 (32 位: 4 字节位图) */
 static uint32_t s_prev_buttons = 0;
 static uint8_t  s_prev_hat = 8;
 
-/* 方向去抖: 从中心(8)偏出才产生一次方向边沿, 返回 100+hat; 摇杆回中才可重触发 */
-static uint8_t s_armed_hat_repeat = 8;
-
-/* "按下锁定": 一个物理输入只有经历完整 按下→松开 周期后, 才会产生下一次边沿。
- * 这是"按一下配好几个按键"的根治: 映射界面推进功能时会 reset 边沿缓存, 若用户
- * 仍按住同一键, 该键会被连续识别成多个功能。锁独立于 s_prev_buttons, 跨
- * poll_reset 保持, 只有松开后才允许识别下一个键。 */
-static int s_locked_raw = -1;   /* 当前处于"按下未松开"的 raw 码 */
+/* hat 值 → 4 个方向位 (上/下/左/右, 斜向 = 相邻两方向同时置位; 8=中心复位) */
+static uint8_t hat_to_dir_bits(uint8_t hat)
+{
+    uint8_t bits = 0;
+    if (hat == 8) return 0;   /* 回中: 全部复位 */
+    if (hat == 0 || hat == 1 || hat == 7) bits |= (1u << 0);   /* 上 */
+    if (hat == 4 || hat == 3 || hat == 5) bits |= (1u << 2);   /* 下 */
+    if (hat == 6 || hat == 7 || hat == 5) bits |= (1u << 3);   /* 左 */
+    if (hat == 2 || hat == 1 || hat == 3) bits |= (1u << 1);   /* 右 */
+    return bits;
+}
 
 /* 摇杆中心是否已采 (v3: 用 Bluepad32 归一化替代人工采集中性点, 保留接口) */
 static bool s_calibrated = false;
+
+/* ---- 摇杆自动校准 (适配不同手柄的归零点/阈值/Jitter, 且仅输出四向) ---- */
+static bool  s_axis_cal_done = false;   /* 摇杆校准是否完成 */
+static int   s_axis_center[2] = {0, 0}; /* X/Y 校准归零点 (相对逻辑中点) */
+static int   s_axis_thr = 40;           /* 校准阈值 (覆盖前用保守默认) */
+static int   s_cal_min[2], s_cal_max[2];/* 采样窗口 min/max */
+static int   s_cal_frames = 0;          /* 已采样帧数 */
 
 static const int k_deadzone = 120;
 
@@ -310,73 +317,15 @@ static int32_t process_axis(const map_cap_t *cp, uint32_t value)
     return centered * 512 / range;
 }
 
-/* ---------------- L3: 差分回退 ---------------- */
-
-/* 判断某个 bit 是否落在描述符"轴/十字"字段的位范围内 (避免把摇杆模拟量当按钮).
- * 按位而非按整字节排除: 很多手柄把肩键/方向键与轴/十字挤在同一个字节里,
- * 整字节排除会把同字节的按钮误杀 —— 这正是"手柄上四个按键识别不了"的根因之一. */
-static bool bit_is_axis_region(uint16_t bit_index)
-{
-    for (int i = 0; i < s_cap_count; i++) {
-        const map_cap_t *cp = &s_caps[i];
-        if (cp->type != 1 && cp->type != 2) continue;   /* 只认轴/十字 */
-        if (bit_index >= cp->bit_pos &&
-            bit_index < (uint16_t)(cp->bit_pos + cp->bit_size)) return true;
-    }
-    return false;
-}
-
-/* 采集基线(首个静止帧)。返回 true 表示已就绪 */
-static void diff_capture_base(const uint8_t *data, uint16_t len)
-{
-    if (s_base_valid) return;
-    if (len > 64) len = 64;
-    memcpy(s_base, data, len);
-    s_base_len = len;
-    s_base_valid = true;
-    s_diff_count = 0;
-    memset(s_diff_bitmap, 0, sizeof(s_diff_bitmap));
-    BT_LOGI("diff: baseline captured (%u bytes)", (unsigned)len);
-}
-
-/* 用差分计算"当前按下按钮", 结果合并进 s_virtual_buttons[0..]
- * 判定规则: 任一 bit 相对静止基线"不同"即视为按下 —— 同时兼容 active-high
- * (基线0按下1) 与 active-low (基线1按下0) 手柄, 真正做到"任意手柄通用".
- * 轴/十字的位范围一律排除, 避免把摇杆模拟量当按钮. */
-static void diff_update_buttons(const uint8_t *data, uint16_t len)
-{
-    if (!s_base_valid) return;
-    if (len > 64) len = 64;
-
-    for (uint16_t bit_index = 0; bit_index < (uint16_t)len * 8; bit_index++) {
-        if (bit_is_axis_region(bit_index)) continue;   /* 排除轴/十字位 */
-        uint8_t byte = (uint8_t)(bit_index >> 3);
-        uint8_t bit  = (uint8_t)(bit_index & 7);
-        /* 相对基线不同 = 按下 (覆盖 active-high 与 active-low) */
-        if (((data[byte] >> bit) & 1) == ((s_base[byte] >> bit) & 1)) continue;
-
-        int idx = -1;
-        for (int i = 0; i < s_diff_count; i++) {
-            if (s_diff_bitmap[i] == bit_index) { idx = i; break; }
-        }
-        if (idx < 0 && s_diff_count < DIFF_MAX_BTNS) {
-            idx = s_diff_count++;
-            s_diff_bitmap[idx] = bit_index;
-            BT_LOGI("diff: bind new button[%d] <- raw bit %u (byte %u bit %d)",
-                    idx, bit_index, byte, bit);
-        }
-        if (idx >= 0 && idx < 32) {
-            s_virtual_buttons[idx / 8] |= (1u << (idx & 7));
-        }
-    }
-}
-
 /* ---------------- 对外接口 ---------------- */
 
 void bt_map_poll_reset(void)
 {
     s_prev_buttons = 0;
     s_prev_hat = 8;
+    /* 只清"边沿/锁"记录, 不清方向 down(由 feed 每帧刷新)。映射界面在松开后才调用本函数,
+     * 此时 s_dir_down 已为 0, 四向全部可重触发, 不会把同一键连配到多个功能。 */
+    s_dir_prev = 0;
 }
 
 bool bt_map_set_report_map(const uint8_t *desc, uint16_t len)
@@ -401,72 +350,53 @@ uint8_t bt_map_neutral(void)
 void bt_map_calibrate_start(void)
 {
     s_calibrated = false;
-    s_base_valid = false;   /* 下一个静止帧作为差分基线 */
-    s_diff_count = 0;
-    s_locked_raw = -1;      /* 全新一轮: 清除按下锁与边沿缓存, 避免上一轮污染 */
     s_prev_buttons = 0;
     s_prev_hat = 8;
-    s_armed_hat_repeat = 8;
+    /* 全新一轮: 清除方向 down/边沿锁与虚拟按钮, 避免上一轮残留污染新映射 */
+    s_dir_down = 0;
+    s_dir_prev = 0;
     /* 清除上一轮(可能来自旧手柄)残留的按键/方向状态, 避免重新连接后映射界面的
      * "请松开所有按键"因读到残留非零值而误判(实际没有按键被按下). */
     memset(s_virtual_buttons, 0, sizeof(s_virtual_buttons));
     s_pad_hat_state = 8;
+    /* 重置摇杆自动校准 (归零点/阈值需按新手柄重测) */
+    s_axis_cal_done = false;
+    s_axis_center[0] = s_axis_center[1] = 0;
+    s_axis_thr = 40;
+    s_cal_min[0] = s_cal_min[1] =  0x7FFFFFFF;
+    s_cal_max[0] = s_cal_max[1] = -0x7FFFFFFF;
+    s_cal_frames = 0;
     BT_LOGI("calibration/diff reset");
-}
-
-/* 方向去抖: 从中心(8)偏出才产生一次方向边沿, 返回 100+hat; 摇杆回中才可重触发
- * (定义见顶部静态变量区 s_armed_hat_repeat) */
-
-/* 判断某个 raw 码(按钮索引 0..31 / 方向 100+hat)当前是否仍处于"按下"状态 */
-static bool raw_is_down(int raw)
-{
-    if (raw >= 0 && raw < 32) {
-        return (s_virtual_buttons[raw / 8] >> (raw & 7)) & 1;
-    }
-    if (raw >= 100) {
-        int d = raw - 100;   /* 0上 2右 4下 6左 */
-        switch (d) {
-        case 0: return s_pad_hat_state == 0;
-        case 2: return s_pad_hat_state == 2;
-        case 4: return s_pad_hat_state == 4;
-        case 6: return s_pad_hat_state == 6;
-        }
-    }
-    return false;
 }
 
 int bt_map_poll_press(void)
 {
-    /* 按下锁定: 上一个物理输入未松开前不产生任何新边沿。
-     * 只有完整 按下→松开 周期后, 才允许识别下一个键。 */
-    if (s_locked_raw >= 0) {
-        if (raw_is_down(s_locked_raw)) return -1;
-        s_locked_raw = -1;   /* 已松开, 解锁 */
-    }
-
-    /* 统一按钮位图 -> 32 位便于边沿 */
+    /* 统一按钮位图 -> 32 位便于逐按钮做上升沿 */
     uint32_t v32 = 0;
     for (int i = 0; i < 4; i++) v32 |= ((uint32_t)s_virtual_buttons[i]) << (8 * i);
 
+    /* 1) 按钮: 每按钮独立上升沿, 只在"上次未按"时上报一次 */
     for (int b = 0; b < 32; b++) {
         uint32_t bit = 1u << b;
         if ((v32 & bit) && !(s_prev_buttons & bit)) {
             s_prev_buttons |= bit;
-            s_locked_raw = b;
-            return b;
+            return b;                 /* 按钮 raw 码 = 索引 0..31 */
         }
     }
-    if (s_pad_hat_state == 8) {
-        s_armed_hat_repeat = 8;
-    }
-    if (s_pad_hat_state != 8 && s_armed_hat_repeat == 8) {
-        s_armed_hat_repeat = s_pad_hat_state;
-        if (s_pad_hat_state == 0 || s_pad_hat_state == 2 ||
-            s_pad_hat_state == 4 || s_pad_hat_state == 6) {
-            s_locked_raw = 100 + s_pad_hat_state;
-            return 100 + s_pad_hat_state;
+    /* 已松开的按钮: prev 回落, 下次再按可重新上报 */
+    s_prev_buttons &= v32;
+
+    /* 2) 4 个独立方向: 每个方向自身上升沿上报一次, 各自锁, 互不影响.
+     *    摇杆回中 → s_dir_down 归零 → 各方向 prev 回落, 下个方向立即可用 */
+    for (int dir = 0; dir < 4; dir++) {
+        uint8_t m = (uint8_t)(1u << dir);
+        if ((s_dir_down & m) && !(s_dir_prev & m)) {
+            s_dir_prev |= m;          /* 该方向已上报, 锁住直至松开 */
+            return 100 + dir * 2;     /* dir 0上1右2下3左 → raw 100/102/104/106, 与 bt_manager.raw_to_phys 一致 */
         }
     }
+    /* 已松开的方向: prev 回落(独立锁解除), 摇杆回中即全部可重触发 */
+    s_dir_prev &= s_dir_down;
     return -1;
 }
 
@@ -478,11 +408,11 @@ bool bt_map_btn_pressed(uint8_t btn_code)
 
 bool bt_map_any_button_down(void)
 {
-    /* 任一按钮位被置位, 或十字/摇杆不在中心 (hat != 8) */
+    /* 任一按钮位被置位, 或任一方向(摇杆/十字)被推动 */
     for (int i = 0; i < 4; i++) {
         if (s_virtual_buttons[i]) return true;
     }
-    return s_pad_hat_state != 8;
+    return s_dir_down != 0;
 }
 
 bool bt_map_hat_dir(int dir)
@@ -505,9 +435,6 @@ bool bt_map_axis_active(int axis)
 bool bt_map_feed(uint8_t report_id, const uint8_t *data, uint16_t len, bt_pad_frame_t *pad)
 {
     if (!data || len == 0) return false;
-
-    /* 差分基线(连接后第一个静止帧) */
-    if (!s_base_valid) diff_capture_base(data, len);
 
     memset(s_virtual_buttons, 0, sizeof(s_virtual_buttons));
     memset(s_pad_axis_raw, 0, sizeof(s_pad_axis_raw));
@@ -546,43 +473,62 @@ bool bt_map_feed(uint8_t report_id, const uint8_t *data, uint16_t len, bt_pad_fr
                 break;
             }
             default: break;
+            }                   /* 关闭 switch */
+        } else if (cp->usage_page == USAGE_PAGE_BUTTON) {
+            /* Bluepad32 语义: 按钮 usage 0x01..0x10 → 逻辑按钮 0..15 (物理按键 1..16).
+             * 与旧版 Q36 布局一致(其描述符按钮就在 byte5/byte6). */
+            int bi = cp->usage - 0x01;        /* usage 0x01 = 按键1 的源位 */
+            if (bi >= 0 && bi < 32 && v) {
+                s_virtual_buttons[bi / 8] |= (1u << (bi & 7));
             }
-        } /* 按钮不再用描述符解码(见下) */
+        }
     }
-
-    /* 按键通道固定用"差分": 以连接后第一个静止帧为基线, 任何相对基线变高的位
-     * 即为一个按下的键。这是对廉价手柄(如 Q36 描述符与实际报告字节不符, 描述符
-     * 解码读不到/读错按键) 最通用、最可靠的解锁方案, 兼容任意 HID 手柄。
-     * 摇杆/十字仍走描述符解码(轴即使布局不同也能靠 logical 范围归一化), 互不干扰。
-     * 差分基线被采集后, 后续帧的变化位自动归到物理按钮索引。 */
-    memset(s_virtual_buttons, 0, sizeof(s_virtual_buttons));
-    diff_update_buttons(data, len);
-
-    if (pad) *pad = f;
 
     /* 方向合成: hat 只有在"非空"(真的按了十字)时才优先, 否则回落到模拟摇杆。
      * 很多手柄同时有 hat 和左右双摇杆, 若 hat 为空(8)却仍霸占方向通道, 会导致
-     * 推摇杆不产生任何方向 —— 这是实测到摇杆无响应的根因. */
-    #define AXIS_THRESHOLD 128
+     * 推摇杆不产生任何方向 —— 这是实测到摇杆无响应的根因.
+     * 摇杆走自动校准 + 四向吸附, 兼容不同手柄的归零点/阈值/Jitter. */
     uint8_t final_hat = 8;
     if (have_hat && hat != 8) {
-        final_hat = hat;
+        final_hat = hat;   /* 十字优先: 保留手柄原始 HAT (4/8 向) */
     } else if (f.have_axes) {
-        int dx = f.axis_x;
-        int dy = f.axis_y;
-        if (dx > AXIS_THRESHOLD || dx < -AXIS_THRESHOLD || dy > AXIS_THRESHOLD || dy < -AXIS_THRESHOLD) {
-            int h = 0, v = 0;
-            if (dx > AXIS_THRESHOLD) h = 1; else if (dx < -AXIS_THRESHOLD) h = -1;
-            if (dy < -AXIS_THRESHOLD) v = -1; else if (dy > AXIS_THRESHOLD) v = 1;
-            static const uint8_t hv_to_hat[3][3] = {
-                /* v=-1(上) */ {7,0,1},
-                /* v=0       */ {6,8,2},
-                /* v=1(下)   */ {5,4,3},
-            };
-            final_hat = hv_to_hat[v+1][h+1];
+        /* 采样窗口: 连接/映射开始后的首若干帧采集摇杆原始量, 求归零点与阈值 */
+        if (!s_axis_cal_done && s_cal_frames < 8) {
+            int ax = f.axis_x, ay = f.axis_y;
+            if (ax < s_cal_min[0]) s_cal_min[0] = ax;
+            if (ax > s_cal_max[0]) s_cal_max[0] = ax;
+            if (ay < s_cal_min[1]) s_cal_min[1] = ay;
+            if (ay > s_cal_max[1]) s_cal_max[1] = ay;
+            s_cal_frames++;
+            if (s_cal_frames >= 8) {
+                s_axis_center[0] = (s_cal_min[0] + s_cal_max[0]) / 2;
+                s_axis_center[1] = (s_cal_min[1] + s_cal_max[1]) / 2;
+                int spx = s_cal_max[0] - s_cal_min[0];
+                int spy = s_cal_max[1] - s_cal_min[1];
+                int thr = (spx > spy ? spx : spy) * 3 / 2 + 24;
+                if (thr < 40) thr = 40;
+                if (thr > 400) thr = 400;
+                s_axis_thr = thr;
+                s_axis_cal_done = true;
+                BT_LOGI("axis cal: center=%d,%d thr=%d", s_axis_center[0], s_axis_center[1], thr);
+            }
+        }
+        int dx = f.axis_x - s_axis_center[0];
+        int dy = f.axis_y - s_axis_center[1];
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        if (adx > s_axis_thr || ady > s_axis_thr) {
+            /* 只输出四向: 取主分量方向, 斜向吸附到最近的上下左右 */
+            if (adx >= ady) final_hat = dx > 0 ? 2 : 6;   /* 右 / 左 */
+            else            final_hat = dy < 0 ? 0 : 4;   /* 上 / 下 */
         }
     }
+    /* 按钮已由上面的描述符解码得到 (全量状态), 不再使用差分/基线.
+     * 差分函数保留但不再调用 —— 按 Bluepad32 路线, 避免基线脆弱引起的幽灵按键. */
+    if (pad) *pad = f;
+
     s_pad_hat_state = final_hat;
+    /* 方向落成 4 个独立数字方向位 (摇杆回中 final_hat==8 → 全部清零解锁) */
+    s_dir_down = hat_to_dir_bits(final_hat);
     s_calibrated = true;
 
     /* 打印关键状态(每帧一次, 便于串口定位) */

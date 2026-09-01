@@ -44,6 +44,7 @@ typedef enum {
     OS_ACTION_POWER_LOCK,  /* 软关机键点按 = 锁屏休眠 */
     OS_ACTION_POWER_HINT,  /* 软关机键 0.5s = 提示 */
     OS_ACTION_POWER_RELEASE, /* 软关机键 0.5s 后松手 */
+    OS_ACTION_BT_SEARCH,     /* 硬件确认键长按 2s = 蓝牙搜索 */
 } os_action_t;
 
 /* ==== 模块/页面 id（迁移后的页面清单, 与旧 menu_page_t 语义一一对应） ==== */
@@ -61,7 +62,6 @@ typedef enum {
     OS_PAGE_KEY_CONFIG,        /* 按键设置 */
     OS_PAGE_VOLUME,            /* 音量设置 */
     OS_PAGE_RETURN_GAME,       /* 返回游戏 */
-    OS_PAGE_FILE_BROWSER,      /* 文件浏览器 */
     OS_PAGE_MP3_PLAYER,        /* MP3 播放器 */
     OS_PAGE_GAME_SETTINGS,     /* 游戏设置 */
     OS_PAGE_GB_GAME,           /* GB 游戏 */
@@ -84,7 +84,11 @@ typedef enum {
     OS_PAGE_WIFI_KB,           /* WiFi 虚拟键盘 (终端内独立模块) */
     OS_PAGE_SPONSOR,           /* 全屏弹窗 (第5类模板: 全屏显示, 如收款二维码) */
     OS_PAGE_DIALOG,            /* 通用弹窗 (modal 覆盖页, 由 os_dialog 驱动) */
-    OS_PAGE_TOUCHTEST,         /* 多点触控测试工具 (临时调测) */
+    OS_PAGE_USB_BT,            /* USB 蓝牙适配器 (USB-BT) */
+    OS_PAGE_USB_NET,           /* USB 网卡共享 (有线/USB-RNDIS) */
+    OS_PAGE_WINASSIST,         /* 运维助手 (USB 键鼠+串口+U盘复合) */
+    OS_PAGE_PLACEHOLDER_SECURE,/* 占位应用: 安全密码机 (开发中) */
+    OS_PAGE_PLACEHOLDER_ALARM, /* 占位应用: 闹钟 (开发中) */
     OS_PAGE_COUNT
 } os_page_t;
 
@@ -126,6 +130,11 @@ struct ui_ctx {
     bool modal_active;         /* 当前是否为模态覆盖页 */
     bool fullscreen;           /* 运行时全屏覆盖 (模块 render 内设置, 帧末复位;
                                 * 阅读器/游戏等需隐藏状态栏的应用页用) */
+    /* 页面级触摸坐标映射 (可选): 如书架竖屏(左/右)与 180°(下)时, 把物理横屏坐标
+     * 换算成 UI 逻辑坐标. 页面在 enter/render 时设置, 内核在分发 tap 前与拖动
+     * 轮询 (os_pane_poll) 中统一应用, 弹窗层与页面层共用同一份映射 — 对应 3.3
+     * 书架页内手动旋转的做法. 阅读器等自管全局 input 旋转的模块不设置此钩子. */
+    void (*map_touch)(int *x, int *y);
     /* 内部(不应被模块直接触碰) */
     const os_module_t *cur;    /* 当前激活模块 */
     /* 模块私有状态一律放各自 .c, 不放这里 */
@@ -151,6 +160,7 @@ void os_pop_to_main(ui_ctx_t *ctx);
 
 /* 事件路由: 按当前模块 action(); 若模块不消费则处理全局 BACK/退栈. */
 void os_handle_action(ui_ctx_t *ctx, os_action_t a);
+void os_page_gamepad_open_scan(ui_ctx_t *ctx);   /* 长按确认键2s: 任意页进入蓝牙搜索 */
 
 /* 输入分发: 触摸 hit-test 到当前模块; 未命中返回 false (调用方可回退确认). */
 bool os_handle_touch(ui_ctx_t *ctx, int x, int y);
@@ -188,6 +198,11 @@ void os_dialog_list(ui_ctx_t *ctx, const char *title,
                     os_dialog_cb_t cb, void *ud);
 void os_dialog_confirm_ex(ui_ctx_t *ctx, const char *msg, uint32_t timeout_ms,
                           int timeout_result, os_dialog_cb_t cb, void *ud); /* 超时自动完成 */
+/* 统一退出确认 (冻结帧直绘版): 步步高/文曲星等自驱动引擎在退出点调用.
+ * 外观/交互与 os_dialog_confirm_ex 完全一致: 标题"退出程序?", 左"确定"右"取消",
+ * 手柄 LEFT=确定/RIGHT=取消 黑块选择, CONFIRM=当前选中项, BACK=取消(松手守卫),
+ * 触摸弹窗内左=确定 右=取消. 阻塞直到用户决定. 返回 true=确认退出. */
+bool os_confirm_exit_blocking(st7305_handle_t *lcd);
 void os_dialog_toast(ui_ctx_t *ctx, const char *msg);   /* 1s 自动关闭 */
 void os_dialog_draw_overlay(ui_ctx_t *ctx);             /* 全局顶层 toast 覆盖: os_render flush 前调用 */
 
@@ -200,8 +215,9 @@ typedef struct os_dlg_stack os_dlg_stack_t;
 typedef bool (*os_dlg_render_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);
 typedef bool (*os_dlg_key_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud);
 typedef void (*os_dlg_poll_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);   /* 每帧轮询 (按键映射捕获等) */
+typedef bool (*os_dlg_touch_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud); /* 可选: 自定义整层触摸(点列/按钮), true=已消费 */
 struct os_dlg_stack {
-    char  title[24];
+    char  title[32];
     char  items[60][30];   /* 列表项 (支持数值选择等长列表, 弹窗栈 4 层共 ~7.2KB) */
     int   count;
     int   sel;
@@ -210,6 +226,7 @@ struct os_dlg_stack {
     os_dlg_render_t on_render;   /* 可选: 自定义整层渲染, true=已消费 */
     os_dlg_key_t    on_key;      /* 可选: 自定义按键, true=已消费 */
     os_dlg_poll_t   on_poll;     /* 可选: 每帧轮询 (当前层激活时调用) */
+    os_dlg_touch_t  on_touch;    /* 可选: 自定义整层触摸(点列/按钮), true=已消费 */
     bool  no_footer;             /* true=无底部"返回"行 (如确认框: 确定/取消) */
     bool  small;                 /* true=小自适应确认弹窗 (退出等, 3.3 notice 样式); false=大窗 350×250 */
     bool  row_x;                 /* true=每行内容最右侧显示删除"×", 点击 x 命中该行→弹删除确认 (长按即时同义) */

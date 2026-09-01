@@ -9,5 +9,7 @@ idf_component_register(
         esp_event
         audio_player
         board_battery
+        usb_bt
+        usb_net
         driver
 )

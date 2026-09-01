@@ -218,44 +218,69 @@ void bf_breaks(const bf_ch_t *win, int cnt, uint8_t enc,
 
 void bf_layout(const bf_ch_t *win, int cnt, const uint8_t *brk,
                int rows, int line_max, int ascii_w, int cjk_w,
-               int *line_end, int *line_count, int *boundary) {
+               bool *at_para, int indent,
+               int *line_end, uint8_t *line_indent,
+               int *line_count, int *boundary) {
     int i = 0, lines = 0, x = 0, cand = -1, ls = 0;
+    bool para = (at_para && *at_para);   /* 当前行是否段落首行 (需缩进) */
+    int nl = 0;                          /* 连续换行数 (>=2 = 空行 → 新段落) */
+    int lm = line_max;                   /* 当前行有效宽度 */
+
+#define BF_LINE_CLOSE()                                   \
+    do {                                                  \
+        if (line_indent) line_indent[lines] = (uint8_t)(lm < line_max ? 1 : 0); \
+        line_end[lines++] = i;                            \
+    } while (0)
+
     while (i < cnt && lines < rows) {
         const bf_ch_t *ch = &win[i];
         if (ch->kind == BF_CH_NEWLINE) {
-            line_end[lines++] = i;
+            BF_LINE_CLOSE();
             i++;
             x = 0;
             cand = -1;
             ls = i;
-            if (lines >= rows) { *line_count = lines; *boundary = i; return; }
+            nl++;
+            if (lines >= rows) { *line_count = lines; *boundary = i; goto out; }
             continue;
+        }
+        /* 行首 (首个内容字符): 决定本行是否缩进 */
+        if (x == 0) {
+            if (nl >= 2) para = true;          /* 空行之后 = 新段落首行 */
+            lm = (para && indent > 0) ? (line_max - indent) : line_max;
+            para = false;                      /* 缩进仅作用于本行 */
+            nl = 0;
         }
         int w = (ch->kind == BF_CH_ASCII) ? ascii_w
               : (ch->kind == BF_CH_SKIP) ? 0 : cjk_w;
-        if (x + w > line_max && x > 0) {
+        if (x + w > lm && x > 0) {
             if (cand >= ls) {
-                line_end[lines++] = cand + 1;
-                if (lines >= rows) { *line_count = lines; *boundary = cand + 1; return; }
+                BF_LINE_CLOSE();
+                if (lines >= rows) { *line_count = lines; *boundary = cand + 1; goto out; }
                 i = cand + 1;
                 x = 0;
                 cand = -1;
                 ls = i;
+                nl = 0;
                 continue;
             }
-            line_end[lines++] = i;
-            if (lines >= rows) { *line_count = lines; *boundary = i; return; }
+            BF_LINE_CLOSE();
+            if (lines >= rows) { *line_count = lines; *boundary = i; goto out; }
             x = 0;
             cand = -1;
             ls = i;
+            nl = 0;
         }
         if (w > 0 && brk && brk[i]) cand = i;
         x += w;
         i++;
     }
-    line_end[lines++] = cnt;
+    BF_LINE_CLOSE();
     *line_count = lines;
     *boundary = cnt;
+out:
+    if (at_para) *at_para = (nl >= 2);
+#undef BF_LINE_CLOSE
 }
 
 /* ---------- 顺序分页 ---------- */
@@ -267,6 +292,7 @@ int bf_paginate(bf_src_t src, uint32_t fsz, uint8_t enc, uint32_t start_off,
                 uint8_t *chunk, uint32_t chunk_cap,
                 bf_ch_t *win, uint8_t *brk, uint8_t *scratch, uint32_t scratch_cap,
                 uint32_t *win_off,
+                bool *at_para, int indent,
                 uint32_t limit, bool resume_open, uint32_t *out_next) {
     uint32_t pos = start_off;
     uint32_t win_base = 0, win_len = 0;
@@ -309,7 +335,7 @@ int bf_paginate(bf_src_t src, uint32_t fsz, uint8_t enc, uint32_t start_off,
         bf_breaks(win, n, enc, brk, scratch, scratch_cap);
         int line_end[BF_MAX_LINES], line_count, boundary;
         bf_layout(win, n, brk, rows, line_max, ascii_w, cjk_w,
-                  line_end, &line_count, &boundary);
+                  at_para, indent, line_end, NULL, &line_count, &boundary);
         if (boundary >= n) {
             /* 窗口耗尽: 本页到窗口尽头结束 (文件尾或大量零宽控制符) */
             if (on_char) {

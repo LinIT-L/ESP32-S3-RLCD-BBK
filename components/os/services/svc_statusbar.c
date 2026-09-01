@@ -11,6 +11,9 @@
 #include "os.h"
 #include "ui_common.h"
 #include "status_icons12.inc"
+#include "usb_bt.h"
+#include "usb_net.h"
+#include "usb_hid.h"
 #include "esp_timer.h"
 #include <time.h>
 #include <string.h>
@@ -95,7 +98,8 @@ static void svc_render(ui_ctx_t *ctx)
     const int M  = 4;
     const int GAP = 4;
     const int text_y = sb_y + 3;
-    const int SCREEN_W = UI_SCREEN_W;
+    const int SCREEN_W = ui_screen_w();   /* 跟随屏幕宽度: 竖屏 300, 横屏 400 */
+                                            /* 竖屏时经 st7305 绘图路由进逻辑 pfb, flush 随屏旋转 */
 
     time_t now_ts = time(NULL);
     struct tm *t = localtime(&now_ts);
@@ -142,7 +146,8 @@ static void svc_render(ui_ctx_t *ctx)
     /* V1.1.1 用户需求: 状态栏默认不显示喇叭音量图标 */
 
     bool data_active = s_ops && s_ops->usb_data_active && s_ops->usb_data_active();
-    if (data_active) {
+    /* USB-BT (蓝牙适配器) 运行时不显示数据传输图标: 该图标仅电脑认到串口(MSC/CDC)时显示 */
+    if (data_active && !usb_bt_is_running()) {
         svc_draw_status_icon(lcd, right_x - STATUS_ICON_W, text_y,
                              DATA_ICON_W, DATA_ICON_H, (DATA_ICON_W + 7) / 8,
                              STATUS_ICON_W, STATUS_ICON_H, data12_icon);
@@ -155,6 +160,32 @@ static void svc_render(ui_ctx_t *ctx)
         st7305_draw_bitmap_1bit(lcd, right_x - WIFI_ICON_W, text_y,
                                 WIFI_ICON_W, WIFI_ICON_H, wifi12_icon);
         right_x -= WIFI_ICON_W + GAP;
+    }
+
+    /* USB-BT (蓝牙适配器) 运行时: 状态栏右侧画 "BLE" 小号瘦英文(8px) + 紧凑方框, 文本上下居中 */
+    if (usb_bt_is_running()) {
+        const char *s = "BLE";
+        const int n = 3;
+        const int tw = n * 8;            /* 3 个 ASCII × 8px 小号瘦英文 */
+        int tx = right_x - tw;           /* 文本右对齐 */
+        /* 先画文字 (glyph 高约 12px), 再画框: 框上下各留 1px 且不与文字行重叠, 实现上下居中 */
+        for (int i = 0; i < n; i++)
+            draw_ascii_small(lcd, tx + i * 8, 5, s[i], false);
+        draw_rect_outline(lcd, tx - 1, 4, tx + tw, 5 + 12, ST7305_COLOR_BLACK);  /* 框: y=4..17 */
+        right_x -= tw + 2 + GAP;
+    }
+
+    /* USB 网卡共享工作指示: 网卡模式运行 且 USB 被主机识别(enumerated/tud_mounted) 才显示.
+     * 未插/未被识别则不显示, 方便确认设备是否真的在工作. */
+    if (usb_net_is_running() && usb_composite_is_connected()) {
+        const char *s = "NET";
+        const int n = 3;
+        const int tw = n * 8;
+        int tx = right_x - tw;
+        for (int i = 0; i < n; i++)
+            draw_ascii_small(lcd, tx + i * 8, 5, s[i], false);
+        draw_rect_outline(lcd, tx - 1, 4, tx + tw, 5 + 12, ST7305_COLOR_BLACK);
+        right_x -= tw + 2 + GAP;
     }
 }
 

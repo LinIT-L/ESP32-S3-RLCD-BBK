@@ -29,6 +29,13 @@ typedef struct {
     int                 spi_cs;
     int                 spi_freq;
     uint8_t            *fb;
+    /* 竖屏绘制目标 (书库旋转左/右时由调用方启用): 非 NULL 时所有绘制写到 300×400
+     * 逻辑缓冲, st7305_flush 自动旋转回物理 400×300 帧缓冲再送屏. 阅读器用自己的
+     * pfb/portrait_rotate, 不启用此目标. */
+    uint8_t            *pt_pfb;
+    int                 pt_rot;
+    /* 横屏 180° 翻转工作缓冲 (rot==1 时用, 80×37 竖排暂存) . */
+    uint8_t            *r_flip1;
 } st7305_handle_t;
 
 typedef struct {
@@ -50,6 +57,13 @@ void st7305_deinit(st7305_handle_t *dev);
 void st7305_clear(st7305_handle_t *dev, st7305_color_t color);
 
 void st7305_draw_pixel(st7305_handle_t *dev, int x, int y, st7305_color_t color);
+
+/* 竖屏绘制目标开关: pfb=300×400 逻辑缓冲 (调用方分配), rot=2(左)/3(右).
+ * 启用后所有绘制写入 pfb, st7305_flush 自动旋转回物理帧缓冲再送屏; pfb=NULL 关闭. */
+void st7305_set_portrait(st7305_handle_t *dev, uint8_t *pfb, int rot);
+/* 统一旋转: rot=0 原样 / 1 横屏180°(用 flip 缓冲翻转) / 2,3 竖屏(用 buf).
+ * 书架与阅读器共用, 触摸由 input_set_screen_rotation(同值) 同步. */
+void st7305_set_rotation(st7305_handle_t *dev, int rot, uint8_t *buf);
 
 void st7305_draw_bitmap_1bit(st7305_handle_t *dev,
                               int x, int y, int w, int h,

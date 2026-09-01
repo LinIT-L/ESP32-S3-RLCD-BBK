@@ -4,6 +4,7 @@ idf_component_register(
     SRCS "wallpapers.c"
     INCLUDE_DIRS "."
     REQUIRES st7305 ui_common
+       PRIV_REQUIRES nvs_flash bt_ctl
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

@@ -22,7 +22,7 @@
 #define WP_NS "os_wp"
 
 static int s_wp_program = 0;      /* 当前壁纸程序 (0=星空) */
-static int s_wp_min     = 0;      /* 休眠时间 (0=未设置) */
+static int s_wp_min     = 3;      /* 休眠时间 (0=未设置; 默认 3 分钟) */
 
 int os_wallpaper_get_program(void) { return s_wp_program; }
 
@@ -136,6 +136,7 @@ static void wp_min_save(int v) {
         nvs_commit(h);
         nvs_close(h);
     }
+    wp_screensaver_set_delay_ms((v <= 0) ? UINT32_MAX : ((uint32_t)v * 60000UL));
 }
 static bool wp_min_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
     (void)ud;

@@ -74,8 +74,9 @@ static bool test_nes_engine(void)
     char d[128];
     snprintf(d, sizeof(d), "internal %u->%u, psram %u->%u",
              (unsigned)ifree0, (unsigned)ifree1, (unsigned)pfree0, (unsigned)pfree1);
-    bool ok = (ifree1 >= ifree0 - 4096);
-    report("S5 NES 引擎 load/run/stop + 内存回收", ok, d);
+    /* 内部 RAM 复原 (容差 4KB) + PSRAM 复原 (容差 64KB, 帧缓冲/共享池释放) */
+    bool ok = (ifree1 >= ifree0 - 4096) && (pfree1 >= pfree0 - (64 * 1024));
+    report("S5 NES 引擎 load/run/stop + 内存回收(含PSRAM)", ok, d);
     return ok;
 }
 

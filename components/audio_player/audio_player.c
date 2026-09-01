@@ -67,6 +67,11 @@ static int64_t s_file_size = 0;
 static int64_t s_elapsed_samples = 0;
 static int64_t s_total_samples = 0;
 static int  s_mp3_sample_rate = 0;
+/* V9.1: 跳转请求 (0..1000 千分比, -1=无). 由 OS 线程置位, 解码任务循环内安全执行,
+ * 避免与解码任务并发操作 s_mp3_file/解码缓冲导致竞态. */
+static int  s_seek_req_progress = -1;
+/* V9.1: 上一曲是否"自然播完" (EOF), 区别于用户主动 stop. 供页面实现循环自动切歌. */
+static bool s_natural_end = false;
 
 /* minimp3 解码器
  * V1.0.44: 移到 PSRAM, 释放 6.6KB 内部 DRAM.
@@ -597,6 +602,19 @@ static void audio_play_task(void *arg) {
         /* \u5582\u72D7: \u9632\u6B62 TWDT \u8D85\u65F6\u91CD\u542F */
         esp_task_wdt_reset();
 
+        /* 跳转 seek: OS 线程置请求, 本任务在此(播放/暂停均可)执行, 避免竞态.
+         * fseek 到目标字节 + 清空解码缓冲, 解码循环随后自动逐字节帧同步重对齐. */
+        if (s_seek_req_progress >= 0) {
+            int64_t target = (int64_t)s_seek_req_progress * s_file_size / 1000;
+            fseek(s_mp3_file, target, SEEK_SET);
+            s_mp3_buf_len = 0;
+            s_mp3_buf_pos = 0;
+            if (s_total_samples > 0)
+                s_elapsed_samples = (int64_t)s_seek_req_progress * s_total_samples / 1000;
+            s_progress = s_seek_req_progress;
+            s_seek_req_progress = -1;
+        }
+
         if (s_state == AUDIO_STATE_PAUSED) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
@@ -632,6 +650,7 @@ static void audio_play_task(void *arg) {
             }
         } else {
             if (s_mp3_buf_len == 0 || feof(s_mp3_file)) {
+                s_natural_end = true;   /* 自然播完 (区别于用户停止), 供循环自动切歌 */
                 ESP_LOGI(TAG, "\u64AD\u653E\u7ED3\u675F: %s", s_filename);
                 break;
             }
@@ -806,6 +825,8 @@ int audio_player_play(const char *filepath) {
     fseek(s_mp3_file, 0, SEEK_SET);
     s_progress = 0;
     s_elapsed_samples = 0;
+    s_natural_end = false;
+    s_seek_req_progress = -1;
 
     s_total_samples = estimate_total_samples(s_mp3_file, s_file_size);
     fseek(s_mp3_file, 0, SEEK_SET);
@@ -870,6 +891,7 @@ void audio_player_stop(void) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (s_task_handle) {
         s_stop_requested = true;
+        s_natural_end = false;   /* 用户主动停止, 不计为自然播完 */
     }
     pa_enable(false);
     xSemaphoreGive(s_mutex);
@@ -952,6 +974,23 @@ const char *audio_player_get_filename(void) {
 
 int audio_player_get_progress(void) {
     return s_progress;
+}
+
+/* V9.1: 跳转播放进度 (0..1000 千分比). 仅在播放/暂停中有效; 置请求标志,
+ * 由解码任务循环内安全执行 fseek + 清空缓冲, 随后自动帧同步重对齐 (CBR 精确, VBR 近似). */
+void audio_player_seek_to(int progress_0_1000) {
+    if (progress_0_1000 < 0) progress_0_1000 = 0;
+    if (progress_0_1000 > 1000) progress_0_1000 = 1000;
+    if (!s_task_handle || !s_mp3_file) return;   /* 未在播放无法跳转 */
+    s_seek_req_progress = progress_0_1000;
+}
+
+/* V9.1: 上一曲是否"自然播放结束" (EOF), 区别于用户主动 stop.
+ * 一次性消费: 读取即清零, 避免页面 poll 重复触发自动切歌. */
+bool audio_player_track_ended(void) {
+    bool e = s_natural_end;
+    s_natural_end = false;
+    return e;
 }
 
 bool audio_player_is_running(void) {

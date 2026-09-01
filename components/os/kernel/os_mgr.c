@@ -116,7 +116,7 @@ static void mem_tick(ui_ctx_t *ctx)
                      (unsigned)s_mem_internal, (unsigned)s_low_mem_bytes);
             os_dialog_toast(ctx, "\xe5\x86\x85\xe5\xad\x98\xe4\xbd\x8e\xe8\xad\xa6\xe5\x91\x8a"); /* 内存低警告 */
 #if CONFIG_OS_MGR_LIFE
-            engine_manager_unload_all();   /* 低内存时优先回收模拟器引擎 */
+            engine_manager_unload_all(false);   /* 低内存回收: 此刻空闲偏低, 跳过泄漏复核防误报 */
 #endif
         }
     } else if (s_mem_internal >= s_low_mem_bytes + 8192) {
@@ -144,18 +144,19 @@ static void life_tick(ui_ctx_t *ctx, uint32_t now_ms, uint32_t last_input_ms, bo
     /* 返回主菜单 → 管家及时清理引擎占用 (状态翻转即触发, 不等 60s 兜底) */
     if (on_main && !in_dialog && !s_was_on_main) {
         ESP_LOGI(TAG, "返回主菜单: 及时清理引擎占用");
-        engine_manager_unload_all();
+        engine_manager_unload_all(true);   /* 正常回主菜单: 做泄漏复核 */
     }
     /* 引擎残留兜底: 主菜单无弹窗时每 60s 回收一次 (幂等) */
     static uint32_t s_eng_last_ms = 0;
     if (on_main && !in_dialog && now_ms - s_eng_last_ms >= 60000) {
         s_eng_last_ms = now_ms;
-        engine_manager_unload_all();
+        engine_manager_unload_all(false);   /* 周期兜底: 重复卸载, 跳过泄漏复核 */
     }
     s_was_on_main = on_main;
 }
 
 /* ---- POWER: 低电量告警 (30s 采样, 不强制关外设) ---- */
+#if CONFIG_OS_MGR_POWER
 static void power_tick(ui_ctx_t *ctx, uint32_t now_ms)
 {
     if (now_ms - s_bat_last_ms < 30000) return;
@@ -175,6 +176,7 @@ static void power_tick(ui_ctx_t *ctx, uint32_t now_ms)
         s_bat_warned = false;
     }
 }
+#endif /* CONFIG_OS_MGR_POWER */
 
 void os_mgr_poll(ui_ctx_t *ctx, uint32_t now_ms, uint32_t last_input_ms, bool in_dialog)
 {

@@ -18,6 +18,7 @@ typedef enum {
     MENU_ACTION_POWER_LOCK,    /* 软关机键点按 = 锁屏休眠 */
     MENU_ACTION_POWER_HINT,    /* 软关机键 0.5s = 提示 */
     MENU_ACTION_POWER_RELEASE, /* 软关机键 0.5s 后松手 = 返回 */
+    MENU_ACTION_BT_SEARCH,     /* 硬件 KEY(确认) 长按 2s = 进入蓝牙搜索 */
 } menu_action_t;
 
 #include "touch_panel.h"   /* V1.0.xx: tp_point_t (多点触控) */
@@ -38,6 +39,28 @@ bool input_has_touch(void);
  * 终止映射流程. 默认 true, 映射启动时设 false, 结束时设 true. */
 void input_set_gamepad_nav_enabled(bool enabled);
 
+/* V1.2.x: 游戏模式标志. 只有真正进入游戏(引擎运行循环)时才置 true.
+ * 用于隔离"导航关闭时仍常开手柄返回/退出键"的检测: nav 关闭既有"游戏中"(本标志
+ * 生效, 允许返回键触发退出确认) 也有"按键映射中"(本标志为 false, 返回键照常被
+ * 当作被映射的键捕获, 绝不误触发退出). 默认 false, 进游戏置 true, 退出置 false. */
+void input_set_gamepad_gamemode(bool enabled);
+
+/* V1.2.x: 查询当前是否处于游戏模式 (引擎运行循环已置 gamemode).
+ * 供震动子系统区分"游戏内按键"(走 joypad 边沿游戏震动) 与"UI 导航"(走 UI 震动). */
+bool input_is_game_mode(void);
+
+/* V1.3.x: 游戏模式变化回调. 引擎进出游戏 (input_set_gamepad_gamemode 变化) 时立即通知,
+ * 供"暗黑UI模式"(除游戏外反色) 等按游戏态切换的机制使用 — 游戏运行是阻塞主循环的,
+ * 普通每帧 service tick 在游戏内不会执行, 必须靠此回调即时同步. */
+typedef void (*input_gamemode_cb_t)(bool enabled);
+void input_set_gamemode_cb(input_gamemode_cb_t cb);
+
+/* 全局活动标记: 游戏 joypad 有任意键按下/按住时由 input 层置位, 供 main 主循环
+ * 刷新休眠计时 (游戏输入不经 os 物理键/触摸, 否则会被误判空闲提前休眠).
+ * input_mark_activity() 由输入层调用; input_consume_activity() 由 main 每帧消费. */
+void input_mark_activity(void);
+bool input_consume_activity(void);
+
 /* 当前是否按住指定按键 (持续电平检测, 不消费任何状态机事件)
  * idx: 0 = KEY (GPIO18), 1 = BOOT (GPIO0). 返回 true 表示正在按住. */
 bool input_is_held(int idx);
@@ -50,10 +73,10 @@ bool input_consume_tap(int *x, int *y);
  * 返回 false 表示当前无手指按下. */
 bool input_get_touch_pos(int *x, int *y);
 
-/* V1.0.xx: 多点触控 — 返回当前触摸点 (最多 2 点, 已映射到屏幕坐标).
- * pts[0..1] 各点 (未按下的置 pressed=false), count 返回实际点数 (0..2).
+/* V1.1.x: 多点触控 — 返回当前触摸点 (最多 TP_MAX_POINTS=5 点, 已映射屏幕坐标).
+ * pts[0..n-1] 各点 (未按下的置 pressed=false), count 返回实际点数 (0..TP_MAX_POINTS).
  * 调用方需在 input_get_action/input_get_touch_pos 同帧读取 (依赖同一触摸缓存). */
-void input_get_touch_multi(tp_point_t pts[2], int *count);
+void input_get_touch_multi(tp_point_t pts[TP_MAX_POINTS], int *count);
 
 /* V1.0.9x: 返回本次手势按下的起点屏幕坐标 (供主菜单拖动排序判定"是否已移动").
  * 未按住或无手势时返回 false. 必须与 input_get_touch_pos 同帧/之后调用. */
@@ -73,6 +96,9 @@ void input_poll_touch(void);
 
 /* V1.1.0: 开关底部上滑=返回手势 (白板等全屏绘图页屏蔽, 避免误退) */
 void input_set_swipe_back(bool enable);
+
+/* 阅读器横滑翻页开关: 仅阅读器打开时启用, 横向滑动 -> LEFT/RIGHT 翻页 */
+void input_set_swipe_turn(bool enable);
 
 /* V1.0.95: 返回当前触摸按住时长(ms); 未按住返回 0.
  * 供壁纸屏保"触摸需长按 1 秒才退出"判定. */

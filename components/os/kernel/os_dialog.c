@@ -17,6 +17,7 @@
 #include "os.h"
 #include "ui_common.h"
 #include "input.h"
+#include "bt_manager.h"   /* os_confirm_exit_blocking: 手柄退出确认直读电平 */
 #include "esp_timer.h"
 #include "esp_attr.h"
 #include <stdio.h>
@@ -37,8 +38,8 @@ bool input_touch_start_pos(int *x, int *y);
  * 确认框: 3px 黑边框 / 标题(消息)在上 / 分隔线 / 确定·取消两行. */
 #define DLG_MARGIN  25
 #define DLG_LINE_H  40
-#define DLG_W       (UI_SCREEN_W - DLG_MARGIN * 2)   /* 350 */
-#define DLG_H       (UI_SCREEN_H - DLG_MARGIN * 2)   /* 250 */
+#define DLG_W       (ui_screen_w() - DLG_MARGIN * 2)   /* 350 (横屏) / 250 (竖屏 300 宽) */
+#define DLG_H       (ui_screen_h() - DLG_MARGIN * 2)   /* 250 (横屏) / 350 (竖屏 400 高) */
 
 static int dlg_content_count(const os_dlg_stack_t *d);   /* 前向声明 (dlg_geom 用) */
 
@@ -57,6 +58,11 @@ static void dlg_geom(const os_dlg_stack_t *d, int *x, int *y, int *w, int *h) {
             int iw = d->icon_w > 0 ? d->icon_w : 0;
             *h = 62 + ih;
             *w = 140;
+            /* 三按钮(items[2]非空): 宽度需容纳三个 24px 按钮 */
+            if (d->items[2][0]) {
+                if (text_width(d->items[0]) + text_width(d->items[1]) + text_width(d->items[2]) + 24 > *w)
+                    *w = text_width(d->items[0]) + text_width(d->items[1]) + text_width(d->items[2]) + 24;
+            }
             if (iw + 24 > *w) *w = iw + 24;   /* 图标左右各留 12px */
         } else {
             /* 固定小窗: 宽随标题文字自适应 (最小 140), 高 74.
@@ -65,16 +71,16 @@ static void dlg_geom(const os_dlg_stack_t *d, int *x, int *y, int *w, int *h) {
             if (tw + 24 > *w) *w = tw + 24;   /* 左右各留 12px */
             *h = 74;
         }
-        if (*w > UI_SCREEN_W - 40) *w = UI_SCREEN_W - 40;   /* 极限: 屏宽-40 */
+        if (*w > ui_screen_w() - 40) *w = ui_screen_w() - 40;   /* 极限: 屏宽-40 */
         /* fix_w>0: 强制统一宽度 (确认框→图标窗原位变形保持同框同宽) */
         if (d->fix_w > 0) *w = d->fix_w;
-        if (*w > UI_SCREEN_W - 40) *w = UI_SCREEN_W - 40;
+        if (*w > ui_screen_w() - 40) *w = ui_screen_w() - 40;
     } else {
         *w = DLG_W;
         *h = DLG_H;
     }
-    *x = (UI_SCREEN_W - *w) / 2;
-    *y = (UI_SCREEN_H - *h) / 2;
+    *x = (ui_screen_w() - *w) / 2;
+    *y = (ui_screen_h() - *h) / 2;
 }
 
 /* 统一布局计算 (渲染/触摸/滚动共用, 保证三者几何完全一致).
@@ -145,9 +151,11 @@ static uint32_t s_toast_ms;
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 static os_dlg_stack_t *top(void) { return (s_top >= 0) ? &s_stack[s_top] : NULL; }
 
+/* 提示弹窗显示时长: 满 1 秒自动消失 (用户规范). */
+#define TOAST_MS 1000
 /* 是否需要显示 toast 提示 (有弹窗时也叠在弹窗之上显示, 1s 自动消失) */
 static bool toast_active(void) {
-    return (s_toast_msg[0] != 0) && (now_ms() - s_toast_ms < 1000);
+    return (s_toast_msg[0] != 0) && (now_ms() - s_toast_ms < TOAST_MS);
 }
 
 /* ============ 渲染 (不清屏, 覆盖在底层之上) ============ */
@@ -187,10 +195,10 @@ static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
 static void dlg_draw_toast(st7305_handle_t *lcd) {
     int tw = text_width(s_toast_msg);
     int w = 3 * 2 + 3 * 2 + tw;
-    if (w > UI_SCREEN_W - 40) w = UI_SCREEN_W - 40;
+    if (w > ui_screen_w() - 40) w = ui_screen_w() - 40;
     const int h = 36;
-    int x0 = (UI_SCREEN_W - w) / 2;
-    int y0 = (UI_SCREEN_H - h) / 2;
+    int x0 = (ui_screen_w() - w) / 2;
+    int y0 = (ui_screen_h() - h) / 2;
     fill_rect(lcd, x0, y0, x0 + w - 1, y0 + h - 1, ST7305_COLOR_WHITE);
     for (int k = 0; k < 3; k++) {
         draw_hline(lcd, x0 + k, x0 + w - 1 - k, y0 + k, ST7305_COLOR_BLACK);
@@ -243,12 +251,26 @@ static void dlg_render(ui_ctx_t *ctx) {
         if (d->icon_w > 0 && d->icon_h > 0)
             st7305_draw_bitmap_1bit(lcd, L.x + (L.w - d->icon_w) / 2, icon_top,
                                     d->icon_w, d->icon_h, d->icon);
-        /* 底部按钮区: 上方 2px 分隔线 + (单/双)按钮, 24px 黑字垂直居中 */
+        /* 底部按钮区: 上方 2px 分隔线 + 按钮, 24px 黑字垂直居中.
+         * 双按钮: 左右对称; 三按钮(items[2]非空): 三等分竖向并排. */
         draw_hline(lcd, L.x,     L.x + L.w - 1, btn_top,     ST7305_COLOR_BLACK);
         draw_hline(lcd, L.x,     L.x + L.w - 1, btn_top + 1, ST7305_COLOR_BLACK);
         int cy = btn_top + 2 + ((btn_bot - btn_top - 2) - 24) / 2;
         const char *lbl = d->items[0][0] ? d->items[0] : "\xe9\x80\x80\xe5\x87\xba\xe6\x8c\x82\xe8\xbd\xbd"; /* 退出挂载 */
-        if (d->items[1][0]) {
+        if (d->items[2][0]) {
+            /* 三按钮横排: 左=items[0] 中=items[1] 右=items[2] */
+            int x0 = L.x + 2, x1 = L.x + L.w - 3;
+            int w3 = (x1 - x0 + 1) / 3;
+            int seg0 = x0 + w3 - 1;
+            int seg1 = x0 + 2 * w3 - 1;
+            draw_vline(lcd, seg0,     btn_top + 2, btn_bot, ST7305_COLOR_BLACK);
+            draw_vline(lcd, seg0 + 1, btn_top + 2, btn_bot, ST7305_COLOR_BLACK);
+            draw_vline(lcd, seg1,     btn_top + 2, btn_bot, ST7305_COLOR_BLACK);
+            draw_vline(lcd, seg1 + 1, btn_top + 2, btn_bot, ST7305_COLOR_BLACK);
+            draw_text(lcd, x0 + (w3 - text_width(d->items[0])) / 2, cy, d->items[0], false);
+            draw_text(lcd, x0 + w3 + (w3 - text_width(d->items[1])) / 2, cy, d->items[1], false);
+            draw_text(lcd, x0 + 2 * w3 + (w3 - text_width(d->items[2])) / 2, cy, d->items[2], false);
+        } else if (d->items[1][0]) {
             int mid = L.x + L.w / 2;
             draw_vline(lcd, mid,     btn_top + 2, btn_bot, ST7305_COLOR_BLACK);
             draw_vline(lcd, mid + 1, btn_top + 2, btn_bot, ST7305_COLOR_BLACK);
@@ -287,21 +309,21 @@ static void dlg_render(ui_ctx_t *ctx) {
         int mid = L.x + L.w / 2;                      /* 正中分割竖线 x (2px) */
         const char *s0 = d->items[0][0] ? d->items[0] : "\xe7\xa1\xae\xe5\xae\x9a"; /* 确定 */
         const char *s1 = d->items[1][0] ? d->items[1] : "\xe5\x8f\x96\xe6\xb6\x88"; /* 取消 */
-        /* 按钮区白底 (内部, 不覆盖弹窗左右边框) */
-        fill_rect(lcd, bx0, by, mid - 1, bot, ST7305_COLOR_WHITE);
-        fill_rect(lcd, mid + 1, by, bx1, bot, ST7305_COLOR_WHITE);
+        /* 按钮区白底/黑底 (选中侧=d->sel 加黑, 手柄 LEFT/RIGHT 切换选择) */
+        fill_rect(lcd, bx0, by, mid - 1, bot, (d->sel == 0) ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+        fill_rect(lcd, mid + 1, by, bx1, bot, (d->sel == 1) ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
         /* 顶部横线: 左右连接到弹窗边框 (L.x .. L.x+w-1) */
         draw_hline(lcd, L.x,     L.x + L.w - 1, by,     ST7305_COLOR_BLACK);
         draw_hline(lcd, L.x,     L.x + L.w - 1, by + 1, ST7305_COLOR_BLACK);
         /* 中间竖线: 从横杠到弹窗底边框 */
         draw_vline(lcd, mid,     by, bot, ST7305_COLOR_BLACK);
         draw_vline(lcd, mid + 1, by, bot, ST7305_COLOR_BLACK);
-        /* 文字各占半边居中, 黑字 (距横杠下沿5px: ty = by+7; 左右对称) */
+        /* 文字各占半边居中 (选中侧白字, 未选黑字) */
         int ty = by + 7;
         int cx0 = (bx0 + mid - 1) / 2;
         int cx1 = (mid + 2 + bx1) / 2;
-        draw_text(lcd, cx0 - text_width(s0) / 2, ty, s0, false);
-        draw_text(lcd, cx1 - text_width(s1) / 2, ty, s1, false);
+        draw_text(lcd, cx0 - text_width(s0) / 2, ty, s0, (d->sel == 0));
+        draw_text(lcd, cx1 - text_width(s1) / 2, ty, s1, (d->sel == 1));
         if (toast_active()) dlg_draw_toast(lcd);
         return;
     }
@@ -396,6 +418,9 @@ static void dlg_action(ui_ctx_t *ctx, os_action_t a) {
     }
     os_dlg_stack_t *d = top();
     if (!d) return;
+    /* 统一置脏: 任何弹窗按键都触发重绘. 修复"自定义 on_key 消费 CONFIRM/打开子弹窗
+     * 却没置脏 → 画面不刷新, 需再按一次方向键才显示"的共性缺漏 (触摸路径先置脏故正常). */
+    ctx->needs_redraw = true;
     /* 触摸长按: 先用长按位置命中弹窗行, 再交给 on_key (供"长按删除"等) */
     if (a == OS_ACTION_LONG_PRESS) {
         int tx, ty;
@@ -425,11 +450,25 @@ static void dlg_action(ui_ctx_t *ctx, os_action_t a) {
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_CONFIRM:
+        /* 物理键激活也置脏 (与触摸选中一致): 立即请求重绘, 否则界面要到下次输入才刷新 */
+        ctx->needs_redraw = true;
         if (!d->no_footer && d->sel == content_count) dlg_finish_top(ctx, -1);   /* 返回行 → 取消 */
         else dlg_finish_top(ctx, d->sel);
         break;
     case OS_ACTION_BACK:
+        ctx->needs_redraw = true;
         dlg_finish_top(ctx, -1);
+        break;
+    case OS_ACTION_LEFT:
+    case OS_ACTION_RIGHT:
+        /* 小确认框: 手柄 LEFT/RIGHT 在 确定/取消 (或三按钮) 之间切换黑块选择,
+         * CONFIRM=选中项, BACK=取消. 列表/其它弹窗左右键忽略. */
+        if (d->no_footer && d->small && d->count >= 2) {
+            int n = (d->count == 2) ? 2 : 3;
+            if (a == OS_ACTION_LEFT) d->sel = (d->sel + n - 1) % n;
+            else d->sel = (d->sel + 1) % n;
+            ctx->needs_redraw = true;
+        }
         break;
     default:
         break;
@@ -453,7 +492,14 @@ static bool dlg_touch(ui_ctx_t *ctx, int x, int y) {
         int btn_top = L.y + 22 + (d->icon_h > 0 ? d->icon_h : 0);
         int btn_bot = L.y + L.h - 6;
         if (y >= btn_top && y <= btn_bot) {
-            if (d->items[1][0])
+            if (d->items[2][0]) {
+                /* 三按钮: 三等分 左=0 中=1 右=2 */
+                int x0 = L.x + 2, x1 = L.x + L.w - 3;
+                int w3 = (x1 - x0 + 1) / 3;
+                if (x < x0 + w3) d->sel = 0;
+                else if (x < x0 + 2 * w3) d->sel = 1;
+                else d->sel = 2;
+            } else if (d->items[1][0])
                 d->sel = (x < L.x + L.w / 2) ? 0 : 1;   /* 双按钮: 左=idx0 右=idx1 */
             else
                 d->sel = 0;
@@ -475,6 +521,11 @@ static bool dlg_touch(ui_ctx_t *ctx, int x, int y) {
         }
         return true;   /* 弹窗内其他区域忽略 */
     }
+
+    /* 自定义整层渲染对话框 (非列表 count=0, 如时间/休眠滚轮): 
+     * 触摸由 on_touch 全权处理整个弹窗框 (含上部相邻值, 点列/点按钮) */
+    if (d->on_render && d->count == 0 && d->on_touch)
+        return d->on_touch(ctx, d, x, y, d->ud);
 
     /* 底部"返回"行 */
     if (!d->no_footer && y >= L.footer_y && y < L.footer_y + DLG_LINE_H) {
@@ -500,13 +551,15 @@ static bool dlg_touch(ui_ctx_t *ctx, int x, int y) {
         dlg_finish_top(ctx, d->sel);
         return true;
     }
+    /* 自定义整层触摸(非列表弹窗: 如滚轮 点列/确认/取消按钮), 弹窗框内转交回调 */
+    if (d->on_touch) return d->on_touch(ctx, d, x, y, d->ud);
     return false;
 }
 
 static void dlg_poll(ui_ctx_t *ctx) {
     /* toast 超时: 1s 后自动关闭 (回到弹出提示前的位置).
-     * 注意不能用 toast_active() 判断 (它要求 <1000ms, 与超时判断矛盾) */
-    if (s_toast_msg[0] && now_ms() - s_toast_ms >= 1000) {
+     * 注意不能用 toast_active() 判断 (它要求 <TOAST_MS, 与超时判断矛盾) */
+    if (s_toast_msg[0] && now_ms() - s_toast_ms >= TOAST_MS) {
         if (s_top < 0) os_pop(ctx);   /* 独立 toast: 关弹窗页; 叠弹窗上的提示仅清消息 */
         s_toast_msg[0] = 0;
         ctx->needs_redraw = true;
@@ -695,4 +748,97 @@ void os_dialog_toast(ui_ctx_t *ctx, const char *msg) {
 void os_dialog_draw_overlay(ui_ctx_t *ctx) {
     if (!ctx->lcd) return;
     if (toast_active()) dlg_draw_toast(ctx->lcd);
+}
+
+/* ==== 统一退出确认 (冻结帧直绘版) ====
+ * 步步高/文曲星等"自驱动游戏画面"引擎不能走 os 弹窗管道 (它们自己画帧),
+ * 故退到冻结的游戏帧上直绘同一套确认框。外观/交互与 os_dialog_confirm_ex
+ * 的 small 小确认模板完全一致 (标题"退出程序?"在上、左"确定"右"取消"、四边黑框、
+ * 手柄 LEFT=确定/RIGHT=取消 黑块选择, CONFIRM=当前选中项, BACK=取消+松手守卫,
+ * 触摸弹窗内左=确定 右=取消)。阻塞直到用户决定, 返回 true=确认退出。
+ *
+ * 输入一律直读手柄电平 (LEFT/RIGHT/CONFIRM/BACK) 并配上升沿/松手守卫, 不依赖
+ * input 层的 nav/gamemode 开关 —— 游戏内 nav 已关闭时手柄左右仍然可控, 这是与
+ * 其它自驱动引擎可靠交互的关键。物理返回/触摸仍走 input_get_action。 */
+bool os_confirm_exit_blocking(st7305_handle_t *lcd) {
+    if (!lcd) return true;
+    const int W = 140, H = 74, MID = W / 2;
+    const int BX = (ui_screen_w() - W) / 2, BY = (ui_screen_h() - H) / 2;
+    const char *s0 = "\xe7\xa1\xae\xe5\xae\x9a"; /* 确定 */
+    const char *s1 = "\xe5\x8f\x96\xe6\xb6\x88"; /* 取消 */
+    const char *title = "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?"; /* 退出程序? */
+    int sel = 0;   /* 0=确定 1=取消 */
+
+    bool conn = bt_manager_is_connected();
+    /* 各键上次电平 (上升沿触发一次) + 触发键/确认键是否还按着 (松手守卫) */
+    bool l_prev = conn && bt_manager_is_key_pressed(F_LEFT);
+    bool r_prev = conn && bt_manager_is_key_pressed(F_RIGHT);
+    bool c_prev = conn && bt_manager_is_key_pressed(F_CONFIRM);
+    bool b_prev = conn && bt_manager_is_key_pressed(F_BACK);
+    /* 进入弹窗这一刻若触发键/确认键还按着, 不立即当作确认/取消 (松手守卫) */
+    bool confirm_held = c_prev;
+    bool back_held    = b_prev;
+
+    while (1) {
+        fill_rect(lcd, BX, BY, BX + W - 1, BY + H - 1, ST7305_COLOR_WHITE);
+        for (int k = 0; k < 2; k++) {
+            draw_hline(lcd, BX + k, BX + W - 1 - k, BY + k, ST7305_COLOR_BLACK);
+            draw_hline(lcd, BX + k, BX + W - 1 - k, BY + H - 1 - k, ST7305_COLOR_BLACK);
+            draw_vline(lcd, BX + k, BY + k, BY + H - 1 - k, ST7305_COLOR_BLACK);          /* 左边线 */
+            draw_vline(lcd, BX + W - 1 - k, BY + k, BY + H - 1 - k, ST7305_COLOR_BLACK);  /* 右边线 */
+        }
+        draw_text_centered(lcd, BY + 7, title, false);
+        int by = BY + 36;
+        int bot = BY + H - 1 - 2;
+        int bx0 = BX + 2, bx1 = BX + W - 1 - 2;
+        int mid = BX + W / 2;   /* 正中分界竖线 (绝对坐标, 对齐 os_dialog small 模板) */
+        fill_rect(lcd, bx0, by, mid - 1, bot, (sel == 0) ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+        fill_rect(lcd, mid + 1, by, bx1, bot, (sel == 1) ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+        draw_hline(lcd, BX,     BX + W - 1, by,     ST7305_COLOR_BLACK);
+        draw_hline(lcd, BX,     BX + W - 1, by + 1, ST7305_COLOR_BLACK);
+        draw_vline(lcd, mid,     by, bot, ST7305_COLOR_BLACK);
+        draw_vline(lcd, mid + 1, by, bot, ST7305_COLOR_BLACK);
+        int ty = by + 7;
+        int cx0 = (bx0 + mid - 1) / 2, cx1 = (mid + 2 + bx1) / 2;
+        draw_text(lcd, cx0 - text_width(s0) / 2, ty, s0, (sel == 0));
+        draw_text(lcd, cx1 - text_width(s1) / 2, ty, s1, (sel == 1));
+        st7305_flush(lcd);
+
+        /* ---- 手柄: 直读电平上升沿, 与 nav/gamemode 无关 ---- */
+        if (conn) {
+            bool l = bt_manager_is_key_pressed(F_LEFT);
+            if (l && !l_prev) sel = 0;          /* LEFT=确定 */
+            l_prev = l;
+            bool r = bt_manager_is_key_pressed(F_RIGHT);
+            if (r && !r_prev) sel = 1;          /* RIGHT=取消 */
+            r_prev = r;
+            bool c = bt_manager_is_key_pressed(F_CONFIRM);
+            if (c && !c_prev && !confirm_held) return (sel == 0);   /* CONFIRM=当前选中项 */
+            confirm_held = confirm_held || c;
+            if (!c) confirm_held = false;
+            c_prev = c;
+            bool b = bt_manager_is_key_pressed(F_BACK);
+            if (b && !b_prev && !back_held) return false;           /* BACK=取消 */
+            back_held = back_held || b;
+            if (!b) back_held = false;
+            b_prev = b;
+        }
+
+        /* ---- 物理键 / 触摸: 走 input 层动作 ---- */
+        menu_action_t action = input_get_action();
+        if (action == MENU_ACTION_LEFT) sel = 0;
+        else if (action == MENU_ACTION_RIGHT) sel = 1;
+        else if (action == MENU_ACTION_BACK) return false;          /* 物理返回=取消 */
+        else if (action == MENU_ACTION_CONFIRM || action == MENU_ACTION_LONG_LEFT) {
+            int tx, ty2;
+            if (input_consume_tap(&tx, &ty2)) {
+                if (tx >= BX && tx < BX + W && ty2 >= BY && ty2 < BY + H)
+                    return (tx < BX + MID);                          /* 触摸: 左=确定 右=取消 */
+                continue;                                            /* 点在弹窗外 → 忽略 */
+            }
+            if (!confirm_held) return (sel == 0);                    /* 物理确认键 → 当前选中项 */
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(16));
+    }
 }

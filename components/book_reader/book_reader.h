@@ -38,10 +38,12 @@ const char *book_reader_title(void);
 bool book_reader_knock_active(void);
 
 /* 应用电子书设置: 夜间模式 / 显示页码 / 旋转方向
- * / 字体大小(0=20 1=24 2=28 3=32) / 边距(0窄 1中 2宽) / 行高(0紧凑 1标准 2宽松) / 字距(0标准 1宽松)
+ * / 字体大小(0=20 1=24 2=28 3=32) / 边距(0窄 1中 2宽) / 行高(0紧凑 1标准 2宽松)
+ * / 字距(0标准 1宽松) / 段落缩进(0关 1开)
  * 在打开书籍前或设置变更时调用 */
 void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, int rot,
-                              int fontstyle, int fontsize, int margin, int lineh, int gap);
+                              int fontstyle, int fontsize, int margin, int lineh, int gap,
+                              int indent);
 
 /* V1.1.1: 阅读菜单交给外部 (os_dialog 列表模板) 呈现.
  * 打开阅读器时置 true → 阅读器内部不再自绘菜单, 由 page_book 用列表弹窗驱动. */

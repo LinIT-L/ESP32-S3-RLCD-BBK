@@ -10,7 +10,9 @@
  */
 #include "os.h"
 #include "os_hw.h"
+#include "st7305.h"       /* st7305_set_inversion: 暗黑模式(面板反色) */
 #include "ui_common.h"
+#include "wallpapers.h" /* wp_screensaver_set_delay_ms: 设置休眠时间后更新息屏延时 */
 #include "input.h"       /* input_consume_tap / input_get_touch_pos (时间滚轮), esp_util.h */
 #include "esp_attr.h"
 #include "font_zh.h"
@@ -36,14 +38,22 @@
 /* 主菜单项 (UTF-8): 显示配置/声音调整/无线连接/系统信息/请作者喝杯饮料 (底部"返回"由 os_dialog 自动加) */
 static const char *const s_set_items[5] = {
     "\xe6\x98\xbe\xe7\xa4\xba\xe9\x85\x8d\xe7\xbd\xae",  /* 显示配置 */
-    "\xe5\xa3\xb0\xe9\x9f\xb3\xe8\xb0\x83\xe6\x95\xb4",  /* 声音调整 */
+    "\xe5\xa3\xb0\xe9\x9f\xb3\xe9\x9c\x87\xe5\x8a\xa8",  /* 声音震动 */
     "\xe6\x97\xa0\xe7\xba\xbf\xe8\xbf\x9e\xe6\x8e\xa5",  /* 无线连接 */
     "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xbf\xa1\xe6\x81\xaf",  /* 系统信息 */
     "\xe8\xaf\xb7\xe4\xbd\x9c\xe8\x80\x85\xe5\x96\x9d\xe6\x9d\xaf\xe9\xa5\xae\xe6\x96\x99",  /* 请作者喝杯饮料 */
 };
 
-/* 震动开关状态 (vibrator 无 get, 自行跟踪 + NVS) */
-static bool s_vib = true;
+/* 震动开关状态 (vibrator 无 get, 自行跟踪 + NVS). V1.2.x: 拆为 UI / 游戏 两个独立通道 */
+static bool s_vib_ui   = true;   /* UI 震动: 拖拉/菜单导航/设置调整 */
+static bool s_vib_game = true;   /* 游戏震动: 游戏内按键 */
+/* 暗黑模式三态 (V1.3.x): 0=关闭 1=暗黑UI模式(除游戏外全反色) 2=全部暗黑模式(含游戏全反色).
+ * 面板反色 (黑↔白) 由 st7305_set_inversion 实现; "暗黑UI"在进入游戏时自动恢复正常,
+ * 退出游戏恢复反色 — 由 service tick 监听 input_is_game_mode() 驱动. */
+static int s_dark = 0;   /* 0/1/2 */
+/* V1.3.x: 保存 lcd 供 gamemode 回调同步反色 (游戏阻塞主循环, service tick 不生效,
+ * 需在进出游戏瞬间由 input_set_gamemode_cb 即时调用 settings_dark_apply_lcd) */
+static st7305_handle_t *s_dark_lcd = NULL;
 
 /* ============ NVS 持久化 ============ */
 static void settings_save_u8(const char *k, uint8_t v) {
@@ -54,6 +64,34 @@ static void settings_save_u8(const char *k, uint8_t v) {
         nvs_close(h);
     }
 }
+/* 按当前暗黑模式 + 游戏态应用反色 (0=关 1=UI反色 2=全部反色).
+ * 供 开机(main) / 设置页切换 / service tick(进出游戏) 三处调用. */
+static void settings_dark_apply_lcd(st7305_handle_t *lcd) {
+    if (!lcd) return;
+    /* 反色判定: 模式2=全部反色(含游戏); 模式1=除游戏外反色; 模式0=不反色.
+     * game mode 由 input_is_game_mode() 提供 (引擎进 eng_task_run_loop 时为 true). */
+    bool inv = (s_dark == 2) || (s_dark == 1 && !input_is_game_mode());
+    st7305_set_inversion(lcd, inv);
+}
+/* 开机应用暗黑模式 (读 NVS → 面板反色). main 在 LCD 初始化后调用.
+ * V1.3.x 三态化: 新 key "darkm" 存 0/1/2; 旧 key "dark"(0/1) 仅作首次迁移 (旧 1=全局反色 → 2 全部暗黑). */
+void settings_apply_dark(st7305_handle_t *lcd) {
+    s_dark = 0;
+    s_dark_lcd = lcd;   /* V1.3.x: 保存供 gamemode 回调同步反色 (游戏阻塞主循环, service 不生效) */
+    nvs_handle_t h;
+    if (nvs_open(SET_NS, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, "darkm", &v) == ESP_OK) {
+            s_dark = (v <= 2) ? (int)v : 2;
+        } else if (nvs_get_u8(h, "dark", &v) == ESP_OK) {
+            s_dark = (v != 0) ? 2 : 0;   /* 旧 1 → 全部暗黑, 行为不变 */
+        }
+        nvs_close(h);
+    }
+    settings_dark_apply_lcd(lcd);
+}
+/* 保存暗黑模式 (写新 key "darkm", 不污染旧 key) */
+static void settings_save_dark(void) { settings_save_u8("darkm", (uint8_t)s_dark); }
 static void settings_load(void) {
     nvs_handle_t h;
     if (nvs_open(SET_NS, NVS_READONLY, &h) != ESP_OK) return;
@@ -66,7 +104,14 @@ static void settings_load(void) {
         audio_player_set_volume(pct);
     }
     if (nvs_get_u8(h, "snd_on", &v) == ESP_OK)     audio_player_set_muted(!v);
-    if (nvs_get_u8(h, "vib", &v) == ESP_OK)        { s_vib = v; vibrator_set_enabled(v); }
+    /* V1.2.x: 震动拆为 UI/游戏 两个独立开关 (NVS vib_ui / vib_game).
+     * 旧固件的单键 "vib" 仅作首次迁移: 任一缺省时取旧值. */
+    if (nvs_get_u8(h, "vib_ui", &v) == ESP_OK)        s_vib_ui = v;
+    else if (nvs_get_u8(h, "vib", &v) == ESP_OK)      s_vib_ui = v;
+    if (nvs_get_u8(h, "vib_game", &v) == ESP_OK)      s_vib_game = v;
+    else if (nvs_get_u8(h, "vib", &v) == ESP_OK)      s_vib_game = v;
+    vibrator_set_ui_enabled(s_vib_ui);
+    vibrator_set_game_enabled(s_vib_game);
     nvs_close(h);
 }
 
@@ -81,6 +126,9 @@ static void build_sysinfo(void) {
     snprintf(b, 32, "\xe5\x89\xa9\xe4\xbd\x99\xe5\x86\x85\xe5\xad\x98:%uKB", /* 剩余内存:XXKB */
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     strcpy(s_info_lines[s_info_n++], b);
+    snprintf(b, 32, "\xe5\x89\xa9\xe4\xbd\x99PSRAM:%uKB", /* 剩余PSRAM:XXKB */
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    strcpy(s_info_lines[s_info_n++], b);
     snprintf(b, 32, "\xe4\xbd\x9c\xe8\x80\x85\xe4\xbf\xa1\xe6\x81\xaf:LinIT"); /* 作者信息:LinIT */
     strcpy(s_info_lines[s_info_n++], b);
 }
@@ -94,17 +142,38 @@ static bool s_edit_valid = false;
 static int  s_time_field = 0;      /* 0=年 1=月 2=日 3=时 4=分 5=秒 */
 
 #define TIME_FIELD_N 6
-#define TIME_STEP_H  20   /* 滚轮相邻值行距 */
-#define TIME_WHEEL_SIDE 4 /* 上下各显示的相邻值个数 */
-static int s_fx[TIME_FIELD_N];   /* 字段列起始 x (渲染/点选共用, 每帧刷新) */
+#define WHEEL_W       350
+#define WHEEL_H       250   /* 与普通列表弹窗尺寸 (350×250) 一致 */
+#define WHEEL_STEP_H  30   /* 相邻值行距(加大→上下值不重叠、不触边框) */
+#define WHEEL_SIDE    2    /* 上下各显示的相邻值个数 */
+#define WHEEL_COL_MAX 3
+static int s_fx[TIME_FIELD_N];   /* 字段列起始 x (渲染/触摸共用, 每帧刷新) */
 static int s_fw[TIME_FIELD_N];   /* 字段列宽 (数值+单位) */
 static int s_time_mode = 0;      /* 0=日期(年/月/日) 1=时间(时/分/秒) */
 
+/* 休眠滚轮: 复用壁纸 NVS "min" (0=自动不息眠, 1..30 分钟) */
+#define SLEEP_NS "os_wp"
+static int s_sleep_idx = 0;      /* 休眠脚本当前档位下标 */
+static int s_wheel_sleep = 0;    /* 当前滚轮是否休眠模式 (时间=0) */
+static int s_wheel_y0 = 0;       /* 滚轮当前值行顶 y (渲染时刷新, 触摸点击选档用) */
+static const int s_sleep_mins[] = { 0, 1, 2, 3, 5, 10, 15, 20, 30 };
+#define SLEEP_MINS_N (int)(sizeof(s_sleep_mins)/sizeof(s_sleep_mins[0]))
+static int sleep_min_get(void) {
+    int v = 3;   /* 默认 3 分钟 (未在 NVS 设置时) */
+    nvs_handle_t h;
+    if (nvs_open(SLEEP_NS, NVS_READONLY, &h) == ESP_OK) {
+        int32_t t = 0;
+        if (nvs_get_i32(h, "min", &t) == ESP_OK) v = (int)t;
+        nvs_close(h);
+    }
+    return v;
+}
+static int sleep_index_of(int min) { for (int i = 0; i < SLEEP_MINS_N; i++) if (s_sleep_mins[i] == min) return i; return 0; }
+
 static void open_time_dlg(ui_ctx_t *ctx);
 static void open_time_wheel_dlg(ui_ctx_t *ctx);
-/* 当前模式字段范围 */
+/* 当前模式字段起点 (时间=时 3, 日期=年 0) */
 static int tm_first(void) { return s_time_mode ? 3 : 0; }   /* 3=时 */
-static int tm_last(void)  { return s_time_mode ? 5 : 2; }   /* 5=秒 / 2=日 */
 
 static int time_field_val(int f) {
     switch (f) {
@@ -121,9 +190,10 @@ static void time_field_str(int f, int v, char *out, size_t n) {
     else if (f < 3)  snprintf(out, n, "%d", v);      /* 月/日 不补零 */
     else             snprintf(out, n, "%02d", v);    /* 时/分/秒 补零 */
 }
-/* 是否带单位后缀 (年/月/日), 时/分/秒用冒号 */
+/* 单位后缀: 年/月/日/小时/分钟/秒 (不用冒号, 状态栏格式保持不变) */
 static const char *time_suffix(int f) {
-    static const char *s[TIME_FIELD_N] = { "\xe5\xb9\xb4", "\xe6\x9c\x88", "\xe6\x97\xa5", "", ":", ":" };
+    static const char *s[TIME_FIELD_N] = { "\xe5\xb9\xb4", "\xe6\x9c\x88", "\xe6\x97\xa5",
+        "\xe5\xb0\x8f\xe6\x97\xb6", "\xe5\x88\x86\xe9\x92\x9f", "\xe7\xa7\x92" }; /* 年/月/日/小时/分钟/秒 */
     return s[f];
 }
 static void time_adjust(int f, int delta) {
@@ -200,7 +270,12 @@ static void time_save_rtc(void) {
     }
 }
 
-static bool time_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+/* ---- 滚轮渲染 (时间/休眠共用): 上下列各 WHEEL_SIDE 个相邻值, 当前值高亮下托 ---- */
+static int  wheel_col_count(void);
+static int  wheel_active(void);
+static void wheel_col_text(int col, int steps, char *out, size_t n);
+static const char *wheel_col_unit(int col);
+static bool wheel_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)d; (void)ud;
     st7305_handle_t *lcd = ctx->lcd;
     if (!lcd) return true;
@@ -209,7 +284,7 @@ static bool time_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         if (ct) s_edit_tm = *ct;
         s_edit_valid = true;
     }
-    const int W = 350, H = 250;
+    const int W = WHEEL_W, H = WHEEL_H;
     int bx = (UI_SCREEN_W - W) / 2, by = (UI_SCREEN_H - H) / 2;
     const int bbt = by + H - 2 - 44;   /* 底部确认/取消按钮区顶 */
     fill_rect(lcd, bx, by, bx + W - 1, by + H - 1, ST7305_COLOR_WHITE);
@@ -219,114 +294,211 @@ static bool time_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         draw_vline(lcd, bx + k, by + k, by + H - 1 - k, ST7305_COLOR_BLACK);
         draw_vline(lcd, bx + W - 1 - k, by + k, by + H - 1 - k, ST7305_COLOR_BLACK);
     }
-
-    /* 内容区 (按钮区上方) 垂直居中 */
-    int cy = by + 2 + (bbt - (by + 2)) / 2;
-    int y0 = cy - 12;
-
-    /* 每列宽: 仅本模式的 3 个字段 */
-    const int first = tm_first(), last = tm_last();
-    int tw[TIME_FIELD_N], line_w = 0;
-    for (int f = first; f <= last; f++) {
-        char vs[8]; time_field_str(f, time_field_val(f), vs, sizeof(vs));
-        const char *su = time_suffix(f);
-        int gap = (f == first) ? 0 : ((f == 3 || f == 4) ? 12 : 18);
-        tw[f] = text_width(vs) + (su[0] ? text_width(su) : 0) + gap;
-        line_w += tw[f];
-    }
-    int x = bx + (W - line_w) / 2;
-    for (int f = first; f <= last; f++) {
-        char vs[8]; time_field_str(f, time_field_val(f), vs, sizeof(vs));
-        const char *su = time_suffix(f);
-        int vw = text_width(vs);
-        s_fx[f] = x; s_fw[f] = tw[f];
-        if (f == s_time_field) {
-            /* 上方 4 个 / 下方 4 个相邻值 (滚轮) */
-            for (int k = 1; k <= TIME_WHEEL_SIDE; k++) {
-                char ps[8], ns[8];
-                time_field_str(f, time_field_steps(f, -k), ps, sizeof(ps));
-                time_field_str(f, time_field_steps(f, +k), ns, sizeof(ns));
-                draw_text(lcd, x, y0 - k * TIME_STEP_H, ps, false);
-                draw_text(lcd, x, y0 + k * TIME_STEP_H, ns, false);
-            }
-            /* 当前值: 仅数字反色高亮, 单位/冒号保持黑字 */
-            fill_rect(lcd, x - 2, y0 - 2, x + vw + 1, y0 + 24 + 1, ST7305_COLOR_BLACK);
-            draw_text(lcd, x, y0, vs, true);
-            if (su[0]) draw_text(lcd, x + vw, y0, su, false);
-        } else {
-            draw_text(lcd, x, y0, vs, false);
-            if (su[0]) draw_text(lcd, x + vw, y0, su, false);
+    const int ncol = wheel_col_count();
+    /* 每列宽 = max(所有显示行 数值+单位 宽度) */
+    int colw[WHEEL_COL_MAX], total = 0;
+    for (int c = 0; c < ncol; c++) {
+        const char *unit = wheel_col_unit(c);
+        int uw = unit[0] ? text_width(unit) : 0;
+        int mw = 0;
+        for (int k = -WHEEL_SIDE; k <= WHEEL_SIDE; k++) {
+            char vs[24]; wheel_col_text(c, k, vs, sizeof(vs));
+            if (!vs[0]) continue;
+            int w = text_width(vs) + uw;
+            if (w > mw) mw = w;
         }
-        x += tw[f];
+        colw[c] = mw; total += mw;
     }
-
-    /* 底部 确认/取消 两键 (参考小确认弹窗: 分隔线 + 中竖线 + 左右对称) */
+    const int gap = 18;
+    total += gap * (ncol - 1);
+    /* 内容区垂直居中 (按钮区上方) */
+    const int cy = by + 2 + (bbt - (by + 2)) / 2;
+    const int y0 = cy - 13;   /* 当前值文字顶 (字形约 26px) */
+    s_wheel_y0 = y0;          /* 供 wheel_touch 点击选档换算档位 */
+    int x = bx + (W - total) / 2;
+    const int ac = wheel_active();
+    for (int c = 0; c < ncol; c++) {
+        const char *unit = wheel_col_unit(c);
+        int ccx = x + colw[c] / 2;   /* 列中心 */
+        s_fx[c] = x; s_fw[c] = colw[c];   /* 触摸热区 */
+        char vs[24]; wheel_col_text(c, 0, vs, sizeof(vs));
+        int vw = text_width(vs);
+        int vcx = ccx - vw / 2;      /* 数字左缘 (数字水平居中于列) */
+        bool act = (c == ac);
+        if (act) {
+            /* 活动列: 上下相邻值 */
+            for (int k = -WHEEL_SIDE; k <= WHEEL_SIDE; k++) {
+                if (k == 0) continue;
+                char ns[24]; wheel_col_text(c, k, ns, sizeof(ns));
+                if (!ns[0]) continue;
+                draw_text(lcd, ccx - text_width(ns) / 2, y0 + k * WHEEL_STEP_H, ns, false);
+            }
+            /* 黑框只包数字 (不包单位), 数字在框内水平垂直都居中; 单位保持黑字非反色 */
+            fill_rect(lcd, vcx - 4, y0 - 3, vcx + vw + 3, y0 + 25, ST7305_COLOR_BLACK);
+            draw_text(lcd, vcx, y0, vs, true);
+            if (unit[0]) draw_text(lcd, vcx + vw + 5, y0, unit, false);
+        } else {
+            draw_text(lcd, vcx, y0, vs, false);
+            if (unit[0]) draw_text(lcd, vcx + vw + 5, y0, unit, false);
+        }
+        x += colw[c] + gap;
+    }
+    /* 底部 确认/取消 */
     draw_hline(lcd, bx + 2, bx + W - 1 - 2, bbt, ST7305_COLOR_BLACK);
     int mid = bx + W / 2;
     draw_vline(lcd, mid, bbt, by + H - 1 - 2, ST7305_COLOR_BLACK);
     int ty = bbt + 10;
-    draw_text(lcd, bx + W / 4 - text_width("\xe7\xa1\xae\xe8\xae\xa4") / 2, ty, "\xe7\xa1\xae\xe8\xae\xa4", false);  /* 确认 */
-    draw_text(lcd, bx + W * 3 / 4 - text_width("\xe5\x8f\x96\xe6\xb6\x88") / 2, ty, "\xe5\x8f\x96\xe6\xb6\x88", false); /* 取消 */
+    draw_text(lcd, bx + W / 4 - text_width("\xe7\xa1\xae\xe8\xae\xa4") / 2, ty, "\xe7\xa1\xae\xe8\xae\xa4", false);   /* 确认 */
+    draw_text(lcd, bx + W * 3 / 4 - text_width("\xe5\x8f\x96\xe6\xb6\x88") / 2, ty, "\xe5\x8f\x96\xe6\xb6\x88", false);  /* 取消 */
     return true;
 }
 
-static bool time_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
-    (void)d; (void)ud;
-    const int first = tm_first(), last = tm_last();
-    switch (a) {
-    case OS_ACTION_LEFT:  s_time_field = (s_time_field > first) ? (s_time_field - 1) : last; ctx->needs_redraw = true; return true;
-    case OS_ACTION_RIGHT: s_time_field = (s_time_field < last) ? (s_time_field + 1) : first; ctx->needs_redraw = true; return true;
-    case OS_ACTION_UP:   time_adjust(s_time_field, +1); ctx->needs_redraw = true; return true;
-    case OS_ACTION_DOWN: time_adjust(s_time_field, -1); ctx->needs_redraw = true; return true;
-    case OS_ACTION_CONFIRM: {
+/* 滚动列信息: 休眠=单列; 时间=当前模式的前 3 字段 */
+static int  wheel_col_count(void) { return s_wheel_sleep ? 1 : 3; }
+static int  wheel_active(void)    { return s_wheel_sleep ? 0 : (s_time_field - tm_first()); }
+static void wheel_set_active(int col) { if (!s_wheel_sleep) s_time_field = tm_first() + col; }
+/* 某列 current+steps 档显示文本 (休眠到首尾返回空串=不画越界值) */
+static void wheel_col_text(int col, int steps, char *out, size_t n) {
+    if (s_wheel_sleep) {
+        int idx = s_sleep_idx + steps;
+        if (idx < 0 || idx >= SLEEP_MINS_N) { out[0] = '\0'; return; }
+        int m = s_sleep_mins[idx];
+        if (m <= 0) snprintf(out, n, "\xe6\xb0\xb8\xe4\xb8\x8d\xe4\xbc\x91\xe7\x9c\xa0"); /* 永不休眠 */
+        else        snprintf(out, n, "%d\xe5\x88\x86\xe9\x92\x9f", m);                 /* X分钟 */
+    } else {
+        int f = tm_first() + col;
+        time_field_str(f, time_field_steps(f, steps), out, n);
+    }
+}
+/* 某列单位: 时间=年/月/日/小时/分钟/秒; 休眠文本已含单位 */
+static const char *wheel_col_unit(int col) {
+    if (s_wheel_sleep) return "";
+    return time_suffix(tm_first() + col);
+}
+/* 调值: 休眠=翻档(夹紧首尾), 时间=调对应字段 */
+static void wheel_adjust(int col, int delta) {
+    if (s_wheel_sleep) {
+        int nb = s_sleep_idx + delta;
+        if (nb < 0) nb = 0;
+        if (nb >= SLEEP_MINS_N) nb = SLEEP_MINS_N - 1;
+        s_sleep_idx = nb;
+    } else {
+        time_adjust(tm_first() + col, delta);
+    }
+}
+/* 确认: 休眠→NVS+息屏延时; 时间→RTC */
+static void wheel_confirm(ui_ctx_t *ctx) {
+    if (s_wheel_sleep) {
+        int v = s_sleep_mins[s_sleep_idx];
+        nvs_handle_t h;
+        if (nvs_open(SLEEP_NS, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_i32(h, "min", v); nvs_commit(h); nvs_close(h);
+        }
+        wp_screensaver_set_delay_ms((v <= 0) ? UINT32_MAX : ((uint32_t)v * 60000UL));
+        os_dialog_toast(ctx, "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4\xe5\xb7\xb2\xe8\xae\xbe\xe7\xbd\xae"); /* 休眠时间已设置 */
+    } else {
         time_save_rtc();
         os_dialog_toast(ctx, "\xe6\x97\xb6\xe9\x97\xb4\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98"); /* 时间已保存 */
-        os_dialog_pop(ctx);
-        return true;
     }
-    default:
-        return false;   /* BACK 走默认关闭 (取消) */
+    os_dialog_pop(ctx);
+}
+
+static bool wheel_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)d; (void)ud;
+    const int ncol = wheel_col_count();
+    switch (a) {
+    case OS_ACTION_LEFT:  wheel_set_active((wheel_active() + ncol - 1) % ncol); ctx->needs_redraw = true; return true;
+    case OS_ACTION_RIGHT: wheel_set_active((wheel_active() + 1) % ncol); ctx->needs_redraw = true; return true;
+    case OS_ACTION_UP:    wheel_adjust(wheel_active(), +1); ctx->needs_redraw = true; return true;
+    case OS_ACTION_DOWN:  wheel_adjust(wheel_active(), -1); ctx->needs_redraw = true; return true;
+    case OS_ACTION_CONFIRM: wheel_confirm(ctx); return true;
+    case OS_ACTION_BACK:
+        if (!s_wheel_sleep) s_time_field = tm_first();   /* 取消: 复位字段选中 (不改状态) */
+        return false;   /* 走默认关闭 */
+    default: return false;   /* BACK → 默认取消 */
     }
 }
 
-static void time_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+static void wheel_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)d; (void)ud;
-    const int first = tm_first(), last = tm_last();
-    int bx = (UI_SCREEN_W - 350) / 2, by = (UI_SCREEN_H - 250) / 2;
-    const int bbt = by + 250 - 2 - 44;   /* 底部按钮区顶 (与渲染一致) */
     int tx, ty;
-    if (input_consume_tap(&tx, &ty)) {
-        /* 底部 确认/取消 */
-        if (ty >= bbt) {
-            int mid = bx + 350 / 2;
-            if (tx < mid) { time_save_rtc(); os_dialog_toast(ctx, "\xe6\x97\xb6\xe9\x97\xb4\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98"); os_dialog_pop(ctx); } /* 确认 */
-            else os_dialog_pop(ctx);   /* 取消 */
-            return;
-        }
-        /* 内容区: 命中本模式字段 → 切换焦点 */
-        for (int f = first; f <= last; f++) {
-            if (tx >= s_fx[f] - 3 && tx <= s_fx[f] + s_fw[f] + 3) {
-                if (s_time_field != f) { s_time_field = f; ctx->needs_redraw = true; }
-                break;
-            }
-        }
-    }
-    /* 上下拖动: 调值 (上滑=+1, 下滑=-1, 跟手) */
+    /* 上下拖动: 累积余差, 每满一行调一级 (跟手; 休眠边界由 wheel_adjust 夹紧, 不越界) */
     static int s_t_last = -1, s_t_acc = 0;
     if (input_get_touch_pos(&tx, &ty)) {
-        if (s_t_last < 0) { s_t_last = ty; s_t_acc = 0; }
-        else {
+        if (s_t_last < 0) {
+            s_t_last = ty; s_t_acc = 0;
+            /* 按下即把手指所在列设为活动列, 随后拖动只改该列 (修复"无论拖到哪都改年").
+             * V1.3.x: 仅内容区 (y < 按钮区顶) 才切列 — 点底部"确认/取消"按钮时
+             * 若 x 恰好落在某列热区 (如时间滚轮第3列=秒) 不再误选中该列. */
+            const int H = WHEEL_H;
+            const int by = (UI_SCREEN_H - H) / 2;
+            const int bbt = by + H - 2 - 44;   /* 与 wheel_touch/wheel_render 同一按钮区顶 */
+            if (!s_wheel_sleep && ty < bbt) {
+                int ncol = wheel_col_count();
+                for (int c = 0; c < ncol; c++) {
+                    if (tx >= s_fx[c] - 4 && tx <= s_fx[c] + s_fw[c] - 1 + 4) {
+                        if (wheel_active() != c) {
+                            wheel_set_active(c);
+                            if (ctx) ctx->needs_redraw = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
             s_t_acc += ty - s_t_last;
             s_t_last = ty;
             bool changed = false;
-            while (s_t_acc <= -TIME_STEP_H) { time_adjust(s_time_field, +1); s_t_acc += TIME_STEP_H; changed = true; }
-            while (s_t_acc >= +TIME_STEP_H) { time_adjust(s_time_field, -1); s_t_acc -= TIME_STEP_H; changed = true; }
+            while (s_t_acc <= -WHEEL_STEP_H) { wheel_adjust(wheel_active(), +1); s_t_acc += WHEEL_STEP_H; changed = true; }
+            while (s_t_acc >= +WHEEL_STEP_H) { wheel_adjust(wheel_active(), -1); s_t_acc -= WHEEL_STEP_H; changed = true; }
             if (changed) ctx->needs_redraw = true;
         }
     } else {
-        s_t_last = -1;
-        s_t_acc = 0;
+        s_t_last = -1; s_t_acc = 0;
     }
+}
+
+/* 自定义触摸: 底部=确认/取消, 内容=点列切焦点 (弹窗框内才响应) */
+static bool wheel_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
+    (void)d; (void)ud;
+    const int W = WHEEL_W, H = WHEEL_H;
+    int bx = (UI_SCREEN_W - W) / 2, by = (UI_SCREEN_H - H) / 2;
+    if (x < bx || x > bx + W - 1 || y < by || y > by + H - 1) return false;
+    const int bbt = by + H - 2 - 44;
+    if (y >= bbt) {
+        int mid = bx + W / 2;
+        if (x < mid) wheel_confirm(ctx);   /* 确认 */
+        else {
+            /* 取消: 复位字段选中 (回到打开时状态, 不残留) */
+            if (!s_wheel_sleep) s_time_field = tm_first();
+            os_dialog_pop(ctx);
+        }
+        return true;
+    }
+    const int ncol = wheel_col_count();
+    for (int c = 0; c < ncol; c++) {
+        if (x >= s_fx[c] - 4 && x <= s_fx[c] + s_fw[c] - 1 + 4) {
+            if (s_wheel_sleep) {
+                /* V1.3.x: 休眠滚轮支持"点击选档" — 点哪行选中哪档 (拖动调档保留).
+                 * 行距 WHEEL_STEP_H, 当前值行顶 s_wheel_y0, 相邻行 = y0 ± k*STEP. */
+                int k = (y - s_wheel_y0 + WHEEL_STEP_H / 2) / WHEEL_STEP_H;
+                if (k < -WHEEL_SIDE) k = -WHEEL_SIDE;
+                if (k > +WHEEL_SIDE) k = +WHEEL_SIDE;
+                int nb = s_sleep_idx + k;
+                if (nb < 0) nb = 0;
+                if (nb >= SLEEP_MINS_N) nb = SLEEP_MINS_N - 1;
+                if (nb != s_sleep_idx) {
+                    s_sleep_idx = nb;
+                    if (ctx) ctx->needs_redraw = true;
+                }
+            } else if (wheel_active() != c) {
+                wheel_set_active(c);
+                if (ctx) ctx->needs_redraw = true;
+            }
+            return true;
+        }
+    }
+    return true;   /* 弹窗内其他区域吞掉, 不外泄到下层 */
 }
 
 /* 日期/时间 选择回调 */
@@ -353,14 +525,30 @@ static void open_time_dlg(ui_ctx_t *ctx) {
     os_dialog_list(ctx, "", items, 2, s_time_mode, on_time_choice, NULL);
 }
 
-/* 滚轮设置弹窗 (仅显示当前模式字段) */
+/* 滚轮设置弹窗 (时间/休眠共用; on_touch 处理点列+按钮) */
 static void open_time_wheel_dlg(ui_ctx_t *ctx) {
+    s_wheel_sleep = 0;
     os_dlg_stack_t dlg;
     memset(&dlg, 0, sizeof(dlg));
     dlg.no_footer = true;
-    dlg.on_render = time_render;
-    dlg.on_key    = time_key;
-    dlg.on_poll   = time_poll;
+    dlg.on_render = wheel_render;
+    dlg.on_key    = wheel_key;
+    dlg.on_poll   = wheel_poll;
+    dlg.on_touch  = wheel_touch;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* 休眠时间: 同款滚轮 UI (单列, 夹紧首尾) */
+static void open_sleep_dlg(ui_ctx_t *ctx) {
+    s_wheel_sleep = 1;
+    s_sleep_idx = sleep_index_of(sleep_min_get());
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    dlg.no_footer = true;
+    dlg.on_render = wheel_render;
+    dlg.on_key    = wheel_key;
+    dlg.on_poll   = wheel_poll;
+    dlg.on_touch  = wheel_touch;
     os_dialog_push(ctx, &dlg);
 }
 
@@ -375,19 +563,68 @@ static void open_font_dlg(ui_ctx_t *ctx) {
     os_dialog_list(ctx, "", items, 2, font_zh_is_light() ? 1 : 0, on_font_select, NULL);
 }
 
-/* ---- 显示配置弹窗: 时间设置 + 字体风格 ---- */
+/* ---- 暗黑模式三选弹窗: 关闭 / 暗黑UI模式(除游戏外反色) / 全部暗黑模式(含游戏) ---- */
+static void on_dark_select(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result < 0) return;   /* 返回/取消: 不修改 */
+    s_dark = result;          /* 0/1/2 */
+    settings_save_dark();
+    settings_dark_apply_lcd(ctx ? ctx->lcd : NULL);
+    if (result == 0)      os_dialog_toast(ctx, "\xe6\x9a\x97\xe9\xbb\x91\xe6\xa8\xa1\xe5\xbc\x8f\xe5\x85\xb3");   /* 暗黑模式关 */
+    else if (result == 1) os_dialog_toast(ctx, "\xe6\x9a\x97\xe9\xbb\x91UI\xe6\xa8\xa1\xe5\xbc\x8f");          /* 暗黑UI模式 */
+    else                 os_dialog_toast(ctx, "\xe5\x85\xa8\xe9\x83\xa8\xe6\x9a\x97\xe9\xbb\x91\xe6\xa8\xa1\xe5\xbc\x8f"); /* 全部暗黑模式 */
+}
+static void open_dark_dlg(ui_ctx_t *ctx) {
+    static const char *items[4] = {
+        "\xe5\x85\xb3\xe9\x97\xad",          /* 关闭 */
+        "\xe6\x9a\x97\xe9\xbb\x91UI\xe6\xa8\xa1\xe5\xbc\x8f",       /* 暗黑UI模式 */
+        "\xe5\x85\xa8\xe9\x83\xa8\xe6\x9a\x97\xe9\xbb\x91\xe6\xa8\xa1\xe5\xbc\x8f", /* 全部暗黑模式 */
+        NULL
+    };
+    os_dialog_list(ctx, "", items, 3, s_dark, on_dark_select, NULL);
+}
+
+/* ---- 显示配置弹窗: 平铺 4 项 (日期/时间/字体/休眠) ---- */
 static void on_disp_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
-    if (result == 0) open_time_dlg(ctx);
-    else if (result == 1) open_font_dlg(ctx);
+    switch (result) {
+    case 0:   /* 日期更改 */
+        if (!s_edit_valid) {
+            time_t t = time(NULL); struct tm *ct = localtime(&t);
+            if (ct) s_edit_tm = *ct;
+            s_edit_valid = true;
+        }
+        s_time_mode = 0; s_time_field = tm_first();
+        open_time_wheel_dlg(ctx);
+        break;
+    case 1:   /* 时间调整 */
+        if (!s_edit_valid) {
+            time_t t = time(NULL); struct tm *ct = localtime(&t);
+            if (ct) s_edit_tm = *ct;
+            s_edit_valid = true;
+        }
+        s_time_mode = 1; s_time_field = tm_first();
+        open_time_wheel_dlg(ctx);
+        break;
+    case 2: open_font_dlg(ctx); break;   /* 字体粗细 */
+    case 3: open_sleep_dlg(ctx); break;  /* 休眠时间 */
+    case 4: open_dark_dlg(ctx); break;   /* 暗黑模式: 三选弹窗 (关闭/暗黑UI/全部暗黑) */
+    default: break;
+    }
 }
 static void open_disp_dlg(ui_ctx_t *ctx) {
-    static const char *items[3] = { "\xe6\x97\xb6\xe9\x97\xb4\xe8\xae\xbe\xe7\xbd\xae", "\xe5\xad\x97\xe4\xbd\x93\xe9\xa3\x8e\xe6\xa0\xbc", NULL };  /* 时间设置/字体风格/返回 */
-    os_dialog_list(ctx, "", items, 2, 0, on_disp_select, NULL);
+    static const char *items[5] = {
+        "\xe6\x97\xa5\xe6\x9c\x9f\xe6\x9b\xb4\xe6\x94\xb9",  /* 日期更改 */
+        "\xe6\x97\xb6\xe9\x97\xb4\xe8\xb0\x83\xe6\x95\xb4",  /* 时间调整 */
+        "\xe5\xad\x97\xe4\xbd\x93\xe7\xb2\x97\xe7\xbb\x86",  /* 字体粗细 */
+        "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4",  /* 休眠时间 */
+        "\xe6\x9a\x97\xe9\xbb\x91\xe6\xa8\xa1\xe5\xbc\x8f",  /* 暗黑模式 */
+    };
+    os_dialog_list(ctx, "", items, 5, 0, on_disp_select, NULL);
 }
 
 /* ---- 声音调整弹窗: 声音开关/音量/震动 (动态显示状态) ---- */
-static void open_snd_dlg(ui_ctx_t *ctx);
+static void open_snd_dlg(ui_ctx_t *ctx, int sel);
 static void on_snd_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     if (result == 0) {   /* 声音开关 */
@@ -400,42 +637,56 @@ static void on_snd_select(ui_ctx_t *ctx, int result, void *ud) {
         int nv = audio_player_vol_to_percent(ns);
         audio_player_set_volume(nv);
         settings_save_u8("vol", (uint8_t)ns);   /* 存档位 0-9 */
-    } else if (result == 2) {   /* 震动开关 */
-        s_vib = !s_vib;
-        vibrator_set_enabled(s_vib);
-        settings_save_u8("vib", s_vib ? 1 : 0);
+    } else if (result == 2) {   /* UI 震动开关 */
+        s_vib_ui = !s_vib_ui;
+        vibrator_set_ui_enabled(s_vib_ui);
+        settings_save_u8("vib_ui", s_vib_ui ? 1 : 0);
+    } else if (result == 3) {   /* 游戏震动开关 */
+        s_vib_game = !s_vib_game;
+        vibrator_set_game_enabled(s_vib_game);
+        settings_save_u8("vib_game", s_vib_game ? 1 : 0);
     } else {
         return;   /* 返回/其它: 不刷新 */
     }
-    /* 原地替换刷新 (先弹当前层再压回, 层级不加深; 返回直接回设置主菜单) */
+    /* 原地替换刷新 (先弹当前层再压回, 层级不加深; 返回直接回设置主菜单).
+     * V1.3.x: 高亮刚操作的行 (sel=result), 触摸/按键选择对应选项即时变黑反馈 */
     os_dialog_pop(ctx);
-    open_snd_dlg(ctx);
+    open_snd_dlg(ctx, result);
 }
-static void open_snd_dlg(ui_ctx_t *ctx) {
+static void open_snd_dlg(ui_ctx_t *ctx, int sel) {
     char items[4][30];
     const char *ptrs[4];
     snprintf(items[0], sizeof(items[0]), "\xe5\xa3\xb0\xe9\x9f\xb3:%s", audio_player_is_muted() ? "\xe5\x85\xb3" : "\xe5\xbc\x80");  /* 声音:关/开 */
     snprintf(items[1], sizeof(items[1]), "\xe9\x9f\xb3\xe9\x87\x8f:%d", /* 音量:N */
              audio_player_vol_to_step(audio_player_get_volume()));
-    snprintf(items[2], sizeof(items[2]), "\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 震动:开/关 */
-    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2];
-    os_dialog_list(ctx, "", ptrs, 3, 0, on_snd_select, NULL);
+    snprintf(items[2], sizeof(items[2]), "UI\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib_ui ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* UI震动:开/关 */
+    snprintf(items[3], sizeof(items[3]), "\xe6\xb8\xb8\xe6\x88\x8f\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib_game ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 游戏震动:开/关 */
+    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3];
+    sel = (sel < 0) ? 0 : (sel > 3 ? 3 : sel);
+    os_dialog_list(ctx, "", ptrs, 4, sel, on_snd_select, NULL);
 }
 
 /* ---- 无线连接弹窗: 蓝牙/WiFi 开关 + 连接WiFi (WiFi 开时显示) ---- */
-static void open_wifi_dlg(ui_ctx_t *ctx);
+static void open_wifi_dlg(ui_ctx_t *ctx, int sel);
 static void open_wifi_scan(ui_ctx_t *ctx);
 extern void wifi_kb_preset_ssid(const char *ssid);   /* WiFi 键盘页预填 SSID */
+
+/* USB 网卡菜单"连接WiFi"入口: 复用以设置页同样的扫描→输密码 流程.
+ * 需在设置页同编译单元内, 故放这里并导出让 page_usb_net 调用. */
+void settings_wifi_connect_open(ui_ctx_t *ctx) {
+    if (!os_hw_is_active(OS_HW_WIFI)) os_hw_request(OS_HW_WIFI);   /* 先确保 WiFi 打开 */
+    open_wifi_scan(ctx);
+}
 static void on_wifi_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     if (result == 0) {   /* 蓝牙开关 (懒加载 os_hw) */
         if (os_hw_is_active(OS_HW_BT)) os_hw_release(OS_HW_BT);
         else os_hw_request(OS_HW_BT);
-        os_dialog_pop(ctx); open_wifi_dlg(ctx);   /* 原地替换, 层级不加深 */
+        os_dialog_pop(ctx); open_wifi_dlg(ctx, result);   /* 原地替换, 层级不加深 */
     } else if (result == 1) {   /* WiFi 开关 */
         if (os_hw_is_active(OS_HW_WIFI)) os_hw_release(OS_HW_WIFI);
         else os_hw_request(OS_HW_WIFI);
-        os_dialog_pop(ctx); open_wifi_dlg(ctx);   /* 原地替换, 层级不加深 */
+        os_dialog_pop(ctx); open_wifi_dlg(ctx, result);   /* 原地替换, 层级不加深 */
     } else if (result == 2) {   /* 连接WiFi → 列表弹窗扫描选择 (子弹窗, 压栈) */
         open_wifi_scan(ctx);
     }
@@ -486,7 +737,7 @@ static void open_wifi_scan(ui_ctx_t *ctx) {
     ESP_LOGI(TAG, "WiFi 扫描开始");
 }
 
-static void open_wifi_dlg(ui_ctx_t *ctx) {
+static void open_wifi_dlg(ui_ctx_t *ctx, int sel) {
     char items[4][30];
     const char *ptrs[4];
     int n = 0;
@@ -498,7 +749,8 @@ static void open_wifi_dlg(ui_ctx_t *ctx) {
         snprintf(items[n], sizeof(items[n]), "\xe8\xbf\x9e\xe6\x8e\xa5WiFi");  /* 连接WiFi */
         ptrs[n] = items[n]; n++;
     }
-    os_dialog_list(ctx, "", ptrs, n, 0, on_wifi_select, NULL);
+    sel = (sel < 0) ? 0 : (sel >= n ? n - 1 : sel);
+    os_dialog_list(ctx, "", ptrs, n, sel, on_wifi_select, NULL);
 }
 
 /* ---- 系统信息: 列表弹窗 (只读展示) ---- */
@@ -535,8 +787,8 @@ static bool settings_main_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, v
         if (d->sel >= d->count) return false;   /* 底部"返回"行 → 默认处理 (关闭) */
         switch (d->sel) {
         case 0: open_disp_dlg(ctx); break;   /* 显示配置 */
-        case 1: open_snd_dlg(ctx);  break;   /* 声音调整 */
-        case 2: open_wifi_dlg(ctx); break;   /* 无线连接 */
+        case 1: open_snd_dlg(ctx, 0);  break;   /* 声音调整 */
+        case 2: open_wifi_dlg(ctx, 0); break;   /* 无线连接 */
         case 3: open_info_dlg(ctx); break;   /* 系统信息 */
         case 4: os_push(ctx, OS_PAGE_SPONSOR); break;   /* 请作者喝杯水 → 全屏二维码弹窗 */
         default: break;
@@ -568,4 +820,18 @@ static const os_module_t s_mod_settings = {
     .fullscreen = false,
 };
 
-void os_page_settings_register(void) { os_register(&s_mod_settings); }
+/* ---- 暗黑模式游戏态同步 ----
+ * 引擎进运行循环时 input_set_gamepad_gamemode(true) (游戏渲染中), 退出后=false.
+ * 仅当 s_dark==1 (暗黑UI) 时反色随游戏态切换; ==2 (全部) 恒反色; ==0 (关闭) 恒不反色.
+ * 关键: 游戏引擎运行是阻塞主循环的 (eng_task_run_loop while(1) / gam4980_emu_run),
+ * 每帧 service tick 在游戏内不会执行 — 必须用 input_set_gamemode_cb 在进出游戏的
+ * 瞬间即时同步, 否则"暗黑UI模式"进入游戏不会恢复正常 (画面仍反色). */
+static void on_gamemode_changed(bool enabled) {
+    (void)enabled;   /* settings_dark_apply_lcd 内部自判 input_is_game_mode() */
+    settings_dark_apply_lcd(s_dark_lcd);
+}
+
+void os_page_settings_register(void) {
+    os_register(&s_mod_settings);
+    input_set_gamemode_cb(on_gamemode_changed);
+}

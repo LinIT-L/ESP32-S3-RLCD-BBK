@@ -52,6 +52,10 @@ typedef struct {
     int16_t y;         /* 原始 Y 坐标 */
 } tp_point_t;
 
+/* 最大支持的触点 (GT911 每点 8 字节, 最多 5 点; CST816=1 / FT6236=2 硬件上限更低).
+ * 本机为 CST816, 实测硬件只支持 2 点. 驱动读到多少就报多少, 调用方按 count 逐个取用. */
+#define TP_MAX_POINTS 2
+
 /* 初始化: 配置 I2C + RESET/INT GPIO, 复位 GT911, 探测芯片型号.
  * 返回探测到的芯片类型; TP_CHIP_NONE 表示未检测到 (之后 read 恒返回 false). */
 tp_chip_t touch_panel_init(void);
@@ -59,10 +63,10 @@ tp_chip_t touch_panel_init(void);
 /* 读取一个触摸点 (每帧轮询一次). 返回 false 表示读取失败/无有效数据. */
 bool touch_panel_read(tp_point_t *pt);
 
-/* 读取多点触摸 (最多 2 点, 向后兼容: touch_panel_read 等价于取 pts[0]).
- * pts[0..1] 各点 (未按压的置 pressed=false), count 返回实际点数 (0..2).
+/* 读取多点触摸 (最多 TP_MAX_POINTS=5 点; GT911 支持满 5 点, CST816/FT6236 更少).
+ * pts[0..n-1] 各点 (未按压的置 pressed=false), count 返回实际点数 (0..TP_MAX_POINTS).
  * 返回 false 表示读取失败/无有效数据. */
-bool touch_panel_read_points(tp_point_t pts[2], int *count);
+bool touch_panel_read_points(tp_point_t pts[TP_MAX_POINTS], int *count);
 
 /* V1.0.68: 禁用触摸屏: 卸载 I2C 驱动(释放内存), 之后 read 恒 false. 可重新 init. */
 void touch_panel_deinit(void);

@@ -547,8 +547,16 @@ static bool p_term_touch(ui_ctx_t *ctx, int x, int y) {
 }
 
 static void p_term_action(ui_ctx_t *ctx, os_action_t a) {
-    (void)a;
-    ctx->needs_redraw = true;
+    switch (a) {
+        case OS_ACTION_BACK:
+            /* 终端为应用页: 按硬件返回键直接退出 (不弹"退出程序?"确认框, 与白板一致).
+             * Task F 已将 os_core 全屏 BACK 门控收窄为仅游戏态拦截, 应用需自行处理退出. */
+            os_pop(ctx);
+            break;
+        default:
+            ctx->needs_redraw = true;
+            break;
+    }
 }
 
 static void p_term_poll(ui_ctx_t *ctx) {
@@ -628,7 +636,7 @@ static const os_module_t s_mod_term = {
     .action     = p_term_action,
     .touch      = p_term_touch,
     .poll       = p_term_poll,
-    .fullscreen = true,   /* 隐藏状态栏; 按返回弹"退出程序?"确认框, 确认后退出 */
+    .fullscreen = true,   /* 隐藏状态栏; 应用页, 按返回直接退出 (不弹确认框) */
 };
 
 void os_page_term_register(void) { os_register(&s_mod_term); }

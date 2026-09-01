@@ -12,11 +12,13 @@
 #include "ui_common.h"
 #include "input.h"
 #include "usb_hid.h"
+#include "font_zh16.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #define TAG "HIDP"
 
@@ -49,6 +51,13 @@
 #define HID_ARROW_W  50
 #define HID_ARROW_XL 150   /* ← 键左框 */
 #define HID_ARROW_XR 203   /* → 键左框 */
+
+/* 运维助手样式底部左右键 (纯触控板 / 52键 布局) */
+#define NEW_MB_Y   260
+#define NEW_MB_H   (HID_TP_Y1 - NEW_MB_Y + 1)   /* 40, 直铺到底 */
+#define NEW_MB_W   100
+#define NEW_MB_XL  100
+#define NEW_MB_XR  200
 
 /* HID 键盘 usage code */
 #define HIDK_A  0x04
@@ -365,7 +374,7 @@ static void hid_ui_reset(void) {
     switch (s_hid_layout) {
         case HID_LAYOUT_28:       s_tp_top = HID_TP_Y1 + 1;  s_show_mbtn = false; break;
         case HID_LAYOUT_76:       s_tp_top = 156;            s_show_mbtn = true;  break;
-        case HID_LAYOUT_TOUCHPAD: s_tp_top = 0;              s_show_mbtn = false; break;
+        case HID_LAYOUT_TOUCHPAD: s_tp_top = 0;              s_show_mbtn = true;  break;
         case HID_LAYOUT_OP:
         default:                  s_tp_top = HID_TP_Y0;      s_show_mbtn = true;  break;
     }
@@ -417,6 +426,57 @@ static void hid_draw_label_centered(st7305_handle_t *lcd, int x, int w,
             draw_ascii_medium(lcd, tx + i * 12, ty, q[0], inverted);
         }
         q += adv;
+    }
+}
+
+/* 16px 中文居中 (Font 16, 同运维助手) */
+static void hid_draw_cn_label(st7305_handle_t *lcd, int x, int w, int y, int h,
+                              const char *s, bool inv) {
+    int n = (int)(strlen(s) / 3);
+    int tw = n * 16;
+    if (tw > w) tw = w;
+    int tx = x + (w - tw) / 2, ty = y + (h - 16) / 2;
+    if (ty < 0) ty = 0;
+    st7305_color_t bg = inv ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
+    st7305_color_t fg = inv ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
+    for (int i = 0; i < n; i++) {
+        int idx = font_zh16_find_utf8(s + i * 3);
+        if (idx < 0) continue;
+        const uint8_t *bmp = zh16_font_data[idx];
+        for (int r = 0; r < 16; r++)
+            for (int c = 0; c < 16; c++) {
+                int byte = bmp[r * 2 + (c / 8)];
+                st7305_draw_pixel(lcd, tx + i * 16 + c, ty + r,
+                                  (byte & (1 << (7 - (c % 8)))) ? fg : bg);
+            }
+    }
+}
+
+/* 单角圆角框: top_left=true 圆左上角(左键), false 圆右上角(右键), 其余直角 */
+static void hid_draw_btn_corner(st7305_handle_t *lcd, int x0, int y0, int x1, int y1,
+                                int r, bool top_left) {
+    if (r < 1 || r * 2 >= x1 - x0 + 1 || r * 2 >= y1 - y0 + 1) {
+        draw_rect_outline(lcd, x0, y0, x1, y1, ST7305_COLOR_BLACK);
+        return;
+    }
+    if (top_left) {
+        draw_vline(lcd, x1, y0, y1, ST7305_COLOR_BLACK);
+        draw_hline(lcd, x0 + r, x1, y0, ST7305_COLOR_BLACK);
+        draw_hline(lcd, x0, x1, y1, ST7305_COLOR_BLACK);
+        draw_vline(lcd, x0, y0 + r, y1, ST7305_COLOR_BLACK);
+        for (int px = x0; px <= x0 + r; px++) {
+            int dx = px - (x0 + r), dy = r - (int)sqrtf((float)(r * r - dx * dx));
+            st7305_draw_pixel(lcd, px, y0 + dy, ST7305_COLOR_BLACK);
+        }
+    } else {
+        draw_vline(lcd, x0, y0, y1, ST7305_COLOR_BLACK);
+        draw_hline(lcd, x0, x1 - r, y0, ST7305_COLOR_BLACK);
+        draw_hline(lcd, x0, x1, y1, ST7305_COLOR_BLACK);
+        draw_vline(lcd, x1, y0 + r, y1, ST7305_COLOR_BLACK);
+        for (int px = x1 - r; px <= x1; px++) {
+            int dx = px - (x1 - r), dy = r - (int)sqrtf((float)(r * r - dx * dx));
+            st7305_draw_pixel(lcd, px, y0 + dy, ST7305_COLOR_BLACK);
+        }
     }
 }
 
@@ -503,26 +563,16 @@ static int hid_layout_rows(hid_rowarr_t *out, int max) {
     return n;
 }
 
-/* 画触控板外框 + 底部: 两侧左右鼠标键 + 中间一对 ←→ 方向键 */
+/* 画触控板底部左右键. OP / 52键 / 纯触控板 三种带触控板布局统一为"运维助手样式":
+ * 无外框直铺到底, 底部中央并排 左键(左上圆)/右键(右上圆). 用户要求 OP 与 52键/纯触控板一致. */
 static void hid_draw_touchpad(st7305_handle_t *lcd) {
-    draw_rect_outline(lcd, 0, s_tp_top, UI_SCREEN_W - 1, HID_TP_Y1, ST7305_COLOR_BLACK);
     if (s_show_mbtn) {
-        draw_rect_outline_side_round(lcd, HID_MB_XL, HID_MB_Y,
-                                     HID_MB_XL + HID_MB_W - 1, HID_MB_Y + HID_MB_H - 1,
-                                     ST7305_COLOR_BLACK, 8, 'L');
-        draw_rect_outline_side_round(lcd, HID_MB_XR, HID_MB_Y,
-                                     HID_MB_XR + HID_MB_W - 1, HID_MB_Y + HID_MB_H - 1,
-                                     ST7305_COLOR_BLACK, 8, 'R');
-        hid_draw_label_centered(lcd, HID_MB_XL, HID_MB_W, HID_MB_Y, HID_MB_H, "L", false);
-        hid_draw_label_centered(lcd, HID_MB_XR, HID_MB_W, HID_MB_Y, HID_MB_H, "R", false);
-        draw_rect_outline_side_round(lcd, HID_ARROW_XL, HID_ARROW_Y,
-                                     HID_ARROW_XL + HID_ARROW_W - 1, HID_ARROW_Y + HID_ARROW_H - 1,
-                                     ST7305_COLOR_BLACK, 8, 'L');
-        draw_rect_outline_side_round(lcd, HID_ARROW_XR, HID_ARROW_Y,
-                                     HID_ARROW_XR + HID_ARROW_W - 1, HID_ARROW_Y + HID_ARROW_H - 1,
-                                     ST7305_COLOR_BLACK, 8, 'R');
-        hid_draw_label_centered(lcd, HID_ARROW_XL, HID_ARROW_W, HID_ARROW_Y, HID_ARROW_H, "\xe2\x86\x90", false); /* ← */
-        hid_draw_label_centered(lcd, HID_ARROW_XR, HID_ARROW_W, HID_ARROW_Y, HID_ARROW_H, "\xe2\x86\x92", false); /* → */
+        hid_draw_btn_corner(lcd, NEW_MB_XL, NEW_MB_Y, NEW_MB_XL + NEW_MB_W - 1,
+                            NEW_MB_Y + NEW_MB_H - 1, 8, true);
+        hid_draw_btn_corner(lcd, NEW_MB_XR, NEW_MB_Y, NEW_MB_XR + NEW_MB_W - 1,
+                            NEW_MB_Y + NEW_MB_H - 1, 8, false);
+        hid_draw_cn_label(lcd, NEW_MB_XL, NEW_MB_W, NEW_MB_Y, NEW_MB_H, "\xe5\xb7\xa6\xe9\x94\xae", false); /* 左键 */
+        hid_draw_cn_label(lcd, NEW_MB_XR, NEW_MB_W, NEW_MB_Y, NEW_MB_H, "\xe5\x8f\xb3\xe9\x94\xae", false); /* 右键 */
     }
 }
 
@@ -571,12 +621,10 @@ static bool hid_ui_hit(ui_ctx_t *ctx, int x, int y) {
             }
         }
     }
-    /* 底部: 中央 ←→ 方向键 + 两侧左右鼠标键 */
-    if (s_show_mbtn && y >= HID_MB_Y && y < HID_MB_Y + HID_MB_H) {
-        if (x >= HID_ARROW_XL && x < HID_ARROW_XL + HID_ARROW_W) { usb_hid_key_tap(0, HIDK_LEFT);  return true; }
-        if (x >= HID_ARROW_XR && x < HID_ARROW_XR + HID_ARROW_W) { usb_hid_key_tap(0, HIDK_RIGHT); return true; }
-        if (x >= HID_MB_XL && x < HID_MB_XL + HID_MB_W) { usb_hid_mouse_click(HID_MOUSE_L); return true; }
-        if (x >= HID_MB_XR && x < HID_MB_XR + HID_MB_W) { usb_hid_mouse_click(HID_MOUSE_R); return true; }
+    /* OP / 52键 / 纯触控板 统一: 底部中央 左键/右键 命中检测 (运维助手样式) */
+    if (s_show_mbtn && y >= NEW_MB_Y && y < NEW_MB_Y + NEW_MB_H) {
+        if (x >= NEW_MB_XL && x < NEW_MB_XL + NEW_MB_W) { usb_hid_mouse_click(HID_MOUSE_L); return true; }
+        if (x >= NEW_MB_XR && x < NEW_MB_XR + NEW_MB_W) { usb_hid_mouse_click(HID_MOUSE_R); return true; }
     }
     return false;
 }
@@ -590,12 +638,11 @@ static void hid_trackpad_poll(ui_ctx_t *ctx) {
     uint32_t now = now_ms();
     bool in_tp = down && tx >= 0 && tx < UI_SCREEN_W &&
                  ty >= s_tp_top && ty <= HID_TP_Y1;
-    if (in_tp && s_show_mbtn && ty >= HID_MB_Y) {
-        bool on_btn =
-            (tx >= HID_MB_XL && tx < HID_MB_XL + HID_MB_W) ||
-            (tx >= HID_MB_XR && tx < HID_MB_XR + HID_MB_W) ||
-            (tx >= HID_ARROW_XL && tx < HID_ARROW_XL + HID_ARROW_W) ||
-            (tx >= HID_ARROW_XR && tx < HID_ARROW_XR + HID_ARROW_W);
+    if (in_tp && s_show_mbtn) {
+        /* OP / 52键 / 纯触控板 统一: 底部中央 L/R 按钮区不计入鼠标移动 */
+        bool on_btn = (ty >= NEW_MB_Y) &&
+                     ((tx >= NEW_MB_XL && tx < NEW_MB_XL + NEW_MB_W) ||
+                      (tx >= NEW_MB_XR && tx < NEW_MB_XR + NEW_MB_W));
         if (on_btn) in_tp = false;
     }
     if (down && !s_tp_active) {
@@ -658,12 +705,13 @@ static const char *const s_layout_names[4] = {
     "\xe7\xba\xaf\xe8\xa7\xa6\xe6\x8e\xa7\xe6\x9d\xbf",            /* 纯触控板 */
 };
 
+/* 选择菜单"返回"/底部"退出"/弹窗态按 BACK → 直接退出键鼠页 (不弹确认框).
+ * 用户需求: 点下方退出直接退出, 硬件返回键按一次直接退出, 不需要退出确认. */
 static void hid_layout_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     if (result < 0) {
-        /* 底部"返回": 退出键鼠页回主菜单 (弹窗由本回调先关, 再退 HID 页) */
-        os_dialog_pop(ctx);
-        os_pop(ctx);
+        os_dialog_clear_all(ctx);      /* 关选择菜单 (若开着) */
+        os_pop(ctx);                   /* 退出 HID 页 (触发 p_hid_exit 恢复串口/上滑返回) */
         return;
     }
     if (result < HID_LAYOUT_MAX) {
@@ -686,8 +734,7 @@ static void p_hid_enter(ui_ctx_t *ctx) {
     hid_ui_reset();
     ESP_LOGI(TAG, "USB HID 已启动");
     /* 3.3 交互: 进入即弹出"键鼠布局"列表弹窗选择布局; 底部固定"返回"退出键鼠页 */
-    os_dialog_list(ctx, "\xe9\x94\xae\xe9\xbc\xa0\xe5\xb8\x83\xe5\xb1\x80", /* 键鼠布局 */
-                   s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
+    os_dialog_list(ctx, "\xe9\x80\x89\xe6\x8b\xa9\xe9\x94\xae\xe7\x9b\x98",  /* 选择键盘 */ s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
 }
 
 static void p_hid_exit(ui_ctx_t *ctx) {
@@ -729,14 +776,14 @@ static void p_hid_render(ui_ctx_t *ctx) {
 static void p_hid_action(ui_ctx_t *ctx, os_action_t a) {
     switch (a) {
     case OS_ACTION_CONFIRM:
-        /* 布局切换: 统一列表弹窗 (4 布局 + 底部固定返回) */
-        os_dialog_list(ctx, "\xe9\x94\xae\xe9\xbc\xa0\xe5\xb8\x83\xe5\xb1\x80", /* 键鼠布局 */
+        /* 确认键 → 弹出"选择键盘"列表菜单 (切换布局); 菜单内按返回/底部"退出"直接退出 */
+        os_dialog_list(ctx, "\xe9\x80\x89\xe6\x8b\xa9\xe9\x94\xae\xe7\x9b\x98",  /* 选择键盘 */
                        s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
         break;
     case OS_ACTION_BACK:
-        /* 布局内按返回 → 弹出"键鼠布局"选择弹窗 (再按弹窗底部"返回"才真正退出) */
-        os_dialog_list(ctx, "\xe9\x94\xae\xe9\xbc\xa0\xe5\xb8\x83\xe5\xb1\x80", /* 键鼠布局 */
-                       s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
+        /* 硬件/手柄返回键 → 直接退出键鼠页 (不弹菜单/确认框); 切换布局改由确认键弹菜单 */
+        os_dialog_clear_all(ctx);
+        os_pop(ctx);
         break;
     default:
         break;

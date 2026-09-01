@@ -1,35 +1,40 @@
 /**
  * @file usb_hid.c
- * @brief USB HID 复合设备 (键盘 itf 0 + 鼠标 itf 1).
+ * @brief USB 复合设备"按需切换"管理器 (esp_tinyusb v2.x).
  *
- * 与 usbh_msc 相同的外设切换模式:
- *   - usb_hid_start(): 卸载 USB Serial/JTAG (释放 GPIO 19/20), 安装 TinyUSB,
- *     向电脑呈现一个复合 HID 设备 = 键盘 + 鼠标.
- *   - usb_hid_stop(): 卸载 TinyUSB, 恢复 USB Serial/JTAG (回到串口日志).
+ * 背景 (彻底解决 TF 卡挂载到电脑即崩溃/失败):
+ *   ESP32-S3 的 USB-OTG 与 USB-Serial/JTAG 共用同一个内部 PHY, 同一时刻只能一个工作.
  *
- * esp_tinyusb 默认描述符不包含 HID 接口, 因此这里通过 tinyusb_driver_install
- * 传入自定义的 configuration descriptor, 并使用 TUD_HID_DESCRIPTOR 拼装
- * 键盘 + 鼠标两个接口.
+ * 本方案采用与"虚拟键鼠"一致的按需切换 (该模式在本机已验证正常):
+ *   - 正常模式 (开机默认): USB Serial/JTAG 串口控制台, 不装 TinyUSB.
+ *   - 键鼠模式: 切换到 HID 键盘 + 鼠标 + CDC 复合设备.
+ *   - 挂载模式: 切换到纯 MSC (标准 U盘) 设备.
+ *   进入: 压制日志 → 卸载 Serial/JTAG → 装 TinyUSB.  退出: 卸 TinyUSB → 装回 Serial/JTAG.
+ *   挂载期间由 usbh_msc 额外暂停串口控制台 (只写文件日志), 彻底避免日志写向已失效串口.
  *
- * HID 报告发送走原生 tinyusb 的 tud_hid_n_keyboard_report / tud_hid_n_mouse_report:
- *   实例 0 = 键盘 (itf 0), 实例 1 = 鼠标 (itf 1).
+ * 注: v2 的 esp_tinyusb 强定义了 tud_cdc_rx_cb/tud_mount_cb 等, 故这里不自定义它们;
+ *     MSC 的 tud_msc_* 由官方 storage 层提供 (usbh_msc_sdspi.c 用 storage API).
  */
 #include "usb_hid.h"
+#include <stdio.h>
+#include <string.h>
 #include "esp_log.h"
 #include "esp_err.h"
-#include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tinyusb.h"
-#include "tusb_tasks.h"
+#include "tinyusb_default_config.h"
 #include "tusb_config.h"
+#include "driver/usb_serial_jtag.h"
 #include "class/hid/hid.h"
 #include "class/hid/hid_device.h"
-#include "esp_private/usb_phy.h"
+#include "class/cdc/cdc_device.h"
+#include "class/msc/msc_device.h"
+#include "class/bth/bth_device.h"
 
 static const char *TAG = "USB_HID";
 
-/* ---------------- 描述符 ---------------- */
+/* ---------------- 报告描述符 ---------------- */
 
 /* 键盘报告描述符 (实例 0):
  * 偏移0: modifier(1字节) 偏移1: reserved(1字节) 偏移2-7: keycode[6] */
@@ -60,35 +65,15 @@ static const uint8_t keyboard_report_desc[] = {
 };
 
 /* 鼠标报告描述符 (实例 1):
- * 偏移0: buttons(1字节) 偏移1: x(int8) 偏移2: y(int8) */
+ * 采用 TinyUSB 官方 TUD_HID_REPORT_DESC_MOUSE 模板 (5 字节: buttons + X + Y + Wheel + Pan, 全 Relative).
+ * 必须 5 字节, 与 tud_hid_n_mouse_report() 实际发出的 5 字节报告一致!
+ * 旧版手写 3 字节描述符 + HID_ITF_PROTOCOL_MOUSE(boot) 在 Windows 上被严格解析为 boot 3 字节格式,
+ * 与设备实际发出的 5 字节报告长度不匹配 -> Windows 不识别鼠标 (macOS 宽松容忍故正常). */
 static const uint8_t mouse_report_desc[] = {
-    0x05, 0x01,       /* Usage Page (Generic Desktop) */
-    0x09, 0x02,       /* Usage (Mouse) */
-    0xA1, 0x01,       /* Collection (Application) */
-    0x09, 0x01,       /*   Usage (Pointer) */
-    0xA1, 0x00,       /*   Collection (Physical) */
-    0x05, 0x09,       /*     Usage Page (Buttons) */
-    0x19, 0x01,       /*     Usage Minimum (1) */
-    0x29, 0x03,       /*     Usage Maximum (3) */
-    0x15, 0x00,       /*     Logical Minimum (0) */
-    0x25, 0x01,       /*     Logical Maximum (1) */
-    0x95, 0x03,       /*     Report Count (3) */
-    0x75, 0x01,       /*     Report Size (1) */
-    0x81, 0x02,       /*     Input (Data, Variable, Absolute) -> buttons */
-    0x95, 0x01,       /*     Report Count (1) */
-    0x75, 0x05,       /*     Report Size (5) */
-    0x81, 0x01,       /*     Input (Constant) -> padding */
-    0x05, 0x01,       /*     Usage Page (Generic Desktop) */
-    0x09, 0x30,       /*     Usage (X) */
-    0x09, 0x31,       /*     Usage (Y) */
-    0x15, 0x81,       /*     Logical Minimum (-127) */
-    0x25, 0x7F,       /*     Logical Maximum (127) */
-    0x75, 0x08,       /*     Report Size (8) */
-    0x95, 0x02,       /*     Report Count (2) */
-    0x81, 0x06,       /*     Input (Data, Variable, Relative) -> x,y */
-    0xC0,             /*   End Collection */
-    0xC0              /* End Collection */
+    TUD_HID_REPORT_DESC_MOUSE()
 };
+
+/* ---------------- 设备 1: HID 键鼠 + CDC (键鼠模式, 照搬旧版验证过的描述符) ---------------- */
 
 /* 接口枚举 */
 enum { ITF_KEYBOARD = 0, ITF_MOUSE = 1, ITF_CDC = 2, ITF_CDC_DATA = 3, ITF_NUM_TOTAL };
@@ -101,14 +86,74 @@ static uint8_t const hid_config_desc[] = {
                           TUSB_DESC_CONFIG_ATT_SELF_POWERED, 100),
     TUD_HID_DESCRIPTOR(ITF_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD,
                        sizeof(keyboard_report_desc), EP_KEYBOARD, 8, 10),
-    TUD_HID_DESCRIPTOR(ITF_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE,
+    TUD_HID_DESCRIPTOR(ITF_MOUSE, 0, HID_ITF_PROTOCOL_NONE,
                        sizeof(mouse_report_desc), EP_MOUSE, 8, 10),
     TUD_CDC_DESCRIPTOR(ITF_CDC, 0, EP_CDC_NOTIF, 8, EP_CDC_OUT, EP_CDC_IN, 64),
 };
 
-/* 字符串描述符: [0]=langid, [1]=manufacturer, [2]=product, [3]=serial */
-static const char *string_desc_arr[] = {
+/* ---------------- 设备 2: 纯 MSC (挂载模式, 标准 U盘) ---------------- */
+
+/* 接口枚举: 0=MSC */
+enum { ITF_MSC = 0, ITF_MSC_TOTAL };
+enum { EP_MSC_OUT = 0x01, EP_MSC_IN = 0x81 };
+
+#define MSC_DESC_LEN (TUD_CONFIG_DESC_LEN + TUD_MSC_DESC_LEN)
+
+static uint8_t const msc_config_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_MSC_TOTAL, 0, MSC_DESC_LEN,
+                          TUSB_DESC_CONFIG_ATT_SELF_POWERED, 100),
+    TUD_MSC_DESCRIPTOR(ITF_MSC, 0, EP_MSC_OUT, EP_MSC_IN, 64),
+};
+
+/* ---------------- 设备 3: USB-BT (蓝牙适配器, 标准 HCI BTH) ---------------- */
+
+/* 接口: 0=BTH-primary, 1=BTH-ISO(需 ISO_ALT_COUNT≥1 供主机蓝牙驱动识别).
+ * EP: evt/interrupt + acl in/out(bulk) + iso in/out. */
+enum { ITF_BTH = 0, ITF_BTH_ISO = 1, ITF_BTH_TOTAL = 2 };
+enum { EP_BTH_EVT = 0x81, EP_BTH_IN = 0x82, EP_BTH_OUT = 0x02, EP_BTH_ISO_IN = 0x83, EP_BTH_ISO_OUT = 0x03 };
+
+/* BTH 配置描述符长度 by 官方宏 (ISO_ALT_COUNT=1 → 8+9+7+7+7+23 = 61) */
+#define BTH_DESC_LEN (TUD_CONFIG_DESC_LEN + TUD_BTH_DESC_LEN)
+
+static uint8_t const bth_config_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_BTH_TOTAL, 0, BTH_DESC_LEN,
+                          TUSB_DESC_CONFIG_ATT_SELF_POWERED, 100),
+    /* evt EP16 间隔1, acl in/out 64, 1 个 ISO alt (in/out 64) */
+    TUD_BTH_DESCRIPTOR(ITF_BTH, 0, EP_BTH_EVT, 16, 1, EP_BTH_IN, EP_BTH_OUT, 64, 64),
+};
+
+static const char *bth_string_desc_arr[] = {
+    (char[]){0x09, 0x04}, "Espressif Systems", "Espresso USB-BT", "123456",
+};
+
+/* ---------------- 设备 4: USB 网卡共享 (RNDIS 有线网卡, Windows 原生识别) ----------------
+ * 接口: 0=CDC 通信(通知, 中断 IN), 1=CDC 数据(网络数据, 批量 OUT/IN).
+ * 用官方 TUD_RNDIS_DESCRIPTOR (IAD + CDC+ACM+RNDIS 功能描述符 + 端点).
+ * 网络数据通路(tud_network_* 回调 + esp_netif/lwIP)见 usb_net.c. */
+enum { ITF_NET = 0, ITF_NET_DATA = 1, ITF_NET_TOTAL = 2 };
+enum { EP_NET_NOTIF = 0x81, EP_NET_OUT = 0x02, EP_NET_IN = 0x82 };
+
+#define NET_DESC_LEN (TUD_CONFIG_DESC_LEN + TUD_RNDIS_DESC_LEN)
+
+static uint8_t const net_config_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NET_TOTAL, 0, NET_DESC_LEN,
+                          TUSB_DESC_CONFIG_ATT_SELF_POWERED, 100),
+    /* 接口0, 无接口字符串, notif IN(8), 数据 OUT/IN(64) */
+    TUD_RNDIS_DESCRIPTOR(ITF_NET, 0, EP_NET_NOTIF, 8, EP_NET_OUT, EP_NET_IN, 64),
+};
+
+static const char *net_string_desc_arr[] = {
+    (char[]){0x09, 0x04}, "Espressif Systems", "Espresso USB Net", "123456",
+};
+
+/* ---------------- 字符串描述符 ---------------- */
+
+/* [0]=langid, [1]=manufacturer, [2]=product, [3]=serial */
+static const char *hid_string_desc_arr[] = {
     (char[]){0x09, 0x04}, "Espressif Systems", "Espresso HID KeyMouse", "123456",
+};
+static const char *msc_string_desc_arr[] = {
+    (char[]){0x09, 0x04}, "Espressif Systems", "Espresso USB Storage", "123456",
 };
 
 /* ---------------- HID 回调 (TinyUSB) ---------------- */
@@ -138,123 +183,175 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
     return 0; /* 不支持 GET_REPORT, 让 stack STALL */
 }
 
-/* ---------------- 状态 ---------------- */
+/* ---------------- 设备事件回调 (v2, 不做日志避免 TinyUSB 任务栈压力) ---------------- */
 
-static bool s_running = false;
-static bool s_jtag_was_running = false;
-/* V1.0.72: stop 时 usb_new_phy(SERIAL_JTAG) 占用的 fsls PHY 句柄.
- * start 时先 usb_del_phy 释放, 否则 tinyusb 内部 usb_new_phy(OTG) 会因
- * "selected PHY is in use" 报 ESP_ERR_INVALID_STATE, 导致退出后重进仿真键鼠失败. */
-static usb_phy_handle_t s_serial_phy_hdl = NULL;
+static void usb_device_event_cb(tinyusb_event_t *event, void *arg)
+{
+    (void)arg;
+    (void)event;
+    /* 事件回调运行在 TinyUSB 任务, 不打日志 (日志走 CDC 会在该任务栈上递归过深) */
+}
 
-static uint8_t s_key_modifier = 0;
-static bool   s_key_held = false;
-static uint8_t s_mouse_buttons = 0;
+/* ---------------- 模式切换管理 ---------------- */
 
-/* 键盘实例 */
+typedef enum {
+    USB_MODE_NORMAL = 0,   /* USB Serial/JTAG 控制台, 无 TinyUSB */
+    USB_MODE_HID,          /* 键鼠: HID 键盘 + 鼠标 + CDC */
+    USB_MODE_MSC,          /* 挂载: MSC + CDC */
+    USB_MODE_BTH,          /* USB-BT: 蓝牙适配器 HCI */
+    USB_MODE_NET,          /* USB 网卡共享: USB-RNDIS 有线网卡 */
+} usb_mode_t;
+
+static usb_mode_t s_mode = USB_MODE_NORMAL;
+
+/* 切换期间日志接管: 只丢弃输出, 不写任何串口 (切换窗口几 ms, 丢失可忽略) */
+static int usb_log_discard(const char *fmt, va_list arg)
+{
+    (void)fmt; (void)arg;
+    return 0;
+}
+
+/* 进入 TinyUSB 模式: 卸载 Serial/JTAG → 装复合/纯 MSC 设备.
+ * 全程压制日志, 避免任何日志写向已卸载的 Serial/JTAG.
+ * 注: 挂载模式由调用方 (usbh_msc) 额外暂停串口控制台 (只写文件), 键鼠模式与旧版一致. */
+static esp_err_t usb_mode_enter(const uint8_t *config_desc, const char **strings, int str_count)
+{
+    vprintf_like_t prev = esp_log_set_vprintf(&usb_log_discard);
+
+    /* 释放 Serial/JTAG (与虚拟键鼠一致的切换序列), 稍等稳定 */
+    esp_err_t sj_ret = usb_serial_jtag_driver_uninstall();
+    if (sj_ret != ESP_OK) {
+        ESP_LOGE(TAG, "卸载 Serial/JTAG 失败: %s", esp_err_to_name(sj_ret));
+        esp_log_set_vprintf(prev);
+        return sj_ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    tinyusb_config_t cfg = TINYUSB_DEFAULT_CONFIG(usb_device_event_cb);
+    /* 加大 TinyUSB 任务栈, 避免任务内日志路径过深溢出 */
+    cfg.task = TINYUSB_TASK_CUSTOM(8192, 5, 1);
+    cfg.descriptor.string = strings;
+    cfg.descriptor.string_count = str_count;
+    cfg.descriptor.full_speed_config = config_desc;
+    cfg.descriptor.qualifier = NULL;
+    cfg.descriptor.high_speed_config = NULL;
+    cfg.phy.self_powered = true;
+    cfg.phy.vbus_monitor_io = -1;
+
+    esp_err_t ret = tinyusb_driver_install(&cfg);
+    if (ret != ESP_OK) {
+        /* 失败: 装回 Serial/JTAG 驱动, 恢复原控制台, 避免串口永久失效 */
+        ESP_LOGE(TAG, "进入 TinyUSB 模式失败: %s", esp_err_to_name(ret));
+        usb_serial_jtag_driver_config_t sj_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+        usb_serial_jtag_driver_install(&sj_cfg);
+        esp_log_set_vprintf(prev);
+        return ret;
+    }
+    esp_log_set_vprintf(prev);
+    return ESP_OK;
+}
+
+/* 退出 TinyUSB 模式: 卸 TinyUSB → 装回 Serial/JTAG 驱动 (恢复串口控制台). */
+static void usb_mode_exit(void)
+{
+    if (s_mode == USB_MODE_NORMAL) return;
+    vprintf_like_t prev = esp_log_set_vprintf(&usb_log_discard);
+
+    /* v2 的 tinyusb_driver_uninstall 会停任务/释放 OTG PHY */
+    tinyusb_driver_uninstall();
+
+    /* 装回 Serial/JTAG 驱动 (自动重挂 /dev/usbserjtag VFS) */
+    usb_serial_jtag_driver_config_t sj_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usb_serial_jtag_driver_install(&sj_cfg);
+
+    esp_log_set_vprintf(prev);
+    s_mode = USB_MODE_NORMAL;
+}
+
+/* 切换到键鼠 (HID+CDC) 复合设备 */
+esp_err_t usb_composite_enter_hid(void)
+{
+    if (s_mode == USB_MODE_HID) return ESP_OK;
+    if (s_mode != USB_MODE_NORMAL) usb_mode_exit();   /* 防御: 先回正常模式 */
+    esp_err_t ret = usb_mode_enter(hid_config_desc, hid_string_desc_arr, 4);
+    if (ret == ESP_OK) s_mode = USB_MODE_HID;
+    return ret;
+}
+
+/* 切换到挂载 (纯 MSC U盘) 设备 */
+esp_err_t usb_composite_enter_msc(void)
+{
+    if (s_mode == USB_MODE_MSC) return ESP_OK;
+    if (s_mode != USB_MODE_NORMAL) usb_mode_exit();   /* 防御: 先回正常模式 */
+    esp_err_t ret = usb_mode_enter(msc_config_desc, msc_string_desc_arr, 4);
+    if (ret == ESP_OK) s_mode = USB_MODE_MSC;
+    return ret;
+}
+
+/* 切换到 USB-BT (蓝牙适配器 HCI) 设备 */
+esp_err_t usb_composite_enter_bth(void)
+{
+    if (s_mode == USB_MODE_BTH) return ESP_OK;
+    if (s_mode != USB_MODE_NORMAL) usb_mode_exit();   /* 防御: 先回正常模式 */
+    esp_err_t ret = usb_mode_enter(bth_config_desc, bth_string_desc_arr, 4);
+    if (ret == ESP_OK) s_mode = USB_MODE_BTH;
+    return ret;
+}
+
+/* 切换到 USB-RNDIS 网卡设备 (USB 有线网卡, Windows 原生识别).
+ * 依赖 sdkconfig 使能 CONFIG_TINYUSB_NET_MODE_ECM_RNDIS (编译 net 类).
+ * 数据通路 (tud_network_mac_address + tud_network_* 回调 + esp_netif/lwIP) 由 usb_net.c 提供. */
+esp_err_t usb_composite_enter_net(void)
+{
+    if (s_mode == USB_MODE_NET) return ESP_OK;
+    if (s_mode != USB_MODE_NORMAL) usb_mode_exit();   /* 防御: 先回正常模式 */
+    esp_err_t ret = usb_mode_enter(net_config_desc, net_string_desc_arr, 4);
+    if (ret == ESP_OK) s_mode = USB_MODE_NET;
+    return ret;
+}
+
+/* 退出任意 TinyUSB 模式, 回到正常 (Serial/JTAG 控制台) */
+void usb_composite_exit(void)
+{
+    usb_mode_exit();
+}
+
+/* 当前是否处于某个 TinyUSB 模式且已被主机枚举 */
+bool usb_composite_is_connected(void)
+{
+    return s_mode != USB_MODE_NORMAL && tud_mounted();
+}
+
+/* ---------------- 对外 API (键鼠) ---------------- */
+
+/* HID 实例: 0=键盘, 1=鼠标 */
 #define HID_ITF_KB 0
-/* 鼠标实例 */
 #define HID_ITF_MS 1
 
-/* ---------------- 对外 API ---------------- */
-
-/* V1.0.74: 调试 - 读取 fsls (internal) PHY 当前占用状态, 打印方便定位重进失败 */
-static void dbg_dump_phy_state(void)
-{
-    usb_phy_status_t st;
-    if (usb_phy_get_phy_status(USB_PHY_TARGET_INT, &st) != ESP_OK) {
-        ESP_LOGI(TAG, "[PHY] fsls 状态读取失败(未安装?)");
-        return;
-    }
-    ESP_LOGI(TAG, "[PHY] fsls=%s, s_serial_phy_hdl=%p", st ? "IN_USE" : "FREE", (void *)s_serial_phy_hdl);
-}
+static bool s_running = false;       /* 键鼠模式是否启用 */
+static uint8_t s_mouse_buttons = 0;
 
 esp_err_t usb_hid_start(void)
 {
     if (s_running) return ESP_OK;
-    ESP_LOGI(TAG, "启动 USB HID 复合设备 (键盘 + 鼠标)...");
-    dbg_dump_phy_state();
-
-    /* 对齐 usbh_msc 已验证模式: 无条件卸载 Serial/JTAG 驱动 (未安装时 IDF
-     * 返回 ESP_OK 仅打 warning), 彻底释放 GPIO 19/20 给 OTG.
-     * 旧版用 is_driver_installed 判断会因日志走 ROM console 误判"未安装"
-     * 跳过卸载, 导致 PHY 被占; 且 s_serial_phy_hdl 跨次保存/释放会在重进时
-     * usb_del_phy 误删有效句柄, 破坏 usb_phy 子系统 ("USB_PHY is not
-     * initialized"), 第二次进入键盘/触控板失效. */
-    s_jtag_was_running = usb_serial_jtag_is_driver_installed();
-    esp_err_t jret = usb_serial_jtag_driver_uninstall();
-    if (jret != ESP_OK) {
-        ESP_LOGE(TAG, "卸载 Serial/JTAG 失败: %s (0x%x)", esp_err_to_name(jret), jret);
-        return jret;
+    esp_err_t ret = usb_composite_enter_hid();
+    if (ret == ESP_OK) {
+        s_running = true;
+        ESP_LOGI(TAG, "键鼠模式已启用 (HID 键盘+鼠标+CDC, 控制台走 CDC)");
+    } else {
+        ESP_LOGE(TAG, "键鼠模式启动失败: %s", esp_err_to_name(ret));
     }
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    /* 不再维护 s_serial_phy_hdl 跨次句柄 (该机制实测破坏 PHY 子系统) */
-    s_serial_phy_hdl = NULL;
-
-    const tinyusb_config_t tusb_cfg = {
-        .external_phy = false,
-        .self_powered = true,
-        .vbus_monitor_io = -1,
-        .device_descriptor = NULL,             /* 用 esp_tinyusb 默认设备描述符 */
-        .configuration_descriptor = hid_config_desc, /* 自定义: 键盘+鼠标 */
-        .string_descriptor = string_desc_arr,
-        .string_descriptor_count = 4,
-    };
-    esp_err_t ret = tinyusb_driver_install(&tusb_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "tinyusb_driver_install 失败: %s (0x%x)", esp_err_to_name(ret), ret);
-        if (s_jtag_was_running) {
-            usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-            usb_serial_jtag_driver_install(&cfg);
-        }
-        return ret;
-    }
-    ESP_LOGI(TAG, "[HID] tinyusb_driver_install 成功");
-
-    s_running = true;
-    ESP_LOGI(TAG, "USB HID 已启动, 请连接电脑 USB 以枚举为键盘+鼠标");
-    ESP_LOGI(TAG, "[HID] start 完成: is_running=%d jtag_was=%d phy_hdl=%p",
-             (int)s_running, (int)s_jtag_was_running, (void *)s_serial_phy_hdl);
-    return ESP_OK;
+    return ret;
 }
 
 void usb_hid_stop(void)
 {
     if (!s_running) return;
-    ESP_LOGI(TAG, "停止 USB HID...");
     usb_hid_key_release();
     usb_hid_mouse_release(MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT | MOUSE_BUTTON_MIDDLE);
-
-    /* 先停掉 tud_task 后台任务再卸载: esp_tinyusb 的 tinyusb_driver_uninstall()
-     * 只会 usb_del_phy() 释放 OTG PHY, 并不会 tusb_stop_task() 停掉后台死循环.
-     * 残留 tud_task 会持续驱动/占用 USB PHY 寄存器. */
-    tusb_stop_task();
-    /* tusb_deinit: 彻底释放 tusb 栈内部状态 (DCD/队列/互斥锁/_usbd_rhport).
-     * 不调 tusb_deinit 则 tud_inited() 仍为 true, 下次 tinyusb_driver_install 时
-     * tud_rhport_init 见已初始化直接跳过 DCD 重配 → 二次打开键鼠失效. */
-    tusb_deinit(0);
-    tinyusb_driver_uninstall();
     s_running = false;
-
-    /* v5.5.5 下不再显式 usb_new_phy(SERIAL_JTAG) 切回 PHY 控制器.
-     *
-     * 关键修复背景 (esp-idf #9826/#15912): 旧方案在 stop 里用 usb_new_phy()
-     * 切回 SERIAL_JTAG, 但该方法产生的 fsls PHY 句柄一旦丢弃就成"无主占用",
-     * 且注释里 s_serial_phy_hdl 跨次保存/释放又可能误删有效句柄破坏 usb_phy
-     * 子系统. 实测二次 start 时报 "selected PHY is in use" (0x103) 启动失败,
-     * 界面闪退回主菜单. v5.5.5 的 tinyusb_driver_uninstall() 内部已正确
-     * usb_del_phy 释放 OTG PHY, 无需手动切回 (与 GitHub 参考版 usbh_msc 一致).
-     *
-     * 这里直接重装 USB Serial/JTAG 驱动恢复到串口日志即可. */
-    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-    esp_err_t sj_ret = usb_serial_jtag_driver_install(&cfg);
-    if (sj_ret == ESP_OK) {
-        ESP_LOGI(TAG, "USB Serial/JTAG 驱动已重装, 串口已恢复 (无需重启)");
-    } else {
-        ESP_LOGW(TAG, "重装 USB Serial/JTAG 驱动失败: %s", esp_err_to_name(sj_ret));
-    }
-    s_serial_phy_hdl = NULL;
+    usb_composite_exit();
+    ESP_LOGI(TAG, "键鼠模式已退出, 已恢复 Serial/JTAG 控制台");
 }
 
 bool usb_hid_is_running(void) { return s_running; }
@@ -287,8 +384,6 @@ void usb_hid_key_press(uint8_t modifier, const uint8_t *keycodes, uint8_t n)
     if (!kb_ready()) return;
     if (n > 6) n = 6;
     for (uint8_t i = 0; i < n; i++) buf[i] = keycodes[i];
-    s_key_modifier = modifier;
-    s_key_held = true;
     tud_hid_n_keyboard_report(HID_ITF_KB, 0, modifier, buf);
 }
 
@@ -296,8 +391,6 @@ void usb_hid_key_release(void)
 {
     if (!s_running) return;
     uint8_t empty[6] = {0, 0, 0, 0, 0, 0};
-    s_key_modifier = 0;
-    s_key_held = false;
     if (kb_ready()) {
         tud_hid_n_keyboard_report(HID_ITF_KB, 0, 0, empty);
     }
@@ -340,37 +433,12 @@ void usb_hid_mouse_release(uint8_t buttons)
     tud_hid_n_mouse_report(HID_ITF_MS, 0, s_mouse_buttons, 0, 0, 0, 0);
 }
 
-/* ---------------- CDC 串口 (复合设备附加功能) ---------------- */
-
-/* 说明: 设备描述符走 esp_tinyusb 默认 (MISC/IAD 复合类), 配置描述符由
- * TUD_CDC_DESCRIPTOR 自动携带 IAD 把接口 2(CDC)/3(CDC_DATA) 关联为单一功能.
- * 这里用 TinyUSB 原生 API (与上方 HID 同风格, 不引入 esp_tinyusb acm 封装层,
- * 避免其内部同样定义 tud_cdc_rx_cb 造成重复定义). 实例号固定为 0. */
-
-static usb_hid_cdc_rx_cb_t s_cdc_rx_cb = NULL;
-
-void usb_hid_cdc_set_rx_cb(usb_hid_cdc_rx_cb_t cb)
-{
-    s_cdc_rx_cb = cb;
-}
-
-/* TinyUSB 在收到 CDC 数据时调用 (tud_task 上下文), 把数据交给应用回调.
- * 应用回调应尽快拷贝/消费, 不要在回调里做耗时操作. */
-void tud_cdc_rx_cb(uint8_t itf)
-{
-    (void)itf; /* 单实例, 恒为 0 */
-    if (!s_cdc_rx_cb) return;
-    uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
-    uint32_t count = tud_cdc_read(buf, sizeof(buf));
-    if (count > 0) {
-        s_cdc_rx_cb(buf, count);
-    }
-}
+/* ---------------- CDC 串口 (复合设备附加) ---------------- */
 
 /* 向 PC CDC 串口发送数据. 返回实际写入字节数; 未运行/未连接返回 0. */
 size_t usb_hid_cdc_write(const uint8_t *data, size_t len)
 {
-    if (!s_running || !tud_cdc_connected()) return 0;
+    if (s_mode == USB_MODE_NORMAL || !tud_cdc_connected()) return 0;
     size_t n = tud_cdc_write(data, len);
     tud_cdc_write_flush();
     return n;
@@ -379,5 +447,5 @@ size_t usb_hid_cdc_write(const uint8_t *data, size_t len)
 /* CDC 串口是否已连接 (PC 打开该串口后 DTR 置位) */
 bool usb_hid_cdc_connected(void)
 {
-    return s_running && tud_cdc_connected();
+    return s_mode != USB_MODE_NORMAL && tud_cdc_connected();
 }

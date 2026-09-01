@@ -24,9 +24,12 @@ void wp_release_buffers(void);
 bool os_screensaver_active(void);
 void os_screensaver_reset(void);
 void os_screensaver_force_enter(void);
-/* 每帧主循环调用: 桌面空闲>WP_SS_DELAY 进入星空屏保; 离开/弹窗/新输入退出.
+/* 每帧主循环调用: 任意界面空闲>设置延时进入星空屏保; 离开/弹窗/新输入退出.
+ * 游戏界面经 input_mark_activity 刷新 last_input_ms, 故"正在玩不睡, 放下睡".
  * 参数 by 值, 避免 wallpapers 依赖 os 头 (无循环依赖). */
-void wp_screensaver_poll(bool on_main, uint32_t now_ms, uint32_t last_input_ms, bool in_dialog);
+void wp_screensaver_poll(uint32_t now_ms, uint32_t last_input_ms, bool in_dialog);
+/* 运行中更新息屏延时缓存 (设置休眠时间后调用; ms 为息屏空闲延时) */
+void wp_screensaver_set_delay_ms(uint32_t ms);
 
 
 #ifdef __cplusplus

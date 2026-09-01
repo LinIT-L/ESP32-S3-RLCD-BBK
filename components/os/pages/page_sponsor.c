@@ -21,13 +21,15 @@ static void p_sponsor_render(ui_ctx_t *ctx) {
                             (UI_SCREEN_H - QR_H) / 2, QR_W, QR_H, s_qr_bitmap);
 }
 
+static void sponsor_tap(ui_ctx_t *ctx);   /* fwd: 5 连点切换 */
+
 static void p_sponsor_action(ui_ctx_t *ctx, os_action_t a) {
-    if (a == OS_ACTION_BACK) os_pop(ctx);   /* 返回上一级 (设置) */
+    if (a == OS_ACTION_BACK) os_pop(ctx);                /* 返回上一级 (设置) */
+    else if (a == OS_ACTION_CONFIRM) sponsor_tap(ctx);   /* 实体/手柄 确认键 也计入 5 连点 (与触屏一致) */
 }
 
-/* V1.1.1 彩蛋: 收款码页连点 5 下屏幕 → 切换"显示隐藏应用" (四个引擎 + 应用管理) */
-static bool p_sponsor_touch(ui_ctx_t *ctx, int x, int y) {
-    (void)x; (void)y;
+/* V1.1.1 彩蛋: 收款码页连点 5 下 → 切换"显示隐藏应用" (四个引擎 + 应用管理) */
+static void sponsor_tap(ui_ctx_t *ctx) {
     static int s_taps = 0;
     static uint32_t s_last_ms = 0;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -42,6 +44,11 @@ static bool p_sponsor_touch(ui_ctx_t *ctx, int x, int y) {
                         ? "\xe5\xb7\xb2\xe6\x98\xbe\xe7\xa4\xba\xe9\x9a\x90\xe8\x97\x8f\xe6\xa8\xa1\xe5\x9d\x97" /* 已显示隐藏模块 */
                         : "\xe5\xb7\xb2\xe9\x9a\x90\xe8\x97\x8f\xe5\xaf\xb9\xe5\xba\x94\xe6\xa8\xa1\xe5\x9d\x97"); /* 已隐藏对应模块 */
     }
+}
+
+static bool p_sponsor_touch(ui_ctx_t *ctx, int x, int y) {
+    (void)x; (void)y;
+    sponsor_tap(ctx);
     return true;   /* 消费全部触摸, 避免误触发其他 */
 }
 

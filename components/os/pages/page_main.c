@@ -13,6 +13,7 @@
 #include "os_theme.h"
 #include "ui_common.h"
 #include "input.h"
+#include "vibrator.h"   /* V1.2.x: 拖动经过图标 → UI 震动 */
 #include "esp_timer.h"
 #include "esp_log.h"
 #include <math.h>
@@ -24,8 +25,21 @@
  * 内置应用在 os_pages.c 静态注册; 商店安装的 WASM 应用运行时注册后主菜单自动出现.
  * icon_idx = 主菜单 SF 图标索引 (见 icons_main.inc 的 main_icons[] 表).
  * 隐藏应用 (引擎/应用管理) 默认不显示, 赞助页 5 连点后显示. */
-#define MAIN_MOD_COUNT  os_app_visible_count()
-static const os_app_t *main_app(int idx) { return os_app_visible_at(idx); }
+/* 可见应用缓存: os_app_visible_at()/os_app_visible_count() 每次都会读 NVS(flash 很慢,
+ * ~几百µs/次). 主菜单渲染每帧要调用十几次 → 一帧几十次 NVS ≈ 80ms 卡顿.
+ * 进入主菜单(on_enter)时一次性构建成纯数组, 渲染只做纯索引, 绝不再碰 NVS. */
+static const os_app_t *s_apps_cache[64];
+static int s_apps_n = 0;
+static void main_rebuild_apps(void) {
+    s_apps_n = 0;
+    for (int i = 0; i < os_app_count() && s_apps_n < 64; i++) {
+        const os_app_t *a = os_app_get(i);
+        if (a && os_app_visible(a)) s_apps_cache[s_apps_n++] = a;
+    }
+}
+static int main_count(void)          { return s_apps_n; }
+static const os_app_t *main_app(int idx) { return s_apps_cache[idx]; }
+#define MAIN_MOD_COUNT main_count()
 
 /* ============ 私有状态 (相机/拖动/动画/选中) ============ */
 typedef struct {
@@ -177,7 +191,7 @@ static void p_main_render(ui_ctx_t *ctx)
             /* 惯性/归位: 抛物线减速 1-(1-t)^2 (速度线性衰减自然停);
              * 按键导航(anim_spring): 弹簧回弹. */
             float ease = s_main.anim_spring ? spring_ease(tt)
-                       : (1.0f - (float)pow(1.0f - tt, 2.0f));
+                       : (1.0f - (float)pow(1.0f - tt, 3.0f));   /* 甩动: 三次方缓出, 尾部平滑滑行 */
             cam = s_main.cam_anim_from +
                   (s_main.cam_anim_to - s_main.cam_anim_from) * ease;
             if (tt >= 1.0f) {
@@ -281,6 +295,7 @@ static void p_main_poll(ui_ctx_t *ctx)
 
     int tx, ty;
     bool down = input_get_touch_pos(&tx, &ty);
+    static int s_drag_vib_sel = -1;   /* V1.2.x: 拖动震动跟踪的"当前居中图标" */
     /* 抑制窗口内禁止开启新拖拽: 用力甩动松手后手指反弹接触会被误认为新拖拽,
      * 把相机基点重置到动画中途 → 图标瞬间后跳 ("甩完后移"感). */
     if (down && !s_main.drag_active && now_ms() >= s_main.suppress_until) {
@@ -291,6 +306,7 @@ static void p_main_poll(ui_ctx_t *ctx)
         s_main.cam_base      = s_main.cam_cur;
         s_main.cam_anim_start = 0;
         s_main.v_n = 0;                       /* 惯性采样清零 */
+        s_drag_vib_sel = -1;                  /* V1.2.x: 新一次拖动重置震动跟踪 */
         ctx->needs_redraw = true;
     }
     if (s_main.drag_active) {
@@ -301,6 +317,13 @@ static void p_main_poll(ui_ctx_t *ctx)
             s_main.drag_offset = off;
             int m = off < 0 ? -off : off;
             if (m > s_main.drag_moved) s_main.drag_moved = m;
+            /* V1.2.x: 拖动经过图标 → UI 震动 (每越过一个居中图标震一次) */
+            int center = mod_wrap(lroundf(s_main.cam_cur));
+            if (s_drag_vib_sel < 0) s_drag_vib_sel = center;
+            else if (center != s_drag_vib_sel) {
+                s_drag_vib_sel = center;
+                vibrator_tap_ui(20, 90);
+            }
             /* 速度采样: 记录最近 16 个 (偏移,时间) */
             if (s_main.v_n < 16) {
                 s_main.v_off[s_main.v_n] = off;
@@ -362,8 +385,8 @@ static void p_main_poll(ui_ctx_t *ctx)
                 s_main.anim_spring = false;
                 int steps = (int)(target - lroundf(s_main.cam_base));
                 if (steps < 0) steps = -steps;
-                uint32_t dur = 240 + (uint32_t)steps * 90;
-                if (dur > 1000) dur = 1000;
+                uint32_t dur = 320 + (uint32_t)steps * 110;   /* 甩动滑行: 时长加长, 慢慢滑停不突停 */
+                if (dur > 1400) dur = 1400;
                 s_main.cam_cur = cur;
                 main_cam_fling(cur, (float)target, dur);
                 ctx->needs_redraw = true;
@@ -374,10 +397,17 @@ static void p_main_poll(ui_ctx_t *ctx)
     }
 }
 
+/* 进入主菜单: 重建可见应用缓存 (应用管理/隐藏开关可能已变更; 渲染用纯索引免 NVS) */
+static void p_main_enter(ui_ctx_t *ctx) {
+    main_rebuild_apps();
+    ctx->needs_redraw = true;
+}
+
 /* ============ 模块契约 ============ */
 static const os_module_t s_mod_main = {
     .name      = "main",
     .page_id   = OS_PAGE_MAIN,
+    .on_enter  = p_main_enter,
     .render    = p_main_render,
     .action    = p_main_action,
     .touch     = p_main_touch,

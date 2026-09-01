@@ -12,6 +12,9 @@
 #include "esp_heap_caps.h"
 #include "ui_common.h"
 #include "esp_log.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "bt_manager.h"   /* 屏保省电: 锁屏关蓝牙 / 唤醒开蓝牙+自动回连 */
 
 #define WP_W ST7305_WIDTH     /* 400 */
 #define WP_H ST7305_HEIGHT    /* 300 */
@@ -411,29 +414,50 @@ static bool s_ss_manual = false;   /* 锁屏键点按强制进入, 不自动复�
 bool os_screensaver_active(void) { return s_ss_active; }
 void os_screensaver_reset(void)
 {
+    bool was = s_ss_active;
     if (s_ss_active) ESP_LOGI(WP_TAG, "屏保退出 (输入唤醒)");
     s_ss_active = false;
     s_ss_manual = false;
+    /* 从屏保唤醒: 重新开工业蓝牙, 自动回连任务会接上次手柄 */
+    if (was) bt_manager_enable();
 }
 void os_screensaver_force_enter(void)
 {
     s_ss_active = true;
     s_ss_manual = true;
+    bt_manager_disable();   /* 锁屏: 彻底关蓝牙(最省电) */
     ESP_LOGI(WP_TAG, "锁屏键点按: 进入壁纸屏保");
 }
-#ifndef WP_SS_DELAY_MS
-#define WP_SS_DELAY_MS 15000
-#endif
-void wp_screensaver_poll(bool on_main, uint32_t now_ms, uint32_t last_input_ms, bool in_dialog)
+/* 息屏(星空屏保)延时: 读壁纸 NVS "os_wp"/"min" (分钟).
+ *   min<=0 = 自动不息眠 (返回 UINT32_MAX, 空闲差永远到不了);
+ *   未在 NVS 设置时默认 3 分钟. */
+static uint32_t s_ss_delay_ms = 0;   /* 缓存; 0=尚未从 NVS 加载 */
+static uint32_t wp_ss_delay_ms(void)
 {
-    (void)now_ms;
+    if (s_ss_delay_ms) return s_ss_delay_ms;
+    int min = 3;
+    nvs_handle_t h;
+    if (nvs_open("os_wp", NVS_READONLY, &h) == ESP_OK) {
+        int32_t t = 0;
+        if (nvs_get_i32(h, "min", &t) == ESP_OK) min = (int)t;
+        nvs_close(h);
+    }
+    s_ss_delay_ms = (min <= 0) ? UINT32_MAX : ((uint32_t)min * 60000UL);
+    return s_ss_delay_ms;
+}
+void wp_screensaver_set_delay_ms(uint32_t ms) { s_ss_delay_ms = ms; }
+void wp_screensaver_poll(uint32_t now_ms, uint32_t last_input_ms, bool in_dialog)
+{
     if (s_ss_manual) return;   /* 手动锁屏不自动进入/复位 */
-    bool idle_long = (last_input_ms != 0 && now_ms - last_input_ms >= WP_SS_DELAY_MS);
+    bool idle_long = (last_input_ms != 0 && now_ms - last_input_ms >= wp_ss_delay_ms());
     /* 本函数只负责"进入"判定. 退出完全由 os_core 输入唤醒路径 (长按1秒/按键/POWER_LOCK)
      * 驱动: 这里不再按空闲状态自动复位, 否则任何触摸(含轻触一下)更新 last_input_ms
-     * 都会把 idle_long 置否而立刻退出屏保 —— 正是"壁纸碰一下就退出"的根因. */
-    if (on_main && !in_dialog && idle_long && !s_ss_active) {
+     * 都会把 idle_long 置否而立刻退出屏保 —— 正是"壁纸碰一下就退出"的根因.
+     * V9.1: 去掉 on_main 门控 —— 任何界面 (含游戏) 超过设置延时无输入都进入休眠,
+     * 游戏输入经 input_mark_activity 刷新 last_input_ms, 故"正在玩不睡, 放下手柄睡". */
+    if (!in_dialog && idle_long && !s_ss_active) {
         s_ss_active = true;
+        bt_manager_disable();   /* 空闲息屏: 同样关蓝牙省电 */
         ESP_LOGI(WP_TAG, "进入屏保 (星空)");
     }
 }

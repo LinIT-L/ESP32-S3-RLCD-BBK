@@ -2,5 +2,5 @@
 idf_component_register(
     SRCS "bbk_boot.c"
     INCLUDE_DIRS "."
-    REQUIRES st7305
+    REQUIRES st7305 ui_common
 )

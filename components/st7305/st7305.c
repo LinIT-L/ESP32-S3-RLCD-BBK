@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
@@ -14,6 +15,14 @@
 #define FB_BYTES  ((ST7305_WIDTH / 4) * (ST7305_HEIGHT / 2))  /* 15000 */
 #define FB_STRIDE (ST7305_HEIGHT >> 2)                     /* 75 */
 
+/* LCD SPI 互斥: 模拟器任务与 OS 主循环可能并发刷屏, 防止
+ * "spi_device_polling_transmit: previous polling transaction not terminated"
+ * 导致画面撕裂("出来一部分")/卡顿. */
+static SemaphoreHandle_t s_lcd_lock = NULL;
+static void lcd_lock_ensure(void) {
+    if (!s_lcd_lock) s_lcd_lock = xSemaphoreCreateMutex();
+}
+
 #define CASET_START  0x12
 #define CASET_END    0x2A
 #define RASET_START  0x00
@@ -22,6 +31,7 @@
 /* MADCTL (0x36): 横屏默认 0x48 = MX|BGR; 竖屏行/列交换 + BGR */
 #define MADCTL_LANDSCAPE  0x48
 #define MADCTL_PORTRAIT   0x28   /* MV|BGR (若方向/镜像不对, 调 MY/MX 位) */
+#define MADCTL_180        0xC8   /* 横屏翻转 XY 两轴 (0x48|x0x80): 硬件 180°, 非软件拷贝 */
 
 static inline void dc_set(st7305_handle_t *dev, int level) {
     gpio_set_level(dev->dc_gpio, level);
@@ -126,10 +136,8 @@ esp_err_t st7305_init(st7305_handle_t *out, const st7305_config_t *config) {
         .spi_freq = config->spi_freq,
     };
 
-    /* 20260816: 帧缓冲改回 PSRAM 优先, 配合 SPI_TRANS_DMA_USE_PSRAM 标志让 SPI DMA
-     * 直接从 PSRAM 读取, 避免 spi_master 额外分配 15000B 内部 DMA 暂存.
-     * 之前(20260812)移到内部 RAM 是因为 gnuboy 模拟器大量读写 PSRAM 导致带宽争抢,
-     * 换用 Peanut-GB 后单帧 <2ms, PSRAM 带宽余量充足, 不再导致闪烁. */
+    /* 帧缓冲: PSRAM 优先 (省内部 SRAM; 绘制逐像素写入 PSRAM 虽稍慢, 主菜单卡顿根因是
+     * 渲染时每帧反复读 NVS, 与 fb 位置无关 — 已在 page_main 用可见应用缓存修复). */
     out->fb = (uint8_t *)heap_caps_calloc(1, FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!out->fb) {
         ESP_LOGW(TAG, "PSRAM full, fallback to SRAM");
@@ -192,13 +200,56 @@ void st7305_deinit(st7305_handle_t *dev) {
     if (dev->spi) spi_bus_remove_device(dev->spi);
 }
 
+/* ---- 竖屏绘制目标 (书库旋转左/右) ----
+ * pfb: 300 宽 x 400 高 逻辑缓冲, 每字节 2 列 x 4 行 (与阅读器竖屏缓冲同布局, 位=1 黑). */
+#define PT_W 300
+#define PT_H 400
+#define PT_ROW_BYTES 40
+static void pt_px(uint8_t *fb, int x, int y, int black) {
+    if (x < 0 || x >= PT_W || y < 0 || y >= PT_H) return;
+    uint8_t *p = &fb[(size_t)y * PT_ROW_BYTES + (size_t)(x >> 3)];
+    uint8_t m = (uint8_t)(0x80u >> (x & 7));
+    if (black) *p |= m; else *p &= (uint8_t)~m;
+}
+static int pt_get(const uint8_t *fb, int x, int y) {
+    if (x < 0 || x >= PT_W || y < 0 || y >= PT_H) return 0;
+    return (int)((fb[(size_t)y * PT_ROW_BYTES + (size_t)(x >> 3)] >> (7 - (x & 7))) & 1u);
+}
+
+void st7305_set_portrait(st7305_handle_t *dev, uint8_t *pfb, int rot) {
+    if (!dev) return;
+    dev->pt_pfb = pfb;
+    dev->pt_rot = (rot == 3) ? 3 : 2;
+}
+
+/* 统一旋转: 书架与阅读器共用. rot0/原样 rot1/横屏180 flip 缓冲 rot2,3/竖屏 pfb */
+void st7305_set_rotation(st7305_handle_t *dev, int rot, uint8_t *buf) {
+    if (!dev) return;
+    dev->pt_pfb = NULL;
+    dev->r_flip1 = NULL;
+    if (rot == 1) {
+        dev->r_flip1 = buf;
+    } else if (rot == 2 || rot == 3) {
+        dev->pt_pfb = buf;
+        dev->pt_rot = rot;
+    }
+}
+
 void st7305_clear(st7305_handle_t *dev, st7305_color_t color) {
     if (!dev || !dev->fb) return;
+    if (dev->pt_pfb) {
+        memset(dev->pt_pfb, (color == ST7305_COLOR_WHITE) ? 0x00 : 0xFF, PT_ROW_BYTES * PT_H);
+        return;
+    }
     memset(dev->fb, (color == ST7305_COLOR_WHITE) ? 0xFF : 0x00, FB_BYTES);
 }
 
 void st7305_draw_pixel(st7305_handle_t *dev, int x, int y, st7305_color_t color) {
     if (!dev || !dev->fb) return;
+    if (dev->pt_pfb) {
+        pt_px(dev->pt_pfb, x, y, (color == ST7305_COLOR_BLACK) ? 1 : 0);
+        return;
+    }
     if ((uint32_t)x >= (uint32_t)ST7305_WIDTH || (uint32_t)y >= (uint32_t)ST7305_HEIGHT) return;
 
     int inv_y = ST7305_HEIGHT - 1 - y;
@@ -379,6 +430,17 @@ void st7305_blit_1bit(st7305_handle_t *dev,
                        int x0, int y0, int w, int h,
                        const uint8_t *bitmap) {
     if (!dev || !dev->fb || !bitmap) return;
+    if (dev->pt_pfb) {
+        /* 竖屏目标: 逐点写 pfb (慢但正确) */
+        const int bpr = (w + 7) >> 3;
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = bitmap + row * bpr;
+            for (int col = 0; col < w; col++)
+                if (src[col >> 3] & (0x80u >> (col & 7)))
+                    pt_px(dev->pt_pfb, x0 + col, y0 + row, 1);   /* 黑 */
+        }
+        return;
+    }
     /* 裁剪到屏幕范围 */
     if (x0 < 0) { bitmap += (-x0) >> 3; w += x0; x0 = 0; }
     if (y0 < 0) { bitmap += (-y0) * ((w + 7) >> 3); h += y0; y0 = 0; }
@@ -412,6 +474,17 @@ void st7305_blit_1bit_white(st7305_handle_t *dev,
                             int x0, int y0, int w, int h,
                             const uint8_t *bitmap) {
     if (!dev || !dev->fb || !bitmap) return;
+    if (dev->pt_pfb) {
+        /* 竖屏目标: 位=1 写白 (清 pfb 位) */
+        const int bpr = (w + 7) >> 3;
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = bitmap + row * bpr;
+            for (int col = 0; col < w; col++)
+                if (src[col >> 3] & (0x80u >> (col & 7)))
+                    pt_px(dev->pt_pfb, x0 + col, y0 + row, 0);   /* 白 */
+        }
+        return;
+    }
     if (x0 < 0) { bitmap += (-x0) >> 3; w += x0; x0 = 0; }
     if (y0 < 0) { bitmap += (-y0) * ((w + 7) >> 3); h += y0; y0 = 0; }
     if (x0 + w > ST7305_WIDTH)  w = ST7305_WIDTH  - x0;
@@ -465,7 +538,8 @@ esp_err_t st7305_flush_from(st7305_handle_t *dev, const uint8_t *fb) {
     if (!dev || !fb) {
         return ESP_ERR_INVALID_ARG;
     }
-
+    lcd_lock_ensure();
+    xSemaphoreTake(s_lcd_lock, portMAX_DELAY);
     uint32_t t0 = esp_timer_get_time();
 
     /* 恢复横屏扫描方向 (阅读器旋转后可能停留在竖屏模式) */
@@ -477,8 +551,7 @@ esp_err_t st7305_flush_from(st7305_handle_t *dev, const uint8_t *fb) {
     spi_transaction_t t = {
         .length = FB_BYTES * 8,
         .tx_buffer = fb,
-        /* FB 在 PSRAM: 让 SPI DMA 直接读 PSRAM, 避免 spi_master 额外分配
-         * 15000B 内部 DMA 暂存 (GB 引擎加载后内部 RAM 碎片化会分配失败). */
+        /* fb 在 PSRAM: SPI DMA 直接从 PSRAM 读, 免内部 15000B DMA 暂存 */
         .flags = SPI_TRANS_DMA_USE_PSRAM,
     };
     spi_device_polling_transmit(dev->spi, &t);
@@ -487,11 +560,44 @@ esp_err_t st7305_flush_from(st7305_handle_t *dev, const uint8_t *fb) {
     if (elapsed > 15000) {  /* >15ms 时打日志, 正常应该是 12-15ms */
         ESP_LOGW(TAG, "flush slow: %lu us", (unsigned long)elapsed);
     }
+    xSemaphoreGive(s_lcd_lock);
     return ESP_OK;
 }
 
+/* 软件旋转用的横屏 fb 像素读写 (定义在文件尾部, 此处前向声明) */
+static inline uint8_t st7305_fb_get_px(const uint8_t *fb, int x, int y);
+static inline void    st7305_fb_set_px(uint8_t *fb, int x, int y, uint8_t white);
+
 esp_err_t st7305_flush(st7305_handle_t *dev) {
     if (!dev || !dev->fb) return ESP_ERR_INVALID_ARG;
+    if (dev->r_flip1) {
+        /* 横屏 180°: 压缩屏(MY行翻转会打散每字节4行)不能走硬件MADCTL,
+         * 须在内存按像素翻转回横屏缓冲再送, 保证无白缝/不虚 */
+        uint8_t *wk = dev->r_flip1;
+        memset(wk, 0xFF, FB_BYTES);
+        for (int y = 0; y < ST7305_HEIGHT; y++)
+            for (int x = 0; x < ST7305_WIDTH; x++) {
+                uint8_t w = st7305_fb_get_px(dev->fb, x, y);
+                st7305_fb_set_px(wk, ST7305_WIDTH - 1 - x, ST7305_HEIGHT - 1 - y, w);
+            }
+        return st7305_flush_from(dev, wk);
+    }
+    if (dev->pt_pfb) {
+        /* 竖屏绘制目标: 把 300×400 pfb 旋转回物理 400×300 fb 再送屏 (阅读器用自带 pfb, 不在此) */
+        memset(dev->fb, 0xFF, FB_BYTES);   /* 全白底 */
+        for (int Y = 0; Y < PT_H; Y++) {
+            for (int X = 0; X < PT_W; X++) {
+                int black = pt_get(dev->pt_pfb, X, Y);
+                int fx = (dev->pt_rot == 2) ? (ST7305_WIDTH - 1 - Y) : Y;
+                int fy = (dev->pt_rot == 2) ? X : (ST7305_HEIGHT - 1 - X);
+                int inv_y = ST7305_HEIGHT - 1 - fy;
+                uint32_t idx = (uint32_t)(fx >> 1) * FB_STRIDE + (uint32_t)(inv_y >> 2);
+                uint8_t bit = 7u - (uint8_t)(((inv_y & 3) << 1) | (fx & 1));
+                if (black) dev->fb[idx] &= (uint8_t)~(1u << bit);
+                else       dev->fb[idx] |= (uint8_t)(1u << bit);
+            }
+        }
+    }
     return st7305_flush_from(dev, dev->fb);
 }
 
@@ -524,7 +630,8 @@ static inline void st7305_portrait_set_px(uint8_t *fb, int X, int Y, uint8_t whi
 }
 
 esp_err_t st7305_flush_rotated(st7305_handle_t *dev, uint8_t rot, uint8_t *work_fb) {
-    if (!dev || !dev->fb || !work_fb) return ESP_ERR_INVALID_ARG;
+    if (!dev || !dev->fb) return ESP_ERR_INVALID_ARG;
+    (void)work_fb;
     const uint8_t *src = dev->fb;
 
     if (rot == 0) {
@@ -533,7 +640,8 @@ esp_err_t st7305_flush_rotated(st7305_handle_t *dev, uint8_t rot, uint8_t *work_
     }
 
     if (rot == 1) {
-        /* 180°: 纯软件旋转, 横屏扫描不变 */
+        /* 180°: 压缩屏不能走硬件 MADCTL(MY 会打散每字节4行→白缝),
+         * 内存按像素翻转回横屏缓冲再送, 干净无白缝 */
         for (int y = 0; y < ST7305_HEIGHT; y++) {
             for (int x = 0; x < ST7305_WIDTH; x++) {
                 uint8_t w = st7305_fb_get_px(src, x, y);

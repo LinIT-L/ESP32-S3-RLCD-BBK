@@ -702,9 +702,9 @@ static esp_ble_scan_params_t hid_scan_params = {
     .scan_type              = BLE_SCAN_TYPE_ACTIVE,
     .own_addr_type          = BLE_ADDR_TYPE_PUBLIC,
     .scan_filter_policy     = BLE_SCAN_FILTER_ALLOW_ALL,
-    .scan_interval          = 0x50,
-    .scan_window            = 0x30,
-    .scan_duplicate         = BLE_SCAN_DUPLICATE_ENABLE,
+    .scan_interval          = 0x40,   /* 40ms: 50% 占空, 发现仍快且不把 CPU0 的 BTC_TASK 吃满 */
+    .scan_window            = 0x20,   /* 20ms */
+    .scan_duplicate         = BLE_SCAN_DUPLICATE_DISABLE,
 };
 
 static esp_err_t start_ble_scan(uint32_t seconds)
@@ -1173,10 +1173,11 @@ esp_err_t esp_hid_gap_init(uint8_t mode)
 
 esp_err_t esp_hid_scan(uint32_t seconds, size_t *num_results, esp_hid_scan_result_t **results)
 {
-    if (num_bt_scan_results || bt_scan_results || num_ble_scan_results || ble_scan_results) {
-        ESP_LOGE(TAG, "There are old scan results. Free them first!");
-        return ESP_FAIL;
-    }
+    /* 自动清理上次遗留结果, 避免 "There are old scan results" 秒失败 */
+    if (bt_scan_results) { esp_hid_scan_results_free(bt_scan_results); bt_scan_results = NULL; }
+    if (ble_scan_results) { esp_hid_scan_results_free(ble_scan_results); ble_scan_results = NULL; }
+    num_bt_scan_results = 0;
+    num_ble_scan_results = 0;
 
 #if CONFIG_BT_BLE_ENABLED
     if (start_ble_scan(seconds) == ESP_OK) {

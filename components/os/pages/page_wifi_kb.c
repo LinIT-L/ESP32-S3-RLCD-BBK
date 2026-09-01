@@ -96,6 +96,84 @@ static char kb_disp(char c) {
     return c;
 }
 
+/* ===== 手柄/方向键导航光标 (可选中任意键并按确认输入) ===== */
+typedef struct { int kind, ch; int cx, w; } kb_nav_t;   /* ch 对 KBK_DEL 区分行, 见 kb_key_label */
+static kb_nav_t s_nav[64];
+static int  s_nav_n = 0;
+static int  s_nav_cur = 0;
+#define NAV_DEL_ROW3 3   /* 行3 退格标签 */
+#define NAV_DEL_ROW4 4   /* 行4 删除标签 */
+
+/* 键标签 (渲染高亮复用) */
+static const char *kb_key_label(int kind, int ch) {
+    static char one[2];
+    switch (kind) {
+    case KBK_CHAR: one[0] = kb_disp((char)ch); one[1] = 0; return one;
+    case KBK_SHIFT: return s_wkb.sym ? "ABC" : (s_wkb.shift ? "\xe5\xb0\x8f\xe5\x86\x99" : "\xe5\xa4\xa7\xe5\x86\x99"); /* 小写/大写 */
+    case KBK_SYM:   return s_wkb.sym ? "ABC" : "&123";
+    case KBK_DEL:   return (ch == NAV_DEL_ROW4) ? "\xe5\x88\xa0\xe9\x99\xa4" : "\xe9\x80\x80\xe6\xa0\xbc"; /* 删除/退格 */
+    case KBK_SPACE: return "\xe7\xa9\xba\xe6\xa0\xbc";  /* 空格 */
+    case KBK_RET:   return "\xe8\xbf\x94\xe5\x9b\x9e";  /* 返回 */
+    case KBK_OK:    return "\xe8\xbf\x9e\xe6\x8e\xa5";   /* 连接 */
+    default: return "?";
+    }
+}
+
+/* 构建当前导航键表 (位置固定; 字母/符号切换会改字符, 需在切换时重建) */
+static void kb_nav_build(void) {
+    s_nav_n = 0;
+    const char *const *lines = s_wkb.sym ? kb_sym_line : kb_abc_line;
+    int y = KB_TOP_Y;
+    for (int r = 0; r < 2; r++) {
+        for (int i = 0; i < 10; i++)
+            s_nav[s_nav_n++] = (kb_nav_t){ KBK_CHAR, lines[r][i], i * KB_KEY_W + KB_KEY_W / 2, KB_KEY_W };
+        y += KB_KEY_H + KB_ROW_GAP;
+    }
+    int x2 = (UI_SCREEN_W - 9 * KB_KEY_W) / 2;
+    for (int i = 0; i < 9; i++)
+        s_nav[s_nav_n++] = (kb_nav_t){ KBK_CHAR, lines[2][i], x2 + i * KB_KEY_W + KB_KEY_W / 2, KB_KEY_W };
+    y += KB_KEY_H + KB_ROW_GAP;
+    int mid_w = (UI_SCREEN_W - 104) / 8;
+    s_nav[s_nav_n++] = (kb_nav_t){ KBK_SHIFT, 0, 52 / 2, 52 };
+    for (int i = 0; i < 8; i++)
+        s_nav[s_nav_n++] = (kb_nav_t){ KBK_CHAR, lines[3][i], 52 + i * mid_w + mid_w / 2, mid_w };
+    s_nav[s_nav_n++] = (kb_nav_t){ KBK_DEL, NAV_DEL_ROW3, UI_SCREEN_W - 52 + 52 / 2, 52 };
+    y += KB_KEY_H + KB_ROW_GAP;
+    s_nav[s_nav_n++] = (kb_nav_t){ KBK_SYM, 0, 60 / 2, 60 };
+    s_nav[s_nav_n++] = (kb_nav_t){ KBK_SPACE, 0, 60 + 152 / 2, 152 };
+    s_nav[s_nav_n++] = (kb_nav_t){ KBK_DEL, NAV_DEL_ROW4, 212 + 88 / 2, 88 };
+    s_nav[s_nav_n++] = (kb_nav_t){ KBK_OK, 0, 300 + (UI_SCREEN_W - 300) / 2, UI_SCREEN_W - 300 };
+    if (s_nav_cur >= s_nav_n) s_nav_cur = s_nav_n - 1;
+    if (s_nav_cur < 0) s_nav_cur = 0;
+}
+
+/* 导航索引 → 键盘行号 (0..4) */
+static int kb_nav_row(int idx) {
+    return (idx < 10) ? 0 : (idx < 20) ? 1 : (idx < 29) ? 2 : (idx < 38) ? 3 : 4;
+}
+/* 指定方向最近键, dir: 0上 1下 2左 3右 */
+static bool kb_nav_move(int dir) {
+    if (s_nav_n <= 1) return false;
+    int cx = s_nav[s_nav_cur].cx;
+    int cur_row = kb_nav_row(s_nav_cur);
+    int cyc = KB_TOP_Y + cur_row * (KB_KEY_H + KB_ROW_GAP);
+    int best = -1, best_k = 1 << 30;
+    for (int i = 0; i < s_nav_n; i++) {
+        if (i == s_nav_cur) continue;
+        int cy0 = KB_TOP_Y + kb_nav_row(i) * (KB_KEY_H + KB_ROW_GAP);
+        if (dir == 0 && cy0 >= cyc) continue;   /* 上: 只在更靠上行 */
+        if (dir == 1 && cy0 <= cyc) continue;   /* 下: 只在更靠下行 */
+        if (dir == 2 && s_nav[i].cx >= cx) continue;   /* 左: 只在更靠左 */
+        if (dir == 3 && s_nav[i].cx <= cx) continue;   /* 右: 只在更靠右 */
+        int dx = s_nav[i].cx - cx; if (dx < 0) dx = -dx;
+        int dy = cy0 - cyc;  if (dy < 0) dy = -dy;
+        int k = (dir == 2 || dir == 3) ? dx : (dy * 2 + dx);   /* 上下优先竖向距离 */
+        if (k < best_k) { best_k = k; best = i; }
+    }
+    if (best >= 0) { s_nav_cur = best; return true; }
+    return false;
+}
+
 /* 画一个按键 (黑边框 + 居中文本; sel=反色) */
 static void kb_draw_key(st7305_handle_t *lcd, int x, int y, int w, const char *label, bool sel) {
     if (sel) {
@@ -132,9 +210,11 @@ static void wkb_do_key(ui_ctx_t *ctx, int kind, int ch) {
     }
     case KBK_SHIFT:
         s_wkb.shift = !s_wkb.shift;
+        kb_nav_build();   /* 切换大小写: 刷新导航标签 (位置不变) */
         break;
     case KBK_SYM:
         s_wkb.sym = !s_wkb.sym;
+        kb_nav_build();   /* 切换字母/符号层: 重建导航字符集 */
         break;
     case KBK_DEL: {
         char *buf = wkb_buf();
@@ -217,6 +297,13 @@ static void p_wifi_kb_render(ui_ctx_t *ctx) {
     kb_draw_key(lcd, 60, y, 152, "\xe7\xa9\xba\xe6\xa0\xbc", false);        /* 空格 */
     kb_draw_key(lcd, 212, y, 88, "\xe5\x88\xa0\xe9\x99\xa4", false);        /* 删除 */
     kb_draw_key(lcd, 300, y, UI_SCREEN_W - 300, "\xe8\xbf\x9e\xe6\x8e\xa5", false); /* 连接 (紧贴右缘) */
+
+    /* 手柄/方向键导航: 最后重绘聚焦键为反色高亮 (覆盖普通绘制) */
+    if (s_nav_n > 0 && s_nav_cur >= 0 && s_nav_cur < s_nav_n) {
+        const kb_nav_t *k = &s_nav[s_nav_cur];
+        int key_y = KB_TOP_Y + kb_nav_row(s_nav_cur) * (KB_KEY_H + KB_ROW_GAP);
+        kb_draw_key(lcd, k->cx - k->w / 2, key_y, k->w, kb_key_label(k->kind, k->ch), true);
+    }
 }
 
 /* ============ 触摸 ============ */
@@ -256,24 +343,36 @@ static bool p_wifi_kb_touch(ui_ctx_t *ctx, int x, int y) {
     return false;
 }
 
-/* ============ 动作 ============ */
+/* ============ 动作 (手柄/方向键) ============ */
 static void p_wifi_kb_action(ui_ctx_t *ctx, os_action_t a) {
     switch (a) {
-    case OS_ACTION_CONFIRM:
-        wkb_do_key(ctx, KBK_OK, 0);   /* 确认 = 连接 */
-        break;
+    case OS_ACTION_UP:   kb_nav_move(0); break;
+    case OS_ACTION_DOWN: kb_nav_move(1); break;
+    case OS_ACTION_LEFT: kb_nav_move(2); break;
+    case OS_ACTION_RIGHT:kb_nav_move(3); break;
+    case OS_ACTION_CONFIRM: {
+        if (s_nav_n <= 0 || s_nav_cur < 0 || s_nav_cur >= s_nav_n) break;
+        int kind = s_nav[s_nav_cur].kind;
+        int ch = s_nav[s_nav_cur].ch;
+        if (kind == KBK_SHIFT && s_wkb.sym) kind = KBK_SYM;   /* 符号层 行3左 = 切回 ABC */
+        wkb_do_key(ctx, kind, ch);
+        return;
+    }
     case OS_ACTION_BACK:
         os_pop(ctx);
-        break;
+        return;
     default:
         break;
     }
+    ctx->needs_redraw = true;
 }
 
 /* ============ 模块契约 ============ */
 static void p_wifi_kb_enter(ui_ctx_t *ctx) {
     (void)ctx;
     wkb_reset();
+    s_nav_cur = 0;
+    kb_nav_build();   /* 进入即建导航键表 (手柄/方向键可用) */
 }
 
 static const os_module_t s_mod_wifi_kb = {

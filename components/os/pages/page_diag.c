@@ -1,8 +1,13 @@
 /**
- * page_diag.c — 故障诊断 页面模块 (P4 迁移: 从 menu/diagnosis_v2.c 改签名为 ui_ctx + 私有 state).
+ * page_diag.c — 故障诊断 页面模块.
  *
- * 浏览模式(左分类/右列表) + 故障向导模式(现象→症状→设备→配置→结果, 概率排序).
- * 状态栏由全局 svc_statusbar 自动叠加 (fullscreen=false).
+ * 移植自早期版 (ESP32_BBK_3.3) menu/diagnosis.c 的完整 UI:
+ *   - 顶部 40px 步进条 (现象/症状/设备/配置/结果, 可点返回)
+ *   - 中部 22px 提问 + 故障选项 (等距, 选中黑底反白)
+ *   - 右侧 176px 设备概率排序栏 (每个设备 64px 图标, 可拖动滚动;
+ *     图标右侧名称+百分比, 下方进度条, 点图标弹排查方案)
+ *   - 排除方案弹窗 (白底黑框, 标题条+4步+返回钮)
+ * 已 os 化: 使用 ui_ctx_t 签名, 返回经 os_pop.
  * 私有 state 全部 static 留本文件.
  */
 #include "os.h"
@@ -12,34 +17,31 @@
 #include "font_zh16.h"
 #include "input.h"
 #include "esp_timer.h"
+#include "diag_dev_icons.inc"   /* 桌面「电脑诊断」6 器件 64x64 位图 (diag_dev_icons[]) */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <dirent.h>
-#include <sys/stat.h>
 
-#define DW 400
-#define DH 300
+#define DW 400   /* ST7305_WIDTH */
+#define DH 300   /* ST7305_HEIGHT */
 
+/* 顶部进度条区高度 (节点 + 上方文字) */
 #define DBAR_H   40
+/* 内容区起始 y */
 #define DCONTENT_Y (DBAR_H)
+/* 进度条水平外边距 */
 #define DNODE_PAD 30
-#define DLEFT_W  120
-#define DIVIDER_X DLEFT_W
-#define RICON_S     52
-#define RICON_GAP   3
-#define RSHOW       3
-#define RPBAR_H     6
+/* 右侧故障元件栏宽 & 分割线 x */
+#define DRIGHT_W 176
+#define DIVIDER_X (DW - DRIGHT_W)
+/* 右侧元件图标尺寸 / 距分割线 / 图标间距 / 展示候选数 / 进度条高 */
+#define RICON_S   64
+#define RICON_PAD 4
+#define RICON_GAP 5
+#define RSHOW     4   /* 右栏默认显示 4 个器件 (第 4 个可部分露出, 提示可拖动) */
+#define RPBAR_H   6
 
-#define RLIN_ICON_Y0(di) ((di) * RL_ROW_H)
-#define RL_ROW_H    88
-#define RL_ROW_X    (DLEFT_W / 2)
-#define RL_NAME_Y(di) (RLIN_ICON_Y0(di) + RICON_S + RICON_GAP)
-#define RL_PROB_Y(di) (RL_NAME_Y(di) + 20)
-#define RL_BAR_Y(di)  (RL_PROB_Y(di) + 14)
-#define RL_MAX_OFF   (DMAXDEV - RSHOW)
-
-/* ================= 通用绘制辅助 ================= */
+/* ================= 通用绘制辅助 (自包含) ================= */
 static inline void dsetp(st7305_handle_t *l, int x, int y) {
     if (x < 0 || x >= DW || y < 0 || y >= DH) return;
     st7305_draw_pixel(l, x, y, ST7305_COLOR_BLACK);
@@ -65,10 +67,14 @@ static void dvline(st7305_handle_t *l, int x, int y0, int y1) {
     if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
     for (int y = y0; y <= y1; y++) if (y >= 0 && y < DH) st7305_draw_pixel(l, x, y, ST7305_COLOR_BLACK);
 }
-static void drect(st7305_handle_t *l, int x0, int y0, int x1, int y1, int fill) { dfill(l, x0, y0, x1, y1, fill); }
+static void drect(st7305_handle_t *l, int x0, int y0, int x1, int y1, int fill) {
+    dfill(l, x0, y0, x1, y1, fill);
+}
 static void doutline(st7305_handle_t *l, int x0, int y0, int x1, int y1) {
-    dhline(l, x0, x1, y0); dhline(l, x0, x1, y1);
-    dvline(l, x0, y0, y1); dvline(l, x1, y0, y1);
+    dhline(l, x0, x1, y0);
+    dhline(l, x0, x1, y1);
+    dvline(l, x0, y0, y1);
+    dvline(l, x1, y0, y1);
 }
 
 /* ================= 中文 / ASCII 绘制 ================= */
@@ -158,24 +164,24 @@ static int dz22s(st7305_handle_t *l, int x, int y, const char *s, bool inv) {
     while (*s && *s != '\n') { dz22(l, x, y, s, inv); x += 24; s += 3; }
     return x;
 }
-static void dpct(st7305_handle_t *l, int x, int y) {
-    static const uint8_t pat[7] = {0x18, 0x18, 0x04, 0x02, 0x01, 0x03, 0x03};
-    for (int row = 0; row < 7; row++)
-        for (int col = 0; col < 5; col++)
-            if (pat[row] & (1 << (4 - col)))
-                dsetp(l, x + col, y + row);
+static void dline(st7305_handle_t *l, int x0, int y0, int x1, int y1) {
+    int dx = x1 - x0, dy = y1 - y0;
+    int steps = (abs(dx) > abs(dy)) ? abs(dx) : abs(dy);
+    if (steps == 0) { dsetp(l, x0, y0); return; }
+    for (int i = 0; i <= steps; i++) dsetp(l, x0 + dx * i / steps, y0 + dy * i / steps);
 }
-static int dpct_text(st7305_handle_t *l, int x, int y, int val) {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d", val);
-    x = dtxt(l, x, y, buf);
-    dpct(l, x, y);
-    return x + 6;
+static void dcircle_c(st7305_handle_t *l, int cx, int cy, int r, int col) {
+    for (int y = cy - r; y <= cy + r; y++)
+        for (int x = cx - r; x <= cx + r; x++) {
+            int dx = x - cx, dy = y - cy;
+            if (dx * dx + dy * dy <= r * r) {
+                if (x >= 0 && x < DW && y >= 0 && y < DH)
+                    st7305_draw_pixel(l, x, y, (st7305_color_t)col);
+            }
+        }
 }
-static void dline(st7305_handle_t *l, int x0, int y0, int x1, int y1);
-static void dcircle(st7305_handle_t *l, int cx, int cy, int r);
-static void dcircle_w(st7305_handle_t *l, int cx, int cy, int r);
-
+static void dcircle(st7305_handle_t *l, int cx, int cy, int r) { dcircle_c(l, cx, cy, r, ST7305_COLOR_BLACK); }
+static void dcircle_w(st7305_handle_t *l, int cx, int cy, int r) { dcircle_c(l, cx, cy, r, ST7305_COLOR_WHITE); }
 static int dtxt2(st7305_handle_t *l, int x, int y, const char *s) {
     while (*s) {
         int gi = (unsigned char)*s >= '0' && (unsigned char)*s <= '9'
@@ -196,27 +202,60 @@ static int dtxt2(st7305_handle_t *l, int x, int y, const char *s) {
     }
     return x;
 }
+static void dpct(st7305_handle_t *l, int x, int y) {
+    static const uint8_t pat[7] = {0x18, 0x18, 0x04, 0x02, 0x01, 0x03, 0x03};
+    for (int row = 0; row < 7; row++)
+        for (int col = 0; col < 5; col++)
+            if (pat[row] & (1 << (4 - col)))
+                dsetp(l, x + col, y + row);
+}
+/* 1.5x 放大数字 (介于小 dtxt 与大 dtxt2 之间): 每字约 8px 宽 */
+static int dtxt15(st7305_handle_t *l, int x, int y, const char *s) {
+    while (*s) {
+        int gi = (unsigned char)*s >= '0' && (unsigned char)*s <= '9'
+                 ? (*s - '0') : dgi(*s);
+        if (gi >= 0) {
+            const uint8_t *g = dgfont[gi];
+            for (int cy = 0; cy < 7; cy++)
+                for (int cx = 0; cx < 5; cx++)
+                    if (g[cx] & (1 << cy)) {
+                        int tx0 = cx * 3 / 2, tx1 = tx0 + ((cx & 1) ? 2 : 1);
+                        int ty0 = cy * 3 / 2, ty1 = ty0 + ((cy & 1) ? 2 : 1);
+                        for (int yy = ty0; yy < ty1; yy++)
+                            for (int xx = tx0; xx < tx1; xx++) dsetp(l, x + xx, y + yy);
+                    }
+        }
+        x += 8;
+        s++;
+    }
+    return x;
+}
+/* 1.5x 放大 '%' 符号 */
+static void dpct15(st7305_handle_t *l, int x, int y) {
+    static const uint8_t pat[7] = {0x18, 0x18, 0x04, 0x02, 0x01, 0x03, 0x03};
+    for (int row = 0; row < 7; row++)
+        for (int col = 0; col < 5; col++)
+            if (pat[row] & (1 << (4 - col))) {
+                int tx0 = col * 3 / 2, tx1 = tx0 + ((col & 1) ? 2 : 1);
+                int ty0 = row * 3 / 2, ty1 = ty0 + ((row & 1) ? 2 : 1);
+                for (int yy = ty0; yy < ty1; yy++)
+                    for (int xx = tx0; xx < tx1; xx++) dsetp(l, x + xx, y + yy);
+            }
+}
 static void dpct2(st7305_handle_t *l, int x, int y) {
     dline(l, x + 7, y - 1, x + 4, y + 13);
     dcircle(l, x + 2, y + 2, 2);
     dcircle(l, x + 9, y + 11, 2);
 }
-
 static uint32_t dmnow(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 /* ================= 决策知识库 ================= */
 #define DMAXOPT  8
 #define DMAXDEV  6
-
-typedef struct {
-    const char *label;
-    int         weight;
-    int         target;
-} diag_opt_t;
-typedef struct { diag_opt_t opts[DMAXOPT]; int nopts; } diag_level_t;
-
 static const char *DDEVNAME[DMAXDEV] = { "内存", "硬盘", "显卡", "主板", "电源", "系统" };
 static int devprob[DMAXDEV];
+/* 器件图标来自桌面「电脑诊断」位图 (diag_dev_icons[], 见 diag_dev_icons.inc):
+ * 0内存(M.2) 1硬盘 2显卡 3主板 4电源 5系统(电脑) */
 
 typedef struct {
     const char  *label;
@@ -225,103 +264,87 @@ typedef struct {
     int         subdev[DMAXOPT];
     int         nsub;
 } diag_cat_t;
-
 static const diag_cat_t DCAT[6] = {
     { "不通电", {
         "电源指示灯不亮", "按下开机键无反应", "机内有焦糊味",
         "指示灯闪烁不稳定", "能通电但瞬间关机", "不确定"
-      },
-      { 28, 24, 20, 22, 18, 5 },
-      { 4, 3, 4, 4, 4, -1 }, 6 },
+      }, { 28, 24, 20, 22, 18, 5 }, { 4, 3, 4, 4, 4, -1 }, 6 },
     { "卡顿闪退", {
         "开机和启动特别慢", "多开程序就卡顿", "运行游戏中闪退",
         "使用中莫名崩溃", "风扇狂转且过热", "不确定"
-      },
-      { 26, 26, 22, 18, 14, 5 },
-      { 1, 0, 2, 0, 3, -1 }, 6 },
+      }, { 26, 26, 22, 18, 14, 5 }, { 1, 0, 2, 0, 3, -1 }, 6 },
     { "蓝屏死机", {
         "蓝屏代码每次不同", "特定操作后蓝屏", "死机后无法关机",
         "开机引导时蓝屏", "蓝屏后重启循环", "不确定"
-      },
-      { 26, 20, 18, 22, 16, 5 },
-      { 0, 2, 3, 1, 5, -1 }, 6 },
+      }, { 26, 20, 18, 22, 16, 5 }, { 0, 2, 3, 1, 5, -1 }, 6 },
     { "花屏闪屏", {
         "屏幕出现彩色条纹", "画面雪花噪点", "屏幕整体闪烁跳动",
         "接外接屏显示正常", "开机花屏但能进系统", "不确定"
-      },
-      { 30, 26, 18, 16, 20, 5 },
-      { 2, 2, 2, 3, 2, -1 }, 6 },
+      }, { 30, 26, 18, 16, 20, 5 }, { 2, 2, 2, 3, 2, -1 }, 6 },
     { "加电无显", {
         "风扇转屏幕无信号", "主板灯亮但屏幕黑", "有开机蜂鸣声",
         "有背光但画面全黑", "完全无背光", "不确定"
-      },
-      { 24, 20, 22, 16, 18, 5 },
-      { 2, 3, 0, 3, 4, -1 }, 6 },
+      }, { 24, 20, 22, 16, 18, 5 }, { 2, 3, 0, 3, 4, -1 }, 6 },
     { "无法进入系统", {
         "卡在品牌标志界面", "提示修复恢复界面", "无限重启进不去",
         "黑屏停住不动", "能进但频繁卡死", "不确定"
-      },
-      { 26, 24, 18, 18, 20, 5 },
-      { 1, 5, 4, 0, 1, -1 }, 6 },
+      }, { 26, 24, 18, 18, 20, 5 }, { 1, 5, 4, 0, 1, -1 }, 6 },
 };
-
 static const char *DDEVTYPE[DMAXOPT] = {
     "台式机", "笔记本", "一体机", "工控机", "服务器", "不确定"
 };
-
 typedef struct {
-    const char *cause;
-    const char *steps[4];
-    const char *tip;
+    const char *cause;       /* 故障原因: 可能怎么导致 */
+    const char *phen;        /* 典型现象: 该配件坏了会出现的表现 */
+    const char *steps[4];    /* 排除方案 */
 } diag_kb_t;
 static const diag_kb_t DKB[DMAXDEV] = {
-    { "接触氧化或颗粒损坏",
-      { "内存检测工具全盘测", "用好内存条替换试", "重插并清洁金手指", "替换后复测无报错" },
-      "单条逐一开机定坏条" },
-    { "坏道或接口接触不良",
-      { "磁盘健康扫描修复", "换数据线或换盘试", "备份资料更换坏盘", "复扫无坏道即通过" },
-      "留意有无异响咔哒声" },
-    { "显示核心或显存故障",
-      { "图形烤机稳定测试", "换一张显卡替换试", "重插显卡清洁插槽", "长时间负载无花屏" },
-      "外接显示器对比排查" },
-    { "供电电路或芯片异常",
-      { "进设置界面查各项", "最小系统替换法测", "清设置重插各部件", "逐一替换后能稳定" },
-      "查看有无鼓包焦糊味" },
-    { "输出电压不稳或不足",
-      { "软件监测各路电压", "用好电源替换测试", "更换电源或减负载", "满载运行不再断电" },
-      "先查供电线是否插紧" },
-    { "系统文件或驱动损坏",
-      { "系统修复工具扫描", "用启动盘工具验证", "还原或重装系统", "连续使用不再复发" },
-      "进安全模式排除软件" },
+    { "内存颗粒虚焊或接触氧化，长期高温下电子元件隐性老化；多为进液、磕碰或出厂不良诱发。",
+      "开机无显示并报警、蓝屏代码不固定、随机重启、程序莫名崩溃。",
+      { "先用内存检测工具全盘扫描", "换好条与坏机交叉替换测", "重插并清洁金手指", "单根逐一开机定位坏条" } },
+    { "硬盘坏道或盘面损伤，多因突然断电、搬运磕碰、长期高负载导致。",
+      "开机卡Logo、读取奇慢、蓝屏0x7B、硬盘异响咔哒。",
+      { "磁盘健康工具扫描修复", "换数据线或换盘交叉验证", "及时备份并隔离坏区", "反复复扫无坏道才算过" } },
+    { "显存虚焊、核心过热或供电电路老化，多为积灰、超频或散热失效引起。",
+      "花屏、雪花噪点、画面撕裂、游戏中突然黑屏。",
+      { "图形烤机做长时间稳定性测试", "替换显卡交叉验证", "清灰并重涂散热硅脂", "长期满载无花屏则通过" } },
+    { "南桥或供电芯片损坏、电容鼓包、液体腐蚀，多为供电异常或进水所致。",
+      "不开机、进系统反复重启、USB与内存接口时好时坏。",
+      { "用最小系统逐一替换法测", "目检电容有无鼓包焦糊味", "清灰并重插各部件", "逐一替换后能稳定为准" } },
+    { "输出功率不足、电容老化、负载超限，多为长期老化或带载过高。",
+      "重载时黑屏重启、电压不稳而花屏、开机无响应。",
+      { "进设置监测各路输出电压", "换额定功率电源替换测试", "降低负载并检查供电插线", "满载运行不再断电为过" } },
+    { "系统文件损坏、驱动冲突或引导异常，多为非正常关机或软件层故障。",
+      "开机蓝屏循环、桌面卡死、驱动报错、无法进入系统。",
+      { "用系统修复工具扫描检错", "用启动盘修复引导记录", "进安全模式排查驱动冲突", "还原或重装系统验证" } },
 };
-
-#define POPUP_X0 (DIVIDER_X + 16)
-#define POPUP_X1 (DW - 14)
+#define POPUP_X0 16
+#define POPUP_X1 (DIVIDER_X - 14)
 #define POPUP_Y0 (DCONTENT_Y + 56)
 #define POPUP_Y1 (DH - 8)
 static bool g_popup_on  = false;
 static int  g_popup_dev = 0;
 
 typedef enum {
-    D_ST_CAT = 0, D_ST_SUB, D_ST_DEVTYPE, D_ST_CFG, D_ST_RESULT, D_ST_COUNT
+    D_ST_DEV = 0, D_ST_CAT, D_ST_SUB, D_ST_CFG, D_ST_RESULT, D_ST_COUNT
 } diag_stage_t;
-
-static const char *DSTAGE_NAME[D_ST_COUNT] = { "现象", "症状", "设备", "配置", "结果" };
+static const char *DSTAGE_NAME[D_ST_COUNT] = { "设备", "现象", "症状", "配置", "结果" };
 static const char *DSTAGE_QUESTION[D_ST_COUNT] = {
-    "请选择故障现象", "您看到了什么症状",
-    "这台是什么设备", "这台设备配置如何",
-    "排查建议按概率排序"
+    "这台是什么设备", "请选择故障现象", "您看到了什么症状",
+    "这台设备配置如何", "排查建议按概率排序"
 };
-
-static diag_stage_t g_stage = D_ST_CAT;
+static diag_stage_t g_stage = D_ST_DEV;
 static int          g_cat   = 0;
-static int          g_sub   = 0;
 static int          g_devtype = 0;
 static int          g_cfg    = 0;
 static bool         g_ans_sub = false, g_ans_devtype = false, g_ans_cfg = false;
 static int          g_cur_opt = 0;
 static int          g_result_k = 0;
-static uint32_t     g_blink_ms = 0;
+/* 症状多轮: 在所选大类下逐条追问其多个症状, 每条选 符合/不符合/不确定, 可提前"完成" */
+#define DSUB_MAX  DMAXOPT
+static int  g_sub_idx = 0;        /* 当前问到的大类内症状索引 */
+static bool g_sub_ans[DSUB_MAX];  /* 各条是否已作答 */
+static int  g_sub_wt[DSUB_MAX];   /* 各条累计权重 (符合=原权, 不确定≈1/3, 不符=0) */
 
 static void devpplus(int target, int weight) {
     if (target < 0 || target >= DMAXDEV) {
@@ -333,8 +356,12 @@ static void devpplus(int target, int weight) {
 }
 static void dRecompute(void) {
     for (int i = 0; i < DMAXDEV; i++) devprob[i] = 0;
-    if (g_ans_sub)
-        devpplus(DCAT[g_cat].subdev[g_sub], DCAT[g_cat].subwt[g_sub]);
+    if (g_ans_sub) {
+        int nsub = DCAT[g_cat].nsub;
+        for (int i = 0; i < nsub; i++)
+            if (g_sub_ans[i] && g_sub_wt[i] > 0)
+                devpplus(DCAT[g_cat].subdev[i], g_sub_wt[i]);
+    }
     if (g_ans_devtype) {
         switch (g_devtype) {
             case 0: devprob[4] += 4; devprob[2] += 4; break;
@@ -350,28 +377,29 @@ static void dRecompute(void) {
         else            { devprob[3] += 4; devprob[0] += 2; }
     }
 }
-
-static int  s_rbar_off = 0;
-static bool s_rbar_drag = false;
-static int  s_rbar_drag_y0 = 0;
-static int  s_rbar_drag_off0 = 0;
-#define RBAR_ROW_H RL_ROW_H
-#define RBAR_MAX_OFF RL_MAX_OFF
+static int  s_pix_off = 0;            /* 右栏整体像素偏移 (0..RBAR_MAX_PX), 跟手滚动 */
+static int  s_drag_y0 = 0;
+static int  s_drag_pix0 = 0;
+static bool s_drag = false;
+#define RBAR_ROW_H (RICON_S + RICON_GAP)
+/* 最大滚动: 让最后一行 (索引 DMAXDEV-1) 的图标底能贴到屏底 (完全显示) */
+#define RBAR_MAX_PX ((DMAXDEV - 1) * RBAR_ROW_H + (DCONTENT_Y + 4) + RICON_S - DH)
 
 static void DReset(void) {
     for (int i = 0; i < DMAXDEV; i++) devprob[i] = 0;
-    g_stage = D_ST_CAT;
-    g_cat = 0; g_sub = 0; g_devtype = 0; g_cfg = 0;
+    g_stage = D_ST_DEV;
+    g_cat = 0; g_devtype = 0; g_cfg = 0;
     g_ans_sub = g_ans_devtype = g_ans_cfg = false;
-    g_cur_opt = 0; g_result_k = 0;
+    g_cur_opt = 0; g_result_k = 0; g_sub_idx = 0;
+    for (int i = 0; i < DSUB_MAX; i++) { g_sub_ans[i] = false; g_sub_wt[i] = 0; }
     g_popup_on = false; g_popup_dev = 0;
-    s_rbar_off = 0; s_rbar_drag = false;
+    s_pix_off = 0; s_drag = false;
 }
 static int dStageOptCount(diag_stage_t st) {
     switch (st) {
-        case D_ST_CAT: return 6;
-        case D_ST_SUB: return DCAT[g_cat].nsub;
-        case D_ST_DEVTYPE: return 6;
+        case D_ST_DEV: return 6;               /* 设备类型 */
+        case D_ST_CAT: return 6;               /* 故障大类 */
+        case D_ST_SUB: return 3;               /* 符合/不符合/结束 */
         case D_ST_CFG: return 2;
         case D_ST_RESULT: return DMAXDEV;
         default: return 0;
@@ -379,9 +407,12 @@ static int dStageOptCount(diag_stage_t st) {
 }
 static const char *dStageOptLabel(diag_stage_t st, int i) {
     switch (st) {
+        case D_ST_DEV:   return DDEVTYPE[i];
         case D_ST_CAT:   return DCAT[i].label;
-        case D_ST_SUB:   return DCAT[g_cat].sub[i];
-        case D_ST_DEVTYPE: return DDEVTYPE[i];
+        case D_ST_SUB: { /* 逐条追问当前症状: 符合/不符合/结束排查 (无"不确定") */
+            static const char *S[3] = { "符合", "不符合", "结束排查" };
+            return S[i];
+        }
         case D_ST_CFG:   return i == 0 ? "有独立显卡" : "无独立显卡";
         case D_ST_RESULT: return DDEVNAME[i];
         default: return "";
@@ -420,134 +451,107 @@ static void dDrawStageBar(st7305_handle_t *l) {
     }
 }
 static void dDrawOptions(st7305_handle_t *l) {
-    dz22s(l, DIVIDER_X + 10, DCONTENT_Y + 4, DSTAGE_QUESTION[g_stage], false);
+    /* 症状阶段: 顶部问题 = 当前逐条追问的那条症状 */
+    const char *q = (g_stage == D_ST_SUB) ? DCAT[g_cat].sub[g_sub_idx] : DSTAGE_QUESTION[g_stage];
+    dz22s(l, 8, DCONTENT_Y + 4, q, false);
     int n = dStageOptCount(g_stage);
     if (n <= 0 || g_stage == D_ST_RESULT) return;
     int top = DCONTENT_Y + 36;
     int bot = DH - 8;
     int row_h = (bot - top) / n;
-    int x0 = DIVIDER_X + 10, x1 = DW - 8;
+    int x0 = 8, x1 = DIVIDER_X - 8;
+    /* 把若干行选项文本作为一个整体块水平居中 (以最长行为块宽, 非逐行居中):
+     * 块左 = 区间中心对齐, 块内每行仍左对齐 块左. */
+    int maxw = 0;
+    for (int i = 0; i < n; i++) {
+        int lw = ((int)(strlen(dStageOptLabel(g_stage, i)) / 3)) * 24;
+        if (lw > maxw) maxw = lw;
+    }
+    int block_x = x0 + ((x1 - x0 + 1) - maxw) / 2;
+    if (block_x < x0) block_x = x0;
     for (int i = 0; i < n; i++) {
         int y0 = top + i * row_h;
         int y1 = y0 + row_h - 1;
         bool sel = (i == g_cur_opt);
         if (sel) drect(l, x0, y0, x1, y1, ST7305_COLOR_BLACK);
         const char *nm = dStageOptLabel(g_stage, i);
-        dz22s(l, x0 + 8, y0 + (row_h - 24) / 2, nm, sel);
+        dz22s(l, block_x, y0 + (row_h - 24) / 2, nm, sel);
     }
 }
+/* 结果区 16px 自动换行 (每行约 maxc 字), 返回排版后的 y */
+static int dwrap16(st7305_handle_t *l, int x0, int x1, int y0, const char *s, int lh) {
+    int maxc = (x1 - x0 + 1) / 16; if (maxc < 1) maxc = 1;
+    int n = 0, y = y0;
+    for (const char *p = s; *p; p += 3) {
+        if (y + 16 > DH) break;                 /* 越界不画 */
+        dzh16(l, x0 + n * 16, y, p, false);
+        if (++n >= maxc) { n = 0; y += lh; }
+    }
+    return y + lh;
+}
+/* 结果页: 售后工程师风格 - 故障配件(带概率)/故障原因/典型现象/排除方案 */
 static void dDrawResult(st7305_handle_t *l) {
     dSortDev();
     int dev = dSortedIdx[g_result_k];
-    int x0 = DIVIDER_X + 10;
-    int y  = DCONTENT_Y + 38;
-    int x = dz22s(l, x0, y, "判断", false);
+    int x0 = 10, x1 = DIVIDER_X - 8;
+    int y = DCONTENT_Y + 34;
+    /* 头: 故障配件 + 名称 + 概率 */
+    int x = dz22s(l, x0, y, "故障配件", false);
     x = dz22s(l, x, y, DDEVNAME[dev], false);
-    dz22s(l, x, y, "故障", false);
-    y += 32;
-    static const char *LBL[6] = { "原因", "软件测", "硬件换", "解决", "确认", "提示" };
-    const char *val[6] = {
-        DKB[dev].cause,
-        DKB[dev].steps[0], DKB[dev].steps[1],
-        DKB[dev].steps[2], DKB[dev].steps[3],
-        DKB[dev].tip,
-    };
-    for (int i = 0; i < 6; i++) {
-        int lx = dzh16s(l, x0, y, LBL[i], false);
-        dzh16s(l, lx + 4, y, val[i], false);
-        y += 20;
-    }
-    dzhs(l, x0, DH - 16, "上下键换候选点图标看方案", false);
-}
-static void dline(st7305_handle_t *l, int x0, int y0, int x1, int y1) {
-    int dx = x1 - x0, dy = y1 - y0;
-    int steps = (abs(dx) > abs(dy)) ? abs(dx) : abs(dy);
-    if (steps == 0) { dsetp(l, x0, y0); return; }
-    for (int i = 0; i <= steps; i++) dsetp(l, x0 + dx * i / steps, y0 + dy * i / steps);
-}
-static void dcircle_c(st7305_handle_t *l, int cx, int cy, int r, int col) {
-    for (int y = cy - r; y <= cy + r; y++)
-        for (int x = cx - r; x <= cx + r; x++) {
-            int dx = x - cx, dy = y - cy;
-            if (dx * dx + dy * dy <= r * r) {
-                if (x >= 0 && x < DW && y >= 0 && y < DH)
-                    st7305_draw_pixel(l, x, y, (st7305_color_t)col);
-            }
-        }
-}
-static void dcircle(st7305_handle_t *l, int cx, int cy, int r) { dcircle_c(l, cx, cy, r, ST7305_COLOR_BLACK); }
-static void dcircle_w(st7305_handle_t *l, int cx, int cy, int r) { dcircle_c(l, cx, cy, r, ST7305_COLOR_WHITE); }
-
-static void dDrawDevIcon(st7305_handle_t *l, int dev, int cx, int cy) {
-    switch (dev) {
-    case 0: {
-        doutline(l, cx - 16, cy - 16, cx + 16, cy + 8);
-        for (int i = -10; i <= 10; i += 5) dvline(l, cx + i, cy - 11, cy - 4);
-        dvline(l, cx - 12, cy + 8, cy + 16); dvline(l, cx - 4, cy + 8, cy + 16);
-        dvline(l, cx + 4, cy + 8, cy + 16);  dvline(l, cx + 12, cy + 8, cy + 16);
-        break;
-    }
-    case 1: { dcircle(l, cx, cy, 19); dcircle_w(l, cx, cy, 16); dcircle(l, cx, cy, 4); break; }
-    case 2: {
-        doutline(l, cx - 19, cy - 13, cx + 19, cy + 13);
-        dcircle(l, cx, cy, 6);
-        dhline(l, cx - 12, cx + 3, cy - 10); dvline(l, cx + 10, cy - 5, cy + 5);
-        dhline(l, cx - 12, cx + 3, cy + 10); dvline(l, cx - 10, cy - 5, cy + 5);
-        break;
-    }
-    case 3: {
-        doutline(l, cx - 19, cy - 18, cx + 19, cy + 18);
-        drect(l, cx - 9, cy - 9, cx + 9, cy + 6, 0);
-        doutline(l, cx - 10, cy - 10, cx + 10, cy + 7);
-        dhline(l, cx - 19, cx - 10, cy - 14); dhline(l, cx + 10, cx + 19, cy - 14);
-        dhline(l, cx - 19, cx - 10, cy + 14); dhline(l, cx + 10, cx + 19, cy + 14);
-        break;
-    }
-    case 4: {
-        dline(l, cx + 3, cy - 18, cx - 6, cy + 1);
-        dline(l, cx - 6, cy + 1, cx + 6, cy + 1);
-        dline(l, cx + 6, cy + 1, cx - 3, cy + 18);
-        break;
-    }
-    default: {
-        doutline(l, cx - 18, cy - 16, cx + 18, cy + 16);
-        drect(l, cx - 18, cy - 16, cx + 18, cy - 10, 0);
-        drect(l, cx - 12, cy - 6, cx + 12, cy - 1, 0);
-        drect(l, cx - 12, cy + 3, cx + 12, cy + 12, 0);
-        break;
-    }
+    char buf[8]; snprintf(buf, sizeof(buf), "%d", devprob[dev]);
+    dtxt15(l, x + 6, y + 6, buf);
+    dpct15(l, x + 6 + (int)strlen(buf) * 8, y + 6);
+    y += 30;
+    /* 故障原因 */
+    dzh16s(l, x0, y, "故障原因", true); y += 20;
+    y = dwrap16(l, x0 + 4, x1, y, DKB[dev].cause, 20);
+    y += 6;
+    /* 典型现象 */
+    dzh16s(l, x0, y, "典型现象", true); y += 20;
+    y = dwrap16(l, x0 + 4, x1, y, DKB[dev].phen, 20);
+    y += 6;
+    /* 排除方案 (序号) */
+    dzh16s(l, x0, y, "排除方案", true); y += 20;
+    for (int i = 0; i < 4; i++) {
+        char t[8]; snprintf(t, sizeof(t), "%d.", i + 1);
+        dtxt15(l, x0 + 4, y, t);
+        y = dwrap16(l, x0 + 4 + (int)strlen(t) * 8, x1, y, DKB[dev].steps[i], 20);
+        y += 2;
     }
 }
-static void dDrawLeftBar(st7305_handle_t *l) {
+static void dDrawRightBar(st7305_handle_t *l) {
     dSortDev();
-    dvline(l, DIVIDER_X, DCONTENT_Y, DH - 1);
+    /* 无分割线. 全部器件按像素偏移 s_pix_off 平移绘制 (跟手滚动). */
     int vyoff = DCONTENT_Y + 4;
-    int icon_x = (DLEFT_W - RICON_S) / 2;
-    for (int k = 0; k < RSHOW; k++) {
-        int si = s_rbar_off + k;
-        if (si >= DMAXDEV) break;
-        int di = dSortedIdx[si];
-        int ic_y = vyoff + k * RL_ROW_H;
-        drect(l, icon_x, ic_y, icon_x + RICON_S - 1, ic_y + RICON_S - 1, 0);
-        doutline(l, icon_x, ic_y, icon_x + RICON_S - 1, ic_y + RICON_S - 1);
-        dDrawDevIcon(l, di, icon_x + RICON_S / 2, ic_y + RICON_S / 2);
-        int name_y = ic_y + RICON_S + RICON_GAP;
-        const char *nm = DDEVNAME[di];
-        int nw = ((int)(strlen(nm) / 3)) * 16;
-        dzh16s(l, (DLEFT_W - nw) / 2, name_y, nm, false);
+    for (int i = 0; i < DMAXDEV; i++) {
+        int iy = vyoff + i * RBAR_ROW_H - s_pix_off;   /* 跟手像素平移 */
+        if (iy > DH || iy + RICON_S < 0) continue;   /* 整行全在屏外才跳; 顶部被进度条遮挡的部分仍绘制, 由其下露出的部分显示 */
+        int di = dSortedIdx[i];
+        int CY = iy + RICON_S / 2;     /* 图标垂直中心 */
         char buf[8];
         snprintf(buf, sizeof(buf), "%d", devprob[di]);
-        int prob_x = (DLEFT_W - ((int)strlen(buf) * 12 + 12)) / 2;
-        int prob_y = name_y + 20;
-        dtxt2(l, prob_x, prob_y, buf);
-        dpct2(l, prob_x + (int)strlen(buf) * 12, prob_y);
-        int bar_y = prob_y + 14;
-        int bx0 = 4, bx1 = DLEFT_W - 5;
-        drect(l, bx0, bar_y, bx1, bar_y + RPBAR_H - 1, 1);
-        doutline(l, bx0, bar_y, bx1, bar_y + RPBAR_H - 1);
-        int fill_w = (int)((bx1 - bx0 + 1) * devprob[di]) / 100;
-        if (fill_w > bx1 - bx0 + 1) fill_w = bx1 - bx0 + 1;
-        if (fill_w > 2) drect(l, bx0 + 1, bar_y + 1, bx0 + fill_w - 1, bar_y + RPBAR_H - 2, 0);
+        int dlen = (int)strlen(buf);
+        int nm_w = (int)((strlen(DDEVNAME[di]) / 3)) * 16;
+        /* 进度条: 贴最右, 高12, 相对图标垂直中心下移 10px */
+        int bar_right = DW - 4;
+        int bar_x0 = bar_right - 64 + 1;
+        int bar_y = CY - 6 + 10;   /* 名称+进度条整体下移 10px (图标不动) */
+        drect(l, bar_x0, bar_y, bar_right, bar_y + 11, ST7305_COLOR_WHITE);
+        doutline(l, bar_x0, bar_y, bar_right, bar_y + 11);
+        int fill_w = (int)((int64_t)(64) * devprob[di]) / 100;
+        if (fill_w > 64) fill_w = 64;
+        if (fill_w > 2) drect(l, bar_x0 + 1, bar_y + 1, bar_x0 + fill_w - 1, bar_y + 10, 0);
+        /* 图标: 桌面「电脑诊断」对应器件位图, 紧靠进度条左边, 无框, 垂直居中 */
+        int icon_left = bar_x0 - 8 - RICON_S;
+        draw_1bpp_stretched(l, icon_left + RICON_S / 2, CY, RICON_S, RICON_S, 64, 64, diag_dev_icons[di]);
+        /* 名称: 进度条正上方, 左对齐进度条 (随进度条下移10px) */
+        int top_y = bar_y - 4 - 16;
+        dzh16s(l, bar_x0, top_y, DDEVNAME[di], false);
+        /* 百分比: 稍大(1.5x), 贴最右, 在进度条正上方 */
+        int w15 = dlen * 8 + 8 + 2;   /* 数字(1.5x 每字8) + '%'(8) + 间隙 */
+        int pct_x = (DW - 4) - w15;
+        dtxt15(l, pct_x, top_y + 2, buf);
+        dpct15(l, pct_x + dlen * 8, top_y + 2);
     }
 }
 static void dDrawPopup(st7305_handle_t *l) {
@@ -575,133 +579,40 @@ static void dDrawPopup(st7305_handle_t *l) {
     dzh16s(l, bx0 + (68 - 32) / 2, by0 + 3, "返回", true);
 }
 
-/* ================= 浏览模式 (左分类 / 右列表) ================= */
-#define DI_CATBAR_W  64
-#define DICAT_N      4
-static const char *DI_NAME[DICAT_N] = { "采集", "当前信息", "信息处理", "历史" };
-static const char *DI_LIST[DICAT_N][12] = {
-  { "获取硬件配置","获取错误日志","获取蓝屏信息","获取IP和MAC","获取系统信息","获取磁盘内存" },
-  { "查看硬件配置","查看错误日志","查看蓝屏信息","查看网络信息","查看系统信息" },
-  { "硬件概率分析","系统问题分析","蓝屏原因分析" },
-  {},
-};
-static int DI_COUNT[DICAT_N] = { 6, 5, 3, 0 };
-
-#define DI_HIST_DIR  "/sdcard/diag"
-#define DI_HIST_MAX  16
-EXT_RAM_BSS_ATTR static char di_hist[DI_HIST_MAX][48];
-static int  di_hist_n = -1;
-
-static void di_scan_history(void) {
-    di_hist_n = 0;
-    DIR *d = opendir(DI_HIST_DIR);
-    if (!d) { di_hist_n = 0; return; }
-    struct dirent *e;
-    while (di_hist_n < DI_HIST_MAX && (e = readdir(d)) != NULL) {
-        if (e->d_name[0] == '.') continue;
-        snprintf(di_hist[di_hist_n], sizeof(di_hist[0]), "%.47s", e->d_name);
-        di_hist_n++;
-    }
-    closedir(d);
-    for (int i = 0; i < di_hist_n - 1; i++)
-        for (int j = i + 1; j < di_hist_n; j++)
-            if (strcmp(di_hist[j], di_hist[i]) > 0) {
-                char t[48]; strncpy(t, di_hist[j], 47); t[47]=0;
-                strncpy(di_hist[j], di_hist[i], 47); di_hist[j][47]=0;
-                strncpy(di_hist[i], t, 47); di_hist[i][47]=0;
-            }
-}
-static void di_hist_label(const char *name, char *out, int n) {
-    out[0] = 0;
-    if (strlen(name) >= 9 && name[0] >= '0' && name[0] <= '9') {
-        snprintf(out, n, "%.4s-%.2s-%.2s %s", name, name + 4, name + 6, name + 9);
-    } else {
-        snprintf(out, n, "%s", name);
-    }
-}
-#define DI_MODE_BROWSE 0
-#define DI_MODE_FLOW   1
-static int g_mode = DI_MODE_BROWSE;
-static int g_bcat = 0;
-static int g_lst  = 0;
-static int g_lsc  = 0;
-#define DI_LROW_H  40
-#define DI_CAT_Y0    24
-#define DI_CAT_ROW_H 64
-#define DI_LTOP    (DI_CAT_Y0 + 40)
-#define DI_LBOT    (DH - 14)
-#define DI_LVIS    ((DI_LBOT - DI_LTOP) / DI_LROW_H)
-static int di_count(void) {
-    if (g_bcat == 3) { if (di_hist_n < 0) di_scan_history(); return di_hist_n; }
-    return DI_COUNT[g_bcat];
-}
-static const char *di_label(int idx) {
-    static char buf[48];
-    if (g_bcat == 3) { di_hist_label(di_hist[idx], buf, sizeof(buf)); return buf; }
-    return DI_LIST[g_bcat][idx];
-}
-static void di_enter_flow(void) { DReset(); g_mode = DI_MODE_FLOW; }
-static void di_act_item(int idx) {
-    switch (g_bcat) {
-    case 0: return;
-    case 2:
-        if (idx == 0) { di_enter_flow(); }
-        return;
-    default: return;
-    }
-}
-
-static void di_draw_browse(ui_ctx_t *ctx) {
-    st7305_handle_t *l = ctx->lcd;
-    st7305_clear(l, ST7305_COLOR_WHITE);
-    dvline(l, DI_CATBAR_W, DI_CAT_Y0, DH - 1);
-    for (int c = 0; c < DICAT_N; c++) {
-        int y0 = DI_CAT_Y0 + c * DI_CAT_ROW_H;
-        draw_main_icon_stretched(l, DI_CATBAR_W / 2, y0 + DI_CAT_ROW_H / 2, 64, 64, c);
-        if (c == g_bcat) {
-            drect(l, DI_CATBAR_W / 2 - 32, y0 + DI_CAT_ROW_H - 2,
-                  DI_CATBAR_W / 2 + 31, y0 + DI_CAT_ROW_H - 1, ST7305_COLOR_BLACK);
-        }
-    }
-    dz22s(l, DI_CATBAR_W + 10, DI_CAT_Y0 + 4, DI_NAME[g_bcat], false);
-    int n = di_count(), vis = DI_LVIS;
-    if (vis < 1) vis = 1;
-    if (g_lsc > n - vis) g_lsc = n - vis;
-    if (g_lsc < 0) g_lsc = 0;
-    for (int i = 0; i < vis; i++) {
-        int idx = g_lsc + i; if (idx >= n) break;
-        int y0 = DI_LTOP + i * DI_LROW_H, y1 = y0 + DI_LROW_H - 1, sel = (idx == g_lst);
-        if (sel) drect(l, DI_CATBAR_W + 10, y0, DW - 8, y1, ST7305_COLOR_BLACK);
-        dz22s(l, DI_CATBAR_W + 14, y0 + (DI_LROW_H - 24) / 2, di_label(idx), sel);
-    }
-    if (n == 0) {
-        dz22s(l, DI_CATBAR_W + 10, 120, g_bcat == 3 ? "\xe6\x9a\x82\xe6\x97\xa0\xe5\x8e\x86\xe5\x8f\xb2\xe8\xae\xb0\xe5\xbd\x95" : "\xe6\x9a\x82\xe6\x97\xa0\xe5\x86\x85\xe5\xae\xb9", false);
-    } else if (n > vis) {
-        dzhs(l, DI_CATBAR_W + 10, DH - 10, "上下滑动查看更多", false);
-    }
-}
-
 /* ================= 主渲染 / 推进 ================= */
 static void p_diag_render(ui_ctx_t *ctx) {
-    if (g_mode == DI_MODE_BROWSE) { di_draw_browse(ctx); return; }
     st7305_handle_t *l = ctx->lcd;
     st7305_clear(l, ST7305_COLOR_WHITE);
-    dDrawStageBar(l);
+    /* 右栏先画 (被进度条遮挡的部分仍绘制, 便于露出的下半显示) */
+    dDrawRightBar(l);
+    /* 顶部步进条区整体清白, 盖掉右栏越顶残留, 保证进度条固定纯净 */
+    dfill(l, 0, 0, DW - 1, DCONTENT_Y - 1, ST7305_COLOR_WHITE);
     if (g_stage == D_ST_RESULT) dDrawResult(l);
     else                        dDrawOptions(l);
-    dDrawLeftBar(l);
+    dDrawStageBar(l);   /* 进度条恒在顶层显示 */
     if (g_popup_on) dDrawPopup(l);
 }
-
 static void dConfirmSelect(void) {
     switch (g_stage) {
-    case D_ST_CAT: g_cat = g_cur_opt; g_cur_opt = 0; g_stage = D_ST_SUB; break;
-    case D_ST_SUB:
-        g_sub = g_cur_opt; g_cur_opt = 0; g_ans_sub = true; dRecompute(); g_stage = D_ST_DEVTYPE;
+    case D_ST_DEV:
+        g_devtype = g_cur_opt; g_cur_opt = 0; g_ans_devtype = true; dRecompute(); g_stage = D_ST_CAT;
         break;
-    case D_ST_DEVTYPE:
-        g_devtype = g_cur_opt; g_cur_opt = 0; g_ans_devtype = true; dRecompute(); g_stage = D_ST_CFG;
+    case D_ST_CAT: g_cat = g_cur_opt; g_cur_opt = 0; g_stage = D_ST_SUB; g_sub_idx = 0; g_ans_sub = false;
+                   for (int zi = 0; zi < DSUB_MAX; zi++) { g_sub_ans[zi] = false; g_sub_wt[zi] = 0; }
+                   break;
+    case D_ST_SUB: {
+        int i = g_sub_idx, nsub = DCAT[g_cat].nsub;
+        /* 符合=原权, 不符合=0 */
+        if (g_cur_opt == 0)      { g_sub_ans[i] = true; g_sub_wt[i] = DCAT[g_cat].subwt[i]; }
+        else if (g_cur_opt == 1) { g_sub_ans[i] = true; g_sub_wt[i] = 0; }
+        /* 选了"结束排查" 或 已问完最后一条 → 进入配置 */
+        if (g_cur_opt == 2 || i >= nsub - 1) {
+            g_ans_sub = true; dRecompute(); g_cur_opt = 0; g_sub_idx = 0; g_stage = D_ST_CFG;
+        } else {
+            g_sub_idx++; g_cur_opt = 0;   /* 继续追问下一条 */
+        }
         break;
+    }
     case D_ST_CFG:
         g_cfg = g_cur_opt; g_cur_opt = 0; g_ans_cfg = true; dRecompute();
         dSortDev(); g_result_k = 0; g_stage = D_ST_RESULT;
@@ -711,16 +622,21 @@ static void dConfirmSelect(void) {
     }
 }
 static void dInvalidateFrom(diag_stage_t st) {
-    if (st <= D_ST_SUB)     g_ans_sub = false;
-    if (st <= D_ST_DEVTYPE) g_ans_devtype = false;
+    if (st <= D_ST_CAT)     g_ans_devtype = false;   /* 跳回 现象/设备 → 设备答案失效 */
+    if (st <= D_ST_SUB) {
+        g_ans_sub = false; g_sub_idx = 0;
+        for (int zi = 0; zi < DSUB_MAX; zi++) { g_sub_ans[zi] = false; g_sub_wt[zi] = 0; }
+    }
     if (st <= D_ST_CFG)     g_ans_cfg = false;
     dRecompute();
 }
 static void dStepBack(void) {
-    if (g_stage <= D_ST_CAT) { g_stage = D_ST_CAT; g_cur_opt = 0; return; }
+    if (g_stage <= D_ST_DEV) { g_stage = D_ST_DEV; g_cur_opt = 0; return; }
     switch (g_stage) {
-        case D_ST_SUB:     g_ans_sub = false; break;
-        case D_ST_DEVTYPE: g_ans_devtype = false; break;
+        case D_ST_CAT:     g_ans_devtype = false; break;   /* 离开 现象 → 回设备重选 */
+        case D_ST_SUB:     g_ans_sub = false; g_sub_idx = 0;
+                   for (int zi = 0; zi < DSUB_MAX; zi++) { g_sub_ans[zi] = false; g_sub_wt[zi] = 0; }
+                   break;
         case D_ST_CFG:     g_ans_cfg = false; break;
         case D_ST_RESULT:  g_ans_cfg = false; break;
         default: break;
@@ -729,10 +645,9 @@ static void dStepBack(void) {
     g_cur_opt = 0;
     dRecompute();
 }
-
 static int dHitOption(int x, int y) {
     if (y < DCONTENT_Y) return -1;
-    if (x < DIVIDER_X + 10 || x >= DW - 8) return -1;
+    if (x >= DIVIDER_X - 8 || x < 8) return -1;
     if (g_stage == D_ST_RESULT) return -1;
     int n = dStageOptCount(g_stage);
     if (n <= 0) return -1;
@@ -743,33 +658,19 @@ static int dHitOption(int x, int y) {
     if (y < top) return -1;
     return i;
 }
-static int dHitLeftDev(int x, int y) {
-    if (x >= DIVIDER_X - 2) return -1;
+static int dHitRightDev(int x, int y) {
+    if (x < DIVIDER_X - 2) return -1;
     int vyoff = DCONTENT_Y + 4;
     if (y < vyoff) return -1;
-    int k = (y - vyoff) / RBAR_ROW_H;
-    if (k < 0 || k >= RSHOW) return -1;
-    if (y > vyoff + k * RBAR_ROW_H + RL_ROW_H - 2) return -1;
-    int si = s_rbar_off + k;
-    if (si >= DMAXDEV) return -1;
+    int rel = y - vyoff + s_pix_off;      /* 相对内容顶 (像素) */
+    int i = rel / RBAR_ROW_H;
+    if (i < 0 || i >= DMAXDEV) return -1;
+    if (rel - i * RBAR_ROW_H > RICON_S) return -1;   /* 仅图标高度内命中 */
     dSortDev();
-    return dSortedIdx[si];
+    return dSortedIdx[i];
 }
-
 static bool p_diag_touch(ui_ctx_t *ctx, int x, int y) {
     ctx->needs_redraw = true;
-    if (g_mode == DI_MODE_BROWSE) {
-        if (x < DI_CATBAR_W && y >= DI_CAT_Y0) {
-            int c = (y - DI_CAT_Y0) / DI_CAT_ROW_H;
-            if (c >= 0 && c < DICAT_N) { g_bcat = c; g_lst = 0; g_lsc = 0; }
-            return false;
-        }
-        if (x >= DI_CATBAR_W + 10 && x < DW - 8 && y >= DI_LTOP) {
-            int i = (y - DI_LTOP) / DI_LROW_H + g_lsc;
-            if (i < di_count()) { g_lst = i; di_act_item(i); }
-        }
-        return false;
-    }
     if (g_popup_on) {
         int bx0 = POPUP_X0 + (POPUP_X1 - POPUP_X0) / 2 - 34, bx1 = bx0 + 68;
         int by0 = POPUP_Y1 - 26, by1 = POPUP_Y1 - 4;
@@ -789,60 +690,42 @@ static bool p_diag_touch(ui_ctx_t *ctx, int x, int y) {
         if (best >= 0 && best <= (int)g_stage) {
             g_stage = (diag_stage_t)best;
             g_cur_opt = 0;
-            if (best <= D_ST_SUB) g_sub = 0;
             dInvalidateFrom((diag_stage_t)best);
         }
         return false;
     }
-    int dev = dHitLeftDev(x, y);
-    if (dev >= 0 && g_stage != D_ST_CAT) { g_popup_dev = dev; g_popup_on = true; return false; }
+    int dev = dHitRightDev(x, y);
+    if (dev >= 0 && g_stage != D_ST_DEV) { g_popup_dev = dev; g_popup_on = true; return false; }
     int hit = dHitOption(x, y);
     if (hit >= 0 && hit < dStageOptCount(g_stage)) { g_cur_opt = hit; dConfirmSelect(); }
     return false;
 }
-
 static void p_diag_poll(ui_ctx_t *ctx) {
-    if (g_mode == DI_MODE_BROWSE) return;
-    if (g_popup_on) { s_rbar_drag = false; return; }
+    if (g_popup_on) { s_drag = false; return; }
     int tx, ty;
     bool down = input_get_touch_pos(&tx, &ty);
-    if (!down) { s_rbar_drag = false; return; }
-    if (tx >= DIVIDER_X - 2) return;
-    if (!s_rbar_drag) {
-        s_rbar_drag = true;
-        s_rbar_drag_y0 = ty;
-        s_rbar_drag_off0 = s_rbar_off;
-        return;
-    }
-    int dy = s_rbar_drag_y0 - ty;
-    int off = s_rbar_drag_off0 + dy / RBAR_ROW_H;
-    if (off < 0) off = 0;
-    if (off > RBAR_MAX_OFF) off = RBAR_MAX_OFF;
-    if (off != s_rbar_off) { s_rbar_off = off; ctx->needs_redraw = true; }
-}
-
-static void p_diag_action(ui_ctx_t *ctx, os_action_t action) {
-    if (g_mode == DI_MODE_BROWSE) {
-        switch (action) {
-        case OS_ACTION_LEFT:
-            g_bcat = (g_bcat + DICAT_N - 1) % DICAT_N; g_lst = 0; g_lsc = 0; break;
-        case OS_ACTION_RIGHT:
-            g_bcat = (g_bcat + 1) % DICAT_N; g_lst = 0; g_lsc = 0; break;
-        case OS_ACTION_UP:
-            if (g_lst > 0) { g_lst--; if (g_lst < g_lsc) g_lsc = g_lst; } break;
-        case OS_ACTION_DOWN:
-            if (g_lst < di_count() - 1) { g_lst++; if (g_lst >= g_lsc + DI_LVIS) g_lsc++; } break;
-        case OS_ACTION_CONFIRM:
-            di_act_item(g_lst); break;
-        case OS_ACTION_BACK:
-        case OS_ACTION_HOME:
-            os_pop(ctx);
-            return;
-        default: break;
+    if (!down) {
+        if (s_drag) {              /* 松手: 吸附到整行 */
+            s_drag = false;
+            int snap = (s_pix_off + RBAR_ROW_H / 2) / RBAR_ROW_H;
+            int p = snap * RBAR_ROW_H;
+            if (p < 0) p = 0;
+            if (p > RBAR_MAX_PX) p = RBAR_MAX_PX;   /* 贴底: 确保最后一行能完全显示 */
+            if (p != s_pix_off) { s_pix_off = p; ctx->needs_redraw = true; }
         }
-        ctx->needs_redraw = true;
         return;
     }
+    if (tx < DIVIDER_X - 2) return;      /* 仅在右侧栏内拖动 */
+    if (!s_drag) {
+        s_drag = true; s_drag_y0 = ty; s_drag_pix0 = s_pix_off;
+        return;
+    }
+    int off = s_drag_pix0 + (s_drag_y0 - ty);    /* 手指上滑 → 内容上移(看更靠后的行) */
+    if (off < 0) off = 0;
+    if (off > RBAR_MAX_PX) off = RBAR_MAX_PX;
+    if (off != s_pix_off) { s_pix_off = off; ctx->needs_redraw = true; }
+}
+static void p_diag_action(ui_ctx_t *ctx, os_action_t action) {
     if (g_stage == D_ST_RESULT) {
         switch (action) {
         case OS_ACTION_UP:
@@ -875,17 +758,15 @@ static void p_diag_action(ui_ctx_t *ctx, os_action_t action) {
         dConfirmSelect();
         break;
     case OS_ACTION_BACK:
-        if (g_stage == D_ST_CAT) { g_mode = DI_MODE_BROWSE; g_bcat = 2; g_lst = 0; g_lsc = 0; }
-        else dStepBack();
+        if (g_stage == D_ST_DEV) { os_pop(ctx); return; }   /* 最顶层: 返回上一页 */
+        dStepBack();
         break;
     default: break;
     }
     ctx->needs_redraw = true;
 }
-
 static void p_diag_enter(ui_ctx_t *ctx) {
     (void)ctx;
-    g_mode = DI_MODE_BROWSE; g_bcat = 0; g_lst = 0; g_lsc = 0;
     DReset();
 }
 
@@ -897,7 +778,7 @@ static const os_module_t s_mod_diag = {
     .action     = p_diag_action,
     .touch      = p_diag_touch,
     .poll       = p_diag_poll,
-    .fullscreen = false,
+    .fullscreen = true,   /* 早期版: 无 os 状态栏, 顶部用诊断自己的步进条(进度条)替代 */
 };
 
 void os_page_diag_register(void) { os_register(&s_mod_diag); }

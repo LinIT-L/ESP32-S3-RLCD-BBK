@@ -42,8 +42,11 @@ typedef struct {
 /* 进入二级菜单时调用: 后台加载对应引擎 */
 void engine_manager_load(engine_id_t id, st7305_handle_t *lcd);
 
-/* 回到主菜单时调用: 卸载全部引擎, 释放所有引擎占用的内存 */
-void engine_manager_unload_all(void);
+/* 回到主菜单时调用: 卸载全部引擎, 释放所有引擎占用的内存.
+ * do_leak_check: true=卸载后做内存泄漏复核 (正常回主菜单场景);
+ *                false=跳过 (低内存回收/周期兜底时, 此刻空闲偏低或重复卸载,
+ *                          做比对会误报 [LEAK]). */
+void engine_manager_unload_all(bool do_leak_check);
 
 #ifdef __cplusplus
 }

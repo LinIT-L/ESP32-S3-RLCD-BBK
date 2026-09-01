@@ -13,6 +13,7 @@
 #include "os.h"
 #include "os_theme.h"
 #include "ui_common.h"
+#include "engine_manager.h"   /* 返回应用管家统一卸载引擎 (应用管家=主菜单级边界) */
 #include "input.h"
 #include "touch_panel.h"
 #include "wifi_manager.h"
@@ -39,56 +40,29 @@
 #define AM_SUB_H       26     /* 顶部子分类条高 */
 #define AM_VIEW_ICON   24     /* 视图切换小图标 24×24 */
 
-/* 左侧 4 分类 (引擎/游戏/应用/商店) */
+/* 左侧 4 分类 (引擎/游戏/应用/运维) */
 #define AM_CAT_ENGINE  0   /* 引擎 */
 #define AM_CAT_GAME    1   /* 游戏 */
 #define AM_CAT_APP     2   /* 应用 */
-#define AM_CAT_STORE   3   /* 商店 */
+#define AM_CAT_STORE   3   /* 运维 (原商店, 已改为已安装运维应用) */
 #define AM_CAT_COUNT   4
 
 /* 商店/应用 子分类 (横排条) */
 #define AM_SUB_ALL     0
 #define AM_SUB_GAME    1   /* 游戏 */
-#define AM_SUB_PROG    2   /* 程序 */
-#define AM_SUB_NET     3   /* 网络 */
+#define AM_SUB_PROG    2   /* 软件 (原 程序) */
+#define AM_SUB_SYS     3   /* 系统 (新增) */
 #define AM_SUB_OPS     4   /* 运维 */
-#define AM_SUB_MANUAL  5   /* 手册 */
-#define AM_SUB_STUDY   6   /* 学习 */
-#define AM_SUB_COUNT   7
+#define AM_SUB_STUDY   5   /* 学习 */
+#define AM_SUB_COUNT   6
 static const char *const s_sub_names[AM_SUB_COUNT] = {
     "\xe5\x85\xa8\xe9\x83\xa8",  /* 全部 */
     "\xe6\xb8\xb8\xe6\x88\x8f",  /* 游戏 */
-    "\xe7\xa8\x8b\xe5\xba\x8f",  /* 程序 */
-    "\xe7\xbd\x91\xe7\xbb\x9c",  /* 网络 */
+    "\xe8\xbd\xaf\xe4\xbb\xb6",  /* 软件 */
+    "\xe7\xb3\xbb\xe7\xbb\x9f",  /* 系统 */
     "\xe8\xbf\x90\xe7\xbb\xb4",  /* 运维 */
-    "\xe6\x89\x8b\xe5\x86\x8c",  /* 手册 */
     "\xe5\xad\xa6\xe4\xb9\xa0",  /* 学习 */
 };
-
-/* ==== 商店可下载应用 (内置清单 + 服务器) ==== */
-#define STORE_MAX 24
-typedef struct {
-    char id[24];
-    char name[24];
-    char brief[48];
-    int  icon_idx;
-    int  cat;            /* 子分类索引 (AM_SUB_*) */
-} store_app_t;
-static store_app_t s_catalog[STORE_MAX];
-static int  s_catalog_n = 0;
-static bool s_store_installed[STORE_MAX];
-#define STORE_NS "os_store"
-#define STORE_MANIFEST "https://bbk.linit.cn/manifest.json"
-
-/* 内置示例商店清单 */
-static const store_app_t s_builtin_catalog[] = {
-    { "snake",  "\xe8\xb4\xaa\xe5\x90\x83\xe8\x9b\x87",      "\xe7\xbb\x8f\xe5\x85\xb8\xe8\xb4\xaa\xe5\x90\x83\xe8\x9b\x87", -1, AM_SUB_GAME },
-    { "tetris", "\xe4\xbf\x84\xe7\xbd\x97\xe6\x96\xaf\xe6\x96\xb9\xe5\x9d\x97", "\xe7\xbb\x8f\xe5\x85\xb8\xe4\xbf\x84\xe7\xbd\x97\xe6\x96\xaf\xe6\x96\xb9\xe5\x9d\x97", -1, AM_SUB_GAME },
-    { "calc",   "\xe8\xae\xa1\xe7\xae\x97\xe5\x99\xa8",      "\xe7\xae\x80\xe6\x98\x93\xe5\x9b\x9b\xe5\x88\x99\xe8\xbf\x90\xe7\xae\x97", -1, AM_SUB_PROG },
-    { "notepad","\xe8\xae\xb0\xe4\xba\x8b\xe6\x9c\xac",      "\xe7\xae\x80\xe6\x98\x93\xe8\xae\xb0\xe4\xba\x8b/\xe5\xa4\x87\xe5\xbf\x98", -1, AM_SUB_PROG },
-    { "clock",  "\xe5\x8d\x93\xe9\x9d\xa2\xe6\x97\xb6\xe9\x92\x9f", "\xe5\xa4\xa7\xe5\xad\x97\xe6\x97\xb6\xe9\x92\x9f/\xe7\xa7\x92\xe8\xa1\xa8", -1, AM_SUB_PROG },
-};
-#define BUILTIN_COUNT (int)(sizeof(s_builtin_catalog)/sizeof(s_builtin_catalog[0]))
 
 /* ==== 页面状态 ==== */
 static int s_cat = AM_CAT_ENGINE;     /* 左栏分类 */
@@ -96,9 +70,9 @@ static int s_sub = AM_SUB_ALL;        /* 顶部子分类 */
 static bool s_view_grid = true;       /* true=网格  false=单条列表 */
 static int  s_focus = 0;              /* 右栏选中索引 */
 static int  s_scroll = 0;             /* 上卷行数 */
+static int  s_focus_bar = 0;          /* 方向键聚焦区: 0=内容网格, 1=顶部子分类横排, 2=左侧分类竖排 */
 static int s_list_n = 0;             /* 当前显示条目数 */
-static const os_app_t *s_list[32];    /* 已安装条目 (应用分类) */
-static bool s_list_is_store = false;  /* 当前是否为商店条目 */
+static const os_app_t *s_list[64];    /* 已安装条目 (应用分类, 预留扩容) */
 
 /* 触摸拖动滚动状态 (列表整行滚动) */
 #define AM_DRAG_THRESH 12   /* 超过此位移判定为拖动 (不触发点击) */
@@ -117,23 +91,36 @@ static int   s_gdrag_last_y = -1;
 static float s_gdrag_base = 0.0f;      /* 拖动起始相机 */
 static bool  s_gdrag_active = false;
 
+/* 长按 (首次按下即算, 无需放手指): 按住图标 3s 弹"添加/删除桌面快捷方式"确认 */
+#define AM_LP_MS       3000
+#define AM_LP_DRAG_MAX 12      /* 长按期间位移超过此值则取消长按意图 */
+static int      s_lp_idx = -1;        /* 长按目标索引 (-1=无) */
+static uint32_t s_lp_t0  = 0;         /* 按下时刻 */
+static bool     s_lp_fired = false;   /* 已触发, 防重复 */
+static bool     s_lp_suppress = false;/* 抑制长按松手后的那次 tap */
+
+/* 视图切换 (网格/列表): 长按硬件确认键 3s 无提示切换.
+ * 确认键长按 2s 时 input 层先投递 OS_ACTION_BT_SEARCH (os_core 已为应用管家拦截),
+ * 该动作到达本页作为"已按住 2s"的起点, 再按住满 1s (累计 3s) 即切换. */
+static bool     s_vt_armed = false;   /* 已收到 BT_SEARCH 起点, 正在等待满 3s */
+static uint32_t s_vt_t0   = 0;        /* BT_SEARCH 起点时刻 (ms) */
+static bool     s_vt_fired = false;   /* 已切换, 防 hold 期间重复 */
+
 /* 前向声明 (定义在下方, 交叉引用) */
 static void am_clamp_scroll(void);
-static int  am_catalog_index(int i);
-static void store_nvs_save(void);
-static void am_rebuild(void);
+static void am_rebuild(void);          /* 常规重建: 相机对齐到焦点行 */
+static void am_rebuild_keep(void);     /* 返回重建: 保留原滚动位置 */
 
 /* 子分类是否匹配应用 */
 static bool app_match_sub(const os_app_t *a) {
     if (!a || !a->cat) return (s_sub == AM_SUB_ALL);
     if (s_sub == AM_SUB_ALL) return true;
     const char *c = a->cat;
-    if (s_sub == AM_SUB_GAME   && strcmp(c, "\xe6\xb8\xb8\xe6\x88\x8f") == 0) return true;
-    if (s_sub == AM_SUB_PROG   && strcmp(c, "\xe7\xa8\x8b\xe5\xba\x8f") == 0) return true;
-    if (s_sub == AM_SUB_NET    && strcmp(c, "\xe7\xbd\x91\xe7\xbb\x9c") == 0) return true;
-    if (s_sub == AM_SUB_OPS    && strcmp(c, "\xe8\xbf\x90\xe7\xbb\xb4") == 0) return true;
-    if (s_sub == AM_SUB_MANUAL && strcmp(c, "\xe6\x89\x8b\xe5\x86\x8c") == 0) return true;
-    if (s_sub == AM_SUB_STUDY  && strcmp(c, "\xe5\xad\xa6\xe4\xb9\xa0") == 0) return true;
+    if (s_sub == AM_SUB_GAME && strcmp(c, "\xe6\xb8\xb8\xe6\x88\x8f") == 0) return true;  /* 游戏 */
+    if (s_sub == AM_SUB_PROG && (strcmp(c, "\xe7\xa8\x8b\xe5\xba\x8f") == 0 || strcmp(c, "\xe8\xbd\xaf\xe4\xbb\xb6") == 0)) return true; /* 程序/软件 */
+    if (s_sub == AM_SUB_SYS  && (strcmp(c, "\xe7\xb3\xbb\xe7\xbb\x9f") == 0 || strcmp(c, "\xe5\xb7\xa5\xe5\x85\xb7") == 0)) return true;  /* 系统/工具 */
+    if (s_sub == AM_SUB_OPS  && strcmp(c, "\xe8\xbf\x90\xe7\xbb\xb4") == 0) return true;  /* 运维 */
+    if (s_sub == AM_SUB_STUDY&& strcmp(c, "\xe5\xad\xa6\xe4\xb9\xa0") == 0) return true;  /* 学习 */
     return false;
 }
 /* 左侧分类是否匹配应用 (引擎/游戏/应用) */
@@ -154,10 +141,16 @@ static bool app_match_cat(const os_app_t *a) {
         return false;
     }
     case AM_CAT_GAME:
-        /* 游戏分类: 暂时空白 */
-        return false;
+        /* 游戏分类(独立): 显示 cat=游戏 的非引擎应用 (如手柄); 引擎(GB/NES等)归引擎分类, 不在此重复 */
+        if (!a->cat || strcmp(a->cat, "\xe6\xb8\xb8\xe6\x88\x8f") != 0) return false;
+        for (int i = 0; i < ENGINE_ORDER_COUNT; i++)
+            if (strcmp(id, s_engine_order[i]) == 0) return false;
+        return true;
     case AM_CAT_APP: {
-        /* 应用: 排除引擎, 按子分类筛选 */
+        /* 应用: 排除引擎 + 排除运维工具 + 排除游戏, 避免在多分类重复显示 */
+        if (strcmp(id, "app_mgr") == 0) return false;
+        if (a->cat && (strcmp(a->cat, "\xe8\xbf\x90\xe7\xbb\xb4") == 0 ||
+                       strcmp(a->cat, "\xe6\xb8\xb8\xe6\x88\x8f") == 0)) return false;
         for (int i = 0; i < ENGINE_ORDER_COUNT; i++)
             if (strcmp(id, s_engine_order[i]) == 0) return false;
         return app_match_sub(a);
@@ -166,19 +159,36 @@ static bool app_match_cat(const os_app_t *a) {
     return false;
 }
 
-/* 重建右侧列表 */
-static void am_rebuild(void) {
-    s_list_is_store = (s_cat == AM_CAT_STORE);
+static float am_gcam_clamp(float c);   /* 前向声明 (定义在下方) */
+
+/* 当前视图可见行数 (网格=AM_GRID_ROWS 行; 列表=整屏可容纳的行数) */
+static int am_vis_rows(void) {
+    return s_view_grid ? AM_GRID_ROWS : ((UI_SCREEN_H - AM_CAT_Y0) / 46);
+}
+/* 焦点所在行 (网格=每行列数归组; 列表=一项一行) */
+static int am_focus_row(void) {
+    return s_view_grid ? (s_focus / AM_GRID_COLS) : s_focus;
+}
+
+/* 重建右侧列表.
+ * keep_cam=true  (从应用返回): 保留当前滚动位置, 仅当焦点已滚出视野才把相机拉回焦点行.
+ *   修复"触摸点开第二排的应用, 退出后第一排消失、第二排顶到第一排" —— 触摸换焦点时
+ *   只改 s_focus 不改相机 (p_am_touch), 若这里无条件把相机对齐焦点行, 画面就会凭空跳一行.
+ * keep_cam=false (切分类/子分类/视图): 相机对齐焦点行 (常规重置). */
+static void am_rebuild_ex(bool keep_cam) {
     s_list_n = 0;
     if (s_cat == AM_CAT_STORE) {
-        /* 商店: 按子分类筛选 s_catalog */
-        for (int i = 0; i < s_catalog_n && s_list_n < 32; i++) {
-            if (s_sub != AM_SUB_ALL && s_catalog[i].cat != s_sub) continue;
-            s_list[s_list_n++] = NULL;   /* 商店条目用 NULL 占位, 具体数据在渲染/操作时按索引取 catalog */
+        /* 运维: 显示 cat=运维 的已安装应用 */
+        int total = os_app_count();
+        for (int i = 0; i < total && s_list_n < 64; i++) {
+            const os_app_t *a = os_app_get(i);
+            if (a && a->cat && strcmp(a->cat, "\xe8\xbf\x90\xe7\xbb\xb4") == 0 &&
+                (s_sub == AM_SUB_ALL || app_match_sub(a)))
+                s_list[s_list_n++] = a;
         }
     } else if (s_cat == AM_CAT_ENGINE) {
         /* 引擎: 按用户指定顺序插入 (从注册表取对应应用) */
-        for (int o = 0; o < ENGINE_ORDER_COUNT && s_list_n < 32; o++) {
+        for (int o = 0; o < ENGINE_ORDER_COUNT && s_list_n < 64; o++) {
             int total = os_app_count();
             for (int i = 0; i < total; i++) {
                 const os_app_t *a = os_app_get(i);
@@ -190,22 +200,34 @@ static void am_rebuild(void) {
         }
     } else {
         int total = os_app_count();
-        for (int i = 0; i < total && s_list_n < 32; i++) {
+        for (int i = 0; i < total && s_list_n < 64; i++) {
             const os_app_t *a = os_app_get(i);
             if (app_match_cat(a)) s_list[s_list_n++] = a;
         }
     }
     if (s_focus >= s_list_n) s_focus = 0;
     if (s_focus < 0) s_focus = 0;
-    /* 网格: 相机吸附到焦点行 */
-    s_gcam = (float)(s_focus / AM_GRID_COLS);
+    if (keep_cam) {
+        /* 保留原画面: 焦点在视野内就不动相机, 只有焦点被滚出视野才拉回去 */
+        int frow  = am_focus_row();
+        int fvis  = (int)(s_gcam + 0.5f);
+        int vlast = fvis + am_vis_rows() - 1;
+        if (frow < fvis || frow > vlast) s_gcam = (float)frow;
+        s_gcam   = am_gcam_clamp(s_gcam);
+        s_scroll = (int)s_gcam;
+    } else {
+        /* 网格: 相机吸附到焦点行 */
+        s_gcam   = (float)(s_focus / AM_GRID_COLS);
+        s_scroll = s_focus / AM_GRID_COLS;
+    }
     s_gcam_anim_start = 0;
-    s_scroll = s_focus / AM_GRID_COLS;
     am_clamp_scroll();
 }
+static void am_rebuild(void)      { am_rebuild_ex(false); }
+static void am_rebuild_keep(void) { am_rebuild_ex(true);  }
 static int am_max_scroll(void) {
     if (!s_view_grid) {
-        int content_top = (s_cat == AM_CAT_APP || s_cat == AM_CAT_STORE) ? (AM_CAT_Y0 + AM_SUB_H) : AM_CAT_Y0;
+        int content_top = AM_CAT_Y0;
         int mv = (UI_SCREEN_H - content_top) / 46;
         int m = s_list_n - mv;
         return m < 0 ? 0 : m;
@@ -235,14 +257,9 @@ static float am_gcam_clamp(float c) {
     if (c > max_row) c = (float)max_row;
     return c;
 }
-/* 相机目标行 → 焦点 (网格: 保持列; 列表: 直接=行) */
-static void am_gcam_set_focus_row(int row) {
-    if (s_view_grid)
-        s_focus = row * AM_GRID_COLS + (s_focus % AM_GRID_COLS);
-    else
-        s_focus = row;
-}
-/* 网格吸附动画: 从当前相机平滑缓动到目标行 (无弹簧过冲), 同步 s_focus */
+/* 网格吸附动画: 只移动相机 (不回写焦点, 焦点由方向键直接推进).
+ * 关键修复: 原来是动画把焦点钳到 am_max_scroll() 行, 导致方向键到不了最后一排
+ * (最多只剩 (max_scroll+1)*列 个); 现在相机最多滚到视图容纳处, 焦点可自由推到任意项. */
 static void am_gcam_animate(int to_row, uint32_t dur_ms) {
     int total_rows = am_max_scroll();
     if (to_row > total_rows) to_row = total_rows;
@@ -251,7 +268,6 @@ static void am_gcam_animate(int to_row, uint32_t dur_ms) {
     float to_c = (float)to_row;
     if (from_c == to_c) {
         s_gcam = to_c;
-        am_gcam_set_focus_row(to_row);
         s_gcam_anim_start = 0;
         return;
     }
@@ -260,15 +276,14 @@ static void am_gcam_animate(int to_row, uint32_t dur_ms) {
     s_gcam_anim_start  = am_now_ms();
     s_gcam_anim_dur    = dur_ms ? dur_ms : 1;
     s_gcam_anim_sel    = to_row;
-    am_gcam_set_focus_row(to_row);
 }
-/* 吸附完成: 把相机锁定到最近焦点行 (动画结束后调用) */
+/* 吸附完成: 相机锁定到最近焦点行 (只锁相机, 不动 s_focus) */
 static void am_gcam_settle(void) {
     s_gcam = am_gcam_clamp(s_gcam);
     int row = (int)(s_gcam + 0.5f);
-    am_gcam_set_focus_row(row);
     s_gcam = (float)row;
     s_gcam_anim_start = 0;
+    (void)row;
 }
 /* 每帧更新动画 (poll 调用), 返回是否还在动画中 */
 static bool am_gcam_tick(void) {
@@ -345,14 +360,6 @@ static void am_draw_text_l(st7305_handle_t *lcd, int x, int y, const char *s, bo
     }
 }
 
-/* 商店默认图标 (店铺图形) */
-static void am_draw_store_icon(st7305_handle_t *lcd, int cx, int cy, int size) {
-    int h2 = size / 2;
-    fill_rect(lcd, cx - h2 + 4,  cy - h2,  cx + h2 - 4,  cy - 2, ST7305_COLOR_BLACK);
-    fill_rect(lcd, cx - h2 + 12, cy + 2,   cx + h2 - 12, cy + h2 - 2, ST7305_COLOR_BLACK);
-    fill_rect(lcd, cx - 6,       cy + 4,   cx + 6,       cy + h2 - 2, ST7305_COLOR_WHITE);
-}
-
 /* 实心圆 (用于"已添加到主菜单"角标, 参考 3.3 app_fill_circle) */
 static void am_fill_circle(st7305_handle_t *lcd, int cx, int cy, int r, st7305_color_t c) {
     for (int dy = -r; dy <= r; dy++)
@@ -360,21 +367,21 @@ static void am_fill_circle(st7305_handle_t *lcd, int cx, int cy, int r, st7305_c
             if (dx * dx + dy * dy <= r * r)
                 st7305_draw_pixel(lcd, cx + dx, cy + dy, c);
 }
-/* 已添加到主菜单的应用: 图标右上角实心黑圆点 (半径3, 往右上各偏移4px) */
+/* 已添加到桌面(主菜单)的应用: 图标右上角圆形标识.
+ * 三层同心圆 (白黑白) 保证黑色背景/白色背景都能看清. */
 static void am_draw_mainmenu_dot(st7305_handle_t *lcd, int cx, int cy, int size) {
-    int dr = 3;
-    am_fill_circle(lcd, cx + size / 2 - dr + 4, cy - size / 2 + dr - 4, dr, ST7305_COLOR_BLACK);
+    int ccx = cx + size / 2 - 4;      /* 右上角, 往里收几像素 */
+    int ccy = cy - size / 2 + 4;
+    am_fill_circle(lcd, ccx, ccy, 5, ST7305_COLOR_WHITE);  /* 外圈白 (黑色背景可见) */
+    am_fill_circle(lcd, ccx, ccy, 3, ST7305_COLOR_BLACK);  /* 中圈黑 (白色背景可见) */
+    am_fill_circle(lcd, ccx, ccy, 1, ST7305_COLOR_WHITE);  /* 内圈白 */
 }
 
 /* 应用图标 (网格视图) */
 static void am_draw_app_icon(ui_ctx_t *ctx, st7305_handle_t *lcd, const os_app_t *a, int cx, int cy, int size, bool sel) {
-    if (a) {
-        const os_theme_t *th = os_theme_get();
-        if (th->draw_icon) th->draw_icon(ctx, lcd, a->icon_idx, cx, cy, size, sel);
-        else draw_main_icon_stretched(lcd, cx, cy, size, size, a->icon_idx);
-    } else {
-        am_draw_store_icon(lcd, cx, cy, size);
-    }
+    const os_theme_t *th = os_theme_get();
+    if (a && th->draw_icon) th->draw_icon(ctx, lcd, a->icon_idx, cx, cy, size, sel);
+    else draw_main_icon_stretched(lcd, cx, cy, size, size, a->icon_idx);
 }
 
 /* 子分类条绘制 (y 顶部, 先填白底盖住下方内容残留, 恒固定显示) */
@@ -390,24 +397,16 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
         bool sel = (i == s_sub);
         if (sel) fill_rect(lcd, sx + 2, y0, sx + slot - 2, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK);
         am_draw_label(lcd, cx, y0 + 5, s_sub_names[i], sel);
+        /* 顶部子分类聚焦中: 给当前子分类画 U 形括号 (顶+两侧, 底部开口并向下延伸),
+         * 表示"正在浏览该分类, 下面内容归它管" — 区别于普通黑块, 便于分辨在哪一层 */
+        if (s_focus_bar == 1 && i == s_sub) {
+            int bx0 = sx + 1, bx1 = sx + slot - 1, by = y0 - 3, bbot = y0 + AM_SUB_H + 16;
+            draw_hline(lcd, bx0, bx1, by, ST7305_COLOR_BLACK);
+            draw_vline(lcd, bx0, by, bbot, ST7305_COLOR_BLACK);
+            draw_vline(lcd, bx1, by, bbot, ST7305_COLOR_BLACK);
+        }
     }
     fill_rect(lcd, x0, y0 + AM_SUB_H - 1, x1, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK);
-}
-
-/* 视图切换小图标 24×24 (最右): 网格=4宫格, 列表=3横条 */
-static void am_draw_view_icon(st7305_handle_t *lcd, int x, int y) {
-    if (s_view_grid) {
-        /* 网格图标: 田字格 */
-        fill_rect(lcd, x + 3, y + 3, x + 9, y + 9, ST7305_COLOR_BLACK);
-        fill_rect(lcd, x + 14, y + 3, x + 20, y + 9, ST7305_COLOR_BLACK);
-        fill_rect(lcd, x + 3, y + 14, x + 9, y + 20, ST7305_COLOR_BLACK);
-        fill_rect(lcd, x + 14, y + 14, x + 20, y + 20, ST7305_COLOR_BLACK);
-    } else {
-        /* 列表图标: 3 横条 */
-        fill_rect(lcd, x + 3, y + 4, x + 20, y + 7, ST7305_COLOR_BLACK);
-        fill_rect(lcd, x + 3, y + 10, x + 20, y + 13, ST7305_COLOR_BLACK);
-        fill_rect(lcd, x + 3, y + 16, x + 20, y + 19, ST7305_COLOR_BLACK);
-    }
 }
 
 /* ==== 左侧分类栏布局 (前3个平均分布, 第4个商店贴底) ==== */
@@ -430,8 +429,8 @@ static void p_am_render(ui_ctx_t *ctx) {
     int grid_x0 = AM_CATBAR_W;
     fill_rect(lcd, AM_CATBAR_W - 1, AM_CAT_Y0, AM_CATBAR_W, UI_SCREEN_H - 1, ST7305_COLOR_BLACK);
 
-    /* 内容起点 (子分类条下方或直接状态栏下方) */
-    int content_top = (s_cat == AM_CAT_APP || s_cat == AM_CAT_STORE) ? (AM_CAT_Y0 + AM_SUB_H) : AM_CAT_Y0;
+    /* 内容起点 (状态栏下方, 不再有顶部子分类条) */
+    int content_top = AM_CAT_Y0;
 
     if (s_view_grid) {
         /* === 网格视图 (4×3, 相机 s_gcam 行单位, 跟手+吸附) === */
@@ -452,27 +451,18 @@ static void p_am_render(ui_ctx_t *ctx) {
                 if (i < 0 || i >= s_list_n) continue;
                 int cx = grid_start_x + col * cell_w + cell_w / 2;
                 bool sel = (i == s_focus);
-                if (s_list_is_store) {
-                    int ci = am_catalog_index(i);
-                    const store_app_t *sa = (ci >= 0) ? &s_catalog[ci] : NULL;
-                    am_draw_store_icon(lcd, cx, y_center, AM_ICON_SIZE);
-                    const char *nm = sa ? sa->name : "\xe6\x9c\xaa\xe7\x9f\xa5";
-                    int lw = am_label_width(nm);
-                    int ly = y_center + AM_ICON_SIZE / 2 + 2;
-                    if (sel) fill_rect(lcd, cx - lw / 2, ly, cx + lw / 2 - 1, ly + ZH16_FONT_H - 1, ST7305_COLOR_BLACK);
-                    am_draw_label(lcd, cx, ly, nm, sel);
-                } else {
-                    const os_app_t *a = s_list[i];
-                    am_draw_app_icon(ctx, lcd, a, cx, y_center, AM_ICON_SIZE, sel);
-                    /* 已添加到主菜单: 图标右上角黑色圆点 (3.3 样式) */
-                    if (a && os_app_in_mainmenu(a->id))
-                        am_draw_mainmenu_dot(lcd, cx, y_center, AM_ICON_SIZE);
-                    const char *nm = a ? a->label : "?";
-                    int lw = am_label_width(nm);
-                    int ly = y_center + AM_ICON_SIZE / 2 + 2;
-                    if (sel) fill_rect(lcd, cx - lw / 2, ly, cx + lw / 2 - 1, ly + ZH16_FONT_H - 1, ST7305_COLOR_BLACK);
-                    am_draw_label(lcd, cx, ly, nm, sel);
-                }
+                const os_app_t *a = s_list[i];
+                am_draw_app_icon(ctx, lcd, a, cx, y_center, AM_ICON_SIZE, sel);
+                /* 已显示在主菜单的应用: 图标右上角黑色圆点 (3.3 样式).
+                 * 用 os_app_visible(与主菜单遍历一致), 而非 os_app_in_mainmenu
+                 * (后者只记录用户显式添加; 默认显示的应用不在该列表, 会漏标). */
+                if (a && os_app_visible(a))
+                    am_draw_mainmenu_dot(lcd, cx, y_center, AM_ICON_SIZE);
+                const char *nm = a ? a->label : "?";
+                int lw = am_label_width(nm);
+                int ly = y_center + AM_ICON_SIZE / 2 + 2;
+                if (sel) fill_rect(lcd, cx - lw / 2, ly, cx + lw / 2 - 1, ly + ZH16_FONT_H - 1, ST7305_COLOR_BLACK);
+                am_draw_label(lcd, cx, ly, nm, sel);
             }
         }
     } else {
@@ -494,40 +484,18 @@ static void p_am_render(ui_ctx_t *ctx) {
             if (sel) fill_rect(lcd, grid_x0 + 2, y, UI_SCREEN_W - 2, y + row_h - 2, ST7305_COLOR_BLACK);
             else     fill_rect(lcd, grid_x0 + 2, y, UI_SCREEN_W - 2, y + row_h - 2, ST7305_COLOR_WHITE);
             if (i > first) fill_rect(lcd, grid_x0 + 2, y, UI_SCREEN_W - 2, y, ST7305_COLOR_BLACK);
-            if (s_list_is_store) {
-                int ci = am_catalog_index(i);
-                const store_app_t *sa = (ci >= 0) ? &s_catalog[ci] : NULL;
-                const char *nm = sa ? sa->name : "?";
-                const char *br = sa ? sa->brief : "";
-                /* 说明左对齐 (不居中, 避免挡左侧分割栏) */
-                am_draw_text_l(lcd, grid_x0 + 12, y + 5, nm, sel);
-                am_draw_text_l(lcd, grid_x0 + 12, y + 25, br, sel);
-                bool inst = (ci >= 0) && s_store_installed[ci];
-                const char *st = inst ? "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85" : "\xe5\xae\x89\xe8\xa3\x85";
-                am_draw_text_l(lcd, UI_SCREEN_W - 48, y + 12, st, sel);
-            } else {
-                const os_app_t *a = s_list[i];
-                const char *nm = a ? a->label : "?";
-                const char *id = a ? a->id : "";
-                am_draw_text_l(lcd, grid_x0 + 12, y + 6, nm, sel);
-                am_draw_text_l(lcd, grid_x0 + 12, y + 27, id, sel);
-                bool mm = a && os_app_in_mainmenu(a->id);
-                const char *st = mm ? "\xe5\x9c\xa8\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95" : "\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95";
-                am_draw_text_l(lcd, UI_SCREEN_W - 58, y + 14, st, sel);
-            }
+            const os_app_t *a = s_list[i];
+            const char *nm = a ? a->label : "?";
+            const char *id = a ? a->id : "";
+            am_draw_text_l(lcd, grid_x0 + 12, y + 6, nm, sel);
+            am_draw_text_l(lcd, grid_x0 + 12, y + 27, id, sel);
+            bool mm = a && os_app_visible(a);
+            const char *st = mm ? "\xe5\x9c\xa8\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95" : "\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95";
+            am_draw_text_l(lcd, UI_SCREEN_W - 58, y + 14, st, sel);
         }
     }
 
-    /* 顶部子分类条 + 视图切换图标 (内容之后绘制, 恒固定在最上层不被拖动遮挡) */
-    if (s_cat == AM_CAT_APP || s_cat == AM_CAT_STORE) {
-        am_draw_subbar(ctx, lcd, grid_x0 + 2, AM_CAT_Y0, UI_SCREEN_W - AM_VIEW_ICON - 6);
-        /* 视图切换图标 (最右) */
-        int vx = UI_SCREEN_W - AM_VIEW_ICON - 2;
-        int vy = AM_CAT_Y0 + 1;
-        fill_rect(lcd, vx - 1, vy - 1, vx + AM_VIEW_ICON, vy + AM_VIEW_ICON, ST7305_COLOR_WHITE);
-        fill_rect(lcd, vx - 1, vy - 1, vx + AM_VIEW_ICON, vy - 1, ST7305_COLOR_BLACK);
-        am_draw_view_icon(lcd, vx, vy);
-    }
+    /* 视图切换图标已移除: 改为 长按硬件确认键 3s 切换 (见 p_am_poll/OS_ACTION_BT_SEARCH). */
 
     if (s_list_n == 0) {
         draw_text(lcd, grid_x0 + 40, content_top + 60,
@@ -539,6 +507,20 @@ static void p_am_render(ui_ctx_t *ctx) {
     for (int r = 0; r < AM_CAT_COUNT; r++) {
         int icon_cx = AM_CATBAR_W / 2;
         int icon_cy = am_cat_cy(r);
+        /* 分类栏聚焦 (方向键) 时: 被聚焦分类画外扩黑框, 表示可在分类间用上下键切换 */
+        if (s_focus_bar == 2 && r == s_cat) {
+            int bx0 = icon_cx - AM_ICON_SIZE / 2 - 2;
+            int bx1 = icon_cx + AM_ICON_SIZE / 2 + 1;
+            int by0 = icon_cy - AM_ICON_SIZE / 2 - 2;
+            int by1 = icon_cy + AM_ICON_SIZE / 2 + 1;
+            for (int k = 0; k < 2; k++) {
+                draw_hline(lcd, bx0 + k, bx1 - k, by0 + k, ST7305_COLOR_BLACK);
+                draw_hline(lcd, bx0 + k, bx1 - k, by1 - k, ST7305_COLOR_BLACK);
+                draw_vline(lcd, bx0 + k, by0 + k, by1 - k, ST7305_COLOR_BLACK);
+                draw_vline(lcd, bx1 - k, by0 + k, by1 - k, ST7305_COLOR_BLACK);
+            }
+        }
+        /* 分类图标: 侧栏四类均用独立 cat 图标 (0引擎/1游戏/2程序/3运维), 不复用应用图标 */
         draw_cat_icon_stretched(lcd, icon_cx, icon_cy, AM_ICON_SIZE, AM_ICON_SIZE, r);
         if (r == s_cat) {
             int lx0 = icon_cx - AM_ICON_SIZE / 2;
@@ -549,80 +531,56 @@ static void p_am_render(ui_ctx_t *ctx) {
     }
 }
 
-/* 商店条目 i → catalog 索引 (重建时按子分类过滤, 此处线性映射) */
-static int am_catalog_index(int i) {
-    int n = 0;
-    for (int k = 0; k < s_catalog_n; k++) {
-        if (s_sub != AM_SUB_ALL && s_catalog[k].cat != s_sub) continue;
-        if (n == i) return k;
-        n++;
-    }
-    return -1;
-}
-
-/* ==== 操作: 已安装应用 操作弹窗 ==== */
-static void am_app_op_cb(ui_ctx_t *ctx, int result, void *ud) {
-    const os_app_t *a = (const os_app_t *)ud;
-    if (!a) return;
-    switch (result) {
-    case 0: os_push(ctx, a->page); break;                      /* 打开 */
-    case 1: os_app_set_mainmenu(a->id, true);
-            os_dialog_toast(ctx, "\xe5\xb7\xb2\xe6\xb7\xbb\xe5\x8a\xa0\xe5\x88\xb0\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95"); /* 已添加到主菜单 */
-            ctx->needs_redraw = true; break;
-    case 2: os_app_set_mainmenu(a->id, false);
-            os_dialog_toast(ctx, "\xe5\xb7\xb2\xe7\xa7\xbb\xe5\x87\xba\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95"); /* 已移出主菜单 */
-            ctx->needs_redraw = true; break;
-    case 3: os_app_set_hidden(a->id, true);                    /* 卸载=隐藏 */
-            os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8d\xb8\xe8\xbd\xbd"); /* 已卸载 */
-            ctx->needs_redraw = true; break;
-    default: break;   /* 返回 */
-    }
-}
-static void am_app_op(ui_ctx_t *ctx, const os_app_t *a) {
-    if (!a) return;
-    static const char *items[5] = {
-        "\xe6\x89\x93\xe5\xbc\x80",                    /* 打开 */
-        "\xe6\xb7\xbb\xe5\x8a\xa0\xe5\x88\xb0\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95", /* 添加到主菜单 */
-        "\xe7\xa7\xbb\xe5\x87\xba\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95", /* 移出主菜单 */
-        "\xe5\x8d\xb8\xe8\xbd\xbd",                    /* 卸载 */
-        "\xe8\xbf\x94\xe5\x9b\x9e",                    /* 返回 */
-    };
-    os_dialog_list(ctx, a->label, items, 5, 0, am_app_op_cb, (void *)a);
-}
-
-/* ==== 操作: 商店 安装/卸载 ==== */
-static void am_store_op_cb(ui_ctx_t *ctx, int result, void *ud) {
-    int ci = (int)(intptr_t)ud;
-    if (result == 0) {
-        if (ci >= 0 && ci < STORE_MAX) {
-            bool inst = s_store_installed[ci];
-            s_store_installed[ci] = !inst;
-            store_nvs_save();
-            os_dialog_toast(ctx, inst ? "\xe5\xb7\xb2\xe5\x8d\xb8\xe8\xbd\xbd" : "\xe5\xae\x89\xe8\xa3\x85\xe5\xae\x8c\xe6\x88\x90");
-            ctx->needs_redraw = true;
-        }
-    }
-}
-static void am_store_op(ui_ctx_t *ctx, int ci) {
-    if (ci < 0 || ci >= s_catalog_n) return;
-    const store_app_t *sa = &s_catalog[ci];
-    bool inst = s_store_installed[ci];
-    char *items[2] = { "\xe5\xae\x89\xe8\xa3\x85", "\xe8\xbf\x94\xe5\x9b\x9e" }; /* 安装/返回 */
-    if (inst) items[0] = "\xe5\x8d\xb8\xe8\xbd\xbd";   /* 已装 → 卸载 */
-    os_dialog_list(ctx, sa->name, (const char *const *)items, 2, 0, am_store_op_cb, (void *)(intptr_t)ci);
-}
-
 /* ==== 交互 ==== */
+/* 是否有顶部子分类横排 (仅在 程序/商店 分类) */
+static bool am_has_sub(void) { return (s_cat == AM_CAT_APP) || (s_cat == AM_CAT_STORE); }
+
 static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
+    /* 左侧分类栏聚焦 (UP/DOWN 切分类; RIGHT/确认 选定回内容; LEFT/BACK 回内容) */
+    if (s_focus_bar == 2) {
+        switch (a) {
+        case OS_ACTION_UP:   s_cat = (s_cat + AM_CAT_COUNT - 1) % AM_CAT_COUNT; am_rebuild(); break;
+        case OS_ACTION_DOWN: s_cat = (s_cat + 1) % AM_CAT_COUNT; am_rebuild(); break;
+        case OS_ACTION_RIGHT:
+        case OS_ACTION_CONFIRM:
+        case OS_ACTION_BACK:
+        case OS_ACTION_LEFT:
+        case OS_ACTION_HOME:
+            s_focus_bar = 0; break;
+        default: break;
+        }
+        ctx->needs_redraw = true;
+        return;
+    }
+    /* 顶部子分类横排聚焦 (LEFT/RIGHT 切子分类; DOWN/确认 选定回内容; UP 不继续向上=停在此层) */
+    if (s_focus_bar == 1) {
+        switch (a) {
+        case OS_ACTION_LEFT:  s_sub = (s_sub + AM_SUB_COUNT - 1) % AM_SUB_COUNT; am_rebuild(); break;
+        case OS_ACTION_RIGHT: s_sub = (s_sub + 1) % AM_SUB_COUNT; am_rebuild(); break;
+        case OS_ACTION_DOWN:
+        case OS_ACTION_CONFIRM:
+            s_focus_bar = 0; break;                 /* 选定子分类 → 回内容 */
+        case OS_ACTION_UP:
+            break;                                  /* 子分类已到顶: 不再继续向上 */
+        case OS_ACTION_BACK:
+            s_focus_bar = 0; break;
+        default: break;
+        }
+        ctx->needs_redraw = true;
+        return;
+    }
     switch (a) {
     case OS_ACTION_UP:
         if (s_view_grid) {
             if (s_focus >= AM_GRID_COLS) {
                 s_focus -= AM_GRID_COLS;
                 am_gcam_animate(s_focus / AM_GRID_COLS, 300);
+            } else {
+                s_focus_bar = 0;   /* 到顶 → 停在内容 (已无顶部子分类条) */
             }
         } else {
             if (s_focus > 0) { s_focus--; am_gcam_animate(s_focus, 260); }
+            else s_focus_bar = 0;   /* 到顶 → 停在内容 (已无顶部子分类条) */
         }
         ctx->needs_redraw = true;
         break;
@@ -638,11 +596,15 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_LEFT:
-        if (s_focus - 1 >= 0) {
-            s_focus--;
-            if (s_view_grid) am_gcam_animate(s_focus / AM_GRID_COLS, 260);
-            else am_gcam_animate(s_focus, 260);
+        /* 内容已到最左列 → 跳到左侧分类栏 */
+        if (s_view_grid ? (s_focus % AM_GRID_COLS == 0) : (s_focus == 0)) {
+            s_focus_bar = 2;
+            ctx->needs_redraw = true;
+            break;
         }
+        s_focus--;
+        if (s_view_grid) am_gcam_animate(s_focus / AM_GRID_COLS, 260);
+        else am_gcam_animate(s_focus, 260);
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_RIGHT:
@@ -655,12 +617,18 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
         break;
     case OS_ACTION_CONFIRM:
         if (s_list_n <= 0) break;
-        if (s_list_is_store) {
-            int ci = am_catalog_index(s_focus);
-            am_store_op(ctx, ci);
-        } else {
-            am_app_op(ctx, s_list[s_focus]);
+        {
+            const os_app_t *a = s_list[s_focus];
+            if (a) os_push(ctx, a->page);   /* 直接打开应用, 不再弹二级操作菜单 */
         }
+        break;
+    case OS_ACTION_BT_SEARCH:
+        /* 确认键已长按 2s (os_core 已为应用管家拦截蓝牙搜索):
+         * 以此刻为起点, 再按住满 1s (累计 3s) 切换 网格/列表 视图, 无提示. */
+        s_vt_armed = true;
+        s_vt_t0    = esp_timer_get_time() / 1000;
+        s_vt_fired = false;
+        ctx->needs_redraw = true;
         break;
     case OS_ACTION_BACK:
     case OS_ACTION_HOME:
@@ -674,6 +642,8 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
 static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
     /* 拖动滚动中: 忽略点击 (松手后由 poll 复位 s_gdrag_active) */
     if (s_gdrag_active) return true;
+    /* 长按已触发: 吞掉松手后的那次 tap (避免重复弹操作窗) */
+    if (s_lp_suppress) { s_lp_suppress = false; return true; }
     /* 左侧分类栏 (触摸按图标中心判定, 触摸区上下延伸: 取最近的分类中心) */
     if (x < AM_CATBAR_W) {
         int best = -1, best_d = 1 << 30;
@@ -686,35 +656,18 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
             s_cat = best;
             s_sub = AM_SUB_ALL;
             s_focus = 0; s_scroll = 0;
+            s_focus_bar = 0;   /* 触摸点分类后回到内容聚焦 */
             am_rebuild();
             ctx->needs_redraw = true;
         }
         return true;
     }
-    /* 顶部子分类条 + 视图切换图标 */
+    /* 顶部状态栏区域: 视图切换图标已移除 (改长按确认键3s), 顶部触摸不再切换 */
     if (y >= AM_CAT_Y0 && y < AM_CAT_Y0 + AM_SUB_H && (s_cat == AM_CAT_APP || s_cat == AM_CAT_STORE)) {
-        /* 视图切换图标 (最右) */
-        int vx = UI_SCREEN_W - AM_VIEW_ICON - 2;
-        if (x >= vx - 2 && x <= vx + AM_VIEW_ICON + 2) {
-            s_view_grid = !s_view_grid;
-            s_focus = 0; s_scroll = 0;
-            am_rebuild();
-            ctx->needs_redraw = true;
-            return true;
-        }
-        /* 子分类 */
-        int slot = (UI_SCREEN_W - AM_CATBAR_W - AM_VIEW_ICON - 8) / AM_SUB_COUNT;
-        int sub = (x - (AM_CATBAR_W + 2)) / slot;
-        if (sub >= 0 && sub < AM_SUB_COUNT && sub != s_sub) {
-            s_sub = sub;
-            s_focus = 0; s_scroll = 0;
-            am_rebuild();
-            ctx->needs_redraw = true;
-        }
         return true;
     }
     /* 右栏内容 (y < content_top: 顶部状态栏/子分类条区域 → 不触发下方图标) */
-    int content_top = (s_cat == AM_CAT_APP || s_cat == AM_CAT_STORE) ? (AM_CAT_Y0 + AM_SUB_H) : AM_CAT_Y0;
+    int content_top = AM_CAT_Y0;
     if (y < content_top) return false;
     if (s_view_grid) {
         int cell_w = (UI_SCREEN_W - AM_CATBAR_W - 8) / AM_GRID_COLS;
@@ -727,8 +680,7 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
         int idx = row * AM_GRID_COLS + col;
         if (idx >= 0 && idx < s_list_n) {
             if (idx == s_focus) {
-                if (s_list_is_store) { int ci = am_catalog_index(idx); am_store_op(ctx, ci); }
-                else am_app_op(ctx, s_list[idx]);
+                const os_app_t *a = s_list[idx]; if (a) os_push(ctx, a->page);  /* 直接打开 */
             } else s_focus = idx;
             ctx->needs_redraw = true;
             return true;
@@ -738,8 +690,7 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
         int idx = (int)floorf(s_gcam) + (y - content_top) / row_h;
         if (idx >= 0 && idx < s_list_n) {
             if (idx == s_focus) {
-                if (s_list_is_store) { int ci = am_catalog_index(idx); am_store_op(ctx, ci); }
-                else am_app_op(ctx, s_list[idx]);
+                const os_app_t *a = s_list[idx]; if (a) os_push(ctx, a->page);  /* 直接打开 */
             } else s_focus = idx;
             ctx->needs_redraw = true;
             return true;
@@ -748,8 +699,75 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
     return false;
 }
 
+/* ==== 长按桌面快捷方式确认 ==== */
+static void am_lp_confirm_cb(ui_ctx_t *ctx, int result, void *ud) {
+    const os_app_t *a = (const os_app_t *)ud;
+    if (!a) return;
+    if (result != 0) return;   /* 取消: 弹窗由框架自动关 */
+    bool vis = os_app_visible(a);
+    if (vis) {
+        /* 移出主菜单: 显式加入隐藏列表, 覆盖 reveal/隐藏开关 的"强制显示",
+         * 否则引擎等 reveal 应用删图标后仍留在主菜单/圆圈不消失 (冲突根因). */
+        os_app_set_mainmenu(a->id, false);
+        os_app_set_hidden(a->id, true);
+        os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x88\xa0\xe9\x99\xa4\xe6\xa1\x8c\xe9\x9d\xa2\xe5\x9b\xbe\xe6\xa0\x87"); /* 已删除桌面图标 */
+    } else {
+        os_app_set_mainmenu(a->id, true);
+        os_dialog_toast(ctx, "\xe5\xb7\xb2\xe6\xb7\xbb\xe5\x8a\xa0\xe6\xa1\x8c\xe9\x9d\xa2\xe5\x9b\xbe\xe6\xa0\x87"); /* 已添加桌面图标 */
+    }
+    /* 确定后必须立即关闭确认弹窗: os_dialog_toast 会置 s_cb_handled 阻止 dlg_finish_top
+     * 自动关, 这里显式弹掉 (否则确认框一直卡着). 之后由 os_enter 重建可见列表. */
+    os_dialog_pop(ctx);
+    ctx->needs_redraw = true;
+}
+/* 按住图标 3s → 弹确认 (已添加到桌面则问删除, 否则问添加). 确认后自动关闭并弹 0.5s 提示 */
+static void am_long_press(ui_ctx_t *ctx, int idx) {
+    if (idx < 0 || idx >= s_list_n) return;
+    if (!s_list[idx]) return;   /* 仅已安装应用图标 */
+    const os_app_t *a = s_list[idx];
+    bool mm = os_app_visible(a);
+    const char *msg = mm ? "\xe5\x88\xa0\xe9\x99\xa4\xe6\xa1\x8c\xe9\x9d\xa2\xe5\x9b\xbe\xe6\xa0\x87?"     /* 删除桌面图标? */
+                         : "\xe6\xb7\xbb\xe5\x8a\xa0\xe6\xa1\x8c\xe9\x9d\xa2\xe5\x9b\xbe\xe6\xa0\x87?";   /* 添加桌面图标? */
+    os_dialog_confirm_ex(ctx, msg, 0, 0, am_lp_confirm_cb, (void *)a);
+}
+
+/* 触摸点 → 当前视图条目索引 (网格/列表) */
+static int am_idx_at(int tx, int ty, int content_top) {
+    if (tx < AM_CATBAR_W || ty < content_top) return -1;
+    if (s_view_grid) {
+        int cell_w = (UI_SCREEN_W - AM_CATBAR_W - 8) / AM_GRID_COLS;
+        int step_y = (UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS;
+        if (step_y < AM_ICON_SIZE + 18) step_y = AM_ICON_SIZE + 18;
+        int col = (tx - (AM_CATBAR_W + 4)) / cell_w;
+        int row_vis = (ty - (content_top + 2)) / step_y;
+        if (col < 0 || col >= AM_GRID_COLS || row_vis < 0) return -1;
+        int row = (int)floorf(s_gcam) + row_vis;
+        int idx = row * AM_GRID_COLS + col;
+        return (idx >= 0 && idx < s_list_n) ? idx : -1;
+    } else {
+        int idx = (int)floorf(s_gcam) + (ty - content_top) / 46;
+        return (idx >= 0 && idx < s_list_n) ? idx : -1;
+    }
+}
+
 /* ==== 每帧轮询: 触摸上下拖动 (相机跟手 + 惯性甩动 + 网格吸附, 仿主菜单) ==== */
 static void p_am_poll(ui_ctx_t *ctx) {
+    /* 视图切换: 确认键已按满 3s (BT_SEARCH 起点再加 1s) 且未松手 → 切换 网格/列表 */
+    if (s_vt_armed && !s_vt_fired) {
+        if (input_is_held(1)) {   /* KEY = 硬件确认键仍在按住 */
+            if ((esp_timer_get_time() / 1000 - s_vt_t0) >= 1000) {
+                s_vt_armed  = false;
+                s_vt_fired  = true;
+                s_view_grid = !s_view_grid;
+                s_focus = 0; s_scroll = 0;
+                am_rebuild();
+                ctx->needs_redraw = true;
+            }
+        } else {
+            s_vt_armed = false;   /* 中途松手: 取消 */
+        }
+    }
+
     /* 相机动画进行中: 每帧请求重绘 */
     if (s_gcam_anim_start > 0) {
         am_gcam_tick();
@@ -759,7 +777,7 @@ static void p_am_poll(ui_ctx_t *ctx) {
 
     int tx, ty;
     bool down = input_get_touch_pos(&tx, &ty);
-    int content_top = (s_cat == AM_CAT_APP || s_cat == AM_CAT_STORE) ? (AM_CAT_Y0 + AM_SUB_H) : AM_CAT_Y0;
+    int content_top = AM_CAT_Y0;
     int row_h = s_view_grid
         ? ((UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS) : 46;
     if (s_view_grid && row_h < AM_ICON_SIZE + 18) row_h = AM_ICON_SIZE + 18;
@@ -778,12 +796,15 @@ static void p_am_poll(ui_ctx_t *ctx) {
             ctx->needs_redraw = true;
         }
         s_gdrag_last_y = -1;
+        s_lp_idx = -1;
+        s_lp_fired = false;
         return;
     }
 
     /* 只在右栏内容区开始拖动 */
     if (tx < AM_CATBAR_W || ty < content_top || ty >= UI_SCREEN_H) {
         s_gdrag_last_y = -1;
+        s_lp_idx = -1;
         return;
     }
 
@@ -793,101 +814,51 @@ static void p_am_poll(ui_ctx_t *ctx) {
         s_gdrag_base     = s_gcam;
         s_gdrag_active   = false;
         s_gcam_anim_start = 0;   /* 新拖动取消旧动画 */
+        s_lp_idx   = am_idx_at(tx, ty, content_top);
+        s_lp_t0    = am_now_ms();
+        s_lp_fired = false;
         return;
     }
     s_gdrag_last_y = ty;
+
+    /* 位移过大 → 判为拖动, 取消长按意图 */
+    int moved = ty - s_gdrag_anchor_y;
+    if (moved < 0) moved = -moved;
+    if (moved >= AM_DRAG_THRESH) { s_gdrag_active = true; }
+    if (moved >= AM_LP_DRAG_MAX) { s_lp_idx = -1; s_lp_fired = false; }
+    else if (s_lp_idx >= 0 && !s_lp_fired && !s_gdrag_active) {
+        /* 按住 3s 未放手即触发 */
+        if (am_now_ms() - s_lp_t0 >= AM_LP_MS) {
+            s_lp_fired = true;
+            s_lp_suppress = true;
+            am_long_press(ctx, s_lp_idx);
+            return;
+        }
+    }
+
     /* 跟手: 相机 = 基点 - 位移/行高 */
     s_gcam = s_gdrag_base - (float)(ty - s_gdrag_anchor_y) / (float)row_h;
     /* 边界 */
     if (s_gcam < 0) s_gcam = 0;
     if (s_gcam > max_row) s_gcam = (float)max_row;
-    int moved = ty - s_gdrag_anchor_y;
-    if (moved < 0) moved = -moved;
-    if (moved >= AM_DRAG_THRESH) {
-        s_gdrag_active = true;
-        ctx->needs_redraw = true;
-    }
-}
-
-/* ==== 商店清单加载 ==== */
-static void store_nvs_save(void) {
-    nvs_handle_t h;
-    if (nvs_open(STORE_NS, NVS_READWRITE, &h) == ESP_OK) {
-        uint32_t mask = 0;
-        for (int i = 0; i < STORE_MAX && i < 32; i++) if (s_store_installed[i]) mask |= (1u << i);
-        nvs_set_u32(h, "installed", mask);
-        nvs_commit(h);
-        nvs_close(h);
-    }
-}
-static void store_catalog_init(void) {
-    if (s_catalog_n > 0) return;
-    int n = 0;
-    memcpy(&s_catalog[n], s_builtin_catalog, sizeof(s_builtin_catalog));
-    n += BUILTIN_COUNT;
-    s_catalog_n = n;
-    nvs_handle_t h;
-    if (nvs_open(STORE_NS, NVS_READONLY, &h) == ESP_OK) {
-        uint32_t mask = 0;
-        if (nvs_get_u32(h, "installed", &mask) == ESP_OK) {
-            for (int i = 0; i < STORE_MAX && i < 32; i++) s_store_installed[i] = (mask >> i) & 1;
-        }
-        nvs_close(h);
-    }
-}
-static void store_fetch(void) {
-    if (!wifi_manager_is_connected()) return;
-    char *body = NULL;
-    esp_http_client_config_t cfg = { .url = STORE_MANIFEST, .timeout_ms = 5000, .buffer_size = 512 };
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (!c) return;
-    if (esp_http_client_open(c, 0) == ESP_OK) {
-        int len = esp_http_client_fetch_headers(c);
-        if (len > 0 && len < 2048) {
-            body = malloc((size_t)len + 1);
-            if (body) {
-                int r = esp_http_client_read_response(c, body, len);
-                if (r > 0) body[r] = '\0';
-                else { free(body); body = NULL; }
-            }
-        }
-    }
-    esp_http_client_close(c);
-    esp_http_client_cleanup(c);
-    if (body) {
-        char *p = body;
-        while ((p = strstr(p, "\"id\":\"")) != NULL) {
-            p += 6;
-            char id[24] = {0}; int i = 0;
-            while (*p && *p != '"' && i < 23) id[i++] = *p++;
-            char *nm = strstr(p, "\"name\":\"");
-            char name[24] = {0};
-            if (nm) { nm += 8; int j = 0; while (*nm && *nm != '"' && j < 23) name[j++] = *nm++; }
-            if (id[0] && name[0]) {
-                int found = -1;
-                for (int k = 0; k < s_catalog_n; k++) if (strcmp(s_catalog[k].id, id) == 0) { found = k; break; }
-                if (found >= 0) strncpy(s_catalog[found].name, name, sizeof(s_catalog[found].name) - 1);
-                else if (s_catalog_n < STORE_MAX) {
-                    store_app_t *a = &s_catalog[s_catalog_n++];
-                    snprintf(a->id, sizeof(a->id), "%s", id);
-                    snprintf(a->name, sizeof(a->name), "%s", name);
-                    snprintf(a->brief, sizeof(a->brief), "%s", "\xe5\xae\x98\xe6\x96\xb9\xe5\xba\x94\xe7\x94\xa8"); /* 官方应用 */
-                    a->cat = AM_SUB_PROG;
-                }
-            }
-        }
-        free(body);
-    }
+    if (s_gdrag_active) ctx->needs_redraw = true;
 }
 
 /* ==== 模块 ==== */
 static void p_am_enter(ui_ctx_t *ctx) {
-    store_catalog_init();
-    store_fetch();
-    s_cat = AM_CAT_ENGINE;
-    s_sub = AM_SUB_ALL;
-    s_focus = 0; s_scroll = 0;
-    am_rebuild();
+    /* 应用管家 = 主菜单级引擎生命周期边界: 从任意引擎/软件页 os_pop 回应用管家时,
+     * 统一卸载所有已加载引擎的后台 (PSRAM/字体缓冲), 防止引擎内存泄漏到应用管家.
+     * - unload_all 幂等 (各引擎 unload 均带 guard/null 保护), 即使 gb/vpet 在 select
+     *   内已直接 unload 也不会双重释放; 未加载引擎时为 no-op.
+     * - do_leak_check=false: 应用管家自身常驻 UI 缓冲使空闲低于开机基线, 此处比对
+     *   会误报 [LEAK]; 真正的泄漏复核由主菜单返回路径 (os_mgr) 的 unload_all(true) 兜底. */
+    engine_manager_unload_all(false);
+    /* 不再无条件重置分类/子分类/焦点: 从应用返回时 os_pop 会再次触发 on_enter,
+     * 保留 static 状态即可回到"原分类原选项" (与主菜单返回保持位置的既定行为一致).
+     * 仅当状态非法时由 am_rebuild 内部兜底复位.
+     * 用 am_rebuild_keep: 连滚动位置一起保留 —— 触摸点开第二排的应用再退出时,
+     * 画面停在打开前那一屏 (第一排仍在), 不会把第二排顶到第一行. */
+    am_rebuild_keep();
     /* 无触摸屏: 提示触摸类应用已隐藏/禁用 (白板/触屏测试等) */
     if (!touch_panel_is_present())
         os_dialog_toast(ctx, "\xe6\x9c\xaa\xe6\xa3\x80\xe6\xb5\x8b\xe5\x88\xb0\xe8\xa7\xa6\xe6\x91\xb8\xe5\xb1\x8f\xef\xbc\x8c\xe8\xa7\xa6\xe6\x91\xb8\xe7\xb1\xbb\xe5\xba\x94\xe7\x94\xa8\xe5\xb7\xb2\xe9\x9a\x90\xe8\x97\x8f"); /* 未检测到触摸屏，触摸类应用已隐藏 */

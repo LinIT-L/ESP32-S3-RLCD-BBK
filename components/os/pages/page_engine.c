@@ -14,6 +14,8 @@
 #include "ui_common.h"
 #include "engine_manager.h"
 #include "input.h"
+#include "esp_timer.h"
+#include "wallpapers.h"   /* 屏保状态 + wp_program_render(星空): 游戏内锁屏暂停 */
 #include "gb_emu.h"
 #include "gbc_emu.h"
 #include "nes_emu.h"
@@ -181,6 +183,8 @@ static int wqx_resolve_lav(const char *gdir, char *out, size_t out_size) {
 static bool wqx_is_game_dir(const char *path, const char *name) {
     if (wqx_ends_lav(name)) return true;   /* 直接 .lav 文件 */
     if (name[0] == '.') return false;
+    /* 顶层 "Lava" 是数据目录 (非游戏): 既不显示在左栏(见 exclude_dir), 也不当右栏游戏项 */
+    if (strcasecmp(name, "Lava") == 0) return false;
     char full[160];
     snprintf(full, sizeof(full), "%s/%.63s", path, name);
     char lav[160];
@@ -213,16 +217,33 @@ static void egs_save(void) {
 static const char *edm_name(void){ return s_edm==0?"\xe7\x82\xb9\xe5\xaf\xb9\xe7\x82\xb9":(s_edm==2?"\xe6\x8b\x89\xe4\xbc\xb8":"\xe5\x85\xa8\xe5\xb1\x8f"); } /*点对点/拉伸/全屏*/
 static const char *evk_name(void){ return s_evk==0?"\xe5\x85\xb3":(s_evk==1?"\xe5\xbc\x80":"\xe8\x87\xaa\xe5\x8a\xa8"); } /*关/开/自动*/
 static const char *eaa_name(void){ return s_eaa?"EPX":"\xe5\x85\xb3"; } /*关*/
-static void eng_settings_render(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1, int y) {
-    (void)rx1; st7305_handle_t *lcd = ctx->lcd; if (!lcd) return;
-    const char *nm[4] = { "\xe6\x98\xbe\xe7\xa4\xba\xe6\xa8\xa1\xe5\xbc\x8f","\xe8\x99\x9a\xe6\x8b\x9f\xe6\x8c\x89\xe9\x94\xae","\xe6\x8a\x97\xe9\x94\xaf\xe9\xbd\xbf","\xe9\x9f\xb3\xe9\x87\x8f" };
-    const char *vl[4] = { edm_name(), evk_name(), eaa_name(), NULL };
+/* 与步步高一致的引擎优化排版: 全角空格补齐到 target 字宽, 使所有冒号竖直对齐 (左对齐) */
+#define ENG_FULL_SPACE "\xe3\x80\x80"
+static void eng_pad_label(char *buf, size_t len, int target, const char *name, const char *val) {
+    int n = 0;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+        if ((*p & 0xC0) != 0x80) n++;
+    int pad = (n < target) ? target - n : 0;
+    int pos = 0;
+    for (int i = 0; i < pad && pos < (int)len; i++)
+        pos += snprintf(buf + pos, len - (size_t)pos, "%s", ENG_FULL_SPACE);
+    snprintf(buf + pos, len - (size_t)pos, "%s: %s", name, val);
+}
+static void eng_settings_render(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1,
+                                int list_y, int list_bottom, int top_row, int off_mod) {
+    (void)rx1; (void)list_bottom; st7305_handle_t *lcd = ctx->lcd; if (!lcd) return;
     char buf[48];
     for (int i = 0; i < p->settings_count; i++) {
-        snprintf(buf, sizeof(buf), "%s: %s", nm[i], (i == 3) ? "" : vl[i]);
-        if (i == 3) { char vbuf[8]; snprintf(vbuf, sizeof(vbuf), "%d", s_evo);
-                      snprintf(buf, sizeof(buf), "%s: %s", nm[i], vbuf); }
-        int ry = y + i * 32; bool sel = (p->focus == 1 && i == p->sel_item);
+        int idx = top_row + i;
+        if (idx >= p->settings_count) break;
+        switch (idx) {
+        case 0: eng_pad_label(buf, sizeof(buf), 5, "\xe6\x98\xbe\xe7\xa4\xba\xe6\xa8\xa1\xe5\xbc\x8f", edm_name()); break; /*显示模式*/
+        case 1: eng_pad_label(buf, sizeof(buf), 5, "\xe8\x99\x9a\xe6\x8b\x9f\xe6\x8c\x89\xe9\x94\xae", evk_name()); break; /*虚拟按键*/
+        case 2: eng_pad_label(buf, sizeof(buf), 5, "\xe6\x8a\x97\xe9\x94\xaf\xe9\xbd\xbf", eaa_name()); break; /*抗锯齿*/
+        default: { char vbuf[8]; snprintf(vbuf, sizeof(vbuf), "%d", s_evo);
+                   eng_pad_label(buf, sizeof(buf), 5, "\xe9\x9f\xb3\xe9\x87\x8f", vbuf); break; } /*音量*/
+        }
+        int ry = list_y + i * 32 - off_mod; bool sel = (p->focus == 1 && idx == p->sel_item);
         if (sel) fill_rect(lcd, rx0, ry, rx1, ry + 30, ST7305_COLOR_BLACK);
         draw_text(lcd, rx0 + 8, ry + 4, buf, sel);
     }
@@ -237,6 +258,12 @@ static void eng_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
         audio_player_set_volume(audio_player_vol_to_percent((int)s_evo));
     }
     egs_save(); ctx->needs_redraw = true;
+}
+
+/* 文曲星: 根目录下的 "Lava" 是数据存放目录 (不是游戏分类), 左栏不显示为类别.
+ * (注意: 游戏目录/自身内部也有 Lava 子目录, 由 wqx_resolve_lav 处理, 与这里无关.) */
+static bool wqx_exclude_lava(const char *name) {
+    return (name && strcasecmp(name, "Lava") == 0);
 }
 
 /* ==== 双栏页面通用辅助 (设置并重建一个 os_pane) ==== */
@@ -289,30 +316,20 @@ typedef struct {
 } eng_loop_ops_t;
 extern uint8_t input_get_held_gb_joypad(void);
 
-static bool s_eng_exit_result = false;
-static void eng_exit_cb(ui_ctx_t *ctx, int result, void *ud) {
-    (void)ctx; (void)ud;
-    s_eng_exit_result = (result == 0);
-}
-/* 弹出"退出程序?"小确认框, 返回 true=确认退出 (运行期间前台渲染弹窗) */
 static bool eng_exit_confirm(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
     if (ops->pause) ops->pause();
-    s_eng_exit_result = false;
-    os_dialog_confirm_ex(ctx, "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?", /* 退出程序? */
-                         0, 0, eng_exit_cb, NULL);
-    while (os_dialog_depth() > 0) {
-        os_render(ctx);                                   /* 前台渲染弹窗(清屏+dialog) */
-        os_action_t a = (os_action_t)input_get_action();
-        if (a != OS_ACTION_NONE) os_handle_action(ctx, a); /* 交 dialog 处理确认/返回 */
-        os_tick(ctx);
-        vTaskDelay(pdMS_TO_TICKS(16));
-    }
+    /* 丢弃触发退出的那一次残留触摸 tap, 防止弹窗一弹出就被当作"确定"自动退出.
+     * 统一确认框 (os_confirm_exit_blocking) 直绘在冻结的游戏帧上, 手柄/物理/触摸
+     * 交互内置, 与步步高/文曲星完全一致; 确认=true 才强行退出, 取消则恢复游戏. */
+    input_consume_tap(NULL, NULL);
+    bool confirm = os_confirm_exit_blocking(ctx->lcd);
     if (ops->resume) ops->resume();
-    return s_eng_exit_result;
+    return confirm;
 }
 /* 引擎前台运行: 阻塞循环喂 joypad, BACK/退出键 → 确认退出; 返回后需 stop() */
 static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
     input_set_gamepad_nav_enabled(false);
+    input_set_gamepad_gamemode(true);   /* V1.2.x: 标记真正进入游戏, 允许手柄返回/退出键退出 */
     /* 屏幕虚拟按键: 引擎优化"虚拟按键"设置 (0=关 1/2=开) */
     virtual_keys_set_enabled(s_evk != 0);
     /* 应用引擎优化的统一音量档位 (0-9) 到全局音频 */
@@ -327,9 +344,37 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
         uint8_t j = input_get_held_gb_joypad();
         ops->set_joypad(j);
         os_action_t a = (os_action_t)input_get_action();
-        if (a == OS_ACTION_HOME || a == OS_ACTION_POWER_LOCK ||
-            a == OS_ACTION_POWER_RELEASE) break;   /* HOME/软关机 → 直接退出 */
-        if (a == OS_ACTION_BACK) exit_req = true;
+        /* 软关机键(锁屏/关机): 游戏运行阻塞主循环, 在此"暂停服务"而非关闭服务.
+         * 短按=锁屏: 暂停游戏模拟(不退出不卸载) → 渲染星空 → 等待唤醒键恢复游戏.
+         * 长按软关机由 input_power_should_sleep 独立轮询(main.c)处理. */
+        if (a == OS_ACTION_POWER_LOCK) {
+            if (ops->pause) ops->pause();          /* 暂停游戏(服务仍在, 只是暂停) */
+            os_screensaver_force_enter();          /* 标记锁屏 */
+            st7305_clear(ctx->lcd, ST7305_COLOR_WHITE);
+            /* 锁屏子循环: 渲染星空 + 等唤醒键 */
+            bool woken = false;
+            while (!woken) {
+                wp_program_render(ctx->lcd, WP_PROG_STARS, (uint32_t)(esp_timer_get_time() / 1000));
+                /* 唤醒判定: 任意输入(含再次按锁屏键/触摸/其它键) → 唤醒恢复游戏 */
+                os_action_t wa = (os_action_t)input_get_action();
+                if (wa != OS_ACTION_NONE && wa != OS_ACTION_POWER_LOCK) woken = true;
+                else if (wa == OS_ACTION_POWER_LOCK) {
+                    /* 再按一次锁屏键 = 解锁(消费掉, 不当作又一次进入锁屏) */
+                    woken = true;
+                }
+                /* 触摸唤醒 (长按1秒语义与全局屏保一致; 此处简化: 按住即唤醒) */
+                else {
+                    int tx, ty;
+                    if (input_get_touch_pos(&tx, &ty)) woken = true;
+                }
+                vTaskDelay(pdMS_TO_TICKS(16));
+            }
+            os_screensaver_reset();                /* 清除锁屏 */
+            st7305_clear(ctx->lcd, ST7305_COLOR_WHITE);
+            if (ops->resume) ops->resume();        /* 恢复游戏(继续暂停前的进度) */
+            a = OS_ACTION_NONE;                    /* 不应答外层的退出逻辑 */
+        }
+        if (a == OS_ACTION_HOME || a == OS_ACTION_BACK) exit_req = true;
         if (exit_req) {
             if (eng_exit_confirm(ctx, ops)) break;
             exit_req = false;
@@ -338,6 +383,7 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
     }
     virtual_keys_set_enabled(false);
     input_set_gamepad_nav_enabled(true);
+    input_set_gamepad_gamemode(false);  /* V1.2.x: 退出关卡, 结束游戏模式标志 */
     st7305_clear(ctx->lcd, ST7305_COLOR_WHITE);
     ctx->needs_redraw = true;
 }
@@ -382,6 +428,7 @@ static void gbc_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char
     input_set_gamepad_nav_enabled(false);
     esp_err_t st = gbc_emu_start(path);   /* 启动模拟任务 (非阻塞, 加载期回调进度) */
     gbc_emu_set_progress_cb(NULL);              /* 加载完成, 移除回调 */
+    eng_loading_draw(100, s_load_text);         /* 补齐到 100% 再进游戏, 避免 70% 就开局 */
     if (st != ESP_OK) {
         ESP_LOGE(TAG, "GBC 启动失败: %s", esp_err_to_name(st));
     } else {
@@ -402,6 +449,7 @@ static void nes_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char
     input_set_gamepad_nav_enabled(false);
     esp_err_t st = nes_emu_start(path);   /* 启动模拟任务 (非阻塞, 加载期回调进度) */
     nes_emu_set_progress_cb(NULL);              /* 加载完成, 移除回调 */
+    eng_loading_draw(100, s_load_text);         /* 补齐到 100% 再进游戏 */
     if (st != ESP_OK) {
         ESP_LOGE(TAG, "NES 启动失败: %s", esp_err_to_name(st));
     } else {
@@ -421,15 +469,28 @@ static void nes_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char
 static bool s_wqx_exit_asked = false;
 bool menu_wqx_confirm_asked(void) { return s_wqx_exit_asked; }  /* 保留历史符号: lavax_platform_poll 查询浮层激活 */
 
+/* 文曲星运行画面由自身绘制, 不能走 os 弹窗管道. 这里缓存当前 lcd, 在宿主退出检测回调里
+ * 直接冻结帧直绘统一退出确认框 (os_confirm_exit_blocking). 确认=true 才真正请求退出. */
+static st7305_handle_t *s_wqx_lcd = NULL;
+
 static bool lavax_host_exit_check(void) {
-    /* 返回键(物理 KEY=左? 定义见 input)转 os BACK 意图 -> 直接请求退出 */
-    return ((os_action_t)input_get_action() == OS_ACTION_BACK);
+    bool want = ((os_action_t)input_get_action() == OS_ACTION_BACK) ||
+                ((os_action_t)input_get_action() == OS_ACTION_HOME);
+    if (!want) return false;
+    /* 已弹出确认框期间 (等待用户决定): 只认确认框自身交互, 不再每次触发 */
+    if (s_wqx_exit_asked) return false;
+    s_wqx_exit_asked = true;
+    bool confirm = os_confirm_exit_blocking(s_wqx_lcd);
+    s_wqx_exit_asked = false;
+    return confirm;
 }
 
 static void lavax_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char *name) {
     (void)p; (void)name;
     ESP_LOGI(TAG, "启动文曲星: %s", path);
+    s_wqx_lcd = ctx->lcd;   /* 缓存屏句柄, 供退出确认直绘用 */
     input_set_gamepad_nav_enabled(false);
+    input_set_gamepad_gamemode(true);   /* V1.2.x: 文曲星自驱动阻塞运行, 标记游戏模式 */
     /* path 可能是游戏文件夹 (内含 Lava 子目录), 解析出 .lav 文件再运行 */
     char lav[160];
     const char *run = path;
@@ -437,6 +498,7 @@ static void lavax_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const ch
         if (wqx_resolve_lav(path, lav, sizeof(lav)) != 0) {
             ESP_LOGE(TAG, "文曲星: %s 内未找到 .lav", path);
             input_set_gamepad_nav_enabled(true);
+            input_set_gamepad_gamemode(false);
             os_dialog_toast(ctx, "\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0\xe6\xb8\xb8\xe6\x88\x8f"); /* 未找到游戏 */
             return;
         }
@@ -446,6 +508,7 @@ static void lavax_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const ch
     lavax_set_exit_check(lavax_host_exit_check);   /* 返回键 -> 请求退出(确认浮层后续按 os_dialog 标准接入) */
     lavax_emu_load_and_run(run);   /* 阻塞直到退出 */
     input_set_gamepad_nav_enabled(true);
+    input_set_gamepad_gamemode(false);  /* V1.2.x: 文曲星退出, 结束游戏模式标志 */
     ctx->needs_redraw = true;
 }
 
@@ -543,6 +606,7 @@ static const os_module_t s_mod_nes = {
 static void lavax_enter(ui_ctx_t *ctx) {
     engine_manager_load(ENGINE_LAVAX, ctx->lcd);
     s_lav_p.fav_enabled = true; s_lav_p.fav_engine = FAV_ENGINE_WQX;
+    s_lav_p.exclude_dir = wqx_exclude_lava;   /* 左栏不显示 Lava 数据目录 (首次 reset 前设置) */
     pane_setup(&s_lav_p, ctx, LAVAX_ROOT, is_lav, lavax_select);
     /* 文曲星: 游戏是目录 (内含 Lava 子目录与 LavaData 数据), 用带路径过滤把"游戏文件夹"当右栏一项 */
     s_lav_p.is_item_d = wqx_is_game_dir;

@@ -104,7 +104,7 @@ void engine_manager_load(engine_id_t id, st7305_handle_t *lcd)
     }
 }
 
-void engine_manager_unload_all(void)
+void engine_manager_unload_all(bool do_leak_check)
 {
     for (int i = 0; i < ENGINE_COUNT; i++) {
         if (s_engines[i].unload)
@@ -115,6 +115,8 @@ void engine_manager_unload_all(void)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    /* 返回主菜单复核: 检测是否有引擎未成功卸载 (内存泄漏) */
-    engine_mem_leak_check();
+    /* 泄漏复核仅在"正常回主菜单"时做: 低内存回收/周期兜底时此刻空闲偏低
+     * 或重复卸载, 做基线比对会误报 [LEAK], 故由调用方决定是否跳过. */
+    if (do_leak_check)
+        engine_mem_leak_check();
 }

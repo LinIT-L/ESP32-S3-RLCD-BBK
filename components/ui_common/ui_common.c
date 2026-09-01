@@ -5,6 +5,16 @@
 #include "ui_common.h"
 #include <math.h>
 
+/* 当前逻辑屏幕尺寸: 默认横屏 400×300; 书库旋转左/右时切为竖屏 300×400 (os_pane/os_dialog 布局按此重排). */
+static int s_ui_w = UI_SCREEN_W;
+static int s_ui_h = UI_SCREEN_H;
+int  ui_screen_w(void) { return s_ui_w; }
+int  ui_screen_h(void) { return s_ui_h; }
+void ui_set_portrait(bool on) {
+    s_ui_w = on ? 300 : UI_SCREEN_W;
+    s_ui_h = on ? 400 : UI_SCREEN_H;
+}
+
 /* 主菜单/应用管理侧栏图标位图: 由本组件内置 (icons_main.inc / cat_icons.inc), 单一来源.
  * ui_common 为唯一持有者, 其他模块经 ui_common.h extern 引用. */
 #include "icons_main.inc"
@@ -304,6 +314,36 @@ void draw_text(st7305_handle_t *lcd, int x, int y, const char *str, bool inverte
         }
     }
 }
+
+/* 带右缘裁切: 超出 x+max_w 之后不再绘制 (不换行). */
+void draw_text_capped(st7305_handle_t *lcd, int x, int y, const char *str,
+                      bool inverted, int max_w) {
+    int cursor_x = x;
+    while (*str) {
+        uint8_t c = (uint8_t)*str;
+        if (c < 0x80) {
+            if (cursor_x + 16 > x + max_w) break;
+            draw_ascii(lcd, cursor_x, y, c, inverted);
+            cursor_x += 16;
+            str++;
+        } else if ((c & 0xE0) == 0xC0) {
+            if (cursor_x + 16 > x + max_w) break;
+            cursor_x += 16;
+            str += 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            if (cursor_x + 24 > x + max_w) break;
+            draw_zh(lcd, cursor_x, y, str, inverted, 1);
+            cursor_x += 24;
+            str += 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            if (cursor_x + 24 > x + max_w) break;
+            cursor_x += 24;
+            str += 4;
+        } else {
+            str++;
+        }
+    }
+}
 void draw_label(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted) {
     int cursor_x = x;
     int scale = 1;
@@ -398,7 +438,7 @@ void draw_label_centered_at(st7305_handle_t *lcd, int cx, int y, const char *str
 }
 void draw_text_centered(st7305_handle_t *lcd, int y, const char *str, bool inverted) {
     int w = text_width(str);
-    int x = (UI_SCREEN_W - w) / 2;
+    int x = (ui_screen_w() - w) / 2;   /* 跟随当前屏幕宽度 (竖屏 300, 横屏 400) */
     if (x < 0) x = 0;
     draw_text(lcd, x, y, str, inverted);
 }
@@ -519,6 +559,13 @@ void draw_main_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, 
     if (icon_idx < 0 || icon_idx >= MAIN_ICON_COUNT) return;
     ui_blit_scaled(lcd, cx - size_w / 2, cy - size_h / 2, size_w, size_h,
                    MAIN_ICON_W, MAIN_ICON_H, main_icons[icon_idx]);
+}
+/* 通用 1bpp 位图缩放直写 (与主图标同款朝向/缩放), 供诊断等自绘页嵌入自定义图标.
+ * src: src_w x src_h 1bpp, MSB-first. */
+void draw_1bpp_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h,
+                         int src_w, int src_h, const uint8_t *src) {
+    if (!src || src_w <= 0 || src_h <= 0) return;
+    ui_blit_scaled(lcd, cx - size_w / 2, cy - size_h / 2, size_w, size_h, src_w, src_h, src);
 }
 void draw_cat_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int cat_idx) {
     if (cat_idx < 0 || cat_idx >= CAT_ICON_COUNT) return;

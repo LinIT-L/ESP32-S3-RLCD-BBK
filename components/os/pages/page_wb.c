@@ -628,14 +628,15 @@ static bool p_wb_touch(ui_ctx_t *ctx, int x, int y) {
 }
 
 static void p_wb_action(ui_ctx_t *ctx, os_action_t a) {
-    /* 全屏页返回退出已由 os_core 统一弹「退出程序?」确认 (os_dialog_confirm_ex);
-     * 加载列表/删除确认/提示 toast 均已走 os_dialog, 此处只处理绘图按键. */
+    /* 白板为应用(非游戏): 全屏返回直接退出 (退出时 wb_exit 自动保存当前白板, 恢复上滑返回).
+     * os_core 的"退出程序?"确认仅针对分类引擎游戏; 应用按返回即退出, 不弹确认.
+     * 加载列表/删除确认/提示 toast 均已走 os_dialog, 此处只处理绘图按键 + 直接退出. */
     switch (a) {
         case OS_ACTION_RIGHT: s_tool = (s_tool+1) % WB_TOOL_N; break;
         case OS_ACTION_LEFT:  s_tool = (s_tool==0) ? WB_TOOL_N-1 : s_tool-1; break;
         case OS_ACTION_UP:    s_size = (s_size >= 6) ? 6 : s_size+1; break;
         case OS_ACTION_DOWN:  s_size = (s_size <= 1) ? 1 : s_size-1; break;
-        case OS_ACTION_BACK:  break;   /* 交给 os_core: 全屏页弹出退出确认 */
+        case OS_ACTION_BACK:  os_pop(ctx); break;   /* 直接退出 (触发 wb_exit 保存) */
         default: break;
     }
     ctx->needs_redraw = true;

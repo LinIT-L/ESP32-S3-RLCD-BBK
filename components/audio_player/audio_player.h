@@ -57,6 +57,14 @@ const char *audio_player_get_filename(void);
 /* 获取播放进度 (0-1000, 千分比) */
 int audio_player_get_progress(void);
 
+/* 跳转播放进度 (0..1000 千分比). 仅在播放/暂停中有效; 任务循环内安全执行, 自动帧同步.
+ * CBR 精确, VBR 近似. */
+void audio_player_seek_to(int progress_0_1000);
+
+/* 上一曲是否"自然播放结束" (非用户停止). 一次性消费: 读取即清零.
+ * 供播放器页面实现单曲/列表/随机循环自动切歌. */
+bool audio_player_track_ended(void);
+
 /* 音频后台任务是否正在运行 */
 bool audio_player_is_running(void);
 

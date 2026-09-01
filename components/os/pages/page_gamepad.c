@@ -6,6 +6,7 @@
  * 私有 state 全部 static 留本文件.
  */
 #include "os.h"
+#include "os_hw.h"
 #include "ui_common.h"
 #include "bt_manager.h"
 #include "esp_attr.h"
@@ -13,6 +14,8 @@
 #include "input.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -37,6 +40,130 @@ static int s_gp_map[6];
 static bt_device_t s_scan_devs[GP_SCAN_MAX];
 static int  s_scan_n = 0;
 static bool s_scan_active = false;
+
+/* ---- 连接中弹窗 (处理 成功/失败/对方断开/超时, 避免"正在连接"永久卡住) ---- */
+static int64_t s_conn_start = 0;      /* connect 发起时刻 (µs), 用于超时判断 */
+static bool  s_conn_ok = false;       /* 已连上, 等待 1s "连接成功" 提示后进映射 */
+static int64_t s_conn_ok_t = 0;
+static bt_device_t s_conn_dev;        /* 待连接设备缓存 (供后台连接任务读取) */
+
+static void start_key_mapping(ui_ctx_t *ctx);   /* 前向声明: 连接成功后直接衔接按键映射 */
+
+/* 后台连接任务: esp_hidh_dev_open 同步阻塞约 2s, 放独立任务以免卡住 UI/延迟弹窗 */
+static void bt_connect_task(void *arg) {
+    (void)arg;
+    bt_manager_connect_device(&s_conn_dev);
+    vTaskDelete(NULL);
+}
+
+static bool conn_dlg_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)ud;
+    if (a == OS_ACTION_BACK) {
+        /* 连接中返回 = 放弃等待: 关闭轮询与弹窗, 后台连接由 bt_manager 状态自行收敛 */
+        d->on_poll = NULL;
+        os_dialog_pop(ctx);
+        return true;
+    }
+    return false;
+}
+static void conn_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)ud;
+    if (bt_manager_is_connected()) {
+        int64_t now = esp_timer_get_time();
+        /* "正在连接"至少显示 600ms 再切"连接成功", 保证点击后有明确反馈 */
+        if (!s_conn_ok && (now - s_conn_start) < 600000LL) {
+            snprintf(d->items[0], sizeof(d->items[0]), "%s", "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5"); /* 正在连接... */
+            ctx->needs_redraw = true;
+            return;
+        }
+        /* 已连接: 先提示"连接成功"约 1s 再收起 */
+        if (!s_conn_ok) {
+            s_conn_ok = true;
+            s_conn_ok_t = esp_timer_get_time();
+            d->count = 1; d->sel = 0;
+            snprintf(d->items[0], sizeof(d->items[0]), "%s", "\xe8\xbf\x9e\xe6\x8e\xa5\xe6\x88\x90\xe5\x8a\x9f\xef\xbc\x81"); /* 连接成功 */
+            ctx->needs_redraw = true;
+            return;
+        }
+        if ((now - s_conn_ok_t) >= 1000000LL) {
+            s_conn_ok = false;
+            d->on_poll = NULL;
+            os_dialog_pop(ctx);   /* "连接成功！" 显示 1s 后收起, 衔接按键映射 */
+            start_key_mapping(ctx);
+        } else {
+            ctx->needs_redraw = true;
+        }
+        return;
+    }
+    if (!bt_manager_is_connecting()) {
+        /* 连接已结束但未成功(失败/连接后被对方短连断开) → 明确提示, 不留死锁 */
+        d->on_poll = NULL;
+        os_dialog_pop(ctx);
+        os_dialog_toast(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5/\xe5\xb7\xb2\xe6\x96\xad\xe5\xbc\x80"); /* 连接失败/已断开 */
+        return;
+    }
+    if ((esp_timer_get_time() - s_conn_start) > 8000000LL) {
+        /* 8s 仍未通 → 强行中止本轮, 提示超时, 不再无限等 */
+        bt_manager_stop_scan();
+        d->on_poll = NULL;
+        os_dialog_pop(ctx);
+        os_dialog_toast(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xb6\x85\xe6\x97\xb6"); /* 连接超时 */
+        return;
+    }
+    /* 仍在连接: 刷新显示并保持"正在连接" */
+    snprintf(d->items[0], sizeof(d->items[0]), "%s", "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5"); /* 正在连接... */
+    ctx->needs_redraw = true;
+}
+
+/* 连接状态小窗渲染: 白底+3px 黑边框+自适应宽, 居中画 items[0] 文本 */
+static bool conn_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)ud;
+    st7305_handle_t *lcd = ctx->lcd;
+    if (!lcd) return true;
+    int tw = text_width(d->items[0]);
+    int w = 3 * 2 + 3 * 2 + tw;
+    const int h = 36;
+    int x0 = (UI_SCREEN_W - w) / 2, y0 = (UI_SCREEN_H - h) / 2;
+    fill_rect(lcd, x0, y0, x0 + w - 1, y0 + h - 1, ST7305_COLOR_WHITE);
+    for (int k = 0; k < 3; k++) {
+        draw_hline(lcd, x0 + k, x0 + w - 1 - k, y0 + k, ST7305_COLOR_BLACK);
+        draw_hline(lcd, x0 + k, x0 + w - 1 - k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, x0 + k, y0 + k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, x0 + w - 1 - k, y0 + k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+    }
+    draw_text_centered(lcd, y0 + 6, d->items[0], false);
+    return true;
+}
+
+/* 发起连接并把当前顶层弹窗原地变成"正在连接"小提示窗 (扫描/历史记录共用) */
+static void enter_connect_dlg(ui_ctx_t *ctx, const bt_device_t *dev) {
+    if (dev) memcpy(&s_conn_dev, dev, sizeof(s_conn_dev));
+    s_conn_start = esp_timer_get_time();
+    s_conn_ok = false;   /* 重置"连接成功 1s"状态 */
+    /* 连接前清理: 删同名历史记录 + 重置该设备配置为默认 + 清输入残留(防幽灵输入) */
+    bt_manager_reset_pad_clean(&s_conn_dev);
+    /* 原地把当前列表弹窗(扫描/历史)替换为"正在连接"小窗: 列表随之消失, 不留后台双层 */
+    os_dlg_stack_t *d = os_dialog_top_mut(ctx);
+    if (d) {
+        snprintf(d->items[0], sizeof(d->items[0]), "%s", "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5"); /* 正在连接... */
+        d->count = 1; d->sel = 0;
+        d->on_render = conn_render;
+        d->on_poll = conn_dlg_poll;
+        d->on_key  = conn_dlg_key;
+        ctx->needs_redraw = true;
+    } else {   /* 无弹窗时新建 */
+        os_dlg_stack_t nd;
+        memset(&nd, 0, sizeof(nd));
+        snprintf(nd.items[0], sizeof(nd.items[0]), "%s", "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5"); /* 正在连接... */
+        nd.count = 1; nd.sel = 0;
+        nd.on_render = conn_render;
+        nd.on_poll = conn_dlg_poll;
+        nd.on_key  = conn_dlg_key;
+        os_dialog_push(ctx, &nd);
+    }
+    /* 立即弹出"正在连接"后, 在后台连接任务里发起同步连接(不阻塞 UI), 保证点击秒反馈 */
+    xTaskCreate(bt_connect_task, "bt_conn", 4096, NULL, 10, NULL);
+}
 
 /* 电量显示 */
 static void gp_batt_str(uint8_t batt, char *out, size_t sz) {
@@ -63,8 +190,7 @@ static void hist_dlg_select(ui_ctx_t *ctx, int result, void *ud) {
     if (result < 0) return;
     if (result < bt_manager_get_history_count()) {
         const bt_device_t *dev = bt_manager_get_history_at(result);
-        if (dev) bt_manager_connect_device(dev);
-        os_dialog_toast(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5..."); /* 正在连接... */
+        if (dev) enter_connect_dlg(ctx, dev);
     }
 }
 
@@ -84,26 +210,41 @@ static void open_hist_dialog(ui_ctx_t *ctx) {
 /* ---- 蓝牙扫描列表弹窗 (3.3: 添加设备 → 扫描结果显示在列表, 确认连接) ---- */
 static void scan_dlg_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ctx; (void)ud;
-    if (result < 0) bt_manager_stop_scan();   /* 返回: 停止扫描 */
+    if (result < 0) bt_manager_stop_scan();   /* 关闭: 停止扫描 */
 }
 static bool scan_dlg_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
     (void)ud;
-    if (a == OS_ACTION_BACK) { bt_manager_stop_scan(); return false; }  /* 走默认弹栈 */
+    if (a == OS_ACTION_BACK) {
+        /* 扫描列表中按返回 = 立即退出并停止扫描, 不卡住 */
+        bt_manager_stop_scan();
+        d->on_poll = NULL;
+        s_scan_n = 0;
+        os_dialog_pop(ctx);
+        return true;
+    }
     if (a == OS_ACTION_CONFIRM) {
         if (s_scan_n > 0 && d->sel >= 0 && d->sel < s_scan_n) {
             bt_manager_stop_scan();
-            bt_manager_connect_device(&s_scan_devs[d->sel]);
-            os_dialog_toast(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5..."); /* 正在连接... */
-            os_dialog_pop(ctx);
+            enter_connect_dlg(ctx, &s_scan_devs[d->sel]);
+        } else if (!bt_manager_is_scanning()) {
+            /* 无设备时确认 → 重新开始搜索 */
+            bt_manager_stop_scan();
+            s_scan_n = 0;
+            bt_manager_start_scan_continuous(gp_on_scan);
+            snprintf(d->items[0], sizeof(d->items[0]), "%s", "\xe6\xad\xa3\xe5\x9c\xa8\xe6\x89\xab\xe6\x8f\x8f..."); /* 正在扫描... */
+            d->count = 1; d->sel = 0;
+            ctx->needs_redraw = true;
         }
-        return true;   /* 扫描中/无设备: 忽略确认 */
+        return true;   /* 扫描中/无设备: 忽略确认或已重扫 */
     }
     return false;   /* UP/DOWN 走默认 */
 }
 static void scan_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)ud;
-    /* 扫描结果变化 → 刷新列表项 */
-    if (s_scan_n != d->count) {
+    static bool s_prev_scanning = false;
+    bool scanning = bt_manager_is_scanning();
+    /* 结果数变化 或 扫描状态变化 → 刷新 */
+    if (s_scan_n != d->count || scanning != s_prev_scanning) {
         if (s_scan_n > 0) {
             d->count = s_scan_n;
             for (int i = 0; i < s_scan_n; i++) {
@@ -111,18 +252,20 @@ static void scan_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
                 snprintf(d->items[i], sizeof(d->items[i]), "%s", nm[0] ? nm : "??");
             }
         } else {
+            /* 扫描未结束时恒显示"正在扫描", 结束且无结果才提示"未发现设备" */
             d->count = 1;
             snprintf(d->items[0], sizeof(d->items[0]), "%s",
-                     bt_manager_is_scanning() ? "\xe6\xad\xa3\xe5\x9c\xa8\xe6\x89\xab\xe6\x8f\x8f..." /* 正在扫描... */
-                                              : "\xe6\x9c\xaa\xe5\x8f\x91\xe7\x8e\xb0\xe8\xae\xbe\xe5\xa4\x87"); /* 未发现设备 */
+                     scanning ? "\xe6\xad\xa3\xe5\x9c\xa8\xe6\x89\xab\xe6\x8f\x8f..." /* 正在扫描... */
+                              : "\xe6\x9c\xaa\xe5\x8f\x91\xe7\x8e\xb0\xe8\xae\xbe\xe5\xa4\x87"); /* 未发现设备 */
         }
         if (d->sel >= d->count) d->sel = d->count - 1;
+        s_prev_scanning = scanning;
         ctx->needs_redraw = true;
     }
 }
 static void open_scan_dialog(ui_ctx_t *ctx) {
     s_scan_n = 0;
-    bt_manager_enable();   /* 蓝牙默认开机启动: 确保已启用再扫 */
+    os_hw_request(OS_HW_BT);   /* 蓝牙默认开机启动: 确保已启用再扫 (走 os_hw 引用计数) */
     bt_manager_start_scan_continuous(gp_on_scan);
     s_scan_active = true;
     os_dlg_stack_t dlg;
@@ -136,10 +279,16 @@ static void open_scan_dialog(ui_ctx_t *ctx) {
     os_dialog_push(ctx, &dlg);
     ESP_LOGI(TAG, "蓝牙扫描开始");
 }
+/* 全局: 长按硬件确认键 2s → 从任意页面直接进入蓝牙搜索弹窗 */
+void os_page_gamepad_open_scan(ui_ctx_t *ctx) { open_scan_dialog(ctx); }
 
 /* ---- 按键映射 (3.3 原版: 遍历 10 功能, 提示弹窗"请按下 X 按键", 捕获即自动进入下一个) ---- */
 static int  s_map_func = 0;      /* 当前映射功能索引 (0..FUNC_MAX-1) */
 static bool s_map_active = false;
+static phys_t s_capture_phys = -1;   /* 已捕获的物理键 (松开确认用) */
+static bool s_capture_armed = false; /* 是否已真实捕获到一个按键 (bool 门控, 规避 enum>=0 恒真 UB) */
+static int64_t s_map_last_progress = 0;  /* 上次映射推进时刻, 超时未动自动取消 */
+static int64_t s_map_ignore_until = 0;  /* 屏蔽"进入映射界面"那次确认的时间点, 防其被误映射成第一个键 */
 
 /* 映射提示弹窗渲染 (3.3 notice 样式: 白底 + 3px 黑边框 + 自适应宽) */
 static bool map_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
@@ -172,33 +321,62 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)d; (void)ud;
     if (!s_map_active) return;
     if (s_map_func < 0 || s_map_func >= FUNC_MAX) return;
-    if (bt_manager_poll_new_press((func_t)s_map_func)) {
-        ESP_LOGI(TAG, "按键映射: [%s] → %s", bt_manager_func_name((func_t)s_map_func),
-                 bt_manager_phys_name(bt_manager_get_key_map((func_t)s_map_func)));
-        s_map_func++;
-        if (s_map_func >= FUNC_MAX) {
-            bt_manager_save_key_map();
-            ESP_LOGI(TAG, "按键映射完成, 已保存到 NVS");
-            s_map_active = false;
-            input_set_gamepad_nav_enabled(true);
-            os_dialog_pop(ctx);   /* 关映射弹窗回手柄主菜单 */
-            os_dialog_toast(ctx, "\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84\xe5\xae\x8c\xe6\x88\x90"); /* 按键映射完成 */
-            return;
+    /* 屏蔽"进入映射界面"那次确认键: 短时间(400ms)内不捕获任何按键, 防误映射 */
+    if (esp_timer_get_time() < s_map_ignore_until) return;
+
+    /* 映射无操作 40s 超时: 自动取消, 恢复手柄导航, 避免卡死在映射界面 */
+    if ((esp_timer_get_time() - s_map_last_progress) > 40000000LL) {
+        s_map_active = false;
+        s_capture_armed = false;
+        s_capture_phys = -1;
+        input_set_gamepad_nav_enabled(true);
+        os_dialog_pop(ctx);
+        os_dialog_toast(ctx, "\xe6\x98\xa0\xe5\xb0\x84\xe8\xb6\x85\xe6\x97\xb6\xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88"); /* 映射超时已取消 */
+        return;
+    }
+
+    /* 已捕获一个真实按键: 等它真正松开才确认并推进 (防按一次因抖动连配多个) */
+    if (s_capture_armed) {
+        if (!bt_manager_is_phys_pressed(s_capture_phys)) {
+            s_capture_armed = false;      /* 已松开, 本次映射确认完成 */
+            s_capture_phys = -1;
+            s_map_last_progress = esp_timer_get_time();
+            s_map_func++;
+            if (s_map_func >= FUNC_MAX) {
+                bt_manager_save_key_map();
+                ESP_LOGI(TAG, "按键映射完成, 已保存到 NVS");
+                s_map_active = false;
+                input_set_gamepad_nav_enabled(true);
+                os_dialog_pop(ctx);   /* 关映射弹窗回手柄主菜单 */
+                os_dialog_toast(ctx, "\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84\xe5\xae\x8c\xe6\x88\x90"); /* 按键映射完成 */
+                return;
+            }
+            bt_manager_poll_new_press_reset();
+            ctx->needs_redraw = true;
         }
-        bt_manager_poll_new_press_reset();
+        return;   /* 仍按住: 等待松开 */
+    }
+
+    /* 尚未捕获: 尝试捕获当前需映射功能的按键 */
+    int fc = s_map_func;
+    int r = bt_manager_poll_new_press((func_t)fc);
+    if (r > 0) {
+        s_capture_phys = bt_manager_get_key_map((func_t)fc);   /* 记住这次的键, 等松开再推进 */
+        s_capture_armed = true;                                /* 只有真实捕获到按键才允许随后推进 */
+        s_map_last_progress = esp_timer_get_time();
+        ESP_LOGI(TAG, "按键映射捕获: [%s] → %s (等松开确认)",
+                 bt_manager_func_name((func_t)fc),
+                 bt_manager_phys_name(s_capture_phys));
         ctx->needs_redraw = true;
     }
 }
 
-/* 映射弹窗按键: BACK = 取消映射 (保留已完成的), 其余忽略 */
+/* 映射弹窗按键: 映射期间**一切按键一律忽略**, 纯由 bt_manager_poll_new_press 硬捕获
+ * 当前功能对应的键 (仅真实按下的物理键泵入映射, 不会产生任何系统动作).
+ * 特别地, 返回键/退出键在此期间不作为"取消/退出"动作 —— 用户"硬设"的是按键本身,
+ * 其功能作用在映射阶段不生效, 避免误终止映射. */
 static bool map_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
-    (void)d; (void)ud;
-    if (a == OS_ACTION_BACK) {
-        s_map_active = false;
-        input_set_gamepad_nav_enabled(true);
-        os_dialog_pop(ctx);   /* 取消 → 回手柄主菜单 */
-        return true;
-    }
+    (void)ctx; (void)d; (void)a; (void)ud;
     return true;   /* 其他键在映射期间一律忽略 */
 }
 
@@ -209,6 +387,12 @@ static void start_key_mapping(ui_ctx_t *ctx) {
     }
     s_map_func = 0;
     s_map_active = true;
+    s_capture_phys = -1;
+    s_capture_armed = false;
+    s_map_last_progress = esp_timer_get_time();
+    s_map_ignore_until = esp_timer_get_time() + 400000LL;   /* 400ms 内屏蔽, 吞掉"进入页面"的那次确认 */
+    /* 清输入残留状态: 防止旧手柄/幽灵状态让"不按任何键映射就自动完成" */
+    bt_manager_reset_input_state();
     bt_manager_poll_new_press_reset();
     input_set_gamepad_nav_enabled(false);   /* 禁用手柄导航, 防干扰映射 */
     os_dlg_stack_t dlg;
@@ -267,14 +451,14 @@ static void on_gamepad_select(ui_ctx_t *ctx, int result, void *ud) {
     case 4: {  /* WiFi 手柄切换 */
         if (web_gamepad_is_running()) {
             web_gamepad_stop();
-            bt_manager_enable();
+            os_hw_request(OS_HW_BT);
             os_dialog_toast(ctx, "WiFi \xe6\x89\x8b\xe6\x9f\x84\xe5\xb7\xb2\xe5\x85\xb3\xe9\x97\xad");
         } else {
-            bt_manager_disable();   /* 释放内部 DMA 给 WiFi softAP */
+            os_hw_release(OS_HW_BT);   /* 释放内部 DMA 给 WiFi softAP (走 os_hw 引用计数) */
             if (web_gamepad_start() == ESP_OK)
                 os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\xbc\x80\xe5\x90\xaf WiFi \xe6\x89\x8b\xe6\x9f\x84");
             else {
-                bt_manager_enable();
+                os_hw_request(OS_HW_BT);
                 os_dialog_toast(ctx, "WiFi \xe6\x89\x8b\xe6\x9f\x84\xe5\x90\xaf\xe5\x8a\xa8\xe5\xa4\xb1\xe8\xb4\xa5");
             }
         }

@@ -18,6 +18,9 @@ extern "C" {
 
 typedef struct os_pane os_pane_t;
 
+/* 右栏单分类最多预渲染的游戏/内容数 (PSRAM 大, 确保"跟手拖动能选到全部") */
+#define OS_PANE_ITEM_MAX 256
+
 /* 右栏确认回调: 打开/启动选中项 (item_path 为完整路径) */
 typedef void (*os_pane_select_cb)(ui_ctx_t *ctx, os_pane_t *p,
                                   const char *item_path, const char *item_name);
@@ -31,6 +34,8 @@ struct os_pane {
     /* 可选: 带完整路径的过滤 (如文曲星需把含 Lava 子目录内 .lav 的游戏文件夹当一项).
      * 设置了 is_item_d 时优先用它, 否则用 is_item. */
     bool        (*is_item_d)(const char *path, const char *name);
+    /* 可选: 左栏分类扫描时排除的文件夹 (如文曲星 Lava 数据目录不显示为分类). 返回 true=排除. */
+    bool        (*exclude_dir)(const char *name);
     os_pane_select_cb   on_select;   /* 右栏确认回调 */
     const char         *all_label;   /* 左栏第一项, NULL="全部" */
     int                 list_y;      /* 列表起点 y (0=默认48; 无状态栏的页设小值) */
@@ -38,7 +43,8 @@ struct os_pane {
     /* ==== 引擎优化/设置首项 (3.3 游戏页: 左栏最上方一项, 右栏内联显示设置, 不弹窗) ==== */
     const char         *settings_label;          /* 左栏首项标签 (如"引擎优化"), NULL=无 */
     int                 settings_count;          /* 右栏设置项数 */
-    void (*settings_render)(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1, int y); /* 画右栏设置行 */
+    void (*settings_render)(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1,
+                            int list_y, int list_bottom, int top_row, int off_mod); /* 画右栏设置行 (含平滑滚动偏移) */
     os_pane_settings_cb  on_settings_select;     /* 点选/确认某设置项 (直接切换值连 API) */
 
     /* ==== 收藏栏 (可选, fav_enabled 时启用) ====
@@ -47,17 +53,27 @@ struct os_pane {
     int  fav_engine;             /* 收藏引擎 id (favorites.h) */
     bool fav_enabled;            /* true=本页启用收藏栏 */
     bool fav_mode;               /* 内部: 当前右栏显示收藏栏 */
+    const char *fav_empty_tip;   /* 可选: 收藏栏为空时的提示文案 (NULL=默认"长按确认游戏加入收藏") */
+
+    /* ==== 最近阅读入口 (可选, recent_label 非 NULL 时启用) ====
+     * 左栏在"阅读优化"后、"收藏栏"前插入"最近阅读"固定项.
+     * 右栏显示最近打开的书 (recent_path), 选中即打开并恢复进度.
+     * 用于 TF 卡损坏/换卡后的设备级兜底 (NVS 记录最近阅读). */
+    const char *recent_label;    /* 左栏标签 (如"最近阅读"), NULL=无 */
+    char        recent_path[160];/* 最近阅读的书完整路径 (调用方填) */
+    bool        recent_mode;     /* 内部: 当前右栏显示最近阅读 */
 
     /* ==== 内部状态 (调用方勿直接改, 结构体静态分配) ==== */
     char  folders[24][64];
     int   folder_count;
-    char  items[128][64];        /* 显示名 (去扩展名) */
-    char  item_paths[128][160];  /* 完整路径 */
+    char  items[OS_PANE_ITEM_MAX][64];        /* 显示名 (去扩展名) */
+    char  item_paths[OS_PANE_ITEM_MAX][160];  /* 完整路径 */
     int   item_count;
     int   sel_folder;            /* 0=全部, 1..=子目录 */
     int   sel_item;
     int   folder_scroll;
     int   item_scroll;
+    int   item_off;              /* 右栏平滑滚动像素偏移 (跟手拖动) */
     int   built_folder;          /* 上次 build_right 的 sel_folder, 同目录不重扫 */
     int   focus;                 /* 0=左栏, 1=右栏 */
     bool  hide_all;              /* 根目录无直接文件 → 隐藏左栏"全部"项 (自动计算) */

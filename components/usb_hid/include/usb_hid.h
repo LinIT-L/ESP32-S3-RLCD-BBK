@@ -1,11 +1,11 @@
 /**
  * @file usb_hid.h
- * @brief USB HID 复合设备 (键盘 + 鼠标), 供 BBK 屏当"外接键鼠"用.
+ * @brief USB 复合设备"按需切换" (esp_tinyusb v2).
  *
- * 与 usbh_msc 相同的外设切换模式:
- *   - usb_hid_start(): 卸载 USB Serial/JTAG (释放 GPIO 19/20), 安装 TinyUSB,
- *     向电脑呈现一个复合 HID 设备 = 键盘接口 (itf 0) + 鼠标接口 (itf 1).
- *   - usb_hid_stop(): 卸载 TinyUSB, 恢复 USB Serial/JTAG (回到串口日志).
+ *   - 正常模式 (开机默认): USB Serial/JTAG 串口控制台, 不装 TinyUSB.
+ *   - 键鼠模式: HID 键盘 + 鼠标 + CDC 复合设备 (控制台走 CDC).
+ *   - 挂载模式: MSC + CDC 复合设备 (TF 卡 U盘 + 串口, 控制台走 CDC).
+ *   切换全程无日志写向已失效的 Serial/JTAG, 挂载 TF 卡到电脑不再崩溃重启.
  *
  * 调用方 (菜单) 负责:
  *   - 上半屏键盘: 触摸按键 -> usb_hid_key_tap()
@@ -16,18 +16,37 @@
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* 启动 USB HID (键盘+鼠标复合设备). 返回 ESP_OK 表示 TinyUSB 已就绪. */
+/* 切换到 MSC+CDC (U盘) 复合设备, 控制台重定向到 CDC. 供挂载流程调用. */
+esp_err_t usb_composite_enter_msc(void);
+
+/* 切换到 USB-BT (蓝牙适配器 HCI) 设备. 供 USB-BT 流程调用 (需先用 NVS 标记抑制手柄蓝牙). */
+esp_err_t usb_composite_enter_bth(void);
+
+/* 切换到 USB-RNDIS 网卡设备 (USB 有线网卡). 供 USB 网卡共享流程调用. */
+esp_err_t usb_composite_enter_net(void);
+
+/* 切换到 HID 键鼠 + CDC 复合设备, 控制台重定向到 CDC. 供键鼠流程调用. */
+esp_err_t usb_composite_enter_hid(void);
+
+/* 退出任意 TinyUSB 模式, 回到正常模式 (恢复 Serial/JTAG 串口控制台). */
+void usb_composite_exit(void);
+
+/* 当前 USB 设备是否已枚举 (处于 TinyUSB 模式且被主机枚举) */
+bool usb_composite_is_connected(void);
+
+/* 启动键鼠模式 (切换到 HID 键盘+鼠标+CDC). 返回 ESP_OK 表示已就绪. */
 esp_err_t usb_hid_start(void);
 
-/* 停止 USB HID, 恢复 USB Serial/JTAG 串口. */
+/* 停止键鼠模式, 切回正常模式 (恢复 Serial/JTAG 控制台). */
 void usb_hid_stop(void);
 
-/* 当前是否处于 HID 模式 */
+/* 当前是否处于键鼠模式 */
 bool usb_hid_is_running(void);
 
 /* 电脑是否已枚举并连接 (TinyUSB mount 就绪) */
@@ -57,13 +76,7 @@ void usb_hid_mouse_click(uint8_t buttons);
 void usb_hid_mouse_press(uint8_t buttons);
 void usb_hid_mouse_release(uint8_t buttons);
 
-/* === CDC 串口 (复合设备附加: HID 键鼠 + CDC 串口同时工作) === */
-
-/* PC 通过串口发来数据的回调 (TinyUSB tud_task 上下文, 应尽快消费或拷贝) */
-typedef void (*usb_hid_cdc_rx_cb_t)(const uint8_t *data, size_t len);
-
-/* 注册 CDC 接收回调 (可传 NULL 取消) */
-void usb_hid_cdc_set_rx_cb(usb_hid_cdc_rx_cb_t cb);
+/* === CDC 串口 (复合设备附加) === */
 
 /* 发送数据到 PC CDC 串口. 返回实际写入字节数; 未运行/未连接返回 0. */
 size_t usb_hid_cdc_write(const uint8_t *data, size_t len);

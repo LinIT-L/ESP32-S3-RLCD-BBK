@@ -61,10 +61,16 @@ void bf_breaks(const bf_ch_t *win, int cnt, uint8_t enc,
 /* 排版窗口 [0,cnt): 切出最多 rows 行, 每行结束下标(不含)写入 line_end,
  * line_count 为已排版行数, boundary 为页边界字符下标 (下一行起点, 或 cnt=窗口尽头).
  * brk 为 bf_breaks 的输出 (可为 NULL, 等价于全 0 纯宽度换行).
- * ascii_w/cjk_w 为半角/全角像素宽 (来自当前字库). */
+ * ascii_w/cjk_w 为半角/全角像素宽 (来自当前字库).
+ * at_para 为"本窗口首个内容行是否段落首行(需缩进)"的 输入/输出 状态 (跨窗口/跨页连续跟踪):
+ *   输入: 窗口起始是否段落首行; 输出: 窗口结束后下一行是否段落首行 (供下一页使用).
+ * indent >0 时, 段落首行在其左侧预留 indent 像素 (首行缩进), 后续行用满 line_max.
+ * line_indent 可选 (可为 NULL): 与 line_end 平行的 0/1 数组, 标记每行是否缩进 (渲染用). */
 void bf_layout(const bf_ch_t *win, int cnt, const uint8_t *brk,
                int rows, int line_max, int ascii_w, int cjk_w,
-               int *line_end, int *line_count, int *boundary);
+               bool *at_para, int indent,
+               int *line_end, uint8_t *line_indent,
+               int *line_count, int *boundary);
 
 /* ---- 顺序分页 (扫描器内核, 固件与主机测试共用) ---- */
 
@@ -87,6 +93,8 @@ typedef void (*bf_on_char_t)(void *ud, const bf_ch_t *ch, uint32_t pos);
  * limit: 阶段检查点 — 分页推进到 >= limit 的页边界即返回 (供后台任务分步扫描,
  *        不改变页边界结果; 传 fsz 则一次扫完).
  * resume_open: 续扫模式 (侧边索引部分落盘后继续), 不再重复记录起始页.
+ * at_para 与 bf_layout 同义 (跨页连续跟踪段落首行状态), 初始为扫描起点状态 (书首=true).
+ * indent: 段落首行缩进像素 (与 bf_layout 一致).
  * 返回 0 成功; *out_next 为下次起始偏移. */
 int bf_paginate(bf_src_t src, uint32_t fsz, uint8_t enc, uint32_t start_off,
                 int rows, int line_max, int ascii_w, int cjk_w,
@@ -95,6 +103,7 @@ int bf_paginate(bf_src_t src, uint32_t fsz, uint8_t enc, uint32_t start_off,
                 uint8_t *chunk, uint32_t chunk_cap,
                 bf_ch_t *win, uint8_t *brk, uint8_t *scratch, uint32_t scratch_cap,
                 uint32_t *win_off,
+                bool *at_para, int indent,
                 uint32_t limit, bool resume_open, uint32_t *out_next);
 
 #ifdef __cplusplus

@@ -19,6 +19,12 @@ extern "C" {
 #define UI_SCREEN_W   ST7305_WIDTH    /* 400 */
 #define UI_SCREEN_H   ST7305_HEIGHT   /* 300 */
 
+/* 当前逻辑屏幕尺寸 (默认 400×300 横屏; 书库旋转左/右时由调用方切为 300×400 竖屏).
+ * os_pane/os_dialog/书库弹窗等布局读取此处, 竖屏时自动按 300 宽重排. */
+int  ui_screen_w(void);
+int  ui_screen_h(void);
+void ui_set_portrait(bool on);   /* true → 300×400 竖屏; false → 400×300 横屏 */
+
 /* 8x12 ASCII 字体 (缩放 2x = 16x24, 与中文字体等高).
  * 历史定义于 menu_system.c, keyboard.c / terminal.c 直接 extern 引用同一符号. */
 extern const uint8_t FONT8X12[][12];
@@ -45,6 +51,8 @@ void draw_zh(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted,
 void draw_zh_small(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted);
 void draw_zh_sb(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted);
 void draw_text(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted);
+void draw_text_capped(st7305_handle_t *lcd, int x, int y, const char *str,
+                      bool inverted, int max_w);
 void draw_label(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted);
 void draw_text_centered(st7305_handle_t *lcd, int y, const char *str, bool inverted);
 void draw_label_centered_at(st7305_handle_t *lcd, int cx, int y, const char *str, bool inverted);
@@ -59,6 +67,9 @@ void menu_show_center_msg(st7305_handle_t *lcd, const char *line1, const char *l
 void draw_icon_bitmap(st7305_handle_t *lcd, int cx, int cy, int size, int icon_idx);
 void draw_icon_bitmap_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx);
 void draw_main_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx);
+/* 通用 1bpp 位图缩放直写 (同主图标朝向), 供嵌入自定义位图 (如诊断器件图标) */
+void draw_1bpp_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h,
+                         int src_w, int src_h, const uint8_t *src);
 void draw_cat_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int cat_idx);
 void menu_draw_cat_icon(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int cat_idx);
 

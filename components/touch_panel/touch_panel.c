@@ -263,7 +263,7 @@ static tp_chip_t tp_probe_chip(void) {
         /* 读芯片 ID/版本 (0xA7-0xAA) 便于确认具体型号 */
         uint8_t id[4] = {0};
         if (tp_i2c_read8(0xA7, id, 4) == ESP_OK) {
-            ESP_LOGI(TAG, "CST816 ID: A7=%02X A8=%02X A9=%02X AA=%02X",
+            ESP_LOGI(TAG, "CST ID: A7=%02X A8=%02X A9=%02X AA=%02X",
                      id[0], id[1], id[2], id[3]);
         }
     } else if (tp_i2c_probe(FT6236_ADDR)) {
@@ -422,39 +422,40 @@ void touch_panel_get_resolution(int *max_x, int *max_y) {
 
 /* ==================== 读点 ==================== */
 
-static bool gt911_read_points(tp_point_t pts[2], int *count) {
+/* 读取多点 (每点 8 字节, 点1@0x814F; GT911 最多 5 点) */
+static bool gt911_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
     uint8_t status = 0;
     if (tp_i2c_read16(GT911_REG_STATUS, &status, 1) != ESP_OK) {
         return false;
     }
     if (!(status & 0x80)) {
         /* 无新数据 */
-        pts[0].pressed = pts[1].pressed = false;
+        for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
         *count = 0;
         return true;
     }
     int n = status & 0x0F;
     if (n <= 0) {
-        pts[0].pressed = pts[1].pressed = false;
+        for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
         *count = 0;
         /* 清状态, 准备下一次中断 */
         uint8_t z = 0;
         tp_i2c_write16(GT911_REG_STATUS, &z, 1);
         return true;
     }
-    /* GT911 每点 8 字节, 点1@0x814F, 点2@0x8157, 一次读 16 字节 */
-    uint8_t p[16] = {0};
-    if (tp_i2c_read16(GT911_REG_POINT1, p, 16) != ESP_OK) {
+    /* 一次读满 TP_MAX_POINTS 个点的原始数据 (5*8=40 字节) */
+    uint8_t p[TP_MAX_POINTS * 8] = {0};
+    if (tp_i2c_read16(GT911_REG_POINT1, p, sizeof(p)) != ESP_OK) {
         return false;
     }
-    int cnt = (n > 2) ? 2 : n;
+    int cnt = (n > TP_MAX_POINTS) ? TP_MAX_POINTS : n;
     for (int i = 0; i < cnt; i++) {
         const uint8_t *pp = p + i * 8;
         pts[i].pressed = true;
         pts[i].x = (int16_t)((pp[2] << 8) | pp[1]);   /* X = high<<8 | low */
         pts[i].y = (int16_t)((pp[4] << 8) | pp[3]);   /* Y = high<<8 | low */
     }
-    for (int i = cnt; i < 2; i++) pts[i].pressed = false;
+    for (int i = cnt; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
     *count = cnt;
     /* 读完清状态位, GT911 才会重新拉低 INT 上报下一次触摸 */
     uint8_t z = 0;
@@ -462,51 +463,53 @@ static bool gt911_read_points(tp_point_t pts[2], int *count) {
     return true;
 }
 
-static bool cst816_read_points(tp_point_t pts[2], int *count) {
+static bool cst816_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
+    /* CST8xx 系列 (本设备 CST836U) 实测布局 + 官方 esp_lcd_touch_cst816s 资料:
+     * 芯片虽在点名里可报 2, 但官方确认 "始终只返回单指事件 + 手势",
+     * 第二点坐标寄存器无有效数据 => 只信任点1, 避免双指时幽灵点乱跳.
+     * 布局: 从 reg 0x00 连续读 11 字节. 0x02=点数; 点1 12 位坐标:
+     *   X = ((d[3]&0x0F)<<8)|d[4], Y = ((d[5]&0x0F)<<8)|d[6].
+     * 实测对照 (n=1, d=00 D7 00 C2): X=0xD7=215, Y=0xC2=194. */
     uint8_t d[11] = {0};
     if (tp_i2c_read8(0x00, d, 11) != ESP_OK) {
         return false;
     }
-    /* 实测寄存器布局 (此 CST816 变体比标准右移一位):
-     *   0x02 = 点数(触摸标志), 0x03=X高4位, 0x04=X低8位,
-     *   0x05=Y高4位, 0x06=Y低8位; 点2 紧随其后 (0x07-0x0A). */
     int n = d[2] & 0x0F;
     if (n <= 0) {
-        pts[0].pressed = pts[1].pressed = false;
+        for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
         *count = 0;
         return true;
     }
-    int cnt = (n > 2) ? 2 : n;
-    for (int i = 0; i < cnt; i++) {
-        const uint8_t *q = d + 3 + i * 4;
-        pts[i].pressed = true;
-        pts[i].x = (int16_t)(((q[0] & 0x0F) << 8) | q[1]);
-        pts[i].y = (int16_t)(((q[2] & 0x0F) << 8) | q[3]);
-    }
-    for (int i = cnt; i < 2; i++) pts[i].pressed = false;
-    *count = cnt;
+    /* 只取点1 (单指有效), 丢弃点2 */
+    int x = (int)(((d[3] & 0x0F) << 8) | d[4]);
+    int y = (int)(((d[5] & 0x0F) << 8) | d[6]);
+    pts[0].pressed = true;
+    pts[0].x = (int16_t)x;
+    pts[0].y = (int16_t)y;
+    pts[1].pressed = false;   /* 第二点无效, 恒为未按压 */
+    *count = 1;
     return true;
 }
 
-static bool ft6236_read_points(tp_point_t pts[2], int *count) {
+static bool ft6236_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
     uint8_t d[10] = {0};
     if (tp_i2c_read8(0x00, d, 10) != ESP_OK) {
         return false;
     }
     int n = d[0] & 0x0F;   /* 0x00 = TD_STATUS 点数 */
     if (n <= 0) {
-        pts[0].pressed = pts[1].pressed = false;
+        for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
         *count = 0;
         return true;
     }
-    int cnt = (n > 2) ? 2 : n;
+    int cnt = (n > 2) ? 2 : n;   /* FT6236 硬件最多 2 点 */
     for (int i = 0; i < cnt; i++) {
         const uint8_t *q = d + 1 + i * 4;
         pts[i].pressed = true;
         pts[i].x = (int16_t)(((q[0] & 0x0F) << 8) | q[1]);
         pts[i].y = (int16_t)(((q[2] & 0x0F) << 8) | q[3]);
     }
-    for (int i = cnt; i < 2; i++) pts[i].pressed = false;
+    for (int i = cnt; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
     *count = cnt;
     return true;
 }
@@ -514,7 +517,7 @@ static bool ft6236_read_points(tp_point_t pts[2], int *count) {
 /* 诊断: 读失败计数 (每 2s 打一次日志, 判断是 I2C 问题还是数据噪声) */
 static uint32_t s_diag_fail = 0, s_diag_ok = 0, s_diag_tick = 0;
 
-bool touch_panel_read_points(tp_point_t pts[2], int *count) {
+bool touch_panel_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
     if (!pts || !count || s_chip == TP_CHIP_NONE) {
         return false;
     }
@@ -567,7 +570,7 @@ bool touch_panel_read_points(tp_point_t pts[2], int *count) {
 }
 
 bool touch_panel_read(tp_point_t *pt) {
-    tp_point_t pts[2];
+    tp_point_t pts[TP_MAX_POINTS];
     int count = 0;
     if (!pt) return false;
     bool ok = touch_panel_read_points(pts, &count);
