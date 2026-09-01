@@ -295,8 +295,11 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
         os_hw_request(OS_HW_BT);
         ESP_LOGI(TAG, "蓝牙已默认启动 (开机)");
     }
-    /* 开机音 (方波直驱方案就绪时播放) */
-    if (tone_player_ready()) tone_play_theme(TONE_THEME_BOOT_UP);
+    /* V1.0.72: 开机不播旋律, 改为震动一下提示.
+     * 原因: tone_mel 任务栈(8KB)在首次 feed_pcm → audio_out_start →
+     * es8311_start/set_sample_rate 的 I2C 深链路爆栈 panic, 导致开机无限重启.
+     * (tone_mel/tone_cont 栈已 2048→4096 words 加固, 开机音仍可随时手动触发) */
+    vibrator_tap(80, 120);
     os_shell_loop(&ctx);
 }
 #endif /* CONFIG_OS */

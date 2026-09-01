@@ -108,7 +108,9 @@ void tone_tone_on(int freq_hz) {
     if (s_cont_freq == freq_hz && s_cont_task) return;  /* 同频持续中, 幂等 */
     tone_stop();
     s_cont_freq = freq_hz;
-    if (xTaskCreate(tone_cont_task, "tone_cont", 2048, NULL, 5, &s_cont_task) != pdPASS) {
+    /* V1.0.72: 栈 2048→4096 words. tone_cont 走 feed_pcm → audio_out_start
+     * → es8311_start/set_sample_rate 的 I2C 深链路, 8KB 会栈溢出 panic (重启循环). */
+    if (xTaskCreate(tone_cont_task, "tone_cont", 4096, NULL, 5, &s_cont_task) != pdPASS) {
         s_cont_freq = 0;
     }
 }
@@ -209,5 +211,7 @@ void tone_play_melody(const tone_note_t *notes, int count) {
     if (!a) return;
     a->notes = notes;
     a->count = count;
-    xTaskCreate(melody_task, "tone_mel", 2048, a, 1, NULL);
+    /* V1.0.72: 栈 2048→4096 words. 开机旋律首次 feed_pcm 触发 audio_out_start
+     * (ES8311/NS4168 配置 + I2C 深链路), 8KB 栈溢出 → 开机无限重启. */
+    xTaskCreate(melody_task, "tone_mel", 4096, a, 1, NULL);
 }
