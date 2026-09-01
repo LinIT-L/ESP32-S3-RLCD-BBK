@@ -16,8 +16,9 @@
 #define ESP32_I2C_SCL_PIN   GPIO_NUM_14
 
 /* 按键 GPIO
- * 已被 LCD 占用: 5(DC),11(SCK),12(MOSI),40(CS),41(RST)   [GPIO6 空闲, TE 线不接]
+ * 已被 LCD 占用: 5(DC),11(SCK),12(MOSI),40(CS),41(RST)
  * 已被 I2C 占用: 13(SDA),14(SCL)
+ * 已被声音占用: 6(tone_player 方波→功放, V1.0.69 起; 原 GPIO48 让给震动 EN)
  *
  * 板载按键 (来自 Waveshare ESP32-S3-RLCD-4.2 官方文档):
  *   BOOT = GPIO0 (输入, 上拉) → RIGHT

@@ -15,7 +15,10 @@
 
 #define TAG "TONE"
 
-#define TONE_GPIO   48   /* V1.0.68: 方波输出 GPIO (飞线到功放 IN+) */
+#define TONE_GPIO   6    /* V1.0.69: 方波输出 GPIO (飞线到功放 IN+).
+                          * 原 GPIO48 与震动 TM6604 EN 同脚冲突(暴龙机启动时
+                          * tone_player_init 抢占 LEDC, 震动使能失效),
+                          * 换至空闲 GPIO6 (user_config.h 标注 TE 线不接, 全仓无引用) */
 #define TONE_DUTY   25   /* 8bit 分辨率: ~10% 占空比 (控制音量, 避免过响削波) */
 
 static bool s_ready = false;

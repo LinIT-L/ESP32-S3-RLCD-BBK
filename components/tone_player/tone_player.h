@@ -1,7 +1,9 @@
 /**
  * @file tone_player.h
- * @brief 简易音调播放器 (V1.0.68): LEDC PWM → GPIO48 → AXS2005B 功放 → 喇叭
+ * @brief 简易音调播放器 (V1.0.69): LEDC PWM → GPIO6 → AXS2005B 功放 → 喇叭
  *
+ * V1.0.69: 输出脚 GPIO48 → GPIO6. 原 GPIO48 与震动 TM6604 EN 同脚,
+ * 暴龙机启动时 tone_player_init 会抢占 LEDC 导致震动使能失效; 换至空闲 GPIO6.
  * 生成常见电子声音 (开机/关机/确认/错误/闹铃) 和简单旋律, 无需解码芯片.
  * 用法:
  *   tone_player_init();              // 初始化 (幂等, 仅在音频方案=方波直驱时调用)
@@ -17,7 +19,7 @@
 extern "C" {
 #endif
 
-/* 初始化 LEDC PWM (GPIO48), 幂等; 返回是否就绪 */
+/* 初始化 LEDC PWM (GPIO6), 幂等; 返回是否就绪 */
 void tone_player_init(void);
 /* 立即静音 */
 void tone_stop(void);
