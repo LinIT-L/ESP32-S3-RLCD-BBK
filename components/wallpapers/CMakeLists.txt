@@ -3,7 +3,7 @@
 idf_component_register(
     SRCS "wallpapers.c"
     INCLUDE_DIRS "."
-    REQUIRES st7305
+    REQUIRES st7305 ui_common
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

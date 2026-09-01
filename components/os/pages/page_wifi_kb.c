@@ -17,8 +17,8 @@
 #define TAG "WIFIKB"
 
 #define KB_KEY_W    40
-#define KB_KEY_H    42
-#define KB_ROW_GAP  3
+#define KB_KEY_H    48   /* V1.1.1: 5 行键盘紧贴到最下方 (58 + 5×48 = 298) */
+#define KB_ROW_GAP  0    /* V1.1.1: 行间无空隙 */
 #define KB_TOP_Y    58
 
 /* 按键动作 */
@@ -50,6 +50,9 @@ typedef struct {
     char msg[24];
 } wkb_state_t;
 static wkb_state_t s_wkb;
+/* 设置页选择 WiFi 后预填的 SSID: 独立缓存, wkb_reset/on_enter 不会把它冲掉,
+ * 保证从"无线连接→连接WiFi→选网"进入时直接显示输密码. */
+static char s_preset_ssid[32] = "";
 
 static void wkb_reset(void) {
     s_wkb.ssid[0] = '\0';
@@ -58,17 +61,33 @@ static void wkb_reset(void) {
     s_wkb.shift = false;
     s_wkb.sym = false;
     s_wkb.msg[0] = '\0';
-    /* 预填 NVS 保存的配置 (有则直接改密码) */
-    char saved_ssid[32], saved_pass[64];
-    wifi_manager_get_saved(saved_ssid, sizeof(saved_ssid), saved_pass, sizeof(saved_pass));
-    if (saved_ssid[0]) {
-        snprintf(s_wkb.ssid, sizeof(s_wkb.ssid), "%s", saved_ssid);
-        s_wkb.field = 1;
+    s_wkb.field = 1;   /* 始终输密码 (SSID 只读, 由设置页预填) */
+    if (s_preset_ssid[0]) {
+        /* 预填缓存的 SSID (来自设置页选网), 直接输密码 */
+        snprintf(s_wkb.ssid, sizeof(s_wkb.ssid), "%s", s_preset_ssid);
+    } else {
+        /* 预填 NVS 保存的配置 (有则直接改密码) */
+        char saved_ssid[32], saved_pass[64];
+        wifi_manager_get_saved(saved_ssid, sizeof(saved_ssid), saved_pass, sizeof(saved_pass));
+        if (saved_ssid[0]) {
+            snprintf(s_wkb.ssid, sizeof(s_wkb.ssid), "%s", saved_ssid);
+            s_wkb.field = 1;
+        }
     }
 }
 
-static char *wkb_buf(void) { return (s_wkb.field == 0) ? s_wkb.ssid : s_wkb.pass; }
-static size_t wkb_max(void) { return (s_wkb.field == 0) ? sizeof(s_wkb.ssid) - 1 : sizeof(s_wkb.pass) - 1; }
+/* V1.1.1: WiFi 列表选择后预填 SSID, 直接输密码 (field=1) */
+void wifi_kb_preset_ssid(const char *ssid) {
+    if (ssid && ssid[0])
+        snprintf(s_preset_ssid, sizeof(s_preset_ssid), "%s", ssid);
+    else
+        s_preset_ssid[0] = '\0';
+    wkb_reset();
+}
+
+/* 本页仅用于输入密码 (SSID 由设置页选网预填), 不再在线编辑 SSID */
+static char *wkb_buf(void) { return s_wkb.pass; }
+static size_t wkb_max(void) { return sizeof(s_wkb.pass) - 1; }
 
 /* 显示字符: 字母层且 Shift 激活时, 小写字母转大写 */
 static char kb_disp(char c) {
@@ -124,7 +143,7 @@ static void wkb_do_key(ui_ctx_t *ctx, int kind, int ch) {
         break;
     }
     case KBK_FIELD:
-        s_wkb.field = !s_wkb.field;
+        /* 密码输入页: 不再切换 SSID/密码字段 */
         break;
     case KBK_RET:
         os_pop(ctx);
@@ -152,11 +171,15 @@ static void p_wifi_kb_render(ui_ctx_t *ctx) {
 
     draw_text_centered(lcd, 2, "Wi-Fi \xe8\xbf\x9e\xe6\x8e\xa5", false); /* Wi-Fi 连接 */
 
-    /* 顶部当前输入行 (点击切换字段) */
+    /* 顶部当前输入行 (点击切换字段); 有提示时显示提示 */
     char line[80];
-    const char *tag = (s_wkb.field == 0) ? "SSID" : "\xe5\xaf\x86\xe7\xa0\x81"; /* SSID / 密码 */
-    const char *val = (s_wkb.field == 0) ? s_wkb.ssid : s_wkb.pass;
-    snprintf(line, sizeof(line), "%s: %s_", tag, val);
+    if (s_wkb.msg[0]) {
+        snprintf(line, sizeof(line), "%s", s_wkb.msg);
+    } else {
+        const char *tag = (s_wkb.field == 0) ? "SSID" : "\xe5\xaf\x86\xe7\xa0\x81"; /* SSID / 密码 */
+        const char *val = (s_wkb.field == 0) ? s_wkb.ssid : s_wkb.pass;
+        snprintf(line, sizeof(line), "%s: %s_", tag, val);
+    }
     draw_text(lcd, 8, 30, line, false);
 
     const char *const *lines = s_wkb.sym ? kb_sym_line : kb_abc_line;
@@ -191,13 +214,9 @@ static void p_wifi_kb_render(ui_ctx_t *ctx) {
 
     /* 行 4: &123 + 空格 + 删除 + 连接 */
     kb_draw_key(lcd, 0, y, 60, s_wkb.sym ? "ABC" : "&123", false);
-    kb_draw_key(lcd, 63, y, 150, "\xe7\xa9\xba\xe6\xa0\xbc", false);           /* 空格 */
-    kb_draw_key(lcd, 216, y, 86, "\xe5\x88\xa0\xe9\x99\xa4", false);           /* 删除 */
-    kb_draw_key(lcd, 305, y, UI_SCREEN_W - 305, "\xe8\xbf\x9e\xe6\x8e\xa5", false); /* 连接 */
-
-    if (s_wkb.msg[0]) {
-        draw_text(lcd, 8, 285, s_wkb.msg, false);
-    }
+    kb_draw_key(lcd, 60, y, 152, "\xe7\xa9\xba\xe6\xa0\xbc", false);        /* 空格 */
+    kb_draw_key(lcd, 212, y, 88, "\xe5\x88\xa0\xe9\x99\xa4", false);        /* 删除 */
+    kb_draw_key(lcd, 300, y, UI_SCREEN_W - 300, "\xe8\xbf\x9e\xe6\x8e\xa5", false); /* 连接 (紧贴右缘) */
 }
 
 /* ============ 触摸 ============ */
@@ -229,8 +248,8 @@ static bool p_wifi_kb_touch(ui_ctx_t *ctx, int x, int y) {
     }
     if (row == 4) {
         if (x < 60) { wkb_do_key(ctx, KBK_SYM, 0); return true; }
-        if (x < 63 + 150) { wkb_do_key(ctx, KBK_SPACE, 0); return true; }
-        if (x < 216 + 86) { wkb_do_key(ctx, KBK_DEL, 0); return true; }
+        if (x < 60 + 152) { wkb_do_key(ctx, KBK_SPACE, 0); return true; }
+        if (x < 212 + 88) { wkb_do_key(ctx, KBK_DEL, 0); return true; }
         wkb_do_key(ctx, KBK_OK, 0);
         return true;
     }

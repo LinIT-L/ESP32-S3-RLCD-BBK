@@ -6,7 +6,7 @@ idf_component_register(
         "lavax_emu.c"
         "core/source/lava.c"
         "core/source/file.c"
-        "core/source/font.c"
+        # "core/source/font.c"  # V1.0.89+: 文曲星字库已迁 appdata (lav_font.bin), 不再编译 2.5MB 数组
         "core/source/gmode16.c"
         "core/source/hardware.c"
         "core/source/lcd.c"
@@ -28,6 +28,7 @@ idf_component_register(
         "input"
         "virtual_keys"
         "fatfs"
+        "fonts"
 )
 
 # lavaxvm 老代码风格宽松, 屏蔽常见告警; 用内部 RAM 稀缺故不强制 PSRAM 栈.

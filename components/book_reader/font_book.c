@@ -6,20 +6,12 @@
 #include <dirent.h>
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "font_part.h"
 
 static const char *TAG = "font_book";
 
-/* 由 CMake target_add_binary_data 生成:
- * assets/book16.fnt -> _binary_book16_fnt_start/_end */
-/* 仿宋 (fs) / 黑体 (hz, 菜单字体款式) × 16/24/32, 全部原生 GB2312 简体点阵 */
-extern const uint8_t book16_fs_fnt_start[] asm("_binary_book16_fs_fnt_start");
-extern const uint8_t book16_fs_fnt_end[]   asm("_binary_book16_fs_fnt_end");
-extern const uint8_t book24_fs_fnt_start[] asm("_binary_book24_fs_fnt_start");
-extern const uint8_t book24_fs_fnt_end[]   asm("_binary_book24_fs_fnt_end");
-extern const uint8_t book32_fs_fnt_start[] asm("_binary_book32_fs_fnt_start");
-extern const uint8_t book32_fs_fnt_end[]   asm("_binary_book32_fs_fnt_end");
-extern const uint8_t book24_hz_fnt_start[] asm("_binary_book24_hz_fnt_start");
-extern const uint8_t book24_hz_fnt_end[]   asm("_binary_book24_hz_fnt_end");
+/* V1.0.89+: 电子书字库从 appdata 分区字库区 mmap 加载 (esp_partition_mmap, XIP 只读),
+ * 不再嵌入固件. 仿宋(fs)/黑体(hz) x 16/24/32, 槽位见 font_part.h. */
 
 #define FONT_MAGIC "BK16FNT1"
 #define GB_GRID    94          /* GB2312 码区 94x94 */
@@ -85,6 +77,10 @@ static int rle_decode(const uint8_t *src, size_t n, uint8_t *dst, size_t cap) {
 }
 
 static bool font_bind(const uint8_t *d, size_t len) {
+    if (!d) {
+        s_error = "字库分区未映射";
+        return false;
+    }
     if (len < sizeof(book_font_header_t)) {
         s_error = "字库文件过小";
         return false;
@@ -121,7 +117,7 @@ static bool font_bind(const uint8_t *d, size_t len) {
 }
 
 bool font_book_init(void) {
-    return font_bind(book24_fs_fnt_start, (size_t)(book24_fs_fnt_end - book24_fs_fnt_start));
+    return font_bind(font_part_map(FONT_SLOT_BK24_OFF, FONT_SLOT_BK24_LEN), FONT_SLOT_BK24_LEN);
 }
 
 /* 样式: 0=仿宋 1=黑体; 字号: 0=16 1=24 2=32 */
@@ -131,11 +127,12 @@ void font_book_select(int style, int size_id) {
     int st = (style < 0) ? 0 : (style > 1 ? 1 : style);
     int sz = (size_id < 0) ? 1 : (size_id > 2 ? 2 : size_id);
     if (st == 1) {   /* 黑体 (菜单字体款式) — 精简后仅保留24, 16/32 回退到24 */
-        d = book24_hz_fnt_start; len = (size_t)(book24_hz_fnt_end - book24_hz_fnt_start);
+        d = font_part_map(FONT_SLOT_BK24HZ_OFF, FONT_SLOT_BK24_LEN);
+        len = FONT_SLOT_BK24_LEN;
     } else {           /* 仿宋 (全套 16/24/32) */
-        if (sz == 0)      { d = book16_fs_fnt_start; len = (size_t)(book16_fs_fnt_end - book16_fs_fnt_start); }
-        else if (sz == 2) { d = book32_fs_fnt_start; len = (size_t)(book32_fs_fnt_end - book32_fs_fnt_start); }
-        else              { d = book24_fs_fnt_start; len = (size_t)(book24_fs_fnt_end - book24_fs_fnt_start); }
+        if (sz == 0)      { d = font_part_map(FONT_SLOT_BK16_OFF, FONT_SLOT_BK16_LEN); len = FONT_SLOT_BK16_LEN; }
+        else if (sz == 2) { d = font_part_map(FONT_SLOT_BK32_OFF, FONT_SLOT_BK32_LEN); len = FONT_SLOT_BK32_LEN; }
+        else              { d = font_part_map(FONT_SLOT_BK24_OFF, FONT_SLOT_BK24_LEN); len = FONT_SLOT_BK24_LEN; }
     }
     /* 释放旧 SD 缓冲 (切回内嵌) */
     if (s_sd_buf) {
@@ -303,7 +300,7 @@ int font_book_scan_sd(char names[][64], int max) {
         /* 只收集 .fnt 文件 */
         const char *dot = strrchr(ent->d_name, '.');
         if (dot && strcasecmp(dot, ".fnt") == 0) {
-            strncpy(names[count], ent->d_name, 63);
+            memcpy(names[count], ent->d_name, 63);
             names[count][63] = '\0';
             count++;
         }

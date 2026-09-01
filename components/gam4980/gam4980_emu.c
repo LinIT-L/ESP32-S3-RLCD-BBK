@@ -6,7 +6,9 @@
  */
 #include "gam4980_emu.h"
 #include "libretro.h"
-#include "menu_system.h"
+#include "input.h"
+#include "os.h"
+#include "ui_common.h"
 #include "font_zh.h"
 #include "audio_player.h"
 #include "virtual_keys.h"
@@ -17,6 +19,8 @@
 #include "esp_timer.h"
 #include "sdmmc_cmd.h"
 #include "input.h"
+#include "os.h"
+#include "ui_common.h"
 #include "bt_manager.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
@@ -32,7 +36,6 @@
 static const char *TAG = "GAM4980";
 
 /* 引用全局菜单状态 (获取 game_status_bar 设置) */
-extern menu_state_t g_menu;
 
 /* libretro 输出: 159x96 RGB565 (LCD_WIDTH+1 x LCD_HEIGHT = 160x96) */
 #define CORE_W 160
@@ -274,6 +277,12 @@ void gam4980_set_fullscreen(int mode)
     g_display_mode = (display_mode_t)mode;
 }
 bool gam4980_get_fullscreen(void) { return g_display_mode != DISP_MODE_POINT2POINT; }
+
+/* V1.1.1: 引擎优化设置由 os 传入 (独立于旧 menu g_menu, 旧 g_menu 在 os 构建未初始化) */
+static int  s_vkey       = 2;    /* 0=关 1=开 2=自动(无手柄时开) */
+static bool s_status_bar  = true; /* 游戏内状态栏 显示/隐藏 */
+void gam4980_set_vkey(int vkey)      { if (vkey >= 0 && vkey <= 2) s_vkey = vkey; }
+void gam4980_set_status_bar(bool on)  { s_status_bar = on; }
 
 /* libretro core callbacks (内部链接) */
 void retro_init(void);
@@ -667,11 +676,8 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
             }
         }
 
-        if (g_menu.settings.game_status_bar) {
-            menu_settings_t fake_settings = {0};
-            fake_settings.battery = g_status_battery;
-            fake_settings.pad_connected = g_status_pad_connected;
-            menu_draw_status_bar(g_lcd, &fake_settings, NULL);
+        if (s_status_bar) {
+            svc_statusbar_draw_game(g_lcd, g_status_battery, g_status_pad_connected);
         }
 
         /* V1.0.68+: 虚拟按键启用时不画底部装饰栏与游戏名称
@@ -741,10 +747,9 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
          * 直接计算 fb 索引, 避免函数调用+边界检查开销 (快 3-5x) */
         /* fb_stride = FB_STRIDE = 75 (compile time) */
         int src_stride = pitch / 2;
-        if (g_pic_opt == 1) {
-            /* === V1.0.58: EPX (Scale2x / AdvMAME2x) 边缘平滑模式 ===
-             * 按中心像素颜色取 8 邻域 LUT 得到 2x2 子像素分布.
-             * 像素风格保留硬朗, 斜线/拐角 自动圆滑, 比 coverage AA 更正统像素风. */
+        if (0) {
+            /* V1.1.1: 点对点模式不做任何优化 (用户要求"点对点=纯2x最近邻"),
+             * 原 EPX 边缘平滑路径禁用, 恒走下方纯 2x 放大, 保证像素硬朗不发虚. */
             for (int y = 0; y < CORE_H; y++) {
                 const uint16_t *row  = src + y * src_stride;
                 const uint16_t *row_u = (y > 0)          ? src + (y - 1) * src_stride : row;
@@ -803,11 +808,8 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
                 }
             }
         }
-        if (g_menu.settings.game_status_bar) {
-            menu_settings_t fake_settings = {0};
-            fake_settings.battery = g_status_battery;
-            fake_settings.pad_connected = g_status_pad_connected;
-            menu_draw_status_bar(g_lcd, &fake_settings, NULL);
+        if (s_status_bar) {
+            svc_statusbar_draw_game(g_lcd, g_status_battery, g_status_pad_connected);
         }
         virtual_keys_draw(g_lcd);   /* V1.0.68 fix: 补画屏幕虚拟按键 */
         st7305_flush(g_lcd);
@@ -879,11 +881,11 @@ static int16_t joypad_state(unsigned id) {
     switch (id) {
         case RETRO_DEVICE_ID_JOYPAD_A:
             gp = bt_manager_is_key_pressed(F_CONFIRM) || !(vk & 0x01) || !(wg & 0x01);
-            phys = input_is_held(0);
+            phys = input_is_held(1);   /* KEY(GPIO18)=确定 → A (旧码误用 idx0=BOOT) */
             break;
         case RETRO_DEVICE_ID_JOYPAD_B:
             gp = bt_manager_is_key_pressed(F_BACK) || !(vk & 0x02) || !(wg & 0x02);
-            phys = input_is_held(1);
+            phys = input_is_held(0);   /* BOOT(GPIO0)=返回/跳出 → B (旧码误用 idx1=KEY) */
             break;
         case RETRO_DEVICE_ID_JOYPAD_UP:    gp = bt_manager_is_key_pressed(F_UP)    || !(vk & 0x40) || !(wg & 0x40); break;
         case RETRO_DEVICE_ID_JOYPAD_DOWN:  gp = bt_manager_is_key_pressed(F_DOWN)  || !(vk & 0x80) || !(wg & 0x80); break;
@@ -1456,7 +1458,7 @@ static game_exit_result_t gam4980_exit_confirm_dialog(void) {
     while (1) {
         /* 每轮强制重绘+刷新, 使弹窗保持可见 (弹窗优先级最高),
          * 避免被游戏帧 flush 覆盖后一闪而过. */
-        menu_draw_notice_popup(g_lcd, "\xe9\x80\x80\xe5\x87\xba\xe6\xb8\xb8\xe6\x88\x8f\xef\xbc\x9f"); /* 退出游戏？ */
+        ui_draw_notice_popup(g_lcd, "\xe9\x80\x80\xe5\x87\xba\xe6\xb8\xb8\xe6\x88\x8f\xef\xbc\x9f"); /* 退出游戏？ */
         st7305_flush(g_lcd);
 
         /* 触发键已松开 → 之后 F_BACK 长按才当作真正的取消 */
@@ -1517,8 +1519,13 @@ static game_exit_result_t gam4980_exit_confirm_dialog(void) {
 
 game_exit_result_t gam4980_emu_run(void) {
     g_running = true;
-    /* V1.0.68 fix: BBK 游戏不走通用 game_run_loop, 必须在此启用屏幕虚拟按键 (V1.0.94: 三态) */
-    virtual_keys_set_enabled(menu_vkey_effective(&g_menu));
+    /* V1.0.68 fix: BBK 游戏不走通用 game_run_loop, 必须在此启用屏幕虚拟按键.
+     * V1.1.1: 三态由 os 引擎优化设置传入 (0关/1开/2自动=无手柄时开), 不再读旧 g_menu.
+     * 引擎定制: 步步高无 Select/Start 虚拟键 (B 键为 BBK 针对性 KEY_EXIT 跳出键, _joyk 已映射). */
+    virtual_keys_set_hide_selsta(true);
+    if (s_vkey == 1) virtual_keys_set_enabled(true);
+    else if (s_vkey == 2) virtual_keys_set_enabled(!bt_manager_is_connected());
+    else virtual_keys_set_enabled(false);
     s_home_prev = false;  /* 每次进入游戏重置退出键边沿状态 */
     game_exit_result_t exit_result = GAME_EXIT_CONFIRMED;
     ESP_LOGI(TAG, "开始运行游戏循环 (长按 BOOT 1秒 或 按 退出到菜单 键 退出, 60fps)");
@@ -1558,7 +1565,7 @@ game_exit_result_t gam4980_emu_run(void) {
         }
 
         frame_count++;
-        if (input_is_held(1)) {
+        if (input_is_held(0)) {   /* BOOT(GPIO0) 长按退出 (旧码误用 idx1=KEY) */
             boot_hold_count++;
             if (boot_hold_count > 60) {
                 ESP_LOGI(TAG, "长按 BOOT, 请求退出游戏");

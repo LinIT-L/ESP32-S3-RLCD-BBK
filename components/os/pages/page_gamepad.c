@@ -8,7 +8,10 @@
 #include "os.h"
 #include "ui_common.h"
 #include "bt_manager.h"
+#include "esp_attr.h"
 #include "web_gamepad.h"
+#include "input.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include <string.h>
 #include <stdio.h>
@@ -25,6 +28,10 @@ static const char *const s_gp_items[6] = {
     "\xe8\xbf\x94\xe5\x9b\x9e",                            /* 返回 */
 };
 
+/* 主菜单项动态构建: 未连接设备时隐藏"设备信息", 保持底部"返回"为末项.
+ * s_gp_map[dst]=src 把显示位置映射回原始 switch case, 保证选中逻辑不错位. */
+static const char *s_gp_items_dyn[6];
+static int s_gp_map[6];
 /* 扫描结果列表 */
 #define GP_SCAN_MAX 16
 static bt_device_t s_scan_devs[GP_SCAN_MAX];
@@ -45,30 +52,9 @@ static void gp_on_scan(bt_device_t *results, int count, bool updated) {
     for (int i = 0; i < count; i++) s_scan_devs[i] = results[i];
 }
 
-/* ---- 设备信息弹窗 (btinfo) ---- */
-static bool btinfo_dlg_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
-    (void)d; (void)ud;
-    st7305_handle_t *lcd = ctx->lcd;
-    char lines[8][40];
-    int n = 0;
-    const btm_conn_info_t *info = bt_manager_get_conn_info();
-    if (info && info->available && bt_manager_is_connected()) {
-        char btmp[16];
-        snprintf(lines[n++], 40, "\xe5\x90\x8d\xe7\xa7\xb0: %s", info->name[0] ? info->name : "?");
-        snprintf(lines[n++], 40, "\xe5\x9e\x8b\xe5\x8f\xb7: %s", info->model[0] ? info->model : "?");
-        gp_batt_str(info->battery, btmp, sizeof(btmp));
-        snprintf(lines[n++], 40, "\xe7\x94\xb5\xe9\x87\x8f: %s", btmp);
-        snprintf(lines[n++], 40, "VID: 0x%02X%02X", info->vid >> 8, info->vid & 0xFF);
-        snprintf(lines[n++], 40, "PID: 0x%02X%02X", info->pid >> 8, info->pid & 0xFF);
-    } else {
-        snprintf(lines[n++], 40, "\xe6\x9c\xaa\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xbe\xe5\xa4\x87");
-    }
-    int y0 = (UI_SCREEN_H - 140) / 2;
-    draw_dialog_frame(lcd, 30, y0, UI_SCREEN_W - 60, 140, 3);
-    draw_text_centered(lcd, y0 + 6, "\xe8\xae\xbe\xe5\xa4\x87\xe4\xbf\xa1\xe6\x81\xaf", false);
-    for (int i = 0; i < n; i++)
-        draw_text(lcd, 48, y0 + 30 + i * 20, lines[i], false);
-    return true;
+/* ---- 设备信息: 列表弹窗只读回调 (项无操作, BACK 返回) ---- */
+static void btinfo_noop(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ctx; (void)result; (void)ud;
 }
 
 /* ---- 连接记录弹窗 (历史列表) ---- */
@@ -85,7 +71,7 @@ static void hist_dlg_select(ui_ctx_t *ctx, int result, void *ud) {
 static void open_hist_dialog(ui_ctx_t *ctx) {
     int cnt = bt_manager_get_history_count();
     if (cnt <= 0) { os_dialog_toast(ctx, "\xe6\x97\xa0\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xb0\xe5\xbd\x95"); return; }
-    static char items[4][64];
+    EXT_RAM_BSS_ATTR static char items[4][64];
     static const char *ptrs[4];
     for (int i = 0; i < cnt && i < 4; i++) {
         const bt_device_t *dev = bt_manager_get_history_at(i);
@@ -95,33 +81,187 @@ static void open_hist_dialog(ui_ctx_t *ctx) {
     os_dialog_list(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xb0\xe5\xbd\x95", ptrs, cnt, 0, hist_dlg_select, NULL);
 }
 
+/* ---- 蓝牙扫描列表弹窗 (3.3: 添加设备 → 扫描结果显示在列表, 确认连接) ---- */
+static void scan_dlg_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ctx; (void)ud;
+    if (result < 0) bt_manager_stop_scan();   /* 返回: 停止扫描 */
+}
+static bool scan_dlg_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)ud;
+    if (a == OS_ACTION_BACK) { bt_manager_stop_scan(); return false; }  /* 走默认弹栈 */
+    if (a == OS_ACTION_CONFIRM) {
+        if (s_scan_n > 0 && d->sel >= 0 && d->sel < s_scan_n) {
+            bt_manager_stop_scan();
+            bt_manager_connect_device(&s_scan_devs[d->sel]);
+            os_dialog_toast(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5..."); /* 正在连接... */
+            os_dialog_pop(ctx);
+        }
+        return true;   /* 扫描中/无设备: 忽略确认 */
+    }
+    return false;   /* UP/DOWN 走默认 */
+}
+static void scan_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)ud;
+    /* 扫描结果变化 → 刷新列表项 */
+    if (s_scan_n != d->count) {
+        if (s_scan_n > 0) {
+            d->count = s_scan_n;
+            for (int i = 0; i < s_scan_n; i++) {
+                const char *nm = bt_manager_get_device_name(&s_scan_devs[i]);
+                snprintf(d->items[i], sizeof(d->items[i]), "%s", nm[0] ? nm : "??");
+            }
+        } else {
+            d->count = 1;
+            snprintf(d->items[0], sizeof(d->items[0]), "%s",
+                     bt_manager_is_scanning() ? "\xe6\xad\xa3\xe5\x9c\xa8\xe6\x89\xab\xe6\x8f\x8f..." /* 正在扫描... */
+                                              : "\xe6\x9c\xaa\xe5\x8f\x91\xe7\x8e\xb0\xe8\xae\xbe\xe5\xa4\x87"); /* 未发现设备 */
+        }
+        if (d->sel >= d->count) d->sel = d->count - 1;
+        ctx->needs_redraw = true;
+    }
+}
+static void open_scan_dialog(ui_ctx_t *ctx) {
+    s_scan_n = 0;
+    bt_manager_enable();   /* 蓝牙默认开机启动: 确保已启用再扫 */
+    bt_manager_start_scan_continuous(gp_on_scan);
+    s_scan_active = true;
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    snprintf(dlg.items[0], sizeof(dlg.items[0]), "%s", "\xe6\xad\xa3\xe5\x9c\xa8\xe6\x89\xab\xe6\x8f\x8f..."); /* 正在扫描... */
+    dlg.count = 1;
+    dlg.sel = 0;
+    dlg.on_poll = scan_dlg_poll;
+    dlg.on_key = scan_dlg_key;
+    dlg.cb = scan_dlg_cb;
+    os_dialog_push(ctx, &dlg);
+    ESP_LOGI(TAG, "蓝牙扫描开始");
+}
+
+/* ---- 按键映射 (3.3 原版: 遍历 10 功能, 提示弹窗"请按下 X 按键", 捕获即自动进入下一个) ---- */
+static int  s_map_func = 0;      /* 当前映射功能索引 (0..FUNC_MAX-1) */
+static bool s_map_active = false;
+
+/* 映射提示弹窗渲染 (3.3 notice 样式: 白底 + 3px 黑边框 + 自适应宽) */
+static bool map_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)d; (void)ud;
+    st7305_handle_t *lcd = ctx->lcd;
+    if (!lcd) return true;
+    char txt[48];
+    if (s_map_func >= 0 && s_map_func < FUNC_MAX)
+        snprintf(txt, sizeof(txt), "\xe8\xaf\xb7\xe6\x8c\x89\xe4\xb8\x8b %s \xe6\x8c\x89\xe9\x94\xae",  /* 请按下 X 按键 */
+                 bt_manager_func_name((func_t)s_map_func));
+    else
+        snprintf(txt, sizeof(txt), "\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84\xe5\xae\x8c\xe6\x88\x90"); /* 按键映射完成 */
+    int tw = text_width(txt);
+    int w = 3 * 2 + 3 * 2 + tw;
+    const int h = 36;
+    int x0 = (UI_SCREEN_W - w) / 2, y0 = (UI_SCREEN_H - h) / 2;
+    fill_rect(lcd, x0, y0, x0 + w - 1, y0 + h - 1, ST7305_COLOR_WHITE);
+    for (int k = 0; k < 3; k++) {
+        draw_hline(lcd, x0 + k, x0 + w - 1 - k, y0 + k, ST7305_COLOR_BLACK);
+        draw_hline(lcd, x0 + k, x0 + w - 1 - k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, x0 + k, y0 + k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, x0 + w - 1 - k, y0 + k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+    }
+    draw_text_centered(lcd, y0 + 6, txt, false);
+    return true;
+}
+
+/* 每帧轮询: 捕获手柄按键, 推进映射 (V1.0.41 起捕获即自动进入下一个) */
+static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)d; (void)ud;
+    if (!s_map_active) return;
+    if (s_map_func < 0 || s_map_func >= FUNC_MAX) return;
+    if (bt_manager_poll_new_press((func_t)s_map_func)) {
+        ESP_LOGI(TAG, "按键映射: [%s] → %s", bt_manager_func_name((func_t)s_map_func),
+                 bt_manager_phys_name(bt_manager_get_key_map((func_t)s_map_func)));
+        s_map_func++;
+        if (s_map_func >= FUNC_MAX) {
+            bt_manager_save_key_map();
+            ESP_LOGI(TAG, "按键映射完成, 已保存到 NVS");
+            s_map_active = false;
+            input_set_gamepad_nav_enabled(true);
+            os_dialog_pop(ctx);   /* 关映射弹窗回手柄主菜单 */
+            os_dialog_toast(ctx, "\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84\xe5\xae\x8c\xe6\x88\x90"); /* 按键映射完成 */
+            return;
+        }
+        bt_manager_poll_new_press_reset();
+        ctx->needs_redraw = true;
+    }
+}
+
+/* 映射弹窗按键: BACK = 取消映射 (保留已完成的), 其余忽略 */
+static bool map_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)d; (void)ud;
+    if (a == OS_ACTION_BACK) {
+        s_map_active = false;
+        input_set_gamepad_nav_enabled(true);
+        os_dialog_pop(ctx);   /* 取消 → 回手柄主菜单 */
+        return true;
+    }
+    return true;   /* 其他键在映射期间一律忽略 */
+}
+
+static void start_key_mapping(ui_ctx_t *ctx) {
+    if (!bt_manager_is_connected()) {
+        os_dialog_toast(ctx, "\xe8\xaf\xb7\xe5\x85\x88\xe8\xbf\x9e\xe6\x8e\xa5\xe6\x89\x8b\xe6\x9f\x84"); /* 请先连接手柄 */
+        return;
+    }
+    s_map_func = 0;
+    s_map_active = true;
+    bt_manager_poll_new_press_reset();
+    input_set_gamepad_nav_enabled(false);   /* 禁用手柄导航, 防干扰映射 */
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    dlg.on_render = map_render;
+    dlg.on_key = map_key;
+    dlg.on_poll = map_poll;
+    os_dialog_push(ctx, &dlg);
+    ESP_LOGI(TAG, "按键映射启动: 请按下 [%s] 对应按键", bt_manager_func_name(F_UP));
+}
+
 /* ---- 主菜单选中回调 ---- */
 static void on_gamepad_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
-    switch (result) {
-    case 0: {  /* 添加设备: 开始扫描 */
+    if (result < 0) { os_pop(ctx); return; }   /* 返回 → 退出手柄页 */
+    int raw = (result >= 0 && result < 6) ? s_gp_map[result] : result;  /* 显示位置 -> 原始case */
+    switch (raw) {
+    case 0: {  /* 添加设备: 扫描蓝牙列表弹窗 (3.3), 确认连接 */
         if (!bt_manager_is_stack_ready()) {
             os_dialog_toast(ctx, "\xe5\x88\x9d\xe5\xa7\x8b\xe5\x8c\x96\xe4\xb8\xad"); /* 初始化中 */
             break;
         }
-        s_scan_n = 0; s_scan_active = true;
-        bt_manager_start_scan_continuous(gp_on_scan);
-        os_dialog_toast(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe6\x89\xab\xe6\x8f\x8f..."); /* 正在扫描... */
+        open_scan_dialog(ctx);
         break;
     }
-    case 1:  /* 按键映射: 占位 (完整映射流程后续) */
-        os_dialog_toast(ctx, "\xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad"); /* 开发中 */
+    case 1:  /* 按键映射 (3.3 原版流程) */
+        start_key_mapping(ctx);
         break;
     case 2:  /* 连接记录 */
         open_hist_dialog(ctx);
         break;
-    case 3: {  /* 设备信息 */
-        os_dlg_stack_t dlg;
-        memset(&dlg, 0, sizeof(dlg));
-        snprintf(dlg.title, sizeof(dlg.title), "\xe8\xae\xbe\xe5\xa4\x87\xe4\xbf\xa1\xe6\x81\xaf");
-        dlg.count = 0;
-        dlg.on_render = btinfo_dlg_render;
-        os_dialog_push(ctx, &dlg);
+    case 3: {  /* 设备信息: 列表弹窗 (只读) */
+        char lines[8][40];
+        int n = 0;
+        const btm_conn_info_t *info = bt_manager_get_conn_info();
+        if (info && info->available && bt_manager_is_connected()) {
+            char btmp[16];
+            snprintf(lines[n++], 40, "\xe5\x90\x8d\xe7\xa7\xb0: %s", info->name[0] ? info->name : "?");   /* 名称 */
+            snprintf(lines[n++], 40, "\xe5\x9e\x8b\xe5\x8f\xb7: %s", info->model[0] ? info->model : "?");  /* 型号 */
+            gp_batt_str(info->battery, btmp, sizeof(btmp));
+            snprintf(lines[n++], 40, "\xe7\x94\xb5\xe9\x87\x8f: %s", btmp);  /* 电量 */
+            snprintf(lines[n++], 40, "VID: 0x%02X%02X", info->vid >> 8, info->vid & 0xFF);
+            snprintf(lines[n++], 40, "PID: 0x%02X%02X", info->pid >> 8, info->pid & 0xFF);
+        } else {
+            snprintf(lines[n++], 40, "\xe6\x9c\xaa\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xbe\xe5\xa4\x87");  /* 未连接设备 */
+        }
+        EXT_RAM_BSS_ATTR static char items[8][40];
+        static const char *ptrs[8];
+        for (int i = 0; i < n; i++) {
+            snprintf(items[i], sizeof(items[i]), "%s", lines[i]);
+            ptrs[i] = items[i];
+        }
+        os_dialog_list(ctx, "", ptrs, n, -1, btinfo_noop, NULL);
         break;
     }
     case 4: {  /* WiFi 手柄切换 */
@@ -140,7 +280,7 @@ static void on_gamepad_select(ui_ctx_t *ctx, int result, void *ud) {
         }
         break;
     }
-    case 5:  /* 返回 */
+    case 5:  /* 返回 (底部固定返回行一般走 result<0; 此项兜底) */
         os_pop(ctx);
         break;
     default: break;
@@ -149,7 +289,15 @@ static void on_gamepad_select(ui_ctx_t *ctx, int result, void *ud) {
 
 static void p_gamepad_enter(ui_ctx_t *ctx) {
     (void)ctx;
-    os_dialog_list(ctx, "\xe6\x89\x8b\xe6\x9f\x84\xe9\x85\x8d\xe7\xbd\xae", s_gp_items, 6, 0,
+    bool conn = bt_manager_is_connected();
+    int count = 0;
+    for (int src = 0; src < 6; src++) {
+        if (src == 3 && !conn) continue;   /* 未连接设备: 隐藏"设备信息" */
+        s_gp_items_dyn[count] = s_gp_items[src];
+        s_gp_map[count] = src;
+        count++;
+    }
+    os_dialog_list(ctx, "\xe6\x89\x8b\xe6\x9f\x84\xe9\x85\x8d\xe7\xbd\xae", s_gp_items_dyn, count, 0,
                    on_gamepad_select, NULL);
 }
 

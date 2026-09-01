@@ -57,6 +57,20 @@ void usb_hid_mouse_click(uint8_t buttons);
 void usb_hid_mouse_press(uint8_t buttons);
 void usb_hid_mouse_release(uint8_t buttons);
 
+/* === CDC 串口 (复合设备附加: HID 键鼠 + CDC 串口同时工作) === */
+
+/* PC 通过串口发来数据的回调 (TinyUSB tud_task 上下文, 应尽快消费或拷贝) */
+typedef void (*usb_hid_cdc_rx_cb_t)(const uint8_t *data, size_t len);
+
+/* 注册 CDC 接收回调 (可传 NULL 取消) */
+void usb_hid_cdc_set_rx_cb(usb_hid_cdc_rx_cb_t cb);
+
+/* 发送数据到 PC CDC 串口. 返回实际写入字节数; 未运行/未连接返回 0. */
+size_t usb_hid_cdc_write(const uint8_t *data, size_t len);
+
+/* CDC 串口是否已连接 (PC 打开该串口后) */
+bool usb_hid_cdc_connected(void);
+
 #ifdef __cplusplus
 }
 #endif

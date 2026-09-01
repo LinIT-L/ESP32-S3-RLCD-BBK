@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define WB_W      ST7305_WIDTH          /* 400 */
@@ -32,7 +33,7 @@
 #define WB_ICON_N  13
 #define WB_ROW_H   (WB_CANV_H/(WB_TOOL_N+1))
 
-#define WB_STK     10
+#define WB_STK     10     /* 撤销/重做层数上限 (命令日志 + 单张快照) */
 
 enum { WB_PEN, WB_MARK, WB_ERAS, WB_LINE, WB_RECT, WB_OVAL };
 
@@ -105,9 +106,28 @@ static const uint8_t s_icon[WB_ICON_N][60] = {
 };
 
 EXT_RAM_BSS_ATTR static uint8_t s_canvas[WB_BYTES];
-EXT_RAM_BSS_ATTR static uint8_t s_undo[WB_STK][WB_BYTES];
-EXT_RAM_BSS_ATTR static uint8_t s_redo[WB_STK][WB_BYTES];
-static int  s_undo_n = 0, s_redo_n = 0;
+/* ==== 撤销/重做: 命令日志 + 单张基线快照 ====
+ * 旧实现用 s_undo/s_redo 各 10 层 × 整幅位图 = 300KB PSRAM.
+ * 改为命令日志式: 每步只记录"参数命令"(WB_CMD_*, 工具/笔粗/坐标点, 十几字节),
+ * 攒够 WB_LOG_N=24 步就把当前画布压缩成唯一基线快照 s_snap(15KB) 并清空日志
+ * (即"超过多少步就截图一次"). 撤销/重做 = 从快照复制 + 重放命令.
+ * 内存: 300KB → ~15KB(快照) + 24×命令(约1KB) + 笔迹点缓冲. */
+#define WB_LOG_N  24
+#define WB_PT_CAP (WB_LOG_N * 64)   /* 笔迹点上限 (每点 x,y 各1B) */
+typedef struct {
+    uint8_t type;     /* WB_CMD_* */
+    uint8_t tool;     /* WB_* 工具 */
+    uint8_t size;     /* 笔粗/尺寸 */
+    uint8_t n;        /* FREE: 总点数 (>=2) */
+    uint16_t pts_idx; /* FREE: 笔迹点在 s_pts 中的起始下标 */
+    int16_t x0, y0;   /* FREE: 首个点; SHAPE: 起点 */
+    int16_t x1, y1;   /* FREE: 末个点; SHAPE: 终点 */
+} wb_cmd_t;
+EXT_RAM_BSS_ATTR static uint8_t  s_snap[WB_BYTES];     /* 唯一基线快照 */
+EXT_RAM_BSS_ATTR static wb_cmd_t s_ulog[WB_LOG_N];     /* 撤销命令日志 */
+EXT_RAM_BSS_ATTR static wb_cmd_t s_rlog[WB_LOG_N];     /* 重做命令日志 */
+EXT_RAM_BSS_ATTR static uint8_t  s_pts[WB_PT_CAP];     /* FREE 笔迹点 (x,y,x,y,...) */
+static int  s_ulog_n = 0, s_rlog_n = 0, s_pts_n = 0;
 
 static int  s_tool  = WB_PEN;
 static int  s_size  = 1;
@@ -118,20 +138,13 @@ static int  s_ax, s_ay;
 static bool s_full  = true;
 static bool s_inited = false;
 
-static char   s_toast[22] = {0};
-static uint32_t s_toast_ms = 0;
 static int   s_top_press = -1;
-static bool  s_exitask = false;
 
 #define WB_FILE_MAX 40
 EXT_RAM_BSS_ATTR static int    s_nfiles;
 EXT_RAM_BSS_ATTR static char   s_names[WB_FILE_MAX][36];
 EXT_RAM_BSS_ATTR static char   s_paths[WB_FILE_MAX][64];
 EXT_RAM_BSS_ATTR static char   s_cur[64];
-static bool   s_load    = false;
-static int    s_lsel    = 0;
-static bool   s_delask  = false;
-static int    s_deln    = 0;
 
 /* ================= 通用绘制 ================= */
 static void px(st7305_handle_t *l, int x, int y, st7305_color_t c) {
@@ -201,22 +214,59 @@ static void wb_outline_ellipse(st7305_handle_t *l, int cx, int cy, int rx, int r
     }
 }
 
-/* ================= 撤销/重做 ================= */
-static void push_undo(void) {
-    if (s_undo_n < WB_STK) memcpy(s_undo[s_undo_n++], s_canvas, WB_BYTES);
-    else { memmove(s_undo[0], s_undo[1], (WB_STK-1)*WB_BYTES); memcpy(s_undo[WB_STK-1], s_canvas, WB_BYTES); }
-    s_redo_n = 0;
+/* ================= 撤销/重做 (命令日志 + 单张基线快照) ================= */
+#define WB_CMD_CLEAR  0   /* 清屏 */
+#define WB_CMD_FREE   1   /* 自由笔/标记/橡皮: 记录笔迹点列 */
+#define WB_CMD_SHAPE  2   /* 直线/矩形/椭圆 */
+
+/* 重放一条命令到 (内存) 画布. FREE 逐段连线; SHAPE 按工具绘制. */
+static void wb_replay_cmd(st7305_handle_t *l, const wb_cmd_t *c, int fade) {
+    (void)fade;
+    if (c->type == WB_CMD_CLEAR) { memset(s_canvas, 0, WB_BYTES); return; }
+    if (c->type == WB_CMD_FREE) {
+        int r = c->size ? c->size : 1;
+        int on = (c->tool == WB_ERAS) ? 0 : 1;
+        int px = c->x0, py = c->y0;
+        if (c->n >= 1) { wb_disk(l, c->x0, c->y0, c->tool==WB_MARK ? r*2 : r, on); }
+        for (int i = 1; i < (int)c->n; i++) {
+            int x = s_pts[(c->pts_idx + i)*2 + 0];
+            int y = s_pts[(c->pts_idx + i)*2 + 1];
+            int rr = (c->tool==WB_MARK) ? r*2 : r;
+            wb_line(l, px, py, x, y, rr, on);
+            px = x; py = y;
+        }
+        return;
+    }
+    /* SHAPE */
+    int x0=c->x0, y0=c->y0, x1=c->x1, y1=c->y1;
+    if (c->tool == WB_LINE)      wb_line(l, x0,y0, x1,y1, 1, 1);
+    else if (c->tool == WB_RECT) {
+        int lx=x0<x1?x0:x1, rx=x0<x1?x1:x0, ty=y0<y1?y0:y1, by=y0<y1?y1:y0;
+        wb_line(l,lx,ty,rx,ty,1,1); wb_line(l,lx,by,rx,by,1,1);
+        wb_line(l,lx,ty,lx,by,1,1); wb_line(l,rx,ty,rx,by,1,1);
+    } else if (c->tool == WB_OVAL) {
+        int dx=x1-x0, dy=y1-y0; if(dx<0)dx=-dx; if(dy<0)dy=-dy;
+        int rx=dx/2+1, ry=dy/2+1, cx=(x0+x1)/2, cy=(y0+y1)/2;
+        wb_outline_ellipse(l, cx,cy, rx,ry);
+    }
 }
+
+/* 把画布从 [snap + 前 n 条命令] 重放重建 */
+static void wb_rebuild(st7305_handle_t *l, int n) {
+    memcpy(s_canvas, s_snap, WB_BYTES);
+    for (int i = 0; i < n; i++) wb_replay_cmd(l, &s_ulog[i], 0);
+}
+
 static void wb_undo(ui_ctx_t *ctx) {
-    if (s_undo_n <= 0) return;
-    if (s_redo_n < WB_STK) memcpy(s_redo[s_redo_n++], s_canvas, WB_BYTES);
-    memcpy(s_canvas, s_undo[--s_undo_n], WB_BYTES);
+    if (s_ulog_n <= 0) return;
+    s_rlog[s_rlog_n++] = s_ulog[--s_ulog_n];   /* 被撤销命令转入 redo 日志 */
+    wb_rebuild(ctx->lcd, s_ulog_n);
     s_down = false; s_full = true; ctx->needs_redraw = true;
 }
 static void wb_redo(ui_ctx_t *ctx) {
-    if (s_redo_n <= 0) return;
-    if (s_undo_n < WB_STK) memcpy(s_undo[s_undo_n++], s_canvas, WB_BYTES);
-    memcpy(s_canvas, s_redo[--s_redo_n], WB_BYTES);
+    if (s_rlog_n <= 0) return;
+    s_ulog[s_ulog_n++] = s_rlog[--s_rlog_n];   /* 命令放回撤销日志 */
+    wb_replay_cmd(ctx->lcd, &s_ulog[s_ulog_n-1], 0);
     s_down = false; s_full = true; ctx->needs_redraw = true;
 }
 
@@ -260,12 +310,6 @@ static int in_tool_col(int x, int y) { return (x < WB_TB_W && y >= WB_TOP_H && y
 static int op_btn(int x) { int w = (WB_W + WB_OP_N-1)/WB_OP_N; int i = x / w; return (i >= WB_OP_N) ? WB_OP_N-1 : i; }
 static int tool_slot_btn(int y) { int i = (y - WB_TOP_H) / WB_ROW_H; return (i >= WB_TOOL_N+1) ? WB_TOOL_N : i; }
 
-static void toast(const char *s) {
-    strncpy(s_toast, s, sizeof(s_toast)-1);
-    s_toast[sizeof(s_toast)-1] = 0;
-    s_toast_ms = (uint32_t)(esp_timer_get_time()/1000);
-}
-
 static void wb_open_loader(ui_ctx_t *ctx);
 static bool wb_bmp_write(const char *path);
 static void wb_new_name(char *out);
@@ -277,11 +321,17 @@ static void handle_op(int op, ui_ctx_t *ctx) {
     switch (op) {
         case 0: wb_undo(ctx); return;
         case 1: wb_redo(ctx); return;
-        case 2: push_undo(); memset(s_canvas, 0, WB_BYTES); s_full = true; break;
+        case 2: {   /* 清屏: 记录 CLEAR 命令 (可撤销) */
+            wb_cmd_t c; memset(&c, 0, sizeof(c));
+            c.type = WB_CMD_CLEAR;
+            if (s_ulog_n < WB_LOG_N) s_ulog[s_ulog_n++] = c;
+            memset(s_canvas, 0, WB_BYTES);
+            s_full = true; break;
+        }
         case 3:
             wb_new_name(s_cur);
-            if (wb_bmp_write(s_cur)) toast("\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98"); /* 已保存 */
-            else                    toast("\xe6\x97\xa0TF\xe5\x8d\xa1");           /* 无TF卡 */
+            if (wb_bmp_write(s_cur)) os_dialog_toast(ctx, "\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98"); /* 已保存 */
+            else                    os_dialog_toast(ctx, "\xe6\x97\xa0TF\xe5\x8d\xa1");           /* 无TF卡 */
             break;
         case 4: wb_open_loader(ctx); return;
         default: break;
@@ -290,11 +340,14 @@ static void handle_op(int op, ui_ctx_t *ctx) {
 }
 
 /* ================= 保存/加载 (1-bit BMP) ================= */
-#define WB_DIR   "/sdcard"
+#define WB_DIR   "/sdcard/App/\xe5\x9b\xbe\xe7\x89\x87"   /* 画布目录: App/图片 (TF) */
 static const int s_bmp_off = 0x3E;
 
 static bool wb_bmp_write(const char *path) {
     if (!sd_is_mounted()) return false;
+    /* 确保画布目录存在 (挂载时已建, 这里防 TF 卡被换/目录被删) */
+    mkdir("/sdcard/App", 0755);
+    mkdir("/sdcard/App/\xe5\x9b\xbe\xe7\x89\x87", 0755);
     FILE *f = fopen(path, "wb");
     if (!f) return false;
     int stride = ((WB_W + 31) / 32) * 4;
@@ -348,7 +401,9 @@ static bool wb_bmp_read(const char *path) {
             if (!((line[x>>3] >> (7-(x&7))) & 1)) row[x>>3] |= (uint8_t)(0x80u >> (x&7));
     }
     fclose(f);
-    s_undo_n = 0; s_redo_n = 0;
+    /* 加载新画布: 基线快照 = 新图, 清空命令日志 */
+    memcpy(s_snap, s_canvas, WB_BYTES);
+    s_ulog_n = 0; s_rlog_n = 0; s_pts_n = 0;
     return true;
 }
 static int wb_file_seq(const char *base) {
@@ -397,101 +452,65 @@ static void wb_new_name(char *out) {
     snprintf(out, 64, "%s/wb%02d%02d%04d.bmp", WB_DIR, t->tm_hour, t->tm_min, seq);
 }
 
-/* ================= 加载列表模态 ================= */
-#define LD_X0    8
-#define LD_Y0    (WB_TOP_H + 4)
-#define LD_YB    294
-#define LD_TITLE_H 28
-#define LD_ROW    26
-
+/* ================= 数据操作 ================= */
 static void wb_do_load(int idx) {
     if (wb_bmp_read(s_paths[idx])) strcpy(s_cur, s_paths[idx]);
-    s_load = false; s_delask = false;
 }
 static void wb_del_entry(int idx) {
     if (idx < 0 || idx >= s_nfiles) return;
     unlink(s_paths[idx]);
     if (strcmp(s_paths[idx], s_cur) == 0) s_cur[0] = 0;
     wb_list();
-    if (s_lsel >= s_nfiles) s_lsel = s_nfiles > 0 ? s_nfiles - 1 : 0;
-    s_delask = false;
 }
 
+/* ================= 加载列表 (统一列表模板, 长按1秒删除) ================= */
+static void wb_load_refresh(ui_ctx_t *ctx);
+static void wb_del_confirm_cb(ui_ctx_t *ctx, int result, void *ud) {
+    int idx = (int)(intptr_t)ud;
+    os_dialog_pop(ctx);                 /* 关确认弹窗 → 回加载列表 */
+    if (result == 0 && idx >= 0 && idx < s_nfiles) wb_del_entry(idx);
+    wb_load_refresh(ctx);               /* 覆盖顶层(加载列表)刷新 */
+}
+static bool wb_load_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)ud;
+    if (a == OS_ACTION_LONG_PRESS) {
+        /* 长按/点击删除× → 立即弹出小巧自适应确认弹窗: 删除该白板 / 取消
+         * (长按已由 dlg 每帧即时检测, 手指按住期间即弹出, 不须松手.) */
+        if (d->sel >= 0 && d->sel < s_nfiles) {
+            os_dialog_confirm_ex(ctx, "\xe5\x88\xa0\xe9\x99\xa4\xe8\xaf\xa5\xe7\x99\xbd\xe6\x9d\xbf?", /* 删除该白板? */
+                                 0, 0, wb_del_confirm_cb, (void *)(intptr_t)d->sel);
+        }
+        return true;
+    }
+    return false;
+}
+static void wb_load_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result < 0) return;          /* 返回 → 保持白板 */
+    if (result < s_nfiles) { wb_do_load(result); ctx->needs_redraw = true; }  /* 载入选中存档 */
+}
+static void wb_load_refresh(ui_ctx_t *ctx) {
+    wb_list();
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    for (int i = 0; i < s_nfiles; i++)
+        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", s_names[i]);
+    dlg.count = s_nfiles;
+    dlg.sel = 0;
+    dlg.on_key = wb_load_key;
+    dlg.cb = wb_load_cb;
+    dlg.row_x = true;   /* 每行最右侧显示删除×, 点击× 弹删除确认; 长按行即时删除确认 */
+    if (os_dialog_depth() > 0) os_dialog_pop(ctx);   /* 覆盖当前层(加载列表)时先弹栈, 层级不加深 */
+    os_dialog_push(ctx, &dlg);                       /* 栈空自动转 push, 打开加载列表 */
+}
 static void wb_open_loader(ui_ctx_t *ctx) {
     wb_list();
-    if (s_nfiles == 0) { toast("\xe6\x97\xa0\xe5\xad\x98\xe6\xa1\xa3"); ctx->needs_redraw = true; return; } /* 无存档 */
-    s_top_press = -1; s_lsel = 0; s_load = true; s_delask = false;
-    ctx->needs_redraw = true;
-}
-
-static void wb_draw_loader(st7305_handle_t *l) {
-    int bx = LD_X0, ty0 = LD_Y0;
-    filr(l, bx-2, ty0-2, WB_W-8+2, LD_YB, ST7305_COLOR_WHITE);
-    outline(l, bx-2, ty0-2, WB_W-8+2, LD_YB);
-    wb_draw_zh(l, bx, ty0, "\xe6\x89\x93\xe5\xbc\x80\xe7\x99\xbd\xe6\x9d\xbf", ST7305_COLOR_BLACK); /* 打开白板 */
-    int y0 = ty0 + LD_TITLE_H, rows = (LD_YB - y0) / LD_ROW;
-    int shown = s_nfiles < rows ? s_nfiles : rows;
-    for (int i = 0; i < shown; i++) {
-        int yy = y0 + i*LD_ROW;
-        if (i == s_lsel) {
-            filr(l, bx-2, yy-1, WB_W-8, yy+LD_ROW-5, ST7305_COLOR_BLACK);
-            wb_draw_zh(l, bx, yy, s_names[i], ST7305_COLOR_WHITE);
-        } else {
-            wb_draw_zh(l, bx, yy, s_names[i], ST7305_COLOR_BLACK);
-        }
+    if (s_nfiles == 0) {
+        os_dialog_toast(ctx, "\xe6\x97\xa0\xe5\xad\x98\xe6\xa1\xa3"); /* 无存档 */
+        ctx->needs_redraw = true;
+        return;
     }
-    wb_draw_zh(l, bx, LD_YB - 26, "\xe9\x95\xbf\xe6\x8c\x89\xe5\x88\xa0\xe9\x99\xa4 / \xe8\xbf\x94\xe5\x9b\x9e\xe5\x8f\x96\xe6\xb6\x88", ST7305_COLOR_BLACK); /* 长按删除 / 返回取消 */
-    if (s_delask) {
-        const char *tk = "\xe5\x88\xa0\xe9\x99\xa4\xe8\xaf\xa5\xe7\x99\xbd\xe6\x9d\xbf?"; /* 删除该白板? */
-        const char *sy = "\xe5\x88\xa0\xe9\x99\xa4", *no = "\xe5\x8f\x96\xe6\xb6\x88"; /* 删除/取消 */
-        int w = wb_zh_w(tk) + 24;
-        int x0 = (WB_W-w)/2, x1 = x0+w-1;
-        int ay0 = 128, ay1 = 188;
-        filr(l, x0, ay0, x1, ay1, ST7305_COLOR_WHITE);
-        outline(l, x0, ay0, x1, ay1);
-        wb_draw_zh(l, (WB_W-wb_zh_w(tk))/2, ay0+8, tk, ST7305_COLOR_BLACK);
-        int bx0 = x0+10, bwx = (w-40-10)/2;
-        filr(l, bx0, ay1-34, bx0+bwx-1, ay1-6, ST7305_COLOR_BLACK);
-        wb_draw_zh(l, bx0+(bwx-wb_zh_w(sy))/2, ay1-30, sy, ST7305_COLOR_WHITE);
-        int bx1 = x0+w-10-bwx;
-        outline(l, bx1, ay1-34, bx1+bwx-1, ay1-6);
-        wb_draw_zh(l, bx1+(bwx-wb_zh_w(no))/2, ay1-30, no, ST7305_COLOR_BLACK);
-    }
-}
-
-static void wb_loader_touch(ui_ctx_t *ctx) {
-    int tx, ty; bool down = input_get_touch_pos(&tx, &ty);
-    static bool last = false; static int ox = 0, oy = 0;
-    int y0 = LD_Y0 + LD_TITLE_H, rows = (LD_YB - y0) / LD_ROW;
-    if (!down) {
-        if (last) {
-            if (s_delask) {
-                const char *tk = "\xe5\x88\xa0\xe9\x99\xa4\xe8\xaf\xa5\xe7\x99\xbd\xe6\x9d\xbf?";
-                int w = wb_zh_w(tk) + 24, x0 = (WB_W-w)/2, x1 = x0+w-1;
-                int ay0 = 128, ay1 = 188, bw = (w-50)/2;
-                int bx0 = x0+10, bx1 = x1-10-bw;
-                if (oy >= ay1-38 && oy <= ay1) {
-                    if (ox >= bx0 && ox <= bx0+bw) { wb_del_entry(s_deln); }
-                    else if (ox >= bx1 && ox <= bx1+bw) { s_delask = false; }
-                }
-            } else {
-                int row = (oy - y0) / LD_ROW;
-                int shown = s_nfiles < rows ? s_nfiles : rows;
-                if (row >= 0 && row < shown) { s_lsel = row; wb_do_load(row); }
-            }
-            ctx->needs_redraw = true;
-        }
-        last = false; return;
-    }
-    if (!last) { ox = tx; oy = ty; last = true; }
-    else if (!s_delask) {
-        uint32_t hold = input_touch_hold_ms();
-        if (hold >= 800) {
-            int row = (oy - y0) / LD_ROW;
-            int shown = s_nfiles < rows ? s_nfiles : rows;
-            if (row >= 0 && row < shown) { s_deln = row; s_lsel = row; s_delask = true; ctx->needs_redraw = true; }
-        }
-    }
+    wb_load_refresh(ctx);   /* 列表模板: 列出已保存白板, 点选加载, 长按删除, 底部返回 */
 }
 
 /* ================= 渲染 ================= */
@@ -515,16 +534,6 @@ static int wb_draw_zh(st7305_handle_t *l, int x, int y, const char *str, st7305_
         cx+=24;
     }
     return cx-x;
-}
-
-static void wb_draw_exitask(st7305_handle_t *l) {
-    const char *t = "\xe9\x80\x80\xe5\x87\xba\xe7\x94\xbb\xe6\x9d\xbf\xef\xbc\x9f"; /* 退出画板？ */
-    int lw = wb_zh_w(t);
-    int x0 = (WB_W-lw)/2 - 6, x1 = (WB_W+lw)/2 + 6;
-    int y0 = 138, y1 = y0 + 24 + 6;
-    filr(l, x0, y0, x1, y1, ST7305_COLOR_WHITE);
-    outline(l, x0, y0, x1, y1);
-    wb_draw_zh(l, (WB_W-lw)/2, y0+3, t, ST7305_COLOR_BLACK);
 }
 
 static void wb_draw_topbar(st7305_handle_t *l) {
@@ -564,17 +573,6 @@ static void wb_draw_toolcol(st7305_handle_t *l) {
     }
 }
 
-static void wb_draw_toast(st7305_handle_t *l) {
-    if (!s_toast[0]) return;
-    uint32_t now = (uint32_t)(esp_timer_get_time()/1000);
-    if (now - s_toast_ms > 1000) { s_toast[0] = 0; return; }
-    int lw = wb_zh_w(s_toast);
-    int x = (WB_W-lw)/2, y = 138, h = 24;
-    filr(l, x-6, y-4, x+lw+6, y+h+2, ST7305_COLOR_WHITE);
-    outline(l, x-6, y-4, x+lw+6, y+h+2);
-    wb_draw_zh(l, x, y, s_toast, ST7305_COLOR_BLACK);
-}
-
 static void wb_icon(st7305_handle_t *l, int n, int ox, int oy, int inv) {
     const uint8_t *p = s_icon[n];
     for (int y = 0; y < 20; y++)
@@ -592,9 +590,6 @@ static void p_wb_render(ui_ctx_t *ctx) {
     st7305_blit_1bit(l, 0, 0, WB_W, WB_H, s_canvas);
     wb_draw_topbar(l);
     wb_draw_toolcol(l);
-    wb_draw_toast(l);
-    if (s_exitask) wb_draw_exitask(l);
-    else if (s_load) wb_draw_loader(l);
 }
 
 /* ================= 模块接口 ================= */
@@ -602,14 +597,12 @@ static void wb_reset(ui_ctx_t *ctx) {
     input_set_swipe_back(false);
     if (!s_inited) {
         memset(s_canvas, 0, WB_BYTES);
-        memset(s_undo, 0, sizeof(s_undo));
-        memset(s_redo, 0, sizeof(s_redo));
+        memcpy(s_snap, s_canvas, WB_BYTES);   /* 基线快照 = 空画布 */
         s_inited = true;
     }
     s_tool = WB_PEN; s_size = 1;
     s_down = false; s_free = false;
-    s_undo_n = 0; s_redo_n = 0;
-    s_load = false; s_delask = false; s_exitask = false;
+    s_ulog_n = 0; s_rlog_n = 0; s_pts_n = 0;
     s_cur[0] = 0;
     wb_list();
     if (s_nfiles > 0) {
@@ -617,6 +610,7 @@ static void wb_reset(ui_ctx_t *ctx) {
         wb_bmp_read(s_cur);
     } else {
         memset(s_canvas, 0, WB_BYTES);
+        memcpy(s_snap, s_canvas, WB_BYTES);
     }
     ctx->needs_redraw = true;
 }
@@ -634,34 +628,14 @@ static bool p_wb_touch(ui_ctx_t *ctx, int x, int y) {
 }
 
 static void p_wb_action(ui_ctx_t *ctx, os_action_t a) {
-    if (s_exitask) {
-        /* 确认退出浮层: 确认=退出, 返回/取消=关闭 */
-        if (a == OS_ACTION_CONFIRM) { s_exitask = false; os_pop(ctx); return; }
-        if (a == OS_ACTION_BACK || a == OS_ACTION_HOME) { s_exitask = false; ctx->needs_redraw = true; return; }
-        return;
-    }
-    if (s_load) {
-        if (s_delask) {
-            if (a == OS_ACTION_CONFIRM) { wb_del_entry(s_deln); }
-            else if (a == OS_ACTION_BACK || a == OS_ACTION_HOME) { s_delask = false; }
-        } else {
-            switch (a) {
-                case OS_ACTION_UP:    if (s_lsel > 0) s_lsel--; break;
-                case OS_ACTION_DOWN:  if (s_lsel < s_nfiles-1) s_lsel++; break;
-                case OS_ACTION_CONFIRM: wb_do_load(s_lsel); break;
-                case OS_ACTION_BACK:  s_load = false; break;
-                default: break;
-            }
-        }
-        ctx->needs_redraw = true;
-        return;
-    }
+    /* 全屏页返回退出已由 os_core 统一弹「退出程序?」确认 (os_dialog_confirm_ex);
+     * 加载列表/删除确认/提示 toast 均已走 os_dialog, 此处只处理绘图按键. */
     switch (a) {
         case OS_ACTION_RIGHT: s_tool = (s_tool+1) % WB_TOOL_N; break;
         case OS_ACTION_LEFT:  s_tool = (s_tool==0) ? WB_TOOL_N-1 : s_tool-1; break;
         case OS_ACTION_UP:    s_size = (s_size >= 6) ? 6 : s_size+1; break;
         case OS_ACTION_DOWN:  s_size = (s_size <= 1) ? 1 : s_size-1; break;
-        case OS_ACTION_BACK:  s_exitask = true; break;   /* 返回: 确认退出浮层 */
+        case OS_ACTION_BACK:  break;   /* 交给 os_core: 全屏页弹出退出确认 */
         default: break;
     }
     ctx->needs_redraw = true;
@@ -669,12 +643,27 @@ static void p_wb_action(ui_ctx_t *ctx, os_action_t a) {
 
 static void p_wb_poll(ui_ctx_t *ctx) {
     int tx, ty;
-    if (s_exitask) return;
-    if (s_load)    { wb_loader_touch(ctx); return; }
     bool down = input_get_touch_pos(&tx, &ty);
 
     if (!down) {
-        if (s_down && !s_free) { commit_shape(ctx->lcd); ctx->needs_redraw = true; }
+        if (s_down && !s_free) {   /* 几何图形松手: 正式绘制 + 记录 SHAPE 命令 */
+            commit_shape(ctx->lcd);
+            /* 记录参数命令: 这一步怎么画的 (撤销/重做用) */
+            wb_cmd_t c;
+            memset(&c, 0, sizeof(c));
+            c.type = WB_CMD_SHAPE; c.tool = (uint8_t)s_tool;
+            c.x0 = (int16_t)s_ax; c.y0 = (int16_t)s_ay;
+            c.x1 = (int16_t)s_lx; c.y1 = (int16_t)s_ly;
+            if (s_ulog_n < WB_LOG_N) { s_ulog[s_ulog_n++] = c; }
+            ctx->needs_redraw = true;
+        }
+        if (s_free && s_down) {   /* 自由笔松手: 正式提交本条 FREE 命令 */
+            wb_cmd_t *c = &s_ulog[s_ulog_n];
+            if (c->n > 0) { s_ulog_n++; }   /* 只有真的有点才算一步 */
+            /* 步数攒够阈值 → 压缩成唯一基线快照 (超过多少步就截图一次) */
+            if (s_ulog_n >= WB_LOG_N) { memcpy(s_snap, s_canvas, WB_BYTES); s_ulog_n = 0; s_rlog_n = 0; s_pts_n = 0; }
+            ctx->needs_redraw = true;
+        }
         if (s_top_press >= 0) { s_top_press = -1; ctx->needs_redraw = true; }
         s_down = false;
         return;
@@ -700,13 +689,40 @@ static void p_wb_poll(ui_ctx_t *ctx) {
         s_down = true;
         s_free = (s_tool==WB_PEN || s_tool==WB_MARK || s_tool==WB_ERAS);
         s_ax = s_lx = tx; s_ay = s_ly = ty;
-        if (s_free) { push_undo(); wb_disk(ctx->lcd, tx, ty, tool_radius(), tool_on()); ctx->needs_redraw = true; }
+        if (s_free) {
+            /* 落笔: 记录一条 FREE 命令 (首点入点缓冲), 之后 move 持续追加点 */
+            if (s_ulog_n < WB_LOG_N) {
+                wb_cmd_t *c = &s_ulog[s_ulog_n];
+                c->type = WB_CMD_FREE; c->tool = (uint8_t)s_tool;
+                c->size = (uint8_t)s_size; c->n = 0;
+                c->pts_idx = (uint16_t)s_pts_n;
+                c->x0 = (int16_t)tx; c->y0 = (int16_t)ty;
+                c->x1 = (int16_t)tx; c->y1 = (int16_t)ty;
+                if (s_pts_n + 2 <= WB_PT_CAP) {
+                    s_pts[s_pts_n++] = (uint8_t)tx; s_pts[s_pts_n++] = (uint8_t)ty;
+                    c->n = 1;
+                }
+                /* 满一条即最后收尾时 s_ulog_n++ */
+            }
+            wb_disk(ctx->lcd, tx, ty, tool_radius(), tool_on());
+            ctx->needs_redraw = true;
+        }
         return;
     }
     if (tx < WB_TB_W || ty < WB_TOP_H || ty >= WB_H) return;
     if (s_free) {
         if (tx==s_lx && ty==s_ly) return;
         wb_line(ctx->lcd, s_lx,s_ly, tx,ty, tool_radius(), tool_on());
+        /* 追加当前点到 FREE 命令的点序列 */
+        if (s_ulog_n < WB_LOG_N) {
+            wb_cmd_t *c = &s_ulog[s_ulog_n];
+            if ((int)c->n > 0 && (int)(c->pts_idx + c->n*2) + 2 <= WB_PT_CAP) {
+                s_pts[c->pts_idx + c->n*2 + 0] = (uint8_t)tx;
+                s_pts[c->pts_idx + c->n*2 + 1] = (uint8_t)ty;
+                c->n = (uint8_t)((int)c->n + 1);
+                c->x1 = (int16_t)tx; c->y1 = (int16_t)ty;
+            }
+        }
         s_lx = tx; s_ly = ty;
         ctx->needs_redraw = true;
     } else {

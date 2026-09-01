@@ -1,13 +1,14 @@
 # Name,   Type, SubType, Offset,  Size, Flags
-# ESP32-S3 16MB Flash — 模块化 OS 存储方案 (2026-08-26 定稿)
+# ESP32-S3 16MB Flash — 模块化 OS 存储方案 (2026-08-26 定稿, 二次瘦身 factory 6MB→4MB)
 # 布局: 单固件区(无OTA) + 统一数据区(系统数据+模拟器数据合并)
-#   factory = 系统固件 6MB (os 内核/驱动/模拟器代码/字库加载器; 更新/网页刷固件只写此)
-#   appdata = 统一数据区 ~9.9MB (永不擦写):
-#              0~4MB      步步高 8.BIN + E.BIN (gam4980 模拟器按偏移读)
-#              4~5.3MB    中文字库 (font_zh 511K + font_zh_light 511K + font_zh16 238K)
-#              5.3~9.9MB  os_db 数据库 + 系统配置 + WASM 应用 + 共享数据
+#   factory = 系统固件 4MB (os 内核/驱动/模拟器代码/字库加载器; 更新/网页刷固件只写此)
+#   appdata = 统一数据区 ~11.9MB (永不擦写):
+#              0~2MB      步步高 8.BIN  (gam4980 词典字库)
+#              2~4MB      步步高 E.BIN  (gam4980 屏幕点阵)
+#              4~8.625MB  字库区 (font_zh/light/16 + book16/24/24hz/32 + lav_font)
+#              8.625~11.875MB os_db 数据库 + 系统配置 + WASM 应用 + 共享数据
 # SubType 0x40 = raw (custom data partition)
 nvs,      data, nvs,     0x9000,  0x8000,
 phy_init, data, phy,     0x11000, 0x1000,
-factory,  app,  factory, 0x20000, 0x600000,
-appdata,  data, 0x40,    0x620000,0x9E0000,
+factory,  app,  factory, 0x20000, 0x400000,
+appdata,  data, 0x40,    0x420000,0xBE0000,

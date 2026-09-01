@@ -17,7 +17,7 @@
 #include <esp_attr.h>
 #include <stdint.h>
 
-#include "make_color.h"
+#include "color_convert.h"
 
 struct lcd *lcd = NULL;
 

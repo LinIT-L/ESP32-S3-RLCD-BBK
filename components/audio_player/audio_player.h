@@ -36,6 +36,13 @@ void audio_player_stop(void);
 void audio_player_set_volume(int percent);
 int  audio_player_get_volume(void);
 
+/* === 统一音量档位 (0-9) ===
+ * 系统设置页与各引擎"引擎优化"共用同一 0-9 档位, 底层换算成 0-100 百分比.
+ * 0 档=静音; 9 档=100%; 每档约 11%. */
+#define AUDIO_VOL_STEPS 10   /* 档位范围 0..9 */
+int  audio_player_vol_to_percent(int step);   /* 0-9 档 -> 0-100 百分比 */
+int  audio_player_vol_to_step(int percent);   /* 0-100 百分比 -> 0-9 档 */
+
 /* V1.0.68: 全局强制静音 (禁用音频). true=彻底关掉所有声音 (音乐 + 游戏引擎 PCM),
  * 停止正在播放的音乐并把编解码器音量拉到 0; false=恢复之前音量. */
 void audio_player_set_muted(bool muted);

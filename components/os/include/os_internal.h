@@ -27,12 +27,18 @@ void os_page_pomodoro_register(void);      /* 番茄钟 */
 void os_page_wallpaper_register(void);     /* 壁纸设置 */
 void os_page_usb_hid_register(void);       /* USB HID 键鼠 */
 void os_page_icon_editor_register(void);   /* 图标编辑器 */
-void os_page_app_manager_register(void);   /* 应用管理 */
+void os_page_app_manager_register(void);   /* 应用管家 (应用管理+商店合并) */
+void os_page_storage_register(void);       /* 存储管理 */
+void os_page_engine_register_all(void);    /* GB/GBC/NES/文曲星/ArduBoy 游戏选择菜单页 */
+void os_page_file_browser_register(void);  /* 文件浏览 */
 void os_page_wifi_kb_register(void);       /* WiFi 虚拟键盘 */
+void wifi_kb_preset_ssid(const char *ssid); /* 列表选网后预填 SSID, 只输密码 */
 void os_page_term_register(void);          /* 终端 (P4) */
 void os_page_wb_register(void);            /* 白板 (P4) */
 void os_page_diag_register(void);          /* 故障诊断 (P4) */
+void os_page_sponsor_register(void);       /* 全屏弹窗 (第5类模板) */
 void os_page_dialog_register(void);        /* 通用弹窗 (modal 覆盖页) */
+void os_page_touchtest_register(void);     /* 多点触控测试工具 */
 
 #ifdef __cplusplus
 }

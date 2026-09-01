@@ -3,7 +3,6 @@ idf_component_register(
     INCLUDE_DIRS "." "include"
     REQUIRES
         st7305
-        menu
         sd_scan
         input
         nvs_flash

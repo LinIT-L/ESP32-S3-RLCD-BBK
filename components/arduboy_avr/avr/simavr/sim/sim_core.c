@@ -29,13 +29,11 @@
 #include "avr_flash.h"
 #include "avr_watchdog.h"
 
-/* 性能关键: 把 AVR 解释器热路径放进 IRAM (SRAM) 执行.
- * avr_run_one 是一个 ~30KB 的巨型 switch, 从 flash 执行会持续击穿指令缓存,
- * 导致每个 AVR 指令平均 ~120 主机周期, 吞吐被锁死在 ~2MHz.
- * 放到 IRAM 后绕过 XIP 缓存抖动, 吞吐可提升数倍. */
+/* 性能关键: AVR 解释器热路径, 但 2026-08 用户决策: 保持放 flash 以省内部 RAM
+ * (avr_run_one 是 ~30KB 巨型 switch, 放 IRAM 会多占内部 RAM). */
 #if defined(__XTENSA__) || defined(CONFIG_IDF_TARGET_ESP32S3)
 #include "esp_attr.h"
-#define AVR_IRAM IRAM_ATTR
+#define AVR_IRAM
 #else
 #define AVR_IRAM
 #endif

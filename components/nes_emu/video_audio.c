@@ -24,7 +24,7 @@
 #include "osd.h"
 
 #include "audio_player.h"
-#include "make_color.h"
+#include "color_convert.h"
 
 /* V1.0.55: 22050 在部分 I2S/ES8311 组合下实际播放偏快 (~26-28kHz),
  * 改回硬件验证过、与 MP3 路径一致的 44100Hz (每帧 44100/60=735 样本). */

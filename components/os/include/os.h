@@ -69,7 +69,11 @@ typedef enum {
     OS_PAGE_WALLPAPER,         /* 壁纸设置 */
     OS_PAGE_POMODORO,          /* 番茄钟 */
     OS_PAGE_USB_HID,           /* USB HID 键鼠 */
-    OS_PAGE_APP_MANAGER,       /* 应用管理 */
+    OS_PAGE_APP_MANAGER,       /* 应用管家 (应用管理+商店合并) */
+    OS_PAGE_STORAGE,           /* 存储管理 (3.3: 浏览/挂载/格式化/信息) */
+    OS_PAGE_GBC_GAME,          /* GBC 游戏 */
+    OS_PAGE_NES_GAME,          /* NES 游戏 */
+    OS_PAGE_ARDUBOY_GAME,      /* ArduBoy 游戏 */
     OS_PAGE_ICON_EDITOR,       /* 图标编辑器 */
     OS_PAGE_DIAGNOSIS,         /* 故障诊断 */
     OS_PAGE_WQX,               /* wqx 文曲星 */
@@ -78,7 +82,9 @@ typedef enum {
     OS_PAGE_WHITEBOARD,        /* 白板 */
     OS_PAGE_TERMINAL,          /* 终端 */
     OS_PAGE_WIFI_KB,           /* WiFi 虚拟键盘 (终端内独立模块) */
+    OS_PAGE_SPONSOR,           /* 全屏弹窗 (第5类模板: 全屏显示, 如收款二维码) */
     OS_PAGE_DIALOG,            /* 通用弹窗 (modal 覆盖页, 由 os_dialog 驱动) */
+    OS_PAGE_TOUCHTEST,         /* 多点触控测试工具 (临时调测) */
     OS_PAGE_COUNT
 } os_page_t;
 
@@ -164,6 +170,13 @@ bool os_modal_active(const ui_ctx_t *ctx);
 /* 当前壁纸程序 id (page_wallpaper 保存; 桌面/屏保渲染用; 0=星空默认). */
 int os_wallpaper_get_program(void);
 
+/* ==== 屏保 (星空壁纸) ====
+ * 桌面空闲超过阈值自动全屏渲染星空 (wp_program_render), 任何输入自动唤醒.
+ * 由 os_mgr 空闲检测置位/复位, os_core 渲染 & 输入唤醒. */
+bool os_screensaver_active(void);
+void os_screensaver_reset(void);
+void os_screensaver_force_enter(void);   /* 锁屏键点按: 强制进入壁纸屏保 */
+
 /* ==== 通用弹窗 (modal 覆盖页) ====
  * 供各页面复用统一弹窗: 列表选择 / 确认框 / 提示 toast.
  * 打开后压入 OS_PAGE_DIALOG (modal), 不退出底层页面; 关闭后自动恢复底层.
@@ -173,29 +186,51 @@ typedef void (*os_dialog_cb_t)(ui_ctx_t *ctx, int result, void *ud);
 void os_dialog_list(ui_ctx_t *ctx, const char *title,
                     const char *const *items, int count, int sel,
                     os_dialog_cb_t cb, void *ud);
-void os_dialog_confirm(ui_ctx_t *ctx, const char *msg, os_dialog_cb_t cb, void *ud);
+void os_dialog_confirm_ex(ui_ctx_t *ctx, const char *msg, uint32_t timeout_ms,
+                          int timeout_result, os_dialog_cb_t cb, void *ud); /* 超时自动完成 */
 void os_dialog_toast(ui_ctx_t *ctx, const char *msg);   /* 1s 自动关闭 */
+void os_dialog_draw_overlay(ui_ctx_t *ctx);             /* 全局顶层 toast 覆盖: os_render flush 前调用 */
 
 /* ==== 弹窗栈 (settings/list_dialog 嵌套弹窗支持) ====
  * os_dialog 内部维护一层弹窗栈: 开子弹窗压栈, 返回弹栈恢复父弹窗原选中位.
- * 自定义渲染/按键 (时间编辑等复杂弹窗) 通过 on_render/on_key 挂接. */
+ * 自定义渲染/按键 (时间编辑等复杂弹窗) 通过 on_render/on_key 挂接.
+ * 嵌套导航: 下一步内容先 os_dialog_pop 弹掉当前层再 os_dialog_push 压入新层 (原地换内容, 不加深层级);
+ * 返回键逐层回退 (上一步), 消除"每个子项单独弹窗"的观感. */
 typedef struct os_dlg_stack os_dlg_stack_t;
 typedef bool (*os_dlg_render_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);
 typedef bool (*os_dlg_key_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud);
+typedef void (*os_dlg_poll_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);   /* 每帧轮询 (按键映射捕获等) */
 struct os_dlg_stack {
     char  title[24];
-    char  items[8][30];
+    char  items[60][30];   /* 列表项 (支持数值选择等长列表, 弹窗栈 4 层共 ~7.2KB) */
     int   count;
     int   sel;
     os_dialog_cb_t cb;
     void *ud;
     os_dlg_render_t on_render;   /* 可选: 自定义整层渲染, true=已消费 */
     os_dlg_key_t    on_key;      /* 可选: 自定义按键, true=已消费 */
+    os_dlg_poll_t   on_poll;     /* 可选: 每帧轮询 (当前层激活时调用) */
+    bool  no_footer;             /* true=无底部"返回"行 (如确认框: 确定/取消) */
+    bool  small;                 /* true=小自适应确认弹窗 (退出等, 3.3 notice 样式); false=大窗 350×250 */
+    bool  row_x;                 /* true=每行内容最右侧显示删除"×", 点击 x 命中该行→弹删除确认 (长按即时同义) */
+    const uint8_t *icon;         /* 可选: 确认弹窗文字区下方居中的 1bpp 位图 (如挂载/传输图标); NULL=无 */
+    int   icon_w, icon_h;        /* icon 宽高 (bitmap 每行 ceil(w/8) 字节, 位=1 黑像素) */
+    int   fix_w;                 /* >0: 固定弹窗宽度 (两阶段同宽; 0=按内容自适应) — 供确认框→图标窗原位变形同框用 */
+    uint32_t timeout_ms;         /* >0: 打开后超时自动完成 (0=不超时) */
+    int      timeout_result;     /* 超时自动回调的 result */
+    uint32_t open_ms;            /* 内部: push 时记录打开时刻 */
+    char  footer[12];            /* 底部固定"返回"行文字 (默认"返回"; 文件浏览用"返回"/"退出"动态) */
+    int   scroll_px;             /* 列表跟手拖动: 内容相对"选中窗口"的子像素偏移 ([-DLG_LINE_H, DLG_LINE_H)) */
 };
-void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg);  /* 压入弹窗栈 (栈空自动开弹窗页) */
-void os_dialog_pop(ui_ctx_t *ctx);                              /* 弹栈; 栈空则关闭弹窗页 */
+void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg);  /* 压入弹窗栈 (栈空自动开弹窗页); cb 内调用=下一步同窗替换 */
+void os_dialog_pop(ui_ctx_t *ctx);                              /* 弹栈 (回上一层); 栈空则关闭弹窗页 */
+void os_dialog_clear_all(ui_ctx_t *ctx);                        /* 关闭全部弹窗 (清空栈+关弹窗页) */
 int  os_dialog_depth(void);
 const os_dlg_stack_t *os_dialog_top(void);
+/* 原位改写当前弹窗内容 (同一框变形, 不加深/不关闭): 返回栈顶可写句柄用于改字段. */
+os_dlg_stack_t *os_dialog_top_mut(ui_ctx_t *ctx);
+/* 标记回调已"接管"当前弹窗 (保持同一窗不自动关闭; 配合 top_mut 原位变形用). */
+void os_dialog_mark_handled(ui_ctx_t *ctx);
 
 /* ==== 应用注册表 (主菜单/应用管理共用; 为应用商店动态安装预留) ==== */
 typedef struct os_app os_app_t;
@@ -204,13 +239,30 @@ struct os_app {
     const char *label;     /* 显示名 (UTF-8) */
     int         icon_idx;  /* 主菜单 SF 图标索引 */
     os_page_t   page;      /* 启动进入的页面 */
-    bool        hidden;    /* true=不在主菜单/应用管理显示 (内部页) */
+    bool        hidden;    /* true=默认不在主菜单显示 (内部页/引擎等) */
+    bool        touch_only;/* true=必须触摸屏才可用 (无触摸时自动隐藏) */
+    const char *cat;       /* 商店子分类: "游戏"/"程序"/"网络"/"运维"/"手册"/"学习", NULL=无分类 */
+    bool        reveal;    /* true=彩蛋(赞助页5连点)揭示类: 开关打开后仅显示引擎游戏+应用管家 */
 };
 
 /* 编译期/运行期注册应用 (商店安装后运行时注册, 主菜单自动出现). */
 void os_app_register(const os_app_t *app);
 int  os_app_count(void);
 const os_app_t *os_app_get(int idx);
+/* 隐藏应用开关 (赞助页 5 连点): 打开后主菜单显示隐藏的引擎/应用管理 */
+bool os_app_hidden_visible(void);
+void os_app_toggle_hidden_visible(void);
+bool os_app_visible(const os_app_t *a);
+int  os_app_visible_count(void);
+const os_app_t *os_app_visible_at(int idx);
+
+/* 主菜单自定义管理 (应用管家): 用户可把任意应用添加到主菜单 / 移出主菜单.
+ * 持久化到 NVS, 覆盖应用的默认 hidden. 返回是否"显式出现在主菜单". */
+bool os_app_in_mainmenu(const char *id);
+void os_app_set_mainmenu(const char *id, bool show);
+/* 显式隐藏/恢复 (从主菜单彻底移除, 类似卸载的入口动作). */
+bool os_app_in_hidden(const char *id);
+void os_app_set_hidden(const char *id, bool hide);
 
 /* ==== 平台状态挂钩 (由外壳 main.c 注入, 解耦 os 与具体硬件组件) ====
  * 状态栏/服务不直接引用 bt_manager/wifi_manager/board_battery 等实现,
@@ -229,6 +281,11 @@ typedef struct os_platform_ops {
 /* 注入平台状态挂钩 (可多次调用, 覆盖生效). */
 void os_platform_set(const os_platform_ops_t *ops);
 
+/* ==== CPU 双核静态亲和性工具 (内核 os_core, 独立于资源管家裁剪) ====
+ * 与资源管理无关, 属系统范围工具, 从旧 os_mgr 迁出归位. */
+int  os_core_current_core(void);                              /* 当前运行核 (0/1) */
+void os_core_pin_task(void *task_handle, int core);           /* core 0/1; -1=任意核 */
+
 /* ==== 内建全局服务 (components/os/services 目录) ==== */
 
 /* 状态栏: 由 os_register_all_internal() 自动注册; 此声明仅供需要手动注册/调试时使用. */
@@ -238,4 +295,5 @@ void os_svc_statusbar_register(void);
 }
 #endif
 
+void svc_statusbar_draw_game(st7305_handle_t *lcd, uint8_t battery, bool pad_connected);
 #endif /* OS_H */

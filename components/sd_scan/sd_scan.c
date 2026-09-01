@@ -22,6 +22,7 @@
 #include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_system.h"        /* esp_restart (卡死看门狗强制重启) */
 
 static const char *TAG = "SDSCAN";
 
@@ -41,6 +42,8 @@ static bool is_hidden_support_dir(const char *name)
     if (strcmp(name, zh_gxhj) == 0) return true;
     /* LavaX 数据目录(不当作游戏/可浏览) */
     if (strcmp(name, "LavaData") == 0 || strcmp(name, "lavadata") == 0) return true;
+    /* 顶层不应存在的 "Lava" 目录: 也隐藏, 不显示为分类 (共享数据实际用 LavaData) */
+    if (strcmp(name, "Lava") == 0 || strcmp(name, "lava") == 0) return true;
     return false;
 }
 
@@ -90,11 +93,10 @@ esp_err_t sd_mount(void) {
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
-    /* 1. 快速挂载 (V1.0.61): 优先 20MHz, 失败降 5MHz 再试一次
-     *    参考 esp-box-emu / Retro-Go: 开机一次性挂载, 不做高频重试,
-     *    旧版 3 档速度 + 200/300/500ms 延时, 无卡时开机要卡 ~1.5s */
-    const uint32_t speeds_khz[] = { 20000, 5000 };
-    const uint32_t delays_ms[]  = {  50,  100 };
+    /* 1. 快速挂载 (V1.0.61): 优先 25MHz (1-bit 标准最高), 失败降 20/5MHz
+     *    参考 esp-box-emu / Retro-Go: 开机一次性挂载, 不做高频重试 */
+    const uint32_t speeds_khz[] = { 25000, 20000, 5000 };
+    const uint32_t delays_ms[]  = {  50,  100,  150 };
     const int retry_count = sizeof(speeds_khz) / sizeof(speeds_khz[0]);
 
     for (int attempt = 0; attempt < retry_count; attempt++) {
@@ -158,6 +160,9 @@ esp_err_t sd_mount(void) {
                 "/sdcard/lava", /* 文曲星 .lav 目录 (wqx) */
                 "/sdcard/lava/LavaData", /* 共用 LavaData (游戏数据回退) */
                 "/sdcard/vpet",    /* 暴龙机 .bin ROM 目录 (vpet) */
+                "/sdcard/App",     /* 应用数据根目录 */
+                "/sdcard/App/\xe5\x9b\xbe\xe7\x89\x87", /* 画布图片目录 (App/图片) */
+                "/sdcard/log",     /* 系统日志目录 (main.c log_drain 写 bbk.log) */
                 NULL
             };
             for (int i = 0; need_dirs[i]; i++) {
@@ -376,7 +381,7 @@ int scan_bbk_games(char out[][64], int max_out) {
         if (dot) *dot = '\0';
         strip_bom(name);
         /* 写入输出 */
-        strncpy(out[n], name, 63);
+        memcpy(out[n], name, 63);
         out[n][63] = '\0';
         n++;
     }
@@ -502,7 +507,7 @@ static int scan_gam_in_dir(const char *dir_path, char out[][64], int max_out) {
         strip_bom(name);
         /* 跳过空名 (e.g. ".gam" / BOM 残留) */
         if (name[0] == '\0') continue;
-        strncpy(out[n], name, 63);
+        memcpy(out[n], name, 63);
         out[n][63] = '\0';
         n++;
     }
@@ -675,7 +680,7 @@ static int scan_games_in_dir(const char *dir_path, const char *folder_name, cons
         if (dot) *dot = '\0';
         strip_bom(name);
         if (name[0] == '\0') continue;
-        strncpy(out[n], name, 63);
+        memcpy(out[n], name, 63);
         out[n][63] = '\0';
         n++;
     }
@@ -790,6 +795,16 @@ int count_bbk_games(void) {
 
 static TaskHandle_t s_sd_watcher_h = NULL;       /* 监控任务句柄 */
 static volatile bool s_watcher_paused = false;   /* 游戏/MSC 期间暂停 */
+
+/* 关键操作看门狗: 已按用户要求删除 (卸载点完界面卡死, 机制本身误触发).
+ * 保留 API 为空操作, 兼容旧调用. */
+/* 开始监视: 已删除, 空实现 */
+void sd_op_watchdog_begin(uint32_t timeout_ms) {
+    (void)timeout_ms;
+}
+/* 结束监视: 已删除, 空实现 */
+void sd_op_watchdog_end(void) {
+}
 
 /* 监控任务: 仅在空闲且未挂载时, 每 15s 补挂一次 */
 static void sd_watcher_task(void *arg) {
@@ -1198,7 +1213,7 @@ static int scan_files_by_ext(const char *dir_path, const char *ext,
         if (dot) *dot = '\0';
         strip_bom(name);
         if (name[0] == '\0') continue;
-        strncpy(out[n], name, 63);
+        memcpy(out[n], name, 63);
         out[n][63] = '\0';
         n++;
     }
@@ -1300,15 +1315,14 @@ int scan_path(const char *path, file_entry_t *out, int max_out) {
     int n = 0;
     struct dirent *ent;
     while ((ent = readdir(dir)) != NULL && n < max_out) {
-        if (IS_APPLE_METANAME(ent->d_name)) continue;
-        /* 跳过 . 和 .. */
-        if (strcmp(ent->d_name, ".") == 0) continue;
+        /* 隐藏点开头文件 (含 . .. .DS_Store ._AppleDouble 等) */
+        if (ent->d_name[0] == '.') continue;
         /* 跳过 system (系统区, 装机时由 system_rom_install 创建) */
         if (strcmp(ent->d_name, "system") == 0) continue;
 
         file_entry_t *e = &out[n];
         memset(e, 0, sizeof(*e));
-        strncpy(e->name, ent->d_name, sizeof(e->name) - 1);
+        memcpy(e->name, ent->d_name, sizeof(e->name) - 1);   /* memset 已保证末字节 NUL */
 
         if (ent->d_type == DT_DIR) {
             e->type = FB_TYPE_DIR;
@@ -1328,7 +1342,7 @@ int scan_path(const char *path, file_entry_t *out, int max_out) {
             /* 限制 path + "/" + name 长度避免截断警告 */
             int written = snprintf(full, sizeof(full), "%s/", path);
             if (written > 0 && (size_t)written < sizeof(full) - 1) {
-                strncpy(full + written, ent->d_name, sizeof(full) - (size_t)written - 1);
+                memcpy(full + written, ent->d_name, sizeof(full) - (size_t)written - 1);
                 full[sizeof(full) - 1] = '\0';
             }
             struct stat fst;
@@ -1636,7 +1650,7 @@ int scan_wqx_games(char out[][64], int max_out)
         snprintf(name, sizeof(name), "%.63s", shown);
         strip_bom(name);
         if (name[0] == '\0') continue;
-        strncpy(out[outn], name, 63);
+        memcpy(out[outn], name, 63);
         out[outn][63] = '\0';
         outn++;
     }
@@ -1734,7 +1748,7 @@ int scan_wqx_games_in_folder(const char *scope, char out[][64], int max_out)
         snprintf(name, sizeof(name), "%.63s", shown);
         strip_bom(name);
         if (name[0] == '\0') continue;
-        strncpy(out[outn], name, 63);
+        memcpy(out[outn], name, 63);
         out[outn][63] = '\0';
         outn++;
     }

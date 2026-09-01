@@ -1,112 +1,182 @@
 /**
- * page_wallpaper.c — 壁纸 页面模块.
+ * page_wallpaper.c — 壁纸 页面模块 (3.3 版壁纸设置弹窗树复刻).
  *
- * 单列选项列表: 仅保留「星空」(其余动态壁纸已删除), 加「返回」.
- * 选中保存 (os_wallpaper_get_program 供桌面/屏保读取).
- * 私有 state 一律 static 留在本文件, 不放进 ui_ctx.
+ * 弹窗树 (3.3 一致):
+ *   壁纸设置: 壁纸类型 / 休眠时间 / 测试壁纸 / 返回
+ *   壁纸类型: 内置壁纸 / TF动态图 / 游戏壁纸 / 返回
+ *     内置壁纸 → 选择壁纸程序: 星空(带*) / 返回
+ *     TF动态图 → 播放速度: 慢/标准/快 / 返回
+ *   休眠时间: 1..30分钟 / 返回
+ * 当前 OS 仅支持星空程序, TF动态图/游戏壁纸/测试壁纸暂以"开发中"提示.
+ * 私有 state 全部 static 留在本文件.
  */
 #include "os.h"
-#include "ui_common.h"
 #include "wallpapers.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include <string.h>
+#include <stdio.h>
 
 #define TAG "PWP"
+#define WP_NS "os_wp"
 
-#define ROW_H       32
-#define LIST_Y      30
-#define LIST_BOTTOM (UI_SCREEN_H - 4)
+static int s_wp_program = 0;      /* 当前壁纸程序 (0=星空) */
+static int s_wp_min     = 0;      /* 休眠时间 (0=未设置) */
 
-/* 私有 state */
-typedef struct {
-    int   selected;
-    int   scroll;
-} wp_state_t;
-static wp_state_t s_wp;
+int os_wallpaper_get_program(void) { return s_wp_program; }
 
-/* 当前生效壁纸程序 (0=星空默认). 桌面渲染读此值. */
-static int s_wallpaper_program = 0;
+static void wp_open_main(ui_ctx_t *ctx);
+static void wp_open_type(ui_ctx_t *ctx);
+static void wp_open_prog(ui_ctx_t *ctx);
+static void wp_open_speed(ui_ctx_t *ctx);
+static void wp_open_min(ui_ctx_t *ctx);
 
-int os_wallpaper_get_program(void) { return s_wallpaper_program; }
-
-/* 选项列表: 星空 + 返回 */
-#define WP_ITEM_STARS  0
-#define WP_ITEM_BACK   1
-static int wp_item_count(void) { return 2; }
-static const char *wp_item_name(int idx) {
-    if (idx == WP_ITEM_STARS) return "\xe6\x98\x9f\xe7\xa9\xba"; /* 星空 */
-    return "\xe8\xbf\x94\xe5\x9b\x9e";                            /* 返回 */
-}
-
-static void p_wp_render(ui_ctx_t *ctx) {
-    st7305_handle_t *lcd = ctx->lcd;
-    if (!lcd) return;
-    st7305_clear(lcd, ST7305_COLOR_WHITE);
-
-    int total = wp_item_count();
-    int max_vis = (LIST_BOTTOM - LIST_Y) / ROW_H;
-    if (max_vis < 1) max_vis = 1;
-    if (s_wp.selected < s_wp.scroll) s_wp.scroll = s_wp.selected;
-    if (s_wp.selected >= s_wp.scroll + max_vis) s_wp.scroll = s_wp.selected - max_vis + 1;
-    int y = LIST_Y;
-    for (int i = 0; i < max_vis && (s_wp.scroll + i) < total; i++) {
-        int idx = s_wp.scroll + i;
-        char buf[48];
-        snprintf(buf, sizeof(buf), "%s%s",
-                 (s_wallpaper_program == 0 && idx == WP_ITEM_STARS) ? "* " : "",
-                 wp_item_name(idx));
-        if (idx == s_wp.selected)
-            draw_hline(lcd, 2, UI_SCREEN_W - 4, y + ROW_H - 3, ST7305_COLOR_BLACK);
-        draw_text(lcd, 12, y + (ROW_H - 16) / 2, buf, false);
-        y += ROW_H;
+/* ============ 壁纸设置 (5 项平铺列表, 3.3 版) ============ */
+static bool wp_main_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)ud;
+    if (a != OS_ACTION_CONFIRM) return false;
+    if (d->sel >= d->count) return false;   /* 返回行走默认 */
+    switch (d->sel) {
+    case 0: wp_open_prog(ctx); break;        /* 内置壁纸 → 选择壁纸程序 */
+    case 1: wp_open_speed(ctx); break;       /* TF图片 → 播放速度 */
+    case 2: /* 游戏壁纸 */
+        os_dialog_toast(ctx, "\xe6\xb8\xb8\xe6\x88\x8f\xe5\xa3\x81\xe7\xba\xb8: \xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad"); /* 游戏壁纸: 开发中 */
+        break;
+    case 3: wp_open_min(ctx); break;         /* 休眠时间 */
+    case 4: /* 测试壁纸 */
+        os_dialog_toast(ctx, "\xe6\xb5\x8b\xe8\xaf\x95\xe5\xa3\x81\xe7\xba\xb8: \xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad"); /* 测试壁纸: 开发中 */
+        break;
+    default: break;
     }
-}
-
-static void p_wp_action(ui_ctx_t *ctx, os_action_t a) {
-    int total = wp_item_count();
-    switch (a) {
-    case OS_ACTION_UP:
-        if (s_wp.selected > 0) s_wp.selected--;
-        ctx->needs_redraw = true;
-        break;
-    case OS_ACTION_DOWN:
-        if (s_wp.selected < total - 1) s_wp.selected++;
-        ctx->needs_redraw = true;
-        break;
-    case OS_ACTION_CONFIRM: {
-        if (s_wp.selected == WP_ITEM_STARS) {
-            s_wallpaper_program = WP_PROG_STARS;
-        } else {
-            os_pop(ctx);
-        }
-        ctx->needs_redraw = true;
-        break;
-    }
-    case OS_ACTION_BACK:
-        os_pop(ctx);
-        break;
-    default:
-        break;
-    }
-}
-
-static bool p_wp_touch(ui_ctx_t *ctx, int x, int y) {
-    (void)x;
-    if (y < LIST_Y || y >= LIST_BOTTOM) return false;
-    int idx = s_wp.scroll + (y - LIST_Y) / ROW_H;
-    if (idx >= wp_item_count()) return false;
-    s_wp.selected = idx;
-    p_wp_action(ctx, OS_ACTION_CONFIRM);
     return true;
+}
+static void wp_main_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)result; (void)ud;
+    os_pop(ctx);   /* 返回 → 退出壁纸页 */
+}
+static void wp_open_main(ui_ctx_t *ctx) {
+    static const char *const items[5] = {
+        "\xe5\x86\x85\xe7\xbd\xae\xe5\xa3\x81\xe7\xba\xb8",   /* 内置壁纸 */
+        "TF\xe5\x9b\xbe\xe7\x89\x87",                          /* TF图片 */
+        "\xe6\xb8\xb8\xe6\x88\x8f\xe5\xa3\x81\xe7\xba\xb8",   /* 游戏壁纸 */
+        "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4",   /* 休眠时间 */
+        "\xe6\xb5\x8b\xe8\xaf\x95\xe5\xa3\x81\xe7\xba\xb8",   /* 测试壁纸 */
+    };
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    dlg.count = 5;
+    for (int i = 0; i < 5; i++)
+        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", items[i]);
+    dlg.sel = 0;
+    dlg.on_key = wp_main_key;
+    dlg.cb = wp_main_cb;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* ============ 选择壁纸程序 (内置壁纸 → 星空) ============ */
+static bool wp_prog_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)ud;
+    if (a != OS_ACTION_CONFIRM) return false;
+    if (d->sel >= d->count) return false;
+    if (d->sel == 0) {   /* 星空 */
+        s_wp_program = WP_PROG_STARS;
+        os_dialog_pop(ctx);
+        wp_open_prog(ctx);   /* 重开带 * 标记 */
+        os_dialog_toast(ctx, "\xe5\xa3\x81\xe7\xba\xb8\xe5\xb7\xb2\xe8\xae\xbe\xe7\xbd\xae"); /* 壁纸已设置 */
+    }
+    return true;
+}
+static void wp_open_prog(ui_ctx_t *ctx) {
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    snprintf(dlg.items[0], sizeof(dlg.items[0]), "%s%s",
+             (s_wp_program == WP_PROG_STARS) ? "* " : "",
+             "\xe6\x98\x9f\xe7\xa9\xba");   /* 星空 */
+    dlg.count = 1;
+    dlg.sel = 0;
+    dlg.on_key = wp_prog_key;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* ============ TF动态图 播放速度 ============ */
+static void wp_open_speed(ui_ctx_t *ctx);
+static bool wp_speed_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)ud;
+    if (a != OS_ACTION_CONFIRM) return false;
+    if (d->sel >= d->count) return false;
+    os_dialog_toast(ctx, "TF\xe5\x8a\xa8\xe6\x80\x81\xe5\x9b\xbe: \xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad"); /* TF动态图: 开发中 */
+    return true;
+}
+static void wp_open_speed(ui_ctx_t *ctx) {
+    static const char *const items[3] = {
+        "\xe6\x85\xa2 (5\xe5\xb8\xa7/\xe7\xa7\x92)",   /* 慢 (5帧/秒) */
+        "\xe6\xa0\x87\xe5\x87\x86 (8\xe5\xb8\xa7/\xe7\xa7\x92)", /* 标准 (8帧/秒) */
+        "\xe5\xbf\xab (12\xe5\xb8\xa7/\xe7\xa7\x92)",  /* 快 (12帧/秒) */
+    };
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    dlg.count = 3;
+    for (int i = 0; i < 3; i++)
+        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", items[i]);
+    dlg.sel = 0;
+    dlg.on_key = wp_speed_key;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* ============ 休眠时间 ============ */
+static const int wp_mins[] = { 1, 2, 3, 5, 10, 15, 20, 30 };
+#define WP_MINS_N (int)(sizeof(wp_mins) / sizeof(wp_mins[0]))
+static void wp_open_min(ui_ctx_t *ctx);
+static void wp_min_save(int v) {
+    s_wp_min = v;
+    nvs_handle_t h;
+    if (nvs_open(WP_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "min", v);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+static bool wp_min_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)ud;
+    if (a != OS_ACTION_CONFIRM) return false;
+    if (d->sel >= d->count) return false;
+    if (d->sel < WP_MINS_N) wp_min_save(wp_mins[d->sel]);
+    os_dialog_pop(ctx);
+    wp_open_min(ctx);
+    os_dialog_toast(ctx, "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4\xe5\xb7\xb2\xe8\xae\xbe\xe7\xbd\xae"); /* 休眠时间已设置 */
+    return true;
+}
+static void wp_open_min(ui_ctx_t *ctx) {
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    dlg.count = WP_MINS_N;
+    for (int i = 0; i < WP_MINS_N; i++) {
+        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s%d\xe5\x88\x86\xe9\x92\x9f",   /* X分钟 */
+                 (s_wp_min == wp_mins[i]) ? "* " : "", wp_mins[i]);
+    }
+    dlg.sel = 0;
+    dlg.on_key = wp_min_key;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* ============ 模块契约 ============ */
+static void p_wp_enter(ui_ctx_t *ctx) {
+    /* 读 NVS (休眠时间; 程序固定星空) */
+    nvs_handle_t h;
+    if (nvs_open(WP_NS, NVS_READONLY, &h) == ESP_OK) {
+        int32_t v = 0;
+        if (nvs_get_i32(h, "min", &v) == ESP_OK) s_wp_min = (int)v;
+        nvs_close(h);
+    }
+    s_wp_program = WP_PROG_STARS;
+    wp_open_main(ctx);
 }
 
 static const os_module_t s_mod_wallpaper = {
     .name       = "wallpaper",
     .page_id    = OS_PAGE_WALLPAPER,
-    .render     = p_wp_render,
-    .action     = p_wp_action,
-    .touch      = p_wp_touch,
+    .on_enter   = p_wp_enter,
     .fullscreen = false,
 };
 

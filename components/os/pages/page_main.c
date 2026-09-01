@@ -22,9 +22,10 @@
 
 /* ============ 应用来源: 统一走 os_app 注册表 ============
  * 内置应用在 os_pages.c 静态注册; 商店安装的 WASM 应用运行时注册后主菜单自动出现.
- * icon_idx = 主菜单 SF 图标索引 (见 icons_main.inc 的 main_icons[] 表). */
-#define MAIN_MOD_COUNT  os_app_count()
-static const os_app_t *main_app(int idx) { return os_app_get(idx); }
+ * icon_idx = 主菜单 SF 图标索引 (见 icons_main.inc 的 main_icons[] 表).
+ * 隐藏应用 (引擎/应用管理) 默认不显示, 赞助页 5 连点后显示. */
+#define MAIN_MOD_COUNT  os_app_visible_count()
+static const os_app_t *main_app(int idx) { return os_app_visible_at(idx); }
 
 /* ============ 私有状态 (相机/拖动/动画/选中) ============ */
 typedef struct {
@@ -260,9 +261,9 @@ static bool p_main_touch(ui_ctx_t *ctx, int x, int y)
         int size = main_icon_size(fabsf((float)g - s_main.cam_cur));
         if (x >= cx - size / 2 - 8 && x <= cx + size / 2 + 8 &&
             y >= UI_SCREEN_H / 2 - 50 && y <= UI_SCREEN_H / 2 + 70) {
-            if (idx != s_main.selected) {
-                main_anim_to(ctx, idx);   /* 先选中动画, 再进入 */
-            }
+            /* 点侧边小图标: 不播归位动画、不改相机, 直接打开对应页.
+             * (原先 main_anim_to 会把该图标弹簧挪到中央再接 history, 返回后
+             *  主菜单中央已换成所点项 → 用户感觉"位置被刷新/闪烁".) */
             os_push(ctx, main_app(idx)->page);
             return true;
         }

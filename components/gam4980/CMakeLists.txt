@@ -3,9 +3,9 @@ idf_component_register(
     SRCS
         "libretro.c"
         "gam4980_emu.c"
-    INCLUDE_DIRS "." "${CMAKE_SOURCE_DIR}/main" "${CMAKE_SOURCE_DIR}/components/menu" "${CMAKE_SOURCE_DIR}/components/audio_player"
+    INCLUDE_DIRS "." "${CMAKE_SOURCE_DIR}/main" "${CMAKE_SOURCE_DIR}/components/audio_player"
     PRIV_REQUIRES "st7305"
-    REQUIRES "fatfs" "virtual_keys" "web_gamepad" "fonts" "bt_ctl"
+    REQUIRES "fatfs" "virtual_keys" "web_gamepad" "fonts" "bt_ctl" "input" "os" "ui_common"
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

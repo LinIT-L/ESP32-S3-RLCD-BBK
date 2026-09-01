@@ -891,6 +891,18 @@ int audio_player_get_volume(void) {
     return s_volume;
 }
 
+/* 统一音量档位换算: 0-9 档 <-> 0-100 百分比 (0档=0, 9档=100) */
+int audio_player_vol_to_percent(int step) {
+    if (step <= 0) return 0;
+    if (step >= AUDIO_VOL_STEPS - 1) return 100;
+    return (step * 100 + (AUDIO_VOL_STEPS - 1) / 2) / (AUDIO_VOL_STEPS - 1);
+}
+int audio_player_vol_to_step(int percent) {
+    if (percent <= 0) return 0;
+    if (percent >= 100) return AUDIO_VOL_STEPS - 1;
+    return (percent * (AUDIO_VOL_STEPS - 1) + 50) / 100;
+}
+
 /* 引脚有效性防护: 仅操作本模组(ESP32-S3-WROOM-1)引出且可作普通 IO 的脚.
  * 22-34 未引出 (含 26), 33-37 为 PSRAM/Flash 专用. */
 static bool ns_ctrl_pin_ok(int pin) {

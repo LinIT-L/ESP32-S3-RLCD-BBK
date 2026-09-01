@@ -5,20 +5,11 @@
 #include "ui_common.h"
 #include <math.h>
 
-/* 图标位图数据由 menu 组件定义 (menu_system.c 包含 icons_main.inc / cat_icons.inc).
- * ui_common 仅 extern 引用, 避免与 menu 重复定义全局数组 (链接冲突). */
-#define MAIN_ICON_W 64
-#define MAIN_ICON_H 64
-#define MAIN_ICON_BYTES ((64*64)/8)
-#define MAIN_ICON_COUNT 25
-extern const uint8_t *main_icons[MAIN_ICON_COUNT];
-#define CAT_ICON_W 64
-#define CAT_ICON_H 64
-#define CAT_ICON_BYTES ((64*64)/8)
-#define CAT_ICON_COUNT 4
-extern const uint8_t *cat_icons[CAT_ICON_COUNT];
-
-/* FONT8X12 (8x12 ASCII) 由 menu 组件全局定义 (ui_common.h extern 引用, 见头文件). */
+/* 主菜单/应用管理侧栏图标位图: 由本组件内置 (icons_main.inc / cat_icons.inc), 单一来源.
+ * ui_common 为唯一持有者, 其他模块经 ui_common.h extern 引用. */
+#include "icons_main.inc"
+#include "cat_icons.inc"
+/* FONT8X12 (8x12 ASCII) 由 fonts/font_ascii.c 提供 (ui_common.h extern 引用). */
 
 /* ---------- 基础图形原语 ---------- */
 void ui_draw_pixel(st7305_handle_t *lcd, int x, int y, st7305_color_t color) {
@@ -534,3 +525,28 @@ void draw_cat_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, i
     ui_blit_scaled(lcd, cx - size_w / 2, cy - size_h / 2, size_w, size_h,
                    CAT_ICON_W, CAT_ICON_H, cat_icons[cat_idx]);
 }
+/* V1.1.1: 居中提示弹窗 "退出游戏？" 等 (从旧 menu draw_notice_popup 移植).
+ * 几何与 gam4980 触摸命中一致: 白底 + 3px 黑边框 + 居中 24px 文字. */
+void ui_draw_notice_popup(st7305_handle_t *lcd, const char *text) {
+    if (!lcd || !text || !text[0]) return;
+    const int BORDER = 3, PAD = 3, TEXT_H = 24;
+    int tw = text_width(text);
+    const int W = BORDER*2 + PAD*2 + tw;
+    const int H = BORDER*2 + PAD*2 + TEXT_H;
+    int x = (UI_SCREEN_W - W) / 2, y = (UI_SCREEN_H - H) / 2;
+    for (int dy = 0; dy < H; dy++)
+        for (int dx = 0; dx < W; dx++)
+            st7305_draw_pixel(lcd, x + dx, y + dy, ST7305_COLOR_WHITE);
+    for (int k = 0; k < BORDER; k++) {
+        for (int dx = 0; dx < W; dx++) {
+            st7305_draw_pixel(lcd, x + dx, y + k, ST7305_COLOR_BLACK);
+            st7305_draw_pixel(lcd, x + dx, y + H - 1 - k, ST7305_COLOR_BLACK);
+        }
+        for (int dy = 0; dy < H; dy++) {
+            st7305_draw_pixel(lcd, x + k, y + dy, ST7305_COLOR_BLACK);
+            st7305_draw_pixel(lcd, x + W - 1 - k, y + dy, ST7305_COLOR_BLACK);
+        }
+    }
+    draw_text_centered(lcd, y + BORDER + PAD, text, false);
+}
+

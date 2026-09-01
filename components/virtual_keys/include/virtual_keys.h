@@ -35,9 +35,16 @@ void virtual_keys_set_force_hidden(bool fh);
 /* 设置布局模式 (游戏启动时调用, 默认 STANDARD) */
 void virtual_keys_set_layout(vk_layout_t layout);
 
+/* 引擎定制: 隐藏 Select/Start 两个虚拟键 (如步步高无 SEL/STA), 默认 false */
+void virtual_keys_set_hide_selsta(bool h);
+
 /* 每帧调用: 传入当前触摸 (屏幕坐标 400x300, down=false 表示无手指),
  * 更新按键状态并返回 joypad 掩码. 不读触摸芯片, 只用输入层缓存的坐标. */
 uint8_t virtual_keys_poll(int touch_x, int touch_y, bool touch_down);
+
+/* V1.0.xx: 多点触控版 — 第一指控方向/摇杆, 第二指只控按键(A/B/SEL/STA).
+ * 两指可同时按下与虚拟按键做 hit-test. */
+uint8_t virtual_keys_poll_multi(int x0, int y0, bool d0, int x1, int y1, bool d1);
 
 /* 读取最近一次 poll 的 joypad 掩码 (不重新 hit-test) */
 uint8_t virtual_keys_get_joypad(void);

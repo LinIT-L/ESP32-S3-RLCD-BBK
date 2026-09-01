@@ -7,7 +7,7 @@
 idf_component_register(
     SRCS "ui_common.c"
     INCLUDE_DIRS "."
-    REQUIRES st7305 menu fonts
+    REQUIRES st7305 fonts
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

@@ -2,7 +2,7 @@
 # 初始化序列来自微雪官方 u8g2_st7305, 显示数据格式直接对接 ST7305 原生 2-bit gray
 
 idf_component_register(
-    SRCS "st7305.c" "bbk_boot.c"
+    SRCS "st7305.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_timer
 )

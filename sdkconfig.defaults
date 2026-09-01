@@ -11,6 +11,10 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# 控制台: 早期引导日志走 USB Serial/JTAG; app_main 里 TinyUSB 复合设备接管后
+# 由 tinyusb_console_init 重定向到 CDC 串口 (常驻复合方案, 无 PHY 切换).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
 # PSRAM (8MB 八线, 80MHz) — gam4980 的 6MB ROM 数据必须放 PSRAM
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
@@ -38,29 +42,22 @@ CONFIG_FATFS_API_ENCODING_UTF_8=y
 # FreeRTOS
 CONFIG_FREERTOS_HZ=1000
 
-# === 方案A V1.x: Bluepad32 内核 (BTstack 替换 Bluedroid) ===
-# ESP32-S3 仅支持 BLE (无 BR/EDR). BTstack 以 LE-only 控制器 + vHCI Host 工作.
-# 控制器单独启用 (CONFIG_BT_CONTROLLER_ONLY=y), Host 层由 BTstack 提供, 不再用 Bluedroid/esp_hidh.
+# 模块化 OS 内核 (components/os): 当前主系统就是新 OS, 必须启用
+CONFIG_OS=y
+
+# === 蓝牙手柄 Host: 官方 esp_hid_host (Bluedroid). ESP32-S3 仅 BLE. ===
 CONFIG_BT_ENABLED=y
-CONFIG_BT_CONTROLLER_ONLY=y
-CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_BLUEDROID_ENABLED=y
+# CONFIG_BT_NIMBLE_ENABLED is not set
+# esp32s3 需显式开 BLE4.2 特性 (ADV/SCAN 被裁剪则 esp_ble_gap_* 链接缺失)
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_42_ADV_EN=y
+CONFIG_BT_BLE_42_SCAN_EN=y
 # 控制器 BLE 配置 (S3 单模): 活动连接只需 2 条 (单手柄, 冗余一条), 省内部 RAM
 CONFIG_BT_CTRL_BLE_MAX_ACT=2
 CONFIG_BT_ACL_CONNECTIONS=2
 # 广播/扫描去重过滤缓存降低 (内部 RAM)
 CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10
-
-# --- BTstack ---
-CONFIG_BTSTACK_INTERNAL_BT=y    # 用 SoC 蓝牙 (vHCI Host)
-CONFIG_BTSTACK_AUDIO=n          # 音频驱动不走 btstack, 节省空间
-CONFIG_BTSTACK_HCI_DUMP_STDOUT=n
-
-# --- Bluepad32 ---
-CONFIG_BLUEPAD32_MAX_DEVICES=1
-CONFIG_BLUEPAD32_PLATFORM_CUSTOM=y
-CONFIG_BLUEPAD32_USB_CONSOLE_ENABLE=n
-CONFIG_BLUEPAD32_GAP_SECURITY=y
-CONFIG_BLUEPAD32_LOG_LEVEL_ERROR=y
 
 # 禁用 secure boot (避免依赖 micro-ecc submodule)
 CONFIG_SECURE_BOOT=n
@@ -82,15 +79,37 @@ CONFIG_MBEDTLS_HARDWARE_ECDSA_SIGN=n
 CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY=n
 CONFIG_MBEDTLS_GCM_SUPPORT_NON_AES_CIPHER=n
 CONFIG_TINYUSB_MSC_ENABLED=y
+# USB 挂载 TF 卡速度优化: MSC FIFO 默认仅 512B (=1 扇区), 导致 PC 每次
+# USB 事务只传 1 块, 全速 USB 吞吐被逐块往返开销卡在 ~40KB/s.
+# 提到 8192 (16 扇区) 后, sdmmc_read/write_sectors 一次多块传输,
+# 吞吐可提升至 ~1MB/s (esp32-s3 USB 为 full-speed, 理论上限 ~1MB/s).
+CONFIG_TINYUSB_MSC_BUFSIZE=8192
 # USB HID 复合设备: 2 个 HID 接口 (键盘 + 鼠标)
 CONFIG_TINYUSB_HID_COUNT=2
+# V2.0 复合设备方案: 控制台走 TinyUSB CDC 串口 (常驻 MSC+CDC / 键鼠 HID+CDC)
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=256
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=256
+CONFIG_TINYUSB_CDC_EP_BUFSIZE=64
+# USB-BT 蓝牙适配器 (BTH): 设备模拟成 USB 蓝牙 HCI 适配器, 电脑可用其蓝牙
+CONFIG_TINYUSB_BTH_ENABLED=y
+# 必须为 >=1: TinyUSB 的 BTH 驱动 btd_open() 在 HCI 主接口后会无条件解析
+# 第二个 ISO 接口(bNumEndpoints==2), 且 usb_hid.c 的 TUD_BTH_DESCRIPTOR IAD
+# 硬编码 bInterfaceCount=2。若设为 0, ISO 接口描述符不生成, 驱动 open 失败,
+# Windows 枚举失败报"未知设备"。参考 esp-iot-solution usb_dongle 取 1(支持 SCO 音频)。
+CONFIG_TINYUSB_BTH_ISO_ALT_COUNT=1
+# USB 网卡共享 (ECM/RNDIS): 设备枚举为电脑 USB 有线网卡 (RNDIS, Windows 原生识别)
+CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y
 
 # CPU 频率: 240MHz (默认 160MHz, 提升 50% 性能)
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 
-# 编译器优化: 速度优先 (-O2 替代默认 -Os)
-CONFIG_COMPILER_OPTIMIZATION_SPEED=y
+# 编译器优化: 速度优先 (-O2 替代默认 -Og)
+# v5.5 起选项名由 COMPILER_OPTIMIZATION_SPEED 改为 COMPILER_OPTIMIZATION_PERF,
+# 旧名已失效被静默忽略 (曾导致整个固件以 -Og 调试级优化编译, 引擎性能偏低)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # WiFi 联网 (V1.0.46 起启用: STA 连接, 设置中心扫描并输入密码)
 CONFIG_ESP_WIFI_ENABLED=y
@@ -106,6 +125,11 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 # 调到 12288, 为 NES/GB/Arduboy start 与 gam4980 libretro 初始化链提供充足栈。
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 
+# esp_timer 任务栈: 默认 3584 太浅。打开大书(蛊真人等)时, SDK 层
+# (flash/mmap 缓存、NVS 等)会在 esp_timer 回调里走深调用, 默认栈触发
+# "stack overflow in task esp_timer" 直接重启。放大到 8192 (内部空闲 ~114KB 够用)。
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=8192
+
 # === V1.0.9x: 精简 WiFi 内存 ===
 # WiFi 目前只两个用途: ①STA 联网(天气/同步) ②softAP 开热点当网页手柄.
 # 都是小数据量, 默认 16 动态收发缓冲/32 管理短缓冲对我们是浪费,
@@ -117,3 +141,7 @@ CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=3
 # IEEE802.11 接收去重共缓存降到 256 (小热点场景够用, 省 DMA)
 CONFIG_ESP32_WIFI_RX_BA_WIN=6
 CONFIG_ESP_WIFI_RX_BA_WIN=6
+
+# V1.1.x: 精简 WiFi: WiFi 仅 STA(天气/同步) + softAP(网页手柄), 无企业/证书登录
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+CONFIG_WPA_MBEDTLS_TLS_CLIENT=n

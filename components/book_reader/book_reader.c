@@ -68,8 +68,8 @@ enum {
 /* === 阅读器状态 === */
 static bool         s_open = false;
 static FILE        *s_fp = NULL;          /* 渲染句柄 (整个阅读期间保持) */
-static char         s_path[256] = {0};
-static char         s_src_path[320] = {0}; /* 实际阅读源 (FB2 时为转换缓存) */
+EXT_RAM_BSS_ATTR static char         s_path[256] = {0};
+EXT_RAM_BSS_ATTR static char         s_src_path[320] = {0}; /* 实际阅读源 (FB2 时为转换缓存) */
 static uint32_t     s_file_size = 0;
 static uint32_t     s_src_size = 0;         /* 实际阅读源字节数 (FB2 为缓存) */
 static uint32_t     s_mtime = 0;
@@ -117,7 +117,7 @@ typedef struct {
     uint32_t page;
     char     title[32];
 } book_bm_t;
-static book_bm_t   s_bms[BOOK_MAX_BOOKMARKS];
+EXT_RAM_BSS_ATTR static book_bm_t   s_bms[BOOK_MAX_BOOKMARKS];
 static uint32_t    s_bm_count = 0;
 static uint32_t    s_loaded_page = 0;     /* 断点续读页 */
 static uint32_t    s_last_saved_page = 0; /* 上次落盘页 (每 5 页保存) */

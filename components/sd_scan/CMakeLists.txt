@@ -10,4 +10,5 @@ idf_component_register(
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wno-unused-function
     -Wno-unused-variable
+    -Wno-error=format-truncation
 )

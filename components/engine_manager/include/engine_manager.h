@@ -27,7 +27,7 @@ typedef enum {
     ENGINE_ARDUBOY,       /* Arduboy (simavr ATmega32u4) */
     ENGINE_LAVAX,         /* wqx 文曲星 (LavaX 虚拟机 lavaxvm) */
     ENGINE_VPET,          /* 暴龙机 (vpet-emu-zepp E0C6200 4-bit CPU) */
-    ENGINE_MESHTASIC,     /* Meshtasic 网络面板 (LVGL/MUI, 系统内 App) */
+    ENGINE_MESHTASIC,     /* Meshtasic (旧菜单兼容保留; 本版本不再实现) */
     ENGINE_COUNT
 } engine_id_t;
 

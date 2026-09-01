@@ -167,29 +167,60 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 
 /* 读扇区: lba 起始扇区, offset/bufsize 用于跨扇区 */
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
+    (void)lun;
     if (!CARD) return -1;
-    if (offset != 0) {
-        /* 跨扇区读: 大部分 MSC 控制器会先对齐 bufsize. 这里简化只支持 aligned. */
-        return -1;
+    uint32_t sec_size = (CARD->csd.sector_size == 0) ? 512 : CARD->csd.sector_size;
+    uint32_t lba_off = lba + offset / sec_size;
+    uint32_t byte_off = offset % sec_size;
+    uint32_t n_sectors = (byte_off == 0) ? (bufsize / sec_size) : (bufsize / sec_size + 1);
+    if (byte_off == 0) {
+        /* 扇区对齐: 一次多块读, 提速 (BUFSIZE=8192 → 16 块) */
+        esp_err_t ret = sdmmc_read_sectors(CARD, buffer, lba_off, n_sectors);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "read10 lba=%u n=%u 失败: %s",
+                     (unsigned)lba_off, (unsigned)n_sectors, esp_err_to_name(ret));
+            return -1;
+        }
+        return (int32_t)bufsize;
     }
-    esp_err_t ret = sdmmc_read_sectors(CARD, buffer, lba, bufsize / 512);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "read10 lba=%u 失败: %s", (unsigned)lba, esp_err_to_name(ret));
-        return -1;
-    }
-    return (int32_t)bufsize;
+    /* 未对齐分段读: 读完整扇区, 再 memcpy 请求区间 */
+    static uint8_t s_secbuf[512];
+    if (n_sectors > 1) return -1;   /* 未对齐跨多块少见, 保守处理 */
+    esp_err_t ret = sdmmc_read_sectors(CARD, s_secbuf, lba_off, 1);
+    if (ret != ESP_OK) return -1;
+    uint32_t copy = bufsize < (sec_size - byte_off) ? bufsize : (sec_size - byte_off);
+    memcpy(buffer, s_secbuf + byte_off, copy);
+    return (int32_t)copy;
 }
 
 /* 写扇区 */
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
+    (void)lun;
     if (!CARD) return -1;
-    if (offset != 0) return -1;
-    esp_err_t ret = sdmmc_write_sectors(CARD, buffer, lba, bufsize / 512);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "write10 lba=%u 失败: %s", (unsigned)lba, esp_err_to_name(ret));
-        return -1;
+    uint32_t sec_size = (CARD->csd.sector_size == 0) ? 512 : CARD->csd.sector_size;
+    uint32_t lba_off = lba + offset / sec_size;
+    uint32_t byte_off = offset % sec_size;
+    uint32_t n_sectors = (byte_off == 0) ? (bufsize / sec_size) : (bufsize / sec_size + 1);
+    esp_err_t ret;
+    if (byte_off == 0) {
+        /* 扇区对齐: 一次多块写, 提速 */
+        ret = sdmmc_write_sectors(CARD, buffer, lba_off, n_sectors);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "write10 lba=%u n=%u 失败: %s",
+                     (unsigned)lba_off, (unsigned)n_sectors, esp_err_to_name(ret));
+            return -1;
+        }
+        return (int32_t)bufsize;
     }
-    return (int32_t)bufsize;
+    /* 未对齐分段写: 读改写 */
+    static uint8_t s_secbuf[512];
+    ret = sdmmc_read_sectors(CARD, s_secbuf, lba_off, 1);
+    if (ret != ESP_OK) return -1;
+    uint32_t copy = bufsize < (sec_size - byte_off) ? bufsize : (sec_size - byte_off);
+    memcpy(s_secbuf + byte_off, buffer, copy);
+    ret = sdmmc_write_sectors(CARD, s_secbuf, lba_off, 1);
+    if (ret != ESP_OK) return -1;
+    return (int32_t)copy;
 }
 
 /* SCSI Start/Stop: 接受弹出/收回 */

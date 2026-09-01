@@ -210,6 +210,18 @@ bool wifi_manager_disable(void) {
     if (!s_enabled) return true;
     esp_wifi_disconnect();
     esp_wifi_stop();
+    /* V1.3.x: 完整释放 esp_wifi_init 分配的内部内存 (仅 stop 不释放, 开/关内存不回落).
+     * 网页手柄 (web_gamepad) 直接初始化 esp_wifi AP 模式共享本子系统 —
+     * 检测到 AP/APSTA 在用时不 deinit, 只停 STA 射频, 避免破坏手柄 AP. */
+    wifi_mode_t mode;
+    if (esp_wifi_get_mode(&mode) == ESP_OK &&
+        mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) {
+        esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
+        esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+        esp_wifi_deinit();
+        s_inited = false;
+        ESP_LOGI(TAG, "WiFi 已 deinit (内部内存已释放)");
+    }
     s_enabled = false;
     s_connected = false;
     s_connecting = false;
@@ -244,8 +256,13 @@ bool wifi_manager_connect(const char *ssid, const char *password) {
     }
 
     wifi_config_t cfg = { 0 };
-    strncpy((char *)cfg.sta.ssid, s_ssid, sizeof(cfg.sta.ssid) - 1);
-    strncpy((char *)cfg.sta.password, s_pass, sizeof(cfg.sta.password) - 1);
+    /* V1.3.x: 原 strncpy(sizeof-1) 对 32 字符 SSID/64 字符密码会截断且不补 NUL,
+     * 在 -O2 (stringop-truncation) 下触发 Werror, 且驱动按 C 串读可能越界.
+     * 改 memcpy 复制满尺寸-1 + 显式置 NUL, 保证驱动收到合法 C 串. */
+    memcpy(cfg.sta.ssid, s_ssid, sizeof(cfg.sta.ssid) - 1);
+    cfg.sta.ssid[sizeof(cfg.sta.ssid) - 1] = '\0';
+    memcpy(cfg.sta.password, s_pass, sizeof(cfg.sta.password) - 1);
+    cfg.sta.password[sizeof(cfg.sta.password) - 1] = '\0';
     cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     esp_wifi_set_config(WIFI_IF_STA, &cfg);

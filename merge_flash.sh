@@ -1,19 +1,19 @@
 #!/bin/bash
-# merge_flash.sh - 把 bootloader / partition-table / app / appdata(8.BIN+E.BIN) 合并成单个 16MB Flash 镜像
+# merge_flash.sh - 把 bootloader / partition-table / app / appdata(8.BIN+E.BIN+字库) 合并成单个 16MB Flash 镜像
 # 烧入地址: 0x0 (一文件搞定)
 # 也可拆开用 Flash Download Tool 多文件烧录:
 #   bootloader.bin         @ 0x0000
 #   partition-table.bin    @ 0x8000
-#   LinTOS.bin             @ 0x20000 (factory, 6MB)
-#   8.BIN                  @ 0x620000 (appdata+0,   gam4980 词典字库)
-#   E.BIN                  @ 0x820000 (appdata+2MB, gam4980 屏幕点阵)
+#   LinTOS.bin             @ 0x20000 (factory, 4MB)
+#   8.BIN                  @ 0x420000 (appdata+0,   gam4980 词典字库)
+#   E.BIN                  @ 0x620000 (appdata+2MB, gam4980 屏幕点阵)
 #
-# 布局 (16MB = 0x1000000, 单固件+统一数据区) —— 必须与 partitions.csv 完全一致:
+# 布局 (16MB = 0x1000000, 单固件+数据区) —— 必须与 partitions.csv 完全一致:
 #   0x000000  bootloader              32KB
 #   0x009000  nvs                      32KB
 #   0x011000  phy_init                  4KB
-#   0x020000  factory app (LinTOS)    6MB    → 0x620000
-#   0x620000  appdata (8.BIN+E.BIN)  ~9.9MB  → 0x1000000
+#   0x020000  factory app (LinTOS)    4MB    → 0x420000
+#   0x420000  appdata (8.BIN+E.BIN+字库)  ~11.9MB → 0x1000000
 #   其余 0xFF 填充
 
 set -e
@@ -46,6 +46,30 @@ BL_SIZE=$(stat -f%z "${BOOTLOADER_BIN}")
 PT_SIZE=$(stat -f%z "${PARTITION_BIN}")
 APP_SIZE=$(stat -f%z "${APP_BIN}")
 
+# 字库区 (appdata 分区内 4MB 起, 固定槽位, 与 font_part.h 完全一致)
+#   槽1 0x400000 font_zh.bin / 槽2 0x480000 font_zh_light.bin / 槽3 0x500000 font_zh16.bin
+#   槽4 0x540000 book16_fs.fnt / 槽5 0x5A0000 book24_fs.fnt / 槽6 0x660000 book24_hz.fnt
+#   槽7 0x720000 book32_fs.fnt / 槽8 0x820000 lav_font.bin
+FONT_ZH_BIN="${PROJECT_DIR}/components/fonts/font_zh.bin"
+FONT_LIGHT_BIN="${PROJECT_DIR}/components/fonts/font_zh_light.bin"
+FONT_16_BIN="${PROJECT_DIR}/components/fonts/font_zh16.bin"
+BOOK16_BIN="${PROJECT_DIR}/components/book_reader/assets/book16_fs.fnt"
+BOOK24_BIN="${PROJECT_DIR}/components/book_reader/assets/book24_fs.fnt"
+BOOK24HZ_BIN="${PROJECT_DIR}/components/book_reader/assets/book24_hz.fnt"
+BOOK32_BIN="${PROJECT_DIR}/components/book_reader/assets/book32_fs.fnt"
+LAV_FONT_SRC="${PROJECT_DIR}/components/lavax/core/source/font.c"   # 文曲星字库源数组
+LAV_FONT_TMP="${PROJECT_DIR}/build/lav_font.bin"                    # 提取产物
+
+APP_BASE=$((0x420000))
+FONT_ZH_ABS=$((APP_BASE + 0x400000))        # appdata+0x400000
+FONT_LIGHT_ABS=$((APP_BASE + 0x480000))
+FONT_16_ABS=$((APP_BASE + 0x500000))
+FONT_BK16_ABS=$((APP_BASE + 0x540000))
+FONT_BK24_ABS=$((APP_BASE + 0x5A0000))
+FONT_BK24HZ_ABS=$((APP_BASE + 0x660000))
+FONT_BK32_ABS=$((APP_BASE + 0x720000))
+FONT_LAV_ABS=$((APP_BASE + 0x820000))
+
 echo "=========================================="
 echo "  合并 16MB Flash 镜像 (单固件+数据区)"
 echo "=========================================="
@@ -55,10 +79,31 @@ echo "LinTOS.bin           $(printf '%8d' ${APP_SIZE}) B  @ 0x020000 (factory)"
 if [ -f "${ROM8_BIN}" ] && [ -f "${ROME_BIN}" ]; then
     ROM8_SIZE=$(stat -f%z "${ROM8_BIN}")
     ROME_SIZE=$(stat -f%z "${ROME_BIN}")
-    echo "8.BIN                $(printf '%8d' ${ROM8_SIZE}) B  @ 0x620000 (appdata+0)"
-    echo "E.BIN                $(printf '%8d' ${ROME_SIZE}) B  @ 0x820000 (appdata+2MB)"
+    echo "8.BIN                $(printf '%8d' ${ROM8_SIZE}) B  @ 0x$(printf '%X' ${APP_BASE}) (appdata+0)"
+    echo "E.BIN                $(printf '%8d' ${ROME_SIZE}) B  @ 0x$(printf '%X' $((APP_BASE + 0x200000))) (appdata+2MB)"
 else
     echo "8.BIN/E.BIN          (未提供, appdata 留空)"
+fi
+if [ -f "${FONT_ZH_BIN}" ] && [ -f "${FONT_LIGHT_BIN}" ] && [ -f "${FONT_16_BIN}" ]; then
+    echo "font_zh.bin          $(printf '%8d' $(stat -f%z "${FONT_ZH_BIN}")) B  @ 0x$(printf '%X' ${FONT_ZH_ABS}) (appdata+4MB)"
+    echo "font_zh_light.bin    $(printf '%8d' $(stat -f%z "${FONT_LIGHT_BIN}")) B  @ 0x$(printf '%X' ${FONT_LIGHT_ABS})"
+    echo "font_zh16.bin        $(printf '%8d' $(stat -f%z "${FONT_16_BIN}")) B  @ 0x$(printf '%X' ${FONT_16_ABS})"
+    echo "book16_fs.fnt        $(printf '%8d' $(stat -f%z "${BOOK16_BIN}")) B  @ 0x$(printf '%X' ${FONT_BK16_ABS})"
+    echo "book24_fs.fnt        $(printf '%8d' $(stat -f%z "${BOOK24_BIN}")) B  @ 0x$(printf '%X' ${FONT_BK24_ABS})"
+    echo "book24_hz.fnt        $(printf '%8d' $(stat -f%z "${BOOK24HZ_BIN}")) B  @ 0x$(printf '%X' ${FONT_BK24HZ_ABS})"
+    echo "book32_fs.fnt        $(printf '%8d' $(stat -f%z "${BOOK32_BIN}")) B  @ 0x$(printf '%X' ${FONT_BK32_ABS})"
+    if [ -f "${LAV_FONT_SRC}" ]; then
+        python3 -c "
+import re,sys
+text=open('${LAV_FONT_SRC}').read()
+m=re.search(r'lav_font\[\]\s*=\s*\{(.*?)\};', text, re.S)
+if not m: sys.exit('lav_font 数组未找到')
+data=bytes(int(x,16) for x in re.findall(r'0x[0-9a-fA-F]+', m.group(1)))
+open('${LAV_FONT_TMP}','wb').write(data)
+" && echo "lav_font.bin         $(printf '%8d' $(stat -f%z "${LAV_FONT_TMP}")) B  @ 0x$(printf '%X' ${FONT_LAV_ABS})"
+    fi
+else
+    echo "字库区               (未提供, appdata 字库区留空, 中文/电子书/文曲星将不显示)"
 fi
 echo "Flash 总大小         ${FLASH_SIZE} B"
 echo "=========================================="
@@ -79,8 +124,21 @@ dd if="${BOOTLOADER_BIN}" of="${OUT_FILE}" bs=1 seek=0 conv=notrunc 2>/dev/null
 dd if="${PARTITION_BIN}"  of="${OUT_FILE}" bs=1 seek=$((0x008000)) conv=notrunc 2>/dev/null
 dd if="${APP_BIN}"        of="${OUT_FILE}" bs=1 seek=$((0x020000)) conv=notrunc 2>/dev/null
 if [ -f "${ROM8_BIN}" ] && [ -f "${ROME_BIN}" ]; then
-    dd if="${ROM8_BIN}" of="${OUT_FILE}" bs=1 seek=$((0x620000)) conv=notrunc 2>/dev/null
-    dd if="${ROME_BIN}" of="${OUT_FILE}" bs=1 seek=$((0x820000)) conv=notrunc 2>/dev/null
+    dd if="${ROM8_BIN}" of="${OUT_FILE}" bs=1 seek=${APP_BASE} conv=notrunc 2>/dev/null
+    dd if="${ROME_BIN}" of="${OUT_FILE}" bs=1 seek=$((APP_BASE + 0x200000)) conv=notrunc 2>/dev/null
+fi
+# 字库区写 appdata (V1.0.89+ 从固件迁出, 运行时 esp_partition_mmap 读取)
+if [ -f "${FONT_ZH_BIN}" ] && [ -f "${FONT_LIGHT_BIN}" ] && [ -f "${FONT_16_BIN}" ]; then
+    dd if="${FONT_ZH_BIN}"    of="${OUT_FILE}" bs=1 seek=${FONT_ZH_ABS}    conv=notrunc 2>/dev/null
+    dd if="${FONT_LIGHT_BIN}" of="${OUT_FILE}" bs=1 seek=${FONT_LIGHT_ABS} conv=notrunc 2>/dev/null
+    dd if="${FONT_16_BIN}"    of="${OUT_FILE}" bs=1 seek=${FONT_16_ABS}    conv=notrunc 2>/dev/null
+    dd if="${BOOK16_BIN}"     of="${OUT_FILE}" bs=1 seek=${FONT_BK16_ABS}  conv=notrunc 2>/dev/null
+    dd if="${BOOK24_BIN}"     of="${OUT_FILE}" bs=1 seek=${FONT_BK24_ABS}  conv=notrunc 2>/dev/null
+    dd if="${BOOK24HZ_BIN}"   of="${OUT_FILE}" bs=1 seek=${FONT_BK24HZ_ABS} conv=notrunc 2>/dev/null
+    dd if="${BOOK32_BIN}"     of="${OUT_FILE}" bs=1 seek=${FONT_BK32_ABS}  conv=notrunc 2>/dev/null
+    if [ -f "${LAV_FONT_TMP}" ]; then
+        dd if="${LAV_FONT_TMP}" of="${OUT_FILE}" bs=1 seek=${FONT_LAV_ABS} conv=notrunc 2>/dev/null
+    fi
 fi
 
 SHA=$(shasum -a 256 "${OUT_FILE}" | awk '{print $1}')

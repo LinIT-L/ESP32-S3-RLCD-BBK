@@ -2,7 +2,6 @@ idf_component_register(
     SRCS
         "gbc_emu.c"
         "host_gnuboy.c"
-        "make_color.c"
         "third_party/gnuboy/src/cpu.c"
         "third_party/gnuboy/src/emu.c"
         "third_party/gnuboy/src/fastmem.c"
@@ -25,6 +24,7 @@ idf_component_register(
         esp_timer
         esp_partition
         esp_system
+        color_convert
         esp_common
         freertos
         heap

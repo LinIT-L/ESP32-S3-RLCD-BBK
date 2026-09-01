@@ -91,10 +91,10 @@ static const uint8_t mouse_report_desc[] = {
 };
 
 /* 接口枚举 */
-enum { ITF_KEYBOARD = 0, ITF_MOUSE = 1, ITF_NUM_TOTAL };
-enum { EP_KEYBOARD = 0x81, EP_MOUSE = 0x82 };
+enum { ITF_KEYBOARD = 0, ITF_MOUSE = 1, ITF_CDC = 2, ITF_CDC_DATA = 3, ITF_NUM_TOTAL };
+enum { EP_KEYBOARD = 0x81, EP_MOUSE = 0x82, EP_CDC_NOTIF = 0x83, EP_CDC_OUT = 0x04, EP_CDC_IN = 0x84 };
 
-#define HID_CONFIG_DESC_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN)
+#define HID_CONFIG_DESC_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
 
 static uint8_t const hid_config_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, HID_CONFIG_DESC_LEN,
@@ -103,6 +103,7 @@ static uint8_t const hid_config_desc[] = {
                        sizeof(keyboard_report_desc), EP_KEYBOARD, 8, 10),
     TUD_HID_DESCRIPTOR(ITF_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE,
                        sizeof(mouse_report_desc), EP_MOUSE, 8, 10),
+    TUD_CDC_DESCRIPTOR(ITF_CDC, 0, EP_CDC_NOTIF, 8, EP_CDC_OUT, EP_CDC_IN, 64),
 };
 
 /* 字符串描述符: [0]=langid, [1]=manufacturer, [2]=product, [3]=serial */
@@ -337,4 +338,46 @@ void usb_hid_mouse_release(uint8_t buttons)
     s_mouse_buttons &= (uint8_t)~buttons;
     if (!ms_ready()) return;
     tud_hid_n_mouse_report(HID_ITF_MS, 0, s_mouse_buttons, 0, 0, 0, 0);
+}
+
+/* ---------------- CDC 串口 (复合设备附加功能) ---------------- */
+
+/* 说明: 设备描述符走 esp_tinyusb 默认 (MISC/IAD 复合类), 配置描述符由
+ * TUD_CDC_DESCRIPTOR 自动携带 IAD 把接口 2(CDC)/3(CDC_DATA) 关联为单一功能.
+ * 这里用 TinyUSB 原生 API (与上方 HID 同风格, 不引入 esp_tinyusb acm 封装层,
+ * 避免其内部同样定义 tud_cdc_rx_cb 造成重复定义). 实例号固定为 0. */
+
+static usb_hid_cdc_rx_cb_t s_cdc_rx_cb = NULL;
+
+void usb_hid_cdc_set_rx_cb(usb_hid_cdc_rx_cb_t cb)
+{
+    s_cdc_rx_cb = cb;
+}
+
+/* TinyUSB 在收到 CDC 数据时调用 (tud_task 上下文), 把数据交给应用回调.
+ * 应用回调应尽快拷贝/消费, 不要在回调里做耗时操作. */
+void tud_cdc_rx_cb(uint8_t itf)
+{
+    (void)itf; /* 单实例, 恒为 0 */
+    if (!s_cdc_rx_cb) return;
+    uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
+    uint32_t count = tud_cdc_read(buf, sizeof(buf));
+    if (count > 0) {
+        s_cdc_rx_cb(buf, count);
+    }
+}
+
+/* 向 PC CDC 串口发送数据. 返回实际写入字节数; 未运行/未连接返回 0. */
+size_t usb_hid_cdc_write(const uint8_t *data, size_t len)
+{
+    if (!s_running || !tud_cdc_connected()) return 0;
+    size_t n = tud_cdc_write(data, len);
+    tud_cdc_write_flush();
+    return n;
+}
+
+/* CDC 串口是否已连接 (PC 打开该串口后 DTR 置位) */
+bool usb_hid_cdc_connected(void)
+{
+    return s_running && tud_cdc_connected();
 }

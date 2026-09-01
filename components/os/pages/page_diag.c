@@ -8,6 +8,7 @@
 #include "os.h"
 #include "ui_common.h"
 #include "font_zh.h"
+#include "esp_attr.h"
 #include "font_zh16.h"
 #include "input.h"
 #include "esp_timer.h"
@@ -588,7 +589,7 @@ static int DI_COUNT[DICAT_N] = { 6, 5, 3, 0 };
 
 #define DI_HIST_DIR  "/sdcard/diag"
 #define DI_HIST_MAX  16
-static char di_hist[DI_HIST_MAX][48];
+EXT_RAM_BSS_ATTR static char di_hist[DI_HIST_MAX][48];
 static int  di_hist_n = -1;
 
 static void di_scan_history(void) {

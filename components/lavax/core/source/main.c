@@ -4,13 +4,13 @@
 #include "type.h"
 #include "base.h"
 #include "lavaxvm.h"
+#include "font_part.h"
 
 extern byte *ram_base;
 extern byte *VRam;
 extern byte *lRam;
 extern byte *pLAVA;
 byte *lav_fonts;
-extern const unsigned char lav_font[];
 extern void main_loop(void);
 extern void InitNds(void);
 extern void Color256Init(void);
@@ -152,7 +152,7 @@ bool lavaxvm_init(void *vm_ram, size_t vm_ram_size, void *local_ram, size_t loca
     VRam = (byte *)vm_memory;
     lRam = VRam;
     pLAVA = NULL;
-    lav_fonts = (byte *)lav_font;
+    lav_fonts = (byte *)font_part_map(FONT_SLOT_LAV_OFF, FONT_SLOT_LAV_LEN);
     printf("LavaXVM: InitNds\n");
     InitNds();
     printf("LavaXVM: Color256Init\n");

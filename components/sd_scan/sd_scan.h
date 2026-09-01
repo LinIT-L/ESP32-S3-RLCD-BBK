@@ -80,6 +80,16 @@ void sd_watcher_start(void);
 /* 暂停/恢复 SD 监控 (游戏运行、USB MSC "挂载到电脑" 期间必须暂停) */
 void sd_watcher_set_paused(bool paused);
 
+/* === 关键操作看门狗 (卡死强制重启) ===
+ * 背景: 拔 TF 卡会使底层 SDMMC/FAT 读写在同步调用里永久阻塞 (如
+ * usbh_msc_stop / sd_remount_vfs_from_card / sd_mount), 若无兜底 UI 会
+ * 永久卡死 (仅剩后台心跳, 看似死机). 此看门狗: begin 记录操作起点, 若超过
+ * timeout_ms 仍未 end, 由独立看门狗任务强制 esp_restart() 自动恢复.
+ * 用法: sd_op_watchdog_begin(5000); ...阻塞调用...; sd_op_watchdog_end();
+ * 调用必须在 sd_watcher_start() 之后 (看门狗随 watcher 一起跑). */
+void sd_op_watchdog_begin(uint32_t timeout_ms);
+void sd_op_watchdog_end(void);
+
 /* 获取 TF 卡容量信息 (总字节, 已用, 空闲)
  * 返回 0 成功, 负值失败 */
 int sd_get_info(uint64_t *total_bytes, uint64_t *free_bytes);

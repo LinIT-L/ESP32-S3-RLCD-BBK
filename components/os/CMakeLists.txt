@@ -11,6 +11,7 @@ idf_component_register(
          "kernel/os_pane.c"
          "kernel/os_theme.c"
          "kernel/os_hw.c"
+         "kernel/os_mgr.c"
          "services/svc_statusbar.c"
          "pages/page_main.c"
          "pages/page_select_game.c"
@@ -23,15 +24,22 @@ idf_component_register(
          "pages/page_usb_hid.c"
          "pages/page_icon_editor.c"
          "pages/page_app_manager.c"
+         "pages/page_storage.c"
+         "pages/page_engine.c"
+         "pages/page_file_browser.c"
          "pages/page_wifi_kb.c"
          "pages/page_term.c"
          "pages/page_wb.c"
          "pages/page_diag.c"
+         "pages/page_sponsor.c"
+         "pages/page_touchtest.c"
     INCLUDE_DIRS "include"
-    REQUIRES st7305 ui_common input audio_player vibrator engine_manager gam4980 book_reader wallpapers usb_hid wifi_manager fonts kbd_lib sd_scan board_battery esp_netif lwip spi_flash esp_system bt_ctl web_gamepad
+    REQUIRES st7305 ui_common input touch_panel audio_player vibrator engine_manager gam4980 gb_emu gbc_emu nes_emu lavax arduboy_avr vpet book_reader wallpapers usb_hid wifi_manager fonts kbd_lib sd_scan board_battery esp_netif lwip spi_flash nvs_flash esp_system bt_ctl web_gamepad usbh_msc vpet virtual_keys board_shim
+        esp_http_client favorites
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wno-unused-function
     -Wno-unused-variable
+    -Wno-error=format-truncation
 )

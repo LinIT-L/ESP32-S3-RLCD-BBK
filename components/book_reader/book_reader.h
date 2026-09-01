@@ -43,6 +43,16 @@ bool book_reader_knock_active(void);
 void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, int rot,
                               int fontstyle, int fontsize, int margin, int lineh, int gap);
 
+/* V1.1.1: 阅读菜单交给外部 (os_dialog 列表模板) 呈现.
+ * 打开阅读器时置 true → 阅读器内部不再自绘菜单, 由 page_book 用列表弹窗驱动. */
+void book_reader_set_external_menu(bool en);
+bool book_reader_menu_active(void);         /* 阅读菜单(目录/书签等)是否打开 */
+int  book_reader_menu_count(void);          /* 当前菜单项数 */
+const char *book_reader_menu_text(int i);   /* 当前菜单项文字 */
+void book_reader_menu_choose(int idx);      /* 选中菜单项 (执行跳转/添加书签/关闭等) */
+void book_reader_menu_cancel(void);         /* 关闭菜单回阅读 */
+const char *book_reader_menu_take_msg(void);/* 取走一次性提示 (已添加书签/已清空), 无则空串 */
+
 #ifdef __cplusplus
 }
 #endif

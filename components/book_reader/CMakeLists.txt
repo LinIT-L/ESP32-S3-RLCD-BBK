@@ -5,16 +5,11 @@ idf_component_register(
          "libunibreak/linebreakdef.c" "libunibreak/unibreakbase.c"
          "libunibreak/unibreakdef.c" "libunibreak/eastasianwidthdef.c"
     INCLUDE_DIRS "." "libunibreak" "miniz"
-    REQUIRES st7305 driver fatfs freertos esp_timer audio_player
+    REQUIRES st7305 driver fatfs freertos esp_timer audio_player fonts
 )
 
-# 嵌入多档 GB2312 点阵字库到 flash (XIP 只读, 运行时切换字号)
-# 精简(挤空间给 Meshtastic ota_0): 保留仿宋全套(16/24/32)+黑体24; 删除黑体16/32(~1.28MB).
-# 黑体16/32 档由 font_book.c 回退到黑体24; TF 卡 /sdcard/fonts 仍可覆盖任意档.
-target_add_binary_data(${COMPONENT_LIB} "assets/book16_fs.fnt" BINARY)
-target_add_binary_data(${COMPONENT_LIB} "assets/book24_fs.fnt" BINARY)
-target_add_binary_data(${COMPONENT_LIB} "assets/book32_fs.fnt" BINARY)
-target_add_binary_data(${COMPONENT_LIB} "assets/book24_hz.fnt" BINARY)
+# V1.0.89+: 字库二进制已迁移到 appdata 分区字库区 (esp_partition_mmap 运行时加载,
+# 经 fonts/font_part 共享加载器), 不再嵌入固件 (target_add_binary_data 已移除).
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     -Wno-unused-function

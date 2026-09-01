@@ -8,7 +8,7 @@ typedef struct {
   uint8_t sp;
   uint8_t status;
 } s6502_t;
-uint32_t IRAM_ATTR s6502_exec(s6502_t *u, uint32_t cycles) {
+uint32_t s6502_exec(s6502_t *u, uint32_t cycles) {
   static void *_table[0x100] = {
       &&_00, &&_01, &&_02, &&_03, &&_04, &&_05, &&_06, &&_07, &&_08, &&_09,
       &&_0a, &&_0b, &&_0c, &&_0d, &&_0e, &&_0f, &&_10, &&_11, &&_12, &&_13,

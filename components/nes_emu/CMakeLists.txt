@@ -3,7 +3,6 @@ idf_component_register(
         "nes_emu.c"
         "video_audio.c"
         "shared_memory.c"
-        "make_color.c"
         "nes_shared_memory.c"
         "nofrendo/bitmap.c"
         "nofrendo/cpu/nes6502.c"
@@ -80,6 +79,7 @@ idf_component_register(
         board_shim
         audio_player
         esp_timer
+        color_convert
         esp_common
         freertos
         heap

@@ -30,6 +30,10 @@ static bool s_force_hidden = false;   /* 壁纸模式: 强制不显示虚拟按�
 static volatile uint8_t s_joypad = 0xFF;   /* 跨任务 (模拟任务 poll, 刷新任务 draw) */
 static bool s_stick_active = false;        /* 摇杆激活后拖出圆圈仍持续, 直到松手 */
 static vk_layout_t s_layout = VK_LAYOUT_STANDARD;
+/* 引擎定制 (步步高等): 隐藏 Select/Start 两个虚拟键 (不命中也不绘制) */
+static bool s_hide_selsta = false;
+
+void virtual_keys_set_hide_selsta(bool h) { s_hide_selsta = h; }
 
 /* 按键几何: 命中框 (x0,y0)-(x1,y1), 圆心/文字由绘制函数按常量计算 */
 typedef struct {
@@ -101,31 +105,23 @@ void virtual_keys_set_layout(vk_layout_t layout)
     s_layout = layout;
 }
 
-uint8_t virtual_keys_poll(int touch_x, int touch_y, bool touch_down)
-{
-    if (!s_enabled) {
-        s_joypad = 0xFF;
-        s_stick_active = false;
-        return s_joypad;
-    }
+/* 单点 hit-test: 返回该点按下的按键掩码 (低电平, 返回掩码各 bit 0=按下).
+ * only_keys=true 时不命中方向/摇杆区, 用于第二根手指"只控按键(A/B/SEL/STA)". */
+static uint8_t vk_hit_point(int x, int y, bool only_keys) {
     uint8_t j = 0xFF;
-    if (touch_down) {
-        /* 暴龙机布局: 只有3个圆形按键, 无方向键/摇杆 */
-        if (s_layout == VK_LAYOUT_VPET) {
-            for (int i = 0; i < VPET_HIT_COUNT; i++) {
-                const vk_hit_t *h = &s_vpet_hits[i];
-                if (touch_x >= h->x0 && touch_x <= h->x1 &&
-                    touch_y >= h->y0 && touch_y <= h->y1) {
-                    j &= (uint8_t)~(1u << h->bit);
-                }
-            }
-            s_joypad = j;
-            return j;
+    /* 暴龙机布局: 只有3个圆形按键, 无方向键/摇杆 */
+    if (s_layout == VK_LAYOUT_VPET) {
+        for (int i = 0; i < VPET_HIT_COUNT; i++) {
+            const vk_hit_t *h = &s_vpet_hits[i];
+            if (x >= h->x0 && x <= h->x1 && y >= h->y0 && y <= h->y1)
+                j &= (uint8_t)~(1u << h->bit);
         }
-        /* 标准布局: 摇杆 + 方向键 + A/B + SEL/STA */
+        return j;
+    }
+    if (!only_keys) {
         /* 摇杆: 中心圆圈内按下即激活, 激活后拖出圆圈范围仍持续判定方向, 直到松手 */
-        int dx = touch_x - VK_STICK_CX;
-        int dy = touch_y - VK_STICK_CY;
+        int dx = x - VK_STICK_CX;
+        int dy = y - VK_STICK_CY;
         if (s_stick_active ||
             (dx * dx + dy * dy <= VK_STICK_R * VK_STICK_R)) {
             s_stick_active = true;
@@ -141,21 +137,46 @@ uint8_t virtual_keys_poll(int touch_x, int touch_y, bool touch_down)
                 }
             }
         }
-        /* 常规按键命中 (摇杆激活时跳过 4 个方向键, 避免与摇杆重复) */
-        for (int i = 0; i < VK_HIT_COUNT; i++) {
-            const vk_hit_t *h = &s_hits[i];
-            if (s_stick_active &&
-                (h->bit == VK_BIT_UP || h->bit == VK_BIT_DOWN ||
-                 h->bit == VK_BIT_LEFT || h->bit == VK_BIT_RIGHT)) {
-                continue;
-            }
-            if (touch_x >= h->x0 && touch_x <= h->x1 &&
-                touch_y >= h->y0 && touch_y <= h->y1) {
-                j &= (uint8_t)~(1u << h->bit);
-            }
+    }
+    for (int i = 0; i < VK_HIT_COUNT; i++) {
+        const vk_hit_t *h = &s_hits[i];
+        /* 引擎定制: 隐藏 Select/Start 时跳过其命中 (如步步高无 SEL/STA) */
+        if (s_hide_selsta &&
+            (h->bit == VK_BIT_SELECT || h->bit == VK_BIT_START)) {
+            continue;
         }
-    } else {
+        bool is_dir = (h->bit == VK_BIT_UP || h->bit == VK_BIT_DOWN ||
+                       h->bit == VK_BIT_LEFT || h->bit == VK_BIT_RIGHT);
+        if (only_keys && is_dir) continue;          /* 第二指不命中方向键 */
+        if (s_stick_active && is_dir) continue;     /* 摇杆激活时跳过方向键, 避免与摇杆重复 */
+        if (x >= h->x0 && x <= h->x1 && y >= h->y0 && y <= h->y1)
+            j &= (uint8_t)~(1u << h->bit);
+    }
+    return j;
+}
+
+uint8_t virtual_keys_poll(int touch_x, int touch_y, bool touch_down)
+{
+    return virtual_keys_poll_multi(touch_x, touch_y, touch_down, 0, 0, false);
+}
+
+/* V1.0.xx: 多点触控 — 左指控方向/摇杆 (第一点), 右指控 A/B/SEL/STA (第二点).
+ * 两指可同时按下 (如格斗游戏拇指按方向同时另一指按 A/B). */
+uint8_t virtual_keys_poll_multi(int x0, int y0, bool d0, int x1, int y1, bool d1)
+{
+    if (!s_enabled) {
+        s_joypad = 0xFF;
         s_stick_active = false;
+        return s_joypad;
+    }
+    uint8_t j = 0xFF;
+    if (d0) {
+        j &= vk_hit_point(x0, y0, false);   /* 第一指: 方向/摇杆 (也可按任意键) */
+    } else {
+        s_stick_active = false;             /* 第一指松开 → 摇杆复位 */
+    }
+    if (d1) {
+        j &= vk_hit_point(x1, y1, true);    /* 第二指: 只控按键区 (不命中方向/摇杆) */
     }
     s_joypad = j;
     return j;
@@ -349,7 +370,9 @@ void virtual_keys_draw(st7305_handle_t *lcd)
     if (!b_p) st7305_draw_text_outlined(lcd, 306, 247, "B");
     else      st7305_draw_text(lcd, 306, 247, "B");
 
-    /* Select/Start: 只画文字, 不画方框 (带白描边) */
-    st7305_draw_text_outlined(lcd, 150, 281, "SEL");
-    st7305_draw_text_outlined(lcd, 217, 281, "STA");
+    /* Select/Start: 只画文字, 不画方框 (带白描边); 引擎定制隐藏时跳过 */
+    if (!s_hide_selsta) {
+        st7305_draw_text_outlined(lcd, 150, 281, "SEL");
+        st7305_draw_text_outlined(lcd, 217, 281, "STA");
+    }
 }

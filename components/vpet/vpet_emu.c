@@ -82,8 +82,36 @@ static bool            s_ready = false;
 /* V1.0.9x: 是否按内容旋转 180° — 按 ROM 尺寸判断机型, 不用文件名:
  *    16KB (8192 字, 数码宝贝/Digimon 家族) → 旋转 180°
  *    12KB (6144 字, Tamagotchi P1/P2)     → 不旋转
- * 由 vpet_emu_start 根据读到的 words 设置. */
+ * V1.3.x: 16KB 家族内再细分 — Tamagotchi Angel(宠物蛋天使)/Mothra(摩斯拉) 同是
+ * 16KB 但内容方向正常, 不能一刀切旋转. 由 vpet_rom_needs_rotate 判定.
+ * 由 vpet_emu_start 根据读到的 words + path 设置. */
 static bool s_rotate = false;
+
+/* V1.3.x: 16KB 家族里区分旋转需求 — Digimon(数码宝贝) 家族 ROM 内容倒置 → 旋转 180°;
+ * Tamagotchi Angel(宠物蛋天使) 与 Mothra(摩斯拉) 同为 16KB 但内容方向正常 → 不旋转.
+ * 用文件名特征词 (大小写不敏感英文 + UTF-8 中文), 其余 16KB 保持旋转 (兼容改名 Digimon). */
+static bool vpet_rom_needs_rotate(const char *path, int words) {
+    if (words != 8192) return false;   /* 12KB = P1/P2 等, 不旋转 */
+    if (path) {
+        const char *fn = strrchr(path, '/');
+        fn = fn ? fn + 1 : path;
+        size_t fl = strlen(fn);
+        static const char *const no_rot[4] = {
+            "angel",                          /* Angel (标准英文名) */
+            "\xe5\xa4\xa9\xe4\xbd\xbf",       /* 天使 (用户中文名) */
+            "mothra",                         /* Mothra (标准英文名) */
+            "\xe6\x91\xa9\xe6\x96\xaf\xe6\x8b\x89"  /* 摩斯拉 (用户中文名) */
+        };
+        for (int i = 0; i < 4; i++) {
+            const char *kw = no_rot[i];
+            size_t kl = strlen(kw);
+            for (size_t j = 0; j + kl <= fl; j++) {
+                if (strncasecmp(fn + j, kw, kl) == 0) return false;
+            }
+        }
+    }
+    return true;   /* 其余 16KB = Digimon 家族, 旋转 */
+}
 
 /* ============ 显示模式 / 抗锯齿 (仅暴龙机, 不吃共享灰度) ============
  * s_disp_mode: 0=点对点, 1=放大(等比拉到最宽/置顶), 2=拉伸(强制全屏)
@@ -373,8 +401,12 @@ esp_err_t vpet_emu_start(const char *path) {
     free(raw);
     s_rom_words = words;
 
-    /* V1.0.9x: 按 ROM 尺寸决定是否旋转 180°(不依赖文件名) */
-    s_rotate = (words == 8192);   /* 16KB = 数码宝贝; 12KB = Tamagotchi P1/P2 */
+    /* V1.3.x: 16KB 家族细分 — Angel(宠物蛋天使)/Mothra(摩斯拉) 内容正常不旋转,
+     * 其余 16KB (Digimon 数码宝贝家族) 内容倒置仍旋转. 文件名优先:
+     * 标准名 TamagotchiAngel.bin / TamagotchiMothra.bin 或用户中文名均含特征词.
+     * (V1.0.9x 的 s_rotate=(words==8192) 一刀切已由本函数取代) */
+    s_rotate = vpet_rom_needs_rotate(path, words);
+    ESP_LOGI(TAG, "ROM %s (%d bytes): %s", path, len, s_rotate ? "旋转180°" : "不旋转");
 
     initCPU(s_rom, s_rom_words, 1600000, vpet_tone_handler, NULL);   /* clockHz=1.6MHz */
 

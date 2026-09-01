@@ -68,8 +68,6 @@ extern esp_err_t lavax_emu_background_init(st7305_handle_t *lcd);
 extern void lavax_emu_unload(void);
 extern esp_err_t vpet_emu_background_init(st7305_handle_t *lcd);
 extern void vpet_emu_unload(void);
-extern void meshtasic_start(st7305_handle_t *lcd);
-extern void meshtasic_stop(void);
 
 static void e_gam4980_load(st7305_handle_t *lcd) { gam4980_emu_background_init(lcd); }
 static void e_gam4980_unload(void)               { gam4980_emu_unload(); }

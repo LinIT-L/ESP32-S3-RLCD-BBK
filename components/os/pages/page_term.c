@@ -43,9 +43,9 @@
 #define HM_ROW 16
 #define ZH16_ADV_W 14
 
-/* --- 历史缓冲 (200 行约 10KB 静态, 无堆分配) --- */
-static char  s_buf[TM_MAXLINES][TM_LINE_LEN];
-static char  s_cmd[TM_LINE_LEN];
+/* --- 历史缓冲 (200 行约 10KB). 放 PSRAM, 不占内部 SRAM. --- */
+EXT_RAM_BSS_ATTR static char  s_buf[TM_MAXLINES][TM_LINE_LEN];
+EXT_RAM_BSS_ATTR static char  s_cmd[TM_LINE_LEN];
 #define LN(i) (s_buf[(i)])
 static bool  s_ready = true;
 static int   s_nlines = 0;
@@ -473,6 +473,7 @@ static int bar_maxofs(void){ int tot=0; for(int i=0;i<TM_BAR_N;i++) tot+=asw(s_b
 
 /* ============ 模块接口 ============ */
 static void term_reset(ui_ctx_t *ctx) {
+    input_set_swipe_back(false);   /* 全屏终端屏蔽上滑退出, 仅返回键触发确认 */
     g_kbd = kbd_std; g_kbd.caps=false; g_kbd.shift=false; g_kbd.fn_mode=0;
     s_ci=0; s_cur=0; s_press=-1; s_bar_ofs=0; s_nlines=0;
     for(int i=0;i<TM_MAXLINES;i++)line_set(i,"");
@@ -627,7 +628,7 @@ static const os_module_t s_mod_term = {
     .action     = p_term_action,
     .touch      = p_term_touch,
     .poll       = p_term_poll,
-    .fullscreen = false,
+    .fullscreen = true,   /* 隐藏状态栏; 按返回弹"退出程序?"确认框, 确认后退出 */
 };
 
 void os_page_term_register(void) { os_register(&s_mod_term); }

@@ -139,19 +139,7 @@ static void svc_render(ui_ctx_t *ctx)
         right_x -= STATUS_ICON_W + GAP;
     }
 
-    int vol_level = 0;
-    if (s_ops) {
-        vol_level = s_ops->is_muted ? (s_ops->is_muted() ? 0 : (s_ops->get_volume ? s_ops->get_volume() : 0)) : 0;
-    }
-    if (vol_level > 10) vol_level = 10;
-    if (vol_level > 0) {
-        int snd_idx = (vol_level <= 3) ? 0 : (vol_level <= 6) ? 1 :
-                      (vol_level <= 9) ? 2 : 3;
-        svc_draw_status_icon(lcd, right_x - STATUS_ICON_W, text_y,
-                             SND_ICON_W, SND_ICON_H, (SND_ICON_W + 7) / 8,
-                             STATUS_ICON_W, STATUS_ICON_H, snd12_icon[snd_idx]);
-        right_x -= STATUS_ICON_W + GAP;
-    }
+    /* V1.1.1 用户需求: 状态栏默认不显示喇叭音量图标 */
 
     bool data_active = s_ops && s_ops->usb_data_active && s_ops->usb_data_active();
     if (data_active) {
@@ -179,4 +167,30 @@ static const os_service_t s_svc_statusbar = {
 void os_svc_statusbar_register(void)
 {
     os_register_service(&s_svc_statusbar);
+}
+
+/* V1.1.1: 游戏内状态栏 (供引擎在游戏渲染循环自绘顶部条).
+ * 轻量版: 居中时间 HH:MM + 右侧 电池/手柄. 从旧 menu_draw_status_bar 迁出精简,
+ * 由引擎把电量/手柄状态作为参数传入 (不读全局菜单状态). */
+void svc_statusbar_draw_game(st7305_handle_t *lcd, uint8_t battery, bool pad_connected) {
+    if (!lcd) return;
+    const int text_y = 3;
+    const int M  = 4;
+    const int GAP = 4;
+    const int SCREEN_W = UI_SCREEN_W;
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char ts[16];
+    snprintf(ts, sizeof(ts), "%02d:%02d", t ? t->tm_hour : 0, t ? t->tm_min : 0);
+    int tw = (int)strlen(ts) * 12;
+    int tx = (SCREEN_W - tw) / 2;
+    for (int i = 0; ts[i]; i++) { draw_ascii_medium(lcd, tx, text_y, ts[i], false); tx += 12; }
+    int rx = SCREEN_W - M;
+    svc_draw_battery(lcd, rx - BAT_ICON_W, text_y, battery);
+    rx -= BAT_ICON_W + GAP;
+    if (pad_connected) {
+        svc_draw_status_icon(lcd, rx - STATUS_ICON_W, text_y,
+                             PAD_ICON_W, PAD_ICON_H, (PAD_ICON_W + 7) / 8,
+                             STATUS_ICON_W, STATUS_ICON_H, pad12_icon);
+    }
 }

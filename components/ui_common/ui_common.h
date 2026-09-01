@@ -67,3 +67,5 @@ void menu_draw_cat_icon(st7305_handle_t *lcd, int cx, int cy, int size_w, int si
 #endif
 
 #endif /* UI_COMMON_H */
+
+void ui_draw_notice_popup(st7305_handle_t *lcd, const char *text);

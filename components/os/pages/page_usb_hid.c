@@ -650,19 +650,22 @@ static void hid_trackpad_poll(ui_ctx_t *ctx) {
     (void)ctx;
 }
 
-/* ============ 布局切换 (统一 os_dialog) ============ */
-static const char *const s_layout_names[5] = {
+/* ============ 布局切换 (统一 os_dialog, 4 布局 + 底部固定返回) ============ */
+static const char *const s_layout_names[4] = {
     "\xe8\xbf\x90\xe7\xbb\xb4\xe9\x94\xae\xe9\xbc\xa0",            /* 运维键鼠 */
     "28\xe9\x94\xae\xe7\xb4\xa7\xe5\x87\x91\xe9\x94\xae\xe7\x9b\x98", /* 28键紧凑键盘 */
     "52\xe9\x94\xae\xe5\x85\xa8\xe9\x94\xae\xe7\x9b\x98+\xe8\xa7\xa6\xe6\x8e\xa7\xe6\x9d\xbf", /* 52键全键盘+触控板 */
     "\xe7\xba\xaf\xe8\xa7\xa6\xe6\x8e\xa7\xe6\x9d\xbf",            /* 纯触控板 */
-    "\xe8\xbf\x94\xe5\x9b\x9e\xe8\x8f\x9c\xe5\x8d\x95",            /* 返回菜单 */
 };
 
 static void hid_layout_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
-    if (result < 0) return;               /* 取消 */
-    if (result == 4) { os_pop(ctx); return; }   /* 返回菜单: 退出键鼠页 */
+    if (result < 0) {
+        /* 底部"返回": 退出键鼠页回主菜单 (弹窗由本回调先关, 再退 HID 页) */
+        os_dialog_pop(ctx);
+        os_pop(ctx);
+        return;
+    }
     if (result < HID_LAYOUT_MAX) {
         s_hid_layout = (hid_layout_t)result;
         hid_ui_reset();
@@ -678,12 +681,18 @@ static void p_hid_enter(ui_ctx_t *ctx) {
         os_pop(ctx);
         return;
     }
+    /* 键鼠操作区整屏占用, 屏蔽底部上滑退出 (仅物理返回键/长按强制退出) */
+    input_set_swipe_back(false);
     hid_ui_reset();
     ESP_LOGI(TAG, "USB HID 已启动");
+    /* 3.3 交互: 进入即弹出"键鼠布局"列表弹窗选择布局; 底部固定"返回"退出键鼠页 */
+    os_dialog_list(ctx, "\xe9\x94\xae\xe9\xbc\xa0\xe5\xb8\x83\xe5\xb1\x80", /* 键鼠布局 */
+                   s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
 }
 
 static void p_hid_exit(ui_ctx_t *ctx) {
     (void)ctx;
+    input_set_swipe_back(true);   /* 恢复全局上滑返回 */
     usb_hid_key_release();
     usb_hid_mouse_release(HID_MOUSE_L | HID_MOUSE_R | HID_MOUSE_M);
     usb_hid_stop();
@@ -720,12 +729,14 @@ static void p_hid_render(ui_ctx_t *ctx) {
 static void p_hid_action(ui_ctx_t *ctx, os_action_t a) {
     switch (a) {
     case OS_ACTION_CONFIRM:
-        /* 布局切换: 统一弹窗 (0..3 布局 + 4 返回菜单) */
+        /* 布局切换: 统一列表弹窗 (4 布局 + 底部固定返回) */
         os_dialog_list(ctx, "\xe9\x94\xae\xe9\xbc\xa0\xe5\xb8\x83\xe5\xb1\x80", /* 键鼠布局 */
-                       s_layout_names, 5, s_hid_layout, hid_layout_cb, NULL);
+                       s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
         break;
     case OS_ACTION_BACK:
-        os_pop(ctx);
+        /* 布局内按返回 → 弹出"键鼠布局"选择弹窗 (再按弹窗底部"返回"才真正退出) */
+        os_dialog_list(ctx, "\xe9\x94\xae\xe9\xbc\xa0\xe5\xb8\x83\xe5\xb1\x80", /* 键鼠布局 */
+                       s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
         break;
     default:
         break;

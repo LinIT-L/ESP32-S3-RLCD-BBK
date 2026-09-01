@@ -9,8 +9,9 @@ idf_component_register(
         input
         app_board
         st7305
-        menu
+        bbk_boot
         os
+        wallpapers
         driver
         esp_timer
         nvs_flash
@@ -20,4 +21,6 @@ idf_component_register(
         tone_player
         vibrator
         engine_manager
+        board_shim
+        sd_scan
 )

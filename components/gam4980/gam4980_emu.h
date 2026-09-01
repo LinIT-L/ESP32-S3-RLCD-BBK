@@ -6,7 +6,7 @@
 #define GAM4980_EMU_H
 
 #include "st7305.h"
-#include "menu_system.h"
+#include "st7305.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,10 +46,20 @@ display_mode_t gam4980_get_display_mode(void);
 
 /* 兼容旧接口 */
 void gam4980_set_fullscreen(int mode);   /* 0=点对点, 1=全屏, 2=拉伸 */
+/* V1.1.1: 引擎优化 (os 传入, 独立于旧 menu g_menu): 虚拟按键三态 / 游戏内状态栏 */
+void gam4980_set_vkey(int vkey);         /* 0=关 1=开 2=自动(无手柄时开) */
+void gam4980_set_status_bar(bool on);     /* 游戏内状态栏 显示/隐藏 */
 bool gam4980_get_fullscreen(void);
 
 /* 游戏壁纸模式: 打开时任意设备按键强制退出游戏 (V1.0.64) */
 void gam4980_set_wallpaper_mode(bool on);
+
+/* 游戏退出确认结果 (gam4980 引擎专有, 从旧 menu_system.h 迁出归位) */
+typedef enum {
+    GAME_EXIT_CANCEL = 0,   /* 取消, 恢复游戏继续 */
+    GAME_EXIT_CONFIRMED,    /* 确认退出 (返回游戏二级菜单) */
+    GAME_EXIT_TIMEOUT,      /* 无操作超时退出 (返回桌面) */
+} game_exit_result_t;
 
 /* 设置 OS 启动进度回调 */
 void gam4980_set_boot_progress_cb(void (*cb)(int percent, const char *msg));

@@ -1,7 +1,25 @@
 #ifndef INPUT_H
 #define INPUT_H
 
-#include "menu_system.h"
+/* 输入动作码 (从旧 menu_system.h 迁出, 归位到 input 子系统: 由本模块产生).
+ * 语义与 os.h 的 os_action_t 完全一致, os 层直接强转复用. */
+typedef enum {
+    MENU_ACTION_NONE = 0,
+    MENU_ACTION_UP,
+    MENU_ACTION_DOWN,
+    MENU_ACTION_LEFT,
+    MENU_ACTION_RIGHT,
+    MENU_ACTION_CONFIRM,
+    MENU_ACTION_BACK,
+    MENU_ACTION_HOME,    /* 退出到桌面 (手柄映射第 7 键) */
+    MENU_ACTION_LONG_LEFT,  /* LEFT 长按 500ms (手柄配置快捷键) */
+    MENU_ACTION_LONG_PRESS, /* 触摸长按 (游戏列表收藏等) */
+    MENU_ACTION_KEY_FAV,    /* 物理 KEY 长按 = 收藏 */
+    MENU_ACTION_POWER_LOCK,    /* 软关机键点按 = 锁屏休眠 */
+    MENU_ACTION_POWER_HINT,    /* 软关机键 0.5s = 提示 */
+    MENU_ACTION_POWER_RELEASE, /* 软关机键 0.5s 后松手 = 返回 */
+} menu_action_t;
+
 #include "touch_panel.h"   /* V1.0.xx: tp_point_t (多点触控) */
 #include <stdbool.h>
 
@@ -52,6 +70,9 @@ bool input_touch_in_bottom_zone(void);
  * (如 BBK 模拟器游戏循环本身不调用 input_get_action). 同一 tick 内重复
  * 调用会被去重, 不会与 input_get_action 抢读 GT911 状态寄存器. */
 void input_poll_touch(void);
+
+/* V1.1.0: 开关底部上滑=返回手势 (白板等全屏绘图页屏蔽, 避免误退) */
+void input_set_swipe_back(bool enable);
 
 /* V1.0.95: 返回当前触摸按住时长(ms); 未按住返回 0.
  * 供壁纸屏保"触摸需长按 1 秒才退出"判定. */
