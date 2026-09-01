@@ -31,6 +31,7 @@
 #define TOUCH_SWIPE_MIN      40    /* 滑动最小位移(原始像素), 低于算点击 */
 #define TOUCH_LONG_MS        3000  /* V1.0.68: 状态栏长按 3 秒 = 返回主菜单 */
 #define TOUCH_LONG_PRESS_MS  2000  /* V1.0.9x: 游戏名/收藏栏长按 2s = 收藏/取消收藏; 应用管理长按弹窗也走此阈值 */
+#define TOUCH_HOLD_VIB_MS    500   /* V1.4.x: 按住超过此毫秒松手 → 补一次"弹起"震动 (按键模拟) */
 #define TOUCH_STILL_MAX      20    /* 长按判定时允许的抖动位移 */
 #define TOUCH_STATUS_H       24    /* 状态栏高度: 长按此区域(按下点 y<24) = 返回主菜单 */
 #define TOUCH_BACK_EDGE_Y    285   /* 底部上滑返回: 按下点屏幕 y >= 此值.
@@ -460,6 +461,10 @@ static menu_action_t touch_gesture_poll(void) {
             rotate_screen_coord(&s_tg_sx0, &s_tg_sy0);    /* 旋转到逻辑坐标 */
             s_tg_t0 = t;
             s_tg_long_fired = false;
+            /* V1.4.x: 按键模拟 — 按下瞬间立即震动 ("点击立马震", 无需等松手判定);
+             * 按住 >0.5s 松手时再补一下"弹起"震动 (见释放分支). 覆盖所有触摸
+             * 按下 (页面/弹窗按钮/主菜单图标/拖动起点), os_core 导航震动跳过触摸来源. */
+            vibrator_click();
         }
         break;
 
@@ -531,13 +536,11 @@ static menu_action_t touch_gesture_poll(void) {
                 ESP_LOGI(TAG, "长按 %lums -> LONG_PRESS @ %d,%d",
                          (unsigned long)dt, s_tap_x, s_tap_y);
             } else if (adx < TOUCH_SWIPE_MIN && ady < TOUCH_SWIPE_MIN) {
-                /* 位移小 = 点击 (tap 坐标用旋转后的逻辑坐标, 供阅读器分区命中) */
+                /* 位移小 = 点击 (tap 坐标用旋转后的逻辑坐标, 供阅读器分区命中).
+                 * 震动: 按下瞬间已触发 (TG_IDLE 按下沿), 快速点击(<0.5s)不再补震,
+                 * 避免"咔哒"两次; 按住 >0.5s 松手统一补"弹起" (见下方释放收尾). */
                 out = MENU_ACTION_CONFIRM;
                 s_tap_x = s_tg_sx0; s_tap_y = s_tg_sy0;
-                /* V1.4.x: 按键模拟 — 触摸点击统一在此触发 (覆盖页面/弹窗按钮/主菜单
-                 * 图标), 模拟机械按键"按下/释放"双脉冲 (苹果触控板式, 设置可关).
-                 * os_core 的 UI 导航震动会跳过触摸来源, 避免双重触发. */
-                vibrator_click();
                 ESP_LOGI(TAG, "触摸点击 (%lums) raw=%d,%d -> %d,%d",
                          (unsigned long)dt, s_tg_x0, s_tg_y0, s_tap_x, s_tap_y);
             } else if (s_swipe_turn && ady < TOUCH_SWIPE_MIN * 2 &&
@@ -577,6 +580,9 @@ static menu_action_t touch_gesture_poll(void) {
                          s_tg_x0, s_tg_y0, s_tg_x, s_tg_y);
             }
             /* V1.0.8x: 已删除左右/上下滑动 -> 方向键. 打开仅靠点击确定位置. */
+            /* V1.4.x: 按住 >0.5s 松手 → 补一次"弹起"震动 (机械按键按下去/放上来
+             * 的段落感; 快速点击按下时已震, 此处 <0.5s 不补, 保证一次点击一声). */
+            if (dt > TOUCH_HOLD_VIB_MS) vibrator_click();
             s_tg_state = TG_IDLE;
         }
         break;
