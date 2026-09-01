@@ -534,6 +534,10 @@ static menu_action_t touch_gesture_poll(void) {
                 /* 位移小 = 点击 (tap 坐标用旋转后的逻辑坐标, 供阅读器分区命中) */
                 out = MENU_ACTION_CONFIRM;
                 s_tap_x = s_tg_sx0; s_tap_y = s_tg_sy0;
+                /* V1.4.x: 按键模拟 — 触摸点击统一在此触发 (覆盖页面/弹窗按钮/主菜单
+                 * 图标), 模拟机械按键"按下/释放"双脉冲 (苹果触控板式, 设置可关).
+                 * os_core 的 UI 导航震动会跳过触摸来源, 避免双重触发. */
+                vibrator_click();
                 ESP_LOGI(TAG, "触摸点击 (%lums) raw=%d,%d -> %d,%d",
                          (unsigned long)dt, s_tg_x0, s_tg_y0, s_tap_x, s_tap_y);
             } else if (s_swipe_turn && ady < TOUCH_SWIPE_MIN * 2 &&

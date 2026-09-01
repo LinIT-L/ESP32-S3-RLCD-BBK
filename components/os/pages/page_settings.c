@@ -47,6 +47,7 @@ static const char *const s_set_items[5] = {
 /* 震动开关状态 (vibrator 无 get, 自行跟踪 + NVS). V1.2.x: 拆为 UI / 游戏 两个独立通道 */
 static bool s_vib_ui   = true;   /* UI 震动: 拖拉/菜单导航/设置调整 */
 static bool s_vib_game = true;   /* 游戏震动: 游戏内按键 */
+static bool s_key_sim  = true;   /* V1.4.x: 按键模拟 — 触摸点击=触控板"按下/释放"双脉冲 */
 /* 暗黑模式三态 (V1.3.x): 0=关闭 1=暗黑UI模式(除游戏外全反色) 2=全部暗黑模式(含游戏全反色).
  * 面板反色 (黑↔白) 由 st7305_set_inversion 实现; "暗黑UI"在进入游戏时自动恢复正常,
  * 退出游戏恢复反色 — 由 service tick 监听 input_is_game_mode() 驱动. */
@@ -112,6 +113,9 @@ static void settings_load(void) {
     else if (nvs_get_u8(h, "vib", &v) == ESP_OK)      s_vib_game = v;
     vibrator_set_ui_enabled(s_vib_ui);
     vibrator_set_game_enabled(s_vib_game);
+    /* V1.4.x: 按键模拟开关 (触控板式点击双脉冲) */
+    if (nvs_get_u8(h, "vib_key", &v) == ESP_OK) s_key_sim = v;
+    vibrator_set_key_sim(s_key_sim);
     nvs_close(h);
 }
 
@@ -645,6 +649,10 @@ static void on_snd_select(ui_ctx_t *ctx, int result, void *ud) {
         s_vib_game = !s_vib_game;
         vibrator_set_game_enabled(s_vib_game);
         settings_save_u8("vib_game", s_vib_game ? 1 : 0);
+    } else if (result == 4) {   /* 按键模拟开关 (V1.4.x) */
+        s_key_sim = !s_key_sim;
+        vibrator_set_key_sim(s_key_sim);
+        settings_save_u8("vib_key", s_key_sim ? 1 : 0);
     } else {
         return;   /* 返回/其它: 不刷新 */
     }
@@ -654,16 +662,17 @@ static void on_snd_select(ui_ctx_t *ctx, int result, void *ud) {
     open_snd_dlg(ctx, result);
 }
 static void open_snd_dlg(ui_ctx_t *ctx, int sel) {
-    char items[4][30];
-    const char *ptrs[4];
+    char items[5][30];
+    const char *ptrs[5];
     snprintf(items[0], sizeof(items[0]), "\xe5\xa3\xb0\xe9\x9f\xb3:%s", audio_player_is_muted() ? "\xe5\x85\xb3" : "\xe5\xbc\x80");  /* 声音:关/开 */
     snprintf(items[1], sizeof(items[1]), "\xe9\x9f\xb3\xe9\x87\x8f:%d", /* 音量:N */
              audio_player_vol_to_step(audio_player_get_volume()));
     snprintf(items[2], sizeof(items[2]), "UI\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib_ui ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* UI震动:开/关 */
     snprintf(items[3], sizeof(items[3]), "\xe6\xb8\xb8\xe6\x88\x8f\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib_game ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 游戏震动:开/关 */
-    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3];
-    sel = (sel < 0) ? 0 : (sel > 3 ? 3 : sel);
-    os_dialog_list(ctx, "", ptrs, 4, sel, on_snd_select, NULL);
+    snprintf(items[4], sizeof(items[4]), "\xe6\x8c\x89\xe9\x94\xae\xe6\xa8\xa1\xe6\x8b\x9f:%s", s_key_sim ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 按键模拟:开/关 */
+    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3]; ptrs[4] = items[4];
+    sel = (sel < 0) ? 0 : (sel > 4 ? 4 : sel);
+    os_dialog_list(ctx, "", ptrs, 5, sel, on_snd_select, NULL);
 }
 
 /* ---- 无线连接弹窗: 蓝牙/WiFi 开关 + 连接WiFi (WiFi 开时显示) ---- */

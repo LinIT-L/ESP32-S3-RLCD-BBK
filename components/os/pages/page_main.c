@@ -188,10 +188,13 @@ static void p_main_render(ui_ctx_t *ctx)
         } else {
             uint32_t d = now - s_main.cam_anim_start;
             float tt = d < s_main.cam_anim_dur ? (float)d / (float)s_main.cam_anim_dur : 1.0f;
-            /* 惯性/归位: 抛物线减速 1-(1-t)^2 (速度线性衰减自然停);
+            /* 惯性/归位: 抛物线减速 1-(1-t)^2 (速度线性衰减, 自然停, 无过冲);
+             * 尾部速度线性走低 → 最后减速段滑行更远, "慢慢停"不突停.
+             * (V1.4.x: 由三次方缓出 1-(1-t)^3 改为二次方 — 三次方速度按平方衰减,
+             *  尾部掉速太快会急停; 二次方速度线性衰减, 甩动末段还能平滑滑过数格.)
              * 按键导航(anim_spring): 弹簧回弹. */
             float ease = s_main.anim_spring ? spring_ease(tt)
-                       : (1.0f - (float)pow(1.0f - tt, 3.0f));   /* 甩动: 三次方缓出, 尾部平滑滑行 */
+                       : (1.0f - (float)pow(1.0f - tt, 2.0f));   /* 甩动: 抛物线缓出 */
             cam = s_main.cam_anim_from +
                   (s_main.cam_anim_to - s_main.cam_anim_from) * ease;
             if (tt >= 1.0f) {
@@ -296,22 +299,69 @@ static void p_main_poll(ui_ctx_t *ctx)
     /* V1.4.x: 齿轮震动 — 拖动或惯性滑行中每跨过一个居中图标震一次.
      * 覆盖松手后的 fling 动画段 (之前只震拖动段, 快速甩动滑行全程静默,
      * 且跳格只震一次 → 次数对不上图标数). 短促高强脉冲(10ms/100)出
-     * "咔哒"手感; 25ms 防抖: 同帧跳多格/过快跨格时合并, 保持脉冲清晰不粘连. */
+     * "咔哒"手感; 25ms 防抖: 同帧跳多格/过快跨格时合并, 保持脉冲清晰不粘连.
+     * V1.4.x: 动画尾段(剩余≤650ms)收尾 — 跨格震动间隔强制递增 100/200/300ms,
+     * 模拟机械滚轮缓停: 图标滑过最后几格"哒…哒…哒"渐慢, 不突停. */
     {
         static int s_vib_grid_last = -1;
         static uint32_t s_vib_grid_ts = 0;
+        static int s_tail_seq = 0;           /* 尾段已震次数 */
+        static uint32_t s_tail_last = 0;     /* 尾段上一震时刻(实际或计划) */
+        static uint32_t s_tail_pend = 0;     /* 延迟触发时刻 (0=无) */
         uint32_t now = now_ms();
+
+        /* 拖动中不延迟 (跟格即震); 尾段延迟震动到点则触发 */
+        if (s_main.drag_active) s_tail_pend = 0;
+        if (s_tail_pend && now >= s_tail_pend) {
+            s_tail_pend = 0;
+            s_tail_last = now;
+            vibrator_tap_ui(10, 100);
+        }
+
         int grid = mod_wrap(lroundf(s_main.cam_cur));
         if (s_main.drag_active || s_main.cam_anim_start > 0) {
             if (grid != s_vib_grid_last) {
-                if (now - s_vib_grid_ts >= 25) {
+                bool tail = false;
+                if (s_main.cam_anim_start > 0) {
+                    uint32_t end = s_main.cam_anim_start + s_main.cam_anim_dur;
+                    tail = (now + 650 >= end);      /* 动画尾段窗口 650ms */
+                }
+                if (tail) {
+                    /* 收尾: 间隔自适应递增 — 取上一格实际跨格间隔 ×1.5
+                     * (动画减速越明显间隔越大), 限制 90~300ms.
+                     * 动画跨格太快(< 目标间隔) → 延迟到满间隔再震; 动画本身
+                     * 已够慢(≥ 间隔) → 跟格即震. 效果: 从 ~100ms 平滑渐至
+                     * ~300ms 的"哒…哒…哒"收尾, 完全随动画自然减速, 不机械. */
+                    uint32_t prev_iv = now - s_vib_grid_ts;  /* 上一格→本格 */
+                    if (prev_iv > 400) prev_iv = 400;        /* 保护: 别撑太长 */
+                    uint32_t gap = prev_iv + prev_iv / 2;    /* ×1.5 递增 */
+                    if (gap < 90)   gap = 90;                /* 下限: 别太密 */
+                    if (gap > 300)  gap = 300;               /* 上限: 别拖沓 */
+                    uint32_t want = s_tail_last + gap;
+                    if (s_tail_seq == 0) {
+                        s_tail_last = now;
+                        vibrator_tap_ui(10, 100);
+                    } else if (now >= want) {
+                        s_tail_last = now;
+                        vibrator_tap_ui(10, 100);
+                    } else {
+                        s_tail_pend = want;                  /* 延迟兜底 */
+                    }
+                    s_tail_seq++;
                     s_vib_grid_ts = now;
-                    vibrator_tap_ui(10, 100);
+                } else {
+                    s_tail_seq = 0;
+                    if (now - s_vib_grid_ts >= 25) {
+                        s_vib_grid_ts = now;
+                        vibrator_tap_ui(10, 100);
+                    }
                 }
                 s_vib_grid_last = grid;
             }
         } else {
             s_vib_grid_last = grid;   /* 静止: 同步当前格, 避免下次拖动首格误震 */
+            s_tail_seq = 0;
+            s_tail_pend = 0;
         }
     }
 
@@ -394,12 +444,14 @@ static void p_main_poll(ui_ctx_t *ctx)
                  * 缓慢归位同曲线 → 平滑回落到槽位, 不甩不弹.
                  * 甩动用 main_cam_fling: 保持方向不回绕 (修"用力甩后瞬间后移").
                  * 2026-08-26: 甩动滑行时长加长 (上限 550→1000ms, 每格 50→90ms),
-                 * 快速甩动"慢慢停"更跟手; 甩动格数(前面速度)保持不变. */
+                 * 快速甩动"慢慢停"更跟手; 甩动格数(前面速度)保持不变.
+                 * 2026-08-31 (V1.4.x): 每格 90→130ms, 上限 1000→1600ms —
+                 * 配合抛物线缓出, 甩动末段减速滑行更长, 最后还能慢慢滑过 2-3 格. */
                 s_main.anim_spring = false;
                 int steps = (int)(target - lroundf(s_main.cam_base));
                 if (steps < 0) steps = -steps;
-                uint32_t dur = 320 + (uint32_t)steps * 110;   /* 甩动滑行: 时长加长, 慢慢滑停不突停 */
-                if (dur > 1400) dur = 1400;
+                uint32_t dur = 320 + (uint32_t)steps * 130;   /* 甩动滑行: 每格 130ms, 慢慢滑停 */
+                if (dur > 1600) dur = 1600;
                 s_main.cam_cur = cur;
                 main_cam_fling(cur, (float)target, dur);
                 ctx->needs_redraw = true;

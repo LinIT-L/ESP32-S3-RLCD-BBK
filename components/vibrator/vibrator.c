@@ -311,6 +311,7 @@ static const vib_seg_t s_seg_sos[]    = {
 static const vib_seg_t s_seg_up[]     = { { 60, 15 }, { 60, 35 }, { 60, 55 }, { 60, 75 }, { 60, 95 } };
 static const vib_seg_t s_seg_down[]   = { { 60, 95 }, { 60, 75 }, { 60, 55 }, { 60, 35 }, { 60, 15 } };
 static const vib_seg_t s_seg_alarm[]  = { { 300, 100 }, { 180, 0 } };
+static const vib_seg_t s_seg_click[]  = { { 18, 100 }, { 22, 0 }, { 16, 100 } };  /* 按下+释放 */
 
 const vib_pattern_t VIB_PAT_TICK      = { s_seg_tick,   1, 1 };
 const vib_pattern_t VIB_PAT_DOUBLE    = { s_seg_double, 3, 1 };
@@ -321,3 +322,18 @@ const vib_pattern_t VIB_PAT_SOS       = { s_seg_sos,   17, 1 };
 const vib_pattern_t VIB_PAT_RAMP_UP   = { s_seg_up,     5, 1 };
 const vib_pattern_t VIB_PAT_RAMP_DOWN = { s_seg_down,   5, 1 };
 const vib_pattern_t VIB_PAT_ALARM     = { s_seg_alarm,  2, 0 };   /* 无限循环 */
+const vib_pattern_t VIB_PAT_CLICK     = { s_seg_click,  3, 1 };   /* 按键模拟 */
+
+/* ================= V1.4.x: 按键模拟 (触摸点击反馈) =================
+ * 苹果触控板式: 无实体按键, 用"按下(18ms强)+释放(16ms强)"双脉冲让触摸点击
+ * 有机械按键的段落感. 开关由设置页持久化 (NVS vib_key), 内存态默认开. */
+static bool s_key_sim = true;
+
+void vibrator_set_key_sim(bool en) { s_key_sim = en; }
+bool vibrator_key_sim_enabled(void) { return s_key_sim; }
+
+void vibrator_click(void) {
+    if (s_mode == VIB_NONE || !s_enabled || !s_vib_ui) return;
+    if (s_key_sim) vibrator_play_pattern(&VIB_PAT_CLICK);
+    else           vibrator_tap(25, 110);
+}
