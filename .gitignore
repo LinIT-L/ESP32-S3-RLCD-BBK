@@ -1,5 +1,5 @@
 # ===== ESP-IDF 构建产物 (可重新生成) =====
-build/
+build*
 managed_components/
 sdkconfig
 sdkconfig.old
