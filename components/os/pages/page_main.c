@@ -13,7 +13,7 @@
 #include "os_theme.h"
 #include "ui_common.h"
 #include "input.h"
-#include "vibrator.h"   /* V1.2.x: 拖动经过图标 → UI 震动 */
+#include "vibrator.h"   /* V1.4.x: 齿轮震动 (拖动/滑行跨格) + UI 震动 */
 #include "esp_timer.h"
 #include "esp_log.h"
 #include <math.h>
@@ -293,9 +293,30 @@ static void p_main_poll(ui_ctx_t *ctx)
     /* 归位/切换动画进行中: 每帧请求重绘 (os 仅在 needs_redraw 时渲染) */
     if (s_main.cam_anim_start > 0) ctx->needs_redraw = true;
 
+    /* V1.4.x: 齿轮震动 — 拖动或惯性滑行中每跨过一个居中图标震一次.
+     * 覆盖松手后的 fling 动画段 (之前只震拖动段, 快速甩动滑行全程静默,
+     * 且跳格只震一次 → 次数对不上图标数). 短促高强脉冲(10ms/100)出
+     * "咔哒"手感; 25ms 防抖: 同帧跳多格/过快跨格时合并, 保持脉冲清晰不粘连. */
+    {
+        static int s_vib_grid_last = -1;
+        static uint32_t s_vib_grid_ts = 0;
+        uint32_t now = now_ms();
+        int grid = mod_wrap(lroundf(s_main.cam_cur));
+        if (s_main.drag_active || s_main.cam_anim_start > 0) {
+            if (grid != s_vib_grid_last) {
+                if (now - s_vib_grid_ts >= 25) {
+                    s_vib_grid_ts = now;
+                    vibrator_tap_ui(10, 100);
+                }
+                s_vib_grid_last = grid;
+            }
+        } else {
+            s_vib_grid_last = grid;   /* 静止: 同步当前格, 避免下次拖动首格误震 */
+        }
+    }
+
     int tx, ty;
     bool down = input_get_touch_pos(&tx, &ty);
-    static int s_drag_vib_sel = -1;   /* V1.2.x: 拖动震动跟踪的"当前居中图标" */
     /* 抑制窗口内禁止开启新拖拽: 用力甩动松手后手指反弹接触会被误认为新拖拽,
      * 把相机基点重置到动画中途 → 图标瞬间后跳 ("甩完后移"感). */
     if (down && !s_main.drag_active && now_ms() >= s_main.suppress_until) {
@@ -306,7 +327,6 @@ static void p_main_poll(ui_ctx_t *ctx)
         s_main.cam_base      = s_main.cam_cur;
         s_main.cam_anim_start = 0;
         s_main.v_n = 0;                       /* 惯性采样清零 */
-        s_drag_vib_sel = -1;                  /* V1.2.x: 新一次拖动重置震动跟踪 */
         ctx->needs_redraw = true;
     }
     if (s_main.drag_active) {
@@ -317,13 +337,6 @@ static void p_main_poll(ui_ctx_t *ctx)
             s_main.drag_offset = off;
             int m = off < 0 ? -off : off;
             if (m > s_main.drag_moved) s_main.drag_moved = m;
-            /* V1.2.x: 拖动经过图标 → UI 震动 (每越过一个居中图标震一次) */
-            int center = mod_wrap(lroundf(s_main.cam_cur));
-            if (s_drag_vib_sel < 0) s_drag_vib_sel = center;
-            else if (center != s_drag_vib_sel) {
-                s_drag_vib_sel = center;
-                vibrator_tap_ui(20, 90);
-            }
             /* 速度采样: 记录最近 16 个 (偏移,时间) */
             if (s_main.v_n < 16) {
                 s_main.v_off[s_main.v_n] = off;
