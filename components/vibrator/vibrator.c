@@ -46,9 +46,12 @@ typedef enum { VIB_NONE = 0, VIB_TM6604 = 1 } vib_mode_t;
 #define VIB_RES_FREQ  190
 
 static vib_mode_t s_mode = VIB_NONE;
-static bool       s_enabled = true;   /* 硬件总开关: ui||game 任一开则开 */
+static bool       s_enabled = true;   /* 硬件总开关: ui||game||key_sim 任一开则开 */
 static bool       s_vib_ui   = true;  /* UI 震动开关 (拖拉/菜单导航/设置调整) */
 static bool       s_vib_game = true;  /* 游戏震动开关 (游戏内按键) */
+/* V1.4.x: 按键模拟开关 (触控板式点击反馈, NVS vib_key, 内存默认开) —
+ * 与 UI/游戏震动三开关互不重叠: 关 → 触摸点击完全不震. */
+static bool       s_key_sim  = true;
 static TimerHandle_t s_tap_timer = NULL;
 static TimerHandle_t s_pat_timer = NULL;
 
@@ -147,16 +150,16 @@ void vibrator_set_enabled(bool en) {
     }
 }
 
-/* V1.2.x: 两个独立震动通道 (UI / 游戏) 的开关与触发.
- * 任一通道开 → 硬件总开关开; 两者都关 → 关断 TM6604 EN 省电.
- * 上层 (设置-声音震动) 调用这两个 setter 而非 vibrator_set_enabled. */
+/* V1.2.x: 三个独立震动通道 (UI / 游戏 / 按键模拟) 的开关与触发.
+ * 任一通道开 → 硬件总开关开; 全部关 → 关断 TM6604 EN 省电.
+ * 上层 (设置-声音震动) 调用这三个 setter 而非 vibrator_set_enabled. */
 void vibrator_set_ui_enabled(bool en) {
     s_vib_ui = en;
-    vibrator_set_enabled(s_vib_ui || s_vib_game);
+    vibrator_set_enabled(s_vib_ui || s_vib_game || s_key_sim);
 }
 void vibrator_set_game_enabled(bool en) {
     s_vib_game = en;
-    vibrator_set_enabled(s_vib_ui || s_vib_game);
+    vibrator_set_enabled(s_vib_ui || s_vib_game || s_key_sim);
 }
 void vibrator_tap_ui(uint16_t ms, uint8_t strength) {
     if (s_vib_ui) vibrator_tap(ms, strength);
@@ -333,14 +336,14 @@ const vib_pattern_t VIB_PAT_CLICK     = { s_seg_click,  1, 1 };   /* 按键模�
  * 苹果触控板式: 无实体按键, 用单段 18ms 短脉冲模拟机械按键"哒"一下.
  * V1.5.x: 去掉"按下+释放"双脉冲 (一次手势 4 个脉冲是"震好多下"根因).
  * 长按(>0.5s)松手补震由 input.c 释放分支再调一次 vibrator_click (按下1次+弹起1次).
- * 开关由设置页持久化 (NVS vib_key), 内存态默认开. */
-static bool s_key_sim = true;
+ * V1.5.x: 归"按键模拟"开关独立控制 (s_key_sim, NVS vib_key, 内存默认开) —
+ * 与 UI震动/游戏震动三开关互不重叠: 按键模拟关 → 触摸点击完全不震 (不降级);
+ * UI震动/游戏震动不影响本通道. 硬件总开关 s_enabled 含本通道. */
 
-void vibrator_set_key_sim(bool en) { s_key_sim = en; }
+void vibrator_set_key_sim(bool en) { s_key_sim = en; vibrator_set_enabled(s_vib_ui || s_vib_game || s_key_sim); }
 bool vibrator_key_sim_enabled(void) { return s_key_sim; }
 
 void vibrator_click(void) {
-    if (s_mode == VIB_NONE || !s_enabled || !s_vib_ui) return;
-    if (s_key_sim) vibrator_play_pattern(&VIB_PAT_CLICK);
-    else           vibrator_tap(25, 110);
+    if (s_mode == VIB_NONE || !s_enabled || !s_key_sim) return;
+    vibrator_play_pattern(&VIB_PAT_CLICK);
 }

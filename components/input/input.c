@@ -67,7 +67,7 @@ static uint32_t now_ms(void) {
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
 
-typedef enum { ST_IDLE, ST_PRESSED, ST_LONG_FIRED } btn_state_t;
+typedef enum { ST_IDLE, ST_DEBOUNCE, ST_PRESSED, ST_LONG_FIRED } btn_state_t;
 typedef struct {
     gpio_num_t gpio;
     btn_state_t state;
@@ -175,22 +175,33 @@ static menu_action_t tick(btn_ctx_t *b) {
     uint32_t now = now_ms();
     switch (b->state) {
         case ST_IDLE:
-            if (pressed) { b->state = ST_PRESSED; b->press_start = now; }
+            if (pressed) { b->state = ST_DEBOUNCE; b->press_start = now; }
+            break;
+        case ST_DEBOUNCE:
+            /* V1.5.x: 按下防抖 (原 DEBOUNCE 只防释放抖动; 按下即触发改为防住
+             * 按下沿抖动误触发, 防抖通过后立即投递短按动作, 不等松手). */
+            if (pressed) {
+                if (now - b->press_start >= DEBOUNCE_MS) {
+                    b->state = ST_PRESSED;
+                    return b->short_action;
+                }
+            } else {
+                b->state = ST_IDLE;   /* 抖动, 取消本次按下 */
+            }
             break;
         case ST_PRESSED:
             if (pressed) {
                 uint32_t thr = (b->long_ms > 0) ? b->long_ms : LONG_PRESS_MS;
                 if (now - b->press_start > thr) {
-                    /* V1.0.40: 长按发射后进入 ST_LONG_FIRED, 等按键释放才回 IDLE,
-                     * 避免释放时再触发短按 (旧 bug: 长按后释放误触发 short_action) */
+                    /* V1.0.40: 长按发射后进入 ST_LONG_FIRED, 等按键释放才回 IDLE.
+                     * V1.5.x 提示: 短按已在按下瞬间触发, 长按触发时短按效果无法回退,
+                     * 故带长按动作的键 (BOOT 回桌面 / KEY 收藏搜索) 长按时会先执行一次短按动作. */
                     b->state = ST_LONG_FIRED;
                     return b->long_action;
                 }
             } else {
-                uint32_t dur = now - b->press_start;
-                if (dur < DEBOUNCE_MS) { b->state = ST_IDLE; break; }
+                /* V1.5.x: 短按已在按下瞬间投递, 释放不再重复触发 */
                 b->state = ST_IDLE;
-                return b->short_action;
             }
             break;
         case ST_LONG_FIRED:
@@ -555,6 +566,12 @@ static menu_action_t touch_gesture_poll(void) {
                 s_tap_x = s_tg_sx0; s_tap_y = s_tg_sy0;
                 ESP_LOGI(TAG, "长按 %lums -> LONG_PRESS @ %d,%d",
                          (unsigned long)dt, s_tap_x, s_tap_y);
+            } else if (dt >= TOUCH_LONG_PRESS_MS && s_tg_sy0 >= TOUCH_STATUS_H &&
+                       adx < TOUCH_SWIPE_MIN && ady < TOUCH_SWIPE_MIN) {
+                /* V1.5.x: 长按时长已到但手指微移 (20~40px) — 用户意图是长按
+                 * (收藏/拖动), 位移恰好破坏 LONG_PRESS 判定. 若下沉到 CONFIRM 会
+                 * 误打开游戏/误触操作 (暴龙机"自动打开"的次要路径), 这里直接吞掉. */
+                ESP_LOGI(TAG, "长按微移 %lums dx=%d dy=%d -> 忽略 (防误触)", (unsigned long)dt, adx, ady);
             } else if (adx < TOUCH_SWIPE_MIN && ady < TOUCH_SWIPE_MIN) {
                 /* 位移小 = 点击 (tap 坐标用旋转后的逻辑坐标, 供阅读器分区命中).
                  * 震动: 按下瞬间已触发 (TG_IDLE 按下沿), 快速点击(<0.5s)不再补震,

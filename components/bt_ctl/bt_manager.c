@@ -16,11 +16,13 @@
 #include <stdio.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"   /* V1.5.x: enable 同步等待初始化任务完成 */
+#include "freertos/timers.h"   /* V1.5.x: 开机自动回连窗口软件定时器 */
 
 static const char *TAG = "bt_manager";
 
@@ -92,6 +94,9 @@ static uint8_t s_last_conn_addr[6];      /* 最近一次连接过的地址 (自�
 static bool s_last_conn_addr_valid = false;
 
 static bool s_auto_reconnect_pending = false;
+/* V1.5.x: 自动回连目标 (本次连接过地址优先, 回退 NVS 最近历史) — 供扫描窗口匹配 */
+static uint8_t s_rc_target_addr[6];
+static bool s_rc_target_valid = false;
 
 /* 上次连接设备名 (持久化): 用于判断"新手柄"——设备名与上次不同则清空旧映射 */
 static char  s_last_conn_name[32] = {0};
@@ -231,9 +236,21 @@ void bt_manager_poll_new_press_reset(void)
 
 void bt_manager_poll_auto_reconnect(void)
 {
-    if (s_connected || s_suspended || bt_manager_is_scanning()) return;
-    if (!s_last_conn_addr_valid) return;
+    if (s_connected || s_suspended) return;
+    /* 回连目标: 本次开机连接过的地址优先 (最新); 无则回退 NVS 持久化的最近历史,
+     * 保证"开机窗口超时后长按确认键"等场景仍能自动回连已配对手柄. */
+    if (s_last_conn_addr_valid) {
+        memcpy(s_rc_target_addr, s_last_conn_addr, 6);
+    } else if (s_history_count > 0) {
+        memcpy(s_rc_target_addr, s_history[0].bd_addr, 6);
+    } else {
+        return;
+    }
+    s_rc_target_valid = true;
     s_auto_reconnect_pending = true;
+    /* V1.5.x: 已有扫描在进行 (长按确认键扫描弹窗/添加设备) → 仅挂起自动回连标志,
+     * 由扫描完成回调在结果里匹配回连目标连接, 不重复发起扫描 (避免 old-results 扫描风暴). */
+    if (bt_manager_is_scanning()) return;
     bt_core_scan(5);
 }
 
@@ -409,6 +426,9 @@ void bt_manager_clear_paired(void)
 {
     memset(s_history, 0, sizeof(s_history));
     s_history_count = 0;
+    s_last_conn_addr_valid = false;   /* V1.5.x: 清除配对后不再自动回连上次设备 */
+    s_rc_target_valid = false;
+    s_auto_reconnect_pending = false;
     history_save();
 }
 
@@ -456,6 +476,12 @@ bool bt_manager_get_connected_addr(uint8_t *out_addr6)
     if (!out_addr6 || !s_conn_addr_valid) return false;
     memcpy(out_addr6, s_conn_addr, 6);
     return true;
+}
+
+/* V1.5.x: 是否有可自动回连目标 (本次连接过 或 有最近历史; 扫描弹窗自动回连判定用) */
+bool bt_manager_has_last_conn(void)
+{
+    return s_last_conn_addr_valid || s_history_count > 0;
 }
 
 /* ========================================================================
@@ -595,6 +621,25 @@ static void on_scan_done_cb(void)
     /* 连续扫描: 扫描完成即停, 不做无限重扫 (用户主动进列表页时一次即可;
      * 无限自旋会反复触发 esp_hid_scan 报 old-results, 造成扫描风暴/列表闪烁). */
     if (s_cont_cb && !s_connected && !s_suspended) {
+        /* V1.5.x: 自动回连 — 长按确认键扫描窗口内挂了回连标志时, 在本次结果里
+         * 匹配回连目标地址 (本次连接过/最近历史), 命中即直接连接 (无需用户点选);
+         * 未命中则照常列表. */
+        if (s_auto_reconnect_pending && s_rc_target_valid) {
+            esp_hid_scan_result_t *rr = bt_core_last_scan();
+            while (rr) {
+                if (memcmp(rr->bda, s_rc_target_addr, 6) == 0) {
+                    s_pending_new = !bt_manager_is_paired_device(s_rc_target_addr);
+                    s_connecting = true;
+                    s_auto_reconnect_pending = false;   /* 已发起: 结果由 on_connected 收敛 */
+                    s_rc_target_valid = false;
+                    bt_core_connect(rr);                /* esp_hidh_dev_open 异步, 安全 */
+                    return;   /* 不再停扫/回列表 (连接成功由上层 0.5s 提示收敛) */
+                }
+                rr = rr->next;
+            }
+            s_auto_reconnect_pending = false;   /* 结果里没有回连目标: 放弃自动回连, 列表照常 */
+            s_rc_target_valid = false;
+        }
         /* 不再自动重扫, 保持一次扫描结果, 交由用户在列表点选连接 */
         bt_core_stop_scan();
         s_scanning = false;
@@ -975,7 +1020,13 @@ void bt_manager_disable(void)
  * ======================================================================== */
 #define BT_RECONNECT_POLL_MS   60000
 #define BT_RECONNECT_MAX_MS    300000
+#define BT_BOOT_RECONNECT_POLL_MS 3000   /* V1.5.x: 开机回连窗口内直连间隔 (低占空比) */
+#define BT_BOOT_RECONNECT_WINDOW_MS 30000 /* V1.5.x: 开机回连窗口默认时长 */
 static uint32_t s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;
+/* V1.5.x: 开机自动回连窗口 — 开机时若有已配对手柄, 短窗口内低占空比直连上次手柄,
+ * 连上即保持; 窗口超时未连上 → 关栈回按需省电. 由 main.c 开机时启动. */
+static volatile bool s_boot_win_active = false;
+static uint32_t s_boot_win_end_ms = 0;
 
 /* 直连最近一次手柄 (esp_hidh_dev_open 按已知地址, 无需扫描, 无线电占用极低) */
 static bool bt_try_reconnect_now(void)
@@ -1003,18 +1054,81 @@ static void bt_reconnect_task(void *arg)
         /* 条件: 已连接/正在连/在扫/被挂起/关电/无历史 → 都不自动回连 */
         if (s_connected || s_connecting || s_suspended || s_power_off ||
             bt_manager_is_scanning() || s_history_count <= 0) {
-            s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;   /* 恢复基础间隔 */
+            if (!s_boot_win_active || s_connected || s_connecting || s_power_off)
+                s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;   /* 恢复基础间隔 */
             continue;
         }
+
+        /* V1.5.x: 开机自动回连窗口 — 短窗口内低占空比(3s)直连上次手柄.
+         * 连上即保持; 窗口超时仍未连上 → 关栈回按需省电 (开机场景, 手柄不在附近).
+         * 若超时瞬间用户已进蓝牙页扫描/使用中 → 保持开启, 不误关. */
+        if (s_boot_win_active) {
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            if (now_ms >= s_boot_win_end_ms) {
+                s_boot_win_active = false;
+                s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;
+                if (!s_scanning && !bt_core_is_scanning() && !s_scan_cb && !s_cont_cb) {
+                    ESP_LOGI(TAG, "开机回连窗口超时: 手柄不在附近, 蓝牙休眠 (按需开启)");
+                    bt_manager_disable();
+                } else {
+                    ESP_LOGI(TAG, "开机回连窗口超时: 用户正在使用蓝牙, 保持开启");
+                }
+                continue;
+            }
+        }
+
         if (!core_ensure_init()) continue;
         if (bt_try_reconnect_now()) {
             s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;   /* 连上/连上中 → 回基础间隔 */
+            s_boot_win_active = false;                     /* 连上即结束开机窗口 */
         } else {
-            /* 失败 → 指数退避, 封顶, 减少无效重试功耗 */
-            s_reconnect_delay_ms *= 2;
-            if (s_reconnect_delay_ms > BT_RECONNECT_MAX_MS) s_reconnect_delay_ms = BT_RECONNECT_MAX_MS;
+            if (s_boot_win_active) {
+                s_reconnect_delay_ms = BT_BOOT_RECONNECT_POLL_MS;  /* 窗口内 3s 低占空比重试 */
+            } else {
+                /* 失败 → 指数退避, 封顶, 减少无效重试功耗 */
+                s_reconnect_delay_ms *= 2;
+                if (s_reconnect_delay_ms > BT_RECONNECT_MAX_MS) s_reconnect_delay_ms = BT_RECONNECT_MAX_MS;
+            }
         }
     }
+}
+
+/* V1.5.x: 开机自动回连窗口 — 启动入口 (main.c 开机时调用).
+ * 先轻量预检 NVS 历史 (不初始化蓝牙核心): 无已配对手柄 → 完全不拉起蓝牙栈 (省电).
+ * 有历史 → 惰性完整初始化, 在 window_ms 窗口内低占空比直连上次手柄;
+ * 窗口超时未连上 → bt_reconnect_task 自动 disable 回按需省电.
+ * 已在连接中 → 直接跳过窗口. */
+void bt_manager_start_boot_reconnect(uint32_t window_ms)
+{
+    /* 轻量预检: NVS 历史条数 (hcnt 是 nvs_set_blob 保存的 4 字节, 用 blob 读) */
+    int hcnt = 0;
+    {
+        size_t len = sizeof(hcnt);
+        nvs_init_handle();
+        if (s_nvs_open && nvs_get_blob(s_nvs, NVS_KEY_HCNT, &hcnt, &len) == ESP_OK) {
+            if (hcnt < 0) hcnt = 0;
+            if (hcnt > BT_HISTORY_MAX) hcnt = BT_HISTORY_MAX;
+        }
+    }
+    if (hcnt <= 0) {
+        ESP_LOGI(TAG, "开机回连: 无已配对手柄历史, 蓝牙不启动 (按需开启)");
+        return;
+    }
+    if (s_connected || s_connecting) {
+        ESP_LOGI(TAG, "开机回连: 已连接/连接中, 跳过窗口");
+        return;
+    }
+    bt_manager_enable();   /* 惰性完整初始化 (映射/NVS/核心/回连任务) */
+    if (!s_full_init_done) {
+        ESP_LOGW(TAG, "开机回连: 完整初始化未完成, 窗口跳过");
+        return;
+    }
+    if (window_ms == 0) window_ms = BT_BOOT_RECONNECT_WINDOW_MS;
+    s_boot_win_active = true;
+    s_boot_win_end_ms = (uint32_t)(esp_timer_get_time() / 1000) + window_ms;
+    s_reconnect_delay_ms = BT_BOOT_RECONNECT_POLL_MS;   /* 立即进入低占空比重试节奏 */
+    ESP_LOGI(TAG, "开机回连窗口启动: %u ms 低占空比直连上次手柄", (unsigned)window_ms);
+    bt_try_reconnect_now();   /* 手柄在身边: 立即直连, 不必等 3s */
 }
 
 bool bt_manager_is_ready(void)

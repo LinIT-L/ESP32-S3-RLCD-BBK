@@ -297,10 +297,11 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
         usb_net_start();
         ESP_LOGI(TAG, "USB 网卡共享模式已启动");
     } else {
-        /* V1.5.x 省电: 蓝牙按需开启 — 开机不再启动蓝牙 (省去常开扫描/回连功耗).
-         * 用户进 设置-无线连接 或 游戏-手柄 页时 os_hw_request(OS_HW_BT) 才首次初始化;
-         * 界面"蓝牙:开/关"由 os_hw 引用计数与 bt_manager_is_ready() 同步显示. */
-        ESP_LOGI(TAG, "蓝牙按需开启: 开机不启动 (进蓝牙/手柄设置页时启用)");
+        /* V1.5.x 省电: 蓝牙按需开启 — 开机不常开蓝牙.
+         * 开机自动回连窗口: 若有已配对手柄历史 → 短窗口(30s)低占空比直连上次手柄,
+         * 连上即保持; 手柄不在附近则窗口超时自动关栈回按需省电.
+         * 无历史 → 完全不开 (进蓝牙/手柄设置页时由 os_hw_request 首次启用). */
+        bt_manager_start_boot_reconnect(30000);
     }
     /* V1.0.72: 开机不播旋律, 改为震动一下提示.
      * 原因: tone_mel 任务栈(8KB)在首次 feed_pcm → audio_out_start →

@@ -472,6 +472,33 @@ static uint32_t wp_ss_run_ms(void)
 }
 void wp_screensaver_set_run_ms(uint32_t ms) { s_ss_run_ms = ms; }
 bool wp_screensaver_shutdown_requested(void) { return s_ss_shutdown; }
+/* V1.5.x: 触摸唤醒屏保开关 — 默认关 (触摸不唤醒壁纸, 仅物理键/手柄唤醒).
+ * NVS "os_wp"/"wp_touch"; -1=尚未从 NVS 加载. */
+static int s_touch_wake = -1;
+bool wp_screensaver_touch_wake_enabled(void)
+{
+    if (s_touch_wake < 0) {
+        int v = 0;
+        nvs_handle_t h;
+        if (nvs_open("os_wp", NVS_READONLY, &h) == ESP_OK) {
+            int32_t t = 0;
+            if (nvs_get_i32(h, "wp_touch", &t) == ESP_OK) v = (int)t;
+            nvs_close(h);
+        }
+        s_touch_wake = v;
+    }
+    return s_touch_wake != 0;
+}
+void wp_screensaver_set_touch_wake(bool en)
+{
+    s_touch_wake = en ? 1 : 0;
+    nvs_handle_t h;
+    if (nvs_open("os_wp", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "wp_touch", s_touch_wake);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
 void wp_screensaver_poll(uint32_t now_ms, uint32_t last_input_ms, bool in_dialog)
 {
     if (s_ss_active) {

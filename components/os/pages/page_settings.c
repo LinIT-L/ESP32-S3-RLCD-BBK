@@ -47,7 +47,7 @@ static const char *const s_set_items[5] = {
 /* 震动开关状态 (vibrator 无 get, 自行跟踪 + NVS). V1.2.x: 拆为 UI / 游戏 两个独立通道 */
 static bool s_vib_ui   = true;   /* UI 震动: 拖拉/菜单导航/设置调整 */
 static bool s_vib_game = true;   /* 游戏震动: 游戏内按键 */
-static bool s_key_sim  = true;   /* V1.4.x: 按键模拟 — 触摸点击=触控板"按下/释放"双脉冲 */
+static bool s_key_sim  = true;   /* V1.4.x: 触摸反馈 — 触摸点击=触控板"按下/释放"双脉冲 */
 /* 暗黑模式三态 (V1.3.x): 0=关闭 1=暗黑UI模式(除游戏外全反色) 2=全部暗黑模式(含游戏全反色).
  * 面板反色 (黑↔白) 由 st7305_set_inversion 实现; "暗黑UI"在进入游戏时自动恢复正常,
  * 退出游戏恢复反色 — 由 service tick 监听 input_is_game_mode() 驱动. */
@@ -588,7 +588,8 @@ static void open_dark_dlg(ui_ctx_t *ctx) {
     os_dialog_list(ctx, "", items, 3, s_dark, on_dark_select, NULL);
 }
 
-/* ---- 显示配置弹窗: 平铺 4 项 (日期/时间/字体/休眠) ---- */
+/* ---- 显示配置弹窗: 平铺 6 项 (日期/时间/字体/休眠/暗黑/触摸唤醒) ---- */
+static void open_disp_dlg(ui_ctx_t *ctx, int sel);   /* case 5 触摸唤醒 toggle 后原地刷新 */
 static void on_disp_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     switch (result) {
@@ -613,18 +614,33 @@ static void on_disp_select(ui_ctx_t *ctx, int result, void *ud) {
     case 2: open_font_dlg(ctx); break;   /* 字体粗细 */
     case 3: open_sleep_dlg(ctx); break;  /* 休眠时间 */
     case 4: open_dark_dlg(ctx); break;   /* 暗黑模式: 三选弹窗 (关闭/暗黑UI/全部暗黑) */
+    case 5: {  /* 触摸唤醒壁纸开关 (V1.5.x): 关=触摸(含长按1s)不唤醒屏保, 仅物理键/手柄唤醒 */
+        bool en = !wp_screensaver_touch_wake_enabled();
+        wp_screensaver_set_touch_wake(en);
+        os_dialog_pop(ctx);
+        open_disp_dlg(ctx, 5);
+        os_dialog_toast(ctx, en ?
+            "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x8f\xaf\xe5\x94\xa4\xe9\x86\x92\xe5\xa3\x81\xe7\xba\xb8" :   /* 触摸可唤醒壁纸 */
+            "\xe8\xa7\xa6\xe6\x91\xb8\xe4\xb8\x8d\xe5\x94\xa4\xe9\x86\x92\xe5\xa3\x81\xe7\xba\xb8");  /* 触摸不唤醒壁纸 */
+        break;
+    }
     default: break;
     }
 }
-static void open_disp_dlg(ui_ctx_t *ctx) {
-    static const char *items[5] = {
-        "\xe6\x97\xa5\xe6\x9c\x9f\xe6\x9b\xb4\xe6\x94\xb9",  /* 日期更改 */
-        "\xe6\x97\xb6\xe9\x97\xb4\xe8\xb0\x83\xe6\x95\xb4",  /* 时间调整 */
-        "\xe5\xad\x97\xe4\xbd\x93\xe7\xb2\x97\xe7\xbb\x86",  /* 字体粗细 */
-        "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4",  /* 休眠时间 */
-        "\xe6\x9a\x97\xe9\xbb\x91\xe6\xa8\xa1\xe5\xbc\x8f",  /* 暗黑模式 */
-    };
-    os_dialog_list(ctx, "", items, 5, 0, on_disp_select, NULL);
+static void open_disp_dlg(ui_ctx_t *ctx, int sel) {
+    char items[6][24];
+    const char *ptrs[6];
+    snprintf(items[0], sizeof(items[0]), "\xe6\x97\xa5\xe6\x9c\x9f\xe6\x9b\xb4\xe6\x94\xb9");  /* 日期更改 */
+    snprintf(items[1], sizeof(items[1]), "\xe6\x97\xb6\xe9\x97\xb4\xe8\xb0\x83\xe6\x95\xb4");  /* 时间调整 */
+    snprintf(items[2], sizeof(items[2]), "\xe5\xad\x97\xe4\xbd\x93\xe7\xb2\x97\xe7\xbb\x86");  /* 字体粗细 */
+    snprintf(items[3], sizeof(items[3]), "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4");  /* 休眠时间 */
+    snprintf(items[4], sizeof(items[4]), "\xe6\x9a\x97\xe9\xbb\x91\xe6\xa8\xa1\xe5\xbc\x8f");  /* 暗黑模式 */
+    snprintf(items[5], sizeof(items[5]), "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x94\xa4\xe9\x86\x92:%s",  /* 触摸唤醒:开/关 */
+             wp_screensaver_touch_wake_enabled() ? "\xe5\xbc\x80" : "\xe5\x85\xb3");
+    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2];
+    ptrs[3] = items[3]; ptrs[4] = items[4]; ptrs[5] = items[5];
+    sel = (sel < 0) ? 0 : (sel > 5 ? 5 : sel);
+    os_dialog_list(ctx, "", ptrs, 6, sel, on_disp_select, NULL);
 }
 
 /* ---- 声音调整弹窗: 声音开关/音量/震动 (动态显示状态) ---- */
@@ -649,7 +665,7 @@ static void on_snd_select(ui_ctx_t *ctx, int result, void *ud) {
         s_vib_game = !s_vib_game;
         vibrator_set_game_enabled(s_vib_game);
         settings_save_u8("vib_game", s_vib_game ? 1 : 0);
-    } else if (result == 4) {   /* 按键模拟开关 (V1.4.x) */
+    } else if (result == 4) {   /* 触摸反馈开关 (V1.4.x) */
         s_key_sim = !s_key_sim;
         vibrator_set_key_sim(s_key_sim);
         settings_save_u8("vib_key", s_key_sim ? 1 : 0);
@@ -669,7 +685,7 @@ static void open_snd_dlg(ui_ctx_t *ctx, int sel) {
              audio_player_vol_to_step(audio_player_get_volume()));
     snprintf(items[2], sizeof(items[2]), "UI\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib_ui ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* UI震动:开/关 */
     snprintf(items[3], sizeof(items[3]), "\xe6\xb8\xb8\xe6\x88\x8f\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib_game ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 游戏震动:开/关 */
-    snprintf(items[4], sizeof(items[4]), "\xe6\x8c\x89\xe9\x94\xae\xe6\xa8\xa1\xe6\x8b\x9f:%s", s_key_sim ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 按键模拟:开/关 */
+    snprintf(items[4], sizeof(items[4]), "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x8f\x8d\xe9\xa6\x88:%s", s_key_sim ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 触摸反馈:开/关 */
     ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3]; ptrs[4] = items[4];
     sel = (sel < 0) ? 0 : (sel > 4 ? 4 : sel);
     os_dialog_list(ctx, "", ptrs, 5, sel, on_snd_select, NULL);
@@ -795,7 +811,7 @@ static bool settings_main_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, v
     case OS_ACTION_CONFIRM:
         if (d->sel >= d->count) return false;   /* 底部"返回"行 → 默认处理 (关闭) */
         switch (d->sel) {
-        case 0: open_disp_dlg(ctx); break;   /* 显示配置 */
+        case 0: open_disp_dlg(ctx, 0); break;   /* 显示配置 */
         case 1: open_snd_dlg(ctx, 0);  break;   /* 声音调整 */
         case 2: open_wifi_dlg(ctx, 0); break;   /* 无线连接 */
         case 3: open_info_dlg(ctx); break;   /* 系统信息 */

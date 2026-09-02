@@ -253,6 +253,8 @@ static void p_main_action(ui_ctx_t *ctx, os_action_t a)
         break;
     case OS_ACTION_CONFIRM:
         if (input_suppressed()) break;
+        /* 打开应用: 震动由 os_handle_action 的 CONFIRM 导航反馈统一触发
+         * (tap_ui 18ms, UI震动开关), 此处不再震 → 避免"导航震+点击震"双击. */
         os_push(ctx, main_app(s_main.selected)->page);
         break;
     case OS_ACTION_BACK:
@@ -280,7 +282,9 @@ static bool p_main_touch(ui_ctx_t *ctx, int x, int y)
             y >= UI_SCREEN_H / 2 - 50 && y <= UI_SCREEN_H / 2 + 70) {
             /* 点侧边小图标: 不播归位动画、不改相机, 直接打开对应页.
              * (原先 main_anim_to 会把该图标弹簧挪到中央再接 history, 返回后
-             *  主菜单中央已换成所点项 → 用户感觉"位置被刷新/闪烁".) */
+             *  主菜单中央已换成所点项 → 用户感觉"位置被刷新/闪烁".)
+             * V1.5.x: 点击应用程序 → 打开瞬间短震一下. */
+            vibrator_click();
             os_push(ctx, main_app(idx)->page);
             return true;
         }

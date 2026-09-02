@@ -204,6 +204,7 @@ void os_dialog_confirm_ex(ui_ctx_t *ctx, const char *msg, uint32_t timeout_ms,
  * 触摸弹窗内左=确定 右=取消. 阻塞直到用户决定. 返回 true=确认退出. */
 bool os_confirm_exit_blocking(st7305_handle_t *lcd);
 void os_dialog_toast(ui_ctx_t *ctx, const char *msg);   /* 1s 自动关闭 */
+void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms); /* V1.5.x: 自定义时长 toast (0=默认1s) */
 void os_dialog_draw_overlay(ui_ctx_t *ctx);             /* 全局顶层 toast 覆盖: os_render flush 前调用 */
 
 /* ==== 弹窗栈 (settings/list_dialog 嵌套弹窗支持) ====

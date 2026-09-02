@@ -362,8 +362,9 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
                     /* 再按一次锁屏键 = 解锁(消费掉, 不当作又一次进入锁屏) */
                     woken = true;
                 }
-                /* 触摸唤醒 (长按1秒语义与全局屏保一致; 此处简化: 按住即唤醒) */
-                else {
+                /* 触摸唤醒 (长按1秒语义与全局屏保一致; 此处简化: 按住即唤醒).
+                 * V1.5.x: 受"触摸唤醒"设置开关控制 (默认关) — 关=触摸不唤醒, 仅按键唤醒 */
+                else if (wp_screensaver_touch_wake_enabled()) {
                     int tx, ty;
                     if (input_get_touch_pos(&tx, &ty)) woken = true;
                 }
@@ -384,6 +385,11 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
     virtual_keys_set_enabled(false);
     input_set_gamepad_nav_enabled(true);
     input_set_gamepad_gamemode(false);  /* V1.2.x: 退出关卡, 结束游戏模式标志 */
+    /* V1.5.x: 退出游戏刷新主循环输入时钟 — 引擎阻塞运行期间 main.c 的 last_input_ms
+     * 停留在进游戏前旧值, 不回写则主循环恢复后 wp_screensaver_poll 立即判定空闲超时,
+     * "退出游戏直接进壁纸" (且壁纸重新计时, 10 分钟软关机看似失效). 置活动标志后
+     * 下一帧 input_consume_activity() 刷新 last_input_ms = now, 正常回到桌面. */
+    input_mark_activity();
     st7305_clear(ctx->lcd, ST7305_COLOR_WHITE);
     ctx->needs_redraw = true;
 }
@@ -509,6 +515,7 @@ static void lavax_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const ch
     lavax_emu_load_and_run(run);   /* 阻塞直到退出 */
     input_set_gamepad_nav_enabled(true);
     input_set_gamepad_gamemode(false);  /* V1.2.x: 文曲星退出, 结束游戏模式标志 */
+    input_mark_activity();   /* V1.5.x: 同 eng_task_run_loop — 刷新主循环输入时钟, 防退出即进壁纸 */
     ctx->needs_redraw = true;
 }
 

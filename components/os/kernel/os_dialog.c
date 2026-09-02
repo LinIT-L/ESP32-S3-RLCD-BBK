@@ -151,11 +151,12 @@ static uint32_t s_toast_ms;
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 static os_dlg_stack_t *top(void) { return (s_top >= 0) ? &s_stack[s_top] : NULL; }
 
-/* 提示弹窗显示时长: 满 1 秒自动消失 (用户规范). */
+/* 提示弹窗显示时长: 默认满 1 秒自动消失 (用户规范); os_dialog_toast_ms 可指定自定义时长. */
 #define TOAST_MS 1000
-/* 是否需要显示 toast 提示 (有弹窗时也叠在弹窗之上显示, 1s 自动消失) */
+static uint32_t s_toast_dur_ms = TOAST_MS;   /* V1.5.x: 当前 toast 显示时长 (ms) */
+/* 是否需要显示 toast 提示 (有弹窗时也叠在弹窗之上显示, 到时自动消失) */
 static bool toast_active(void) {
-    return (s_toast_msg[0] != 0) && (now_ms() - s_toast_ms < TOAST_MS);
+    return (s_toast_msg[0] != 0) && (now_ms() - s_toast_ms < s_toast_dur_ms);
 }
 
 /* ============ 渲染 (不清屏, 覆盖在底层之上) ============ */
@@ -557,9 +558,9 @@ static bool dlg_touch(ui_ctx_t *ctx, int x, int y) {
 }
 
 static void dlg_poll(ui_ctx_t *ctx) {
-    /* toast 超时: 1s 后自动关闭 (回到弹出提示前的位置).
-     * 注意不能用 toast_active() 判断 (它要求 <TOAST_MS, 与超时判断矛盾) */
-    if (s_toast_msg[0] && now_ms() - s_toast_ms >= TOAST_MS) {
+    /* toast 超时: 到时后自动关闭 (回到弹出提示前的位置).
+     * 注意不能用 toast_active() 判断 (它要求 < 时长, 与超时判断矛盾) */
+    if (s_toast_msg[0] && now_ms() - s_toast_ms >= s_toast_dur_ms) {
         if (s_top < 0) os_pop(ctx);   /* 独立 toast: 关弹窗页; 叠弹窗上的提示仅清消息 */
         s_toast_msg[0] = 0;
         ctx->needs_redraw = true;
@@ -736,6 +737,12 @@ void os_dialog_confirm_ex(ui_ctx_t *ctx, const char *msg, uint32_t timeout_ms,
 }
 
 void os_dialog_toast(ui_ctx_t *ctx, const char *msg) {
+    os_dialog_toast_ms(ctx, msg, TOAST_MS);
+}
+
+/* V1.5.x: 自定义时长 toast — ms 毫秒后自动消失 (0=默认 1s). 用于"回连成功"等短提示. */
+void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms) {
+    s_toast_dur_ms = (ms == 0) ? TOAST_MS : ms;
     snprintf(s_toast_msg, sizeof(s_toast_msg), "%s", msg ? msg : "");
     s_toast_ms = now_ms();
     if (s_top < 0) os_push(ctx, OS_PAGE_DIALOG);   /* 无弹窗栈时需打开弹窗页 */

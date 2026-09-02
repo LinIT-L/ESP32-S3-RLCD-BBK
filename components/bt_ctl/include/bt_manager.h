@@ -191,6 +191,9 @@ bool bt_manager_is_connecting(void);
 void bt_manager_cancel_connect(void);
 void bt_manager_enable(void);
 void bt_manager_disable(void);
+/* V1.5.x: 开机自动回连窗口 — 有已配对手柄时短窗口内低占空比直连上次手柄,
+ * 连上即保持; 窗口超时未连上自动关栈回按需省电 (main.c 开机时调用, 0=默认30s). */
+void bt_manager_start_boot_reconnect(uint32_t window_ms);
 bool bt_manager_is_ready(void);
 bool bt_manager_is_stack_ready(void);
 /* 屏保软挂起: 断开连接 + 停止扫描, 协议栈保持存活 */
@@ -209,6 +212,7 @@ void bt_manager_clear_paired(void);
 bool bt_manager_is_paired_device(const uint8_t *bd_addr);
 void bt_manager_add_to_history(const bt_device_t *dev);
 bool bt_manager_get_connected_addr(uint8_t *out_addr6);
+bool bt_manager_has_last_conn(void);   /* V1.5.x: 是否有上次连接设备 (扫描自动回连判定) */
 
 #ifdef __cplusplus
 }

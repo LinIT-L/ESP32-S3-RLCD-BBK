@@ -110,6 +110,7 @@ static void on_game_select(ui_ctx_t *ctx, os_pane_t *p,
     gam4980_emu_run();
     input_set_gamepad_gamemode(false);  /* V1.3.x: 退出步步高, 结束游戏模式标志 (暗黑UI恢复反色) */
     input_set_gamepad_nav_enabled(true);
+    input_mark_activity();   /* V1.5.x: 同 eng_task_run_loop — 刷新主循环输入时钟, 防退出即进壁纸 */
     ctx->needs_redraw = true;   /* 游戏退出后重绘列表 */
 }
 

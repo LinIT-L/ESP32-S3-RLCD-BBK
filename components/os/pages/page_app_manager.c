@@ -15,6 +15,7 @@
 #include "ui_common.h"
 #include "engine_manager.h"   /* 返回应用管家统一卸载引擎 (应用管家=主菜单级边界) */
 #include "input.h"
+#include "vibrator.h"         /* V1.5.x: 点击应用震动 (ctx_block 屏蔽 input 层, 打开/选中时补) */
 #include "touch_panel.h"
 #include "wifi_manager.h"
 #include "font_zh.h"
@@ -32,9 +33,15 @@
 #define TAG "APPM"
 
 /* ==== 布局 (复刻 3.3 应用管理页) ==== */
-#define AM_CATBAR_W    68     /* 左侧分类栏宽度 */
+#define AM_CATBAR_W    75     /* 左侧分类栏宽度 (V1.5.x: 4px左缘+4px边距+64图标+2px空隙+1px分割线) */
 #define AM_CAT_Y0      24     /* 分类栏起始 y = 状态栏边界 */
+#define AM_CAT_X0      4      /* V1.5.x: 左缘留白, 让左角外凸圆角有显示空间 (需 ≥ 选中框 R) */
 #define AM_ICON_SIZE   64     /* 网格图标尺寸 */
+#define AM_ICON_GAP    4      /* V1.5.x: 图标周围/间隔 4px 空间 */
+#define AM_ICON_X      (AM_CAT_X0 + AM_ICON_GAP + AM_ICON_SIZE / 2)  /* 图标中心 x = 40 (左缘 4px 留白) */
+#define AM_SEL_GAP     2      /* V1.5.x: 选中指示线距图标 2px */
+#define AM_SEL_W       2      /* V1.5.x: 选中指示线宽 2px */
+#define AM_SEL_R       3      /* V1.5.x: 选中指示圆角半径 R3 */
 #define AM_GRID_COLS   4      /* 网格列数 */
 #define AM_GRID_ROWS   3      /* 网格可见行数 */
 #define AM_SUB_H       26     /* 顶部子分类条高 */
@@ -409,13 +416,57 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
     fill_rect(lcd, x0, y0 + AM_SUB_H - 1, x1, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK);
 }
 
-/* ==== 左侧分类栏布局 (前3个平均分布, 第4个商店贴底) ==== */
+/* ==== 选中框圆角 (V1.5.x) ====
+ * 左侧两角 (左上/左下) 为外凸圆角: 弧向外鼓出, 圆心在角外侧;
+ * 右侧两角 (上/下横线右端接分割线) 为内凹圆角: 弧凹向框内, 与左侧方向相反 (镜像). */
+
+/* 内凹圆角(弧凹向框内)弧带: (cx,cy)=角外顶点, r=半径, w=线宽.
+ * q: 1=右上(上横线右端接分割线) 2=右下(下横线右端接分割线) */
+static void am_sel_corner_in(st7305_handle_t *lcd, int cx, int cy, int r, int w, int q,
+                             st7305_color_t color) {
+    int ox = cx - r;                                 /* 圆心 x 在角内侧左方 */
+    int oy = cy + ((q == 1) ? r : -r);               /* 右上: 圆心 y 在角内侧下方; 右下: 上方 */
+    int x0 = cx - r, x1 = cx, y0 = cy - r, y1 = cy + r;
+    for (int y = y0; y <= y1; y++) {
+        if (y < 0 || y >= UI_SCREEN_H) continue;
+        for (int x = x0; x <= x1; x++) {
+            if (x < 0 || x >= UI_SCREEN_W) continue;
+            float dx = (x + 0.5f) - ox;
+            float dy = (y + 0.5f) - oy;
+            bool inq = (q == 1) ? (dx >= 0 && dy <= 0) : (dx >= 0 && dy >= 0);
+            if (!inq) continue;
+            float d = sqrtf(dx * dx + dy * dy);
+            if (d >= (r - w) && d <= r) st7305_draw_pixel(lcd, x, y, color);
+        }
+    }
+}
+
+/* 外凸圆角(弧向外鼓出)弧带: (cx,cy)=角外顶点, r=半径, w=线宽.
+ * q: 0=左上外凸(圆心在角左上方外侧) 1=左下外凸(圆心在角左下方外侧) */
+static void am_sel_corner_out(st7305_handle_t *lcd, int cx, int cy, int r, int w, int q,
+                              st7305_color_t color) {
+    int ox = cx - r;                                 /* 圆心 x 在角外侧左方 */
+    int oy = (q == 0) ? (cy - r) : (cy + r);         /* 左上: 圆心在上方; 左下: 在下方 */
+    int x0 = cx - r, x1 = cx, y0 = cy - r, y1 = cy + r;
+    for (int y = y0; y <= y1; y++) {
+        if (y < 0 || y >= UI_SCREEN_H) continue;
+        for (int x = x0; x <= x1; x++) {
+            if (x < 0 || x >= UI_SCREEN_W) continue;
+            float dx = (x + 0.5f) - ox;
+            float dy = (y + 0.5f) - oy;
+            bool inq = (q == 0) ? (dx >= 0 && dy >= 0) : (dx >= 0 && dy <= 0);
+            if (!inq) continue;
+            float d = sqrtf(dx * dx + dy * dy);
+            if (d >= (r - w) && d <= r) st7305_draw_pixel(lcd, x, y, color);
+        }
+    }
+}
+
+/* ==== 左侧分类栏布局 (V1.5.x: 4 图标等距排布, 顶部距状态栏 4px,
+ * 底部留 6px 供选中框下缘+外凸/内凹圆角完整显示) ==== */
 static int am_cat_cy(int r) {
-    if (r >= AM_CAT_COUNT - 1)
-        return UI_SCREEN_H - 1 - AM_ICON_SIZE / 2;      /* 最后一个贴底 */
-    int top = AM_CAT_Y0;
-    int bottom = UI_SCREEN_H - 1 - AM_ICON_SIZE;        /* 最后一个图标顶 */
-    int slot = (bottom - top) / (AM_CAT_COUNT - 1);     /* 前3个均分 */
+    int top = AM_CAT_Y0 + AM_ICON_GAP;               /* 图标0顶: 状态栏 + 4px */
+    int slot = AM_ICON_SIZE + AM_ICON_GAP - 1;       /* 67: 图标间隔 3px (底部圆角让位 1px) */
     return top + r * slot + AM_ICON_SIZE / 2;
 }
 
@@ -427,7 +478,19 @@ static void p_am_render(ui_ctx_t *ctx) {
     st7305_clear(lcd, th->bg_color);
 
     int grid_x0 = AM_CATBAR_W;
-    fill_rect(lcd, AM_CATBAR_W - 1, AM_CAT_Y0, AM_CATBAR_W, UI_SCREEN_H - 1, ST7305_COLOR_BLACK);
+    /* V1.5.x: 分割线右移 (图标右缘 + 2px 空隙), 单列 1px 竖线.
+     * 仅覆盖图标列范围 (图标0顶 ~ 末图标底); 在选中图标处断开 —
+     * 选中框右侧不再有直线 (上/下横线右端以内凹圆角收尾). */
+    {
+        int rx   = AM_CATBAR_W - 1;
+        int d_top = am_cat_cy(0) - AM_ICON_SIZE / 2;
+        int d_bot = am_cat_cy(AM_CAT_COUNT - 1) + AM_ICON_SIZE / 2;
+        int scy  = am_cat_cy(s_cat);
+        int s_ty = scy - AM_ICON_SIZE / 2 - AM_SEL_GAP - AM_SEL_W;
+        int s_by = scy + AM_ICON_SIZE / 2 + AM_SEL_GAP + AM_SEL_W - 1;
+        if (s_ty > d_top)      fill_rect(lcd, rx, d_top, rx, s_ty - 1, ST7305_COLOR_BLACK);
+        if (s_by + 1 <= d_bot) fill_rect(lcd, rx, s_by + 1, rx, d_bot, ST7305_COLOR_BLACK);
+    }
 
     /* 内容起点 (状态栏下方, 不再有顶部子分类条) */
     int content_top = AM_CAT_Y0;
@@ -503,31 +566,38 @@ static void p_am_render(ui_ctx_t *ctx) {
         /* 该分类暂无应用 */
     }
 
-    /* 左侧分类栏 (引擎/游戏/应用/商店: 前3均分 + 商店贴底, 仅图标, 不显示名称, 选中=图标下方 2px 横线) */
+    /* 左侧分类栏 (引擎/游戏/应用/运维: 4px 等距排布, 仅图标).
+     * V1.5.x 选中样式: 左/上/下三边 2px 线 (距图标 2px);
+     * 四角 R3: 左两角外凸 (弧向外鼓, 边框上/下/左拉长), 右两角内凹 (弧凹向框内, 接分割线). */
     for (int r = 0; r < AM_CAT_COUNT; r++) {
-        int icon_cx = AM_CATBAR_W / 2;
+        int icon_cx = AM_ICON_X;
         int icon_cy = am_cat_cy(r);
-        /* 分类栏聚焦 (方向键) 时: 被聚焦分类画外扩黑框, 表示可在分类间用上下键切换 */
-        if (s_focus_bar == 2 && r == s_cat) {
-            int bx0 = icon_cx - AM_ICON_SIZE / 2 - 2;
-            int bx1 = icon_cx + AM_ICON_SIZE / 2 + 1;
-            int by0 = icon_cy - AM_ICON_SIZE / 2 - 2;
-            int by1 = icon_cy + AM_ICON_SIZE / 2 + 1;
-            for (int k = 0; k < 2; k++) {
-                draw_hline(lcd, bx0 + k, bx1 - k, by0 + k, ST7305_COLOR_BLACK);
-                draw_hline(lcd, bx0 + k, bx1 - k, by1 - k, ST7305_COLOR_BLACK);
-                draw_vline(lcd, bx0 + k, by0 + k, by1 - k, ST7305_COLOR_BLACK);
-                draw_vline(lcd, bx1 - k, by0 + k, by1 - k, ST7305_COLOR_BLACK);
-            }
+        if (r == s_cat) {
+            int il = icon_cx - AM_ICON_SIZE / 2;            /* 图标左缘 */
+            int it = icon_cy - AM_ICON_SIZE / 2;            /* 图标顶 */
+            int ib = icon_cy + AM_ICON_SIZE / 2;            /* 图标底 */
+            int lx = il - AM_SEL_GAP - AM_SEL_W;            /* 左竖线 x0 */
+            int ty = it - AM_SEL_GAP - AM_SEL_W;            /* 上横线 y0 */
+            int by = ib + AM_SEL_GAP;                       /* 下横线 y0 */
+            int rx = AM_CATBAR_W - 1;                       /* 横线右端 = 分割线 */
+            int w1 = AM_SEL_W - 1;
+            /* 左竖线: 上下各延长 R, 为左角外凸圆角让位 (弧向外鼓, 边框上/下/左拉长) */
+            draw_vline(lcd, lx, ty - AM_SEL_R, by + w1 + AM_SEL_R, ST7305_COLOR_BLACK);
+            draw_vline(lcd, lx + w1, ty - AM_SEL_R, by + w1 + AM_SEL_R, ST7305_COLOR_BLACK);
+            /* 上横线: 左端延伸 R (接外凸圆角), 右端缩进 R (接内凹圆角→分割线) */
+            draw_hline(lcd, lx - AM_SEL_R, rx - AM_SEL_R, ty, ST7305_COLOR_BLACK);
+            draw_hline(lcd, lx - AM_SEL_R, rx - AM_SEL_R, ty + w1, ST7305_COLOR_BLACK);
+            /* 下横线: 同上 (左外凸 / 右内凹) */
+            draw_hline(lcd, lx - AM_SEL_R, rx - AM_SEL_R, by, ST7305_COLOR_BLACK);
+            draw_hline(lcd, lx - AM_SEL_R, rx - AM_SEL_R, by + w1, ST7305_COLOR_BLACK);
+            /* 四角 R3: 左两角外凸 (corner_out, 弧向外鼓) / 右两角内凹 (corner_in, 弧凹向框内), 镜像对称 */
+            am_sel_corner_out(lcd, lx, ty, AM_SEL_R, AM_SEL_W, 0, ST7305_COLOR_BLACK);      /* 左上外凸 */
+            am_sel_corner_in(lcd, rx, ty, AM_SEL_R, AM_SEL_W, 1, ST7305_COLOR_BLACK);       /* 右上内凹 */
+            am_sel_corner_in(lcd, rx, by + w1, AM_SEL_R, AM_SEL_W, 2, ST7305_COLOR_BLACK);  /* 右下内凹 */
+            am_sel_corner_out(lcd, lx, by + w1, AM_SEL_R, AM_SEL_W, 1, ST7305_COLOR_BLACK); /* 左下外凸 */
         }
         /* 分类图标: 侧栏四类均用独立 cat 图标 (0引擎/1游戏/2程序/3运维), 不复用应用图标 */
         draw_cat_icon_stretched(lcd, icon_cx, icon_cy, AM_ICON_SIZE, AM_ICON_SIZE, r);
-        if (r == s_cat) {
-            int lx0 = icon_cx - AM_ICON_SIZE / 2;
-            int lx1 = icon_cx + AM_ICON_SIZE / 2;
-            int ly  = icon_cy + AM_ICON_SIZE / 2 + 1;
-            fill_rect(lcd, lx0, ly, lx1 - 1, ly + 1, ST7305_COLOR_BLACK);
-        }
     }
 }
 
@@ -679,6 +749,9 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
         int row = (int)floorf(s_gcam) + row_vis;
         int idx = row * AM_GRID_COLS + col;
         if (idx >= 0 && idx < s_list_n) {
+            /* V1.5.x: 软件管家点击任意软件也要震动 — input 层按下震动被 ctx_block
+             * (应用管家页) 屏蔽, 这里在"点击命中图标"时补一次触摸反馈 (打开/选中一致) */
+            vibrator_click();
             if (idx == s_focus) {
                 const os_app_t *a = s_list[idx]; if (a) os_push(ctx, a->page);  /* 直接打开 */
             } else s_focus = idx;
@@ -689,6 +762,8 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
         int row_h = 46;
         int idx = (int)floorf(s_gcam) + (y - content_top) / row_h;
         if (idx >= 0 && idx < s_list_n) {
+            /* V1.5.x: 同上 — 列表视图点击应用补触摸反馈震动 */
+            vibrator_click();
             if (idx == s_focus) {
                 const os_app_t *a = s_list[idx]; if (a) os_push(ctx, a->page);  /* 直接打开 */
             } else s_focus = idx;

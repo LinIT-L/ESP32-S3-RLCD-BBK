@@ -40,6 +40,8 @@ static int s_gp_map[6];
 static bt_device_t s_scan_devs[GP_SCAN_MAX];
 static int  s_scan_n = 0;
 static bool s_scan_active = false;
+/* V1.5.x: 长按确认键扫描窗口 — 期望自动回连上次手柄 (连上即 0.5s"回连成功" + 关全部弹窗) */
+static bool s_auto_rc_pending = false;
 
 /* ---- 连接中弹窗 (处理 成功/失败/对方断开/超时, 避免"正在连接"永久卡住) ---- */
 static int64_t s_conn_start = 0;      /* connect 发起时刻 (µs), 用于超时判断 */
@@ -210,12 +212,16 @@ static void open_hist_dialog(ui_ctx_t *ctx) {
 /* ---- 蓝牙扫描列表弹窗 (3.3: 添加设备 → 扫描结果显示在列表, 确认连接) ---- */
 static void scan_dlg_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ctx; (void)ud;
-    if (result < 0) bt_manager_stop_scan();   /* 关闭: 停止扫描 */
+    if (result < 0) {
+        s_auto_rc_pending = false;   /* 关闭: 放弃自动回连期望 */
+        bt_manager_stop_scan();      /* 关闭: 停止扫描 */
+    }
 }
 static bool scan_dlg_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
     (void)ud;
     if (a == OS_ACTION_BACK) {
         /* 扫描列表中按返回 = 立即退出并停止扫描, 不卡住 */
+        s_auto_rc_pending = false;
         bt_manager_stop_scan();
         d->on_poll = NULL;
         s_scan_n = 0;
@@ -241,6 +247,14 @@ static bool scan_dlg_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *
 }
 static void scan_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)ud;
+    /* V1.5.x: 长按确认键扫描窗口 — 自动回连成功 → 关闭所有弹窗 + 0.5s"回连成功"提示 */
+    if (s_auto_rc_pending && bt_manager_is_connected()) {
+        s_auto_rc_pending = false;
+        bt_manager_stop_scan();
+        os_dialog_clear_all(ctx);   /* 关闭全部弹窗 (扫描列表等), 回到进入前页面 */
+        os_dialog_toast_ms(ctx, "\xe5\x9b\x9e\xe8\xbf\x9e\xe6\x88\x90\xe5\x8a\x9f", 500); /* 回连成功 */
+        return;
+    }
     static bool s_prev_scanning = false;
     bool scanning = bt_manager_is_scanning();
     /* 结果数变化 或 扫描状态变化 → 刷新 */
@@ -267,6 +281,10 @@ static void open_scan_dialog(ui_ctx_t *ctx) {
     s_scan_n = 0;
     os_hw_request(OS_HW_BT);   /* V1.5.x 蓝牙按需开启: 进手柄页才首次启用再扫 (走 os_hw 引用计数) */
     bt_manager_start_scan_continuous(gp_on_scan);
+    /* V1.5.x: 长按确认键扫描窗口 — 有上次连接设备且当前未连接 → 扫描过程中自动回连,
+     * 连上即 0.5s"回连成功"提示并关闭所有弹窗 (由 scan_dlg_poll 每帧检测收敛) */
+    s_auto_rc_pending = bt_manager_has_last_conn() && !bt_manager_is_connected();
+    bt_manager_poll_auto_reconnect();
     s_scan_active = true;
     os_dlg_stack_t dlg;
     memset(&dlg, 0, sizeof(dlg));

@@ -26,6 +26,11 @@
 #define GAP         6
 #define RIGHT_EDGE  (ui_screen_w() - 4)   /* 右栏右缘 (横屏 396 / 竖屏 296) */
 
+/* V1.5.x: 跟手滚动"防误开"标志 — 本手势发生过滚动时置位, 松手被输入层误判为点击
+ * (位移 <40px 判 CONFIRM) 的 tap 在 os_pane_touch 入口吞掉, 防止"浏览游戏/暴龙机
+ * 列表轻滑误打开游戏" (自动打开根因). 新手势起始清零, os_pane_touch 消费一次复位. */
+static bool s_scroll_suppress_tap = false;
+
 /* 扫描目录项上限: 防止巨目录 (数千文件) 全量遍历拖慢切换 */
 #define PANE_SCAN_MAX 512
 
@@ -472,6 +477,9 @@ bool os_pane_action(ui_ctx_t *ctx, os_pane_t *p, os_action_t a) {
 }
 
 bool os_pane_touch(ui_ctx_t *ctx, os_pane_t *p, int x, int y) {
+    /* V1.5.x: 滚动保护 — 本手势滚动过 (浏览列表), 松手被误判为点击的 tap 直接吞掉,
+     * 不打开游戏/不触发操作. 标志由 pane_poll 置位/新手势清零, 此处消费一次. */
+    if (s_scroll_suppress_tap) { s_scroll_suppress_tap = false; return true; }
     const int list_y = p->list_y > 0 ? p->list_y : LIST_Y;
     if (y < list_y || y >= LIST_BOTTOM) return false;
     /* 左栏: 切目录/设置 */
@@ -543,6 +551,7 @@ void os_pane_poll(ui_ctx_t *ctx, os_pane_t *p) {
             s_started_right = in_right;
             s_last_y = ty;
             s_start_off = p->item_off;
+            s_scroll_suppress_tap = false;   /* 新手势起始: 作废旧滚动标志 (防误吞下次点击) */
             return;
         }
         if (!s_started_right) return;   /* 起点在左栏 → 不跟手滚动 */
@@ -554,6 +563,7 @@ void os_pane_poll(ui_ctx_t *ctx, os_pane_t *p) {
         if (new_off != p->item_off) {
             p->item_off = new_off;
             p->item_scroll = (max_off > 0) ? (new_off / ROW_H) : 0;
+            s_scroll_suppress_tap = true;   /* 本手势滚动过 → 松手 tap 无效 (防误开游戏) */
             if (ctx) ctx->needs_redraw = true;
         }
     } else {

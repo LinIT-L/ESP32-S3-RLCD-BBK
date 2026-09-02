@@ -192,14 +192,16 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
         os_pop_to_main(ctx);        /* 回主菜单 (page_main static 状态保留 → 原位置) */
         return;
     }
-    /* V1.2.x: UI 震动 — 非游戏态下, 方向导航 / 确认键触发单次 UI 反馈.
+    /* V1.2.x: UI 震动 — 非游戏态下, 方向导航 / 确认 / 返回键触发按键反馈.
+     * V1.5.x: 归"UI震动"开关 (vibrator_tap_ui), 与"按键模拟"通道分离 —
+     * 18ms/100% 短脉冲与触摸点击手感一致; UI震动关 → 导航不震, 不影响触摸点击.
      * 覆盖主菜单/设置/弹窗/应用管家/番茄钟滚轮等所有 UI 导航 (弹窗键也经此处).
      * 游戏态不在此触发 (游戏内按键走 input 层 joypad 边沿游戏震动). */
     if (!input_is_game_mode() &&
         (a == OS_ACTION_UP || a == OS_ACTION_DOWN ||
          a == OS_ACTION_LEFT || a == OS_ACTION_RIGHT ||
-         a == OS_ACTION_CONFIRM)) {
-        vibrator_tap_ui(25, 110);
+         a == OS_ACTION_CONFIRM || a == OS_ACTION_BACK)) {
+        vibrator_tap_ui(18, 100);
     }
     /* 全屏应用按返回 → 退出确认弹窗 (确认退出 / 10秒自动退出 / 返回取消).
      * 门控: 仅"游戏(分类引擎)"拦截弹"退出程序?"——引擎进 eng_task_run_loop 时
@@ -248,8 +250,11 @@ void os_tick(ui_ctx_t *ctx)
 
     for (int i = 0; i < s_service_count; i++)
         if (s_services[i]->tick) s_services[i]->tick(ctx);
-    /* 屏保: 触摸长按1秒立即唤醒 (不松手); 该手势遗留动作标 pending 不穿透 */
-    if (os_screensaver_active() && input_touch_hold_ms() >= 1000) {
+    /* 屏保: 触摸长按1秒立即唤醒 (不松手); 该手势遗留动作标 pending 不穿透.
+     * V1.5.x: 受"触摸唤醒"设置开关控制 (默认关) — 关=触摸不唤醒屏保,
+     * 仅物理键/手柄唤醒 (os_handle_action 按键路径不受影响). */
+    if (os_screensaver_active() && wp_screensaver_touch_wake_enabled() &&
+        input_touch_hold_ms() >= 1000) {
         s_ss_touch_wake_pending = true;
         os_screensaver_reset();
     }

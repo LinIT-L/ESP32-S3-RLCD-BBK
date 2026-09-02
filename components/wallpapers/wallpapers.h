@@ -34,6 +34,10 @@ void wp_screensaver_set_delay_ms(uint32_t ms);
 void wp_screensaver_set_run_ms(uint32_t ms);
 /* 壁纸运行时长已耗尽, 主循环应执行软关机 (清屏 + deep sleep) */
 bool wp_screensaver_shutdown_requested(void);
+/* 触摸唤醒屏保开关 (V1.5.x): 开=触摸长按1秒唤醒屏保; 关=触摸不唤醒, 仅物理键/手柄唤醒.
+ * NVS "os_wp"/"wp_touch" (1=开, 默认 0=关). 由 os_core 屏保触摸唤醒路径查询, 设置页修改. */
+bool wp_screensaver_touch_wake_enabled(void);
+void wp_screensaver_set_touch_wake(bool en);
 
 
 #ifdef __cplusplus
