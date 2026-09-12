@@ -1,0 +1,163 @@
+# ESP32-S3-RLCD-4.2 步步高模拟器配置
+# 芯片: ESP32-S3-WROOM-1-N16R8 (16MB Flash, 8MB PSRAM)
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# 分区表 (自定义,容纳大应用)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 控制台: 早期引导日志走 USB Serial/JTAG; app_main 里 TinyUSB 复合设备接管后
+# 由 tinyusb_console_init 重定向到 CDC 串口 (常驻复合方案, 无 PHY 切换).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# PSRAM (8MB 八线, 80MHz) — gam4980 的 6MB ROM 数据必须放 PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+# 允许 BSS 段放 PSRAM (sys 结构体 ~6MB)
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# V1.0.64: 关闭 SPIRAM_RODATA (字库等 rodata 保持 Flash XIP, 不进 PSRAM).
+# 之前=y 时开机把全部字库(~4.9MB)复制进 PSRAM, 堆只剩 3.1MB,
+# gam4980 需要 6MB PSRAM -> 分配失败 -> 进游戏 5% 时写空指针崩溃重启.
+# 现在字库按需从 Flash 缓存读取, PSRAM 堆恢复到 ~7.4MB, BBK 正常.
+# CONFIG_SPIRAM_RODATA=y
+# 非必要数据尽量放 PSRAM: ALWAYSINTERNAL 阈值调小 (≤此值才保留内部), 内部预留调小
+# 以腾出 ≥32KB 连续内部块给 BBK 引擎 sys_ram (动态分配).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=24576
+# 允许 FreeRTOS 任务栈放 PSRAM (音频解码任务栈 60KB, 蓝牙任务栈也需要)
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# FAT 文件系统 (SD 卡读 ROM, 支持中文长文件名)
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_CODEPAGE_936=y
+CONFIG_FATFS_CODEPAGE=936
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+
+# 模块化 OS 内核 (components/os): 当前主系统就是新 OS, 必须启用
+CONFIG_OS=y
+
+# === 蓝牙手柄 Host: 官方 esp_hid_host (Bluedroid). ESP32-S3 仅 BLE. ===
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+# CONFIG_BT_NIMBLE_ENABLED is not set
+# esp32s3 需显式开 BLE4.2 特性 (ADV/SCAN 被裁剪则 esp_ble_gap_* 链接缺失)
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_42_ADV_EN=y
+CONFIG_BT_BLE_42_SCAN_EN=y
+# 控制器 BLE 配置 (S3 单模): 活动连接只需 2 条 (单手柄, 冗余一条), 省内部 RAM
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+CONFIG_BT_ACL_CONNECTIONS=2
+# 广播/扫描去重过滤缓存降低 (内部 RAM)
+CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10
+
+# 禁用 secure boot (避免依赖 micro-ecc submodule)
+CONFIG_SECURE_BOOT=n
+CONFIG_SECURE_BOOT_V2_ENABLED=n
+
+# lwip 已从 gitee 镜像克隆, 启用网络栈 (esp_http_server 等组件依赖)
+# CONFIG_LWIP_ENABLE 默认为 y (SOC_WIFI_SUPPORTED)
+
+# 启用 mbedTLS 证书包 (V1.0.68 天气时钟 HTTPS 需要 esp_crt_bundle)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# 关闭 mbedTLS 硬件加速 (上游 mbedtls 不含 espressif 的 soft fallback 类型)
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_HARDWARE_MPI=n
+CONFIG_MBEDTLS_HARDWARE_SHA=n
+CONFIG_MBEDTLS_HARDWARE_GCM=n
+CONFIG_MBEDTLS_HARDWARE_ECC=n
+CONFIG_MBEDTLS_HARDWARE_ECDSA_SIGN=n
+CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY=n
+CONFIG_MBEDTLS_GCM_SUPPORT_NON_AES_CIPHER=n
+CONFIG_TINYUSB_MSC_ENABLED=y
+# USB 挂载 TF 卡速度优化: MSC FIFO 默认仅 512B (=1 扇区), 导致 PC 每次
+# USB 事务只传 1 块, 全速 USB 吞吐被逐块往返开销卡在 ~40KB/s.
+# 提到 8192 (16 扇区) 后, sdmmc_read/write_sectors 一次多块传输,
+# 吞吐可提升至 ~1MB/s (esp32-s3 USB 为 full-speed, 理论上限 ~1MB/s).
+CONFIG_TINYUSB_MSC_BUFSIZE=8192
+# USB HID 复合设备: 2 个 HID 接口 (键盘 + 鼠标)
+CONFIG_TINYUSB_HID_COUNT=2
+# V2.0 复合设备方案: 控制台走 TinyUSB CDC 串口 (常驻 MSC+CDC / 键鼠 HID+CDC)
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=256
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=256
+CONFIG_TINYUSB_CDC_EP_BUFSIZE=64
+# USB-BT 蓝牙适配器 (BTH): 设备模拟成 USB 蓝牙 HCI 适配器, 电脑可用其蓝牙
+CONFIG_TINYUSB_BTH_ENABLED=y
+# 必须为 >=1: TinyUSB 的 BTH 驱动 btd_open() 在 HCI 主接口后会无条件解析
+# 第二个 ISO 接口(bNumEndpoints==2), 且 usb_hid.c 的 TUD_BTH_DESCRIPTOR IAD
+# 硬编码 bInterfaceCount=2。若设为 0, ISO 接口描述符不生成, 驱动 open 失败,
+# Windows 枚举失败报"未知设备"。参考 esp-iot-solution usb_dongle 取 1(支持 SCO 音频)。
+CONFIG_TINYUSB_BTH_ISO_ALT_COUNT=1
+# USB 网卡共享 (ECM/RNDIS): 设备枚举为电脑 USB 有线网卡 (RNDIS, Windows 原生识别)
+CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y
+
+# CPU 频率: 240MHz (默认 160MHz, 提升 50% 性能)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# 编译器优化: 速度优先 (-O2 替代默认 -Og)
+# v5.5 起选项名由 COMPILER_OPTIMIZATION_SPEED 改为 COMPILER_OPTIMIZATION_PERF,
+# 旧名已失效被静默忽略 (曾导致整个固件以 -Og 调试级优化编译, 引擎性能偏低)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# WiFi 联网 (V1.0.46 起启用: STA 连接, 设置中心扫描并输入密码)
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_COEX_ENABLED=y
+# V1.0.67: 蓝牙+音频占用大量 DMA 后, WiFi 16KB 静态 RX 缓冲分不到导致 init 失败,
+# 减小缓冲降低 DMA 需求 (网页手柄/天气小数据足够)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+
+# main 任务栈: 默认 3584 对引擎启动/加载链(在 main 任务上运行)太浅,
+# 打开任意引擎会触发 "stack overflow in task main" 重启。
+# 调到 12288, 为 NES/GB/Arduboy start 与 gam4980 libretro 初始化链提供充足栈。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
+
+# esp_timer 任务栈: 默认 3584 太浅。打开大书(蛊真人等)时, SDK 层
+# (flash/mmap 缓存、NVS 等)会在 esp_timer 回调里走深调用, 默认栈触发
+# "stack overflow in task esp_timer" 直接重启。放大到 8192 (内部空闲 ~114KB 够用)。
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=8192
+
+# === V1.0.9x: 精简 WiFi 内存 ===
+# WiFi 目前只两个用途: ①STA 联网(天气/同步) ②softAP 开热点当网页手柄.
+# 都是小数据量, 默认 16 动态收发缓冲/32 管理短缓冲对我们是浪费,
+# 下发后可腾出数千字节内部 DMA, 避免 WiFi 手柄启动时与蓝牙争 DMA 失败.
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
+CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=3
+# IEEE802.11 接收去重共缓存降到 256 (小热点场景够用, 省 DMA)
+CONFIG_ESP32_WIFI_RX_BA_WIN=6
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+
+# V1.1.x: 精简 WiFi: WiFi 仅 STA(天气/同步) + softAP(网页手柄), 无企业/证书登录
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+CONFIG_WPA_MBEDTLS_TLS_CLIENT=n
+
+# === V1.5.x: 省电 — PM 自动降频 (DFS) ===
+# 开启电源管理: 空闲时 CPU 自动降到 XTAL(40MHz), 忙时升回 240MHz.
+# PM_DFS_INIT_AUTO 默认 n, 须显式开启让启动代码自动配置 DFS (max=240, min=40).
+# 游戏/模拟器运行期间由 input.c 用 esp_pm_lock(CPU_FREQ_MAX) 锁 240MHz 防掉帧.
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+
+# === V1.6.x: 内存审计 — 开启 heap 追踪转储 (standalone) ===
+# remcon `audit` 可输出内部/PSRAM 分类堆积 + 所有任务栈水位 + 各堆块明细,
+# 用于定位"谁占用内部 RAM". standalone 模式无需宿主 init, 转储即用.
+CONFIG_HEAP_TRACING=y
+CONFIG_HEAP_TRACING_STANDALONE=y
+# vTaskList/任务栈水位审计依赖 (内存审计工具用)
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y

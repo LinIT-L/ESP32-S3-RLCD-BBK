@@ -1,0 +1,8 @@
+## IDF Component Manager Manifest File
+## 自包含 ST7305 驱动, 无外部依赖
+dependencies:
+  idf:
+    version: '>=5.0'
+  espressif/esp_tinyusb: '^2.0.0'
+## 注释: 2.x (最新 2.2.1) 官方复合设备方案 (MSC+CDC/HID), 支持运行时外设端口选择
+## 原 1.4.5 的 tusb_msc_storage (SDSPI storage) 不再使用, 本项目用原生 tud_msc_* 回调直读写 SD 扇区
