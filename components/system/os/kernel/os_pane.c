@@ -398,7 +398,6 @@ void os_pane_render(ui_ctx_t *ctx, os_pane_t *p) {
 
     /* 右栏: 设置模式走调用方自定义渲染 (内联设置项, 含平滑跟手滚动) */
     if (p->settings_mode) {
-        int view_h2 = pane_bottom(p) - list_y;
         int off2 = p->item_off;
         if (off2 < 0) off2 = 0;
         int top2 = off2 / ROW_H;

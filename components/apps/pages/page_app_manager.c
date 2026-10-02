@@ -86,7 +86,6 @@ static bool s_list_vis[64];           /* 每项可见性缓存: 渲染用, 避�
 /* ==== 网格相机 (仿主菜单: 跟手 + 平滑吸附) ====
  * s_gcam 以"行"为单位, 可小数; 拖动时跟手, 松手后平滑吸附到最近焦点行. */
 static float s_gcam = 0.0f;            /* 当前相机 (行, 可小数) */
-static float s_gcam_base = 0.0f;       /* 拖动起点相机 */
 static float s_gcam_anim_from = 0.0f;
 static float s_gcam_anim_to   = 0.0f;
 static uint32_t s_gcam_anim_start = 0;

@@ -208,12 +208,8 @@ static void km_pane_select(ui_ctx_t *ctx, os_pane_t *p,
 /* 左栏"设置"右栏渲染: 设置功能列表 */
 /* V1.6.x: 蓝牙HID键盘↔手柄 二选一模式 (0=手柄/正常, 1=蓝牙键盘) */
 static int  s_hid_ble = 0;
-static bool s_bt_prev = false;   /* 切到蓝牙键盘前, 蓝牙是否原本启用 (切回时恢复) */
 static void km_hidmode_load(void) {
     s_hid_ble = svc_cfg_get_i32("hidmode", "mode", 0);
-}
-static void km_hidmode_save(void) {
-    svc_cfg_set_i32("hidmode", "mode", s_hid_ble);
 }
 /* 设置"设置"左栏首项: 设置管理 */
 static void km_settings_render(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1,
@@ -417,16 +413,6 @@ static void km_render_pin_popup(st7305_handle_t *lcd) {
 }
 
 /* ---- 主列表底部操作行 ---- */
-static void km_render_bottom(st7305_handle_t *lcd) {
-    int by = 260;
-    draw_hline(lcd, 0, S_W - 1, by - 2, ST7305_COLOR_BLACK);
-    draw_label_centered_at(lcd, 43, by + 6, "\xe5\x88\x86\xe7\xb1\xbb", false);    /* 分类 */
-    draw_label_centered_at(lcd, 116, by + 6, "\xe6\x96\xb0\xe5\xa2\x9e", false);   /* 新增 */
-    draw_label_centered_at(lcd, 185, by + 6, "\xe5\xaf\xbc\xe5\x87\xba", false);   /* 导出 */
-    draw_label_centered_at(lcd, 255, by + 6, "\xe5\xaf\xbc\xe5\x85\xa5", false);   /* 导入 */
-    draw_label_centered_at(lcd, 330, by + 6, "\xe5\x88\xa0\xe9\x99\xa4", false);   /* 删除 */
-    draw_label_centered_at(lcd, 376, by + 6, "\xe9\x80\x80\xe5\x87\xba", false);   /* 退出 */
-}
 
 /* 导出/导入到 TF 卡 (手动备份) */
 static void on_export_or_import_ex(ui_ctx_t *ctx, bool is_export) {

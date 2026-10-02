@@ -220,7 +220,6 @@ static void p_main_render(ui_ctx_t *ctx)
 {
     st7305_handle_t *lcd = ctx->lcd;
     if (!lcd) return;
-    int total = (int)MAIN_MOD_COUNT;
 
     const os_theme_t *th = os_theme_get();
 

@@ -173,33 +173,33 @@ typedef enum {
 
 /* ============ 键位表 ============ */
 static const hid_key_t hid_row0[] = {   /* 第1排: F1-F6 */
-    { "F1", HIDK_F1,  0, 0, HID_COL0, HID_R0_Y, HID_KW, HID_KH },
-    { "F2", HIDK_F2,  0, 0, HID_COL1, HID_R0_Y, HID_KW, HID_KH },
-    { "F3", HIDK_F3,  0, 0, HID_COL2, HID_R0_Y, HID_KW, HID_KH },
-    { "F4", HIDK_F4,  0, 0, HID_COL3, HID_R0_Y, HID_KW, HID_KH },
-    { "F5", HIDK_F5,  0, 0, HID_COL4, HID_R0_Y, HID_KW, HID_KH },
-    { "F6", HIDK_F6,  0, 0, HID_COL5, HID_R0_Y, HID_KW_LAST, HID_KH },
+    { "F1", HIDK_F1,  0, 0, HID_COL0, HID_R0_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F2", HIDK_F2,  0, 0, HID_COL1, HID_R0_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F3", HIDK_F3,  0, 0, HID_COL2, HID_R0_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F4", HIDK_F4,  0, 0, HID_COL3, HID_R0_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F5", HIDK_F5,  0, 0, HID_COL4, HID_R0_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F6", HIDK_F6,  0, 0, HID_COL5, HID_R0_Y, HID_KW_LAST, HID_KH, NULL, 0, 0 },
 };
 static const hid_key_t hid_row1[] = {   /* 第2排: F7-F12 */
-    { "F7",  HIDK_F7,  0, 0, HID_COL0, HID_R1_Y, HID_KW, HID_KH },
-    { "F8",  HIDK_F8,  0, 0, HID_COL1, HID_R1_Y, HID_KW, HID_KH },
-    { "F9",  HIDK_F9,  0, 0, HID_COL2, HID_R1_Y, HID_KW, HID_KH },
-    { "F10", HIDK_F10, 0, 0, HID_COL3, HID_R1_Y, HID_KW, HID_KH },
-    { "F11", HIDK_F11, 0, 0, HID_COL4, HID_R1_Y, HID_KW, HID_KH },
-    { "F12", HIDK_F12, 0, 0, HID_COL5, HID_R1_Y, HID_KW_LAST, HID_KH },
+    { "F7",  HIDK_F7,  0, 0, HID_COL0, HID_R1_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F8",  HIDK_F8,  0, 0, HID_COL1, HID_R1_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F9",  HIDK_F9,  0, 0, HID_COL2, HID_R1_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F10", HIDK_F10, 0, 0, HID_COL3, HID_R1_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F11", HIDK_F11, 0, 0, HID_COL4, HID_R1_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "F12", HIDK_F12, 0, 0, HID_COL5, HID_R1_Y, HID_KW_LAST, HID_KH, NULL, 0, 0 },
 };
 static const hid_key_t hid_row2[] = {   /* 第3排: + / 上 / - / ESC(纵跨) / 删除 */
-    { "+",   HIDK_EQUAL,  0, 0, HID_COL0, HID_R2_Y, HID_KW, HID_KH },
-    { "^",   HIDK_UP,     0, 0, HID_COL1, HID_R2_Y, HID_KW, HID_KH },
-    { "-",   HIDK_MINUS,  0, 0, HID_COL2, HID_R2_Y, HID_KW, HID_KH },
-    { "Esc", HIDK_ESC,    0, 0, HID_COL3, HID_R2_Y, HID_KW, HID_ESC_H },
-    { "Del", HIDK_DELETE, 0, 0, HID_COL4, HID_R2_Y, HID_2W, HID_KH },
+    { "+",   HIDK_EQUAL,  0, 0, HID_COL0, HID_R2_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "^",   HIDK_UP,     0, 0, HID_COL1, HID_R2_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "-",   HIDK_MINUS,  0, 0, HID_COL2, HID_R2_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "Esc", HIDK_ESC,    0, 0, HID_COL3, HID_R2_Y, HID_KW, HID_ESC_H, NULL, 0, 0 },
+    { "Del", HIDK_DELETE, 0, 0, HID_COL4, HID_R2_Y, HID_2W, HID_KH, NULL, 0, 0 },
 };
 static const hid_key_t hid_row3[] = {   /* 第4排: 左 / 下 / 右 / 回车 */
-    { "<-",    HIDK_LEFT,  0, 0, HID_COL0, HID_R3_Y, HID_KW, HID_KH },
-    { "v",     HIDK_DOWN,  0, 0, HID_COL1, HID_R3_Y, HID_KW, HID_KH },
-    { "->",    HIDK_RIGHT, 0, 0, HID_COL2, HID_R3_Y, HID_KW, HID_KH },
-    { "Enter", HIDK_ENTER, 0, 0, HID_COL4, HID_R3_Y, HID_2W, HID_KH },
+    { "<-",    HIDK_LEFT,  0, 0, HID_COL0, HID_R3_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "v",     HIDK_DOWN,  0, 0, HID_COL1, HID_R3_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "->",    HIDK_RIGHT, 0, 0, HID_COL2, HID_R3_Y, HID_KW, HID_KH, NULL, 0, 0 },
+    { "Enter", HIDK_ENTER, 0, 0, HID_COL4, HID_R3_Y, HID_2W, HID_KH, NULL, 0, 0 },
 };
 #define HID_R0_N (sizeof(hid_row0)/sizeof(hid_key_t))
 #define HID_R1_N (sizeof(hid_row1)/sizeof(hid_key_t))
@@ -213,42 +213,42 @@ static const hid_key_t hid_row3[] = {   /* 第4排: 左 / 下 / 右 / 回车 */
 #define K28_KH   72
 
 static const hid_key_t k28_row0[] = {   /* 第1排: Q W E R T Y U I O P */
-    { "Q", HIDK_Q, 0, 0, 0,   K28_R0_Y, 40, K28_KH },
-    { "W", HIDK_W, 0, 0, 40,  K28_R0_Y, 40, K28_KH },
-    { "E", HIDK_E, 0, 0, 80,  K28_R0_Y, 40, K28_KH },
-    { "R", HIDK_R, 0, 0, 120, K28_R0_Y, 40, K28_KH },
-    { "T", HIDK_T, 0, 0, 160, K28_R0_Y, 40, K28_KH },
-    { "Y", HIDK_Y, 0, 0, 200, K28_R0_Y, 40, K28_KH },
-    { "U", HIDK_U, 0, 0, 240, K28_R0_Y, 40, K28_KH },
-    { "I", HIDK_I, 0, 0, 280, K28_R0_Y, 40, K28_KH },
-    { "O", HIDK_O, 0, 0, 320, K28_R0_Y, 40, K28_KH },
-    { "P", HIDK_P, 0, 0, 360, K28_R0_Y, 40, K28_KH },
+    { "Q", HIDK_Q, 0, 0, 0,   K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "W", HIDK_W, 0, 0, 40,  K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "E", HIDK_E, 0, 0, 80,  K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "R", HIDK_R, 0, 0, 120, K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "T", HIDK_T, 0, 0, 160, K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "Y", HIDK_Y, 0, 0, 200, K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "U", HIDK_U, 0, 0, 240, K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "I", HIDK_I, 0, 0, 280, K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "O", HIDK_O, 0, 0, 320, K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
+    { "P", HIDK_P, 0, 0, 360, K28_R0_Y, 40, K28_KH, NULL, 0, 0 },
 };
 static const hid_key_t k28_row1[] = {   /* 第2排: A S D F G H J K L */
-    { "A", HIDK_A, 0, 0, 0,   K28_R1_Y, 44, K28_KH },
-    { "S", HIDK_S, 0, 0, 44,  K28_R1_Y, 44, K28_KH },
-    { "D", HIDK_D, 0, 0, 88,  K28_R1_Y, 44, K28_KH },
-    { "F", HIDK_F, 0, 0, 132, K28_R1_Y, 44, K28_KH },
-    { "G", HIDK_G, 0, 0, 176, K28_R1_Y, 44, K28_KH },
-    { "H", HIDK_H, 0, 0, 220, K28_R1_Y, 44, K28_KH },
-    { "J", HIDK_J, 0, 0, 264, K28_R1_Y, 44, K28_KH },
-    { "K", HIDK_K, 0, 0, 308, K28_R1_Y, 44, K28_KH },
-    { "L", HIDK_L, 0, 0, 352, K28_R1_Y, 48, K28_KH },
+    { "A", HIDK_A, 0, 0, 0,   K28_R1_Y, 44, K28_KH, NULL, 0, 0 },
+    { "S", HIDK_S, 0, 0, 44,  K28_R1_Y, 44, K28_KH, NULL, 0, 0 },
+    { "D", HIDK_D, 0, 0, 88,  K28_R1_Y, 44, K28_KH, NULL, 0, 0 },
+    { "F", HIDK_F, 0, 0, 132, K28_R1_Y, 44, K28_KH, NULL, 0, 0 },
+    { "G", HIDK_G, 0, 0, 176, K28_R1_Y, 44, K28_KH, NULL, 0, 0 },
+    { "H", HIDK_H, 0, 0, 220, K28_R1_Y, 44, K28_KH, NULL, 0, 0 },
+    { "J", HIDK_J, 0, 0, 264, K28_R1_Y, 44, K28_KH, NULL, 0, 0 },
+    { "K", HIDK_K, 0, 0, 308, K28_R1_Y, 44, K28_KH, NULL, 0, 0 },
+    { "L", HIDK_L, 0, 0, 352, K28_R1_Y, 48, K28_KH, NULL, 0, 0 },
 };
 static const hid_key_t k28_row2[] = {   /* 第3排: Z X C V B N M Del(最后一个) */
-    { "Z",   HIDK_Z,      0, 0, 0,   K28_R2_Y, 50, K28_KH },
-    { "X",   HIDK_X,      0, 0, 50,  K28_R2_Y, 50, K28_KH },
-    { "C",   HIDK_C,      0, 0, 100, K28_R2_Y, 50, K28_KH },
-    { "V",   HIDK_V,      0, 0, 150, K28_R2_Y, 50, K28_KH },
-    { "B",   HIDK_B,      0, 0, 200, K28_R2_Y, 50, K28_KH },
-    { "N",   HIDK_N,      0, 0, 250, K28_R2_Y, 50, K28_KH },
-    { "M",   HIDK_M,      0, 0, 300, K28_R2_Y, 50, K28_KH },
-    { "Del", HIDK_DELETE, 0, 0, 350, K28_R2_Y, 50, K28_KH },
+    { "Z",   HIDK_Z,      0, 0, 0,   K28_R2_Y, 50, K28_KH, NULL, 0, 0 },
+    { "X",   HIDK_X,      0, 0, 50,  K28_R2_Y, 50, K28_KH, NULL, 0, 0 },
+    { "C",   HIDK_C,      0, 0, 100, K28_R2_Y, 50, K28_KH, NULL, 0, 0 },
+    { "V",   HIDK_V,      0, 0, 150, K28_R2_Y, 50, K28_KH, NULL, 0, 0 },
+    { "B",   HIDK_B,      0, 0, 200, K28_R2_Y, 50, K28_KH, NULL, 0, 0 },
+    { "N",   HIDK_N,      0, 0, 250, K28_R2_Y, 50, K28_KH, NULL, 0, 0 },
+    { "M",   HIDK_M,      0, 0, 300, K28_R2_Y, 50, K28_KH, NULL, 0, 0 },
+    { "Del", HIDK_DELETE, 0, 0, 350, K28_R2_Y, 50, K28_KH, NULL, 0, 0 },
 };
 static const hid_key_t k28_row3[] = {   /* 第4排: 大小写 | 空格 | 回车 */
-    { "Caps",  HIDK_TOGGLE_CAPS, 0, 0, 0,   K28_R3_Y, 100, K28_KH },
-    { "Space", HIDK_SPACE,       0, 0, 100, K28_R3_Y, 150, K28_KH },
-    { "Enter", HIDK_ENTER,       0, 0, 250, K28_R3_Y, 150, K28_KH },
+    { "Caps",  HIDK_TOGGLE_CAPS, 0, 0, 0,   K28_R3_Y, 100, K28_KH, NULL, 0, 0 },
+    { "Space", HIDK_SPACE,       0, 0, 100, K28_R3_Y, 150, K28_KH, NULL, 0, 0 },
+    { "Enter", HIDK_ENTER,       0, 0, 250, K28_R3_Y, 150, K28_KH, NULL, 0, 0 },
 };
 #define K28_R0_N (sizeof(k28_row0)/sizeof(hid_key_t))
 #define K28_R1_N (sizeof(k28_row1)/sizeof(hid_key_t))

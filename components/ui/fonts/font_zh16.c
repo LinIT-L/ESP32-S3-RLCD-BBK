@@ -5,7 +5,6 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
-static const char *TAG = "FONTZH16";
 
 /* V1.0.86: 文泉驿点阵宋体 16px 紧凑二进制字库 (font_zh16.bin)
  * V1.0.89+: 字库从 appdata 分区字库区 mmap 加载 (esp_partition_mmap, XIP 只读)

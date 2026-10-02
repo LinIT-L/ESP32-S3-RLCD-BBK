@@ -188,7 +188,6 @@ static void svc_render(ui_ctx_t *ctx)
     if (!lcd) return;
 
     const int text_y = 3;
-    const int M  = 4;
     const int GAP = 4;
     const int SCREEN_W = ui_screen_w();
 

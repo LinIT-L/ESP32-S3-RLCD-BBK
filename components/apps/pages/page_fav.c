@@ -174,7 +174,6 @@ static void fav_load(void){
     if(s_cat>=s_cat_n) s_cat=0;
 }
 static bool pinconf_load(void){ keyvault_init(); return keyvault_has_pin(); } /* 统一PIN: 复用系统 keyvault */
-static void pinconf_save(bool v){ (void)v; }
 static bool pin_verify(void){ return keyvault_verify_pin(s_pin) == 0; }        /* 统一验证 */
 static void pin_store(void){ keyvault_set_pin(s_pin_again); }                  /* 首次设置统一写入 keyvault */
 

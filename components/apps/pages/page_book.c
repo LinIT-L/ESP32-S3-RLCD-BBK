@@ -443,30 +443,8 @@ static int book_left_total(void) {
 }
 
 /* UTF-8 截断到最多 max_chars 个字符 (防超长目录名溢出) */
-static void book_name_short(char *out, size_t n, const char *src, int max_chars) {
-    size_t w = 0;
-    int cnt = 0;
-    while (*src && cnt < max_chars && w + 1 < n) {
-        unsigned char c = (unsigned char)*src;
-        int cl = (c < 0x80) ? 1 : ((c & 0xF0) == 0xE0) ? 3 : ((c & 0xE0) == 0xC0) ? 2 : 4;
-        for (int i = 0; i < cl && src[i] && w + 1 < n; i++) out[w++] = src[i];
-        src += cl;
-        cnt++;
-    }
-    out[w] = 0;
-}
 
 /* 左栏显示名 */
-static void book_left_name(int disp, char *out, size_t n) {
-    int idx = disp;
-    size_t cap = 4;
-    if (s_bp.settings_label && idx-- == 0) { book_name_short(out, n, s_bp.settings_label, (int)cap); return; }
-    if (s_bp.recent_label && idx-- == 0)   { book_name_short(out, n, s_bp.recent_label, (int)cap); return; }
-    if (s_bp.fav_enabled && idx-- == 0)    { book_name_short(out, n, "\xe6\x94\xb6\xe8\x97\x8f\xe6\xa0\x8f", (int)cap); return; } /* 收藏栏 */
-    if (s_bp.hide_all) { book_name_short(out, n, (idx >= 0 && idx < s_bp.folder_count) ? s_bp.folders[idx] : "", (int)cap); return; }
-    if (idx == 0) { book_name_short(out, n, (s_bp.all_label ? s_bp.all_label : "\xe5\x85\xa8\xe9\x83\xa8"), (int)cap); return; } /* 全部 */
-    book_name_short(out, n, (idx - 1 >= 0 && idx - 1 < s_bp.folder_count) ? s_bp.folders[idx - 1] : "", (int)cap);
-}
 
 /* 右栏平滑滚动最大偏移 */
 static int book_max_off(void) {

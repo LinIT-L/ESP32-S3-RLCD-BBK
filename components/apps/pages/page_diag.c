@@ -78,29 +78,6 @@ static void doutline(st7305_handle_t *l, int x0, int y0, int x1, int y1) {
 }
 
 /* ================= 中文 / ASCII 绘制 ================= */
-static void dzh(st7305_handle_t *l, int x, int y, const char *str, bool inverted) {
-    int idx = font_zh_find_utf8(str);
-    st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
-    st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
-    dfill(l, x, y, x + 11, y + 11, bg);
-    if (idx < 0) return;
-    const uint8_t *bmp = zh_font_data[idx];
-    int bpr = (ZH_FONT_W + 7) / 8;
-    for (int r = 0; r < 12; r++)
-        for (int c = 0; c < 12; c++) {
-            bool any = false;
-            for (int dy = 0; dy < 2 && !any; dy++)
-                for (int dx = 0; dx < 2 && !any; dx++) {
-                    int row = r * 2 + dy, col = c * 2 + dx;
-                    if (bmp[row * bpr + (col / 8)] & (1 << (7 - (col % 8)))) any = true;
-                }
-            st7305_draw_pixel(l, x + c, y + r, any ? fg : bg);
-        }
-}
-static int dzhs(st7305_handle_t *l, int x, int y, const char *s, bool inv) {
-    while (*s) { dzh(l, x, y, s, inv); x += 12; s += 3; }
-    return x;
-}
 static const uint8_t dgfont[][5] = {
     {0x3E,0x51,0x49,0x45,0x3E},{0,0x42,0x7F,0x40,0},{0x42,0x61,0x51,0x49,0x46},
     {0x21,0x41,0x45,0x4B,0x31},{0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},
@@ -113,22 +90,6 @@ static int dgi(char c) {
     int i = (c - 0x20);
     if (i < 0 || i > 58) return -1;
     return i;
-}
-static int dtxt(st7305_handle_t *l, int x, int y, const char *s) {
-    while (*s) {
-        int gi = (unsigned char)*s >= '0' && (unsigned char)*s <= '9'
-                 ? (*s - '0') : dgi(*s);
-        if (gi >= 0) {
-            const uint8_t *g = dgfont[gi];
-            for (int cx = 0; cx < 5; cx++)
-                for (int cy = 0; cy < 7; cy++)
-                    if (g[cx] & (1 << cy))
-                        dsetp(l, x + cx, y + cy);
-        }
-        x += 6;
-        s++;
-    }
-    return x;
 }
 static void dzh16(st7305_handle_t *l, int x, int y, const char *str, bool inv) {
     int idx = font_zh16_find_utf8(str);
@@ -164,12 +125,6 @@ static int dz22s(st7305_handle_t *l, int x, int y, const char *s, bool inv) {
     while (*s && *s != '\n') { dz22(l, x, y, s, inv); x += 24; s += 3; }
     return x;
 }
-static void dline(st7305_handle_t *l, int x0, int y0, int x1, int y1) {
-    int dx = x1 - x0, dy = y1 - y0;
-    int steps = (abs(dx) > abs(dy)) ? abs(dx) : abs(dy);
-    if (steps == 0) { dsetp(l, x0, y0); return; }
-    for (int i = 0; i <= steps; i++) dsetp(l, x0 + dx * i / steps, y0 + dy * i / steps);
-}
 static void dcircle_c(st7305_handle_t *l, int cx, int cy, int r, int col) {
     for (int y = cy - r; y <= cy + r; y++)
         for (int x = cx - r; x <= cx + r; x++) {
@@ -182,33 +137,6 @@ static void dcircle_c(st7305_handle_t *l, int cx, int cy, int r, int col) {
 }
 static void dcircle(st7305_handle_t *l, int cx, int cy, int r) { dcircle_c(l, cx, cy, r, ST7305_COLOR_BLACK); }
 static void dcircle_w(st7305_handle_t *l, int cx, int cy, int r) { dcircle_c(l, cx, cy, r, ST7305_COLOR_WHITE); }
-static int dtxt2(st7305_handle_t *l, int x, int y, const char *s) {
-    while (*s) {
-        int gi = (unsigned char)*s >= '0' && (unsigned char)*s <= '9'
-                 ? (*s - '0') : dgi(*s);
-        if (gi >= 0) {
-            const uint8_t *g = dgfont[gi];
-            for (int cy = 0; cy < 7; cy++)
-                for (int cx = 0; cx < 5; cx++)
-                    if (g[cx] & (1 << cy)) {
-                        dsetp(l, x + cx * 2,     y + cy * 2);
-                        dsetp(l, x + cx * 2 + 1, y + cy * 2);
-                        dsetp(l, x + cx * 2,     y + cy * 2 + 1);
-                        dsetp(l, x + cx * 2 + 1, y + cy * 2 + 1);
-                    }
-        }
-        x += 12;
-        s++;
-    }
-    return x;
-}
-static void dpct(st7305_handle_t *l, int x, int y) {
-    static const uint8_t pat[7] = {0x18, 0x18, 0x04, 0x02, 0x01, 0x03, 0x03};
-    for (int row = 0; row < 7; row++)
-        for (int col = 0; col < 5; col++)
-            if (pat[row] & (1 << (4 - col)))
-                dsetp(l, x + col, y + row);
-}
 /* 1.5x 放大数字 (介于小 dtxt 与大 dtxt2 之间): 每字约 8px 宽 */
 static int dtxt15(st7305_handle_t *l, int x, int y, const char *s) {
     while (*s) {
@@ -242,12 +170,6 @@ static void dpct15(st7305_handle_t *l, int x, int y) {
                     for (int xx = tx0; xx < tx1; xx++) dsetp(l, x + xx, y + yy);
             }
 }
-static void dpct2(st7305_handle_t *l, int x, int y) {
-    dline(l, x + 7, y - 1, x + 4, y + 13);
-    dcircle(l, x + 2, y + 2, 2);
-    dcircle(l, x + 9, y + 11, 2);
-}
-static uint32_t dmnow(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 /* ================= 决策知识库 ================= */
 #define DMAXOPT  8
@@ -531,7 +453,6 @@ static void dDrawRightBar(st7305_handle_t *l) {
         char buf[8];
         snprintf(buf, sizeof(buf), "%d", devprob[di]);
         int dlen = (int)strlen(buf);
-        int nm_w = (int)((strlen(DDEVNAME[di]) / 3)) * 16;
         /* 进度条: 贴最右, 高12, 相对图标垂直中心下移 10px */
         int bar_right = DW - 4;
         int bar_x0 = bar_right - 64 + 1;

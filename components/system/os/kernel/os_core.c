@@ -344,7 +344,6 @@ void os_tick(ui_ctx_t *ctx)
     if (m && m->poll) m->poll(ctx);
 }
 
-static uint32_t os_now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 /* ==== 底部上滑返回 ====
  * 注: 历史上曾有一根"跟手"黑色指示横条 (draw_back_gesture_hint), 用户明确表示不需要显示,
