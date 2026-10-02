@@ -419,7 +419,11 @@ static void wb_list(void) {
     while ((e = readdir(d))) {
         if (e->d_name[0]=='.' || strncmp(e->d_name,"wb",2) || !strstr(e->d_name,".bmp")) continue;
         if (wb_file_seq(e->d_name) < 0) continue;
-        snprintf(tmp[n], 64, "%s/%.50s", WB_DIR, e->d_name);
+        /* WB_DIR 是编译期常量 → 文件名可用长度 = sizeof(tmp[n]) - sizeof(WB_DIR) - 1
+         * (原写 %.50s, 实际可用只有 45, 第 46 字符起被静默吃掉 → 长名会变成另一个名字) */
+        snprintf(tmp[n], sizeof(tmp[n]), "%.*s/%.*s",
+                 (int)sizeof(WB_DIR) - 1, WB_DIR,
+                 (int)sizeof(tmp[n]) - (int)sizeof(WB_DIR) - 2, e->d_name);
         n++; if (n >= WB_FILE_MAX) break;
     }
     closedir(d);
@@ -491,7 +495,7 @@ static void wb_load_refresh(ui_ctx_t *ctx) {
     os_dlg_stack_t dlg;
     memset(&dlg, 0, sizeof(dlg));
     for (int i = 0; i < s_nfiles; i++)
-        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", s_names[i]);
+            snprintf(dlg.items[i], sizeof(dlg.items[i]), "%.*s", (int)sizeof(dlg.items[i]) - 1, s_names[i]);
     dlg.count = s_nfiles;
     dlg.sel = 0;
     dlg.on_key = wb_load_key;

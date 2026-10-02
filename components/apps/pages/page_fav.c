@@ -85,7 +85,7 @@ static bool s_show_cats = false;   /* 抽屉内: true=图标选择 */
 static EXT_RAM_BSS_ATTR os_pane_t s_pane;
 static int pane_mem_folders(os_pane_t *p) {
     for (int i = 0; i < s_cat_n && i < 24; i++)
-        snprintf(p->folders[i], sizeof(p->folders[i]), "%s", s_cats[i]);
+        snprintf(p->folders[i], sizeof(p->folders[i]), "%.*s", (int)sizeof(p->folders[i]) - 1, s_cats[i]);
     p->folder_count = s_cat_n;
     p->hide_all = true;
     return s_cat_n;
@@ -284,7 +284,7 @@ static esp_err_t fav_web_list_handler(httpd_req_t *req)
     httpd_resp_sendstr(req, "{\"cats\":[");
     for (int i = 0; i < s_cat_n; i++) {
         if (i) httpd_resp_sendstr(req, ",");
-        char cb[48]; snprintf(cb, sizeof(cb), "\"%s\"", s_cats[i]);
+    char cb[48]; snprintf(cb, sizeof(cb), "\"%.*s\"", (int)sizeof(cb) - 3, s_cats[i]);
         httpd_resp_sendstr(req, cb);
     }
     httpd_resp_sendstr(req, "],\"items\":[");

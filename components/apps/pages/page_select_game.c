@@ -65,7 +65,10 @@ static bool gam_find_in(const char *dir, char *out, size_t osz, int depth) {
             if (e->d_name[0] == '.') continue;
             if (e->d_type == DT_DIR) {
                 char sub[256];
-                snprintf(sub, sizeof(sub), "%s/%s", dir, e->d_name);
+                /* 目录+名放不下就跳过: 不用被截断的路径去找游戏 */
+                if (strlen(dir) + 1 + strlen(e->d_name) >= sizeof(sub)) continue;
+                snprintf(sub, sizeof(sub), "%.*s/%.*s",
+                         (int)sizeof(sub) / 2 - 1, dir, (int)sizeof(sub) / 2 - 1, e->d_name);
                 if (gam_find_in(sub, out, osz, depth + 1)) { found = true; break; }
             }
         }

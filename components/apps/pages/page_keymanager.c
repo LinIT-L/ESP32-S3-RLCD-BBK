@@ -856,8 +856,14 @@ static esp_err_t km_web_list_handler(httpd_req_t *req)
         os_keyvault_get_secret(s_web_key, i, sc, sizeof(sc));
         if (i) httpd_resp_sendstr(req, ",");
         char b[512];
-        snprintf(b, sizeof(b), "{\"id\":%d,\"cat\":%d,\"name\":\"%s\",\"account\":\"%s\",\"secret\":\"%s\"}",
-                 i, cats[i], names[i], ac, sc);
+        /* 每个 %s 按各自缓冲显式限长 (原来无界: 编译器证不出不溢出, 且真超长会被静默截断)
+         * → 限长后最坏 325B < b[512] */
+        snprintf(b, sizeof(b),
+                 "{\"id\":%d,\"cat\":%d,\"name\":\"%.*s\",\"account\":\"%.*s\",\"secret\":\"%.*s\"}",
+                 i, cats[i],
+                 (int)sizeof(names[0]) - 1, names[i],
+                 (int)sizeof(ac) - 1, ac,
+                 (int)sizeof(sc) - 1, sc);
         httpd_resp_sendstr(req, b);
     }
     httpd_resp_sendstr(req, "]}");

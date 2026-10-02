@@ -445,8 +445,11 @@ static void nvs_restore_list(ui_ctx_t*ctx){
     if(d){ struct dirent *e;
         while((e=readdir(d)) && n<8){
             if(!strstr(e->d_name,".bin")) continue;
-            snprintf(s_bak_paths[n],sizeof(s_bak_paths[0]),"%s/%s",NVS_BAK_DIR,e->d_name);
-            snprintf(dlg.items[n],sizeof(dlg.items[0]),"%s",e->d_name); n++;
+            /* 放不下就跳过: 不用被截断的备份路径 */
+            if (strlen(NVS_BAK_DIR) + 1 + strlen(e->d_name) >= sizeof(s_bak_paths[0])) continue;
+            snprintf(s_bak_paths[n],sizeof(s_bak_paths[0]),"%.*s/%.*s",
+                     (int)sizeof(s_bak_paths[0])/2-1,NVS_BAK_DIR,(int)sizeof(s_bak_paths[0])/2-1,e->d_name);
+                snprintf(dlg.items[n],sizeof(dlg.items[0]),"%.*s",(int)sizeof(dlg.items[0])-1,e->d_name); n++;
         }
         closedir(d);
     }
@@ -507,7 +510,7 @@ static bool fb_at_root(void) { return s_fb_path[0] == '\0'; }
 static const char *fb_dir_path(void) {
     if (fb_at_root()) return "/sdcard";
     static EXT_RAM_BSS_ATTR char buf[160];
-    snprintf(buf, sizeof(buf), "/sdcard/%s", s_fb_path);
+    snprintf(buf, sizeof(buf), "/sdcard/%.*s", (int)sizeof(buf) - 9, s_fb_path);
     return buf;
 }
 static void fb_fullpath(char *out, int cap, const char *name) {

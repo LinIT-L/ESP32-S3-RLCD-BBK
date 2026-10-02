@@ -116,7 +116,7 @@ static void am_pkg_scan(void) {
                     snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%s", meta.name);
                     snprintf(s_pkg[k].desc, sizeof(s_pkg[k].desc), "%s", meta.desc);
                 } else {
-                    snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%s", nb);
+        snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%.*s", (int)sizeof(s_pkg[k].label) - 1, nb);
                 }
                 snprintf(s_pkg[k].cat, sizeof(s_pkg[k].cat), "app");
                 snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/app/%s", AM_STORE_DST, nm);

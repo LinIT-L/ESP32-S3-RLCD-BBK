@@ -48,7 +48,8 @@ static void build_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_white(), LV_PART_MAIN);
-    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    /* LVGL 9: lv_obj_remove_flag 已弃用 → 用专用 setter (见 lv_obj.c 的 LV_LOG_DEPRECATED 提示) */
+    lv_obj_set_scrollable(scr, false);
 
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "LVGL " LVGL_VERSION_INFO "  400x300  1bpp");
@@ -71,15 +72,24 @@ static void build_ui(void)
     lv_obj_align(s_arc, LV_ALIGN_TOP_RIGHT, -8, 44);
     lv_arc_set_range(s_arc, 0, 100);
     lv_arc_set_value(s_arc, 0);
-    lv_obj_remove_flag(s_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_clickable(s_arc, false);
 
-    /* 列表 */
-    lv_obj_t *list = lv_list_create(scr);
+    /* 列表: LVGL 9 里 lv_list_* 已弃用 → 按官方 lv_example_flex_list 的做法,
+     * 用「弹性列 + 按钮」自建 (效果等价, 且不再走弃用 API)。 */
+    lv_obj_t *list = lv_obj_create(scr);
     lv_obj_set_size(list, 230, 130);
     lv_obj_align(list, LV_ALIGN_BOTTOM_LEFT, 8, -8);
-    lv_list_add_button(list, NULL, "List item A");
-    lv_list_add_button(list, NULL, "List item B");
-    lv_list_add_button(list, NULL, "List item C");
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(list, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(list, 4, LV_PART_MAIN);
+    static const char *const demo_items[3] = { "List item A", "List item B", "List item C" };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *btn = lv_button_create(list);
+        lv_obj_set_width(btn, LV_PCT(100));
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, demo_items[i]);
+        lv_obj_center(bl);
+    }
 
     /* 开关 */
     lv_obj_t *sw = lv_switch_create(scr);

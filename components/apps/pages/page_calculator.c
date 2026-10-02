@@ -184,7 +184,7 @@ static void calc_do(ui_ctx_t *ctx, const ckey_t *k, bool is_operator) {
         double res = 0;
         int rc = calc_eval(s_expr, s_has_ans ? s_ans : 0, &res);
         if (rc == 0) {
-            snprintf(s_last_expr, sizeof(s_last_expr), "%s", s_expr);
+    snprintf(s_last_expr, sizeof(s_last_expr), "%.*s", (int)sizeof(s_last_expr) - 1, s_expr);
             s_ans = res; s_has_ans = true;
             fmt_num(res, s_res, sizeof(s_res));
             s_show_res = true; s_show_err = false;

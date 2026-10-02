@@ -595,7 +595,10 @@ static int scan_gam_in_dir(const char *dir_path, char out[][64], int max_out) {
         if (ent->d_type != DT_REG) {
             if (ent->d_type == DT_UNKNOWN) {
                 char full[300];
-                snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+                /* 路径放不下就跳过该项: 绝不用**被截断的**路径去访问(会开错文件) */
+                if (strlen(dir_path) + 1 + strlen(ent->d_name) >= sizeof(full)) continue;
+                snprintf(full, sizeof(full), "%.*s/%.*s",
+                         (int)sizeof(full) / 2 - 1, dir_path, (int)sizeof(full) / 2 - 1, ent->d_name);
                 struct stat fst;
                 if (stat(full, &fst) == 0 && S_ISREG(fst.st_mode)) {
                     /* 是普通文件, 继续 */
@@ -1727,7 +1730,9 @@ static bool wqx_cache_load(const char *root, uint32_t expect_hash)
 {
     if (!s_wqx_dirs) return false;
     char path[WQX_DIR_LEN + 24];
-    snprintf(path, sizeof(path), "%s/%s", root, WQX_CACHE_NAME);
+    if (strlen(root) + 1 + strlen(WQX_CACHE_NAME) >= sizeof(path)) return false;   /* 路径放不下: 不读被截断的缓存 */
+    snprintf(path, sizeof(path), "%.*s/%s",
+             (int)sizeof(path) - (int)sizeof(WQX_CACHE_NAME) - 2, root, WQX_CACHE_NAME);
     FILE *f = fopen(path, "r");
     if (!f) return false;
     char line[WQX_DIR_LEN];
@@ -1753,7 +1758,9 @@ static bool wqx_cache_load(const char *root, uint32_t expect_hash)
 static bool wqx_cache_save(const char *root, uint32_t hash)
 {
     char path[WQX_DIR_LEN + 24];
-    snprintf(path, sizeof(path), "%s/%s", root, WQX_CACHE_NAME);
+    if (strlen(root) + 1 + strlen(WQX_CACHE_NAME) >= sizeof(path)) return false;   /* 路径放不下: 不写被截断的缓存 */
+    snprintf(path, sizeof(path), "%.*s/%s",
+             (int)sizeof(path) - (int)sizeof(WQX_CACHE_NAME) - 2, root, WQX_CACHE_NAME);
     FILE *f = fopen(path, "w");
     if (!f) return false;
     fprintf(f, "%s\n", WQX_CACHE_MAGIC);

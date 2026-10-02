@@ -119,7 +119,7 @@ static uint32_t s_sys_t0 = 0;          /* 等待自动连接开始时间戳(ms) 
 #define ND_AUTOCONN_TIMEOUT 8000       /* 自动连接超时: 8秒未连上, 或连接已停止 → 开手动选网 */
 /* ---- 连接网络子界面 (0=WiFi列表 1=输密码 2=连接中) ---- */
 static int  s_conn   = 0;
-static char s_ssid[33]; static char s_pass[33]; static int s_pas;   /* 待连 SSID / 密码 / 长度 */
+static char s_ssid[33]; static char s_pass[65]; static int s_pas;   /* 待连 SSID / 密码 / 长度 (WPA2 口令最长 63, 原来 33 装不下) */
 static int  s_press_k = -1; static bool s_cl_sym=false, s_cl_shift=false;   /* 经典键盘: 符号层/大写 */
 static const char *const s_clk[2][4] = {
     { "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm,." },
@@ -232,11 +232,11 @@ static void nd_kbd_act(ui_ctx_t *ctx, int id) {
         const char *const *rows = s_clk[s_cl_sym ? 1 : 0];
         char c = (id < 20) ? rows[id / 10][id % 10] : ((id < 29) ? rows[2][id - 20] : rows[3][id - 30]);
         if (s_cl_shift && !s_cl_sym && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-        if (c && s_pas < 32) { s_pass[s_pas++] = c; s_pass[s_pas] = 0; }
+            if (c && s_pas < 64) { s_pass[s_pas++] = c; s_pass[s_pas] = 0; }
     } else if (id == 29) { s_cl_shift = !s_cl_shift; }                    /* Shift/ABC */
     else if (id == 38) { if (s_pas > 0) { s_pas--; s_pass[s_pas] = 0; } } /* 删除 */
     else if (id == 39) { s_cl_sym = !s_cl_sym; }                          /* &123/ABC */
-    else if (id == 40) { if (s_pas < 32) { s_pass[s_pas++] = ' '; s_pass[s_pas] = 0; } } /* 空格 */
+            else if (id == 40) { if (s_pas < 64) { s_pass[s_pas++] = ' '; s_pass[s_pas] = 0; } } /* 空格 */
     else if (id == 41) { nd_do_connect(); }                               /* 回车=连接 */
 }
 
@@ -585,11 +585,11 @@ static void fetch_pub_info(void){
         }
         /* 融合: 更长的值信息更多 → 覆盖 */
         if(!s_pub_ip[0] && mip[0]) snprintf(s_pub_ip,sizeof(s_pub_ip),"%s",mip);
-        if(mis[0] && strlen(mis)>strlen(s_isp_brand)) snprintf(s_isp_brand,sizeof(s_isp_brand),"%s",mis);
+    if(mis[0] && strlen(mis)>strlen(s_isp_brand)) snprintf(s_isp_brand,sizeof(s_isp_brand),"%.*s",(int)sizeof(s_isp_brand)-1,mis);
         char cm[56]="";
         if(mpr[0]){ snprintf(cm,sizeof(cm),"%s",mpr);
             if(mct[0] && strcmp(mct,mpr)!=0){ strcat(cm," "); strncat(cm,mct,sizeof(cm)-strlen(cm)-1); } }
-        if(cm[0] && strlen(cm)>strlen(s_city)) snprintf(s_city,sizeof(s_city),"%s",cm);
+    if(cm[0] && strlen(cm)>strlen(s_city)) snprintf(s_city,sizeof(s_city),"%.*s",(int)sizeof(s_city)-1,cm);
         ESP_LOGI("netdect","[info/myip融合] ip=%s city=%s isp=%s", s_pub_ip, s_city, s_isp_brand);
     }
     ESP_LOGI("netdect","[info/result] ip=%s isp=%s city=%s", s_pub_ip, s_isp_brand, s_city);
@@ -716,7 +716,7 @@ static void netdect_run(void *arg){
       /* 网关延迟 (esp_ping RTT) */
       snprintf(s_gw_rtt,sizeof(s_gw_rtt),"--");
       if(s_gw[0]){ struct in_addr g; inet_aton(s_gw,&g); int ms=nd_ping_rtt(ntohl(g.s_addr),3);
-          if(ms>=0) snprintf(s_gw_rtt,sizeof(s_gw_rtt),"%d ms",ms); }
+    if(ms>=0) { int mv=ms; if(mv>9999) mv=9999; snprintf(s_gw_rtt,sizeof(s_gw_rtt),"%d ms",mv); } }
       ESP_LOGI("netdect","[gw] ip=%s rtt=%s mac=%s %s", s_gwip, s_gw_rtt, s_gwmac, s_gwmac_vendor);
     s_prog=100; if(ND_ABORT) goto fin;   /* 联网步只采集本机信息: 不停, 直接进"信息"页(停在那等手动下一步) */
     /* 2 信息: 公网 IP / ISP / 城市 */
@@ -726,7 +726,7 @@ static void netdect_run(void *arg){
     /* 公网延迟 (esp_ping RTT): ping 稳定国内公网主机 阿里DNS 223.5.5.5 */
     snprintf(s_pub_rtt,sizeof(s_pub_rtt),"--");
     { struct in_addr pi; if(inet_aton("223.5.5.5",&pi)){ int ms=nd_ping_rtt(ntohl(pi.s_addr),3);
-        if(ms>=0) snprintf(s_pub_rtt,sizeof(s_pub_rtt),"%d ms",ms); } }
+    if(ms>=0) { int mv=ms; if(mv>9999) mv=9999; snprintf(s_pub_rtt,sizeof(s_pub_rtt),"%d ms",mv); } } }
     ESP_LOGI("netdect","[pub] rtt=%s", s_pub_rtt);
     s_prog=100; nd_pause(ST_IPINFO); if(ND_ABORT) goto fin;
     /* 3 IP: 主机扫描 (逐台扫描, 显示当前 IP, 扫到一台→加进列表→扫下一台) */
@@ -947,7 +947,7 @@ static void nd_try_connect(ui_ctx_t *ctx,int idx){
         char ss[32]="", pp[64]="";
         wifi_manager_get_saved(ss,sizeof(ss),pp,sizeof(pp));
         if(ss[0] && strcmp(ssid,ss)==0 && pp[0]){
-            s_pas=(int)strlen(pp); snprintf(s_pass,sizeof(s_pass),"%s",pp);
+    s_pas=(int)strlen(pp); snprintf(s_pass,sizeof(s_pass),"%.*s",(int)sizeof(s_pass)-1,pp);
             nd_do_connect();
         } else {
             /* 需密码(或历史密码不对) → 停扫描, 框内融合输密码 (s_conn==1, 不跳全屏页) */
@@ -1266,8 +1266,8 @@ static void nd_append_eval(char lines[][72], int *nlin){
     else if(nhost<=15) snprintf(lines[nk++],72,"\xc2\xb7 \xe5\xae\xb6\xe5\xba\xad/\xe5\xb0\x8f\xe5\x8d\x95\xe4\xbd\x8d\xe7\xbd\x91\xe7\xbb\x9c,\xe9\x87\x8d\xe7\x82\xb9\xe5\x85\xb3\xe6\xb3\xa8\xe6\x99\xba\xe8\x83\xbd\xe4\xb8\x8e\xe6\x91\x84\xe5\x83\x8f\xe5\xa4\xb4\xe5\xae\x89\xe5\x85\xa8"); /* 家庭/小单位,关注智能与摄像头 */
     else snprintf(lines[nk++],72,"\xc2\xb7 \xe8\xae\xbe\xe5\xa4\x87\xe8\xbe\x83\xe5\xa4\x9a,\xe5\xbb\xba\xe8\xae\xae\xe5\xae\x9e\xe6\x96\xbd VLAN \xe5\x88\x86\xe5\x8c\xba\xe4\xb8\x8e\xe6\x9d\x83\xe9\x99\x90\xe6\x8e\xa7\xe5\x88\xb6"); /* 设备较多,建议VLAN分区 */
     if(open) snprintf(lines[nk++],72,"\xc2\xb7 \xe6\x98\xaf\xe5\xbc\x80\xe6\x94\xbe\xe7\xbd\x91\xe7\xbb\x9c,\xe4\xbb\xbb\xe4\xbd\x95\xe4\xba\xba\xe5\x8f\xaf\xe8\xbf\x9e,\xe9\xa3\x8e\xe9\x99\xa9\xe9\xab\x98"); /* 是开放网络,风险高 */
-    if(weak>0) snprintf(lines[nk++],72,"\xc2\xb7 \xe6\xa3\x80\xe6\xb5\x8b\xe5\x88\xb0 %d \xe4\xb8\xaa\xe5\xbc\xb1\xe5\x8f\xa3\xe4\xbb\xa4,\xe5\xbb\xba\xe8\xae\xae\xe5\x85\xb3\xe9\x97\xad\xe5\xaf\xb9\xe5\xba\x94 FTP/Telnet \xe6\x9c\x8d\xe5\x8a\xa1\xe5\xb9\xb6\xe6\x94\xb9\xe5\xbc\xba\xe5\xaf\x86\xe7\xa0\x81",weak);
-    if(hi_risk>0) snprintf(lines[nk++],72,"\xc2\xb7 \xe5\x90\xab %d \xe4\xb8\xaa\xe9\xab\x98\xe9\xa3\x8e\xe9\x99\xa9\xe7\xab\xaf\xe5\x8f\xa3(23/21/445/3389/2333\xe7\xad\x89),\xe5\xbb\xba\xe8\xae\xae\xe5\x85\xb3\xe9\x97\xad\xe6\x88\x96\xe9\x99\x90\xe6\x9d\xa5\xe6\xba\x90",hi_risk);
+    if(weak>0) snprintf(lines[nk++],72,"\xc2\xb7 \xe6\xa3\x80\xe6\xb5\x8b\xe5\x88\xb0 %d \xe4\xb8\xaa\xe5\xbc\xb1\xe5\x8f\xa3\xe4\xbb\xa4,\xe5\xbb\xba\xe8\xae\xae\xe6\x94\xb9\xe5\xbc\xba\xe5\xaf\x86\xe7\xa0\x81\xe5\xb9\xb6\xe5\x85\xb3\xe6\x9c\x8d\xe5\x8a\xa1",weak);
+    if(hi_risk>0) snprintf(lines[nk++],72,"\xc2\xb7 \xe5\x90\xab %d \xe4\xb8\xaa\xe9\xab\x98\xe9\xa3\x8e\xe9\x99\xa9\xe7\xab\xaf\xe5\x8f\xa3,\xe5\xbb\xba\xe8\xae\xae\xe5\x85\xb3\xe9\x97\xad\xe6\x88\x96\xe9\x99\x90\xe6\x9d\xa5\xe6\xba\x90",hi_risk);
     /* 风险统计 */
     snprintf(lines[nk++],72,"---- \xe9\xa3\x8e\xe9\x99\xa9\xe7\xbb\x9f\xe8\xae\xa1 ----"); /* 风险统计 */
     int hi=hi_risk + (open?1:0); int mi=(ports>10?1:0)+(weak>0?1:0); int lo=(nhost>0?1:0);
@@ -1290,8 +1290,8 @@ static void nd_append_eval(char lines[][72], int *nlin){
     snprintf(lines[nk++],72,"\xc2\xb7 \xe5\xbc\x80\xe5\x90\xaf\xe5\xae\xa2\xe6\x88\xb7\xe7\xab\xaf\xe9\x9a\x94\xe7\xa6\xbb,\xe9\x99\x90\xe5\x88\xb6\xe5\x86\x85\xe7\xbd\x91\xe4\xba\x92\xe8\xae\xbf"); /* 开启客户端隔离,限制内网互访 */
     if(hi_risk>0) snprintf(lines[nk++],72,"\xc2\xb7 \xe5\xaf\xb9 445/3389 \xe7\xad\x89\xe5\xbc\x80\xe6\x94\xbe\xe7\xab\xaf\xe5\x8f\xa3\xe8\xbf\x9b\xe8\xa1\x8c\xe6\x89\x93\xe8\xa1\xa5\xe4\xb8\x8e\xe9\x99\x90\xe6\x9d\xa5\xe6\xba\x90"); /* 对高危端口封堵 */
     snprintf(lines[nk++],72,"\xc2\xb7 \xe5\xae\x9a\xe6\x9c\x9f\xe6\x9b\xb4\xe6\x96\xb0\xe5\x9b\xba\xe4\xbb\xb6/\xe9\x87\x8d\xe6\x96\xb0\xe6\x8e\x92\xe6\x9f\xa5\xe6\x9c\xaa\xe7\x9f\xa5\xe8\xae\xbe\xe5\xa4\x87"); /* 定期更新固件/排查未知设备 */
-    if(nhost<=15) snprintf(lines[nk++],72,"\xc2\xb7 \xe5\xbb\xba\xe8\xae\xae\xe5\xa2\x9e\xe8\xae\xbe: \xe5\x8f\xaf\xe6\xb7\xbb NAS/NVR(\xe9\x87\x8d\xe8\xa6\x81\xe6\x95\xb0\xe6\x8d\xae\xe5\xa4\x87\xe4\xbb\xbd)"); /* 建议设备: NAS/NVR */
-    else snprintf(lines[nk++],72,"\xc2\xb7 \xe5\xbb\xba\xe8\xae\xae\xe5\xa2\x9e\xe8\xae\xbe: \xe4\xbc\x81\xe4\xb8\x9a\xe7\xba\xa7\xe9\x98\xb2\xe7\x81\xab\xe5\xa2\x99+AC+\xe7\xae\xa1\xe6\x8e\xa7\xe4\xba\xa4\xe6\x8d\xa2\xe6\x9c\xba/\xe5\xae\x89\xe5\x85\xa8\xe4\xba\x8b\xe4\xbb\xb6\xe7\xae\xa1\xe7\x90\x86"); /* 建议设备: 防火墙+AC+交换机/安管 */
+    if(nhost<=15) snprintf(lines[nk++],72,"\xc2\xb7 \xe5\xbb\xba\xe8\xae\xae\xe5\xa2\x9e\xe8\xae\xbe: \xe5\x8f\xaf\xe6\xb7\xbb NAS/NVR(\xe9\x87\x8d\xe8\xa6\x81\xe6\x95\xb0\xe6\x8d\xae\xe5\xa4\x87\xe4\xbb\xbd)");
+    else snprintf(lines[nk++],72,"\xc2\xb7 \xe5\xbb\xba\xe8\xae\xae\xe5\xa2\x9e\xe8\xae\xbe: \xe4\xbc\x81\xe4\xb8\x9a\xe7\xba\xa7\xe9\x98\xb2\xe7\x81\xab\xe5\xa2\x99+AC+\xe4\xba\xa4\xe6\x8d\xa2\xe6\x9c\xba");
     *nlin=nk;
 }
 
@@ -1310,7 +1310,7 @@ static void netdect_render(ui_ctx_t *ctx){
             /* 融合: 上半 SSID + 密码明文, 下半经典键盘, 全 16px (英文 8×16), 都在恒定框内 */
             int cx=(CT_X0+CT_X1)/2;
             nd16c(l,cx,CT_TOP+4, s_ssid[0]?s_ssid:"...", false);
-            char pp[40]; snprintf(pp,sizeof(pp),"\xe5\xaf\x86\xe7\xa0\x81:%s", s_pass); /* 密码:明文 */
+            char pp[40]; snprintf(pp,sizeof(pp),"\xe5\xaf\x86\xe7\xa0\x81:%.*s",(int)sizeof(pp)-8, s_pass); /* 密码:明文 */
             nd16c(l,cx,CT_TOP+30, pp, false);
             pf(l,CT_X0+4,CT_TOP+58,CT_X1-4,CT_TOP+58,0);   /* 分隔线 */
             nd_kbd_draw(l, s_press_k);   /* 经典 5 排 16px 键盘 (回车=连接) */
@@ -1383,7 +1383,7 @@ static void netdect_render(ui_ctx_t *ctx){
         if(s_gw_rtt[0]) snprintf(lines[nlin++],72,"网关延迟 %s",s_gw_rtt);
         if(s_pub_rtt[0]) snprintf(lines[nlin++],72,"公网延迟 %s",s_pub_rtt);
         if(s_ipv6[0]) snprintf(lines[nlin++],72,"IPv6 %s",s_ipv6);
-        if(s_pub_ip[0]) snprintf(lines[nlin++],72,"公网 %s %s %s",s_pub_ip,s_isp_brand,s_city);
+    if(s_pub_ip[0]) snprintf(lines[nlin++],72,"\xe5\x85\xac\xe7\xbd\x91 %.15s %.18s %.24s",s_pub_ip,s_isp_brand,s_city);
         else snprintf(lines[nlin++],72,"公网未取到(可能未联网)");
         snprintf(lines[nlin++],72,"主机 %d 台",s_nhost);
         for(int hi=0;hi<s_nhost && nlin<60;hi++){

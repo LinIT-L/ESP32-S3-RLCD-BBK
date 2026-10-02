@@ -129,7 +129,7 @@ static bool am_lua_scan(int cat, bool bg) {
               }
               L[k].icon_idx = named ? am_lua_icon_idx(&meta) : ICON_MINI_GAMES;
               if (b == 1) {
-                  if (named) snprintf(L[k].label, sizeof(L[k].label), "\xe3\x80\x8c%s\xe3\x80\x8d", meta.name);
+            if (named) snprintf(L[k].label, sizeof(L[k].label), "\xe3\x80\x8c%.*s\xe3\x80\x8d", (int)sizeof(L[k].label) - 7, meta.name);
                   else       snprintf(L[k].label, sizeof(L[k].label), "\xe3\x80\x8c%.*s\xe3\x80\x8d", (int)len - 4, nm);
               } else {
                   if (named) snprintf(L[k].label, sizeof(L[k].label), "%s", meta.name);

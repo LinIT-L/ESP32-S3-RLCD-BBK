@@ -400,7 +400,7 @@ static bool exec_one(char*c){
 
 static void exec_cmd(char*line){
     s_scroll=0.0f; s_scrv=0.0f;
-    char d[TM_LINE_LEN]; snprintf(d,TM_LINE_LEN,"> %s",line); line_add(d);
+    char d[TM_LINE_LEN]; snprintf(d,TM_LINE_LEN,"> %.*s",TM_LINE_LEN-3,line); line_add(d);
     char*p=line; while(*p==' '||*p=='\t')p++;
     if(!*p){ line_add(""); return; }
     bool ok=true;
