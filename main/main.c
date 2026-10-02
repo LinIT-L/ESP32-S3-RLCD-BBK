@@ -15,9 +15,11 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "sd_scan.h"
+#include "svc_log.h"
 #include "esp_heap_caps.h"
 #include "esp_sleep.h"
-#include "nvs_flash.h"
+#include "esp_system.h"   /* ESP_RST_DEEPSLEEP: 深睡唤醒恢复原页面判定 */
+#include "svc_nvs.h"
 #include "esp_event.h"
 
 #include "st7305.h"
@@ -38,95 +40,27 @@ void settings_apply_dark(st7305_handle_t *lcd);
 #include "board_rlcd.h"   /* board_shim_set_lcd: 绑定主屏, 供 NES/GBC/文曲星/ArduBoy 引擎使用 */
 #include "usb_bt.h"        /* usb_bt_is_active / usb_bt_start */
 #include "usb_net.h"       /* usb_net_is_active / usb_net_start */
+#include "remcon.h"        /* 串口远程控制台 (远程自动化测试/排障) */
 #include "tone_player.h"   /* V1.0.68: 方波直驱音调播放器 (开机音/按键音) */
 #include "engine_manager.h" /* V1.0.98: 主菜单定时复核引擎残留 (unload_all 幂等) */
-#include "vibrator.h"      /* V1.0.76: 苹果 Taptic Engine 震动马达 (GPIO2) */
+#include "vibrator.h"
 #include "self_test.h"
 #include "display_test.h"
 #include "esp_attr.h"
+#include "driver/gpio.h"     /* 软关机唤醒防误触: 读 PWR 电平判定是否仍按住 */
+#include "apps.h"            /* V1.2 模块化: L4 应用层装配入口 apps_register_all() */
 
 static const char *TAG = "BBK";
 static st7305_handle_t g_lcd;
+/* 本次启动是否跳过开机 Logo —— 仅"休眠到点自动关机"唤醒时为 true(什么都不显示, 直接进桌面)。
+ * 手动关机唤醒 / 冷启动为 false → 正常显示开机 Logo。 */
+static bool s_soft_boot = false;
+/* 电量提示状态 (用户规则: 低电只提示一次不关机; 未接电量模块仅提示一次不关机):
+ *  -1=未评估  0=已提示过低电  1=已提示未检测到电量 */
+static int s_bat_low_remind = -1;
+static uint32_t s_bat_check_ms = 0;   /* 电量评估节流时间戳 (每 10 秒读一次, 省电) */
 /* 20260812: 菜单状态移到 PSRAM (UI 数据均在普通任务上下文访问, PSRAM 安全),
  * 腾出 ~33KB 内部 RAM 给引擎/蓝牙/DMA. */
-
-/* === V1.0.90: 自动保存日志到 TF 卡 (排查随机重启/内存问题).
- * 通过 esp_log_set_vprintf 接管日志: 串口照常打印, 同时按行缓存进内部缓冲,
- * 再由主循环 log_drain() 追加写入 /sdcard/log/bbk.log. 只在 SD 挂载后写盘,
- * 失败静默跳过; 文件超过上限后从 0 回绕重建, 避免无限膨胀.
- * s_log_skip 用于多任务/写盘期间的重入保护, 防止日志递归写盘死循环. */
-#define LOG_SAVE_BUF       4096
-#define LOG_SAVE_MAX       (1024UL * 1024)   /* 单个日志文件上限 1MB */
-#define LOG_SAVE_PATH      "/sdcard/log/bbk.log"
-EXT_RAM_BSS_ATTR static char          s_log_buf[LOG_SAVE_BUF];
-static volatile size_t    s_log_len = 0;
-static volatile bool      s_log_skip = false;
-/* 多任务日志互斥 (蓝牙/音频/WiFi/主循环等任务都会打日志):
- * log_to_file_vprintf 与 log_drain 对 s_log_buf/s_log_len 的并发访问用互斥锁保护,
- * 避免 vsnprintf/memmove 交错写坏缓冲. 无 ISR 场景 (确认无 IRAM 日志), 普通 mutex 即可. */
-static SemaphoreHandle_t  s_log_lock = NULL;
-/* 挂载到电脑期间: 暂停串口控制台输出 (Serial/JTAG 已卸载, 只保留文件日志),
- * 从根源避免日志写向已失效串口导致崩溃. 见 usbh_msc 挂载流程. */
-static volatile bool      s_log_console_suspend = false;
-
-void log_console_suspend(bool suspend) { s_log_console_suspend = suspend; }
-
-static int log_to_file_vprintf(const char *fmt, va_list arg) {
-    int n = 0;
-    /* 1) 串口照常输出 (保留原有监视能力); 挂载期间暂停避免写已卸载串口 */
-    if (!s_log_console_suspend) {
-        va_list arg_console;
-        va_copy(arg_console, arg);
-        n = vprintf(fmt, arg_console);
-        va_end(arg_console);
-    }
-    /* 2) 只缓存到文件缓冲, 不阻塞串口输出 (互斥锁保护多任务并发写) */
-    if (s_log_lock && xSemaphoreTake(s_log_lock, pdMS_TO_TICKS(10)) == pdTRUE) {
-        if (!s_log_skip && s_log_len < LOG_SAVE_BUF) {
-            s_log_skip = true;
-            va_list arg_file;
-            va_copy(arg_file, arg);
-            int k = vsnprintf(s_log_buf + s_log_len, LOG_SAVE_BUF - s_log_len,
-                              fmt, arg_file);
-            va_end(arg_file);
-            if (k > 0) {
-                size_t need = (size_t)k;
-                if (need >= LOG_SAVE_BUF - s_log_len)
-                    need = LOG_SAVE_BUF - s_log_len - 1;
-                s_log_len += need;
-            }
-            s_log_skip = false;
-        }
-        xSemaphoreGive(s_log_lock);
-    }
-    return n;
-}
-
-/* 主循环每帧调用: 把缓冲内容追加写入日志文件. 仅 SD 挂载且缓冲非空时写盘. */
-static void log_drain(void) {
-    if (!sd_is_mounted()) return;          /* 无卡/未挂载: 保留缓冲稍后再写 */
-    if (!s_log_lock) return;
-    if (xSemaphoreTake(s_log_lock, pdMS_TO_TICKS(50)) != pdTRUE) return;   /* 写盘竞争让位 */
-    s_log_skip = true;
-    size_t len = s_log_len;
-    if (len == 0) { s_log_skip = false; xSemaphoreGive(s_log_lock); return; }
-    /* 超限回绕: 重建文件保留最新内容 */
-    struct stat st;
-    if (stat(LOG_SAVE_PATH, &st) == 0 &&
-        st.st_size + (off_t)len > (off_t)LOG_SAVE_MAX) {
-        remove(LOG_SAVE_PATH);
-    }
-    FILE *f = fopen(LOG_SAVE_PATH, "ab");
-    if (f) {
-        fwrite(s_log_buf, 1, len, f);
-        fclose(f);
-    }
-    /* 移走已写部分, 保留写盘期间新追加的日志 */
-    if (s_log_len >= len) s_log_len -= len; else s_log_len = 0;
-    if (s_log_len && len) memmove(s_log_buf, s_log_buf + len, s_log_len);
-    s_log_skip = false;
-    xSemaphoreGive(s_log_lock);
-}
 
 /* V1.0.68: 列表弹窗跟手拖动状态 (番茄钟时间列表等) — 拖动逻辑已下沉 input 层,
  * 本文件不再持有跨帧拖动状态 (V1.0.99 起由 input_get_touch_pos 统一锁存). */
@@ -146,9 +80,12 @@ static void log_drain(void) {
  * 本路径只做"外壳"职责: 平台状态挂钩注入 + 硬件延后初始化 + 主循环喂 input.
  * ========================================================================== */
 #include "os.h"
+#include "lintos_version.h"   /* ★ 版本管理: 固件版本/构建信息唯一来源 */
+#include "lintos_version.h"   /* ★ 版本管理: 固件版本/构建信息 */
 #include "os_hw.h"
 #include "os_mgr.h"
 #include "wallpapers.h"
+#include "sleep.h"
 #include "bt_manager.h"
 #include "wifi_manager.h"
 #include "usb_hid.h"
@@ -158,7 +95,8 @@ static void log_drain(void) {
 /* ---- 平台状态挂钩 (os 全局服务经此读取系统状态, 解耦 os 与具体组件) ---- */
 static uint8_t os_plat_battery(void) {
     board_battery_status_t bat;
-    if (board_battery_read(&bat) == ESP_OK) return bat.percent;
+    /* 60s 缓存采样: 与低电量告警/网页手柄等共用同一个节拍器 (linit 2026-09-20) */
+    if (board_battery_read_cached(&bat) == ESP_OK) return bat.percent;
     return 255;   /* 未检测到电池哨兵 -> 状态栏显示 "?" */
 }
 static int  os_plat_volume(void)      { return audio_player_get_volume(); }
@@ -182,18 +120,33 @@ static const os_platform_ops_t s_os_platform = {
     .usb_data_active  = os_plat_usb_data,
 };
 
-/* 软关机: 清屏后 deep sleep (任意按键经 ext1 唤醒后重新开机) */
-static void do_soft_shutdown(ui_ctx_t *ctx) {
-    ESP_LOGI(TAG, "软关机: 清屏并 deep sleep");
-    if (ctx->lcd) { st7305_clear(ctx->lcd, ST7305_COLOR_WHITE); st7305_flush(ctx->lcd); }
-    esp_deep_sleep_start();
+
+/* 关机(深睡, 复位式, 等同真关机) — 两条来源, 唤醒条件不同(见 sleep.h):
+ *   MANUAL 手动(长按关机键 → 确认框): 仅 PWR 键唤醒, 且须保持按住 ≥0.5s 才开机
+ *   AUTO   自动(休眠时间到点)      : 任意键唤醒, 短按即开机
+ * 两者的深睡前动作相同: 先挂起屏保监督任务(PSRAM 栈持续刷屏, 深睡禁缓存瞬间会撞断言),
+ * 再交给电源模块停射频 → 清屏 → esp_deep_sleep_start()。 */
+static void do_manual_shutdown(ui_ctx_t *ctx) {
+    (void)ctx;
+    wp_screensaver_halt();
+    wp_power_off(WP_OFF_MANUAL);   /* 不返回 */
 }
-/* 软关机确认: 长按关机键弹出, 确认=关机 / 10秒超时自动关机 / 返回=取消 */
+static void do_auto_shutdown(void) {
+    wp_screensaver_halt();
+    wp_power_off(WP_OFF_AUTO);     /* 不返回 */
+}
+/* 远程关机 (remcon 命令 shutdown [auto|manual]): 便于实测两条唤醒策略。
+ * auto_mode=1 走"休眠到点自动关机"(任意键唤醒, 不显示 Logo); 0 走手动路径。 */
+void os_remote_shutdown(int auto_mode) {
+    if (auto_mode) do_auto_shutdown();
+    else           do_manual_shutdown(NULL);
+}
+/* 关机确认: 长按关机键弹出, 确认=关机 / 10秒超时自动关机 / 返回=取消 */
 static bool s_pwr_dlg_open = false;
 static void on_power_confirm(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     s_pwr_dlg_open = false;
-    if (result == 0) do_soft_shutdown(ctx);
+    if (result == 0) do_manual_shutdown(ctx);
 }
 
 /* 新 OS 主循环: input -> os 内核分发(action/touch) -> 管家 -> 渲染 */
@@ -204,26 +157,55 @@ static void os_shell_loop(ui_ctx_t *ctx) {
     uint32_t last_log_ms = 0;     /* V1.5.x: 日志写 TF 节流 (每 3 秒一次, 省电+延长卡寿命) */
     os_mgr_init();
     while (1) {
-        /* 软关机键 GPIO1 长按 2 秒 → 弹出确认关机弹窗 (确认/10秒自动/返回取消) */
-        if (input_power_should_sleep() && !s_pwr_dlg_open) {
-            s_pwr_dlg_open = true;
-            os_dialog_confirm_ex(ctx, "\xe5\x85\xb3\xe6\x9c\xba?", 10000, 0, /* 关机? */
-                                 on_power_confirm, NULL);
+        /* 休眠时间到点 → 自动关机(任意键唤醒)。标志由屏保监督任务置位,
+         * 必须在此(内部 RAM 栈)消费并深睡。 */
+        if (wp_screensaver_shutdown_requested()) {
+            do_auto_shutdown();   /* 不返回 */
+        }
+        /* 关机键 (PWR) 长按 2 秒 → 手动关机(仅 PWR 键唤醒, 须按住 0.5s 才开机)。
+         * 屏保态下 LCD 被壁纸独占, 确认框画不出来 → 直接关机;
+         * 桌面态弹"关机?"确认框, 确认 / 10 秒超时 → do_manual_shutdown()。 */
+        if (input_power_should_sleep()) {
+            if (os_screensaver_active()) {
+                do_manual_shutdown(ctx);   /* 不返回 */
+            }
+            if (!s_pwr_dlg_open) {
+                s_pwr_dlg_open = true;
+                os_dialog_confirm_ex(ctx, "\xe5\x85\xb3\xe6\x9c\xba?", 10000, 0, /* 关机? */
+                                     on_power_confirm, NULL);
+            }
+        }
+        /* 屏保态: 不轮询触摸(碰 I2C/flash)、不跑 os_tick、不写日志、不跑 os_mgr_poll,
+         * 屏保画面由独立监督任务渲染。 */
+        if (os_screensaver_active()) {
+            /* 屏保态**只轮询物理键**(更新空闲时钟 → 监督任务据此"按键唤醒壁纸").
+             * touch_blocked=true 时 input_get_action 内部触摸完全短路(不碰 I2C/flash),
+             * 物理键仅 gpio 读取+状态机, 无 flash 访问, 安全.
+             * 跳过 os_tick/日志/os_mgr_poll/渲染 —— 屏保由独立监督任务渲染. */
+            os_action_t act = (os_action_t)input_get_action();
+            if (act != OS_ACTION_NONE) {
+                last_input_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                os_handle_action(ctx, act);   /* 物理键 → os_screensaver_reset 唤醒壁纸 */
+            }
+            vTaskDelay(pdMS_TO_TICKS(32));
+            continue;
         }
         uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if (now_ms - last_log_ms >= 3000) {
             last_log_ms = now_ms;
-            log_drain();   /* 缓存日志每 3 秒追加写入 TF 卡一次 */
+            svc_log_drain();   /* 缓存日志每 3 秒追加写入 TF 卡一次 */
         }
         os_tick(ctx);  /* 服务 tick + 当前模块 poll */
         os_action_t action = (os_action_t)input_get_action();
         if (action != OS_ACTION_NONE) {
             last_input_ms = now_ms;
             if (action == OS_ACTION_CONFIRM) {
-                /* 触摸点击: 先走 hit-test (点哪进哪); 未命中忽略 */
+                /* 触摸点击: 先走 hit-test (点哪进哪); 未命中忽略.
+                 * 震动策略: 仅当 os_handle_touch 消费成功(命中有效 UI 元素)才振动 —
+                 * 点空白/无效区不震无反应(规范). */
                 int tx, ty;
                 if (input_consume_tap(&tx, &ty)) {
-                    os_handle_touch(ctx, tx, ty);
+                    if (os_handle_touch(ctx, tx, ty)) vibrator_click();
                 } else {
                     os_handle_action(ctx, action);   /* 物理键/手柄确认 */
                 }
@@ -239,14 +221,15 @@ static void os_shell_loop(ui_ctx_t *ctx) {
             if (os_screensaver_active()) os_screensaver_reset();
             else last_input_ms = now_ms;
         }
-        /* 屏保: 任意界面空闲超过设置延时进入星空 (状态机归 wallpapers) */
-        wp_screensaver_poll(now_ms, last_input_ms, os_modal_active(ctx));
-        /* 壁纸运行时长耗尽 → 软关机 (任意按键唤醒); 本帧有输入唤醒时标志已被清除 */
-        if (wp_screensaver_shutdown_requested()) do_soft_shutdown(ctx);
+        /* 屏保进入/渲染由独立监视任务负责(wp_screensaver_supervisor_start),
+         * 不随主循环/游戏阻塞而遗漏; 此处不再判定, 避免与监视任务抢进入. */
         /* 管家: 内存/生命周期/电源/健康 (低频节流, 内部裁剪) */
         os_mgr_poll(ctx, now_ms, last_input_ms, os_modal_active(ctx));
+        remcon_tick(ctx);   /* 串口远程控制台: 派发 page/key/tap 到 os 内核 */
         os_render(ctx);
-        vTaskDelay(pdMS_TO_TICKS(16));   /* V1.5.x: 轮询 500Hz→62Hz (省电, 触摸/按键走事件判定) */
+        /* 屏保态主循环放慢省一点CPU(壁纸由独立监督任务渲染, 输入唤醒不受影响);
+             * 正常/游戏态保持 16ms 高响应. */
+        vTaskDelay(pdMS_TO_TICKS(os_screensaver_active() ? 32 : 16));
         if (now_ms - last_ms >= 1000) {
             extern int font_zh_count(void);   /* 每秒带字体绑定状态 (0=绑定失败) */
             sdmmc_card_t *sd = sd_get_card(); /* SD 卡型号/容量 (确认挂载与卡型) */
@@ -257,17 +240,61 @@ static void os_shell_loop(ui_ctx_t *ctx) {
                      font_zh_count(),
                      sd ? (const char *)sd->cid.name : "-",
                      sd ? (unsigned)(sd->csd.capacity / 2048) : 0);
+            /* 电量提示 (用户规则): 低电只提示一次不关机; 未接电量模块(percent==255)仅提示一次不关机.
+             * 5% 关机由壁纸监督任务处理, 此处仅负责"提醒". 每 10 秒评估一次省电. */
+            if (s_bat_low_remind != 0 && (now_ms - s_bat_check_ms >= 10000)) {
+                s_bat_check_ms = now_ms;
+                board_battery_status_t bat;
+                if (board_battery_read_cached(&bat) == ESP_OK) {
+                    bool low = bat.percent != 255 && bat.percent <= 20;
+                    if (bat.percent == 255 && s_bat_low_remind != 1) {
+                        s_bat_low_remind = 1;   /* 未接模块: 仅提示一次 */
+                        os_dialog_toast(ctx, "\xe6\x9c\xaa\xe6\xa3\x80\xe6\xb5\x8b\xe5\x88\xb0\xe7\x94\xb5\xe9\x87\x8f\xef\xbc\x88\xe4\xb8\x8d\xe6\x8c\x82\xe6\x9c\xba\xef\xbc\x89"); /* 未检测到电量（不关机） */
+                        ESP_LOGW("BAT", "未检测到电量模块, 仅提示 (不关机)");
+                    } else if (low && s_bat_low_remind != 0) {
+                        s_bat_low_remind = 0;   /* 低电: 提示一次 */
+                        os_dialog_toast(ctx, "\xe7\x94\xb5\xe9\x87\x8f\xe4\xbd\x8e\xef\xbc\x8c\xe5\x85\x88\xe5\x85\x85\xe7\x94\xb5"); /* 电量低，先充电 */
+                        ESP_LOGW("BAT", "电量低 %d%%, 请充电 (不关机)", (int)bat.percent);
+                    }
+                }
+            }
             last_ms = now_ms;
         }
     }
 }
 
+/* V1.6.x 启动提速: 开机 Logo **最短**显示时长 (ms). 与 OS 初始化并行计时:
+ * 先画 Logo 上屏(不等待) → 期间做 os_init/页面注册等初始化 → 最后只补等"Logo 至少显示
+ * 这么久"。原实现是"固定死等 1.5s(30×50ms)", 实测白占启动 1.18s, 是主循环被拖到 3.4s 的主因。
+ * 按 A/BOOT 键仍可随时跳过。想让 Logo 停久一点就调大这个值。
+ * V1.7.x: 软关机(深睡)唤醒跳过 Logo, 直接初始化进桌面 (用户要求快速唤醒). */
+#define LOGO_HOLD_MS 1000
+
 /* 新 OS 启动 (初始化 + 进桌面 + 主循环, 不返回) */
 static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
+    (void)board;
     ui_ctx_t ctx;
+    /* 开机 Logo: 冷启动 / 手动关机唤醒显示; 休眠到点自动关机唤醒不显示(直接进桌面) */
+    uint32_t t_logo_ms = 0;
+    if (!s_soft_boot) {
+        st7305_clear(lcd, ST7305_COLOR_WHITE);
+        bbk_boot_draw_logo(lcd);
+        st7305_flush(lcd);
+        t_logo_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
     os_init(&ctx, lcd);
+    apps_register_all();     /* V1.2 模块化: 注册全部内置应用页 + 应用表 (原 os_init 内部调用) */
+    wp_sleep_boot_diag();   /* 复位/唤醒诊断: 此处 USB 已重新枚举, 日志不会丢 */
+    remcon_init();           /* 串口远程控制台 (USB Serial/JTAG 收命令, 远程自动化测试) */
     board_shim_set_lcd(lcd);   /* 绑定主屏到 board_shim: NES/GBC/文曲星/ArduBoy 引擎前置 (board_rlcd_is_initialized) */
     os_platform_set(&s_os_platform);
+    /* 补等 Logo 显示时长 (仅硬上电; 软开机直接进桌面, 不等) */
+    if (!s_soft_boot) {
+        while ((uint32_t)(esp_timer_get_time() / 1000 - t_logo_ms) < LOGO_HOLD_MS) {
+            if (gpio_get_level(BTN_GPIO_A) == 0) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
     /* 统一进桌面. USB-BT 激活时: 蓝牙适配器后台运行(状态栏显示图标), 不进 USB-BT 页;
      * 需关闭时到 应用管家 → 运维 → USB-BT. */
     os_push(&ctx, OS_PAGE_MAIN);
@@ -285,6 +312,10 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
      * V1.5.x 省电: 蓝牙按需开启 — 开机不再初始化蓝牙 (进蓝牙/手柄设置页时由 os_hw 触发). */
     app_board_init_audio(board);
     app_board_init_battery(board);
+    /* MAX-M10S GPS (2026-09-29 新增硬件): VCC 常通电, 固件当前不用定位 →
+     * 初始化后立刻送"软件待机"(UBX-RXM-PMREQ), 把常驻 25~30mA 降到 µA 级.
+     * 模块化: 驱动在 components/drivers/gps (gps.h API), 板级封装在 app_board. */
+    app_board_init_gps(board);
     if (usb_bt_is_active()) {
         /* USB-BT 激活 (开机早期进 BTH 模式): 蓝牙控制器供 USB 蓝牙适配器独占,
          * 不启动手柄蓝牙, 直接初始化 BTH. 这是官方 usb_dongle 方式(开机早期进),
@@ -297,46 +328,48 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
         usb_net_start();
         ESP_LOGI(TAG, "USB 网卡共享模式已启动");
     } else {
-        /* V1.5.x 省电: 蓝牙按需开启 — 开机不常开蓝牙.
-         * 开机自动回连窗口: 若有已配对手柄历史 → 短窗口(30s)低占空比直连上次手柄,
-         * 连上即保持; 手柄不在附近则窗口超时自动关栈回按需省电.
-         * 无历史 → 完全不开 (进蓝牙/手柄设置页时由 os_hw_request 首次启用). */
+        /* 开机短暂自动回连: 有配对手柄历史 → 短窗口(30s)低占空比直连上次手柄;
+         * 连上保持; 手柄不在则窗口超时自动关栈释放(省内部RAM). 无历史 → 不开.
+         * 需要时(进蓝牙/手柄页)由 os_hw_request 首次启用. */
         bt_manager_start_boot_reconnect(30000);
     }
     /* V1.0.72: 开机不播旋律, 改为震动一下提示.
      * 原因: tone_mel 任务栈(8KB)在首次 feed_pcm → audio_out_start →
      * es8311_start/set_sample_rate 的 I2C 深链路爆栈 panic, 导致开机无限重启.
      * (tone_mel/tone_cont 栈已 2048→4096 words 加固, 开机音仍可随时手动触发) */
-    vibrator_tap(80, 120);
+    /* 关机唤醒已在按键瞬间震过, 进桌面不再重复震; 冷启动在此震一次 */
+    if (!wp_power_woke_from_off()) vibrator_tap(80, 120);
     os_shell_loop(&ctx);
 }
 #endif /* CONFIG_OS */
 
 void app_main(void)
 {
+    /* 关机唤醒门控 —— 必须最先执行: 手动关机唤醒时要求 PWR 键保持按住 ≥0.5s,
+     * 不足(碰一下)判为误触, 直接回深睡(不返回); 自动关机 / 上电启动直接放行。 */
+    wp_power_wake_gate();
+
     /* V1.0.90: 自动保存日志到 TF (串口照常打印, 同时缓存进 /sdcard/log/bbk.log) */
-    s_log_lock = xSemaphoreCreateMutex();   /* 多任务日志互斥锁 (创建失败则跳过文件缓存) */
-    esp_log_set_vprintf(&log_to_file_vprintf);
-    ESP_LOGI(TAG, "==== BBK 游戏模拟器启动 ====");
+    svc_log_init();
+    /* ★ 版本管理整合 (2026-10-02): 开机横幅带版本 + git 提交 + 构建时刻。
+     * 烧录后一眼可确认"设备里跑的到底是哪一版/哪个提交" (串口日志即可)。 */
+    ESP_LOGI(TAG, "==== LinTOS %s (%s) ====", os_version_str(), os_version_name());
+    ESP_LOGI(TAG, "     date=%s  build=%s  git=%s",
+             os_version_date(), os_build_stamp(), os_git_desc());
+    /* 唤醒来源诊断延后到 os_boot_shell(USB 重新枚举完成后)打印, 否则早期日志会丢 */
 
-    /* 默认时间 2026-09-01: 设备未联网校时(无真实时间, 早于2025)时用该默认值做日期兜底;
-     * 联网后 wifi_manager 的 SNTP 会自动校时覆盖 (今天的真实时间晚于该默认, 故不冲突). */
-    {
-        time_t t0 = time(NULL);
-        if (t0 < 1735689600) {   /* 2025-01-01 00:00 UTC 之前 = 未校时/初始 1970 */
-            struct timeval tv = { 1788220800, 0 };   /* 2026-09-01 00:00 UTC */
-            settimeofday(&tv, NULL);
-            ESP_LOGI(TAG, "未联网校时, 设默认时间 2026-09-01");
-        }
-    }
+    /* V1.7.x: 统一北京时间时区 + 默认时间兜底 (收拢到 svc_time) */
+    { extern void svc_time_init(void); svc_time_init(); }
 
-    /* V1.0.68: 判断本次启动来源 (deep sleep 唤醒 = 电源键开机) */
-    {
-        esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-        if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-            ESP_LOGI(TAG, "电源键唤醒 (软开机)");
-        }
-    }
+
+
+    /* 本次唤醒来源决定开机观感:
+     *   自动关机(休眠到点)唤醒 → 不显示任何东西, 直接进桌面;
+     *   手动关机(长按关机键)唤醒 / 冷启动 → 显示开机 Logo。 */
+    s_soft_boot = (wp_power_wake_origin() == WP_OFF_AUTO);
+
+    /* Lua 集成冒烟测试: 挂载 SPIFFS(/lua)+加载执行 test.lua (失败不影响主系统) */
+    { extern void lua_smoke_test(void); lua_smoke_test(); }
 
     /* === 硬件初始化 (app_board 模块化封装, 顺序敏感见 components/app_board) === */
     app_board_t board;
@@ -346,33 +379,23 @@ void app_main(void)
         return;
     }
     g_lcd = board.lcd;
+    /* 把主屏句柄交给串口远程控制台 → `fbinfo` / `fbdump` 可抓屏 (真机/QEMU 通用) */
+    remcon_set_lcd(&g_lcd);
 
     /* 暗黑模式: 开机即应用面板反色 (黑↔白, 含开机画面, 全局强制) */
     settings_apply_dark(&g_lcd);
 
     /* V1.0.76: 震动马达 LEDC 初始化 (幂等, 无硬件也不影响运行) */
     vibrator_init();
+    /* 关机唤醒(由按键触发) → 立即震动反馈; 冷启动则由进桌面流程震动。 */
+    if (wp_power_woke_from_off()) vibrator_tap(80, 120);
 
     /* V1.0.70: 音调播放器全局初始化 (PCM→I2S, 两板通用).
      * 声音是固件全局功能, 不绑定任何引擎; 开机音/按键音/闹铃随时可播. */
     tone_player_init();
 
-    /* USB-BT 重启: 不清屏画 logo, 保留当前画面直接进桌面 (视作无感重启).
-     * 正常启动才显示开机 Logo (1.5秒, 按 A 键跳过). */
-    if (!usb_bt_is_active() && !usb_net_is_active()) {
-        /* 显示开机 Logo (1.5秒, 按 A 键跳过) */
-        st7305_clear(&g_lcd, ST7305_COLOR_WHITE);
-        bbk_boot_draw_logo(&g_lcd);
-        st7305_flush(&g_lcd);
-    }
-
-    /* 快速跳过检测: 50ms 间隔, 最多 30 次 = 1.5s */
-    for (int i = 0; i < 30; i++) {
-        if (gpio_get_level(BTN_GPIO_A) == 0) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+    /* 开机 Logo 已移入 os_boot_shell 顶部 (与 OS 初始化并行, 见 LOGO_HOLD_MS 注释)。
+     * 原此处"固定死等 1.5s"会白占启动时间。 */
 
 #ifdef CONFIG_APP_AUTOTEST
     self_test_run_all();

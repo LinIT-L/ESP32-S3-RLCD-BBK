@@ -1,86 +1,72 @@
 #!/usr/bin/env python3
-"""Regenerate icons_main.inc at 64x64 from the "完美图标" desktop PNG folder.
+"""Regenerate icons_main.inc (64x64 1bpp) + icons_main_enum.h from desktop icon folders.
 
-Source: /Users/linit/Desktop/完美图标
-All source PNGs are already 64x64 (native), so no resize is performed;
-icons are embedded at their original resolution to avoid up/down scaling.
-The only exception is the main-menu scroll effect where the center icon is
-highlighted/zoomed at draw time (handled by firmware, not this script).
+Sources (2026-09-20 重整后):
+  /Users/linit/Desktop/完美图标/     结构化应用图标集
+  /Users/linit/Desktop/其他图标/     散装/成品库补充
 
-Mapping (main_icons[] index -> desktop PNG, relative to 完美图标 root):
-  0  game      -> 应用管理.png            (应用管理)
-  1  key       -> 应用管理/运维/仿真键鼠.png
-  2  bt        -> 状态栏/蓝牙.png         (蓝牙, 未在主菜单显示, 保留槽位)
-  3  pad       -> 应用管理/程序/手柄.png
-  4  vol       -> 状态栏/声音/喇叭2.png   (音量, 未在主菜单显示, 保留槽位)
-  5  sd        -> 应用管理/程序/存储.png
-  6  info      -> 设置.png
-  7  play      -> 应用管理/程序/音乐.png
-  8  gb        -> 应用管理/引擎/GB.png
-  9  book      -> 应用管理/程序/阅读.png
-  10 wall      -> 应用管理/程序/壁纸.png
-  11 pomo      -> 应用管理/程序/番茄钟.png
-  12 gbc       -> 应用管理/引擎/GBC.png
-  13 nes       -> 应用管理/引擎/NES.png
-  14 arduboy   -> 应用管理/引擎/ArduBoy.png
-  15 mini      -> 应用管理/独立游戏/独立游戏1.png
-  16 wq        -> 应用管理/引擎/文曲星.png
-  17 cwj       -> 应用管理/引擎/暴龙机.png
-  18 theme     -> 应用管理/程序/白板.png   (主题用白板替代)
-  19 net       -> 应用管理/运维/网络工具.png
-  20 diag      -> 应用管理/运维/电脑诊断.png
-  21 bbk       -> 应用管理/引擎/步步高.png
-  22 alarm     -> 应用管理/程序/闹钟.png   (占位: 暂无对应应用)
-  23 terminal  -> 应用管理/运维/终端.png   (占位: 暂无对应应用)
+规范化 (2026-09-20):
+  - 仅编译"被应用注册表 os_pages.c 实际引用"的图标 (linit: 不用的图标不进固件).
+    下面 MAP 就是精简后的 33 个, 已剔除 蓝牙(2)/音量(4)/网络工具(19)/闹钟(22)/
+    Meshtastic(24)/下载程序(28) 共 6 个占位图标.
+  - 语义化 ID: icons_main_enum.h 自动生成 ICON_* 枚举, 值 = main_icons[] 下标.
+    os_pages.c 等一律写 .icon_idx = ICON_XXX, 不再写魔法数字.
+  - 单一入口: 运行期一律走 draw_main_icon_stretched() / ui_main_icon_bitmap(),
+    二者现在都直接用 main_icons[icon_idx] (main_icon_index() 已退化为直通, 兼容 tbl 删除).
 
-Polarity: 源图暗(<threshold)=bit 1=黑像素. For main menu icons the original
-is black-on-transparent/white, so keep that (invert=False).
+MAP 顺序即 main_icons[] 下标, 亦即 ICON_* 枚举值. 新增图标请在此追加 (顺序即下标).
 """
 import os
 from PIL import Image
 
-SRC = "/Users/linit/Desktop/完美图标"
-DST = os.path.join(os.path.dirname(__file__), "../../components/ui_common/icons_main.inc")
+SRC = "/Users/linit/Desktop"
+DST_INC = os.path.join(os.path.dirname(__file__), "../../components/ui/ui_common/icons_main.inc")
+DST_H   = os.path.join(os.path.dirname(__file__), "../../components/ui/ui_common/icons_main_enum.h")
 W = H = 64
 THRESHOLD = 128
 
-# USB 数据传输图标 (64x64), 独立数组, 供挂载/键鼠界面引用
-TRANSFER_PNG = "状态栏/数据传输.png"
-# 仿真键鼠图标
-KEY_PNG = "应用管家/运维/仿真键鼠.png"
-
-# (var_name, png_relative_to_SRC)  —— 顺序必须与 icons_main.inc 现有变量一致
+# (enum_name, png_relative_to_SRC) —— 顺序即 main_icons[] 下标, 亦即 ICON_* 枚举值
 MAP = [
-    ("main_icon_game",      "应用管家.png"),
-    ("main_icon_key",       KEY_PNG),
-    ("main_icon_bt",        "状态栏/蓝牙.png"),
-    ("main_icon_pad",       "应用管家/独立游戏/手柄.png"),
-    ("main_icon_vol",       "状态栏/声音/喇叭2.png"),
-    ("main_icon_sd",        "应用管家/应用/存储.png"),
-    ("main_icon_info",      "设置.png"),
-    ("main_icon_play",      "应用管家/应用/音乐.png"),
-    ("main_icon_gb",        "应用管家/引擎/GB.png"),
-    ("main_icon_book",      "应用管家/应用/阅读.png"),
-    ("main_icon_wall",      "应用管家/应用/壁纸.png"),
-    ("main_icon_pomo",      "应用管家/应用/番茄钟.png"),
-    ("main_icon_gbc",       "应用管家/引擎/GBC.png"),
-    ("main_icon_nes",       "应用管家/引擎/NES.png"),
-    ("main_icon_arduboy",   "应用管家/引擎/ArduBoy.png"),
-    ("main_icon_mini_games","应用管家/独立游戏.png"),
-    ("main_icon_wq",        "应用管家/引擎/文曲星.png"),
-    ("main_icon_cwj",       "应用管家/引擎/暴龙机.png"),
-    ("main_icon_theme",     "应用管家/应用/白板.png"),
-    ("main_icon_net",       "应用管家/运维/USB网卡.png"),   # 网络工具: 源无"网络工具.png", 用 USB网卡
-    ("main_icon_diag",      "应用管家/运维/电脑诊断.png"),
-    ("main_icon_bbk",       "应用管家/引擎/步步高.png"),
-    ("main_icon_alarm",     "应用管家/应用/闹钟.png"),
-    ("main_icon_terminal",  "应用管家/运维/终端.png"),
+    ("ICON_APP_MGR",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6.png"),                          # 0  \u5e94\u7528\u5fc3
+    ("ICON_USB_HID",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/\u4eff\u771f\u952e\u9f20.png"),  # 1  \u4eff\u771f\u952e\u9f20
+    ("ICON_GAMEPAD",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u72ec\u7acb\u6e38\u620f/\u624b\u67c4.png"),    # 2  \u624b\u67c4
+    ("ICON_STORAGE",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u5b58\u50a8.png"),        # 3  \u5b58\u50a8
+    ("ICON_SETTINGS",    "\u5b8c\u7f8e\u56fe\u6807/\u8bbe\u7f6e.png"),                                # 4  \u8bbe\u7f6e
+    ("ICON_MP3",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u97f3\u4e50.png"),        # 5  \u97f3\u4e50
+    ("ICON_GB",          "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/GB.png"),           # 6  GB
+    ("ICON_BOOK",        "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u9605\u8bfb.png"),        # 7  \u9605\u8bfb\u5668
+    ("ICON_WALLPAPER",   "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u58c1\u7eb8.png"),      # 8  \u58c1\u7eb8
+    ("ICON_POMODORO",    "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u756a\u8304\u949f.png"),    # 9  \u756a\u8304\u949f
+    ("ICON_GBC",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/GBC.png"),         # 10 GBC
+    ("ICON_NES",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/NES.png"),         # 11 NES
+    ("ICON_ARDUBOY",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/ArduBoy.png"),      # 12 ArduBoy
+    ("ICON_MINI_GAMES",  "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u72ec\u7acb\u6e38\u620f.png"),          # 13 \u72ec\u7acb\u6e38\u620f
+    ("ICON_WQX",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/\u6587\u66f2\u661f.png"),      # 14 \u6587\u66f2\u661f
+    ("ICON_VPET",        "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/\u66b4\u9f99\u673a.png"),      # 15 \u66b4\u9f99\u673a
+    ("ICON_WHITEBOARD",  "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u767d\u677f.png"),      # 16 \u767d\u677f
+    ("ICON_DIAG",        "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/\u7535\u8111\u8bca\u65ad.png"),  # 17 \u7535\u8111\u8bca\u65ad
+    ("ICON_BBK",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/\u6b65\u6b65\u9ad8.png"),      # 18 \u6b65\u6b65\u9ad8
+    ("ICON_TERMINAL",    "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/\u7ec8\u7aef.png"),        # 19 \u7ec8\u7aef
+    ("ICON_USB_BT",      "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/USB-\u84dd\u7259.png"), # 20 USB\u84dd\u7259
+    ("ICON_USB_NET",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/USB\u7f51\u5361.png"),   # 21 USB\u7f51\u5361
+    ("ICON_WINASSIST",   "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/Windows\u52a9\u624b.png"), # 22 \u8fd0\u7ef4\u52a9\u624b
+    ("ICON_MODTOOL",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u72ec\u7acb\u6e38\u620f/\u4fee\u6539\u673a.png"),  # 23 \u4fee\u6539\u673a
+    ("ICON_LOGDIAG",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/\u65e5\u5fd7\u8bca\u65ad.png"),  # 24 \u65e5\u5fd7\u8bca\u65ad
+    ("ICON_SECURE",      "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u79c1\u4eba\u5bc6\u7801\u673a.png"), # 25 \u5bc6\u94a5\u7ba1\u7406\u5668
+    ("ICON_CALC",        "\u5176\u4ed6\u56fe\u6807/\u8ba1\u7b97\u5668.png"),                            # 26 \u8ba1\u7b97\u5668
+    ("ICON_NETDECT",     "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/\u7f51\u7edc\u63a2\u6d4b.png"),  # 27 \u7f51\u7edc\u68c0\u6d4b
+    ("ICON_MORSE",       "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u6469\u65af\u5bc6\u7801.png"),  # 28 \u6469\u65af\u5bc6\u7801
+    ("ICON_WIFIPROBE",   "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u65e0\u7ebf\u63a2\u6d4b.png"),  # 29 \u65e0\u7ebf\u63a2\u6d4b
+    ("ICON_MD",          "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/MD.png"),           # 30 MD
+    ("ICON_SMS",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/SMS.png"),         # 31 SMS
+    ("ICON_FAV",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u6536\u85cf\u5939.png"),      # 32 \u6536\u85cf\u5939
 ]
 
+TRANSFER_PNG = "\u5b8c\u7f8e\u56fe\u6807/\u72b6\u6001\u680f/\u6570\u636e\u4f20\u8f93.png"
 
-def to_1bit(path):
-    img = Image.open(os.path.join(SRC, path)).convert("L")
-    # 源图均已是 64x64 原生尺寸, 仅在非目标大小时才缩放 (尽量不放大缩小)
+
+def to_1bit(rel):
+    img = Image.open(os.path.join(SRC, rel)).convert("L")
     if img.size != (W, H):
         img = img.resize((W, H), Image.Resampling.LANCZOS)
     out = []
@@ -89,8 +75,7 @@ def to_1bit(path):
             byte = 0
             for bit in range(8):
                 x = b * 8 + bit
-                v = img.getpixel((x, y))
-                if v < THRESHOLD:
+                if img.getpixel((x, y)) < THRESHOLD:
                     byte |= (1 << (7 - bit))
             out.append(byte)
     return out
@@ -104,61 +89,68 @@ def fmt(data):
     return "\n".join(lines)
 
 
+assert len({v for v, _ in MAP}) == len(MAP), "枚举名重复"
 bytes_per_icon = (W * H) // 8
-arrays = []
-var_names = []
-for var, png in MAP:
+arrays, var_names, enum_names = [], [], []
+for name, png in MAP:
     data = to_1bit(png)
-    assert len(data) == bytes_per_icon, (var, len(data))
+    assert len(data) == bytes_per_icon, (name, png, len(data))
+    var = "main_icon_" + name[5:].lower()   # ICON_APP_MGR -> main_icon_app_mgr
     var_names.append(var)
+    enum_names.append(name)
     arrays.append(f"const uint8_t {var}[MAIN_ICON_BYTES] = {{\n{fmt(data)}\n}};")
 
-# 脚本生成的图标数 (纯完美图标库来源)
-N_GEN = len(MAP)
-# 额外手工图标 (Meshtastic/USB蓝牙/USB网卡/运维助手/编程), 位于 icons_main_extra.inc
-EXTRA = ["main_icon_meshtastic", "main_icon_usbbt", "main_icon_usbnet",
-         "main_icon_winassist", "main_icon_code"]
-N_EXTRA = len(EXTRA)
-N_TOTAL = N_GEN + N_EXTRA
-
-header = f"""/* ============================================================
- * 主菜单专用图标 (64x64 1bpp, MSB first)  由脚本批量生成
- * 来源: 桌面「完美图标」 (见 tools/image_convert/gen_main_icons_64.py)
- * 原生 64x64 嵌入, 不缩放.
- * 前 {N_GEN} 个由脚本从「完美图标」生成; 后 {N_EXTRA} 个 (Meshtastic/
- * USB蓝牙/USB网卡/运维助手/编程) 为手工图标, 定义见 icons_main_extra.inc.
+N = len(MAP)
+enum_lines = "\n".join(f"    {n} = {i}," for i, n in enumerate(enum_names))
+enum_header = f"""/* ============================================================
+ * \u4e3b\u83dc\u5355/\u5e94\u7528\u7ba1\u5bb6 \u56fe\u6807\u679a\u4e3e + \u5c3a\u5bf8\u5b8f \u2014\u2014 \u81ea\u52a8\u751f\u6210 (gen_main_icons_64.py)
+ * \u52ff\u624b\u5de5\u4fee\u6539. \u6bcf\u4e2a ICON_* \u7684\u503c = \u5176\u5728 main_icons[] \u4e2d\u7684\u4e0b\u6807.
  * ============================================================
  */
+#ifndef ICONS_MAIN_ENUM_H
+#define ICONS_MAIN_ENUM_H
+
 #define MAIN_ICON_W {W}
 #define MAIN_ICON_H {H}
 #define MAIN_ICON_BYTES (({W}*{H})/8)
-#define MAIN_ICON_COUNT {N_TOTAL}
+#define MAIN_ICON_COUNT {N}
+
+typedef enum {{
+{enum_lines}
+}} icon_id_t;
+
+#endif /* ICONS_MAIN_ENUM_H */
+"""
+
+inc_header = f"""/* ============================================================
+ * \u4e3b\u83dc\u5355/\u5e94\u7528\u7ba1\u5bb6 \u56fe\u6807\u4f4d\u56fe (64x64 1bpp, MSB first) \u2014\u2014 \u81ea\u52a8\u751f\u6210 (gen_main_icons_64.py)
+ * \u6765\u6e90: \u684c\u9762\u300c\u5b8c\u7f8e\u56fe\u6807\u300d(\u7ed3\u6784\u5316) + \u300c\u5176\u4ed6\u56fe\u6807\u300d(\u8865\u5145)
+ * \u679a\u4e3e/\u5c3a\u5bf8\u5b8f\u89c1 icons_main_enum.h (\u672c\u6587\u4ef6\u4f9d\u8d56\u5b83).
+ * \u26a0 \u52ff\u624b\u5de5\u4fee\u6539\u672c\u6587\u4ef6; \u6539\u56fe\u6807\u8bf7\u6539\u684c\u9762 PNG \u540e\u91cd\u8dd1\u811a\u672c.
+ * ============================================================
+ */
+#include "icons_main_enum.h"
 
 """
 
 body = "\n\n".join(arrays)
-icon_list = "\n".join(f"    {v}," for v in var_names + EXTRA)
+icon_list = "\n".join(f"    {v}," for v in var_names)
 footer = f"""
 const uint8_t *main_icons[MAIN_ICON_COUNT] = {{
 {icon_list}
 }};
 """
 
-# 手工图标定义 (外部 .inc, 由 #include 引入, 脚本不重新生成).
-# 必须位于 main_icons[] 表之前, 否则表引用不到这些变量.
-extra_arr = f"""
-/* ===== 手工图标 (icons_main_extra.inc, 非脚本生成) ===== */
-#include "icons_main_extra.inc"
-"""
-
-# USB 数据传输图标: 独立数组 (不进入 main_icons, 供挂载/键鼠界面直接引用)
-transfer_data = to_1bit(TRANSFER_PNG)
-assert len(transfer_data) == bytes_per_icon, (TRANSFER_PNG, len(transfer_data))
+td = to_1bit(TRANSFER_PNG)
+assert len(td) == bytes_per_icon, (TRANSFER_PNG, len(td))
 transfer_arr = (
-    "/* USB 数据传输图标 64x64 (挂载/键鼠同步界面专用) */\n"
-    f"const uint8_t icon_transfer[MAIN_ICON_BYTES] = {{\n{fmt(transfer_data)}\n}};\n"
+    "/* USB \u6570\u636e\u4f20\u8f93\u56fe\u6807 64x64 (\u6302\u8f7d/\u952e\u9f20\u540c\u6b65\u754c\u9762\u4e13\u7528, \u4e0d\u8fdb main_icons) */\n"
+    f"const uint8_t icon_transfer[MAIN_ICON_BYTES] = {{\n{fmt(td)}\n}};\n"
 )
 
-with open(DST, "w") as f:
-    f.write(header + extra_arr + "\n" + body + "\n\n" + footer + "\n\n" + transfer_arr + "\n")
-print(f"Wrote {DST}: {W}x{H}, {N_TOTAL} icons ({N_GEN} 脚本 + {N_EXTRA} 手工), {bytes_per_icon} B each")
+with open(DST_INC, "w") as f:
+    f.write(inc_header + body + "\n\n" + footer + "\n\n" + transfer_arr + "\n")
+with open(DST_H, "w") as f:
+    f.write(enum_header)
+print(f"Wrote {DST_INC}: {W}x{H}, {N} icons")
+print(f"Wrote {DST_H}: {N} ICON_* enums")

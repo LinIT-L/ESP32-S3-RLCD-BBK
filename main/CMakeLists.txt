@@ -2,7 +2,7 @@
 # BBK 游戏模拟器 - 菜单系统前端
 
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main.c" "remcon.c" "lua_launch.c"
     INCLUDE_DIRS "."
     REQUIRES
         self_test
@@ -11,10 +11,11 @@ idf_component_register(
         st7305
         bbk_boot
         os
+        apps
         wallpapers
         driver
         esp_timer
-        nvs_flash
+        nvs_flash svc_time svc_log svc_nvs
         esp_event
         board_battery
         book_reader
@@ -25,4 +26,7 @@ idf_component_register(
         sd_scan
         usb_bt
         usb_net
+        nes_emu
+        spiffs
+        lua
 )

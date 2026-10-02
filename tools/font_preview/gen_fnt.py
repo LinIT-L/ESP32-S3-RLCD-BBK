@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 HZK = 'tools/font_preview/hzk'
 ZHUQUE = '/tmp/fz/fzfs.ttf'   # 方正仿宋简体 (朱雀仿宋是繁体风格, 已弃用)
-OUT = 'components/book_reader/assets'
+OUT = 'components/engines/book_reader/assets'
 MAGIC = b'BK16FNT1'
 
 def gb2312_positions():

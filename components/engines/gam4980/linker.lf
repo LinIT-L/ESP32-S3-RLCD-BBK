@@ -1,0 +1,9 @@
+# V2.x 内存精简: 整库 BSS/common 段搬到 PSRAM。
+# 用 IDF 内置 extram_bss 方案 (定义于 components/esp_wifi/linker.lf),
+# 需 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y (本项目已开)。
+# 动机: 内部 SRAM 里 IRAM 与 DRAM 共享同一物理区, .bss 搬走后内部堆直接变大。
+[mapping:gam4980_extram_bss]
+archive: libgam4980.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)

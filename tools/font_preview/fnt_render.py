@@ -137,7 +137,7 @@ if __name__ == '__main__':
               "“那……我们明天还去河边吗？”她小声地问。\n"
               "我没有回答，只是默默地把那本书收进了怀里。\n"
               "有些话，说出口就收不回了。")
-    base = 'components/book_reader/assets'
+    base = 'components/engines/book_reader/assets'
     for sz in (20, 24, 28, 32):
         f = load_fnt(f'{base}/book{sz}.fnt')
         rows = render_text(f, SAMPLE, sz, 400)

@@ -81,7 +81,7 @@ SAMPLE = ("他抬起头，看了一眼窗外的雨，又低下头继续写着。
 
 # 当前字库 (设备正在用的)
 for sz in (20, 24, 28, 32):
-    f = load_fnt(f'components/book_reader/assets/book{sz}.fnt')
+    f = load_fnt(f'components/engines/book_reader/assets/book{sz}.fnt')
     rows = render_text(f, SAMPLE, sz, 400)
     label_img(rows, f'当前字库 {sz}px', os.path.join(OUT, f'now_{sz}.png'))
 

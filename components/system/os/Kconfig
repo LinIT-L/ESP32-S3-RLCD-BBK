@@ -1,0 +1,60 @@
+# components/os — 标准化模块化 OS 内核
+menu "LinTOS 模块化 OS"
+    config OS
+        bool "启用新模块化 OS 内核 (components/os)"
+        default n
+        help
+            启用全新的标准化模块化 OS 内核 (components/os):
+            内核只负责页面栈/事件路由/输入分发/内存生命周期,
+            状态栏/音量/电量/蓝牙为全局 service, 每个应用页为独立模块。
+
+            关闭 (默认) 时回退到旧版 components/menu/menu_system 巨石菜单系统。
+            迁移阶段建议: 新内核逐页验证通过后再长期开启。
+
+    config OS_MGR
+        bool "系统资源管家 os_mgr (内存/生命周期/电源/健康)"
+        depends on OS
+        default y
+        help
+            主循环内嵌的低频管家 (性能优先: 无独立任务/无锁, 默认 1s 节流):
+              - MEM   : 内部/PSRAM 空闲采样 + 峰值统计 + 低水位告警(自动回收引擎)
+              - LIFE  : 空闲超时自动回主菜单 + 引擎残留兜底回收
+              - POWER : 低电量告警
+              - HEALTH: 异常复位计数 (NVS, 供诊断页)
+            各子功能可在下方单独裁剪; 总开关关闭时全部空实现零开销。
+            注: 双核静态亲和性 API 属系统工具, 已归 os_core (os_core_pin_task)。
+
+    if OS_MGR
+        config OS_MGR_MEM
+            bool "内存监控/峰值/低水位告警"
+            default y
+        config OS_MGR_LIFE
+            bool "应用生命周期: 空闲超时自动回主菜单 + 引擎回收"
+            default y
+        config OS_MGR_POWER
+            bool "电源: 低电量告警"
+            default y
+        config OS_MGR_HEALTH
+            bool "健康: 异常复位计数 (NVS)"
+            default y
+        config OS_MGR_IDLE_TIMEOUT_MS
+            int "空闲自动回主菜单超时 (ms, 0=关闭)"
+            range 0 3600000
+            default 300000
+            help
+                非主菜单且无弹窗、非全屏应用时, 无输入超过该时长自动返回主菜单。
+                0 表示关闭自动退出。
+        config OS_MGR_LOW_MEM_BYTES
+            int "内部内存低水位告警阈值 (bytes, 0=关闭)"
+            range 0 262144
+            default 20480
+            help
+                内部 RAM 空闲低于该值触发告警并自动回收模拟器引擎 (防止内存耗尽崩溃)。
+        config OS_MGR_POLL_MS
+            int "管家轮询周期 (ms)"
+            range 100 10000
+            default 1000
+            help
+                采样/决策周期。越大管家自身 CPU 占用越低; 空闲检测精度随之降低。
+    endif
+endmenu

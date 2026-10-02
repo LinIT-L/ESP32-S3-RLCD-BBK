@@ -11,7 +11,7 @@ SRC_DIRS = [
     "main",
     "components/menu",
     "components/bbk",
-    "components/usbh_msc",
+    "components/services/usbh_msc",
 ]
 
 # 匹配中文字符 (3-byte UTF-8)

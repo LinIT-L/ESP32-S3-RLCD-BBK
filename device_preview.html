@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LinTOS 0.5 · 侧栏选中态预览</title>
+<style>
+  :root{
+    --bg:#0e1014; --body:#181b21; --ink:#e8eaee; --muted:#8b93a1; --dim:#4a4f5a;
+    --screen:#f2efe6; --screen-ink:#1a1c20; --screen-hi:#2f6feb;
+    --frame:#23262e; --inner:#2c303a; --edge:#3a3f4b;
+    --accent:#4f7cff; --shadow:0 24px 60px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(120% 120% at 50% 0%,#161a22 0%,#0b0d12 55%,#07090c 100%);
+      min-height:100vh;display:flex;align-items:center;justify-content:center;padding:48px 24px;
+      font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--ink);}
+  .stage{display:flex;gap:34px;align-items:center;flex-wrap:wrap;justify-content:center}
+
+  /* ===== 设备机身 ===== */
+  .device{position:relative;width:820px;height:auto;background:linear-gradient(180deg,var(--body),#101318);
+          border:1px solid var(--edge);border-radius:34px;padding:26px 26px 34px;
+          box-shadow:var(--shadow);}
+  .brand{display:flex;align-items:center;justify-content:space-between;padding:0 6px 14px;color:var(--dim);font-size:12px;letter-spacing:1px}
+  .brand .logo{color:var(--muted);font-weight:700;letter-spacing:2px}
+  .brand .modl{font-size:11px}
+
+  /* ===== 屏幕 ===== */
+  .glass{position:relative;background:var(--screen);border-radius:18px;padding:22px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.12), inset 0 2px 14px rgba(0,0,0,.18)}
+  .sc{overflow:hidden;border-radius:8px;background:var(--screen);width:100%}
+  .top-legend{display:flex;justify-content:space-between;align-items:center;padding:0 4px 14px;color:var(--dim);font-size:12px;letter-spacing:.5px}
+  .top-legend b{color:var(--muted)}
+
+  /* 屏幕内置真实尺寸画布(400x300) */
+  .scp{position:relative;width:100%;aspect-ratio:400/300;background:var(--screen);
+       -webkit-user-select:none;user-select:none}
+
+  /* 状态栏 */
+  .stat{position:absolute;left:0;right:0;top:0;height:24px;display:flex;align-items:center;justify-content:space-between;
+        padding:0 10px 0 44px;color:var(--screen-ink);font-size:13px}
+  .stat .sicons{display:flex;gap:9px}
+  .stat svg{display:block}
+
+  /* 侧栏底格线(分割线已删, 仅残留选区范围感) */
+  .catside{position:absolute;left:0;top:0;bottom:0;width:76px;z-index:6}
+  .catbtn{position:absolute;left:4px;width:68px;height:64px;border-radius:10px;
+         display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+         color:var(--screen-ink);cursor:pointer;background:transparent;border:1px dashed rgba(0,0,0,0);}
+  .catbtn .cd{width:44px;height:44px;display:flex;align-items:center;justify-content:center;font-size:26px;line-height:1}
+  .catbtn .ct{font-size:10px;letter-spacing:.5px;color:var(--screen-ink)}
+  .catbtn:hover .cd{background:rgba(0,0,0,.05)}
+  #c0{top:34px} #c1{top:101px} #c2{top:168px} #c3{top:235px}
+
+  /* 选中水管线 */
+  .pipeline{fill:none;stroke:var(--screen-hi);stroke-width:2;stroke-linecap:round;stroke-linejoin:round;
+            filter:drop-shadow(0 1px 1px rgba(0,0,0,.25));transition:stroke .3s}
+  .pipeline.black{stroke:var(--screen-ink);transition:stroke .3s}
+
+  /* 内容区 */
+  .content{position:absolute;left:88px;right:0;top:28px;bottom:6px;display:grid;
+          grid-template-columns:repeat(4,1fr);gap:10px;align-content:start}
+  .app{aspect-ratio:1;border-radius:12px;background:rgba(0,0,0,.03);border:1px solid rgba(0,0,0,.06);
+       display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+       cursor:pointer;color:var(--screen-ink);transition:transform .15s, box-shadow .2s}
+  .app .ae{width:40px;height:40px;display:flex;align-items:center;justify-content:center;font-size:22px}
+  .app .an{font-size:9px;letter-spacing:.4px}
+  .app:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(0,0,0,.14)}
+  .app.cur{background:rgba(0,0,0,.1);box-shadow:inset 0 0 0 2px var(--screen-hi);transform:translateY(-2px)}
+  .apps-fade{animation:appfade .18s ease}
+  @keyframes appfade{from{opacity:.2;transform:translateY(3px)}to{opacity:1;transform:none}}
+
+  /* 右侧说明板 */
+  .panel{width:300px;background:var(--frame);border:1px solid var(--edge);border-radius:20px;padding:20px}
+  .panel h2{margin:0 0 4px;font-size:13px;letter-spacing:1px;color:var(--muted);font-weight:600}
+  .panel .state{font-size:22px;color:var(--ink);margin:2px 0 6px;font-weight:800}
+  .panel .desc{font-size:13px;line-height:1.7;color:var(--muted);min-height:44px}
+  .rules{margin:18px 0 0;padding:12px 14px;background:var(--inner);border-radius:12px;font-size:12px;line-height:1.8;color:var(--ink)}
+  .rules span{color:var(--accent);font-weight:700}
+  .sw{display:flex;align-items:center;gap:10px;margin-top:14px;font-size:12px;color:var(--muted);cursor:pointer}
+  .sw input{width:16px;height:16px;accent-color:var(--accent)}
+  .bend{display:flex;align-items:center;gap:12px;margin-top:8px;background:var(--inner);border-radius:12px;padding:10px 12px;font-size:12px;color:var(--muted)}
+  .bend svg{flex:none}
+  .bend b{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <!-- 设备 -->
+  <div class="device">
+    <div class="brand">
+      <span class="logo">LinTOS ◆ 0.5</span>
+      <span class="modl">Esp32-S3 · RLCD 4.2"</span>
+    </div>
+    <div class="glass">
+      <div class="top-legend">
+        <b>应用管家</b>
+        <span>软件管家 · 分类选中预览</span>
+      </div>
+      <div class="scp" id="scp">
+
+        <!-- 状态栏 -->
+        <div class="stat">
+          <span id="clock">08:42</span>
+          <span class="sicons">
+            <svg width="15" height="11" viewBox="0 0 15 11"><path d="M0 3.2h2V7H0zM3.4 1.6h2v7.2h-2zM6.8 0h2v9.8h-2zM10.4 2.6h1.6V8h-1.6zM12.8 4.6l1.7 1.2" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+            <svg width="14" height="14" viewBox="0 0 14 14"><rect x=".5" y="7" width="3" height="4" rx=".7" fill="currentColor"/><rect x="5" y="5" width="3" height="6" rx=".7" fill="currentColor"/><rect x="9.5" y="2.5" width="3" height="8.5" rx=".7" fill="currentColor"/></svg>
+          </span>
+        </div>
+
+        <!-- 分类图标 -->
+        <div class="catside">
+          <button class="catbtn" id="c0" data-idx="0" role="tab" aria-selected="false">
+            <span class="cd">⚙️</span><span class="ct">引擎</span></button>
+          <button class="catbtn" id="c1" data-idx="1" role="tab" aria-selected="true">
+            <span class="cd">🎮</span><span class="ct">游戏</span></button>
+          <button class="catbtn" id="c2" data-idx="2" role="tab" aria-selected="false">
+            <span class="cd">🧩</span><span class="ct">应用</span></button>
+          <button class="catbtn" id="c3" data-idx="3" role="tab" aria-selected="false">
+            <span class="cd">🛠️</span><span class="ct">运维</span></button>
+        </div>
+
+        <!-- 选中水管线 (2px + 90°外凸圆弧弯) -->
+        <svg class="scp" viewBox="0 0 400 300" preserveAspectRatio="none" aria-hidden="true" style="pointer-events:none">
+          <g id="divs" stroke="rgba(26,28,32,.55)" stroke-width="1">
+            <line x1="75" y1="34"  x2="75" y2="98"/>
+            <line x1="75" y1="101" x2="75" y2="165"/>
+            <line x1="75" y1="168" x2="75" y2="232"/>
+            <line x1="75" y1="235" x2="75" y2="299"/>
+          </g>
+          <path id="pipe" class="pipeline" d="M 74 111 L 4 111 Q 1 111 1 114 L 1 178 Q 1 181 4 181 L 74 181"/>
+        </svg>
+
+        <!-- 内容区 -->
+        <div class="content" id="content"></div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- 说明板 -->
+  <div class="panel">
+    <h2>当前选中</h2>
+    <div class="state" id="pstate">游戏 · 中间项</div>
+    <div class="desc" id="pdesc">左竖 + 上横 + 下横，左上、左下各一个外凸弯</div>
+
+    <div class="bend">
+      <svg width="44" height="44" viewBox="0 0 44 44"><path d="M8 4v24a8 8 0 0 0 8 8h24" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div>弯头为 <b>90° 外凸圆弧</b>（像水管拐弯），半径 R3，线宽 2px</div>
+    </div>
+
+    <div class="rules">
+      <span>①</span> 常驻分割线已删除<br>
+      <span>②</span> 一根 2px 管线 = 直线 + 外凸圆弧弯<br>
+      <span>③</span> 顶 / 底自由端为平头<br>
+      <span>④</span> 只围住当前选中图标，无多余延伸线
+    </div>
+
+    <label class="sw"><input type="checkbox" id="hl" checked> 高亮选中线（便于确认）</label>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  const pipe = document.getElementById('pipe');
+  const content = document.getElementById('content');
+  const HL = document.getElementById('hl');
+  var last = 1;
+
+  // 分类应用数据
+  const APPS = {
+    0: [["BBK4980","📖"],["文曲星","📚"],["暴龙机","🐾"],["GB","🎮"],["GBC","🕹️"],["NES","🕹️"],["Arduboy","🛹"],["合计","🧮"],["挂钟","🕐"]],
+    1: [["仙剑","⚔️"],["魂斗罗","🔫"],["马里奥","🍄"],["坦克","💥"],["贪吃蛇","🐍"],["俄罗斯","🧱"],["五子棋","⚪"],["扫雷","💣"]],
+    2: [["文本","📄"],["MP3","🎵"],["收藏","⭐"],["番茄钟","🍅"],["计算","🧮"],["天气","⛅"],["手电","🔦"],["单位","📐"]],
+    3: [["WiFi","📶"],["蓝牙","🛜"],["按键","⌨️"],["屏幕","🖥️"],["系统","⚙️"],["电源","🔋"],["时钟","⏰"],["存储","💾"]]
+  };
+  const NAMES = ["引擎项","游戏·中间","应用·中间","运维·底部"];
+
+  function rectOf(i){ const n=[34,101,168,235][i]; return {ty:n-4, by:n+64+2, L:1, R:3, rx:74, lr:4}; }
+
+  function shape(i){
+    const g=rectOf(i);
+    if(i===0) return "M "+g.L+" "+g.ty+" L "+g.L+" "+(g.by-g.R)+" Q "+g.L+" "+g.by+" "+g.lr+" "+g.by+" L "+g.rx+" "+g.by;
+    if(i===3) return "M "+g.rx+" "+g.ty+" L "+g.lr+" "+g.ty+" Q "+g.L+" "+g.ty+" "+g.L+" "+(g.ty+g.R)+" L "+g.L+" "+g.by;
+    return "M "+g.rx+" "+g.ty+" L "+g.lr+" "+g.ty+" Q "+g.L+" "+g.ty+" "+g.L+" "+(g.ty+g.R)+" L "+g.L+" "+(g.by-g.R)+" Q "+g.L+" "+g.by+" "+g.lr+" "+g.by+" L "+g.rx+" "+g.by";
+  }
+
+  function fill(i){
+    content.innerHTML='';
+    content.classList.remove('apps-fade'); void content.offsetWidth; content.classList.add('apps-fade');
+    APPS[i].forEach(([n,e],k)=>{
+      const d=document.createElement('div');
+      d.className='app'+(k===0?' cur':'');
+      d.innerHTML='<span class="ae">'+e+'</span><span class="an">'+n+'</span>';
+      content.appendChild(d);
+    });
+  }
+
+  function apply(i){
+    last=i;
+    pipe.setAttribute('d', shape(i));
+    /* 完善分割: 选中行让位(隐藏该行竖条), 其他三行右缘保留竖条 */
+    const lines=document.getElementById('divs').children;
+    for(let k=0;k<lines.length;k++) lines[k].style.opacity = (k===i)?'0':'1';
+    const st=i===0?'顶部项':(i===3?'底部项':'中间项');
+    const desc={0:'左竖 + 下横，左下一个外凸弯；竖上端平头',
+                1:'左竖 + 上横 + 下横，左上、左下各一个外凸弯',
+                2:'左竖 + 上横 + 下横，左上、左下各一个外凸弯',
+                3:'左竖 + 上横，左上一个外凸弯；竖下端平头'}[i];
+    document.getElementById('pstate').textContent = NAMES[i]+' · '+st;
+    document.getElementById('pdesc').textContent = desc;
+    ['c0','c1','c2','c3'].forEach((id,k)=>document.getElementById(id).setAttribute('aria-selected', k===i));
+    fill(i);
+  }
+
+  HL.addEventListener('change', e=>pipe.classList.toggle('black', !e.target.checked));
+  document.querySelector('.catside').addEventListener('click', e=>{
+    const b=e.target.closest('.catbtn'); if(b) apply(parseInt(b.dataset.idx,10));
+  });
+
+  function tick(){const d=new Date(),h=String(d.getHours()).padStart(2,'0'),m=String(d.getMinutes()).padStart(2,'0');
+    document.getElementById('clock').textContent=h+':'+m;}
+  tick(); setInterval(tick,20000);
+
+  apply(1);
+})();
+</script>
+</body>
+</html>

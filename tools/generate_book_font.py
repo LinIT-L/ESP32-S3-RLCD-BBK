@@ -2,8 +2,8 @@
 """生成电子书多档 GB2312 点阵字库 (从 macOS 苹果字体渲染)
 
 输入: macOS 系统字体 (Hiragino Sans GB 优先 = 苹果黑体; 可传参指定其它字体)
-输出: components/book_reader/assets/book{size}.fnt (黑体, 默认)
-      components/book_reader/assets/song{size}.fnt (宋体, 传 Songti 路径 + 后缀 song)
+输出: components/engines/book_reader/assets/book{size}.fnt (黑体, 默认)
+      components/engines/book_reader/assets/song{size}.fnt (宋体, 传 Songti 路径 + 后缀 song)
       SD 字体: python3 generate_book_font.py <任意字体> <名称> 20 → <名称>20.fnt
       (只生成指定单字号, 放进 /sdcard/fonts/ 即可用)
       (二进制: 32B 头 + ASCII + GB2312 偏移表 + GB2312 字形 + Unicode 索引表)
