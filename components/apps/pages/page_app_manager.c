@@ -195,6 +195,17 @@ static int am_focus_row(void) {
     return s_view_grid ? (s_focus / AM_GRID_COLS) : s_focus;
 }
 
+/* ★ 2026-10-02 焦点可见化 (linit 反馈: 焦点移到左侧分类栏时"没有任何指示",
+ *   而右侧内容首项一直反色 → 分不清焦点在哪一层)。
+ *   根因: `s_focus_bar` 只驱动导航 (p_am_action); 渲染侧原先**只有顶部子分类**用了它,
+ *   内容区 sel 恒按 `s_focus`、左栏框恒按 `s_cat` —— 两处标记都不代表"焦点"。
+ *   现在渲染与导航同源: **只有焦点在内容区时才反色**; 焦点在别处时内容只留 1px
+ *   下划线做"弱定位"(表示按 RIGHT/DOWN 会回到哪一项)。 */
+static bool am_focus_on_content(void) { return s_focus_bar == 0; }
+static bool am_weak_mark(int i) {
+    return !input_scheme_touch() && !am_focus_on_content() && (i == s_focus);
+}
+
 /* 重建右侧列表.
  * keep_cam=true  (从应用返回): 保留当前滚动位置, 仅当焦点已滚出视野才把相机拉回焦点行.
  *   修复"触摸点开第二排的应用, 退出后第一排消失、第二排顶到第一排" —— 触摸换焦点时
@@ -680,7 +691,7 @@ static void am_col_render_grid(void) {
             int i = row * AM_GRID_COLS + col;
             if (i >= s_list_n) break;
             int cx = gx0 + col * cell_w + cell_w / 2;
-            bool sel = !input_scheme_touch() && (i == s_focus);
+            bool sel = !input_scheme_touch() && am_focus_on_content() && (i == s_focus);
             const os_app_t *a = s_list[i];
             am_col_icon(cx, cy, AM_ICON_SIZE, a ? a->icon_idx : 0);
             if (s_list_vis[i]) am_col_dot(cx, cy, AM_ICON_SIZE);
@@ -689,6 +700,8 @@ static void am_col_render_grid(void) {
             int ly = cy + AM_ICON_SIZE / 2 + 2;
             if (sel) am_col_fill(cx - lw / 2, ly, cx + lw / 2 - 1, ly + ZH16_FONT_H - 1, true);
             am_col_label(cx, ly, nm, sel);
+            if (am_weak_mark(i))   /* 焦点不在内容区 → 1px 下划线弱定位 (不反色) */
+                am_col_hline(cx - lw / 2, cx + lw / 2 - 1, ly + ZH16_FONT_H, true);
         }
     }
 }
@@ -697,10 +710,12 @@ static void am_col_render_list(void) {
     s_col_h = s_list_n * row_h;
     for (int i = 0; i < s_list_n; i++) {
         int y = i * row_h;
-        bool sel = !input_scheme_touch() && (i == s_focus);
+        bool sel = !input_scheme_touch() && am_focus_on_content() && (i == s_focus);
         if (sel) am_col_fill(2, y, AM_COL_W - 2, y + row_h - 2, true);
         else     am_col_fill(2, y, AM_COL_W - 2, y + row_h - 2, false);
         if (i > 0) am_col_fill(2, y, AM_COL_W - 2, y, true);   /* 行间分隔线 */
+        if (am_weak_mark(i))   /* 弱定位: 行底 1px 下划线 */
+            am_col_hline(3, AM_COL_W - 4, y + row_h - 4, true);
         const os_app_t *a = s_list[i];
         const char *nm = a ? a->label : "?";
         const char *id = a ? a->id : "";
@@ -804,7 +819,7 @@ static void p_am_render(ui_ctx_t *ctx) {
                     int i = row * AM_GRID_COLS + col;
                     if (i < 0 || i >= s_list_n) continue;
                     int cx = grid_start_x + col * cell_w + cell_w / 2;
-                    bool sel = !input_scheme_touch() && (i == s_focus);
+                    bool sel = !input_scheme_touch() && am_focus_on_content() && (i == s_focus);
                     const os_app_t *a = s_list[i];
                     am_draw_app_icon(ctx, lcd, a, cx, y_center, AM_ICON_SIZE, sel);
                     if (s_list_vis[i]) am_draw_mainmenu_dot(lcd, cx, y_center, AM_ICON_SIZE);
@@ -813,6 +828,8 @@ static void p_am_render(ui_ctx_t *ctx) {
                     int ly = y_center + AM_ICON_SIZE / 2 + 2;
                     if (sel) fill_rect(lcd, cx - lw / 2, ly, cx + lw / 2 - 1, ly + ZH16_FONT_H - 1, ST7305_COLOR_BLACK);
                     am_draw_label(lcd, cx, ly, nm, sel);
+                    if (am_weak_mark(i))
+                        draw_hline(lcd, cx - lw / 2, cx + lw / 2 - 1, ly + ZH16_FONT_H, ST7305_COLOR_BLACK);
                 }
             }
         } else {
@@ -828,10 +845,12 @@ static void p_am_render(ui_ctx_t *ctx) {
                 int y = content_top + (int)(((float)i - cam) * row_h);
                 if (y + row_h > UI_SCREEN_H) break;
                 if (y < content_top) continue;
-                bool sel = !input_scheme_touch() && (i == s_focus);
+                bool sel = !input_scheme_touch() && am_focus_on_content() && (i == s_focus);
                 if (sel) fill_rect(lcd, grid_x0 + 2, y, UI_SCREEN_W - 2, y + row_h - 2, ST7305_COLOR_BLACK);
                 else     fill_rect(lcd, grid_x0 + 2, y, UI_SCREEN_W - 2, y + row_h - 2, ST7305_COLOR_WHITE);
                 if (i > first) fill_rect(lcd, grid_x0 + 2, y, UI_SCREEN_W - 2, y, ST7305_COLOR_BLACK);
+                if (am_weak_mark(i))
+                    draw_hline(lcd, grid_x0 + 3, UI_SCREEN_W - 4, y + row_h - 4, ST7305_COLOR_BLACK);
                 const os_app_t *a = s_list[i];
                 const char *nm = a ? a->label : "?";
                 const char *id = a ? a->id : "";
@@ -929,6 +948,22 @@ static void p_am_render(ui_ctx_t *ctx) {
         draw_hline(lcd, lx + w1 + R, rx - R, by + 1, ST7305_COLOR_BLACK);
     }
 
+    /* ★ 2026-10-02 焦点在**左侧分类栏**时, 把包围框向外加粗 2px (2px 水管 → 4px):
+     *   与"内容区取消反色"配对 —— 任何时刻只有一处是强指示, 一眼看出焦点在哪层。
+     *   纯附加绘制 (只往更外侧多画两行/两列), 不动原有管线的几何与拐角。 */
+    if (s_focus_bar == 2) {
+        draw_vline(lcd, lx - 1, lty0, lby1, ST7305_COLOR_BLACK);
+        draw_vline(lcd, lx - 2, lty0, lby1, ST7305_COLOR_BLACK);
+        if (!is_top) {
+            draw_hline(lcd, lx + w1 + R - 2, rx - R, ty - 1, ST7305_COLOR_BLACK);
+            draw_hline(lcd, lx + w1 + R - 2, rx - R, ty - 2, ST7305_COLOR_BLACK);
+        }
+        if (!is_bot) {
+            draw_hline(lcd, lx + w1 + R - 2, rx - R, by + w1 + 1, ST7305_COLOR_BLACK);
+            draw_hline(lcd, lx + w1 + R - 2, rx - R, by + w1 + 2, ST7305_COLOR_BLACK);
+        }
+    }
+
     /* 四角 R3 外凸圆弧弯头 (接触分割线的是右上/右下, 用 kind3/kind4) */
     if (!is_top) { /* 上两角: 仅非顶部项 */
         am_elbow(lcd, lx, ty, R, 1, ST7305_COLOR_BLACK);   /* 左上: 外凸向左上 */
@@ -959,7 +994,9 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
         case OS_ACTION_BACK:
         case OS_ACTION_LEFT:
         case OS_ACTION_HOME:
-            s_focus_bar = 0; break;
+            s_focus_bar = 0;
+            s_col_dirty = true;   /* ★ 回内容区 → 恢复反色, 须重渲染整列 */
+            break;
         default: break;
         }
         ctx->needs_redraw = true;
@@ -984,17 +1021,22 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
     }
     switch (a) {
     case OS_ACTION_UP:
+        /* ★ 2026-10-02: 到顶**不再停在内容**。原来这里的注释写"已无顶部子分类条",
+         *   但实现相反 —— 顶部子分类条(应用/商店)确实画出来了 (am_draw_subbar, 见 760 行)。
+         *   而且 `s_focus_bar` 全文件从未被赋 1 → 手柄/键盘**永远够不到**子分类层,
+         *   492 行那处"子分类聚焦 U 形括号"因此是死代码。现在补上这一跳(三层贯通)。 */
         if (s_view_grid) {
             if (s_focus >= AM_GRID_COLS) {
                 s_focus -= AM_GRID_COLS;
                 am_gcam_animate(s_focus / AM_GRID_COLS, 300);
                 s_col_dirty = true;   /* 选中行变 → 重渲染整列 */
             } else {
-                s_focus_bar = 0;   /* 到顶 → 停在内容 (已无顶部子分类条) */
+                s_focus_bar = am_has_sub() ? 1 : 0;   /* 有子分类条就上去, 否则停住 */
+                s_col_dirty = true;                   /* 内容改画"弱定位" */
             }
         } else {
             if (s_focus > 0) { s_focus--; am_gcam_animate(s_focus, 260); s_col_dirty = true; }
-            else s_focus_bar = 0;   /* 到顶 → 停在内容 (已无顶部子分类条) */
+            else { s_focus_bar = am_has_sub() ? 1 : 0; s_col_dirty = true; }
         }
         ctx->needs_redraw = true;
         break;
@@ -1014,6 +1056,7 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
         /* 内容已到最左列 → 跳到左侧分类栏 */
         if (s_view_grid ? (s_focus % AM_GRID_COLS == 0) : (s_focus == 0)) {
             s_focus_bar = 2;
+            s_col_dirty = true;   /* ★ 焦点离开内容区 → 内容改画"弱定位", 须重渲染整列 */
             ctx->needs_redraw = true;
             break;
         }
