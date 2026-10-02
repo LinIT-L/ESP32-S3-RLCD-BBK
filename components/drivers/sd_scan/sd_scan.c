@@ -1069,7 +1069,8 @@ static int sd_full_remount(uint8_t format_if_needed) {
 static volatile bool s_fmt_running = false;
 static volatile int  s_fmt_pct     = 0;
 static volatile int  s_fmt_result  = 0;
-static volatile const char *s_fmt_stage = "";
+/* ⚠ volatile 要加在**指针本身**上: 是"别的任务会换掉这个指针", 不是"内容可变" */
+static const char * volatile s_fmt_stage = "";
 
 bool sd_format_is_running(void) { return s_fmt_running; }
 int  sd_format_pct(void)        { return s_fmt_pct; }

@@ -68,14 +68,18 @@ typedef struct {
     int   fn_mode;           /* 0=数字 1=F1-F12 2=符号 */
 } kbd_t;
 
-/* 标准 52 键布局(全屏宽)实例 */
-extern const kbd_t kbd_std;
+/* 标准 52 键布局(全屏宽)实例.
+ * ⚠ 必须**非 const**: kbd_t 里的 caps/shift/fn_mode 是可变状态, kbd_press() 会写它。
+ *   申明成 const 会被放进 .flash.rodata(flash 映射**只读**) → 按 Caps/Shift/Fn
+ *   就是往只读内存写 = 未定义行为(在 S3 上触发异常)。page_keymanager 曾直接传
+ *   &kbd_std, 于是这两个 -Wdiscarded-qualifiers 告警其实是真 bug 的报警。 */
+extern kbd_t kbd_std;
 
 /* 编辑键盘布局(全屏宽, 收藏夹/编辑场景用):
  * 整体行高压低 1/3(KBD_EDIT_ROW), 删除并入退格键, 原删除位改为空格, 回车改名.
  * 用于需要"编辑输入"但空间受限的界面. */
 #define KBD_EDIT_ROW 19            /* 压低 1/3 (原 29) */
-extern const kbd_t kbd_edit;
+extern kbd_t kbd_edit;   /* 同上: 含可变状态, 不可 const */
 /* 编辑键盘排高: 绘制/命中用 KBD_EDIT_ROW 而非 KBD_ROW */
 void kbd_draw_edit(st7305_handle_t* l, int base_y, const kbd_t* k, int press);
 int  kbd_hit_edit(const kbd_t* k, int base_y, int sx, int sy);

@@ -28,10 +28,11 @@ static const kbd_key_t s_keys[] = {
 };
 #define KBD_N (sizeof(s_keys)/sizeof(s_keys[0]))
 
-const kbd_t kbd_std = { s_keys, (int)KBD_N, ST7305_WIDTH, false, false, 0 };
+/* ⚠ 非 const (见 keyboard.h): 键位表 s_keys 仍是 const, 但 caps/shift/fn_mode 会被改动 */
+kbd_t kbd_std = { s_keys, (int)KBD_N, ST7305_WIDTH, false, false, 0 };
 
 /* 编辑键盘布局 (复用 s_keys 键位几何, 仅用 KBD_EDIT_ROW 排高绘制/命中) */
-const kbd_t kbd_edit = { s_keys, (int)KBD_N, ST7305_WIDTH, false, false, 0 };
+kbd_t kbd_edit = { s_keys, (int)KBD_N, ST7305_WIDTH, false, false, 0 };
 
 /* ===== 按压逻辑: 对 Caps/Shift/Fn 翻转内部状态, 其余返回动作码 ===== */
 int kbd_press(kbd_t* k, int idx){
