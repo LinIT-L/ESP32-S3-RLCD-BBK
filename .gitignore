@@ -58,3 +58,24 @@ __pycache__/
 *.pyc
 .engine_backup/
 *.spec.md
+
+# ===== 版本管理整合 (2026-10-02): 快照/归档/暂存 一律不入库 =====
+# 这些目录是"重构期间的历史快照", 内容已被 git 历史取代 —— 留在本地做回滚参考即可
+backup_*/
+.trash_*/
+*.bak_*
+*.orig
+*.rej
+
+# 构建 apps(SPIFFS) 分区的暂存目录 (由 tools 脚本生成)
+lua_fs/
+tf_stage/
+
+# 代理/编辑器配置
+.trae/
+.cursor/
+
+# 调试抓取产物 (串口/唤醒/内存)
+sleep_monitor.txt
+wake_capture.txt
+*_capture.txt
