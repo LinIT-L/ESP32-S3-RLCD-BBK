@@ -353,7 +353,8 @@ void app_main(void)
     svc_log_init();
     /* ★ 版本管理整合 (2026-10-02): 开机横幅带版本 + git 提交 + 构建时刻。
      * 烧录后一眼可确认"设备里跑的到底是哪一版/哪个提交" (串口日志即可)。 */
-    ESP_LOGI(TAG, "==== LinTOS %s (%s) ====", os_version_str(), os_version_name());
+    ESP_LOGI(TAG, "==== LinTOS 对外 %s / 内部 %s (%s) ====",
+             os_version_public(), os_version_full(), os_version_name());
     ESP_LOGI(TAG, "     date=%s  build=%s  git=%s",
              os_version_date(), os_build_stamp(), os_git_desc());
     /* 唤醒来源诊断延后到 os_boot_shell(USB 重新枚举完成后)打印, 否则早期日志会丢 */

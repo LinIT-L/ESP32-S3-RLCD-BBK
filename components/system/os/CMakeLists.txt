@@ -54,9 +54,25 @@ endif()
 if(NOT LINTOS_GIT_DESC)
     set(LINTOS_GIT_DESC "unknown")
 endif()
+
+# 内部迭代号 = 距最近 tag 的提交数 (git describe 的 "-N-"), 让"细粒度"自动来, 不必手改版本号。
+# 没有任何 tag 时退化为"总提交数", 仍是单调递增, 一样能用。
+if(LINTOS_GIT_DESC MATCHES "^v[0-9]+\\.[0-9]+\\.[0-9]+-([0-9]+)-g")
+    set(LINTOS_GIT_ITER "${CMAKE_MATCH_1}")
+elseif(LINTOS_GIT_EXECUTABLE)
+    execute_process(COMMAND ${LINTOS_GIT_EXECUTABLE} rev-list --count HEAD
+                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                    OUTPUT_VARIABLE LINTOS_GIT_ITER
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+if(NOT LINTOS_GIT_ITER)
+    set(LINTOS_GIT_ITER "0")
+endif()
+
 string(TIMESTAMP LINTOS_BUILD_STAMP "%Y-%m-%d %H:%M")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     LINTOS_GIT_DESC="${LINTOS_GIT_DESC}"
+    LINTOS_GIT_ITER="${LINTOS_GIT_ITER}"
     LINTOS_BUILD_STAMP="${LINTOS_BUILD_STAMP}"
 )
-message(STATUS "[LinTOS] 版本 1.7.0 / git=${LINTOS_GIT_DESC} / build=${LINTOS_BUILD_STAMP}")
+message(STATUS "[LinTOS] 内部 1.3.1+${LINTOS_GIT_ITER} (对外 1.3) / git=${LINTOS_GIT_DESC} / build=${LINTOS_BUILD_STAMP}")
