@@ -4,106 +4,33 @@
 <meta charset="utf-8">
 <title>BIOS 模拟器 · 装机与固件选项学习台（LinTOS 外置应用）</title>
 <style>
-  :root{
-    --bg:#1a1c20; --panel:#23262c; --line:#3a3f47; --dim:#8b929c; --fg:#e8eaed;
-    --ok:#2ecc71; --no:#e74c3c; --warn:#f1c40f; --acc:#4a9eff;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);
-       font:13px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
-  .wrap{max-width:1280px;margin:0 auto;padding:14px 16px 40px}
-  h1{font-size:15px;font-weight:500;margin:0 0 2px}
-  .sub{color:var(--dim);font-size:12px;margin-bottom:12px}
-  .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
-  select,button{font:12px inherit;color:var(--fg);background:var(--panel);
-       border:1px solid var(--line);border-radius:6px;padding:5px 9px;cursor:pointer}
-  button:hover,select:hover{border-color:var(--acc)}
-  button.primary{background:#26456e;border-color:#3b6ea8}
-  .layout{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
-  .monitor{flex:0 0 660px;max-width:660px;background:#0b0d10;border:1px solid #000;
-       border-radius:10px;padding:10px;box-shadow:inset 0 0 0 2px #2b2f36}
-  .screen{height:430px;overflow:hidden;font-family:"SF Mono",Menlo,Consolas,monospace;
-       font-size:12px;line-height:1.5;white-space:pre;padding:8px 10px;border-radius:4px}
-  .hintbar{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px;color:var(--dim);font-size:11px}
-  kbd{background:#2b2f36;border:1px solid #444a53;border-bottom-width:2px;border-radius:4px;
-       padding:1px 5px;font:11px "SF Mono",Menlo,monospace;color:var(--fg)}
-  aside{flex:1 1 340px;min-width:300px;display:flex;flex-direction:column;gap:12px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
-  .card h2{font-size:13px;font-weight:500;margin:0 0 8px;display:flex;gap:8px;align-items:center}
-  .card h2 .tag{font-size:11px;color:var(--dim);font-weight:400}
-  .rules{list-style:none;margin:0;padding:0}
-  .rules li{display:flex;gap:8px;padding:5px 0;border-bottom:1px dashed #31353c;font-size:12px}
-  .rules li:last-child{border-bottom:0}
-  .rules .ic{flex:0 0 16px;text-align:center;font-weight:700}
-  .rules .t{flex:1}
-  .rules .now{color:var(--dim);font-size:11px}
-  .verdict{margin-top:8px;padding:9px 11px;border-radius:6px;font-size:12.5px;
-       border:1px solid;white-space:pre-wrap}
-  .verdict.y{background:#12331f;border-color:#1f6b3f}
-  .verdict.n{background:#331616;border-color:#7a2b2b}
-  .verdict.w{background:#332c10;border-color:#7a6420}
-  .score{font-size:12px;color:var(--dim);margin-top:6px}
-  .why{font-size:12px;color:var(--dim);margin-top:6px}
-  .why b{color:var(--fg);font-weight:500}
-  pre#selftest-out{background:#12141a;border:1px solid var(--line);border-radius:6px;
-       padding:10px;max-height:340px;overflow:auto;font-size:11.5px;white-space:pre-wrap}
-  .hide{display:none!important}
-  footer{margin-top:14px;color:var(--dim);font-size:11.5px}
+  /* 纯黑白 + 全屏: 模拟掌机 ST7305 1bpp 屏, 只用 #000 / #fff */
+  html,body{margin:0;padding:0;background:#000;overflow:hidden}
+  #scr{position:absolute;left:0;top:0;width:100vw;height:100vh;
+       margin:0;box-sizing:border-box;padding:6px 8px;
+       white-space:pre;overflow:hidden;
+       font:13px/1.15 "SF Mono",Menlo,Consolas,"PingFang SC",monospace;
+       font-variant-ligatures:none}
+  /* 深色屏(黑底白字) / 浅色屏(白底黑字) —— 都由脚本切换 */
+  .scr-dark {background:#000;color:#fff}
+  .scr-light{background:#fff;color:#000}
+  .scr-dark  .inv{background:#fff;color:#000}    /* 反色高亮 */
+  .scr-light .inv{background:#000;color:#fff}
+  /* 弹窗覆盖层: 同样纯黑白, 居中 */
+  #dlg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+       margin:0;box-sizing:border-box;padding:8px 10px;
+       white-space:pre;overflow:hidden;
+       font:13px/1.15 "SF Mono",Menlo,Consolas,"PingFang SC",monospace;
+       font-variant-ligatures:none;
+       border:2px solid currentColor;z-index:9}
+  #dlg.hide{display:none}
+  #selftest-out{position:absolute;left:-99999px;top:0;white-space:pre}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>BIOS 模拟器 · 装机与固件选项学习台</h1>
-  <div class="sub">模拟 4 家厂商的 BIOS 界面（AMI Aptio / Award-Phoenix / Dell / ThinkPad），
-    练 Boot / CSM / Secure Boot / TPM / SATA(AHCI·RST·IDE) / AMT 这些装机必改项。
-    全键盘操作，右下角有任务与判定。</div>
-
-  <div class="toolbar">
-    <span style="color:var(--dim)">厂商皮肤</span>
-    <select id="brand"></select>
-    <span style="color:var(--dim)">学习任务</span>
-    <select id="task"></select>
-    <button id="btn-check" class="primary">检查这台机器（Enter 也走完流程）</button>
-    <button id="btn-reset">恢复这台机器的默认值</button>
-    <button id="btn-selftest">跑自测（不开浏览器也能验）</button>
-  </div>
-
-  <div class="layout">
-    <div class="monitor">
-      <div class="screen" id="scr" tabindex="0"></div>
-      <div class="hintbar">
-        <span><kbd>↑↓←→</kbd>移动</span><span><kbd>Enter</kbd>进入/确认</span>
-        <span><kbd>+</kbd><kbd>-</kbd>改值</span><span><kbd>Esc</kbd>返回</span>
-        <span><kbd>F1</kbd>帮助</span><span><kbd>F5</kbd>刷新</span>
-        <span><kbd>F9</kbd>默认值</span><span><kbd>F10</kbd>保存并退出</span>
-        <span><kbd>Tab</kbd>切一级菜单</span>
-      </div>
-    </div>
-
-    <aside>
-      <div class="card">
-        <h2>任务目标 <span class="tag" id="task-name"></span></h2>
-        <div class="why" id="task-brief"></div>
-        <ul class="rules" id="rules"></ul>
-        <div class="verdict" id="verdict"></div>
-        <div class="score" id="score"></div>
-      </div>
-      <div class="card">
-        <h2>帮助 / 说明 <span class="tag">F1 或鼠标悬停</span></h2>
-        <div class="why" id="help">把光标移到某一项上，按 <kbd>F1</kbd> 看这一项到底影响什么。</div>
-      </div>
-      <div class="card" id="selftest-card">
-        <h2>自测 <span class="tag">引擎与按键流程断言</span></h2>
-        <pre id="selftest-out">点"跑自测"。</pre>
-      </div>
-    </aside>
-  </div>
-
-  <footer>
-    说明：界面按真实 BIOS 的菜单结构与选项名还原，但**不是**任何厂商固件，改这里不会影响你的真机。
-    想练真机前先在模拟器上把顺序走熟：<b>先定 Boot Mode/CSM → 再定 Secure Boot / TPM → 最后定 SATA 模式</b>。
-  </footer>
-</div>
+<pre id="scr" class="scr-dark"></pre>
+<pre id="dlg" class="hide"></pre>
+<pre id="selftest-out"></pre>
 
 <script>
 /* ============================================================================
@@ -184,28 +111,28 @@ const BRANDS = {
     label:'AMI Aptio（台机主板通用，蓝底）',
     layout:'topmenu', title:'Aptio Setup Utility - Copyright (C) 2021 American Megatrends, Inc.',
     fbar:'F1 Help   +/- Change   Enter Select   F9 Defaults   F10 Save & Exit   ESC Exit',
-    css:{ bg:'#0000a8', fg:'#dcdcdc', inv:'#dcdcdc', invfg:'#0000a8', ro:'#8a8a8a', bar:'#c8c8c8', barfg:'#0000a8', line:'#4a4a9a' },
+    mono:'dark',  /* 黑底白字 */
     menus:['Main','Advanced','Security','Boot','Exit'],
   },
   award: {
     label:'Award / Phoenix（老主机与品牌机常见，深蓝底黄字）',
     layout:'leftmenu', title:'CMOS Setup Utility - Copyright (C) 1984-2005 Award Software',
     fbar:'ESC:Quit  ↑↓→←:Select  F10:Save & Exit Setup  F9:Load Defaults  F1:Help',
-    css:{ bg:'#00007a', fg:'#e8d27a', inv:'#e8d27a', invfg:'#00007a', ro:'#9a8f5a', bar:'#e8d27a', barfg:'#00007a', line:'#2b2b8f' },
+    mono:'dark',  /* 黑底白字 */
     menus:['Standard CMOS Features','Advanced BIOS Features','Advanced Chipset Features','Integrated Peripherals','Power Management Setup','PnP/PCI Configurations','PC Health Status','Load Fail-Safe Defaults','Save & Exit Setup'],
   },
   dell: {
     label:'Dell（OptiPlex/Latitude 灰白底黑字）',
     layout:'leftmenu', title:'Dell BIOS Setup   |   Settings   System Information',
     fbar:'↑↓ Select   Enter Select   +/- Change   Esc Exit   F9 Defaults   F10 Save & Exit',
-    css:{ bg:'#e8e8e8', fg:'#101010', inv:'#101010', invfg:'#e8e8e8', ro:'#7a7a7a', bar:'#101010', barfg:'#e8e8e8', line:'#b0b0b0' },
+    mono:'light', /* 白底黑字 (这一家真机就是浅色界面) */
     menus:['General','System Configuration','Video','Security','Secure Boot','Performance','Power Management','POST Behavior','Virtualization Support','Maintenance','System Logs','Exit'],
   },
   thinkpad: {
     label:'Lenovo ThinkPad（黑底白字）',
     layout:'leftmenu', title:'ThinkPad Setup   Copyright (C) 2021 Lenovo',
     fbar:'↑↓  Select   Enter  Select   +/-  Change   Esc  Exit   F9  Defaults   F10  Save & Exit',
-    css:{ bg:'#101010', fg:'#f0f0f0', inv:'#f0f0f0', invfg:'#101010', ro:'#8a8a8a', bar:'#f0f0f0', barfg:'#101010', line:'#3a3a3a' },
+    mono:'dark',  /* 黑底白字 */
     menus:['Config','Date/Time','Security','Startup','Restart'],
   },
 };
@@ -386,6 +313,9 @@ let S = freshCfg();
 let brand = 'ami', page = 'Main', cur = 0, helpOpen = false, dirty = false, msg = '';
 let nav = [];              /* 子菜单栈: ['SATA Configuration'] 表示正停在该子菜单里 */
 let boEdit = false, boSel = 0;   /* 引导顺序页: 是否进入编辑态 + 光标在第几项 */
+let mode = 'boot';         /* 'boot'=打开程序时的选择屏; 'bios'=全屏 BIOS 界面 */
+let bootStep = 0, bootCur = 0;   /* 选择屏: 0=选厂商, 1=选场景 */
+let dlgKind = null;        /* 弹窗: null / 'help' / 'check' */
 let task = 'win11';
 
 const cfgGet  = k => (ITEMS[k].ro ? 0 : S.cfg[k]);
@@ -435,6 +365,7 @@ function keyToAction(e){
   if (k === 'Escape') return 'esc';
   if (k === 'Tab') return 'tab';
   if (k === 'F1') return 'f1';
+  if (k === 'F8') return 'f8';
   if (k === 'F9') return 'f9';
   if (k === 'F10') return 'f10';
   if (k === '+' || k === '=' || k === 'PageUp') return 'inc';
@@ -444,6 +375,27 @@ function keyToAction(e){
 }
 
 function doAction(a){
+  /* ---- 打开程序时的选择屏: 两步选择 ---- */
+  if (mode === 'boot'){
+    if (a === 'up')   { bootCur = Math.max(0, bootCur - 1); }
+    else if (a === 'down'){ bootCur = Math.min((bootStep === 0 ? Object.keys(BRANDS).length : Object.keys(TASKS).length) - 1, bootCur + 1); }
+    else if (a === 'esc'){
+      if (bootStep === 1){ bootStep = 0; bootCur = Object.keys(BRANDS).indexOf(brand); }
+    }
+    else if (a === 'enter' || a === 'right'){
+      if (bootStep === 0){
+        brand = Object.keys(BRANDS)[bootCur];
+        page = BRANDS[brand].menus[0]; nav = []; cur = 0;
+        bootStep = 1; bootCur = 0;
+      } else {
+        task = Object.keys(TASKS)[bootCur];
+        mode = 'bios'; msg = '按 Enter 改值; F1 看说明; F8 检查; F10 保存并退出';
+      }
+    }
+    render(); return;
+  }
+  /* ---- BIOS 界面 ---- */
+  if (dlgKind && a === 'esc'){ dlgKind = null; render(); return; }   /* 先关弹窗 */
   if (helpOpen && a !== 'f1' && a !== 'esc') helpOpen = false;
   const rowsArr = rows();
   const R = rowsArr[cur];
@@ -497,16 +449,15 @@ function doAction(a){
       else if (R.kind === 'item'){ if (!R.ro) setCfg(R.key, S.cfg[R.key] + 1); }
       break;
     case 'esc':
-      if (popSub()) msg = 'Esc：退回上一级菜单';
-      else if (nav.length) msg = 'Esc：退回上级';
-      else msg = 'Esc：退回上一级（模拟）';
+      if (popSub()) msg = '退回上一级菜单';
+      else { mode = 'boot'; bootStep = 0; bootCur = Object.keys(BRANDS).indexOf(brand); msg = ''; }  /* 最外层 Esc = 回开机选择 */
       break;
-    case 'f1':   helpOpen = !helpOpen;
-      if (R) document.getElementById('help').innerHTML =
-        `<b>${esc(R.label)}</b><br>${esc(R.help || '（此项无额外说明）')}`;
-      break;
-    case 'f9':   S = freshCfg(); dirty = true; nav = []; msg = 'F9：已载入默认值'; break;
-    case 'f10':  S.saved = true; dirty = false; msg = 'F10：保存并退出（模拟重启）'; break;
+    case 'f1':   dlgKind = (dlgKind === 'help') ? null : 'help'; break;
+    case 'f8':   dlgKind = (dlgKind === 'check') ? null : 'check'; break;
+    case 'f9':   S = freshCfg(); dirty = true; nav = []; msg = '已载入默认值'; break;
+    case 'f10':  S.saved = true; dirty = false; nav = [];
+                 mode = 'boot'; bootStep = 0; bootCur = Object.keys(BRANDS).indexOf(brand);   /* 保存退出 = 重启回开机选择 */
+                 break;
   }
   render();
 }
@@ -541,106 +492,202 @@ function evaluate(cf, taskId){
 /* ============================================================================
  * 渲染
  * ==========================================================================*/
+/* ============================================================================
+ * 渲染层：掌机风格 —— 纯黑白、全屏字符网格（模拟 ST7305 1bpp 屏）
+ * ==========================================================================*/
 const scr = document.getElementById('scr');
-const COLS = 84;   /* 一行 84 个等宽字符: 实测配 660px 监视器 + 12px 等宽字刚好; 再多会被右边裁掉 */
+const dlg = document.getElementById('dlg');
+let COLS = 84, ROWS = 30;      /* 由窗口尺寸实时算出, 见 measureGrid() */
+
+/* 中文占 2 格 —— 必须按**显示宽度**排版, 否则汉字后面的对齐全是错的 */
+function dw(s){
+  let w = 0;
+  for (const ch of String(s)){
+    const c = ch.codePointAt(0);
+    const wide = (c >= 0x1100 && (c <= 0x115f || c === 0x2329 || c === 0x232a ||
+                 (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
+                 (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe6f) ||
+                 (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6) ||
+                 (c >= 0x20000 && c <= 0x3fffd)));
+    w += wide ? 2 : 1;
+  }
+  return w;
+}
+function cutW(s, n){                    /* 按显示宽度截断 */
+  let r = '', w = 0;
+  for (const ch of String(s)){ const c = dw(ch); if (w + c > n) break; r += ch; w += c; }
+  return r;
+}
+function padW(s, n){ s = cutW(s, n); while (dw(s) < n) s += ' '; return s; }
+function wrapW(text, w){                 /* 按显示宽度折行 */
+  const out = [];
+  for (const para of String(text).split('\n')){
+    let line = '';
+    for (const ch of para){
+      if (dw(line) + dw(ch) > w){ out.push(line); line = ''; }
+      line += ch;
+    }
+    out.push(line);
+  }
+  return out;
+}
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
-function pad(s,n){ s = String(s); while (s.length < n) s += ' '; return s; }
+function L(text, inv){ return inv ? `<span class="inv">${esc(text)}</span>` : esc(text); }
+function mid(text, w){ const n = Math.max(0, Math.floor((COLS - dw(text)) / 2) - Math.floor((w - dw(text)) / 2)); return ' '.repeat(n) + text; }
 
-function render(){
-  const B = BRANDS[brand], C = B.css;
-  scr.style.background = C.bg; scr.style.color = C.fg;
+function measureGrid(){
+  const cs = getComputedStyle(scr);
+  const probe = document.createElement('span');
+  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;font:' + cs.font;
+  probe.textContent = 'M'.repeat(200);
+  document.body.appendChild(probe);
+  const cw = probe.getBoundingClientRect().width / 200;
+  document.body.removeChild(probe);
+  const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.15;
+  COLS = Math.max(40, Math.floor((window.innerWidth  - 18) / cw));
+  ROWS = Math.max(14, Math.floor((window.innerHeight - 14) / lh));
+}
+function setMono(){
+  scr.className = (BRANDS[brand].mono === 'light') ? 'scr-light' : 'scr-dark';
+  dlg.className = (BRANDS[brand].mono === 'light' ? 'scr-light' : 'scr-dark') + (dlgKind ? '' : ' hide');
+}
+
+/* ---- 开机选择屏：打开程序时先选（厂商 → 场景） ---- */
+function renderBoot(){
+  const out = [];
+  out.push('');
+  out.push(mid('BIOS 模拟器  装机学习台', 22));
+  out.push(mid('400x300  1bpp', 13));
+  out.push('');
+  if (bootStep === 0){
+    out.push(padW('  第 1 步 / 2   选择 BIOS 厂商界面', COLS));
+    out.push('');
+    Object.keys(BRANDS).forEach((k, i) => {
+      const it = BRANDS[k];
+      out.push(L(padW(`   ${i === bootCur ? '▶' : ' '} ${it.label}`, COLS), i === bootCur));
+    });
+  } else {
+    out.push(padW(`  第 2 步 / 2   厂商: ${BRANDS[brand].label}`, COLS));
+    out.push(padW('  选择要练的装机场景', COLS));
+    out.push('');
+    Object.keys(TASKS).forEach((k, i) => {
+      out.push(L(padW(`   ${i === bootCur ? '▶' : ' '} ${TASKS[k].label}`, COLS), i === bootCur));
+    });
+  }
+  while (out.length < ROWS - 1) out.push('');
+  out.push(padW('  ↑↓ 选择     Enter 进入     Esc 返回', COLS));
+  scr.className = 'scr-dark';
+  scr.innerHTML = out.slice(0, ROWS).join('\n');
+}
+
+/* ---- 全屏 BIOS 界面（无边框、无按键提示条） ---- */
+function renderBios(){
+  setMono();
+  const B = BRANDS[brand];
   const rowsArr = rows();
-  if (cur >= rowsArr.length) cur = Math.max(0, rowsArr.length-1);
-  let out = '';
+  if (cur >= rowsArr.length) cur = Math.max(0, rowsArr.length - 1);
+  const out = [];
 
-  /* 标题栏 */
-  out += `<span style="color:${C.invfg};background:${C.inv}">${esc(pad(' ' + B.title, COLS))}</span>\n`;
-  out += `<span style="color:${C.line}">${'─'.repeat(COLS)}</span>\n`;
+  out.push(L(padW(' ' + B.title, COLS), true));           /* 标题栏: 反色 */
+  out.push('─'.repeat(COLS));
 
   if (B.layout === 'topmenu'){
-    /* AMI 风格：顶部横排一级菜单 */
-    const menus = B.menus;
     let bar = '';
-    for (const m of menus){
-      const on = (m === page);
-      bar += on ? `<span style="color:${C.invfg};background:${C.inv}">${esc(' ' + m + ' ')}</span>` : `<span>${esc(' ' + m + ' ')}</span>`;
+    for (const m of B.menus) bar += (m === page) ? `<@INV>${esc(padW(' ' + m + ' ', dw(m) + 2))}</@INV>` : esc(padW(' ' + m + ' ', dw(m) + 2));
+    out.push(bar);
+    out.push('─'.repeat(COLS));
+    out.push(padW('  ' + pageTitle() + (inSub() ? '   (Esc 返回上级)' : ''), COLS));
+    out.push('');
+    const half = Math.ceil(rowsArr.length / 2);
+    const W = Math.floor(COLS / 2) - 1;
+    const cell = (r, i) => {
+      const on = (i === cur);
+      const val = r.kind === 'item' ? cfgName(r.key) : '[Enter]';
+      const ro = !!r.ro || (r.kind === 'item' && ITEMS[r.key].ro);
+      const t = padW(`${on ? '▶' : ' '} ${r.label}`, Math.max(dw(r.label) + 2, 26)) + ' ' + val;
+      return on ? L(padW(t, W), true) : (ro ? esc(padW(t, W)) : esc(padW(t, W)));
+    };
+    for (let i = 0; i < half; i++){
+      out.push(cell(rowsArr[i], i) + (i + half < rowsArr.length ? cell(rowsArr[i + half], i + half) : ''));
     }
-    out += bar + '\n';
-    out += `<span style="color:${C.line}">${'─'.repeat(COLS)}</span>\n`;
-    out += esc(pad('  ' + pageTitle() + (inSub() ? '   (Esc 返回上级)' : ''), COLS)) + '\n\n';
   } else {
-    /* Award / Dell / ThinkPad 风格：左侧竖排一级菜单（当前页高亮）+ 右侧本页选项 */
     const LW = 26, RW = COLS - LW - 2;
-    const cell = (text, on, dimColor) =>
-      on ? `<span style="color:${C.invfg};background:${C.inv}">${esc(text)}</span>`
-         : (dimColor ? `<span style="color:${dimColor}">${esc(text)}</span>` : esc(text));
-    const left = B.menus.slice(0, 14).map(m => cell(pad(' ' + m, LW), m === page));
-    const right = [];
-    right.push(cell(pad(' ' + pageTitle() + (inSub() ? '  (Esc 返回)' : ''), RW), true));
+    const left = B.menus.slice(0, Math.max(4, ROWS - 12)).map(m => L(padW(' ' + m, LW), m === page));
+    const right = [L(padW(' ' + pageTitle() + (inSub() ? '  (Esc 返回)' : ''), RW), true)];
     rowsArr.forEach((r, i) => {
       const on = (i === cur);
       const val = r.kind === 'item' ? cfgName(r.key) : '[Enter]';
-      const ro  = !!r.ro || (r.kind === 'item' && ITEMS[r.key].ro);
-      right.push(cell(pad(`${on ? '▶' : ' '} ${pad(r.label, 30)} ${val}`, RW), on, ro ? C.ro : null));
+      const t = padW(`${on ? '▶' : ' '} ${r.label}`, Math.max(dw(r.label) + 2, 30)) + ' ' + val;
+      right.push(on ? L(padW(t, RW), true) : esc(padW(t, RW)));
     });
-    const n = Math.max(left.length, right.length);
-    for (let i = 0; i < n; i++) out += (left[i] || pad('', LW)) + '  ' + (right[i] || '') + '\n';
-    out += `\n<span style="color:${C.line}">${'─'.repeat(COLS)}</span>\n`;
+    for (let i = 0; i < Math.max(left.length, right.length); i++)
+      out.push((left[i] || ' '.repeat(LW)) + '  ' + (right[i] || ''));
   }
 
-  if (B.layout === 'topmenu'){
-    /* AMI 风格：选项两列铺开 */
-    const half = Math.ceil(rowsArr.length / 2);
-    const W = COLS / 2 - 1;   /* 每列 43 字符 */
-    const lineFor = (r, i) => {
-      const on = (i === cur);
-      let val = r.kind === 'item' ? cfgName(r.key) : (r.kind === 'sub' ? '[Enter]' : '[Enter]');
-      let s = `${on?'▶':' '} ${pad(r.label, 26)} ${val}`;
-      if (r.ro || (r.kind==='item' && ITEMS[r.key].ro)) s = `  ${pad(r.label, 26)} ${val}`;
-      return on ? `<span style="color:${C.invfg};background:${C.inv}">${esc(pad(s, W))}</span>` : esc(pad(s, W));
-    };
-    for (let i = 0; i < half; i++){
-      out += lineFor(rowsArr[i], i);
-      if (i + half < rowsArr.length) out += lineFor(rowsArr[i+half], i+half);
-      out += '\n';
-    }
-  }
-
-  /* 引导顺序页：把真实设备串画出来 */
+  /* 引导顺序页: 把真实设备串列出来, 编辑态带光标 */
   const curRow = rowsArr[cur];
   if (curRow && curRow.act === 'bootorder'){
-    out += `\n<span style="color:${C.invfg};background:${C.inv}">${esc(pad('  Boot Priority Order  (+/- 上移下移, 引导取最上面那个)', COLS))}</span>\n`;
-    S.order.forEach((d,i) => {
-      out += esc(pad(`  ${i+1}. ${d}`, COLS)) + '\n';
+    out.push('');
+    out.push(L(padW(boEdit ? '  Boot Priority Order  ↑↓选  +/-上下移  Enter退出'
+                           : '  Boot Priority Order', COLS), true));
+    S.order.forEach((d, i) => {
+      const t = padW(`  ${boEdit && i === boSel ? '▶' : ' '} ${i + 1}. ${d}`, COLS);
+      out.push((boEdit && i === boSel) ? L(t, true) : esc(t));
     });
   }
+  if (msg) out.push(L(padW(' ' + msg, COLS), true));
 
-  /* 底部功能键条 */
-  out += `\n<span style="color:${C.barfg};background:${C.bar}">${esc(pad(' ' + (B.fbar.length > COLS - 1 ? B.fbar.slice(0, COLS - 1) : B.fbar), COLS))}</span>`;
-  if (msg) out += `\n<span style="color:${C.invfg};background:${C.inv}">${esc(pad(' ' + msg, COLS))}</span>`;
-  scr.innerHTML = out;
+  /* 底部只有一行"任务 + 进度", 不放按键提示 */
+  const r = evaluate(S.cfg, task);
+  const right = `符合 ${r.ok}/${r.total}` + (r.pass ? '  可装机' : '');
+  while (out.length < ROWS - 1) out.push('');
+  out.push(L(padW(padW(' 任务: ' + TASKS[task].label, COLS - dw(right) - 1) + ' ' + right, COLS), true));
 
-  renderCoach();
+  scr.innerHTML = out.slice(0, ROWS).join('\n').replace(/<\/@INV>/g, '</span>').replace(/<@INV>/g, '<span class="inv">');
 }
 
-function renderCoach(){
-  const t = TASKS[task];
-  document.getElementById('task-name').textContent = t.label.replace(/^给.*?装/,'装机：');
-  document.getElementById('task-brief').textContent = t.brief;
-  const r = evaluate(S.cfg, task);
-  const ul = document.getElementById('rules');
-  ul.innerHTML = r.lines.map(l =>
-    `<li><span class="ic" style="color:${l.ok?'var(--ok)':'var(--no)'}">${l.ok?'✔':'✘'}</span>
-      <span class="t">${esc(l.text)}<div class="now">${esc(l.now)}</div></span></li>`).join('');
-  const v = document.getElementById('verdict');
-  v.className = 'verdict ' + (r.pass ? 'y' : (r.ok === 0 ? 'n' : 'w'));
-  v.textContent = r.pass
-    ? `✅ 这台机器的设置可以装这个系统了（${r.ok}/${r.total} 项符合）。`
-    : `❌ 还差 ${r.total - r.ok} 项（${r.ok}/${r.total}）：上面标 ✘ 的就是要改的项。` + (r.extra ? '\n' + r.extra : '');
-  document.getElementById('score').textContent =
-    `进度 ${r.ok}/${r.total}` + (dirty ? ' · 有未保存的改动（真机要按 F10 才生效）' : ' · 无未保存改动');
-  if (t.extra && t.extra.length) document.getElementById('help').innerHTML =
-    t.extra.map(x => esc(x)).join('<br>') + '<hr style="border:0;border-top:1px dashed #3a3f47;margin:8px 0">';
+/* ---- 黑白弹窗（帮助 / 检查结果）: 双线框, 居中 ---- */
+function renderDlg(){
+  if (!dlgKind){ dlg.className = 'hide'; return; }
+  setMono();
+  const W = Math.min(COLS - 4, 62);
+  const rowsArr = rows();
+  const R = rowsArr[cur];
+  let title = '', body = [];
+  if (dlgKind === 'help'){
+    title = R ? R.label : '帮助';
+    body = R ? wrapW(R.help || '（此项无额外说明）', W - 4) : [];
+    body.push('');
+    body = body.concat(wrapW('键位: ' + BRANDS[brand].fbar, W - 4));
+  } else {
+    const r = evaluate(S.cfg, task);
+    title = '检查结果';
+    body = wrapW(TASKS[task].brief, W - 4);
+    body.push('');
+    for (const l of r.lines){
+      const mark = l.ok ? '✔' : '✘';
+      const t = body.length;
+      body = body.concat(wrapW(`${mark} ${l.text}`, W - 4).map((x, k) => k ? '   ' + x : x));
+      body.push('   当前: ' + l.now);
+    }
+    if (r.extra) { body.push(''); body = body.concat(wrapW(r.extra, W - 4)); }
+    body.push('');
+    body = body.concat(wrapW(r.pass ? '这台机器的设置可以装这个系统了。' : `还差 ${r.total - r.ok} 项, 标 ✘ 的就是要改的。`, W - 4));
+  }
+  const inner = W - 2;
+  const o = [];
+  o.push('┌' + '─'.repeat(inner) + '┐');
+  o.push('│ ' + padW(cutW(title, inner - 2), inner - 2) + ' │');
+  o.push('├' + '─'.repeat(inner) + '┤');
+  for (const b of body.slice(0, Math.min(body.length, ROWS - 8))) o.push('│ ' + padW(cutW(b, inner - 2), inner - 2) + ' │');
+  o.push('└' + '─'.repeat(inner) + '┘');
+  dlg.innerHTML = o.join('\n');
+  dlg.className = (BRANDS[brand].mono === 'light' ? 'scr-light' : 'scr-dark');
+}
+
+function render(){
+  if (mode === 'boot') renderBoot(); else renderBios();
+  renderDlg();
 }
 
 /* ============================================================================
