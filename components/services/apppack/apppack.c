@@ -69,6 +69,14 @@ esp_err_t apppack_parse(const char *path, apppack_meta_t *out)
                 else if (KEY_IS("cat"))     snprintf(out->cat, sizeof(out->cat), "%.*s", (int)vlen, v);
                 else if (KEY_IS("desc"))    snprintf(out->desc, sizeof(out->desc), "%.*s", (int)vlen, v);
                 else if (KEY_IS("version")) snprintf(out->version, sizeof(out->version), "%.*s", (int)vlen, v);
+                else if (KEY_IS("need")) {
+                    /* 逗号分隔的能力声明 (目前只有 wifi); 大小写不敏感, 只在 vlen 内找 */
+                    for (size_t i = 0; i + 4 <= vlen; i++)
+                        if ((v[i] | 0x20) == 'w' && (v[i+1] | 0x20) == 'i' &&
+                            (v[i+2] | 0x20) == 'f' && (v[i+3] | 0x20) == 'i') {
+                            out->need_wifi = true; break;
+                        }
+                }
                 else if (KEY_IS("icon")) {
                     int got = b64decode(v, out->icon, (int)APPPACK_ICON_BYTES);
                     out->has_icon = (got == (int)APPPACK_ICON_BYTES);

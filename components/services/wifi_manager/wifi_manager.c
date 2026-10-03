@@ -2,6 +2,7 @@
 #include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "bt_manager.h"   /* bt_manager_is_enabled(): BT 开着时扫描时序不能覆盖 */
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
@@ -173,13 +174,25 @@ bool wifi_manager_scan_start(void) {
     s_scan_done = false;
     s_ap_count = 0;
     esp_wifi_set_ps(WIFI_PS_NONE);   /* 保险: 扫描期间禁用省电, 联网速度优先 */
-    /* 快速主动扫描: 缩短每信道驻留 (40-200ms), show_hidden=false 免去隐藏网被动监听,
-     * 全 13 信道约 1~2s 完成 (此前 active 100-300ms + show_hidden 超慢). */
     wifi_scan_config_t cfg = {
         .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = false,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time = { .active = { .min = 40, .max = 200 } },
     };
+    /* ★★ 蓝牙开着时**绝不能覆盖 scan_time** (2026-10-02 实机定案):
+     *   IDF 会直接报错 —— 日志原文
+     *   "Error! Should use default active scan time parameter for WiFi scan when
+     *    Bluetooth is enabled!!!!!!"
+     *   原因: BT 与 WiFi 共用 2.4G 射频, 扫描驻留必须按 IDF 的时隙交错参数走;
+     *   自己压到 40-200ms 会让扫描漏网 + 关联失败。
+     *   实测症状 (linit 报): 手机热点扫不到、或扫到却连不上
+     *   (`wifi:Coexist: Wi-Fi connect fail, apply reconnect coex policy` → 1s 重试 1/5..5/5)。
+     *   所以: 蓝牙关着才用"快速扫描"提速; 蓝牙开着交回 IDF 默认。 */
+    if (bt_manager_is_enabled()) {
+        ESP_LOGW(TAG, "蓝牙开启中 → 扫描用 IDF 默认时序 (不覆盖 scan_time, 保 coex 交错)");
+    } else {
+        cfg.scan_time.active.min = 40;    /* 蓝牙关: 快速主动扫描, 全 13 信道 1~2s */
+        cfg.scan_time.active.max = 200;
+    }
     esp_err_t ret = esp_wifi_scan_start(&cfg, false);
     if (ret != ESP_OK) {
         /* 状态未就绪/忙: 延迟重试一次 (刚开 WiFi 常见), 仍失败才返回 false */
@@ -192,7 +205,7 @@ bool wifi_manager_scan_start(void) {
         s_suppress_reconnect = false;
         return false;
     }
-    ESP_LOGI(TAG, "扫描已启动 (active 40-200ms)");
+    ESP_LOGI(TAG, "扫描已启动 (%s)", bt_manager_is_enabled() ? "IDF 默认时序/BT 开" : "active 40-200ms/BT 关");
     return true;
 }
 

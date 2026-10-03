@@ -18,6 +18,7 @@
 #include "input.h"
 #include "vibrator.h"         /* V1.5.x: 点击应用震动 (ctx_block 屏蔽 input 层, 打开/选中时补) */
 #include "touch_panel.h"
+#include "wifi_manager.h"   /* 商店联网门禁: is_connected */
 #include "font_zh.h"
 #include "font_zh16.h"
 #include "esp_log.h"
@@ -69,6 +70,35 @@ static const char *const s_sub_names[AM_SUB_COUNT] = {
     "\xe5\xad\xa6\xe4\xb9\xa0",  /* 学习 */
 };
 
+/* ==== 商店联网门禁 (2026-10-02 linit) ====
+ * 需求: "每次进入应用管家后, 第一次打开商店要弹窗提示联网一次; 退出应用管家再进才会重新提示"。
+ * 做法: 未联网时弹确认框 → 确定走系统"连接WiFi"(扫描+密码键盘); 取消仍可浏览本地包。
+ * "只提示一次"的边界 = **本次驻留管家**: 只有真退出管家才复位, 所以
+ *   "商店 → 点开某个应用 → 返回商店" 不会再提示一遍 (那份 on_exit/on_enter 是子页往返)。
+ * ⚠ 不要自己 os_hw_request(OS_HW_WIFI): settings_wifi_connect_open() 内部按需 request
+ *   并记账, 用户取消时才会 release。 */
+static bool s_store_wifi_asked   = false;
+static bool s_store_wifi_connect = false;  /* 下一帧开连网流程 */
+static int  s_am_leave_child     = 0;      /* >0 = 本次离开管家是进了自己推的子页 */
+/* ⚠ 连网弹窗**不能在这个回调里开**: 回调返回后 os_dialog 还要收掉当前确认框,
+ *   同期再 push 会被顶掉 (实测: 点了"确定"界面停在确认框、扫描在后台空跑)。
+ *   与 Lua 应用门禁 (am_lua.c wl_gate_tick) 同一处理: 挂个标志, 下一帧再开。 */
+static void am_store_wifi_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ctx; (void)ud;
+    if (result != 0) return;                       /* 取消: 本地包照常可看 */
+    s_store_wifi_connect = true;
+}
+static void am_store_wifi_gate(ui_ctx_t *ctx) {
+    ESP_LOGI(TAG, "商店门禁: asked=%d conn=%d", (int)s_store_wifi_asked, (int)wifi_manager_is_connected());
+    if (s_store_wifi_asked) return;
+    s_store_wifi_asked = true;
+    if (wifi_manager_is_connected()) return;
+    ESP_LOGI(TAG, "商店门禁 -> 弹连接确认框");
+    os_dialog_confirm_ex(ctx,
+        "\xe5\x95\x86\xe5\xba\x97\xe9\x9c\x80\xe8\xa6\x81\xe8\x81\x94\xe7\xbd\x91, \xe7\x8e\xb0\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5 Wi-Fi?", /* 商店需要联网, 现在连接 Wi-Fi? */
+        0, -1, am_store_wifi_cb, NULL);
+}
+
 /* ==== 页面状态 ==== */
 static int s_cat = AM_CAT_ENGINE;     /* 左栏分类 */
 static int s_sub = AM_SUB_ALL;        /* 顶部子分类 */
@@ -103,7 +133,16 @@ static bool  s_gdrag_active = false;
  * 内容/焦点/安装状态变化时才重渲染整列 (s_col_dirty). */
 #define AM_COL_W      (UI_SCREEN_W - AM_CATBAR_W)   /* 内容区宽 = 325 */
 #define AM_COL_BPR    ((AM_COL_W + 7) / 8)          /* 41 bytes/行 */
-#define AM_COL_H_MAX  (64 * 46)                     /* 列表最多 64 行 × 46px = 2944px */
+/* ---- 列表行几何 (2026-10-02 linit 定): 左边图标 + 名称/说明 整体右移 + 右侧 安装/卸载 按钮 ----
+ * ⚠ 行高只能从这里改: 下面所有滚动/命中/预渲染都用 AM_ROW_H, 不再有裸 46。
+ *   46px 时会"图标 + 两行 16px 文字"塞不下 (说明行紧贴行底) —— linit 实机反馈。 */
+#define AM_ROW_H        54                          /* 列表行高 */
+#define AM_ROW_ICON_SZ  36                          /* 行内图标边长 (缩放到行高内) */
+#define AM_ROW_ICON_X   (6 + AM_ROW_ICON_SZ / 2)    /* 图标中心 x = 24 (左缘留 6px) */
+#define AM_ROW_TX       50                          /* 名称/说明左边界 (图标右缘 + 9) */
+#define AM_ROW_BTN_TW   32                          /* 按钮两汉字宽 (16px×2) */
+#define AM_ROW_BTN_X0   (AM_COL_W - 10 - AM_ROW_BTN_TW)   /* 按钮文字左边 = 283 */
+#define AM_COL_H_MAX  (64 * AM_ROW_H)               /* 列表最多 64 行的整列缓冲高 */
 static uint8_t *s_col = NULL;                       /* PSRAM 整列缓冲 */
 static int      s_col_h = 0;                        /* 当前列高 (px) */
 static bool     s_col_dirty = false;                /* 需要重渲染整列 */
@@ -188,7 +227,7 @@ static int am_content_top(void) {
 }
 /* 当前视图可见行数 (网格=AM_GRID_ROWS 行; 列表=整屏可容纳的行数) */
 static int am_vis_rows(void) {
-    return s_view_grid ? AM_GRID_ROWS : ((UI_SCREEN_H - am_content_top()) / 46);
+    return s_view_grid ? AM_GRID_ROWS : ((UI_SCREEN_H - am_content_top()) / AM_ROW_H);
 }
 /* 焦点所在行 (网格=每行列数归组; 列表=一项一行) */
 static int am_focus_row(void) {
@@ -216,20 +255,24 @@ static bool am_weak_mark(int i) {
 static void am_launch(ui_ctx_t *ctx, const os_app_t *a) {
     if (!a) return;
     lua_probe_stage(1, "am_launch 入口");
-    if (s_cat == AM_CAT_STORE) { am_store_activate(ctx, a); return; }
-    const char *lp = NULL;
-    if (am_lua_is_entry(a, &lp)) { lua_probe_stage(2, "Lua 项命中"); os_page_lua_set_boot(lp); os_push(ctx, OS_PAGE_LUA); return; }
+    if (s_cat == AM_CAT_STORE) { am_store_toggle(ctx, a); return; }   /* 商店只装/卸, 不启动 */
+    /* 标记"这次离开管家是进了子页" → 从子页返回时商店门禁不会又提示一遍。
+     * (若子页被门禁拦下没真进, p_am_poll 会把标记收回。) */
+    s_am_leave_child++;
+    /* Lua 项统一走 am_lua_open_if_entry: 它除了设 boot 路径, 还带 `need=wifi` 门禁
+     * (未联网时先弹窗连网, 连上再进) —— 原先这里自己 push, 门禁就被绕过了。 */
+    if (am_lua_open_if_entry(ctx, a)) return;
     os_push(ctx, a->page);
 }
 /* 商店列表行触摸: 命中右侧"安装/卸载"按钮 → 走激活(确认安装/卸载); 命中名称区 →
  * 已装运行 / 未装不弹窗 (安装必须点右边按钮, 避免点名称误弹确认). */
 static void am_launch_list(ui_ctx_t *ctx, const os_app_t *a, int x, int ty, int y_row) {
     if (!a || s_cat != AM_CAT_STORE) { am_launch(ctx, a); return; }
-    /* 按钮几何: "安装/卸载" 两字 + 紧贴边框, x=[UI_SCREEN_W-43, UI_SCREEN_W-6], y=[y_row+12,y_row+26] */
-    int bx0 = UI_SCREEN_W - 43, bx1 = UI_SCREEN_W - 6;
-    bool on_btn = (x >= bx0 && x <= bx1) && (ty >= y_row + 12 && ty <= y_row + 26);
-    if (on_btn) { am_store_activate(ctx, a); return; }   /* 点按钮 → 确认安装(未装)/卸载 */
-    if (am_store_installed_of(a)) am_store_activate(ctx, a); /* 名称区: 已装→运行, 未装→无操作 */
+    /* 商店行: 点按钮 或 点名称区 **都一样** —— 已装→弹卸载确认 / 未装→弹安装确认。
+     * **商店里永不启动应用**(要运行去「应用」分类)。
+     * (原先还算了 on_btn 命中框, 但两个分支行为完全相同 → 已删, 免得后人以为有区别) */
+    (void)x; (void)ty; (void)y_row;
+    am_store_toggle(ctx, a);
 }
 
 
@@ -328,7 +371,7 @@ void am_rebuild_keep(void) { am_rebuild_ex(true);  }   /* 对外: am_store.c 安
 static int am_max_scroll(void) {
     if (!s_view_grid) {
         int content_top = am_content_top();
-        int mv = (UI_SCREEN_H - content_top) / 46;
+        int mv = (UI_SCREEN_H - content_top) / AM_ROW_H;
         int m = s_list_n - mv;
         return m < 0 ? 0 : m;
     }
@@ -485,6 +528,9 @@ static void am_draw_app_icon(ui_ctx_t *ctx, st7305_handle_t *lcd, const os_app_t
 }
 
 /* 子分类条绘制 (y 顶部, 先填白底盖住下方内容残留, 恒固定显示) */
+/* 前置声明: 子分类条的水管弯头用它, 实现在下方 (与左栏选中框同一套) */
+static void am_elbow(st7305_handle_t *lcd, int cx, int cy, int r, int kind, st7305_color_t color);
+
 static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, int x1) {
     (void)ctx;
     /* 先整条白底, 覆盖拖动/滚动时滑到顶部的图标残留, 保证子分类条固定不被遮挡 */
@@ -494,20 +540,38 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
     for (int i = 0; i < AM_SUB_COUNT; i++) {
         int sx = x0 + i * slot;
         int cx = sx + slot / 2;
-        bool sel = (i == s_sub);
-        if (sel) fill_rect(lcd, sx + 2, y0, sx + slot - 2, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK);
+        /* 选中态样式 (2026-10-02 linit 定):
+         *   · 焦点在**顶栏**时 → 当前项整块反色 (黑底白字), 这是唯一的强指示;
+         *   · 焦点在**下面内容区**时 → 当前项不反色, 只用**左右两条竖线**定位;
+         *   · 未选中的项 → **下方各画一条横线**; 当前项**下方不画横线** (给竖线开口)。
+         * ⚠ 原先还画了一个 U 形括号 + 整条底边横线 —— linit 明确要求去掉。 */
+        bool cur = (i == s_sub);
+        bool inv = cur && (s_focus_bar == 1);   /* 焦点在顶栏 → 整块反色 (强指示) */
+        if (inv) fill_rect(lcd, sx + 2, y0, sx + slot - 2, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK);
         am_draw_label(lcd, cx, y0 + 5,
-                      (s_cat == AM_CAT_APP && i == AM_SUB_OPS) ? "\xe5\xa3\x81\xe7\xba\xb8" : s_sub_names[i], sel); /* 应用分类: 运维→壁纸 */
-        /* 顶部子分类聚焦中: 给当前子分类画 U 形括号 (顶+两侧, 底部开口并向下延伸),
-         * 表示"正在浏览该分类, 下面内容归它管" — 区别于普通黑块, 便于分辨在哪一层 */
-        if (s_focus_bar == 1 && i == s_sub) {
-            int bx0 = sx + 1, bx1 = sx + slot - 1, by = y0 - 3, bbot = y0 + AM_SUB_H + 16;
-            draw_hline(lcd, bx0, bx1, by, ST7305_COLOR_BLACK);
-            draw_vline(lcd, bx0, by, bbot, ST7305_COLOR_BLACK);
-            draw_vline(lcd, bx1, by, bbot, ST7305_COLOR_BLACK);
+                      (s_cat == AM_CAT_APP && i == AM_SUB_OPS) ? "\xe5\xa3\x81\xe7\xba\xb8" : s_sub_names[i], inv); /* 应用分类: 运维→壁纸 */
+        if (!inv && cur) {
+            /* ★ 当前项 = **一根 2px 水管线绕出来** (linit 指定照左侧四分类那套做):
+             *   左竖 + 上横 + 右竖 三条线, **下方开口不画线**; 两个上角用 am_elbow()
+             *   90° 外凸圆弧弯头连接 (直边各让位 R). 坐标 y0 就是子分类条顶边,
+             *   所以水管正好把这格圈起来, 与左栏选中观感同族。 */
+            int R  = AM_SEL_R;
+            int ex0 = sx + 1, ex1 = sx + slot - 2;     /* 水管左右外缘 */
+            int ytop = y0, ybot = y0 + AM_SUB_H - 1;
+            draw_vline(lcd, ex0,     ytop + R, ybot, ST7305_COLOR_BLACK);   /* 左竖 (2px) */
+            draw_vline(lcd, ex0 + 1, ytop + R, ybot, ST7305_COLOR_BLACK);
+            draw_vline(lcd, ex1 - 1, ytop + R, ybot, ST7305_COLOR_BLACK);   /* 右竖 (2px) */
+            draw_vline(lcd, ex1,     ytop + R, ybot, ST7305_COLOR_BLACK);
+            draw_hline(lcd, ex0 + R, ex1 - R, ytop,     ST7305_COLOR_BLACK); /* 上横 (2px) */
+            draw_hline(lcd, ex0 + R, ex1 - R, ytop + 1, ST7305_COLOR_BLACK);
+            if (ytop - R >= AM_CAT_Y0 - R) {           /* 上两角外凸圆弧弯头 */
+                am_elbow(lcd, ex0, ytop, R, 1, ST7305_COLOR_BLACK);   /* 左上: 外凸向左上 */
+                am_elbow(lcd, ex1, ytop, R, 3, ST7305_COLOR_BLACK);   /* 右上: 外凸向右上 */
+            }
+        } else if (!cur) {
+            draw_hline(lcd, sx + 4, sx + slot - 5, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK); /* 未选中: 下方横线 */
         }
     }
-    fill_rect(lcd, x0, y0 + AM_SUB_H - 1, x1, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK);
 }
 
 /* ==== 选中框样式 (V1.6.x) ====
@@ -647,8 +711,9 @@ static void am_col_text_l(int x, int y, const char *s, bool inv) {
         }
     }
 }
-/* 列内图标: 从 ui_common 图标位图最近邻缩放 (同 ui_blit_scaled 算法, 写 s_col) */
-static void am_col_icon(int cx, int cy, int size, int icon_idx) {
+/* 列内图标: 从 ui_common 图标位图最近邻缩放 (同 ui_blit_scaled 算法, 写 s_col).
+ * inv=true → 只画"已填黑的行"上的白像素 (商店选中行整行反白, 黑图标会看不见)。 */
+static void am_col_icon_inv(int cx, int cy, int size, int icon_idx, bool inv) {
     int sw = 0, sh = 0;
     const uint8_t *src = ui_main_icon_bitmap(icon_idx, &sw, &sh);
     if (!src || sw <= 0 || sh <= 0) return;
@@ -660,9 +725,33 @@ static void am_col_icon(int cx, int cy, int size, int icon_idx) {
         for (int dx = 0; dx < size; dx++) {
             int sx = (dx * sw) / size;
             if (row[sx >> 3] & (0x80 >> (sx & 7)))
-                am_col_px(x0 + dx, y0 + dy, true);
+                am_col_px(x0 + dx, y0 + dy, !inv);
         }
     }
+}
+static void am_col_icon(int cx, int cy, int size, int icon_idx) {
+    am_col_icon_inv(cx, cy, size, icon_idx, false);
+}
+/* 按像素宽度截断 UTF-8 串 (超宽补 ".."); 16px 汉字 / 8px ASCII, 与 am_col_text_l 同口径。
+ * 返回**静态缓冲** —— 只供渲染当场使用, 不要留存指针。 */
+static const char *am_col_ellipsis(const char *s, int max_w) {
+    static char buf[160];
+    int i = 0, w = 0;
+    const int lim = max_w - 16;                 /* 先给尾部 ".." 预留 16px */
+    if (!s) s = "";
+    while (s[i] && i < (int)sizeof(buf) - 4) {
+        unsigned char c = (unsigned char)s[i];
+        int wide = ((c & 0xe0) == 0xe0);
+        int adv = wide ? 16 : 8;
+        int len = wide ? 3 : 1;
+        if (w + adv > lim) break;
+        for (int k = 0; k < len; k++) buf[i + k] = s[i + k];
+        i += len;
+        w += adv;
+    }
+    if (s[i]) { buf[i++] = '.'; buf[i++] = '.'; }   /* 后面还有内容 → 省略号 */
+    buf[i] = 0;
+    return buf;
 }
 /* 列内实心圆 / 主菜单角标 (白底上: 黑中圈 + 白内圈) */
 static void am_col_circle(int cx, int cy, int r, bool black) {
@@ -706,7 +795,7 @@ static void am_col_render_grid(void) {
     }
 }
 static void am_col_render_list(void) {
-    const int row_h = 46;
+    const int row_h = AM_ROW_H;
     s_col_h = s_list_n * row_h;
     for (int i = 0; i < s_list_n; i++) {
         int y = i * row_h;
@@ -719,22 +808,30 @@ static void am_col_render_list(void) {
         const os_app_t *a = s_list[i];
         const char *nm = a ? a->label : "?";
         const char *id = a ? a->id : "";
-        am_col_text_l(12, y + 6, nm, sel);
+        /* 行内统一: 左图标 + 右侧名称/说明 (图标在反白行上用反色画, 否则黑图标看不见) */
+        am_col_icon_inv(AM_ROW_ICON_X, y + row_h / 2, AM_ROW_ICON_SZ,
+                        a ? a->icon_idx : 0, sel);
+        am_col_text_l(AM_ROW_TX, y + 6, nm, sel);
         if (s_cat == AM_CAT_STORE) {
-            const char *pf = am_store_fname_of(a);
-            am_col_text_l(12, y + 27, pf ? pf : id, sel);
+            /* 第二行显示**包简介** (LAPP desc=), 不再显示文件路径/文件名 ——
+             * 用户原话: "模拟器下方不要显示路径名称, 直接显示对应说明"。 */
+            const char *ds = am_store_desc_of(a);
+            if (ds && ds[0])
+                am_col_text_l(AM_ROW_TX, y + 27,
+                              am_col_ellipsis(ds, AM_ROW_BTN_X0 - 4 - AM_ROW_TX), sel);
             bool inst = am_store_installed_of(a);      /* 读缓存, 不逐帧 fopen */
-            /* 按钮 = 紧贴两字加边框框 (V1.6.x: 去掉 ➕/空框, 框宽正好容纳两字) */
             const char *act = inst ? "\xe5\x8d\xb8\xe8\xbd\xbd" : "\xe5\xae\x89\xe8\xa3\x85"; /* 卸载/安装 */
-            int txt_w = 32;                                   /* 两汉字 16px×2 */
-            int bx0 = AM_COL_W - 8 - txt_w;                    /* 右缘留 8px 边距 */
-            am_col_text_l(bx0, y + 14, act, sel);
-            am_col_rect_outline(bx0 - 3, y + 12, bx0 + txt_w + 2, y + 26, !sel);
+            const int bt = y + (AM_ROW_H - 16) / 2;    /* 按钮垂直居中 */
+            am_col_text_l(AM_ROW_BTN_X0, bt, act, sel);
+            /* 框必须**完整包住**两字: 文字实占 [bt, bt+15] → 框 [bt-2, bt+17] (上下各留 2px).
+             * (旧代码框底到 y+26 < 文字底 y+30 → 两字下半截露在框外, 就是"框没框住"。) */
+            am_col_rect_outline(AM_ROW_BTN_X0 - 3, bt - 2,
+                                AM_ROW_BTN_X0 + AM_ROW_BTN_TW + 2, bt + 17, !sel);
         } else {
-            am_col_text_l(12, y + 27, id, sel);
+            am_col_text_l(AM_ROW_TX, y + 27, id, sel);
             bool mm = (i >= 0 && i < s_list_n) && s_list_vis[i];
             const char *st = mm ? "\xe5\x9c\xa8\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95" : "\xe4\xb8\xbb\xe8\x8f\x9c\xe5\x8d\x95"; /* 在主菜单/主菜单 */
-            am_col_text_l(UI_SCREEN_W - 58 - AM_CATBAR_W, y + 14, st, sel);
+            am_col_text_l(UI_SCREEN_W - 58 - AM_CATBAR_W, y + (AM_ROW_H - 16) / 2, st, sel);
         }
     }
 }
@@ -795,7 +892,7 @@ static void p_am_render(ui_ctx_t *ctx) {
                 ESP_LOGW(TAG, "整列预渲染 %llu us (条目=%d 网格=%d 列高=%d)",
                          d_col, s_list_n, (int)s_view_grid, s_col_h);
         }
-        int row_h = 46;
+        int row_h = AM_ROW_H;
         if (s_view_grid) {
             row_h = (UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS;
             if (row_h < AM_ICON_SIZE + 18) row_h = AM_ICON_SIZE + 18;
@@ -833,7 +930,7 @@ static void p_am_render(ui_ctx_t *ctx) {
                 }
             }
         } else {
-            int row_h = 46;
+            int row_h = AM_ROW_H;
             float cam = s_gcam;
             int max_vis = (UI_SCREEN_H - content_top) / row_h;
             int list_max = s_list_n - max_vis;
@@ -987,8 +1084,16 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
         /* ⚠ 切左侧分类必须把顶部子分类复位: 否则残留的 s_sub 会跟到别的分类去
          * (触摸路径本来就有 s_sub = AM_SUB_ALL, 键盘这条原先漏了 → 在「应用→游戏」
          *  后按 UP/DOWN 切到「引擎」, 残留"游戏"会让按子分类过滤的逻辑把内容滤空)。 */
-        case OS_ACTION_UP:   s_cat = (s_cat + AM_CAT_COUNT - 1) % AM_CAT_COUNT; s_sub = AM_SUB_ALL; am_rebuild(); break;
-        case OS_ACTION_DOWN: s_cat = (s_cat + 1) % AM_CAT_COUNT; s_sub = AM_SUB_ALL; am_rebuild(); break;
+        case OS_ACTION_UP:
+            s_cat = (s_cat + AM_CAT_COUNT - 1) % AM_CAT_COUNT;
+            s_sub = AM_SUB_ALL; am_rebuild();
+            if (s_cat == AM_CAT_STORE) am_store_wifi_gate(ctx);
+            break;
+        case OS_ACTION_DOWN:
+            s_cat = (s_cat + 1) % AM_CAT_COUNT;
+            s_sub = AM_SUB_ALL; am_rebuild();
+            if (s_cat == AM_CAT_STORE) am_store_wifi_gate(ctx);
+            break;
         case OS_ACTION_RIGHT:
         case OS_ACTION_CONFIRM:
         case OS_ACTION_BACK:
@@ -1122,6 +1227,7 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
             s_focus = 0; s_scroll = 0;
             s_focus_bar = 0;   /* 触摸点分类后回到内容聚焦 */
             am_rebuild();
+            if (s_cat == AM_CAT_STORE) am_store_wifi_gate(ctx);
             ctx->needs_redraw = true;
         }
         return true;
@@ -1163,7 +1269,7 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
             return true;
         }
     } else {
-        int row_h = 46;
+        int row_h = AM_ROW_H;
         int idx = (int)floorf(s_gcam) + (y - content_top) / row_h;
         if (idx >= 0 && idx < s_list_n) {
             vibrator_click();
@@ -1232,13 +1338,20 @@ static int am_idx_at(int tx, int ty, int content_top) {
         int idx = row * AM_GRID_COLS + col;
         return (idx >= 0 && idx < s_list_n) ? idx : -1;
     } else {
-        int idx = (int)floorf(s_gcam) + (ty - content_top) / 46;
+        int idx = (int)floorf(s_gcam) + (ty - content_top) / AM_ROW_H;
         return (idx >= 0 && idx < s_list_n) ? idx : -1;
     }
 }
 
 /* ==== 每帧轮询: 触摸上下拖动 (相机跟手 + 惯性甩动 + 网格吸附, 仿主菜单) ==== */
 static void p_am_poll(ui_ctx_t *ctx) {
+    /* 商店联网门禁: 用户点了"确定" → 这一帧(确认框已收)再开连网流程 */
+    if (s_store_wifi_connect) {
+        s_store_wifi_connect = false;
+        settings_wifi_connect_open(ctx);           /* ★ 唯一入口: 内部按需 os_hw_request */
+    }
+    /* 子页没真推入(如 Wi-Fi 门禁拦下)时把"离开管家"标记收回, 否则会累积 */
+    if (s_am_leave_child > 0 && ctx->current_page == OS_PAGE_APP_MANAGER) s_am_leave_child = 0;
     /* 商店卸载: 确认键按满 3s (BT_SEARCH 起点再加 1s) 且未松手 → 弹卸载确认 */
     if (s_cat == AM_CAT_STORE && s_uninstall_armed && !s_uninstall_fired) {
         if (input_is_held(1)) {
@@ -1277,11 +1390,11 @@ static void p_am_poll(ui_ctx_t *ctx) {
     bool down = input_get_touch_pos(&tx, &ty);
     int content_top = am_content_top();
     int row_h = s_view_grid
-        ? ((UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS) : 46;
+        ? ((UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS) : AM_ROW_H;
     if (s_view_grid && row_h < AM_ICON_SIZE + 18) row_h = AM_ICON_SIZE + 18;
     int max_row = s_view_grid ? am_max_scroll() : 0;
     if (!s_view_grid) {
-        int mv = (UI_SCREEN_H - content_top) / 46;
+        int mv = (UI_SCREEN_H - content_top) / AM_ROW_H;
         max_row = s_list_n - mv;
         if (max_row < 0) max_row = 0;
     }
@@ -1373,6 +1486,7 @@ static void p_am_enter(ui_ctx_t *ctx) {
     /* 进应用管家即后台预扫描商店包 (幂等: 已扫描/扫描中会早退), 不必等首次切到商店;
      * 这样首次进商店时列表/安装态已就绪, 不再闪现"正在扫描…". */
     am_store_prefetch();
+    if (s_cat == AM_CAT_STORE) am_store_wifi_gate(ctx);   /* 进来就停在商店 → 照样提示一次 */
     uint64_t t_store = (uint64_t)esp_timer_get_time();
     am_rebuild_keep();
     uint64_t t_end = (uint64_t)esp_timer_get_time();
@@ -1383,10 +1497,18 @@ static void p_am_enter(ui_ctx_t *ctx) {
      * linit 2026-10-01: 本机(微雪)就是没有触摸芯片的硬件, 每次进管家都提一句是噪音。 */
 }
 
+/* 离开管家: 进子页只收回标记; **真退出**才复位商店联网提示 (下次重进重新提示一次) */
+static void p_am_exit(ui_ctx_t *ctx) {
+    (void)ctx;
+    if (s_am_leave_child > 0) s_am_leave_child--;
+    else                      s_store_wifi_asked = false;
+    ESP_LOGI(TAG, "exit: child=%d asked=%d", s_am_leave_child, (int)s_store_wifi_asked);
+}
 static const os_module_t s_mod_app_manager = {
     .name       = "app_butler",
     .page_id    = OS_PAGE_APP_MANAGER,
     .on_enter   = p_am_enter,
+    .on_exit    = p_am_exit,
     .render     = p_am_render,
     .action     = p_am_action,
     .touch      = p_am_touch,
@@ -1394,4 +1516,7 @@ static const os_module_t s_mod_app_manager = {
     .fullscreen = false,   /* 显示状态栏 */
 };
 
-void os_page_app_manager_register(void) { os_register(&s_mod_app_manager); }
+void os_page_app_manager_register(void) {
+    os_register(&s_mod_app_manager);
+    am_lua_gate_register();           /* need=wifi 应用的启动门禁 (全局 service, 每帧轮询) */
+}

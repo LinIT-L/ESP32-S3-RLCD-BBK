@@ -445,6 +445,19 @@ size_t usb_hid_cdc_write(const uint8_t *data, size_t len)
 }
 
 /* CDC 串口是否已连接 (PC 打开该串口后 DTR 置位) */
+/* ★ 2026-10-02: USB 是否被**主机枚举**(挂载) —— 不区分当前复合模式(HID/CDC/MSC...)。
+ * 插到电脑等**数据主机**上为真; 插纯充电器(不枚举)为假。
+ * 用途: "USB 连接时不要自动休眠/自动关机"(linit)。见 wallpapers.c 的独立监视任务。
+ * ⚠ 当前板把 CHRG/VBUS 留在模块里没接给 MCU(见 docs/硬件与IO.md), 所以**纯充电器检测不了**。 */
+bool usb_hid_host_mounted(void)
+{
+    /* linit 明确: 不做充电检测, 只按 **USB/串口连接** 判。
+     * tud_mounted()      = 主机已枚举我们(插到电脑上就算, 不要求打开串口)
+     * tud_cdc_connected()= 串口已被主机打开(在跑 monitor / 传文件)
+     * 两者任一为真即视为"USB 连着"。纯充电器不枚举 → 仍检测不到(板子没把 CHRG/VBUS 接给 MCU)。 */
+    return tud_mounted() || tud_cdc_connected();
+}
+
 bool usb_hid_cdc_connected(void)
 {
     return s_mode != USB_MODE_NORMAL && tud_cdc_connected();

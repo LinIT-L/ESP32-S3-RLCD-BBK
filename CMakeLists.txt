@@ -57,3 +57,17 @@ add_custom_target(lin_dep_guard ALL
 )
 # 让最终镜像依赖该检查 → 守卫不过就不出固件
 add_dependencies(${CMAKE_PROJECT_NAME}.elf lin_dep_guard)
+
+# === Lua 桥 API 文档守卫接入构建 (2026-10-02) ===
+# 每次构建前自动跑 tools/lua_api_doc.py --check: 拿 components/apps/lua_bridge/luat_lib_*.c
+# 里**实际注册**的 app.* 与 docs/Lua桥API参考.md 对账 —— 加了/删了 API 却没重新生成文档就构建失败,
+# 从根上杜绝"文档与代码不同步"(照着旧文档写就会踩坑)。
+# 修法: 只要跑一次 `python3 tools/lua_api_doc.py` 把文档重新生成即可。
+add_custom_target(lin_lua_api_guard ALL
+    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH= python3
+            ${CMAKE_SOURCE_DIR}/tools/lua_api_doc.py --check
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "LinTOS Lua 桥 API 文档守卫 (tools/lua_api_doc.py --check)"
+    VERBATIM
+)
+add_dependencies(${CMAKE_PROJECT_NAME}.elf lin_lua_api_guard)

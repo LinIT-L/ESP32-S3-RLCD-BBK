@@ -62,6 +62,17 @@ static bool am_file_exist(const char *p) {
 /* 安装目标默认值: 0=内置固件 /store/apps, 1=TF 卡 /sdcard/apps。
  * (原"运维类包推荐装 TF 卡"的按名规则随预置包一并移除; 以后需要可按包名再扩展) */
 static int am_pkg_prefer(const char *fname) { (void)fname; return 0; }
+/* 商店列表要的是 main_icons 索引, 而 LAPP 头里带的是 64x64 位图(应用管家用) ——
+ * 两者没有反查关系。原实现把所有包硬写成 ICON_MINI_GAMES(迷你游戏), 看着像 bug。
+ * 这里给已知包名一个小映射, 未知包沿用默认。 */
+static int am_store_icon_of(const char *fname) {
+    static const struct { const char *f; int ic; } T[] = {
+        { "biossim.lua", ICON_DIAG },      /* BIOS 装机模拟器 */
+    };
+    for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++)
+        if (strcmp(T[i].f, fname) == 0) return T[i].ic;
+    return ICON_MINI_GAMES;
+}
 static bool am_copy_file(const char *src, const char *dst) {
     FILE *in = fopen(src, "rb");
     if (!in) return false;
@@ -95,6 +106,15 @@ static void am_pkg_scan(void) {
         while ((e = readdir(d)) != NULL) {
             const char *nm = e->d_name;
             if (nm[0] == '.') continue;
+            /* ★★ 只取**直接子项** (2026-10-02 定案, 这是"两个 BIOS 模拟器/可重复安装"的根因):
+             *   ESP-IDF 的 SPIFFS VFS `readdir` 并不会像 FAT 那样逐层展开 ——
+             *   `esp_spiffs.c: vfs_spiffs_readdir_r()` 只剥掉一层前缀, 之后**原样返回剩余路径**。
+             *   实测 `opendir("/store")` 会同时吐出 "apps"、"apps/app"、"apps/app/biossim.lua"
+             *   —— 后两个名字里带 '/'。旧代码只用"长度>5 且以 .lua 结尾"过滤 →
+             *   **预装副本 apps/app/xxx.lua 被当成"商店待装包"** → 商店里出现同名第二条,
+             *   点"安装"又往 /apps/app/ 复制一份 → 想装几次就重复几份。
+             *   (am_lua.c 扫 /store/apps/{cat} 不受影响: 它剥前缀后正好只剩文件名。) */
+            if (strchr(nm, '/')) continue;
             size_t len = strlen(nm);
             if (len <= 5 || strcasecmp(nm + len - 4, ".lua") != 0) continue;
             int k = am_pkg_find_name(nm);
@@ -124,7 +144,7 @@ static void am_pkg_scan(void) {
                 s_pkg[k].pref = am_pkg_prefer(nm);
                 s_pkg[k].app.id        = s_pkg[k].id;
                 s_pkg[k].app.label     = s_pkg[k].label;
-                s_pkg[k].app.icon_idx  = ICON_MINI_GAMES;
+                s_pkg[k].app.icon_idx  = am_store_icon_of(nm);
                 s_pkg[k].app.page      = OS_PAGE_LUA;
                 s_pkg[k].app.hidden    = true;
                 s_pkg[k].app.touch_only= false;
@@ -136,6 +156,28 @@ static void am_pkg_scan(void) {
             s_pkg_inst[k] = am_file_exist(s_pkg[k].dst) || am_file_exist(s_pkg[k].dst_sd);
         }
         closedir(d);
+    }
+    /* ⚠ 按文件名去重 (2026-10-02): am_store_invalidate() 曾经把 s_pkg_busy 清零,
+     * 扫描还没跑完就允许再起一个任务 → 两个任务交错写同一个 s_pkg[] →
+     * 商店里出现**同名重复条目**(实测日志里"状态已刷新"打印了 3 次)。
+     * 这里做一次保序去重作为最后防线。
+     * ⚠ 搬完必须重指 app.id/app.label —— 它们是"指向自己数组"的自指针, 整体拷贝后会指到旧槽位。 */
+    {
+        int w = 0;
+        for (int r = 0; r < s_pkg_n; r++) {
+            bool dup = false;
+            for (int q = 0; q < w; q++)
+                if (strcmp(s_pkg[q].fname, s_pkg[r].fname) == 0) { dup = true; break; }
+            if (dup) continue;
+            if (w != r) {
+                s_pkg[w] = s_pkg[r];
+                s_pkg[w].app.id    = s_pkg[w].id;
+                s_pkg[w].app.label = s_pkg[w].label;
+            }
+            w++;
+        }
+        if (w != s_pkg_n) ESP_LOGW(TAG, "商店包去重: %d -> %d 条", s_pkg_n, w);
+        s_pkg_n = w;
     }
     s_pkg_scanned = 0;   /* 全部填充完成, UI 才可见数据 */
 }
@@ -214,15 +256,30 @@ static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
         os_dialog_toast(ctx, "\xe5\xae\x89\xe8\xa3\x85\xe5\xa4\xb1\xe8\xb4\xa5");   /* 安装失败 */
     }
     am_rebuild_keep();
+    /* ★ 2026-10-02: 原来安装完**不关**确认框, 要用户手动按返回才消失
+     *   (卸载路径一直有 os_dialog_pop, 安装路径漏了)。这里补上, 与卸载对称。 */
+    os_dialog_pop(ctx);
+    ctx->needs_redraw = true;
 }
+/* ★ 商店行统一入口 (2026-10-02 linit: "商店只负责安装/卸载, 卸载不负责启动应用"):
+ *   已安装 → 弹"卸载 XXX?" ; 未安装 → 弹"安装 XXX?" 。
+ *   **商店里永远不启动应用** —— 要运行请到「应用」分类点它。
+ *   (原来已安装时走这里会直接运行, 用户点了按钮却跑起来、卸载还藏在长按里, 等于点不到) */
+void am_store_toggle(ui_ctx_t *ctx, const os_app_t *a) {
+    if (!a) return;
+    int k = am_pkg_find(a);
+    if (k < 0) return;
+    if (am_pkg_installed(k)) { am_store_uninstall_ask(ctx, a); return; }
+    am_store_activate(ctx, a);          /* 未装时 activate 的本职就是弹"安装?"确认 */
+}
+
 /* 商店选中: 已安装(内置或卡) → 运行; 未安装 → 弹"安装 XXX?" 确认 (目标是应用默认, 不选) */
 void am_store_activate(ui_ctx_t *ctx, const os_app_t *a) {
     int k = am_pkg_find(a);
     if (k < 0) return;
     if (am_pkg_installed(k)) {
         const char *run = am_file_exist(s_pkg[k].dst) ? s_pkg[k].dst : s_pkg[k].dst_sd; /* 优先内置, 否则TF卡 */
-        os_page_lua_set_boot(run);
-        os_push(ctx, OS_PAGE_LUA);
+        am_lua_open_path(ctx, run);     /* 统一入口: 带 `need=wifi` 门禁 (未联网先弹窗连网) */
         return;
     }
     char title[64];
@@ -279,8 +336,17 @@ const char *am_store_fname_of(const os_app_t *a) {
     int k = am_pkg_find(a);
     return (k >= 0) ? s_pkg[k].fname : NULL;
 }
+/* 商店包简介 (LAPP `desc=`); 非商店包/无简介返回 NULL。
+ * 商店行第二行改用它 —— 原来显示 fname 等于给用户看文件名, 没信息量。 */
+const char *am_store_desc_of(const os_app_t *a) {
+    int k = am_pkg_find(a);
+    return (k >= 0 && s_pkg[k].desc[0]) ? s_pkg[k].desc : NULL;
+}
 /* 目录变化(装入/卸载)后调用: 下次进商店重新扫描 */
-void am_store_invalidate(void) { s_pkg_scanned = -1; s_pkg_busy = false; s_pkg_done = false; }
+/* 目录变化(装入/卸载)后调用: 下次进商店重新扫描。
+ * ⚠ 不要清 s_pkg_busy —— 扫描任务可能还在跑, 清了就允许**再起一个并发扫描**,
+ *   两个任务交错写 s_pkg[] 会产生同名重复条目(2026-10-02 linit 报的"商店里有两个"). */
+void am_store_invalidate(void) { s_pkg_scanned = -1; s_pkg_done = false; }
 
 /* 每帧取货: 后台扫描完成后刷新"安装状态"缓存; 返回 true = UI 应重建列表 */
 bool am_store_tick(void) {

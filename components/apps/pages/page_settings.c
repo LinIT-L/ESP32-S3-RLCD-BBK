@@ -20,6 +20,7 @@
 #include "audio_player.h"
 #include "vibrator.h"
 #include "wifi_manager.h"
+#include "bt_manager.h"   /* bt_is_on(): 蓝牙实际开关状态 */
 #include "keyboard.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -794,24 +795,33 @@ static void open_info_dlg(ui_ctx_t *ctx);
  * 需在设置页同编译单元内, 故放这里并导出让 page_usb_net 调用. */
 /* 追踪"本次扫码是否由我们开 WiFi": 仅在真正为我们开启时才负责关闭,
  * 避免误关用户本来就在用的 WiFi (如局域网服务/已连状态). */
+/* ★ 蓝牙/WiFi 的"当前是否开着"一律以**底层实际状态**为准 (2026-10-02 linit 实测)：
+ *   手柄已经连上、蓝牙明明在跑，"网络与系统"却显示「蓝牙:关」—— 因为原来只看
+ *   os_hw_is_active()，那只是资源管家的**引用计数视图**。一旦某处直接调
+ *   bt_manager_enable()/wifi_manager_enable()（或计数曾错位），底层在跑而计数为 0：
+ *   ① 菜单显示错误；② 按开关会再 os_hw_request 一次 → 引用计数 +1 → **关不掉**。
+ *   所以这里显示与开关都改问底层。 */
+static bool bt_is_on(void)   { return bt_manager_is_ready() || bt_manager_is_enabled(); }
+static bool wifi_is_on(void) { return wifi_manager_is_enabled() || os_hw_is_active(OS_HW_WIFI); }
+
 static bool s_wifi_conn_we_opened = false;
 void settings_wifi_connect_open(ui_ctx_t *ctx) {
-    if (!os_hw_is_active(OS_HW_WIFI)) { os_hw_request(OS_HW_WIFI); s_wifi_conn_we_opened = true; }
+    if (!wifi_is_on()) { os_hw_request(OS_HW_WIFI); s_wifi_conn_we_opened = true; }
     open_wifi_scan(ctx);
 }
 static void on_wifi_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     if (result == 0) {   /* 蓝牙开关 (懒加载 os_hw) */
-        if (os_hw_is_active(OS_HW_BT)) os_hw_release(OS_HW_BT);
-        else os_hw_request(OS_HW_BT);
+        if (bt_is_on()) { os_hw_release(OS_HW_BT); bt_manager_disable(); }  /* 计数错位时兜底直关 */
+        else            os_hw_request(OS_HW_BT);
         os_dialog_pop(ctx); open_wifi_dlg(ctx, result);   /* 原地替换, 层级不加深 */
     } else if (result == 1) {   /* WiFi 开关 */
-        if (os_hw_is_active(OS_HW_WIFI)) os_hw_release(OS_HW_WIFI);
-        else os_hw_request(OS_HW_WIFI);
+        if (wifi_is_on()) { os_hw_release(OS_HW_WIFI); wifi_manager_disable(); }
+        else              os_hw_request(OS_HW_WIFI);
         os_dialog_pop(ctx); open_wifi_dlg(ctx, result);   /* 原地替换, 层级不加深 */
     } else if (result == 2) {
         /* WiFi 开时 = "连接WiFi"; WiFi 关时该项为"系统信息" (固定末项映射) */
-        if (os_hw_is_active(OS_HW_WIFI)) open_wifi_scan(ctx);
+        if (wifi_is_on()) open_wifi_scan(ctx);
         else open_info_dlg(ctx);
     } else if (result == 3) {   /* WiFi 开时末项 = 系统信息 */
         open_info_dlg(ctx);
@@ -826,6 +836,10 @@ static char  s_wifi_pwd_pass[65];
 static int   s_wifi_pwd_len = 0;
 static bool  s_wp_sym   = false;   /* 符号层 */
 static bool  s_wp_shift = false;   /* 大写 */
+/* 手柄光标 (2026-10-02 linit): 用触屏时不需要选中态; **一旦按方向键**就出现黑块光标,
+ * 方向键移动、确认键敲下当前键。触摸一下即隐藏光标 (回归纯触屏观感)。 */
+static bool  s_wp_gp     = false;  /* 已用方向键 → 显示光标 */
+static int   s_wp_sel_r  = 4, s_wp_sel_c = 2;   /* 默认停在"回车"(直接按确认就是连接) */
 
 /* 弹窗式几何: 直接复用"搜索WiFi"同款 350×250 居中弹窗外框 (margins 25);
  * 顶部 SSID/密码框, 中部经典 5 排自定义键盘贴弹窗底部 (无返回行). */
@@ -846,6 +860,36 @@ static const char *const wp_symk[4] = {
 static char wp_disp(char c) {
     if (!s_wp_sym && s_wp_shift && c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
     return c;
+}
+
+/* ---- 键盘单元格几何 (与渲染/触摸同一套数字; 行 r / 列 c) ----
+ * 列数: r0/r1=10, r2=9, r3=10 (Shift + 8字母 + 删除), r4=3 (&123 + 空格 + 回车) */
+static int wp_row_cols(int r) {
+    return (r == 2) ? 9 : ((r == 4) ? 3 : 10);
+}
+static void wifi_pwd_connect(ui_ctx_t *ctx);   /* 定义在下方 (回车键要用) */
+/* 敲下 (r,c) 键: 与触摸命中后做的事**完全一致** */
+static void wp_apply(ui_ctx_t *ctx, int r, int c) {
+    const char *const *ll = s_wp_sym ? wp_symk : wp_abc;
+    if (r == 0 || r == 1) {
+        char ch = wp_disp(ll[r][c]);
+        if (ch && s_wifi_pwd_len < 63) s_wifi_pwd_pass[s_wifi_pwd_len++] = ch;
+    } else if (r == 2) {
+        char ch = wp_disp(ll[2][c]);
+        if (ch && s_wifi_pwd_len < 63) s_wifi_pwd_pass[s_wifi_pwd_len++] = ch;
+    } else if (r == 3) {
+        if (c == 0)      { if (s_wp_sym) s_wp_sym = false; else s_wp_shift = !s_wp_shift; }
+        else if (c == 9) { if (s_wifi_pwd_len > 0) s_wifi_pwd_len--; }
+        else {
+            char ch = wp_disp(ll[3][c - 1]);
+            if (ch && s_wifi_pwd_len < 63) s_wifi_pwd_pass[s_wifi_pwd_len++] = ch;
+        }
+    } else {
+        if (c == 0)      s_wp_sym = !s_wp_sym;
+        else if (c == 1) { if (s_wifi_pwd_len < 63) s_wifi_pwd_pass[s_wifi_pwd_len++] = ' '; }
+        else             wifi_pwd_connect(ctx);
+    }
+    ctx->needs_redraw = true;
 }
 
 /* 密码页发起连接后, 后台轮询连接结果并 toast 提示 */
@@ -890,6 +934,7 @@ static bool wifi_pwd_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);
 
 static bool wifi_pwd_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
     (void)d; (void)ud;
+    s_wp_gp = false;                    /* 一触摸就把手柄光标收掉 (不让触屏用户看到黑块) */
     if (s_wifi_pwd_len < 0) s_wifi_pwd_len = 0;
     if (s_wifi_pwd_len > 63) s_wifi_pwd_len = 63;
     const int kb0 = WKB_TOP, R = WKB_ROWH;
@@ -949,9 +994,27 @@ static bool wifi_pwd_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *
         s_wifi_conn_we_opened = false;
         os_dialog_pop(ctx); return true;
     }
-    if (a == OS_ACTION_CONFIRM) { wifi_pwd_connect(ctx); return true; }
+    /* 方向键 = 光标导航 (2026-10-02 linit: "用手柄按方向键的时候就要选中") */
     if (a == OS_ACTION_LEFT || a == OS_ACTION_RIGHT || a == OS_ACTION_UP || a == OS_ACTION_DOWN) {
-        return true;   /* 方向键暂不导航键盘, 触摸为主 */
+        s_wp_gp = true;                                  /* 出现黑块光标 */
+        if (a == OS_ACTION_UP || a == OS_ACTION_DOWN) {
+            int r = s_wp_sel_r + (a == OS_ACTION_DOWN ? 1 : -1);
+            if (r < 0) r = 4; else if (r > 4) r = 0;     /* 5 排循环 */
+            s_wp_sel_r = r;
+            if (s_wp_sel_c >= wp_row_cols(r)) s_wp_sel_c = wp_row_cols(r) - 1;
+        } else {
+            int n = wp_row_cols(s_wp_sel_r);
+            int c = s_wp_sel_c + (a == OS_ACTION_RIGHT ? 1 : -1);
+            if (c < 0) c = n - 1; else if (c >= n) c = 0;
+            s_wp_sel_c = c;
+        }
+        ctx->needs_redraw = true;
+        return true;
+    }
+    if (a == OS_ACTION_CONFIRM) {
+        if (s_wp_gp) wp_apply(ctx, s_wp_sel_r, s_wp_sel_c);   /* 光标可见 → 敲当前键 */
+        else         wifi_pwd_connect(ctx);                   /* 纯触屏/未导航过 → 原行为: 直接连 */
+        return true;
     }
     return true;
 }
@@ -1001,7 +1064,8 @@ static bool wifi_pwd_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         for (int i = 0; i < 10; i++) {
             int kx = WKB_LX + i * 34;
             char lb[2] = { wp_disp(ll[r][i]), 0 };
-            bool sel = tv && ty >= kb0 + r * R && ty < kb0 + r * R + R && tx >= kx && tx < kx + 34;
+            bool sel = (s_wp_gp && s_wp_sel_r == r && s_wp_sel_c == i)
+                       || (tv && ty >= kb0 + r * R && ty < kb0 + r * R + R && tx >= kx && tx < kx + 34);
             wp_draw_key(lcd, kx, kb0 + r * R, 34, lb, sel);
         }
         draw_hline(lcd, WKB_LX, dx + WPW_W - 4, kb0 + (r + 1) * R - 1, ST7305_COLOR_BLACK);
@@ -1010,7 +1074,8 @@ static bool wifi_pwd_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     for (int i = 0; i < 9; i++) {
         int kx = WKB_LX + i * 38;
         char lb[2] = { wp_disp(ll[2][i]), 0 };
-        bool sel = tv && ty >= kb0 + 2 * R && ty < kb0 + 2 * R + R && tx >= kx && tx < kx + 38;
+        bool sel = (s_wp_gp && s_wp_sel_r == 2 && s_wp_sel_c == i)
+                   || (tv && ty >= kb0 + 2 * R && ty < kb0 + 2 * R + R && tx >= kx && tx < kx + 38);
         wp_draw_key(lcd, kx, kb0 + 2 * R, 38, lb, sel);
     }
     draw_hline(lcd, WKB_LX, dx + WPW_W - 4, kb0 + 3 * R - 1, ST7305_COLOR_BLACK);
@@ -1019,26 +1084,32 @@ static bool wifi_pwd_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         int ry = kb0 + 3 * R;
         const char *sh = s_wp_sym ? "ABC"
                         : (s_wp_shift ? "\xe5\xb0\x8f\xe5\x86\x99" : "\xe5\xa4\xa7\xe5\x86\x99"); /* 小写/大写 */
-        bool s0 = tv && ty >= ry && ty < ry + R && tx >= WKB_LX && tx < WKB_LX + 50;
+        bool s0 = (s_wp_gp && s_wp_sel_r == 3 && s_wp_sel_c == 0)
+                  || (tv && ty >= ry && ty < ry + R && tx >= WKB_LX && tx < WKB_LX + 50);
         wp_draw_key(lcd, WKB_LX, ry, 50, sh, s0);
         for (int i = 0; i < 8; i++) {
             int kx = WKB_LX + 50 + i * 30;
             char lb[2] = { wp_disp(ll[3][i]), 0 };
-            bool se = tv && ty >= ry && ty < ry + R && tx >= kx && tx < kx + 30;
+            bool se = (s_wp_gp && s_wp_sel_r == 3 && s_wp_sel_c == i + 1)
+                      || (tv && ty >= ry && ty < ry + R && tx >= kx && tx < kx + 30);
             wp_draw_key(lcd, kx, ry, 30, lb, se);
         }
-        bool s9 = tv && ty >= ry && ty < ry + R && tx >= WKB_LX + 290 && tx < WKB_LX + 342;
+        bool s9 = (s_wp_gp && s_wp_sel_r == 3 && s_wp_sel_c == 9)
+                  || (tv && ty >= ry && ty < ry + R && tx >= WKB_LX + 290 && tx < WKB_LX + 342);
         wp_draw_key(lcd, WKB_LX + 290, ry, 52, "\xe5\x88\xa0\xe9\x99\xa4", s9); /* 删除 */
         draw_hline(lcd, WKB_LX, dx + WPW_W - 4, kb0 + 4 * R - 1, ST7305_COLOR_BLACK);
     }
     /* 行4: &123 + 空格(大, 往右) + 回车(原连接, 去删除并入退格) */
     {
         int ry = kb0 + 4 * R;
-        bool s0 = tv && ty >= ry && ty < ry + R && tx >= WKB_LX && tx < WKB_LX + 64;
+        bool s0 = (s_wp_gp && s_wp_sel_r == 4 && s_wp_sel_c == 0)
+                  || (tv && ty >= ry && ty < ry + R && tx >= WKB_LX && tx < WKB_LX + 64);
         wp_draw_key(lcd, WKB_LX, ry, 64, s_wp_sym ? "ABC" : "&123", s0);
-        bool s1 = tv && ty >= ry && ty < ry + R && tx >= WKB_LX + 64 && tx < WKB_LX + 64 + 218;
+        bool s1 = (s_wp_gp && s_wp_sel_r == 4 && s_wp_sel_c == 1)
+                  || (tv && ty >= ry && ty < ry + R && tx >= WKB_LX + 64 && tx < WKB_LX + 64 + 218);
         wp_draw_key(lcd, WKB_LX + 64, ry, 218, "\xe7\xa9\xba\xe6\xa0\xbc", s1); /* 空格 */
-        bool s3 = tv && ty >= ry && ty < ry + R && tx >= WKB_LX + 282 && tx < WKB_LX + 342;
+        bool s3 = (s_wp_gp && s_wp_sel_r == 4 && s_wp_sel_c == 2)
+                  || (tv && ty >= ry && ty < ry + R && tx >= WKB_LX + 282 && tx < WKB_LX + 342);
         wp_draw_key(lcd, WKB_LX + 282, ry, 60, "\xe5\x9b\x9e\xe8\xbd\xa6", s3); /* 回车 */
     }
 
@@ -1053,6 +1124,7 @@ static void open_wifi_pwd_dlg(ui_ctx_t *ctx, const char *ssid) {
     s_wifi_pwd_len = 0;
     s_wifi_pwd_pass[0] = '\0';
     s_wp_sym = false; s_wp_shift = false;
+    s_wp_gp = false; s_wp_sel_r = 4; s_wp_sel_c = 2;   /* 光标默认停"回车" */
     /* 原位改写当前弹窗 (扫描列表 → 输密码键盘) */
     os_dlg_stack_t *d = os_dialog_top_mut(ctx);
     if (!d) return;
@@ -1124,11 +1196,11 @@ static void open_wifi_dlg(ui_ctx_t *ctx, int sel) {
     char items[4][30];
     const char *ptrs[4];
     int n = 0;
-    snprintf(items[n], sizeof(items[n]), "\xe8\x93\x9d\xe7\x89\x99:%s", os_hw_is_active(OS_HW_BT) ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 蓝牙:开/关 */
+    snprintf(items[n], sizeof(items[n]), "\xe8\x93\x9d\xe7\x89\x99:%s", bt_is_on() ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 蓝牙:开/关 */
     ptrs[n] = items[n]; n++;
-    snprintf(items[n], sizeof(items[n]), "WiFi:%s", os_hw_is_active(OS_HW_WIFI) ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* WiFi:开/关 */
+    snprintf(items[n], sizeof(items[n]), "WiFi:%s", wifi_is_on() ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* WiFi:开/关 */
     ptrs[n] = items[n]; n++;
-    if (os_hw_is_active(OS_HW_WIFI)) {
+    if (wifi_is_on()) {
         /* 已连 WiFi → 该项显示"已连接:<IP>"; 未连 → "连接WiFi" */
         char ip[16] = "";
         if (wifi_manager_get_ip(ip, sizeof(ip)) && ip[0])

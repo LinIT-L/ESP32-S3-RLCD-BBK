@@ -215,6 +215,10 @@ static TaskHandle_t s_ss_task_h = NULL;  /* 深睡前 vTaskSuspend */
 static st7305_handle_t *s_ss_lcd = NULL;
 
 #include "sleep.h"   /* 电源模块: wp_power_init(绑定 LCD + 注册深睡唤醒源) */
+#include "usb_hid.h" /* usb_hid_host_mounted(): USB 插着就不自动休眠 (2026-10-02) */
+
+/* USB(主机已枚举) 期间不自动休眠: 插在电脑上时正在传文件/调试/充电, 不希望它息屏甚至自动关机。 */
+static bool s_usb_suppress_prev = false;
 
 static void ss_supervisor_task(void *arg) {
     (void)arg;
@@ -224,10 +228,23 @@ static void ss_supervisor_task(void *arg) {
     while (1) {
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         if (os_screensaver_active()) {
+            /* ★★★ 2026-10-02 修复「按一次键画面定住、要按第二次才返回」:
+             *   原来本分支是"**先画星空+刷屏, 再判输入唤醒**"。按键唤醒时:
+             *     主循环 os_handle_action → os_screensaver_reset() → os_render 用"刚退出那一帧"
+             *     的边沿把页面重绘回来; 但本任务这一轮已经把 active 判过(true)了, 于是
+             *     **又画了一帧星空盖在页面上** → 屏幕停在壁纸不动 → 必须再按一次才回到原界面。
+             *   修法: **唤醒判定提到渲染之前**, 有新输入就直接跳过本帧渲染(交给主循环重绘页面)。
+             *   顺序: 唤醒判定 → 自动关机判定 → 渲染。 */
+            if (input_last_any_ms() > s_ss_enter_ms) {
+                os_screensaver_reset();
+                vTaskDelay(pdMS_TO_TICKS(52));
+                continue;                       /* 本帧不画壁纸, 让主循环把页面画回来 */
+            }
             /* 屏保播满"休眠时间"(wp_run) → 请求自动关机(任意键唤醒)。
              * 本任务栈在 PSRAM, 不能自己深睡(禁缓存瞬间会撞断言), 故只置标志并自挂起;
              * 真正入睡由 main 主循环(内部 RAM 栈)执行 wp_power_off(WP_OFF_AUTO)。 */
-            if (now - s_ss_enter_ms >= wp_ss_run_ms()) {
+            /* USB 插着 → 不自动关机 (屏保可以继续播, 但永不入睡) */
+            if (!usb_hid_host_mounted() && now - s_ss_enter_ms >= wp_ss_run_ms()) {
                 s_ss_shutdown = true;
                 vTaskSuspend(xTaskGetCurrentTaskHandle());
                 continue;
@@ -238,18 +255,20 @@ static void ss_supervisor_task(void *arg) {
                 wp_program_render(s_ss_lcd, WP_PROG_STARS, t);
                 st7305_flush_override(s_ss_lcd);   /* 屏保期间唯一允许写屏的通道 */
             }
-            /* 统一唤醒判定: 进入屏保(s_ss_enter_ms)之后, 任何新的输入(时间戳>进入时刻)才唤醒. */
-            if (input_last_any_ms() > s_ss_enter_ms) {
-                os_screensaver_reset();
-            }
             /* 流畅优先: 星空 16fps (1000/62). 必须有 vTaskDelay 让出 CPU **并喂狗**,
              * 否则本任务(优先级 IDLE+2)在此分支 100% 空转, 饿死同一核上的主循环/输入,
              * 表现为"任意键(含锁屏键)都点不醒壁纸"+ task_wdt(CPU0: sse). */
             vTaskDelay(pdMS_TO_TICKS(52));
         } else {
-            /* 空闲检测 (低频省电) */
+            /* 空闲检测 (低频省电) —— USB 插着就不进屏保(也就不会连锁到自动关机) */
+            bool usb = usb_hid_host_mounted();
+            if (usb != s_usb_suppress_prev) {
+                s_usb_suppress_prev = usb;
+                ESP_LOGW(WP_TAG, "USB 主机%s → %s", usb ? "已连接" : "已断开",
+                         usb ? "暂停自动休眠/自动关机" : "恢复自动休眠");
+            }
             uint32_t last_in = input_last_any_ms();
-            if (last_in != 0 && now - last_in >= wp_ss_delay_ms()) {
+            if (!usb && last_in != 0 && now - last_in >= wp_ss_delay_ms()) {
                 ESP_LOGW(WP_TAG, "独立监视: 空闲超时, 强制进入壁纸");
                 os_screensaver_force_enter();
             }

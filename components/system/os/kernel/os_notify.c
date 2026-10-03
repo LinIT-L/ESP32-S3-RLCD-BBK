@@ -46,6 +46,18 @@ void os_notify_tone(uint16_t freq, uint16_t dur_ms) {
     tone_beep((int)freq, (int)dur_ms);
 }
 
+void os_notify_tone_async(uint16_t freq, uint16_t dur_ms, uint16_t amp) {
+    tone_beep_async((int)freq, (int)dur_ms, (int)amp);
+}
+
+/* os_note_t 与 tone_note_t 都是 { int freq; int ms; } —— 把这句话钉在编译期,
+ * 以后任何一边改了字段就会直接编译失败, 而不是静默跑飞. */
+_Static_assert(sizeof(os_note_t) == sizeof(tone_note_t), "os_note_t 布局必须与 tone_note_t 一致");
+
+void os_notify_tone_melody(const os_note_t *notes, int count) {
+    tone_play_melody((const tone_note_t *)notes, count);
+}
+
 void os_notify_tone_stop(void) {
     tone_stop();
 }

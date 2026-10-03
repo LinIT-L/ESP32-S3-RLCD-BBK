@@ -83,6 +83,8 @@ size_t usb_hid_cdc_write(const uint8_t *data, size_t len);
 
 /* CDC 串口是否已连接 (PC 打开该串口后) */
 bool usb_hid_cdc_connected(void);
+/* USB 被主机枚举(挂载) = 插在数据主机上; 用于"插着 USB 就不自动休眠" */
+bool usb_hid_host_mounted(void);
 
 /* 读取 PC 经 CDC 串口发来的数据 (信息回传). 返回实际读取字节数; 无数据/未连接返回 0. */
 size_t usb_hid_cdc_read(uint8_t *data, size_t len);

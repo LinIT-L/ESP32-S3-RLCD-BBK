@@ -64,6 +64,16 @@ static void tone_feed_amp(int freq_hz, int ms, int amp) {
 
 static void tone_feed(int freq_hz, int ms) { tone_feed_amp(freq_hz, ms, TONE_AMP); }
 
+/* 非阻塞单音: 只喂 PCM 不等待. 连续调用 = 天然排进 I2S 环形缓冲, 形成小旋律. */
+void tone_beep_async(int freq_hz, int ms, int amp) {
+    if (!s_ready || ms <= 0) return;
+    if (freq_hz < 40) freq_hz = 40;
+    if (freq_hz > 20000) freq_hz = 20000;
+    if (amp < 1) amp = TONE_AMP;
+    if (amp > TONE_AMP) amp = TONE_AMP;
+    tone_feed_amp(freq_hz, ms, amp);
+}
+
 /* ============ 持续音 (tone_tone_on / tone_stop) ============
  * "按下持续响、松开停"语义: 后台任务循环合成方波 PCM 喂给 I2S,
  * 直到 tone_stop() 置 0 退出并 flush 清空环形缓冲. */

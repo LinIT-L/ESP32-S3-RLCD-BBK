@@ -333,3 +333,26 @@ CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM=0
 
 # panic 复位前留 3 秒, 让 panic 正文能打出来 (否则被复位吞掉)
 CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=3
+
+# ---- TLS 内存瘦身 (2026-10-02) ----
+# 背景: 蓝牙(手柄)+WiFi 同时开着时内部堆只剩 ~15KB/最大连续块 7.6KB,
+# 而默认 IN=16384 的 mbedtls 上下文需要一块连续 16KB → calloc 失败 →
+# esp_http_client_open 242µs 就返回 ESP_ERR_HTTP_CONNECT (实测日志)。
+# DYNAMIC_BUFFER 把收发缓冲从"上下文内"改成"按需单独分配", 于是不再要求
+# 一整块 16KB 连续内存; IN 降到 4096 / OUT 降到 2048 进一步压低峰值。
+# ⚠ 代价: 单个 TLS 记录 >4096B 会失败 (服务器一般按 ≤4KB 分包; 若遇到大响应,
+#   表现为 ESP_ERR_HTTP_CONNECT 或握手后读失败, 可再调大 IN)。
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# ---- mbedtls 的 TLS 工作内存一律用 PSRAM (2026-10-02 linit 立规) ----
+# 原来 INTERNAL_MEM_ALLOC=y → 握手每一小块都从内部 RAM 要, BT+WiFi 同开时只剩 ~14KB,
+# 直接 `Dynamic Impl: alloc(2389 bytes) failed` + `mbedtls_ssl_handshake returned -0x0010`
+# (= MBEDTLS_ERR_SSL_ALLOC_FAILED) → esp_http_client 报 ESP_ERR_HTTP_CONNECT(28674)。
+# 改成 EXTERNAL_SPIRAM: mbedtls 的 calloc/free 走 PSRAM(空闲 6.5MB), 内部 RAM 只留必要项。
+CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096

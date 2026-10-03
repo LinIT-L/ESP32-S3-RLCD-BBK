@@ -3,7 +3,7 @@
 idf_component_register(
     SRCS "wifi_manager.c" "dns_server.c" "macoui.c" "wifi_probe.c"
     INCLUDE_DIRS "." "include"
-    REQUIRES nvs_flash svc_time svc_nvs esp_wifi esp_event esp_netif lwip
+    REQUIRES nvs_flash svc_time svc_nvs esp_wifi esp_event esp_netif lwip bt_ctl
     EMBED_FILES oui_db.bin
 )
 

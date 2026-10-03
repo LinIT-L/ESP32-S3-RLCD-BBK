@@ -9,6 +9,7 @@
         --@app cat=运维                  ← 分类: 程序/游戏/系统/运维/网络/学习
         --@app desc=按现象追问, 概率排序  ← 商店列表简介
         --@app version=1.0
+        --@app need=wifi                 ← 能力声明: 启动前需要联网 (未连则先弹窗连网)
         --@app icon=<base64, 64x64 1bpp> ← 图标位图 (512B → base64 684 字符)
         --@lapp v1                       ← 格式标记 (存在即视为已打包)
 
@@ -170,25 +171,34 @@ end
 
 def do_pack(a):
     src = open(a.file, encoding="utf-8").read()
+    old = parse_header(src)          # 已打包过的文件: 用来"只改一项、其余照旧"
     body = strip_lapp(src)
+    # 图标: 显式给了就重取, 否则复用包里已有的 (只加 need= 之类时不必再指图标)
     if a.icon:
         bits = bits_from_png(a.icon)
     elif a.icon_from_main:
         bits = bits_from_main(a.icon_from_main)
+    elif "icon" in old:
+        bits = bits_from_b64(old["icon"])
     else:
         raise SystemExit("需要 --icon <png> 或 --icon-from-main ICON_XXX")
+    name = a.name or old.get("name")
+    cat  = a.cat  or old.get("cat")
+    desc = a.desc or old.get("desc")
+    need = a.need if a.need is not None else old.get("need")
     head = [MARK]
-    if a.name:    head.append("--@app name=%s" % a.name)
-    if a.cat:     head.append("--@app cat=%s" % a.cat)
-    if a.desc:    head.append("--@app desc=%s" % a.desc)
-    head.append("--@app version=%s" % a.version)
+    if name: head.append("--@app name=%s" % name)
+    if cat:  head.append("--@app cat=%s" % cat)
+    if desc: head.append("--@app desc=%s" % desc)
+    if need: head.append("--@app need=%s" % need)
+    head.append("--@app version=%s" % (a.version or old.get("version") or "1.0"))
     head.append("--@app icon=%s" % b64(bits))
     out = "\n".join(head) + "\n" + "-- 图标自绘: blit_app_icon(x, y[, inv=true])\n" \
           + (PRELUDE % b64(bits)) + body + "\n"
     open(a.file, "w", encoding="utf-8").write(out)
     print("  ✓ 已打包 %s" % os.path.relpath(a.file, ROOT))
-    print("     名称: %s   分类: %s   图标: %d B(b64 %d 字符)"
-          % (a.name, a.cat, ICON_BYTES, len(b64(bits))))
+    print("     名称: %s   分类: %s   图标: %d B(b64 %d 字符)%s"
+          % (name, cat, ICON_BYTES, len(b64(bits)), "   need=%s" % need if need else ""))
     do_verify(a)
 
 
@@ -199,7 +209,7 @@ def do_verify(a):
     print("  文件: %s  (%d 行, %d 字节)" % (os.path.basename(a.file),
                                           text.count("\n") + 1, len(text)))
     print("  LAPP: %s" % ("是" if packed else "否 (普通 .lua, 仍可直接运行)"))
-    for k in ("name", "cat", "desc", "version"):
+    for k in ("name", "cat", "desc", "version", "need"):
         if k in meta: print("  %-8s %s" % (k + ":", meta[k]))
     if "icon" in meta:
         try:
@@ -227,6 +237,7 @@ def main():
     p = sub.add_parser("pack"); p.add_argument("file")
     p.add_argument("--name"); p.add_argument("--cat"); p.add_argument("--desc")
     p.add_argument("--version", default="1.0")
+    p.add_argument("--need", help="能力声明, 逗号分隔; 目前支持 wifi (启动前门禁: 未联网则先弹窗连网)")
     p.add_argument("--icon"); p.add_argument("--icon-from-main")
     v = sub.add_parser("verify"); v.add_argument("file")
     u = sub.add_parser("unpack"); u.add_argument("file"); u.add_argument("-o", "--out", required=True)

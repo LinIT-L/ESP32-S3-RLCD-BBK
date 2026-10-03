@@ -21,6 +21,10 @@ typedef struct {
     char    desc[96];              /* 商店列表简介 (可空) */
     char    version[12];           /* 版本 (可空) */
     bool    has_icon;              /* icon[] 是否有效 */
+    /* 能力声明 `--@app need=wifi`: 应用启动前需要联网。
+     * 启动侧据此做门禁 (未连接 → 提示 + 复用系统"连接WiFi"流程), 见 am_lua.c。
+     * 未声明 = false, 行为与老应用完全一致。 */
+    bool    need_wifi;
     uint8_t icon[APPPACK_ICON_BYTES];
 } apppack_meta_t;
 

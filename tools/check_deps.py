@@ -54,6 +54,9 @@ ALLOW_INVERSIONS = {
     ("wallpapers", "input"),
     ("wallpapers", "wifi_manager"),
     ("wallpapers", "svc_nvs"),
+    # usb_hid: 屏保/自动关机策略要知道"USB 是否插在主机上"(2026-10-02 linit 要求
+    # "USB 连接时不自动休眠")。同上面几条, 属 ui→services 倒置, 一并归到 P5 拆分时还。
+    ("wallpapers", "usb_hid"),
     # input(system) 直接吃反馈策略 (音/震动) 与网页手柄服务 —— 应改为事件回调.
     ("input", "tone_player"),
     ("input", "vibrator"),

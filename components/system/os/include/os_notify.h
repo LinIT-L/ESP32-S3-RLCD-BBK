@@ -33,6 +33,15 @@ void os_notify_vibrate_stop(void);
 void os_notify_tone_init(void);
 /* 单音: 播放 freq Hz 方波 dur_ms 毫秒 (阻塞调用者). */
 void os_notify_tone(uint16_t freq, uint16_t dur_ms);
+/* 单音(非阻塞): 喂完 PCM 立刻返回. amp 传 0 用默认音量.
+ * 游戏按键音 / 连发提示音用它, 否则每次发声都会卡住一整帧. */
+void os_notify_tone_async(uint16_t freq, uint16_t dur_ms, uint16_t amp);
+
+/* 旋律音符 (布局与 tone_player 的 tone_note_t 一致, 编译期已校验). */
+typedef struct { int freq; int ms; } os_note_t;
+/* 旋律(非阻塞): 后台任务顺序播放. ⚠ notes 必须是**静态/全局**数据 (只存指针不拷贝);
+ * 末尾放一个 {0,0} 作终止, 或按 count 播完即止。 */
+void os_notify_tone_melody(const os_note_t *notes, int count);
 /* 关闭音调. */
 void os_notify_tone_stop(void);
 /* 音调是否就绪 (可发声). */

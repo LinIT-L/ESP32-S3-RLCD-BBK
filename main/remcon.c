@@ -18,6 +18,7 @@
  *   diag                         → 综合诊断: uptime+内存+任务栈表+根目录
  *   page                         → 列出全部可用页面 id
  *   page <id>                    → 打开指定页面 (os_push)
+ *   app <lua path>               → 直接拉起 Lua 应用 (等价应用管家点击, 供自动化回归)
  *   key <action>                 → 注入按键动作 (os_handle_action)
  *   tap <x> <y>                  → 注入触摸点击 (os_handle_touch)
  *   fbinfo                       → 帧缓冲指针/字节数/CRC (确认抓屏是否可用)
@@ -60,13 +61,16 @@
 #include "remcon.h"
 #include "nes_emu.h"
 #include "st7305.h"      /* 抓屏: 帧缓冲布局 + 面板尺寸 */
+#include "os_hw.h"       /* wifi 命令: 走资源管家开/关射频 (与页面同一记账) */
+#include "wifi_manager.h"
+#include "input.h"   /* input_mark_activity(): remcon 注入按键也算"有人在用" */
 
 #define RC_TAG      "remcon"
 #define RC_LINE_MAX 256
 #define RC_QUEUE_LEN 32
 
 /* ---- 注入命令类型 ---- */
-enum { RC_KEY = 1, RC_TAP, RC_PAGE };
+enum { RC_KEY = 1, RC_TAP, RC_PAGE, RC_APP };
 typedef struct {
     uint8_t type;
     int a;   /* key=os_action_t / page=os_page_t ; tap=x */
@@ -74,6 +78,10 @@ typedef struct {
 } rc_cmd_t;
 
 static QueueHandle_t s_q;
+
+/* RC_APP 的参数暂存 (Lua 脚本路径). 队列是异步派发的, 用静态缓冲避免动态分配;
+ * 一次只会拉起一个应用, 无并发写。 */
+static char s_rc_app_path[128];
 
 /* 主屏句柄 (main.c 在 LCD 初始化后经 remcon_set_lcd 绑定) —— 抓屏命令用 */
 static st7305_handle_t *s_lcd;
@@ -143,6 +151,10 @@ static const struct { const char *name; os_action_t act; } s_actions[] = {
     {"back", OS_ACTION_BACK},
     {"cancel", OS_ACTION_BACK},
     {"home", OS_ACTION_HOME},
+    /* 2026-10-02: 加锁屏动作 —— 否则**远程无法进入屏保**,
+     * "屏保按一次键不返回"这类 bug 就设法远程回归(输入注入不走 input 层, 不会自己进屏保)。 */
+    {"lock",   OS_ACTION_POWER_LOCK},
+    {"unlock", OS_ACTION_POWER_RELEASE},
     {"long_left", OS_ACTION_LONG_LEFT},
     {"long_press", OS_ACTION_LONG_PRESS},
     {"fav", OS_ACTION_KEY_FAV},
@@ -203,6 +215,30 @@ static void rc_cmd_immediate(const char *line){
         char *lvl = rc_next(&rest); int v = lvl ? atoi(lvl) : -1;
         if (v >= 0 && v <= 5) { esp_log_level_set("*", (esp_log_level_t)v); printf("LOGLEVEL %d\r\n", v); }
         else printf("LOGLEVEL ERR (0..5)\r\n");
+    } else if (strcmp(cmd, "wifi") == 0) {
+        /* 调试/回归用: `wifi [on|off|status]` (默认 on)。
+         * 为什么需要: 联网类 Lua 应用 (如航班雷达) 必须"已联网"才能跑 ——
+         * lwip 是 wifi_manager_enable() 里 esp_netif_init() 建的, 没联过网时
+         * 任何 socket 调用都会 assert 崩机。远程回归时用本命令先把网连上。
+         * 走 os_hw_request/release, 与页面共用同一个引用计数。 */
+        char *wa = rc_next(&rest);
+        if (wa) rc_lower(wa);
+        if (wa && strcmp(wa, "off") == 0) {
+            os_hw_release(OS_HW_WIFI);
+            printf("WIFI off (ref released)\r\n");
+        } else if (wa && strcmp(wa, "status") == 0) {
+            printf("WIFI active=%d connected=%d\r\n",
+                   (int)os_hw_is_active(OS_HW_WIFI), (int)wifi_manager_is_connected());
+        } else if (wa && strcmp(wa, "conn") == 0) {
+            /* 用 NVS 里已存的 SSID/密码直接连 —— 远程回归没法人肉输密码,
+             * 这是"不碰设备就能进联网态"的唯一入口。 */
+            char ssid[33] = "", pass[65] = "";
+            wifi_manager_get_saved(ssid, sizeof(ssid), pass, sizeof(pass));
+            if (!ssid[0]) printf("WIFI conn: 无已存配置\r\n");
+            else          printf("WIFI conn %s ok=%d\r\n", ssid, (int)wifi_manager_connect(ssid, pass));
+        } else {
+            printf("WIFI on ok=%d\r\n", (int)os_hw_request(OS_HW_WIFI));
+        }
     } else if (strcmp(cmd, "audit") == 0) {
         /* 内存详细审计 (并入资源管家): 分类堆积 + 所有任务栈水位 + 堆块 */
         os_housekeeper_mem_audit();
@@ -318,20 +354,32 @@ static void rc_cmd_immediate(const char *line){
         }
     } else if (strcmp(cmd, "fbdump") == 0) {
         /* 抓屏: 帧缓冲 → base64 → 串口。15000B → 20000 字符 → 264 行。
-         * 缓冲区从堆上取 (20KB, 不能放 5120B 的读任务栈); 编码用 IDF 自带 mbedtls。 */
+         * 缓冲区从堆上取 (20KB, 不能放 5120B 的读任务栈); 编码用 IDF 自带 mbedtls。
+         *
+         * ★ 2026-10-03 修「CRC 恒定不符, 长度却精确」:
+         *   原来 base64 与 CRC32 各自**直接读 s_lcd->fb**。当画面在逐帧重绘时
+         *   (例如全屏刷新的游戏), 这两次读之间缓冲已经被改写 —— 症状是每次都
+         *   "长度=15000 正确, CRC 不符, 且三次抓到三个不同的 CRC"(实测), 很容易
+         *   被误判成"串口丢字节"或"固件坏了"。
+         *   正确做法: **先 memcpy 一份快照, 编码与 CRC 都只认这份快照**, 并顺手把
+         *   fb 指针固定下来 (渲染侧若换过缓冲, 两次读会指向不同内存)。 */
         if (!s_lcd || !s_lcd->fb) { printf("FB_NONE\r\n"); }
         else {
             size_t b64_cap = 4 * ((RC_FB_BYTES + 2) / 3) + 8;
             char *b64 = (char *)heap_caps_malloc(b64_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!b64) b64 = (char *)malloc(b64_cap);
+            uint8_t *snap = (uint8_t *)heap_caps_malloc(RC_FB_BYTES, MALLOC_CAP_SPIRAM);
+            if (!snap) snap = (uint8_t *)malloc(RC_FB_BYTES);
+            const uint8_t *src = s_lcd->fb;
+            if (snap) { memcpy(snap, src, RC_FB_BYTES); src = snap; }
             size_t b64_len = 0;
             if (!b64) {
                 printf("FB_ERR no mem (%u B)\r\n", (unsigned)b64_cap);
             } else if (mbedtls_base64_encode((unsigned char *)b64, b64_cap, &b64_len,
-                                             s_lcd->fb, RC_FB_BYTES) != 0) {
+                                             src, RC_FB_BYTES) != 0) {
                 printf("FB_ERR base64 encode failed\r\n");
             } else {
-                uint32_t crc = esp_rom_crc32_le(0, s_lcd->fb, RC_FB_BYTES);
+                uint32_t crc = esp_rom_crc32_le(0, src, RC_FB_BYTES);
                 printf("FB_BEGIN %d %d %d %08x\r\n",
                        ST7305_WIDTH, ST7305_HEIGHT, RC_FB_BYTES, (unsigned)crc);
                 for (size_t i = 0; i < b64_len; i += 76) {
@@ -342,10 +390,11 @@ static void rc_cmd_immediate(const char *line){
                 printf("FB_END\r\n");
             }
             free(b64);
+            free(snap);
             fflush(stdout);
         }
     } else if (strcmp(cmd, "help") == 0) {
-        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan wait help\r\n");
+        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait help\r\n");
     }
     fflush(stdout);
 }
@@ -398,7 +447,7 @@ static void rc_exec(const char *line){
         strcmp(cmd, "mem") == 0 || strcmp(cmd, "blk") == 0 ||
         strcmp(cmd, "audit") == 0 || strcmp(cmd, "stack") == 0 ||
         strcmp(cmd, "uptime") == 0 || strcmp(cmd, "tasks") == 0 ||
-        strcmp(cmd, "ls") == 0 ||
+        strcmp(cmd, "ls") == 0 || strcmp(cmd, "wifi") == 0 ||
         strcmp(cmd, "cat") == 0 || strcmp(cmd, "rm") == 0 ||
         strcmp(cmd, "cp") == 0 || strcmp(cmd, "diag") == 0 ||
         strcmp(cmd, "help") == 0 || strcmp(cmd, "shutdown") == 0 ||
@@ -415,6 +464,10 @@ static void rc_exec(const char *line){
         for (unsigned i = 0; i < sizeof(s_actions)/sizeof(s_actions[0]); i++)
             if (strcmp(an, s_actions[i].name) == 0) {
                 rc_cmd_t m = { RC_KEY, (int)s_actions[i].act, 0 };
+                /* ⚠ remcon 注入的按键**不走 input_get_action()**, 所以不会刷新空闲计时 →
+                 *   远程跑长回归时会撞上屏保/自动休眠, 表现为"设备突然黑屏没反应"。
+                 *   这里显式标一次"有人在用"。 */
+                input_mark_activity();
                 rc_enqueue(&m); return;
             }
         printf("RC_ERR unknown action '%s'\r\n", an);
@@ -453,6 +506,19 @@ static void rc_exec(const char *line){
                 rc_enqueue(&m); found = 1; break;
             }
         if (!found) printf("RC_ERR unknown page '%s'\r\n", pn);
+    } else if (strcmp(cmd, "app") == 0) {
+        /* 直接拉起指定 Lua 应用 (等价于在应用管家点这一项):
+         * 设置 boot 路径 + 进 Lua 页。用途 = 自动化回归: 远程打开应用后
+         * 注入按键 + fbdump 抓屏, 验证能导航、不崩溃。 */
+        char *p = rest;
+        while (p && *p && isspace((unsigned char)*p)) p++;
+        if (!p || !*p) { printf("RC_ERR app <lua path>\r\n"); return; }
+        size_t pl = strlen(p);
+        while (pl && (p[pl-1] == '\r' || p[pl-1] == '\n' ||
+                      isspace((unsigned char)p[pl-1]))) p[--pl] = 0;
+        snprintf(s_rc_app_path, sizeof(s_rc_app_path), "%s", p);
+        rc_cmd_t m = { RC_APP, 0, 0 };
+        rc_enqueue(&m);
     } else {
         printf("RC_ERR unknown cmd '%s' (help)\r\n", cmd);
     }
@@ -490,6 +556,8 @@ void remcon_tick(ui_ctx_t *ctx){
         case RC_KEY:  os_handle_action(ctx, (os_action_t)m.a); break;
         case RC_TAP:  os_handle_touch(ctx, m.a, m.b);          break;
         case RC_PAGE: os_push(ctx, (os_page_t)m.a);            break;
+        case RC_APP:  os_page_lua_set_boot(s_rc_app_path);      /* 先设 boot 路径 */
+                      os_push(ctx, OS_PAGE_LUA);               break;
         }
     }
 }

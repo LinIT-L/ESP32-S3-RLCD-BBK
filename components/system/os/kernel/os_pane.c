@@ -131,9 +131,17 @@ static void pane_left_name(const os_pane_t *p, int disp, char *out, size_t n) {
 
 void os_pane_reset(os_pane_t *p) {
     uint32_t t0 = esp_timer_get_time();
+    if (!p) return;
     if (p->mem_folders) {
         /* 内存数据源: 回调填充 folders[] / folder_count, 并决定 hide_all */
         p->folder_count = p->mem_folders(p);
+    } else if (!p->root) {
+        /* ⚠ 未初始化的 pane: 应用管家直接拉起 Lua 应用时只走 RUN 态、从未进过列表态,
+         * p->root 仍为 NULL → 下面 opendir(NULL) 会在 VFS 内部 strlen 上空指针崩溃
+         * (实测 LoadProhibited / EXCVADDR=0, PC 落在 ROM strlen; 触发动作 = HOME 退出应用)。
+         * 这里退化成"空目录", 完全不碰文件系统。 */
+        p->folder_count = 0;
+        p->hide_all = true;
     } else {
     DIR *dir = opendir(p->root);
     p->folder_count = 0;

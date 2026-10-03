@@ -34,6 +34,11 @@ void tone_tone_on(int freq_hz);
 /* 单音: 播放 freq Hz 方波 ms 毫秒 (阻塞调用者 ms 时间) */
 void tone_beep(int freq_hz, int ms);
 
+/* 非阻塞单音: 只把 PCM 喂进 I2S 环形缓冲就立刻返回 (不 vTaskDelay).
+ * amp = 方波幅值 1..6000, 传 0 用默认 TONE_AMP.
+ * ⚠ 游戏 / Lua 应用按键音必须用它 —— tone_beep() 会阻塞整帧, 连按明显卡顿. */
+void tone_beep_async(int freq_hz, int ms, int amp);
+
 /* 指定音量单音: amp = 方波幅值 (1..6000, 越小越轻). 游戏按键音用 (TONE_AMP/5)。 */
 void tone_beep_amp(int freq_hz, int ms, int amp);
 
