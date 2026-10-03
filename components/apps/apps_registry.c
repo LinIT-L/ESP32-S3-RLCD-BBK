@@ -81,7 +81,6 @@ static const os_app_t s_builtin_apps[] = {
     /* 商店可下载应用 (默认隐藏, 从应用管家"商店"下载后解隐加入主菜单) */
     { .id="secure",   .label="密钥管理器", .icon_idx=ICON_SECURE, .page=OS_PAGE_PLACEHOLDER_SECURE, .hidden=true, .cat="程序" }, /* 密钥管理器 程序 */
     { .id="fav",   .label="收藏夹", .icon_idx=ICON_FAV, .page=OS_PAGE_FAV, .hidden=true, .cat="程序" }, /* 收藏夹 程序 (ICON_FAV) */
-    { .id="lvgl",  .label="LVGL演示", .icon_idx=ICON_MINI_GAMES, .page=OS_PAGE_LVGL_DEMO, .hidden=true, .cat="程序" }, /* LVGL 移植层自检页 (开发用) */
     { .id="sdr", .label="频谱仪", .icon_idx=ICON_WIFIPROBE, .page=OS_PAGE_SDR, .hidden=true, .cat="系统" }, /* 频谱仪 (new_app.py) */
 };
 #define BUILTIN_APP_COUNT (sizeof(s_builtin_apps) / sizeof(s_builtin_apps[0]))
@@ -132,7 +131,6 @@ void apps_register_all(void)
     os_page_keymanager_register();    /* 密钥管理器 */
     os_page_fav_register();           /* 收藏夹 */
     os_page_lua_register();           /* Lua 单文件程序 */
-    os_page_lvgl_register();          /* LVGL 演示页 (移植层自检) */
     os_page_sdr_register();                /* 频谱仪 */
 
 /* 应用注册表 (主菜单/应用管理共用) */

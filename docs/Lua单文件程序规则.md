@@ -402,3 +402,33 @@ end
 
 理由：视觉细节（自绘小字、圆角、图标像素）属表现层，允许用固件字模近似；
 而**菜单结构 + 逻辑 + 交互**是用户的操作契约，改了就是另一个软件。
+
+
+## 弹窗一律用 `app.dlg.*`（禁止自绘）
+
+规范（linit 2026-09-22 / 2026-10-03 补全）：**弹窗的框架与位置只有一处实现**（`os_dialog.c`），
+调用方只给文字。Lua 侧对应：
+
+| API | 说明 | 取结果 |
+|---|---|---|
+| `app.dlg.toast(msg[, ms])` | 提示，默认 0.5s 自动关 | 无需取 |
+| `app.dlg.confirm(msg)` | 确认框（左"确定"右"取消"） | `app.dlg.result()` → `0`=确定 / `-1`=取消 |
+| `app.dlg.list(title, {项…}[, sel])` | 列表选择，返回项数 | `app.dlg.result()` → 选中下标(1起) / `-1`=取消 |
+
+**轮询式取值**（贴合 on_enter/render/poll/action 契约，不需要额外回调）：
+
+```lua
+local awaiting = false
+-- 打开
+app.dlg.confirm("删除这条记录?") ; awaiting = true
+-- poll 里取
+function poll()
+  if awaiting then
+    local r = app.dlg.result()
+    if r ~= nil then
+      awaiting = false
+      if r == 0 then ...确定... end
+    end
+  end
+end
+```

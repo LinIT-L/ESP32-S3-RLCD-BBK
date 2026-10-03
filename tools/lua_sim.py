@@ -34,6 +34,12 @@
   move[:N]          仅走时间 (N 帧, 默认 1), 用于计时/动画
   move:X,Y          按住拖到 (X,Y) (需先 hold, 用于画线/拖动)
   key:N             action(N)  (1UP 2DOWN 3LEFT 4RIGHT 5OK 6BACK 7HOME)
+  press:N           按住第 N 个动作键 (置"按住"态 → app.key_down/keys_mask/keys_repeat 可读)
+  release:[N,...]   松开 (不给参数 = 全松)
+  rpt:MS            只推进 MS 毫秒并调 poll (测 app.key_repeat 的自动重复节奏)
+
+⚠ 固件里 key_down 的数据源是 input_get_held_gb_joypad()(保持态), 所以
+  "按住移动"类逻辑必须用 press:N + rpt:MS + release 来测; 光 key:N 只是瞬时边沿。
 """
 import argparse
 import os
@@ -83,6 +89,44 @@ VENDOR_MAP = {
 # 假公网信息 JSON (app.net.http_get): 与 C 版首选源 ip9.com.cn/get 的字段一致
 FAKE_PUBJSON = '{"ip":"112.5.20.31","prov":"福建","city":"莆田","isp":"中国电信"}'
 
+# 假 IP 定位应答 (app.net.fetch_start): 首选 api.ip.sb 给 latitude/longitude,
+# 兜底 ip-api.com 给 lat/lon —— 与 planeradar.lua 的 GEO_URLS 对应
+FAKE_GEO_IPSB   = '{"ip":"112.48.94.33","region":"Fujian","city":"Putian","latitude":25.4310,"longitude":119.0078,"isp":"China Mobile"}'
+FAKE_GEO_IPAPI  = '{"status":"success","country":"\u4e2d\u56fd","regionName":"\u798f\u5efa\u7701","city":"\u8386\u7530\u5e02","lat":25.4310,"lon":119.0078}'
+
+# 假 ADS-B 应答 (app.net.fetch_start/fetch_poll + app.json.pick) —— 字段与 adsb.fi
+# v2 接口 (https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{nm}) 一致,
+# 含该接口**已算好的** dst(距离NM)/dir(方位角)。以湄洲岛为中心、50NM 内的十几个目标。
+FAKE_ADSB = ('{"now":1790951848.001,"resultCount":9,"ptime":0.11,"aircraft":['
+             '{"hex":"780abc","flight":"CES2345 ","r":"B-1234","t":"B738","lat":25.31,"lon":119.42,'
+             '"alt_baro":31000,"alt_geom":31450,"gs":445.2,"track":212.4,"baro_rate":-640,"squawk":"3024",'
+             '"dst":12.3,"dir":35.7,"rssi":-8.2,"ownOp":"China Eastern","emergency":"none"},'
+             '{"hex":"780def","flight":"CCA1856 ","r":"B-5678","t":"A320","lat":24.95,"lon":118.81,'
+             '"alt_baro":28000,"alt_geom":28300,"gs":402.0,"track":48.9,"baro_rate":0,"squawk":"1234",'
+             '"dst":18.9,"dir":248.1,"rssi":-12.4,"ownOp":"Air China","emergency":"none"},'
+             '{"hex":"781122","flight":"CSN3301 ","r":"B-9012","t":"A321","lat":25.62,"lon":119.19,'
+             '"alt_baro":36000,"alt_geom":36300,"gs":471.5,"track":95.0,"baro_rate":1280,"squawk":"4512",'
+             '"dst":24.6,"dir":2.4,"rssi":-9.9,"ownOp":"China Southern","emergency":"none"},'
+             '{"hex":"781133","flight":"CXA8899 ","r":"B-2345","t":"B737","lat":25.03,"lon":119.73,'
+             '"alt_baro":12400,"alt_geom":12600,"gs":318.7,"track":276.3,"baro_rate":-1920,"squawk":"2244",'
+             '"dst":33.1,"dir":91.2,"rssi":-14.0,"ownOp":"Xiamen Air","emergency":"none"},'
+             '{"hex":"781144","flight":"CHH7721 ","r":"B-3456","t":"B789","lat":24.66,"lon":119.65,'
+             '"alt_baro":38000,"alt_geom":38250,"gs":488.9,"track":12.8,"baro_rate":0,"squawk":"6421",'
+             '"dst":41.5,"dir":152.6,"rssi":-16.8,"ownOp":"Hainan Airlines","emergency":"none"},'
+             '{"hex":"781155","flight":"CSZ9001 ","r":"B-4567","t":"A333","lat":25.71,"lon":118.55,'
+             '"alt_baro":2900,"alt_geom":3000,"gs":212.4,"track":338.1,"baro_rate":-1024,"squawk":"7012",'
+             '"dst":44.8,"dir":286.5,"rssi":-18.2,"ownOp":"Shenzhen Airlines","emergency":"none"},'
+             '{"hex":"781166","flight":"","r":"","t":"","lat":25.05,"lon":119.16,'
+             '"alt_baro":"ground","alt_geom":0,"gs":12.0,"track":180.0,"baro_rate":0,"squawk":"1200",'
+             '"dst":0.6,"dir":210.0,"rssi":-22.0,"ownOp":"","emergency":"none"},'
+             '{"hex":"781177","flight":"CPA301 ","r":"B-KQZ","t":"A35K","lat":24.40,"lon":118.30,'
+             '"alt_baro":41000,"alt_geom":41300,"gs":502.1,"track":55.4,"baro_rate":0,"squawk":"3411",'
+             '"dst":62.7,"dir":215.8,"rssi":-20.1,"ownOp":"Cathay Pacific","emergency":"none"},'
+             '{"hex":"781188","flight":"NOK888  ","r":"B-7788","t":"B738","lat":25.44,"lon":119.86,'
+             '"alt_baro":7600,"alt_geom":7800,"gs":268.3,"track":150.9,"baro_rate":1664,"squawk":"5501",'
+             '"dst":47.9,"dir":78.3,"rssi":-17.5,"ownOp":"Thai AirAsia","emergency":"none"}'
+             ']}')
+
 
 class Sim:
     """实现 app.* 桥 → 1bpp 帧缓冲 (fb 值: 1=白, 0=黑, 与固件同义)"""
@@ -92,13 +136,19 @@ class Sim:
         self.kbd = KbdKernel()
         self.fb = bytearray(b"\x01" * (W * H))
         self.touch_xy = None
+        self.kfifo = []          # 按键 FIFO (app.key() 从这里取)
+        self.kdown = set()       # 当前"按住"的动作码集合 (app.key_down/keys_mask)
+        self.krep = {}           # a -> [t0, last]  (app.key_repeat 的内部状态)
+        self.applog = []         # app.log() 落这里, 兼作"是不是真跑到这行"的判据
         self.touch_from = None          # 本次按下的起点 (app.touch_start)
         self.t_down_ms = 0              # 按下时刻
         self.t_was = False
         self.ms = 0
         self.nvs, self.fs, self.db = {}, {}, {}
         self._seed_fs()
+        self.imgs = {}
         self.log = []
+        self._seed_store()   # 需在 self.log 之后 (预载会写日志)
         self.exited = False
         self.sbar_invert = False        # app.sbar(v) 记录: 暗底页面应置 true, 退出还原
         self.toast_msg, self.toast_until = "", 0     # app.dlg.toast 提示 (叠加层)
@@ -447,9 +497,19 @@ class Sim:
         a.bigc = lambda cx, y, s, scale=1, inv=False: self.bigc(cx, y, s, scale, inv)
         # 时间 / 输入 / 声音
         a.millis = lambda: self.ms
-        a.key = lambda: None
+        # app.key(): 非阻塞取按键。⚠ 必须和固件一致 —— 固件里 lua_action 会先 key_push((int)a)
+        # 再调 action(a), 所以"只读 app.key() 的应用"在模拟器里也必须能拿到键(原来恒返回 None → 测不动)
+        a.key = self._key_pop
         a.delay = lambda ms: setattr(self, "ms", self.ms + int(ms))
-        a.tone = lambda f, ms: None
+        a.tone = lambda f, ms, *rest: None
+        a.tone_async = lambda f, ms, amp=0: None      # 非阻塞: 模拟器无音频, 只吞掉
+        a.melody = lambda tbl=None: None
+        # ⚠ 与固件一致: 固件的 key_is_down 取自 input_get_held_gb_joypad()(保持态),
+        #   模拟器用 kdown 集合模拟"按住"; key:N 是瞬时边沿(压完即松), press:N/release:N 才产生按住。
+        a.key_down = lambda n: int(n) in self.kdown
+        a.keys_mask = lambda: sum((1 << (int(n) - 1)) for n in self.kdown if 1 <= int(n) <= 6)
+        a.key_repeat = self._key_repeat
+        a.log = self._applog
         a.vibrate = lambda ms: None
         a.exit = lambda: setattr(self, "exited", True)
         a.redraw = lambda: None
@@ -468,6 +528,63 @@ class Sim:
         # ⚠ 二进制安全: lupa 默认把 Lua 串按 UTF-8 解码成 Python str, 一旦内容含非 UTF-8 字节
         #   (如 1-bit BMP 里的 0x90) 就会 UnicodeDecodeError —— 且异常发生在"进入 Python 之前",
         #   回调里救不回来。所以写盘走 hex 通道: Lua 侧先 encode 成 hex 再过桥。
+        # ---- app.img: 1bpp BMP 大图 (对齐 luat_lib_img.c 的语义) ----
+        #   语义与固件一致: BMP 位=1 → 白, 所以 ink = 位==0;
+        #   mode=1 时"位=1 画白" (精灵底版刷白用)。
+        def _img_load(path, opaque=False):
+            b = self.fs.get(str(path))
+            if not b or len(b) < 62 or b[:2] != b"BM":
+                return None
+            off = int.from_bytes(b[10:14], "little")
+            w = int.from_bytes(b[18:22], "little", signed=True)
+            h = int.from_bytes(b[22:26], "little", signed=True)
+            bpp = int.from_bytes(b[28:30], "little")
+            if bpp != 1 or w <= 0 or h == 0:
+                return None
+            flip, h = (h > 0), abs(h)
+            ssrc, sdst = ((w + 31) // 32) * 4, (w + 7) // 8
+            bits = bytearray(sdst * h)
+            for fy in range(h):
+                y = (h - 1 - fy) if flip else fy
+                row = off + fy * ssrc
+                for x in range(w):
+                    if not ((b[row + (x >> 3)] >> (7 - (x & 7))) & 1):
+                        bits[y * sdst + (x >> 3)] |= (0x80 >> (x & 7))
+            i = (max(self.imgs) + 1) if self.imgs else 1
+            self.imgs[i] = {"w": w, "h": h, "stride": sdst, "bits": bits,
+                            "opaque": bool(opaque)}
+            return i
+
+        def _img_blit(i, sx, sy, dx, dy, w, h, mode=0):
+            im = self.imgs.get(int(i))
+            if not im:
+                return
+            sx, sy = int(sx), int(sy)
+            dx, dy, w, h = int(dx), int(dy), int(w), int(h)
+            mode = int(mode or 0)
+            for y in range(h):
+                ry = sy + y
+                if ry < 0 or ry >= im["h"]:
+                    continue
+                for x in range(w):
+                    rx = sx + x
+                    if rx < 0 or rx >= im["w"]:
+                        continue
+                    ink = (im["bits"][ry * im["stride"] + (rx >> 3)] >> (7 - (rx & 7))) & 1
+                    if mode == 1:
+                        if ink:
+                            self.px(dx + x, dy + y, black=False)
+                    elif ink:
+                        self.px(dx + x, dy + y, black=True)
+                    elif im["opaque"]:
+                        self.px(dx + x, dy + y, black=False)
+
+        a.img = self.lua.table(
+            load=_img_load, blit=_img_blit,
+            size=lambda i: ((self.imgs[int(i)]["w"], self.imgs[int(i)]["h"])
+                            if int(i) in self.imgs else None),
+            free=lambda i: self.imgs.pop(int(i), None),
+            freeall=lambda: self.imgs.clear())
         a.fs = self.lua.table(exists=lambda p: str(p) in self.fs,
                               read=lambda p: self.fs.get(str(p)),
                               write=lambda p, hexd: (self.fs.__setitem__(
@@ -475,10 +592,15 @@ class Sim:
                               append=lambda p, d: True,
                               remove=lambda p: self.fs.pop(str(p), None) is not None,
                               listdir=lambda d: self._listdir(d))
-        a.nvs = self.lua.table(get_int=lambda sp, k: self.nvs.get((str(sp), str(k))),
-                               set_int=lambda sp, k, v: (self.nvs.__setitem__((str(sp), str(k)), v), True)[1],
-                               get_str=lambda sp, k: self.nvs.get((str(sp), str(k))),
-                               set_str=lambda sp, k, v: (self.nvs.__setitem__((str(sp), str(k)), str(v)), True)[1])
+        # ⚠ 必须与固件一致(page_lua.c): 命名空间是**固定的** "luaapp"，
+        #    签名里没有 sp 参数 —— get_int(key) / set_int(key,v) / get_str(key) / set_str(key,v)
+        #    且 get_* 在键不存在时返回 **0 个值**(即 nil)，不是默认值。
+        #    NVS 键名上限 15 字符(ESP-IDF 限制)。
+        #    (原先这里多了一个 sp 形参 → 用模拟器写出来的 app 在真机上会写到错的键上)
+        a.nvs = self.lua.table(get_int=lambda k: self.nvs.get(("luaapp", str(k))),
+                               set_int=lambda k, v: (self.nvs.__setitem__(("luaapp", str(k)), v), True)[1],
+                               get_str=lambda k: self.nvs.get(("luaapp", str(k))),
+                               set_str=lambda k, v: (self.nvs.__setitem__(("luaapp", str(k)), str(v)), True)[1])
         # 软键盘 kbd_lib 统一入口 (与固件 page_lua.c 的 app.kbd 对齐)
         _kb = self.kbd
         a.kbd = self.lua.table(
@@ -512,7 +634,14 @@ class Sim:
                                arp_list=lambda: self._arp_list(),
                                ipinfo=lambda: ("192.168.1.23", "255.255.255.0", "192.168.1.1",
                                                "192.168.1.1", "WIFI_STA_DEF", "A4:5E:60:AA:BB:CC"),
-                               vendor=lambda mac: VENDOR_MAP.get(str(mac)[:8].upper()))
+                               vendor=lambda mac: VENDOR_MAP.get(str(mac)[:8].upper()),
+                               fetch_start=lambda url, t=8000: self._fetch_start(url, t),
+                               fetch_poll=lambda: self._fetch_poll())
+        # JSON 模块 (与固件 luat_lib_json.c 同契约: 只物化用得到的字段)
+        a.json = self.lua.table(pick=lambda b, k="", f="", m=200: self._json_pick(b, k, f, m),
+                                num=lambda b, k, d=0: self._json_num(b, k, d),
+                                str=lambda b, k: self._json_str(b, k),
+                                bool=lambda b, k: self._json_bool(b, k))
         a.wifi = self.lua.table(init=lambda: True, release=lambda: True, scan=lambda: True,
                                 scan_done=lambda: True,
                                 ap_count=lambda: len(FAKE_APS), ap_info=lambda i: self._ap_info(i),
@@ -537,6 +666,38 @@ class Sim:
         return None
 
     # ---- 触摸 ----
+    def _key_pop(self):
+        if self.kfifo:
+            return self.kfifo.pop(0)
+        return None
+
+    def _applog(self, *args):
+        """app.log(...): 拼成一行存进 self.applog + 打到 stdout (对标固件 ESP_LOGI "[APP]")"""
+        line = " ".join(str(x) for x in args)
+        self.applog.append(line)
+        print("  [APP] " + line)
+        return None
+
+    def _key_repeat(self, a, first=400, rate=90):
+        """app.key_repeat(a, first, rate): 按下沿立即 true; 按住超 first 后每 rate 一次 true。
+        与固件的 s_rep_t0/s_rep_last 逻辑逐行对齐 (固件用 esp_timer, 这里用 self.ms)。"""
+        a = int(a)
+        if not (1 <= a <= 6):
+            return False
+        rate = max(20, int(rate))
+        now = self.ms
+        if a not in self.kdown:
+            self.krep.pop(a, None)
+            return False
+        st = self.krep.get(a)
+        if st is None or st[0] is None:          # 本次按下沿
+            self.krep[a] = [now if now else 1, now]
+            return True
+        if (now - st[0]) >= int(first) and (now - st[1]) >= rate:
+            st[1] = now
+            return True
+        return False
+
     def _touch(self):
         if self.touch_xy is None:
             return None
@@ -563,6 +724,30 @@ class Sim:
         mac, rssi, ch = FAKE_PROBES[i]
         ssid = "" if i % 3 else "Hidden_AP_%d" % i      # 探针多为隐藏 SSID
         return (mac, rssi, ch, ssid, 3 + i * 2)
+
+    def _seed_store(self):
+        """把工程的 apps/lua/ 挂到设备路径 /store/ 下。
+
+        没有这一步, 模拟器里 app.fs.read("/store/...") 全是 nil —— 依赖素材的 Lua 应用
+        (江湖行 / QQ堂冒险) 在本地根本跑不起来, 只能靠烧录试错。这正是"先在电脑上测"卡住的原因。
+        """
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "apps", "lua")
+        if not os.path.isdir(root):
+            return
+        n = 0
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in files:
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                try:
+                    if os.path.getsize(full) > (2 << 20):
+                        continue
+                    self.fs["/store/" + rel] = open(full, "rb").read()
+                    n += 1
+                except OSError:
+                    pass
+        self.log.append("[sim] /store 预载 %d 个文件" % n)
 
     def _seed_fs(self):
         """预置几个白板存档 (路径/命名与固件 WB_DIR 一致: /sdcard/App/图片/wbHHMMSSSS.bmp)。
@@ -607,6 +792,79 @@ class Sim:
         if ar and "ip9" in str(ar[0]):
             return FAKE_PUBJSON
         return None
+
+    # ---- 异步 HTTPS (app.net.fetch_start / fetch_poll) ----
+    # 固件把它丢到后台任务, 脚本每帧 poll; 模拟器用"隔两帧再给结果"复现这个节奏
+    # (让脚本里的 loading 分支真的被走到)。
+    def _fetch_start(self, url, timeout=8000):
+        u = str(url)
+        if "ip.sb" in u:
+            payload = FAKE_GEO_IPSB
+        elif "ip-api" in u:
+            payload = FAKE_GEO_IPAPI
+        else:
+            payload = FAKE_ADSB
+        self._fetch = {"url": u, "n": 2, "body": payload}
+        return True
+
+    def _fetch_poll(self):
+        """返回 1 或 3 个值 —— 必须是 tuple, lupa 才会展开成多返回值。"""
+        st = getattr(self, "_fetch", None)
+        if not st:
+            return ("idle",)
+        if st["n"] > 0:
+            st["n"] -= 1
+            return ("wait",)
+        body = st.get("body", FAKE_ADSB)
+        self._fetch = None
+        return ("ok", body, 200)
+
+    # ---- JSON (app.json.*) ----
+    # 契约与固件一致: pick 只保留白名单字段, 缺字段则键不出现 (与 lua_setfield 不写该键等价)
+    @staticmethod
+    def _json_load(body):
+        import json as _json
+        try:
+            return _json.loads(str(body))
+        except Exception:
+            return None
+
+    def _json_pick(self, body, akey="", fields="", mx=200):
+        want = [f for f in str(fields).split(",") if f]
+        out = self.lua.table()
+        d = self._json_load(body)
+        arr = d.get(str(akey)) if isinstance(d, dict) else None
+        if not isinstance(arr, list):
+            return out
+        k = 0
+        for o in arr[: max(0, int(mx))]:
+            if not isinstance(o, dict):
+                continue
+            row = self.lua.table()
+            for f in want:
+                v = o.get(f)
+                if isinstance(v, (int, float, str, bool)):
+                    row[f] = v
+            k += 1
+            out[k] = row
+        return out
+
+    def _json_num(self, body, key, default=0):
+        d = self._json_load(body)
+        v = d.get(str(key)) if isinstance(d, dict) else None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _json_str(self, body, key):
+        d = self._json_load(body)
+        v = d.get(str(key)) if isinstance(d, dict) else None
+        return v if isinstance(v, str) else None
+
+    def _json_bool(self, body, key):
+        d = self._json_load(body)
+        return bool(d.get(str(key))) if isinstance(d, dict) else False
 
     def _ping(self, ip, c=4):
         """app.net.ping → **Lua 表** {ok, rtt, ok, rtt, ...} (与固件 lua_net_ping 一致)。
@@ -808,8 +1066,18 @@ def run_steps(sim, steps, outdir, scale, verbose=False):
             sim.touch_xy = (x, y)
             sim.call("poll")
         elif kind == "release":
+            # release[:N,...] —— 同时管两件事:
+            #   · 触摸: 总是抬起 (保持老行为, 老的 release 无参数)
+            #   · 按键: 给了参数只松列出的动作码; 没给参数则全部松开
             sim.touch_xy = None
             sim.touch_from = None
+            sim.ms += 40
+            if arg:
+                for v in str(arg).split(","):
+                    if v.strip():
+                        sim.kdown.discard(int(v))
+            else:
+                sim.kdown.clear()
             sim.call("poll")
         elif kind == "move":
             if "," in arg:
@@ -823,7 +1091,23 @@ def run_steps(sim, steps, outdir, scale, verbose=False):
                     sim.ms += 40
                     sim.call("poll")
         elif kind == "key":
+            # 与固件 lua_action 完全一致: key_push((int)a) → action(a); 然后下一次 poll 会取走。
+            # ⚠ 先推进 40ms —— 真人按键有间隔(>100ms), 不推进的话"连按同一个键"会被应用的
+            #   防抖(同值 12ms 内只算一次)吃掉, 造成"那一步没生效"的假象。
+            sim.ms += 40
+            sim.kfifo.append(int(arg))
             sim.call("action", int(arg))
+            # ⚠ 必须紧跟一帧 poll —— 固件里 lua_poll 每帧都跑, 应用正是在 poll() 里读 app.key()
+            sim.call("poll")
+        elif kind == "press":
+            # press:N = 按住第 N 个动作键 (不产生边沿, 只置"按住"态) → 下一次 poll 供 key_down 用
+            sim.ms += 40
+            sim.kdown.add(int(arg))
+            sim.call("poll")
+        elif kind == "rpt":
+            # rpt:N = 只推进时间并调 poll (不重新触发边沿), 用来测 key_repeat 的自动重复
+            sim.ms += int(arg) if arg else 40
+            sim.call("poll")
         elif kind == "enter":
             continue
         elif kind != "render":

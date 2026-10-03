@@ -238,3 +238,29 @@ python3 tools/new_app.py mytool --remove
 - `components/os/include/os.h` —— `os_app_t` 结构与注册接口
 - `components/apps/apps_registry.c` —— 内置应用注册表 + 装配入口 `apps_register_all()`
 - `components/apps/pages/page_app_manager.c` —— 商店/分类/卸载逻辑
+
+---
+
+## 7. 退出确认（★ 所有全屏程序/游戏必须遵守，2026-10-03 定案）
+
+全屏程序与游戏在退出时**必须先弹「退出程序?」**，防误触退出丢进度。这是**桥接层统一能力**，
+不要在脚本里自己画弹窗。
+
+- **默认已开启**：任何 Lua 程序/游戏的返回键在"脚本没消费"时都会弹确认框，**不用写代码**。
+- **它挡不住脚本自己处理 BACK**：脚本把 BACK 当返回键用（关子窗/收菜单/返回上一层）时**依旧优先**，
+  不会被确认框抢走 —— 这是故意的，否则游戏内菜单就没法用。
+- **要关掉**（纯浏览类、或退出前已自行确认过）：
+
+  ```lua
+  app.exit_confirm(false)     -- 关闭
+  app.exit_confirm(true)      -- 打开（默认）
+  local on = app.exit_confirm()   -- 查询当前值
+  ```
+
+- **入口唯一**：`app.exit()` 与"框架 BACK 未消费"都走桥层的 `lua_request_exit()`，
+  所以两处行为一致；`app.exit()` 也会先弹确认。
+- 实现要点（改桥层时别踩）：弹窗**延迟到下一帧 poll** 才 push（在被 Lua `action()` 间接调用的
+  路径里 push 弹窗属于重入）；弹窗回调里**只置标志**，不直接 `os_pop` 页面
+  （回调返回后弹窗层才被关闭，直接弹会把弹窗弹掉、应用留着）。
+- C 原生应用页（非 Lua）若要同样效果，参照 `page_engine.c` 的 `eng_exit_confirm()` /
+  `os_confirm_exit_blocking()`。

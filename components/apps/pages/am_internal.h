@@ -46,7 +46,9 @@ const os_app_t *am_store_app(int k);      /* 第 k 个包的应用条目 */
 bool  am_store_owns(const os_app_t *a);   /* a 是否商店里的包 */
 bool  am_store_installed_of(const os_app_t *a);   /* 已装? (读缓存, 渲染可安全每帧调用) */
 const char *am_store_fname_of(const os_app_t *a); /* 包文件名; 非商店包返回 NULL */
+const char *am_store_desc_of(const os_app_t *a);  /* 包简介 (LAPP desc=); 无则 NULL (商店行第二行显示它) */
 void  am_store_activate(ui_ctx_t *ctx, const os_app_t *a);      /* 已装→运行 / 未装→弹安装确认 */
+void  am_store_toggle(ui_ctx_t *ctx, const os_app_t *a);        /* 商店行: 只装/卸, 不启动应用 */
 void  am_store_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a); /* 长按 → 弹卸载确认 */
 void  am_store_invalidate(void);          /* 目录变化 → 下次重扫 */
 
@@ -61,6 +63,12 @@ void am_lua_append(bool ops_only);        /* 把已就绪的 Lua 项追加进列
 bool am_lua_open_if_entry(ui_ctx_t *ctx, const os_app_t *a);
 bool am_lua_is_entry(const os_app_t *a, const char **path_out); /* 是否 Lua 项(回填启动路径) */
 void am_lua_invalidate(void);             /* 目录变化 → 下次重扫 */
+/* 按路径启动 LAPP (只知道文件路径的入口, 如商店"已装 → 运行"): 会现读包内 `need=wifi`
+ * 并走同一套 Wi-Fi 门禁。普通 Lua 文件 (没打包) 等同直接进 Lua 页。 */
+void am_lua_open_path(ui_ctx_t *ctx, const char *path);
+/* 注册 Wi-Fi 门禁全局服务 (`need=wifi` 应用: 未联网时先弹窗连网再启动)。
+ * 必须在开机注册阶段调用一次 (os_page_app_manager_register 里调)。 */
+void am_lua_gate_register(void);
 
 /* ==================== 崩溃定位探针 (2026-09-28) ====================
  * 现象: 第一次打开 Lua 应用即整机重启, 串口在复位瞬间丢字抓不到 panic.

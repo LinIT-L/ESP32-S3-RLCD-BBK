@@ -15,8 +15,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "am_internal.h"
 #include "apppack.h"   /* LAPP 单文件资源包: 取名称/简介/分类/图标 */
+#include "wifi_manager.h" /* is_connected/is_connecting: need=wifi 门禁 */
 #include "ui_common.h" /* ui_main_icon_bitmap: LAPP icon= 反查主图标表下标 */
 
 #define TAG "AMLUA"
@@ -38,6 +40,7 @@ typedef struct {
     char     desc[96];      /* LAPP 简介 (无打包则空) */
     char     cat[16];       /* LAPP 分类 (无打包则空) —— app.cat 指向这里 */
     int      icon_idx;      /* LAPP icon= 反查主图标表得到的下标 */
+    bool     need_wifi;     /* LAPP `need=wifi`: 启动前须联网 (见文件末门禁) */
 } am_lua_entry_t;
 static am_lua_entry_t s_lua[AM_LUA_MAX];
 static int s_lua_n = 0;
@@ -56,16 +59,110 @@ bool am_lua_is_entry(const os_app_t *a, const char **path_out) {
         if (&s_lua[i].app == a) { if (path_out) *path_out = s_lua[i].path; return true; }
     return false;
 }
-/* 启动 Lua 文件项 (应用管家与主菜单共用): 先设 boot 路径再进 Lua 页。
- * 主菜单直接 os_push(OS_PAGE_LUA) 会拿不到路径 → 打开空白/上次的程序, 所以必须走这里。 */
-bool am_lua_open_if_entry(ui_ctx_t *ctx, const os_app_t *a) {
-    const char *p = NULL;
-    lua_probe_stage(1, "主菜单 open_if_entry");
-    if (!am_lua_is_entry(a, &p) || !p) return false;
-    lua_probe_stage(2, "Lua 项命中(主菜单)");
+/* 同上, 但返回下标 (-1 = 不是 Lua 项)。门禁需要"记住待启动的是哪一项"。 */
+static int am_lua_index(const os_app_t *a) {
+    for (int i = 0; i < s_lua_n; i++) if (&s_lua[i].app == a) return i;
+    return -1;
+}
+
+/* ==================== Wi-Fi 门禁 (LAPP `--@app need=wifi`) ====================
+ * 用户规范 (2026-10-02): "如果某个软件声明需要 Wi-Fi, 打开软件时弹窗提醒需要 Wi-Fi,
+ *   用内置连接 Wi-Fi 弹窗进行连接; 若点取消没连上, 这个软件又必须用 Wi-Fi, 就退出它。"
+ *
+ * 流程: 点开 → 未联网 → 确认框 ─┬─ 确定 → 复用系统"连接WiFi"(扫描+密码键盘)
+ *                              │        → 连上后**继续把应用启动起来**
+ *                              └─ 取消 → 不启动 (toast)
+ *       连网超时 / 用户中途退出连网流程 → 同样不启动。
+ *
+ * ⚠ 不要自己 os_hw_request(OS_HW_WIFI): settings_wifi_connect_open() 内部会按需
+ *   request 并记下"是我们开的"私有标志, 用户取消时才有 release。这里先 request
+ *   会让它以为 WiFi 早已开着 → 不记标志 → 取消后再也没人关 (射频常开)。
+ * ⚠ 轮询必须走全局 service: 连网期间用户可能回到桌面/别的页面, 应用管家的 poll
+ *   那时根本不执行; 而 service tick 每帧都跑。
+ * ⚠ 开连网弹窗**不在确认框回调里做**, 而是挂到下一帧的 tick: 弹窗回调返回后
+ *   os_dialog 还要收掉当前框, 同期再 push 容易互相顶掉。 */
+#define WL_GATE_TIMEOUT_MS  120000u     /* 等待联网上限 (2 分钟) */
+static char     s_wg_path[160];         /* 待启动脚本路径 ("" = 无) */
+static bool     s_wg_ask     = false;   /* 确认框已弹 (防重复点按) */
+static bool     s_wg_wait    = false;   /* 等 Wi-Fi 连接中 */
+static bool     s_wg_connect = false;   /* 下一帧开"连接WiFi"弹窗 */
+static uint32_t s_wg_t0      = 0;
+
+static void wl_gate_abort(ui_ctx_t *ctx) {
+    s_wg_path[0] = 0; s_wg_ask = false; s_wg_wait = false; s_wg_connect = false;
+    os_dialog_toast(ctx, "\xe8\xaf\xa5\xe5\xba\x94\xe7\x94\xa8\xe9\x9c\x80\xe8\xa6\x81 Wi-Fi"); /* 该应用需要 Wi-Fi */
+}
+/* 连上 → 这时才真正启动 (保证应用拿到的是已联网状态) */
+static void wl_gate_launch(ui_ctx_t *ctx) {
+    char p[160];
+    snprintf(p, sizeof(p), "%s", s_wg_path);
+    s_wg_path[0] = 0; s_wg_ask = false; s_wg_wait = false; s_wg_connect = false;
+    if (!p[0]) return;
+    os_dialog_clear_all(ctx);           /* 收掉"正在扫描/输密码"等中间弹窗 */
+    ESP_LOGI(TAG, "Wi-Fi 已连接 → 启动 %s", p);
     os_page_lua_set_boot(p);
     os_push(ctx, OS_PAGE_LUA);
+}
+static void wl_gate_confirm_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    s_wg_ask = false;
+    if (result != 0) { wl_gate_abort(ctx); return; }   /* 取消 → 不启动 */
+    s_wg_wait = true;
+    s_wg_connect = true;                /* 交给 tick 开连网弹窗 (见上面第 3 条) */
+}
+static void wl_gate_tick(ui_ctx_t *ctx) {
+    if (s_wg_connect) {                 /* 用户点了"确定" → 下一帧进连网流程 */
+        s_wg_connect = false;
+        s_wg_t0 = (uint32_t)(esp_timer_get_time() / 1000);
+        settings_wifi_connect_open(ctx);   /* ★ 唯一入口: 内部按需 request, 别自己开 */
+        return;
+    }
+    if (!s_wg_wait) return;
+    if (wifi_manager_is_connected()) { wl_gate_launch(ctx); return; }
+    /* 还在连(扫描/输密码/关联) 或有弹窗在 → 继续等; 否则=用户退出了连网流程 */
+    bool alive = wifi_manager_is_connecting() || os_dialog_depth() > 0;
+    if (!alive || (uint32_t)(esp_timer_get_time() / 1000) - s_wg_t0 > WL_GATE_TIMEOUT_MS) {
+        ESP_LOGI(TAG, "Wi-Fi 门禁: 未连上(%s), 不启动", alive ? "超时" : "已退出");
+        wl_gate_abort(ctx);
+    }
+}
+static const os_service_t s_svc_lua_gate = { .name = "lua_wifi_gate", .tick = wl_gate_tick };
+void am_lua_gate_register(void) { os_register_service(&s_svc_lua_gate); }
+
+/* 门禁 + 启动的唯一落地处: need_wifi 且未联网 → 弹窗; 否则直接进 Lua 页。 */
+static void wl_open(ui_ctx_t *ctx, const char *path, bool need_wifi) {
+    if (!path || !path[0]) return;
+    if (need_wifi && !wifi_manager_is_connected()) {
+        ESP_LOGI(TAG, "Wi-Fi 门禁: %s 需要联网, 先问用户", path);
+        if (s_wg_ask || s_wg_wait) return;           /* 已在门禁流程中 → 吞掉重复点按 */
+        snprintf(s_wg_path, sizeof(s_wg_path), "%s", path);
+        s_wg_ask = true;
+        os_dialog_confirm_ex(ctx,
+            "\xe8\xaf\xa5\xe5\xba\x94\xe7\x94\xa8\xe9\x9c\x80\xe8\xa6\x81 Wi-Fi\xef\xbc\x8c\xe6\x98\xaf\xe5\x90\xa6\xe8\xbf\x9e\xe6\x8e\xa5\xef\xbc\x9f", /* 该应用需要 Wi-Fi，是否连接？ */
+            0, -1, wl_gate_confirm_cb, NULL);
+        return;
+    }
+    os_page_lua_set_boot(path);
+    os_push(ctx, OS_PAGE_LUA);
+}
+
+/* 启动 Lua 文件项 (应用管家与主菜单共用): 先设 boot 路径再进 Lua 页。
+ * 主菜单直接 os_push(OS_PAGE_LUA) 会拿不到路径 → 打开空白/上次的程序, 所以必须走这里。
+ * 声明了 `need=wifi` 的应用在未联网时**不直接进**, 改为弹窗 → 连网 → 连上再进。 */
+bool am_lua_open_if_entry(ui_ctx_t *ctx, const os_app_t *a) {
+    lua_probe_stage(1, "open_if_entry 入口");
+    int i = am_lua_index(a);
+    if (i < 0) return false;
+    lua_probe_stage(2, "Lua 项命中");
+    wl_open(ctx, s_lua[i].path, s_lua[i].need_wifi);
     return true;
+}
+/* 按路径启动 LAPP (商店"已装 → 运行"等只知道路径的入口): 现读包内 `need=wifi` 再决定。
+ * 与 am_lua_open_if_entry 共用同一套门禁状态, 不会出现两条流程互相打架。 */
+void am_lua_open_path(ui_ctx_t *ctx, const char *path) {
+    apppack_meta_t m;
+    bool need = (apppack_parse(path, &m) == ESP_OK) && m.need_wifi;
+    wl_open(ctx, path, need);
 }
 /* LAPP 里的 icon= 是 64×64 位图 (打包器从主图标表取)。os_app_t 只有 icon_idx,
  * 没有"自带位图"字段 → 这里做**反查**: 逐张比对主图标表, 命中就用那个下标,
@@ -127,6 +224,7 @@ static bool am_lua_scan(int cat, bool bg) {
                   snprintf(L[k].desc, sizeof(L[k].desc), "%s", meta.desc);
                   snprintf(L[k].cat,  sizeof(L[k].cat),  "%s", meta.cat);   /* 可空 */
               }
+              L[k].need_wifi = named && meta.need_wifi;   /* 条目复用 → 必须显式赋值 */
               L[k].icon_idx = named ? am_lua_icon_idx(&meta) : ICON_MINI_GAMES;
               if (b == 1) {
             if (named) snprintf(L[k].label, sizeof(L[k].label), "\xe3\x80\x8c%.*s\xe3\x80\x8d", (int)sizeof(L[k].label) - 7, meta.name);

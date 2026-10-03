@@ -22,7 +22,20 @@ idf_component_register(
         "pages/page_keymanager.c"
         "pages/page_logdiag.c"
         "pages/page_lua.c"
-        "pages/page_lvgl.c"
+        # ↓ Lua 桥模块 (2026-10-02 从 page_lua.c 拆出; 加新 API 去对应模块, 不要往 page_lua.c 堆)
+        "lua_bridge/lua_bridge.c"
+        "lua_bridge/luat_lib_consts.c"
+        "lua_bridge/luat_lib_gfx.c"
+        "lua_bridge/luat_lib_input.c"
+        "lua_bridge/luat_lib_sys.c"
+        "lua_bridge/luat_lib_fs.c"
+        "lua_bridge/luat_lib_store.c"
+        "lua_bridge/luat_lib_net.c"
+        "lua_bridge/luat_lib_json.c"
+        "lua_bridge/luat_lib_wifi.c"
+        "lua_bridge/luat_lib_hid.c"
+        "lua_bridge/luat_lib_kbd.c"
+        "lua_bridge/luat_lib_img.c"
         "pages/page_main.c"
         "pages/page_modtool.c"
         "pages/page_morse.c"
@@ -43,7 +56,7 @@ idf_component_register(
         "pages/page_winassist.c"
         "pages/page_sdr.c"
         "pages/sdr_view.c"
-    INCLUDE_DIRS "include" "pages"
+    INCLUDE_DIRS "include" "pages" "lua_bridge"
     REQUIRES os apppack netscan st7305 ui_common input touch_panel audio_player tone_player vibrator engine_manager gam4980 gb_emu gbc_emu nes_emu md_emu sms_emu lavax arduboy_avr vpet book_reader wallpapers usb_hid usb_bt usb_net wifi_manager fonts kbd_lib sd_scan board_battery esp_netif lwip spi_flash nvs_flash svc_cfg svc_nvs esp_system bt_ctl web_gamepad usbh_msc vpet virtual_keys board_shim keyvault calc esp_http_client favorites esp_timer lua espressif__esp-dsp lvgl_port
 )
 
