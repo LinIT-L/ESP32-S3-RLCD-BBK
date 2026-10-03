@@ -180,16 +180,27 @@ static bool s_scan_active = false;
 static bool s_auto_rc_pending = false;
 
 /* ---- 连接中弹窗 (处理 成功/失败/对方断开/超时, 避免"正在连接"永久卡住) ---- */
+#define CONN_TIMEOUT_MS 25000         /* 连接总预算: 底层 esp_hidh_dev_open 自己就要 ~30s,
+                                       * 原来给 8s 会把它掐死 → "第一次超时, 第二次自动回连" */
 static int64_t s_conn_start = 0;      /* connect 发起时刻 (µs), 用于超时判断 */
 static bool  s_conn_ok = false;       /* 已连上, 等待 1s "连接成功" 提示后进映射 */
 static int64_t s_conn_ok_t = 0;
+/* ★ 2026-10-02 竞态修复: 是否已**观察到**"连接中"。
+ *   本弹窗的第一帧 poll 可能早于连接任务把 s_connecting 置真(见 enter_connect_dlg:
+ *   先换弹窗 + 立刻 xTaskCreate) → 原逻辑会当场判"连接失败", 而后台其实还在连,
+ *   过一会儿真连上 = 用户报的"连经常失败, 但实际上又连接成功"。 */
+static bool  s_saw_connecting = false;
 static bt_device_t s_conn_dev;        /* 待连接设备缓存 (供后台连接任务读取) */
 
 static void start_key_mapping(ui_ctx_t *ctx);   /* 前向声明: 连接成功后直接衔接按键映射 */
 
 /* 后台连接任务: esp_hidh_dev_open 同步阻塞约 2s, 放独立任务以免卡住 UI/延迟弹窗 */
+/* ⚠ 先等 300ms: 点选连接前刚 bt_manager_stop_scan(), BLE 控制器还在退出扫描态,
+ *   立刻 esp_hidh_dev_open 会和"扫描收尾"抢控制器 → 连接被拖慢甚至失败。
+ *   (这一步是"第一次连接超时"的另一半原因。) */
 static void bt_connect_task(void *arg) {
     (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(300));
     bt_manager_connect_device(&s_conn_dev);
     vTaskDelete(NULL);
 }
@@ -226,21 +237,51 @@ static void conn_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         if ((now - s_conn_ok_t) >= 1000000LL) {
             s_conn_ok = false;
             d->on_poll = NULL;
-            os_dialog_pop(ctx);   /* "连接成功！" 显示 1s 后收起, 衔接按键映射 */
-            start_key_mapping(ctx);
+            os_dialog_pop(ctx);   /* "连接成功！" 显示 1s 后收起 */
+            /* ★ 2026-10-02 修"同一只手柄被引导映射两次":
+             *   连接时 bt_manager 会给"尚未映射过"的手柄挂一个**一次性待办**。
+             *   原实现在这里无条件 start_key_mapping(), 却**没取走待办** →
+             *   用户退回桌面时 page_main 的 C5 轮询把同一个(已过期)待办又取出来弹一次。
+             *   现在: 只有该待办存在(= 这只手柄还没映射过)才衔接向导, 并**顺手取走**。
+             *   已映射过的手柄重连 → 只提示"连接成功", 不再强拉进向导(要重映射可从菜单进)。 */
+            char pnm[33];
+            if (bt_manager_take_map_pending(pnm, sizeof pnm)) {
+                ESP_LOGW(TAG, "[EV] 新手柄 '%s' 连接成功 -> 衔接按键映射", pnm);
+                start_key_mapping(ctx);
+            } else {
+                ESP_LOGI(TAG, "[EV] 手柄已映射过, 连接成功不打扰(不弹映射向导)");
+            }
         } else {
             ctx->needs_redraw = true;
         }
         return;
     }
     if (!bt_manager_is_connecting()) {
+        /* ★ 宽限期(1s): 还没观察到"连接中"之前不许判失败 ——
+         *   连接任务可能只是还没被调度到(先弹窗后 xTaskCreate 的竞态)。
+         *   没有这 1s, 就会出现"闪一下『连接失败/已断开』, 然后手柄其实连上了"。 */
+        if (!s_saw_connecting && (esp_timer_get_time() - s_conn_start) < 1000000LL) {
+            ctx->needs_redraw = true;
+            return;
+        }
         /* 连接已结束但未成功(失败/连接后被对方短连断开) → 明确提示, 不留死锁 */
         d->on_poll = NULL;
         os_dialog_pop(ctx);
         os_dialog_toast(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5/\xe5\xb7\xb2\xe6\x96\xad\xe5\xbc\x80"); /* 连接失败/已断开 */
         return;
     }
-    if ((esp_timer_get_time() - s_conn_start) > 8000000LL) {
+    s_saw_connecting = true;   /* 确认真进入"连接中"状态, 之后才允许判失败 */
+    /* ★★ 2026-10-03 修"第一次连不上、提示连接超时, 第二次自动回连成功":
+     *   根因是**这里 8 秒就把连接掐了**, 而底层 esp_hidh_dev_open() 自己的预算是
+     *   ~30s(设备不在范围/未广播时会一直等)。手动点选连接还叠加了两件事:
+     *     ① 刚 bt_manager_stop_scan(), BLE 控制器还没退出扫描态就发起连接;
+     *     ② 手柄上报的地址**每次会话会漂移** → 连接前会清掉旧绑定, 属于冷配对,
+     *        比开机直连(已配对)慢得多。
+     *   结果: 8s 被 cancel → 用户看到"连接超时"; 而底层其实快连上了/已留下绑定,
+     *   于是"第二次就自动回连"。
+     *   现在: 预算提到 25s, 中途给"按手柄键唤醒"的提示, 让用户知道在等它。 */
+    int64_t elapsed = esp_timer_get_time() - s_conn_start;
+    if (elapsed > (int64_t)CONN_TIMEOUT_MS * 1000LL) {
         /* 8s 仍未通 → 强行中止本轮, 提示超时, 不再无限等.
          * 必须调 cancel_connect 而不是只停扫描: esp_hidh_dev_open 是异步的且没有超时,
          * 设备不在范围内时 OPEN 事件可能永不回调, 只停扫描会让 bt_manager 的
@@ -253,8 +294,11 @@ static void conn_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         os_dialog_toast(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xb6\x85\xe6\x97\xb6"); /* 连接超时 */
         return;
     }
-    /* 仍在连接: 刷新显示并保持"正在连接" */
-    snprintf(d->items[0], sizeof(d->items[0]), "%s", "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5"); /* 正在连接... */
+    /* 仍在连接: 刷新显示并保持"正在连接"; 等久了给一句可操作提示 */
+    const char *txt = "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5"; /* 正在连接... */
+    if (elapsed > 8000000LL)
+        txt = "\xe6\x8c\x89\xe4\xb8\x80\xe4\xb8\x8b\xe6\x89\x8b\xe6\x9f\x84\xe9\x94\xae\xe5\x94\xa4\xe9\x86\x92"; /* 按一下手柄键唤醒 */
+    snprintf(d->items[0], sizeof(d->items[0]), "%s", txt);
     ctx->needs_redraw = true;
 }
 
@@ -282,7 +326,8 @@ static bool conn_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
 static void enter_connect_dlg(ui_ctx_t *ctx, const bt_device_t *dev) {
     if (dev) memcpy(&s_conn_dev, dev, sizeof(s_conn_dev));
     s_conn_start = esp_timer_get_time();
-    s_conn_ok = false;   /* 重置"连接成功 1s"状态 */
+    s_conn_ok = false;          /* 重置"连接成功 1s"状态 */
+    s_saw_connecting = false;   /* 重置"已见到连接中"(见 conn_dlg_poll 的宽限说明) */
     /* 连接前清理: 删同名历史记录 + 重置该设备配置为默认 + 清输入残留(防幽灵输入) */
     bt_manager_reset_pad_clean(&s_conn_dev);
     /* 原地把当前列表弹窗(扫描/历史)替换为"正在连接"小窗: 列表随之消失, 不留后台双层 */
@@ -304,6 +349,10 @@ static void enter_connect_dlg(ui_ctx_t *ctx, const bt_device_t *dev) {
         nd.on_key  = conn_dlg_key;
         os_dialog_push(ctx, &nd);
     }
+    ESP_LOGW(TAG, "[EV] 发起连接: name=%s addr=%02x:%02x:%02x:%02x:%02x:%02x type=%d",
+             s_conn_dev.name, s_conn_dev.bd_addr[0], s_conn_dev.bd_addr[1], s_conn_dev.bd_addr[2],
+             s_conn_dev.bd_addr[3], s_conn_dev.bd_addr[4], s_conn_dev.bd_addr[5],
+             (int)s_conn_dev.addr_type);
     /* 立即弹出"正在连接"后, 在后台连接任务里发起同步连接(不阻塞 UI), 保证点击秒反馈 */
     xTaskCreate(bt_connect_task, "bt_conn", 4096, NULL, 10, NULL);
 }
@@ -449,6 +498,12 @@ static bool s_capture_armed = false; /* 是否已真实捕获到一个按键 (bo
 static int64_t s_map_last_progress = 0;  /* 上次映射推进时刻, 超时未动自动取消 */
 static int64_t s_map_ignore_until = 0;  /* 屏蔽"进入映射界面"那次确认的时间点, 防其被误映射成第一个键 */
 static int64_t s_map_done_ms = 0;       /* 映射结束(完成/超时)时刻: 兜底收敛残留弹窗/提示 */
+/* ★ 2026-10-02 "每个按键只映射一次": 本轮已经捕获过的物理键(位图, PHYS_MAX=20)。
+ *   向导要依次映射 10 个功能, 但没有 Start/Select 的手柄凑不出 10 个键 →
+ *   用户被迫把同一个键按给多个功能。记录已用过的键, 再遇到"用过的键"就判定
+ *   没有更多键可指了, 直接保存结束向导。 */
+static uint32_t s_map_used = 0;
+static void finish_key_mapping(ui_ctx_t *ctx);   /* 前向声明 */
 
 /* 映射提示弹窗渲染 (3.3 notice 样式: 白底 + 3px 黑边框 + 自适应宽) */
 static bool map_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
@@ -516,13 +571,7 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
             s_map_last_progress = esp_timer_get_time();
             s_map_func++;
             if (s_map_func >= FUNC_MAX) {
-                bt_manager_save_key_map();
-                ESP_LOGI(TAG, "按键映射完成, 已保存到 NVS");
-                s_map_active = false;
-                s_map_done_ms = esp_timer_get_time();   /* 兜底收敛计时起点 */
-                input_set_gamepad_nav_enabled(true);
-                os_dialog_pop(ctx);   /* 关映射弹窗回手柄主菜单 */
-                os_dialog_toast(ctx, "\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84\xe5\xae\x8c\xe6\x88\x90"); /* 按键映射完成 */
+                finish_key_mapping(ctx);
                 return;
             }
             bt_manager_poll_new_press_reset();
@@ -535,7 +584,19 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     int fc = s_map_func;
     int r = bt_manager_poll_new_press((func_t)fc);
     if (r > 0) {
-        s_capture_phys = bt_manager_get_key_map((func_t)fc);   /* 记住这次的键, 等松开再推进 */
+        int phys = (int)bt_manager_get_key_map((func_t)fc);
+        /* ★ "每个按键只映射一次": 这个物理键本轮已经映射过了 → 用户手上没有"新键"可指
+         *   (典型: 没有 Start/Select 的手柄)。**不再让他重复按同一个键**, 直接保存结束。 */
+        if (phys >= 0 && phys < 32 && (s_map_used & (1u << phys))) {
+            ESP_LOGW(TAG, "按键映射: 键[%s]本轮已映射过 → 判定没有更多键, 提前完成",
+                     bt_manager_phys_name((phys_t)phys));
+            s_capture_armed = false;
+            s_capture_phys = -1;
+            finish_key_mapping(ctx);
+            return;
+        }
+        if (phys >= 0 && phys < 32) s_map_used |= 1u << phys;
+        s_capture_phys = (phys_t)phys;                         /* 记住这次的键, 等松开再推进 */
         s_capture_armed = true;                                /* 只有真实捕获到按键才允许随后推进 */
         s_map_last_progress = esp_timer_get_time();
         ESP_LOGI(TAG, "按键映射捕获: [%s] → %s (等松开确认)",
@@ -543,6 +604,18 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
                  bt_manager_phys_name(s_capture_phys));
         ctx->needs_redraw = true;
     }
+}
+
+/* 正常收尾: 保存映射 + 恢复手柄导航 + 关向导/给完成提示。
+ * 抽出来是因为"映射够 10 个功能"和"没有更多不同的键"两种结束方式都要走这一套。 */
+static void finish_key_mapping(ui_ctx_t *ctx) {
+    bt_manager_save_key_map();
+    ESP_LOGI(TAG, "按键映射完成, 已保存到 NVS");
+    s_map_active = false;
+    s_map_done_ms = esp_timer_get_time();   /* 兜底收敛计时起点 */
+    input_set_gamepad_nav_enabled(true);
+    os_dialog_pop(ctx);   /* 关映射弹窗回手柄主菜单 */
+    os_dialog_toast(ctx, "\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84\xe5\xae\x8c\xe6\x88\x90"); /* 按键映射完成 */
 }
 
 /* 映射弹窗按键: 映射期间**一切按键一律忽略**, 纯由 bt_manager_poll_new_press 硬捕获
@@ -559,7 +632,12 @@ static void start_key_mapping(ui_ctx_t *ctx) {
         os_dialog_toast(ctx, "\xe8\xaf\xb7\xe5\x85\x88\xe8\xbf\x9e\xe6\x8e\xa5\xe6\x89\x8b\xe6\x9f\x84"); /* 请先连接手柄 */
         return;
     }
+    /* ★ 消费"待映射待办" —— 无论从哪条路进向导(本页连接成功 / 桌面 C5 / 本页菜单),
+     *   都要把它取掉, 保证同一只新手柄只被引导一次。
+     *   (C5 路径下桌面已经取过, 这里再取一次返回 false, 无害) */
+    bt_manager_take_map_pending(NULL, 0);
     s_map_func = 0;
+    s_map_used = 0;          /* 新的一轮映射: 清空"已用过的物理键" */
     s_map_active = true;
     s_capture_phys = -1;
     s_capture_armed = false;
@@ -691,10 +769,28 @@ static void p_gamepad_enter(ui_ctx_t *ctx) {
     }
 }
 
+/* ★ 2026-10-02 修"手柄没法控制任何界面":
+ *   start_key_mapping() 会 input_set_gamepad_nav_enabled(false) 关掉手柄导航(防干扰映射),
+ *   而恢复(true)只写在 map_poll() 的"超时/完成"两条路径里 —— 本模块**原来没有 on_exit**。
+ *   于是: 映射向导还开着时用**物理返回键**离开手柄页 → 那条 dialog 随页面一起消失,
+ *   map_poll 再也不跑 → nav 永远停在 false → 手柄之后在**任何**界面都导航不了。
+ *   这里补 on_exit 兜底恢复(幂等), 并清掉映射中间态。 */
+static void p_gamepad_exit(ui_ctx_t *ctx) {
+    (void)ctx;
+    if (s_map_active) {
+        ESP_LOGW(TAG, "[EV] 带着未完成的映射离开手柄页 → 取消映射并恢复手柄导航");
+    }
+    s_map_active = false;
+    s_capture_armed = false;
+    s_capture_phys = -1;
+    input_set_gamepad_nav_enabled(true);   /* ★ 幂等兜底: 无论如何都把导航恢复 */
+}
+
 static const os_module_t s_mod_gamepad = {
     .name       = "gamepad",
     .page_id    = OS_PAGE_GAMEPAD,
     .on_enter   = p_gamepad_enter,
+    .on_exit    = p_gamepad_exit,
     .fullscreen = false,
 };
 

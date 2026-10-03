@@ -890,6 +890,32 @@ static void on_disconnected_cb(bool connected, esp_hidh_dev_t *dev)
     if (s_connect_cb) s_connect_cb(false);
 }
 
+/* ★ 2026-10-02 边扫边连: 扫描**过程中**扫到回连目标的瞬间就发起连接。
+ *
+ * 原来只有 on_scan_done_cb() 里做匹配 → 必须等 BLE 整轮扫描结束(实测 ≈10s)才回连,
+ * 用户感受就是"进了搜索要等快 10 秒才自动连上"。现在逐条结果一进来就匹配:
+ * 历史手柄的地址或名字一出现 → 立刻 bt_connect_async(), 不用等扫完。
+ * (目标是"最近连接过的"手柄, 地址/名字已知, 扫到即可连, 不需要更多结果。) */
+static bool bt_connect_async(const esp_hid_scan_result_t *r);   /* 定义在后面 */
+
+static bool rc_try_connect_now(const esp_hid_scan_result_t *rr)
+{
+    if (!rr || !s_auto_reconnect_pending || !s_rc_target_valid) return false;
+    if (s_connected || s_suspended) return false;
+    if (!rc_match(rr->bda, rr->name)) return false;   /* 地址 或 名字 命中都算 */
+
+    s_pending_new = !bt_manager_is_known_device(rr->bda, rr->name);
+    snprintf(s_pending_name, sizeof s_pending_name, "%s", rr->name ? rr->name : "");
+    ESP_LOGW(TAG, "[EV] 回连命中(边扫边连): name=%s addr=%02x:%02x 新手柄=%d",
+             rr->name ? rr->name : "-", rr->bda[0], rr->bda[1], s_pending_new);
+    s_connecting = true;
+    s_auto_reconnect_pending = false;   /* 已发起: 结果由 on_connected 收敛 */
+    s_rc_target_valid = false;
+    /* 必须异步: esp_hidh_dev_open 会阻塞(设备不在时等满连接超时) */
+    bt_connect_async(rr);
+    return true;
+}
+
 static void on_scan_done_cb(void)
 {
     s_scanning = false;
@@ -929,17 +955,8 @@ static void on_scan_done_cb(void)
         if (s_auto_reconnect_pending && s_rc_target_valid) {
             esp_hid_scan_result_t *rr = bt_core_last_scan();
             while (rr) {
-                /* ★ 地址 **或 名字** 命中都算 (手柄换地址后靠名字找回来) */
-                if (rc_match(rr->bda, rr->name)) {
-                    s_pending_new = !bt_manager_is_known_device(rr->bda, rr->name);
-                    snprintf(s_pending_name, sizeof s_pending_name, "%s", rr->name ? rr->name : "");
-                    ESP_LOGW(TAG, "[EV] 回连命中(扫描): name=\'%s\' addr=%02x:%02x 新手柄=%d",
-                             rr->name ? rr->name : "-", rr->bda[0], rr->bda[1], s_pending_new);
-                    s_connecting = true;
-                    s_auto_reconnect_pending = false;   /* 已发起: 结果由 on_connected 收敛 */
-                    s_rc_target_valid = false;
-                    bt_connect_async(rr);   /* 必须异步: esp_hidh_dev_open 会阻塞(设备不在时等满连接超时) */
-                    return;   /* 不再停扫/回列表 (连接成功由上层 0.5s 提示收敛) */
+                if (rc_try_connect_now(rr)) {
+                    return;   /* 已发起连接: 不再停扫/回列表 (连接成功由上层 0.5s 提示收敛) */
                 }
                 rr = rr->next;
             }
@@ -983,6 +1000,14 @@ static void on_scan_result_cb(const esp_hid_scan_result_t *r)
     if (!r) return;
     if (!r->name || r->name[0] == '\0') return;   /* 与完成时一致: 无名设备不显示 */
     if (!s_cont_cb || !s_scanning) return;        /* 仅列表 UI 场景推送 */
+
+    /* ★ 2026-10-02 边扫边连: 扫到回连目标的**第一次**就发起连接, 不等整轮扫描结束。
+     *   命中即 return —— 连接由 on_connected 收敛; UI 层(scan_dlg_poll)看到连上会
+     *   自己停扫并关掉弹窗, 所以这里不需要也不应该去动扫描状态。 */
+    if (rc_try_connect_now(r)) {
+        ESP_LOGW(TAG, "[EV] 边扫边连命中, 提前发起连接(不再等整轮扫描)");
+        return;
+    }
 
     /* 查重: 已存在则仅补名字 (此前无名) / 更新 RSSI, 不重复推送 */
     for (int i = 0; i < s_dev_cache_count; i++) {
@@ -1211,6 +1236,26 @@ void bt_manager_reset_pad_clean(const bt_device_t *dev)
 {
     if (!dev) return;
 
+    /* ★★ 2026-10-03 (linit: "我这手柄有两种唤醒方式, 有一种不会改变地址")
+     *   **地址没变 = 就是上次那台已配对设备** → 绝不能走下面"清历史 + 清旧绑定"那条路径。
+     *   那条路径是给"地址漂移"准备的: 清掉旧绑定虽然能让漂移模式重新配对干净,
+     *   但它同时会 ①抹掉历史记录 ②打掉 known 标志 ③让本次连接退化成"新手柄"流程;
+     *   而对"地址不变"的唤醒方式来说, **保住绑定才是快路径**
+     *   —— 和开机回连同一条路(实测 5.1s AUTH SUCCESS)。
+     *   所以这里提前返回, 只清输入残留。
+     *   (实测手柄: "Q36 for Android", 两种唤醒方式分别是 静态地址 / 每会话漂移地址。) */
+    for (int i = 0; i < s_history_count; i++) {
+        if (memcmp(s_history[i].bd_addr, dev->bd_addr, 6) == 0) {
+            bt_map_calibrate_start();
+            ESP_LOGI(TAG, "[clean] 地址未变 %02x:%02x:%02x:%02x:%02x:%02x [%s]"
+                          " → 保留绑定与历史, 直接复用配对",
+                     dev->bd_addr[0], dev->bd_addr[1], dev->bd_addr[2],
+                     dev->bd_addr[3], dev->bd_addr[4], dev->bd_addr[5],
+                     dev->name[0] ? dev->name : "?");
+            return;
+        }
+    }
+
     /* 先判定"是否同一只手柄换了 BLE 地址"(同名但地址不同)。
      * 某些手柄(如 "Q36 for Android")每次会话地址都会漂移; 若一律按"新手柄"处理, 会
      * ①**每次连接都把用户自定义的按键映射重置回默认**(很烦);
@@ -1223,12 +1268,30 @@ void bt_manager_reset_pad_clean(const bt_device_t *dev)
         if (same_name && !same_addr) name_drift = true;
     }
 
-    /* 删除与该设备同名/同地址的历史记录; 对"同名不同址"的旧记录**连带清掉其 BLE 绑定** */
+    /* 清理"同名但地址已漂移掉"的旧记录 —— **只去重历史, 不再删它的 BLE 绑定**。
+     *
+     * ★★ 2026-10-03 关键修正 (linit: "我这手柄有两种唤醒方式, 有一种不会改变地址"):
+     *   ① `bt_manager_add_to_history()` 是**按名字去重**的 → 历史里 "Q36 for Android"
+     *      永远只有 1 条, 地址会随唤醒方式在 A/B 之间**轮流顶替**;
+     *   ② 于是"同名不同址 → 删绑定"这条规则会**把另一种唤醒方式的绑定删掉**:
+     *        A 连过(有绑定A) → 切 B(删掉绑定A、历史变成B) → 再切回 A(A 已无绑定) = 冷配对。
+     *      两种唤醒方式互相破坏, 每次都是"重新配对" → 8s 不够 → 用户看到"连接超时"。
+     *   ③ 其实**不需要删绑定**: ESP32 侧本来就能存多个绑定, 两种地址各留一条正好各自复用;
+     *      而"手柄换了新地址"这种情况, 我们本来就没有那个新地址的绑定 → 自然会走新配对,
+     *      删旧绑定对"新地址配对"没有任何帮助。
+     *   所以: 这里只把历史去重(保持列表干净), 绑定**留着**。
+     *   要彻底清绑定请用「忘记此手柄」(bt_manager_forget_device)。 */
     for (int i = s_history_count - 1; i >= 0; i--) {
         bool same_addr = memcmp(s_history[i].bd_addr, dev->bd_addr, 6) == 0;
         bool same_name = btm_same_name(dev->name, s_history[i].name);
-        if (same_name && !same_addr) (void)bt_core_remove_bond(s_history[i].bd_addr);
-        if (same_addr || same_name) bt_manager_remove_history_at(i);
+        if (same_addr) continue;                 /* 当前这条不动 */
+        if (same_name) {
+            ESP_LOGI(TAG, "[clean] 同名但地址不同: 去重历史 %02x:%02x:%02x:%02x:%02x:%02x"
+                          " (绑定保留, 供另一种唤醒方式复用)",
+                     s_history[i].bd_addr[0], s_history[i].bd_addr[1], s_history[i].bd_addr[2],
+                     s_history[i].bd_addr[3], s_history[i].bd_addr[4], s_history[i].bd_addr[5]);
+            bt_manager_remove_history_at(i);
+        }
     }
 
     /* 清除输入残留状态: 防"不按任何键映射就自动完成"的幽灵输入 */
