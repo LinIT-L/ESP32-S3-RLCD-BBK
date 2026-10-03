@@ -10,16 +10,6 @@
 
 ---
 
-## 隐藏功能 
-
-> **隐藏游戏**(GB / GBC / NES / Arduboy。应用菜单):
-
-1. 主菜单 → **设置** → **「请作者喝杯水」**(全屏赞助图)
-2. 赞助图上**连按确认键 5 次**
-3. 返回主菜单即可看到这些引擎图标
----
-
-
 ## 功能
 
 ### 模拟器 / 游戏引擎
@@ -180,24 +170,33 @@ idf.py build        # 构建
 
 ## 烧录
 
-**方式一: 应用更新(分区不变)**
+分区真相源是 **[`partitions.csv`](partitions.csv)**(16MB),常用地址:
+
+| 目标 | 烧录地址 | 说明 |
+|---|---|---|
+| `build/LinTOS.bin` | **`0x60000`** | 系统固件(factory, 5MB) |
+| `build/apps_l.bin` | **`0xC00000`** | Lua 应用区(SPIFFS, 4MB) |
+| `dist/merged_16mb.bin` | **`0x0`** | 完整镜像(新设备 / 含系统 ROM) |
+
+**方式一: 只更新固件(分区不变)**
 ```bash
 python -m esptool --chip esp32s3 -b 460800 write_flash \
   --flash_mode dio --flash_size 16MB --flash_freq 80m \
-  0x10000 build/esp32-bbk-emu.bin
+  0x60000 build/LinTOS.bin
 ```
 
-**方式二: 完整 16MB 镜像(新设备/含系统 ROM)** — `./merge_flash.sh` 生成
-`dist/merged_16mb.bin` 后烧 `0x0`。
+**方式二: 完整 16MB 镜像** — `./merge_flash.sh` 生成 `dist/merged_16mb.bin` 后烧 `0x0`。
 
 ## 系统 ROM
 
-BBK 词典需要系统 ROM `8.BIN` + `E.BIN`(在 `system_image/`),组装后烧到 `0x900000`:
+BBK 词典需要系统 ROM `8.BIN` + `E.BIN`(在 `system_image/`)。`./merge_flash.sh` 会自动把它们
+按 `appdata` 分区内的固定槽位写入(`8.BIN` @ `0x560000`、`E.BIN` @ `0x760000`):
 
 ```bash
-cat system_image/8.BIN system_image/E.BIN > system_image/system.bin
 ./merge_flash.sh
 ```
+
+> 注意: `idf.py flash` **不会**更新 `appdata`/`apps` 分区,系统 ROM 与字库必须走 `merge_flash.sh`。
 
 版本变更见 **[CHANGELOG.md](CHANGELOG.md)**。
 

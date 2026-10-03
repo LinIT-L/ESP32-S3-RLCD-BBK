@@ -199,19 +199,35 @@
 > GPIO33-37 内置 PSRAM——均不可作普通 IO。
 
 ## 分区与存储布局（partitions.csv，16MB）
-```
-nvs       data nvs    0x9000  0x8000
-phy_init  data phy    0x11000 0x1000
-factory   app  factory 0x20000 0x400000   # 4MB 系统固件
-appdata   data 0x40   0x420000 0xBE0000    # ~11.9MB 数据区
-```
-appdata 数据区内部布局：
-| 段 | 内容 |
-|---|---|
-| 0~2MB | 步步高 8.BIN（词典字库） |
-| 2~4MB | 步步高 E.BIN（屏幕点阵） |
-| 4~8.625MB | 字库区（font_zh/light/16 + book* + lav_font） |
-| 8.625~11.875MB | os_db 数据库 + 配置 + WASM 应用 + 共享数据 |
+
+> **真相源是 [`partitions.csv`](../partitions.csv)**（2026-09-22 定案），本表仅作对照，改动只改 csv。
+
+| 分区 | 类型 | 偏移 | 大小 | 说明 |
+|---|---|---|---|---|
+| bootloader | — | `0x0` | 32KB | |
+| partition-table | — | `0x8000` | 4KB | |
+| `nvs` | data/nvs | `0x10000` | 256KB | 系统 nvs（含 core_db / app.db，统一命名空间） |
+| `phy_init` | data/phy | `0x50000` | 4KB | RF 校准，保留不动 |
+| `factory` | app/factory | **`0x60000`** | 5MB | 系统固件（**烧录地址不是旧的 `0x20000`**） |
+| `appdata` | data/0x40 | `0x560000` | 6.625MB | 统一数据区，**永不擦写** |
+| `apps` | data/spiffs | **`0xC00000`** | 4MB | Lua 应用安装区 + 存档 |
+
+磁盘上**没有** `recovery` / `ota_0` / `ota_1` 分区（曾有过，2026-09-22 一并取消）。
+
+### appdata 内部布局（相对分区首址，按**相对偏移** mmap）
+| 偏移 | 大小 | 内容 |
+|---|---|---|
+| `+0` | 2MB | 步步高 `8.BIN`（词典字库） |
+| `+0x200000` | 2MB | 步步高 `E.BIN`（屏幕点阵） |
+| `+0x400000` | 512KB | `font_zh.bin`（中文字库） |
+| `+0x480000` | 256KB | `font_zh16.bin`（16px 中文） |
+| `+0x4C0000` | 256KB | `lav_font.bin`（文曲星字库） |
+| `+0x540000` | 256KB | `bp_lut.bin`（SMS 像素表） |
+| `+0x580000` | 128KB | `SZHVC_add.bin` |
+| `+0x5A0000` | 128KB | `SZHVC_sub.bin` |
+
+> `merge_flash.sh` 已改为**从 partitions.csv 自动解析**偏移与大小（历史上曾硬编码，导致分区调整后
+> 镜像静默写错地址）。字库用 `esp_partition_mmap()` 按相对偏移读取，故 appdata 整体平移是安全的。
 
 ## 数据存取三档（恢复系统设计）
 | 层级 | 位置 | 内容 |
