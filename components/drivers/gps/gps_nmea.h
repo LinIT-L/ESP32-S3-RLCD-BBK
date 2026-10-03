@@ -18,6 +18,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>          /* size_t (gps_nmea_feed 的 len) */
 #include "esp_err.h"
 
 #ifdef __cplusplus

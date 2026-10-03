@@ -118,6 +118,7 @@ void lua_mod_wifi_register(lua_State *L);
 void lua_mod_hid_register(lua_State *L);
 void lua_mod_kbd_register(lua_State *L);
 void lua_mod_img_register(lua_State *L);
+void lua_mod_gps_register(lua_State *L);
 
 /* ---- 几何参数取值器 (定义在 luat_lib_gfx.c, 非 static 供各模块共用) ----
  * 坐标/尺寸一律**容忍小数**(四舍五入); 颜色参数仍走严格的 luaL_checkinteger。

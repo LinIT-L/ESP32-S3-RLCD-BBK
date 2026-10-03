@@ -60,6 +60,8 @@ MAP = [
     ("ICON_MD",          "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/MD.png"),           # 30 MD
     ("ICON_SMS",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5f15\u64ce/SMS.png"),         # 31 SMS
     ("ICON_FAV",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u6536\u85cf\u5939.png"),      # 32 \u6536\u85cf\u5939
+    # 33 码表 (自行车码表, bikecomp.lua). 图标是程序化线描 (tools 里生成后存桌面), 不是缩图.
+    ("ICON_BIKE",        "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u7801\u8868.png"),        # 33 \u7801\u8868
 ]
 
 TRANSFER_PNG = "\u5b8c\u7f8e\u56fe\u6807/\u72b6\u6001\u680f/\u6570\u636e\u4f20\u8f93.png"

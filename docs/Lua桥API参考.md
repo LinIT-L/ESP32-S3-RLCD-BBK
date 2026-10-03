@@ -2,7 +2,7 @@
 
 > 由 `tools/lua_api_doc.py` 从 `components/apps/lua_bridge/luat_lib_*.c` **自动提取**。
 > 「说明」一列取的是源码里函数上方的注释 —— **改代码就是改文档**，不需要手改本文件。
-> 共 **125** 个 API / 12 个模块。加 API 见技能 `lintos-lua-app-pipeline` §18。「定义」列是源码位置。
+> 共 **129** 个 API / 13 个模块。加 API 见技能 `lintos-lua-app-pipeline` §18。「定义」列是源码位置。
 
 ## `fs` — 文件（TF 卡，`fs` 子表）
 
@@ -45,6 +45,15 @@
 | `app.mixc` | （源码未写注释） | `luat_lib_gfx.c:364` |
 | `app.mixw` | （源码未写注释） | `luat_lib_gfx.c:365` |
 
+## `gps` — 
+
+| API | 说明 | 定义 |
+|---|---|---|
+| `app.gps.start` | app.gps.start() → bool: 初始化 UART 并起后台解析任务 (幂等) | `luat_lib_gps.c:88` |
+| `app.gps.fix` | app.gps.fix() → table \| nil * 全是整数定标值 (见文件头), 括号里是还原公式 | `luat_lib_gps.c:89` |
+| `app.gps.demo` | app.gps.demo([on]) → bool: 开/关演示数据 (不读 UART) | `luat_lib_gps.c:90` |
+| `app.gps.reset` | app.gps.reset(): 清定位状态与统计 (不关演示开关) | `luat_lib_gps.c:91` |
+
 ## `hid` — USB 键鼠（`hid` 子表）
 
 | API | 说明 | 定义 |
@@ -65,11 +74,11 @@
 
 | API | 说明 | 定义 |
 |---|---|---|
-| `app.img.load` | app.img.load(path[, opaque]) -> id \| nil | `luat_lib_img.c:235` |
-| `app.img.blit` | #define IMG_ROW_MAX 64 上限 512 像素宽 (我们的屏 400) | `luat_lib_img.c:236` |
-| `app.img.size` | app.img.size(id) -> w, h | `luat_lib_img.c:237` |
-| `app.img.free` | app.img.free(id) / app.img.freeall() | `luat_lib_img.c:238` |
-| `app.img.freeall` | （源码未写注释） | `luat_lib_img.c:239` |
+| `app.img.load` | app.img.load(path[, opaque]) -> id \| nil | `luat_lib_img.c:248` |
+| `app.img.blit` | #define IMG_ROW_MAX 64 上限 512 像素宽 (我们的屏 400) | `luat_lib_img.c:249` |
+| `app.img.size` | app.img.size(id) -> w, h | `luat_lib_img.c:250` |
+| `app.img.free` | app.img.free(id) / app.img.freeall() | `luat_lib_img.c:251` |
+| `app.img.freeall` | （源码未写注释） | `luat_lib_img.c:252` |
 
 ## `input` — 时间与输入（按键 / 按住状态 / 自动重复 / 触摸 / 重绘）
 
