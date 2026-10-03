@@ -141,6 +141,77 @@ def glyph_icon(im, fs=FRAME, pad=3):
 
 
 # ---------------- 瓦片（程序化重绘，理由同 QQ堂：原图是高清贴图，二值化必成噪点） ----------
+# ---------------- 1bpp 有序抖动 (把原版灰度素材转成墨点) ----------------
+_BAYER4 = ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))
+
+
+def dither_bits(g, w, h, ink=0.16):
+    """灰度图 → w×h 的 0/1 墨点 (8×8 有序抖动)。
+    ink = 目标墨量: 先量原图均值, 再把阈值整体平移, 让**均值处正好落在 ink 的黑点比例**。
+    这样不同亮度的原图能得到不同密度但同一"颗粒感", 不会有的全黑有的全白。"""
+    g = g.convert("L").resize((w, h), Image.LANCZOS)
+    px = g.load()
+    mean = sum(px[x, y] for y in range(h) for x in range(w)) / float(w * h)
+    # 要的是 P(px+shift < t) = ink, t 均匀于 [0,255] ⇒ px+shift = 255·(1-ink)
+    shift = 255.0 * (1.0 - ink) - mean
+    bits = [[0] * w for _ in range(h)]
+    for y in range(h):
+        for x in range(w):
+            # ⛔ 阈值就是标准 4×4 Bayer: (b+0.5)/16*255 → 铺满 [0,255]。
+            #   我曾写成 `B[a]*4 + B[b]` 想凑 8x8, 结果阈值只到 75 ⇒ 判据永远不成立 ⇒ **整张全白**。
+            t = (_BAYER4[y % 4][x % 4] + 0.5) / 16.0 * 255.0
+            if px[x, y] + shift < t:
+                bits[y][x] = 1
+    return bits
+
+
+GROUND_TILEMAP = "environment/ground_tilemap.png"
+GROUND_CELL = 60
+GROUND_2BPP = None          # 缓存: [(mean_lum, bits20)]
+
+
+def ground_cells(src):
+    """切原版 environment/ground_tilemap.png (60px 网格) 的**非空**格 → 20px 1bpp。
+    返回按亮度升序(暗→亮)的 [(mean, bits)]。"""
+    global GROUND_2BPP
+    if GROUND_2BPP is not None:
+        return GROUND_2BPP
+    out = []
+    p = os.path.join(src, GROUND_TILEMAP)
+    if os.path.exists(p):
+        im = Image.open(p).convert("RGBA")
+        W, H = im.size
+        for cy in range(H // GROUND_CELL):
+            for cx in range(W // GROUND_CELL):
+                t = im.crop((cx * GROUND_CELL, cy * GROUND_CELL,
+                             (cx + 1) * GROUND_CELL, (cy + 1) * GROUND_CELL))
+                a = t.getchannel("A")
+                if sum(1 for v in a.getdata() if v > 100) < GROUND_CELL * GROUND_CELL * 0.95:
+                    continue                       # 空格 / 半透明格: 原图里是空白, 跳过
+                g = Image.new("L", (GROUND_CELL, GROUND_CELL), 255)
+                g.paste(t.convert("L"), (0, 0), a)
+                mean = sum(g.getdata()) / float(GROUND_CELL * GROUND_CELL)
+                out.append((mean, dither_bits(g, 20, 20, 0.16)))
+    out.sort(key=lambda z: z[0])
+    GROUND_2BPP = out
+    return out
+
+
+def ground_tile(kind, v):
+    """按**亮度档**把原版地面格分配给地形 (0=最暗)。取不到原图就返回 None(回落程序化)。"""
+    c = ground_cells(SRC_DEFAULT)
+    n = len(c)
+    if n < 8:
+        return None
+    # 原图是灰度噪声: 暗的像沥青/深土, 亮的像沙/室内地板
+    idx = {"water": (0, 1), "dirt": (n // 2, n // 2 + 1),
+           "grass": (n // 2 - 3, n // 2 - 5, n // 2 + 4, n // 2 + 6),
+           "floor": (n - 4, n - 5), "sand": (n - 1, n - 2)}.get(kind)
+    if not idx:
+        return None
+    return c[idx[v % len(idx)] % n][1]
+
+
 def blank(w, h):
     return [[0] * w for _ in range(h)]
 
@@ -173,6 +244,14 @@ def make_tile(kind, T=20, v=0):
       草地=稀疏草簇(8~12px 一个) / 路面=**密实细颗粒**(像沥青, 明显更深)
       水=横向波纹线 / 沙=中等散点 / 墙=粗框砖缝 / 室内地板=板缝线 / 树=实心树冠+树干
     """
+    # ★ 地面类 (草/土/沙/路/室内地板/水) **优先用原版 environment/ground_tilemap.png**,
+    #   按亮度档分配; 取不到原图才回落到下面的程序化画法。
+    #  . ⛔ road 不在其中: 路面的"路缘线"是按"格子在 4 格宽路里第几列"画的(linit 已认可),
+    #    换成原版噪声格会把这条线丢掉, 而且 road_disp 的 5 位置组下标也会全部错位。
+    if kind in ("grass", "dirt", "sand", "floor", "water"):
+        gt = ground_tile(kind, v)
+        if gt is not None:
+            return gt
     g = blank(T, T)
     if kind == "grass":                                    # 4 变体: 草簇位置疏密不同
         sets = (
@@ -344,6 +423,7 @@ def write_bmp1(path, rows, w, h):
     open(path, "wb").write(fh + dh + pal + bytes(pix))
 
 
+SRC_DEFAULT = os.path.join(os.path.expanduser("~"), "Desktop", "minidayz-master", "asset", "images")
 SPR_COLS = 45          # 精灵图集列数 (180 帧 → 45×4 = 1440×128, 宽度安全低于 IMG_MAX_W)
 
 
