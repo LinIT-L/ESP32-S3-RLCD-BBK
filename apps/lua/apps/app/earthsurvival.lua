@@ -316,32 +316,31 @@ end
 --    水面又画了 12 条线 ⇒ 一屏全是横线。**图案越少越清楚**: 让最常见的草**完全留白**,
 --    其余地形只用"一眼能认出的**少量**记号":
 --      草 = 空白 · 水 = 2 条断波纹 · 流沙 = 3 个小叉(稀疏) · 山 = 实心三角 · 洞 = 实心黑 · 墙 = 双线框
-local function draw_tile(t, sx, sy)
+-- 地形 = **不透明图集** (tile.bmp, 6 格 @32px, 由 tools 生成)
+-- ★★ 为什么必须用"不透明 blit"而不是"草地留白 + 全屏 clear":
+--    帧缓冲是 **x 主序** (相邻 x 相隔 75 字节) → 全屏 fill 12 万像素全是 PSRAM 随机写 ⇒
+--    **一次几十毫秒**; 而相机每走 32px 就跨一格 ⇒ 每 0.25 秒顿一次 = 用户说的"走一下顿一下"。
+--    改成 opaque blit: 白底和墨色一起刷出来, **完全不需要 clear**, 而且 108 次 blit 走的是
+--    行缓冲重排的紧凑循环, 比逐像素 API 快一个量级。
+local RES = { dir = "/store/earthsurvival/" }
+
+local function blit_tile(t, sx, sy)
+    if not RES.tile then return end
     local S = CFG.TILE
-    if t == T_GRASS then
-        -- 留白: 什么都不画 (整屏的"纸"就是草地)
-    elseif t == T_WATER then                             -- 水: 两条错开的短波纹, 不铺满
-        app.hline(sx + 3,  sx + 14, sy + 10, BK)
-        app.hline(sx + 18, sx + 29, sy + 10, BK)
-        app.hline(sx + 8,  sx + 24, sy + 21, BK)
-    elseif t == T_MOUNT then                             -- 山: 实心三角 (最重的记号)
-        for k = 0, S // 2 - 1 do
-            app.hline(sx + 16 - k, sx + 15 + k, sy + 12 + k, BK)
-        end
-    elseif t == T_QUICK then                             -- 流沙: 3 个稀疏小叉
-        local pts = { { 8, 8 }, { 22, 15 }, { 12, 25 } }
-        for i = 1, 3 do
-            local x, y = sx + pts[i][1], sy + pts[i][2]
-            app.px(x, y, BK); app.px(x - 1, y, BK); app.px(x + 1, y, BK)
-            app.px(x, y - 1, BK); app.px(x, y + 1, BK)
-        end
-    elseif t == T_CAVE then                              -- 洞: 实心黑
-        app.fill(sx, sy, sx + S - 1, sy + S - 1, BK)
-    elseif t == T_WALL then                              -- 墙: 双线框
-        app.rect(sx + 1, sy + 1, sx + S - 2, sy + S - 2, BK)
-        app.rect(sx + 3, sy + 3, sx + S - 4, sy + S - 4, BK)
+    local ox, oy, w, h = 0, 0, S, S
+    if sx < 0 then ox = -sx; w = w - ox; sx = 0 end
+    if sy < CFG.HUD_H then                                    -- 被状态条压住的行: 只画露出来的部分
+        local clip = CFG.HUD_H - sy
+        if clip >= S then return end
+        oy = clip; h = h - clip; sy = CFG.HUD_H
     end
+    if sx + w > W then w = W - sx end
+    if sy + h > H then h = H - sy end
+    if w <= 0 or h <= 0 then return end
+    app.img.blit(RES.tile, (t - 1) * S + ox, oy, sx, sy, w, h)
 end
+
+local function draw_tile(t, sx, sy) blit_tile(t, sx, sy) end
 
 local function blit_cell(cx, cy)
     if cx < 0 or cy < 0 or cx >= CFG.MCOLS or cy >= CFG.MROWS then return end
@@ -379,10 +378,17 @@ local function dcell(x, y)
     GAME.dn = n
     GAME.dyn_cur[n] = y * 1000 + x
 end
-local function dcell3(x, y)
-    dcell(x - 1, y - 1); dcell(x, y - 1); dcell(x + 1, y - 1)
-    dcell(x - 1, y);     dcell(x, y);     dcell(x + 1, y)
-    dcell(x - 1, y + 1); dcell(x, y + 1); dcell(x + 1, y + 1)
+-- ★ 按**像素包围盒**精确标脏 (而不是固定 3×3):
+--   ① 3×3 会白擦 9 格 (9×1024 px), 精确只要 1~4 格 → 快 3~4 倍;
+--   ② 精确覆盖**杜绝残留** —— 拖影就是"有格子没被标到"。
+local function dbox(px, py, w, h)
+    local c0 = math.floor(px / CFG.TILE)
+    local r0 = math.floor(py / CFG.TILE)
+    local c1 = math.floor((px + w - 1) / CFG.TILE)
+    local r1 = math.floor((py + h - 1) / CFG.TILE)
+    for r = r0, r1 do
+        for c = c0, c1 do dcell(c, r) end
+    end
 end
 
 local function draw_dynamic()
@@ -403,7 +409,7 @@ local function draw_dynamic()
         local o = ORBS[i]
         local sx, sy = o.x * S - CAM.x + 12, o.y * S - CAM.y + 12
         if vis(sx, sy) then
-            dcell(o.x, o.y)
+            dbox(o.x * S + 12, o.y * S + 12, 8, 8)
             app.fill(sx, sy, sx + 7, sy + 7, BK)
         end
     end
@@ -412,7 +418,7 @@ local function draw_dynamic()
         local o = POWERS[i]
         local sx, sy = o.x * S - CAM.x + 8, o.y * S - CAM.y + 8
         if vis(sx, sy) then
-            dcell(o.x, o.y)
+            dbox(o.x * S + 8, o.y * S + 8, 16, 16)
             app.fill(sx + 4, sy, sx + 11, sy + 15, BK)
             app.fill(sx, sy + 4, sx + 15, sy + 11, BK)
         end
@@ -422,7 +428,7 @@ local function draw_dynamic()
         local e = ENEMIES[i]
         local gx, gy = math.floor(e.x) // S, math.floor(e.y) // S
         local sx, sy = gx * S - CAM.x, gy * S - CAM.y
-        dcell3(gx, gy)
+        dbox(e.x - 10, e.y - 10, 20, 20)
         if vis(sx, sy) then
             if e.fast then
                 for k = 0, 7 do
@@ -438,7 +444,7 @@ local function draw_dynamic()
         local s2 = SHARKS[i]
         local gx, gy = math.floor(s2.x) // S, math.floor(s2.y) // S
         local sx, sy = gx * S - CAM.x, gy * S - CAM.y
-        dcell3(gx, gy)
+        dbox(s2.x - 12, s2.y - 12, 24, 24)
         if vis(sx, sy) then
             for k = 0, 10 do
                 app.hline(sx + 16 - k, sx + 15 + k, sy + 6 + k, BK)
@@ -448,7 +454,7 @@ local function draw_dynamic()
     -- 玩家: 实心圆 + 无敌时外圈
     local pgx = math.floor(P.x) // S
     local pgy = math.floor(P.y) // S
-    dcell3(pgx, pgy)
+    dbox(P.x - 14, P.y - 14, 28, 28)
     local psx, psy = math.floor(P.x) - CAM.x, math.floor(P.y) - CAM.y
     if psx > -40 and psy > CFG.HUD_H - 40 and psx < W and psy < H then
         local blink = (P.invuln > 0) and (math.floor(app.millis() / 100) % 2 == 0)
@@ -545,6 +551,16 @@ local function step(dt)
     elseif app.key_down(A_DOWN) then dy = 1
     elseif app.key_down(A_LEFT) then dx = -1
     elseif app.key_down(A_RIGHT) then dx = 1 end
+    -- ★ 方向键做**保持 120ms 的惯性**:
+    --   固件的"按住态"是按输入任务节拍刷新的, 直接单帧读会出现"按下→松开→按下"的抖动,
+    --   表现就是**走一下顿一下**。记住方向并在 120ms 内续命, 抖动就被抹平了。
+    if dx ~= 0 or dy ~= 0 then
+        P.hdx, P.hdy, P.hold = dx, dy, 120
+    elseif (P.hold or 0) > 0 then
+        P.hold = P.hold - dt
+        dx, dy = P.hdx or 0, P.hdy or 0
+    end
+
     local spd = CFG.PSPD * (dt / 1000)
     if pt == T_QUICK then spd = spd * 0.4 end                 -- 流沙减速 (原版)
     if dx ~= 0 or dy ~= 0 then
@@ -711,7 +727,9 @@ function render()
     if GAME.play_full then
         GAME.play_full = false
         GAME.hud_key = nil
-        app.clear(WH)
+        -- ⛔ 这里**故意不调 app.clear()**: 图集是不透明的(白底也会刷),
+        --    全屏重铺已经把每个像素覆盖掉; 而 clear 一次 = 12 万次 PSRAM 随机写 ≈ 几十毫秒,
+        --    正是"走一下顿一下"的元凶。
         GAME.draw_static()
         GAME.dn, GAME.dn_prev = 0, 0
     end
@@ -738,11 +756,14 @@ function poll()
 end
 
 function on_enter()
+    RES.tile = app.img.load(RES.dir .. "tile.bmp", true)   -- true = 不透明(白底一并刷出)
     reset()
-    msg("吃光能量球, 水里有鲨鱼")
+    msg(RES.tile and "吃光能量球, 水里有鲨鱼" or "素材缺失")
 end
 
-function on_exit() end
+function on_exit()
+    app.img.freeall()
+end
 
 function action(a)
     if type(a) ~= "number" or a < 1 or a > 7 then return true end

@@ -594,6 +594,10 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
         int ex0  = sx + 1, ex1 = sx + slot - 2;        /* 水管左右外缘 */
         int ytop = y0;
         bool sel = (s_focus_bar == 1);                 /* 焦点在顶栏 = 选中态 */
+        /* ★ 选中态的底边**上提 2px** (2026-10-03 linit: "选中的分类底部不要有黑线"):
+         *   黑块底边若和下方各格的分隔线齐平, 两者会**连成一条黑线**, 看着就是"底部有黑线"。
+         *   上提 2px 留出白缝后, 这一格才像"坐在栏上的一个按钮"而不是跟底线糊成一体。 */
+        int yend = sel ? (ybot - 2) : ybot;
         /* ★ 线宽随状态变 (linit 2026-10-03):
          *   未选中 = 2px 细框"定位用"; **选中 = 1px** —— 里面已经填满了黑, 2px 边框会显得又粗又笨。 */
         int  w   = sel ? 1 : 2;
@@ -602,13 +606,13 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
         if (sel) {
             /* 左/上/右各内缩 w 让开边框; **底边不内缩** —— 黑块要一直铺到 ybot,
              *   和下方各格的分隔线齐平, 看起来才是"这一格坐在栏上"。 */
-            am_fill_top_round(lcd, ex0 + w, ytop + w, ex1 - w, ybot,
+            am_fill_top_round(lcd, ex0 + w, ytop + w, ex1 - w, yend,
                               R - w, ST7305_COLOR_BLACK);
         }
         /* 竖线一插到底, 左下/右下**不打弯头** ⇒ 两下角是方角。 */
         for (int k = 0; k < w; k++) {
-            draw_vline(lcd, ex0 + k, ytop + R, ybot, ST7305_COLOR_BLACK);   /* 左竖 */
-            draw_vline(lcd, ex1 - k, ytop + R, ybot, ST7305_COLOR_BLACK);   /* 右竖 */
+            draw_vline(lcd, ex0 + k, ytop + R, yend, ST7305_COLOR_BLACK);   /* 左竖 */
+            draw_vline(lcd, ex1 - k, ytop + R, yend, ST7305_COLOR_BLACK);   /* 右竖 */
             draw_hline(lcd, ex0 + R, ex1 - R, ytop + k, ST7305_COLOR_BLACK); /* 上横 */
         }
         /* ★ 下横**只有未选中才画**: 选中时下方开口 (linit: "选中的分类底部不要有黑线") ——
@@ -633,8 +637,8 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
  * kind=2: 外凸向左下 (左下弯: 竖线在左 + 下横线在下), 圆心 (cx+r, cy-r).
  * kind=3: 外凸向右上 (右上弯: 竖线在右 + 上横线在上), 圆心 (cx-r, cy+r).
  * kind=4: 外凸向右下 (右下弯: 竖线在右 + 下横线在下), 圆心 (cx-r, cy-r).
- * 保留到圆心距离 d∈[r-2,r] 的环带像素 (各角朝外凸出的 90° 弧). */
- * [param w]: 弧带**线宽**(像素)。w=2 是原来的观感(左栏/未选中用), w=1 是细线(选中态用, 2026-10-03 linit)。 */
+ * 保留到圆心距离 d∈[r-w,r] 的环带像素 (各角朝外凸出的 90° 弧).
+ * [param w]: 弧带**线宽**(像素)。w=2 = 原观感(左栏/未选中用); w=1 = 细线(选中态用, 2026-10-03 linit)。 */
 static void am_elbow(st7305_handle_t *lcd, int cx, int cy, int r, int kind, int w, st7305_color_t color) {
     if (w < 1) w = 1;
     int ox, oy, x0, x1, y0, y1, sx, sy;
