@@ -80,6 +80,11 @@ MANIFEST = {
     #   僵尸分布按"贴地点密度"(源工程僵尸系统尚未实现, 只有美术)。
     "minidayz": ("app", "迷你DayZ", "游戏",
                  "废墟搜刮 + 僵尸生存: 找人烟、抢物资、别被围死", "ICON_MINI_GAMES"),
+    # ★ Earth Survival 掌机版: 移植自开源项目 Cod-e-Codes/Love2D-TestGame (Love2D/Lua)。
+    #   原版**全部用几何图形绘制**(没有贴图) → 转 1bpp 几乎零信息损失, 是"低分辨率原生"的正例。
+    #   瓦片改成 32px(linit 定: 原版 60px 缩到 32px 这一档) + 相机跟随。
+    "earthsurvival": ("app", "地球生存", "游戏",
+                      "开源移植: 吃光能量球, 躲开敌人与鲨鱼, 水和流沙会耗能量", "ICON_MINI_GAMES"),
     "planeradar": ("ops", "航班雷达", "运维",
                    "自动定位当前位置, 扫描附近空域航班: 距离/方位/高度/地速/呼号", "ICON_NETDECT"),
 }
