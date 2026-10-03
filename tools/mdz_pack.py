@@ -97,23 +97,46 @@ def rgba_to_bits(im, fs=FRAME, thresh=150, opaque_alpha=110):
 
 
 def glyph_icon(im, fs=FRAME, pad=3):
-    """小图标（9~40px）→ 居中放大到 fs 帧里（**最近邻**，像素画不要插值），再按 alpha 转墨。"""
+    """道具图标 → fs×fs 的墨点。三步，缺一步就会得到"空白格"或"只剩一角"：
+
+    ① **先裁到 alpha 边界** —— 官方图里图标往往只占一小块（武器帧 39 尤其明显：
+       32×32 的格里只有一条 20×6 的刀身）。不裁就居中缩放，结果缩得比蚂蚁还小，
+       看起来像"没画出来"。
+    ② 等比缩放进 (fs-2*pad) 的框：**放大用 NEAREST**（像素画不插值），**缩小用 LANCZOS**。
+       ⛔ 旧版只做了 `max(1, ...)` 的整数放大 ⇒ 大图（如 128×544 的武器表）s 恒为 1,
+       于是把图片**左上角 32×32 直接糊进格子里** —— 这就是"图标全是垃圾/空白"的原因。
+    ③ 居中贴进 fs 画布，再按"alpha 不透明 且 亮度 < 150"落墨。
+    """
     im = im.convert("RGBA")
+    bbox = im.getchannel("A").getbbox()                 # ① 去掉四周全透明的边
+    if bbox:
+        im = im.crop(bbox)
     w, h = im.size
-    s = max(1, min((fs - pad * 2) // max(1, w), (fs - pad * 2) // max(1, h)))
-    im = im.resize((w * s, h * s), Image.NEAREST)
+    inner = max(1, fs - pad * 2)
+    if w > inner or h > inner:                          # ② 大图 → 等比缩
+        sc = min(inner / w, inner / h)
+        im = im.resize((max(1, round(w * sc)), max(1, round(h * sc))), Image.LANCZOS)
+    else:                                               # 小图 → 整数倍最近邻放大
+        sc = max(1, min(inner // max(1, w), inner // max(1, h)))
+        im = im.resize((w * sc, h * sc), Image.NEAREST)
     canvas = Image.new("RGBA", (fs, fs), (0, 0, 0, 0))
     canvas.paste(im, ((fs - im.size[0]) // 2, (fs - im.size[1]) // 2))
     px = canvas.load()
-    bits = [[0] * fs for _ in range(fs)]
-    for y in range(fs):
-        for x in range(fs):
-            r, g, b, a = px[x, y]
-            if a < 110:
-                continue
-            lum = 0.299 * r + 0.587 * g + 0.114 * b
-            if lum < 150:
-                bits[y][x] = 1
+    # ⚠ 阈值必须能自愈: 有的图标本体是**浅色**的(子弹是黄铜色, 亮度 ~170),
+    #   固定 150 会把整张判成"白" ⇒ 出来一个**空图标**(6/7 号就中过)。
+    #   所以逐档放宽, 一旦有墨就停; 全档都空才返回。
+    bits = None
+    for thresh in (150, 180, 205):
+        bits = [[0] * fs for _ in range(fs)]
+        for y in range(fs):
+            for x in range(fs):
+                r, g, b, a = px[x, y]
+                if a < 110:
+                    continue
+                if 0.299 * r + 0.587 * g + 0.114 * b < thresh:
+                    bits[y][x] = 1
+        if any(any(row) for row in bits):
+            break
     return bits
 
 
@@ -139,46 +162,169 @@ def box(g, x0, y0, x1, y1, v=1):
     vline(g, x0, y0, y1, v); vline(g, x1, y0, y1, v)
 
 
-def make_tile(kind, T=20):
+def make_tile(kind, T=20, v=0):
+    """地形瓦片。v = 变体号。
+
+    ⛔ 为什么必须给变体: 同一种地形只有一张图时, 20px 的小草簇会在屏幕上**整齐排成网格**,
+       整片地图看起来"全是一个样"(2026-10-03 实测就踩了, 用户看到的是一片整齐的点阵)。
+       每个地形给 2~4 个变体, 由 Lua 侧**确定性哈希**挑(不能用随机: 静态层会重建, 随机会满屏闪)。
+
+    区分地形靠"**线宽/线密**", 不靠"谁更黑":
+      草地=稀疏草簇(8~12px 一个) / 路面=**密实细颗粒**(像沥青, 明显更深)
+      水=横向波纹线 / 沙=中等散点 / 墙=粗框砖缝 / 室内地板=板缝线 / 树=实心树冠+树干
+    """
     g = blank(T, T)
-    if kind == "grass":                                    # 草地: 稀疏草簇
-        for (x, y) in ((3, 5), (12, 3), (7, 13), (16, 10), (2, 16)):
-            g[y][x] = 1; g[y - 1][x - 1] = 1; g[y - 1][x + 1] = 1
-    elif kind == "dirt":                                   # 土路: 小点
-        for (x, y) in ((4, 4), (13, 7), (6, 14), (15, 15), (9, 9)):
+    if kind == "grass":                                    # 4 变体: 草簇位置疏密不同
+        sets = (
+            ((3, 5), (12, 3), (7, 13), (16, 10), (2, 16)),
+            ((6, 8), (15, 6), (4, 16), (11, 12)),
+            ((9, 4), (2, 10), (14, 15), (18, 8), (7, 17)),
+            ((5, 6), (13, 11), (1, 14), (17, 17), (10, 15), (8, 2)),
+        )
+        for (x, y) in sets[v % len(sets)]:
+            if 0 <= x < T and 0 <= y < T:
+                g[y][x] = 1
+            if 0 <= x - 1 and 0 <= y - 1:
+                g[y - 1][x - 1] = 1
+            if x + 1 < T and 0 <= y - 1:
+                g[y - 1][x + 1] = 1
+    elif kind == "dirt":                                   # 土: 中等散点
+        for (x, y) in ((4, 4), (13, 7), (6, 14), (15, 15), (9, 9), (2, 11), (17, 3)):
             g[y][x] = 1
-    elif kind == "tree":                                   # 树: 树冠 + 树干
-        for r in (9, 6, 3):
-            for k in range(-r, r + 1):
-                yy = 9 - int((r * r - k * k) ** 0.5)
-                if 0 <= yy < T:
-                    g[yy][9 + k] = 1
+    elif kind == "tree":                                   # 3 变体: 树冠大小/位置
+        r  = (7, 6, 8)[v % 3]
+        cx = (9, 10, 8)[v % 3]
+        for k in range(-r, r + 1):
+            yy = 9 - int((r * r - k * k) ** 0.5)
+            if 0 <= yy < T and 0 <= cx + k < T:
+                g[yy][cx + k] = 1
         for i in range(4, 10):
-            hline(g, 8 - (9 - i) // 3, 10 + (9 - i) // 3, i)
-        vline(g, 9, 13, 18); vline(g, 10, 13, 18)
-    elif kind == "water":                                  # 水: 波纹
-        for y in (4, 8, 12, 16):
+            hline(g, cx - 1 - (9 - i) // 3, cx + 1 + (9 - i) // 3, i)
+        vline(g, cx, 13, 18); vline(g, cx + 1, 13, 18)
+    elif kind == "water":                                  # 波纹: 线最密
+        for y in (3, 6, 9, 12, 15, 18):
             hline(g, 2, 17, y)
-            g[y - 1][3] = 1; g[y - 1][16] = 1
-    elif kind == "wall":                                   # 建筑墙: 粗框 + 砖缝
+            g[y - 1][3] = 1; g[y - 1][16] = 1; g[y - 1][10] = 1
+    elif kind == "wall":                                   # 墙: 粗框 + 砖缝 (最"实")
         box(g, 0, 0, T - 1, T - 1)
         box(g, 1, 1, T - 2, T - 2)
         hline(g, 2, T - 3, 9); hline(g, 2, T - 3, 10)
         vline(g, 13, 2, 9); vline(g, 6, 11, T - 3)
-    elif kind == "floor":                                  # 室内地板: 极淡格线
-        for (x, y) in ((2, 2), (T - 4, 2), (2, T - 4), (T - 4, T - 4)):
-            g[y][x] = 1; g[y][x + 1] = 1
-    elif kind == "sand":
-        for (x, y) in ((5, 3), (14, 6), (3, 11), (11, 15), (17, 12)):
-            g[y][x] = 1; g[y + 1][x] = 1
-    elif kind == "road":                                   # 柏油路: 中线
-        hline(g, 8, 11, 0, 1)
-        for y in range(0, T, 6):
-            hline(g, 9, 10, y)
+    elif kind == "floor":                                  # 2 变体: 室内板缝
+        if v % 2 == 0:
+            hline(g, 0, T - 1, 6); hline(g, 0, T - 1, 13)
+        else:
+            vline(g, 6, 0, T - 1); vline(g, 13, 0, T - 1)
+        g[3][3] = 1; g[16][16] = 1
+    elif kind == "sand":                                   # 沙: 比草稍密
+        for (x, y) in ((5, 3), (14, 6), (3, 11), (11, 15), (17, 12), (8, 8), (16, 17)):
+            g[y][x] = 1
+            if y + 1 < T:
+                g[y + 1][x] = 1
+    elif kind == "road":
+        # 5 种"位置" × 3 种颗粒 = 15 个变体。
+        #   v//3: 0=路中(纯颗粒) 1=左边线 2=右边线 3=上边线 4=下边线
+        #   v%3 : 3 套颗粒花纹(打破沿路重复)
+        # ⛔ 别在路格上画"中心虚线" —— 那是原版 **60px 一格** 才有意义的设计;
+        #   我们的格子是 20px, 每格一条虚线会在路上排出一整排竖线, 看着像**梯子**
+        #   (2026-10-03 实测踩过, 用户报"路像格子")。
+        #   正确做法: 路缘线由"格子处在路的第几列"决定 → 见 Lua 侧 disp_tile 的 T_ROAD 分支。
+        grains = (
+            ((2, 3), (6, 3), (10, 3), (14, 3), (18, 3), (4, 7), (8, 7), (12, 7), (16, 7),
+             (2, 11), (6, 11), (10, 11), (14, 11), (18, 11), (4, 15), (8, 15), (12, 15), (16, 15)),
+            ((3, 1), (7, 1), (11, 1), (15, 1), (19, 1), (1, 5), (5, 5), (9, 5), (13, 5), (17, 5),
+             (3, 9), (7, 9), (11, 9), (15, 9), (19, 9), (1, 13), (5, 13), (9, 13), (13, 13), (17, 13)),
+            ((1, 2), (5, 2), (9, 2), (13, 2), (17, 2), (3, 6), (7, 6), (11, 6), (15, 6), (19, 6),
+             (1, 10), (5, 10), (9, 10), (13, 10), (17, 10), (3, 14), (7, 14), (11, 14), (15, 14), (19, 14)),
+        )
+        for (x, y) in grains[v % 3]:
+            if 0 <= x < T and 0 <= y < T:
+                g[y][x] = 1
+        m = v // 3
+        if m == 1:                                         # 左边线 (2px)
+            vline(g, 0, 0, T - 1); vline(g, 1, 0, T - 1)
+        elif m == 2:                                       # 右边线
+            vline(g, T - 1, 0, T - 1); vline(g, T - 2, 0, T - 1)
+        elif m == 3:                                       # 上边线
+            hline(g, 0, T - 1, 0); hline(g, 0, T - 1, 1)
+        elif m == 4:                                       # 下边线
+            hline(g, 0, T - 1, T - 1); hline(g, 0, T - 1, T - 2)
     return g
 
 
+# 每种地形给几个变体 (顺序 = 图集里的排列顺序; 下标 = atlas 序号)
+TILE_VARIANTS = {
+    "grass": 4, "dirt": 1, "tree": 3, "water": 1,
+    "wall": 1, "floor": 2, "sand": 1,
+    "road": 15,          # 5 种位置 x 3 种颗粒 (见 make_tile 的 road 分支)
+}
+
+
+# ⚠ 武器图标**不要自己画** —— 官方取法已经查到了 (2026-10-03):
+#   item/durability_item.gd:  SPRITE_HFRAMES = 4 / SPRITE_INIT_FRAME = 39 / MELEE_WEAPON_VFRAMES = 17
+#   item/melee_weapon.gd:     hframes=4, vframes=17, frame=39  ⇒ 图标 = 4×17 网格的第 39 帧
+#                             (col = 39%4 = 3, row = 39//4 = 9 ⇒ 区域 (96, 288, 32, 32))
+#   item/ranged_weapon.gd:    只设 hframes=4, 不设 frame ⇒ 图标 = 第 0 帧
+#                             (gui_pistol.png 实际是 82×82 的 4列×3行, 第 0 帧 = 左上角那把)
+# 这些帧里的图**很小**(只占一格中一小块), 所以下面 glyph_icon 会先裁到墨点边界再放大。
+WPN_FRAME = (96, 288, 32, 32)          # 近战: 帧 39 在 128×544 表里的区域
+PISTOL_FRAME = (0, 0, 82, 82)          # 手枪: 帧 0 (4列×3行 @82px 的左上)
+
+
 TILE_KINDS = ("grass", "dirt", "tree", "water", "wall", "floor", "sand", "road")
+
+
+# ---- 道具精选表: 顺序 = item.bmp 里的图标序号 = Lua 侧 items[i].icon ----
+# ⛔ 别再用 `sorted(glob(item/*.png))[:64]` —— 那是**字母序前 64 个**(0~z), 结果全是
+#    弹药 / 浆果 / 种子 / 瞄具, **一把武器都没有** ⇒ "打僵尸"根本没家伙用。
+#    改成按用途精选; 武器不在 `item/` 而在 `equipment/weapon/`。
+# 字段: (相对 asset/images 的路径, 中文名, 类别, 数值)
+#   类别 melee=近战(val=伤害) / gun=枪(val=伤害, 消耗 pistol_ammo) / food / drink / med / tool
+ITEM_PICK = [
+    # ---- 武器 ----  (第 5 项 = 在精灵表里抠的区域; 不写 = 整张图就是图标)
+    ("equipment/weapon/melee/army_knife.png",     "军刀",     "melee", 3, WPN_FRAME),
+    ("equipment/weapon/melee/hunter_knife.png",   "猎刀",     "melee", 4, WPN_FRAME),
+    ("equipment/weapon/melee/butcher_knife.png",  "屠刀",     "melee", 4, WPN_FRAME),
+    ("equipment/weapon/melee/pickaxe.png",        "铁镐",     "melee", 5, WPN_FRAME),
+    ("equipment/weapon/melee/fire_axe.png",       "消防斧",   "melee", 7, WPN_FRAME),
+    ("equipment/weapon/pistol/gui_pistol.png",    "手枪",     "gun",   8, PISTOL_FRAME),
+    # ---- 弹药 ----
+    ("equipment/weapon/bullet/pistol_bullet.png", "手枪弹",   "tool",  1),
+    ("equipment/weapon/bullet/rifle_bullet.png",  "步枪弹",   "tool",  1),
+    # ---- 吃的 ----
+    ("item/apple.png",          "苹果",     "food", 8),
+    ("item/orange.png",         "橘子",     "food", 7),
+    ("item/banana.png",         "香蕉",     "food", 8),
+    ("item/canned_bean.png",    "豆罐头",   "food", 18),
+    ("item/canned_tuna.png",    "鱼罐头",   "food", 20),
+    ("item/herring.png",        "鲱鱼",     "food", 12),
+    ("item/tactical_bacon.png", "培根",     "food", 22),
+    ("item/mre_ration.png",     "军用口粮", "food", 35),
+    ("item/cooked_steak.png",   "熟肉排",   "food", 28),
+    # ---- 喝的 ----
+    ("item/canteen.png",        "军用水壶", "drink", 30),
+    ("item/water_bottle.png",   "矿泉水",   "drink", 25),
+    ("item/nota_cola.png",      "可乐",     "drink", 12),
+    ("item/kvas.png",           "格瓦斯",   "drink", 10),
+    ("item/energy_drink.png",   "能量饮料", "drink", 15),
+    # ---- 药 ----
+    ("item/bandage.png",        "绷带",     "med", 12),
+    ("item/saline_bag.png",     "生理盐水", "med", 25),
+    ("item/blood_bag.png",      "血袋",     "med", 40),
+    ("item/morphine.png",       "吗啡",     "med", 20),
+    ("item/tetracycline.png",   "四环素",   "med", 15),
+    ("item/vitamins.png",       "维生素",   "med", 8),
+    ("item/heat_pack.png",      "暖贴",     "med", 6),
+    # ---- 杂项 ----
+    ("item/matches.png",        "火柴",     "tool", 0),
+    ("item/battery.png",        "电池",     "tool", 0),
+    ("item/rope.png",           "绳索",     "tool", 0),
+    ("item/duct_tape.png",      "胶带",     "tool", 0),
+    ("item/radio.png",          "收音机",   "tool", 0),
+    ("item/car_toolbox.png",    "工具箱",   "tool", 0),
+    ("item/cleaning_kit.png",   "清洁套件", "tool", 0),
+    ("item/burlap_sack.png",    "麻袋",     "tool", 0),
+]
 
 
 def write_bmp1(path, rows, w, h):
@@ -267,16 +413,44 @@ def main():
     write_bmp1(os.path.join(args.out, "spr.bmp"), hstack(frames, FRAME), FRAME * len(frames), FRAME)
     print("  spr.bmp  %d 帧 @%dpx" % (len(frames), FRAME))
 
-    # ---------- 2. 道具 ----------
-    ipaths = sorted(glob.glob(os.path.join(args.src, "item", "*.png")))[:64]
-    icons = [glyph_icon(load_rgba(p)) for p in ipaths]
+    # ---------- 2. 道具 (按 ITEM_PICK 精选, 顺序 = 图标序号) ----------
+    icons, items, miss = [], [], []
+    for ent in ITEM_PICK:
+        rel, cn, kind, val = ent[0], ent[1], ent[2], ent[3]
+        region = ent[4] if len(ent) > 4 else None
+        p = os.path.join(args.src, rel)
+        if not os.path.exists(p):
+            miss.append(rel)
+            continue           # ⛔ 缺一张就**跳过它** —— 不能留空洞, 否则后面所有图标序号整体错位
+        src = load_rgba(p)
+        if region:             # 武器 = 从精灵表里抠官方那一帧 (见 WPN_FRAME 注释)
+            x, y, w, h = region
+            src = src.crop((x, y, x + w, y + h))
+        icons.append(glyph_icon(src))
+        items.append((cn, len(icons) - 1, kind, val))
+    if not icons:
+        raise SystemExit("一件道具素材都没找到 —— 检查 --src")
     write_bmp1(os.path.join(args.out, "item.bmp"), hstack(icons, FRAME), FRAME * len(icons), FRAME)
-    print("  item.bmp %d 图标 @%dpx" % (len(icons), FRAME))
+    print("  item.bmp %d 道具 @%dpx (武器 %d / 食 %d / 饮 %d / 药 %d / 杂 %d)"
+          % (len(icons), FRAME,
+             sum(1 for it in items if it[2] in ("melee", "gun")),
+             sum(1 for it in items if it[2] == "food"),
+             sum(1 for it in items if it[2] == "drink"),
+             sum(1 for it in items if it[2] == "med"),
+             sum(1 for it in items if it[2] == "tool")))
+    if miss:
+        print("  ⚠ 缺素材 %d 个(已跳过): %s" % (len(miss), ", ".join(m[:40] for m in miss[:6])))
 
-    # ---------- 3. 地形瓦片 ----------
-    tiles = [make_tile(k) for k in TILE_KINDS]
+    # ---------- 3. 地形瓦片 (每类带变体, 打破"整齐网格"观感) ----------
+    tiles, disp = [], {}
+    for ti, k in enumerate(TILE_KINDS):
+        n = TILE_VARIANTS.get(k, 1)
+        disp[ti] = [len(tiles) + i for i in range(n)]
+        for v in range(n):
+            tiles.append(make_tile(k, 20, v))
     write_bmp1(os.path.join(args.out, "tile.bmp"), hstack(tiles, 20), 20 * len(tiles), 20)
-    print("  tile.bmp %d 格 @20px = %s" % (len(tiles), " ".join(TILE_KINDS)))
+    print("  tile.bmp %d 格 @20px (变体: %s)"
+          % (len(tiles), " ".join("%s%d" % (k, TILE_VARIANTS.get(k, 1)) for k in TILE_KINDS)))
 
     # ---------- 4. map.lua ----------
     L = ["-- minidayz/map.lua — Mini DayZ 掌机版资源元信息 (由 tools/mdz_pack.py 生成)",
@@ -300,7 +474,19 @@ def main():
         if n:
             L.append('    { name="%s", first=%d, count=%d },' % (name, idx, n))
             idx += n
-    L += ["  },", "}", ""]
+    L += ["  },", "  items = {"]
+    for cn, ic, kind, val in items:
+        L.append('    { name="%s", icon=%d, kind="%s", val=%d },' % (cn, ic, kind, val))
+    L += ["  },", "  -- disp[地形id+1] = tile.bmp 里的图集序号(变体); 地形: " + " ".join(TILE_KINDS),
+          "  disp = {"]
+    for ti in range(len(TILE_KINDS)):
+        L.append("    { %s }," % ", ".join(str(x) for x in disp[ti]))
+    L += ["  },",
+          "  -- 路面: 位置组首号 (m=路中 l=左缘 r=右缘 u=上缘 d=下缘); 组内 +0..2 是颗粒变体",
+          "  road_disp = { m = %d, l = %d, r = %d, u = %d, d = %d },"
+          % (disp[7][0], disp[7][3], disp[7][6], disp[7][9], disp[7][12]),
+          "  tile_n = %d," % len(tiles),
+          "}", ""]
     open(os.path.join(args.out, "map.lua"), "w", encoding="utf-8").write("\n".join(L))
     print("  map.lua  角色 %d 组 / 道具 %d / 瓦片 %d" % (len(meta), len(icons), len(tiles)))
 

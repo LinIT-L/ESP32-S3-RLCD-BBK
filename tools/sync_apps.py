@@ -74,6 +74,12 @@ MANIFEST = {
               "原版地图整图 + 原版人物 + 63 张场景: 拜师/行囊/回合战斗/走江湖", "ICON_MINI_GAMES"),
     "qqtang": ("app", "QQ堂冒险", "游戏",
                "泡泡炸砖块探无限地牢: 道具/背包/技能升级/越深越难", "ICON_MINI_GAMES"),
+    # ★ Mini DayZ 掌机版: 世界生成规则**学自源工程** environment/ground.gd
+    #   (地块 17×17 格 / 整图 8×8 地块 / 逐行逐列"连前两个地点" / 空地 1/9 变水 /
+    #    路宽 4 格在块内偏移 6..9), 素材 tools/mdz_pack.py 打包 → /store/minidayz/。
+    #   僵尸分布按"贴地点密度"(源工程僵尸系统尚未实现, 只有美术)。
+    "minidayz": ("app", "迷你DayZ", "游戏",
+                 "废墟搜刮 + 僵尸生存: 找人烟、抢物资、别被围死", "ICON_MINI_GAMES"),
     "planeradar": ("ops", "航班雷达", "运维",
                    "自动定位当前位置, 扫描附近空域航班: 距离/方位/高度/地速/呼号", "ICON_NETDECT"),
 }
