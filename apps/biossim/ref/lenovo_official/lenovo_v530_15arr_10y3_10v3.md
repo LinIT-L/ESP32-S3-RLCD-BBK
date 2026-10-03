@@ -1,0 +1,246 @@
+# Lenovo V530-15ARR (10Y3,10V3) — BIOS 菜单树（联想官方模拟器提取）
+
+- 来源: https://download.lenovo.com/bsco/index.html#/textsimulator/Lenovo%20V530-15ARR%20(10Y3,10V3)
+- 抓取日期: 2026-10-02
+- 顶层菜单: Main / Devices / Advanced / Power / Security / Startup / Exit
+- 统计: 7 个顶层菜单, 24 个子菜单, 202 个条目, 187 个候选值
+
+# Main
+  - System Summary  ▸
+    - (空)  —— 分隔线 ——
+    - CPU Type  = CPU Brand String  [禁用]
+    - CPU Speed  = xx0GHz  [禁用]
+    - CPU Core Count  = x  [禁用]
+    - Installed Memory  = xxxx MB  [禁用]
+    - Memory Bus Speed  = XX MHz  [禁用]
+    - Active Video  = IGD/PEG/PCI  [禁用]
+    - Onboard Audio  = Enabled  [禁用]
+    - Onboard Ethernet  = Enabled  [禁用]
+    - CPU Fan  = Operating  [禁用]
+    - System Fan  = Operating  [禁用]
+    - Aux Fan  = Operating  [禁用]
+    - M.2 Drive 1  = None  [禁用]
+    - SATA Drive 1  = None  [禁用]
+    - SATA Drive 2  = None  [禁用]
+  - System Time && Date  ▸
+    - System Time(HH:MM:SS)  (日期/时间)
+    - System Date(YYYY:MM:DD)  (日期/时间)
+  - (空)  —— 分隔线 ——
+  - Machine Type and Model  = 10Y3  [禁用]
+  - System Brand ID  = Lenovo V530-15ARR  [禁用]
+  - System Serial Number  = INVALID  [禁用]
+  - Asset tag  =    [禁用]
+  - System UUID  = 666DE75C-1234-1234-1234-1234567890AB  [禁用]
+  - Ethernet MAC Address  = XX-XX-XX-XX-XX-XX  [禁用]
+  - Embedded Controller Version  = O4DCT  [禁用]
+  - BIOS Revision Level  = O4DKT  [禁用]
+  - Boot Block Revision Level  = x.xx  [禁用]
+  - BIOS Date (MM/DD/YYYY)  = xx/xx/xxxx  [禁用]
+  - Preinstalled OS License  = Not Defined  [禁用]
+  - OA3 License Key ID  = NO DPK  [禁用]
+  - OA2.1 Marker  = N  [禁用]
+  - Language  = English   可选: [English, Francais, 中文]
+
+# Devices
+  - Serial Port Setup  ▸
+    - (空)  —— 分隔线 ——
+    - Serial Port1 Address  = 3F8/IRQ4   可选: [3F8/IRQ4, 2F8/IRQ3, Disabled, 3E8/IRQ4, 2E8/IRQ3]
+  - Parallel Port Setup  ▸
+    - Parallel Port Address  = 378   可选: [378, 278, 3BC, Disabled]
+    - Parallel Port Mode  = ECP+EPP   可选: [ECP+EPP, ECP, EPP]
+    - EPP Version  = 1.9   可选: [1.9, 1.7]
+    - ECP Mode DMA Channel  = DMA3   可选: [DMA3, DMA1]
+    - Parallel Port IRQ  = IRQ7   可选: [IRQ7, IRQ5]
+  - USB Setup  ▸
+    - USB Support  = Enabled   可选: [Enabled, Disabled]
+    - USB Legacy Support  = Enabled   可选: [Enabled, Disabled]
+    - USB Enumeration Delay  = Disabled   可选: [Disabled, Enabled]
+    - Front USB Ports  = Enabled   可选: [Enabled, Disabled]
+    - Rear USB Ports  = Enabled   可选: [Enabled, Disabled]
+  - ATA Drive Setup  ▸
+    - (空)  —— 分隔线 ——
+    - SATA Controller  = Enabled   可选: [Enabled, Disabled]
+    - SATA Drive 1  = Enabled   可选: [Enabled, Disabled]
+    - SATA Drive 2  = Enabled   可选: [Enabled, Disabled]
+    - (空)  —— 分隔线 ——
+    - Configure SATA as  = AHCI   可选: [AHCI]
+    - Hard Disk Pre-delay  = Disabled   可选: [Disabled, 3 Seconds, 6 Seconds, 9 Seconds, 12 Seconds, 15 Seconds, 21 Seconds, 30 Seconds]
+  - Video Setup  ▸
+    - (空)  —— 分隔线 ——
+    - UMA Frame Buffer Size  = Auto   可选: [Auto, 256M, 512M, 1024M]
+    - Primary Video Controller  = Auto   可选: [Auto, IGD, PEG]
+    - Surround View  = Enabled   可选: [Enabled, Disabled]
+  - Audio Setup  ▸
+    - (空)  —— 分隔线 ——
+    - Onboard Audio Controller  = Enabled   可选: [Enabled, Disabled]
+  - Network Setup  ▸
+    - Onboard Ethernet Controller  = Enabled   可选: [Enabled, Disabled]
+    - PXE Option ROM  = Enabled   可选: [Enabled, Disabled]
+    - (空)  —— 分隔线 ——
+    - PXE IPV4 network stack  = Enabled   可选: [Enabled, Disabled]
+    - PXE IPV6 network stack  = Enabled   可选: [Enabled, Disabled]
+    - (空)  —— 分隔线 ——
+    - Wireless LAN  = Enabled   可选: [Enabled, Disabled]
+  - PCI Express Configuration  ▸
+    - ASPM Support  = Auto   可选: [Auto, Disabled]
+    - PCIe 16x Slot Speed  = Auto   可选: [Auto, Gen 1, Gen 2, Gen 3]
+    - PCIe 1x Slot 1 Speed  = Auto   可选: [Auto, Gen 1, Gen 2, Gen 3]
+  - (空)  —— 分隔线 ——
+  - Card Reader  = Enabled   可选: [Enabled, Disabled]
+  - Bluetooth  = Enabled   可选: [Enabled, Disabled]
+
+# Advanced
+  - CPU Setup  ▸
+    - AMD Secure Virtual Machine  = Enabled   可选: [Enabled, Disabled]
+    - CPB Mode  = Enabled   可选: [Enabled, Disabled]
+    - C6 Support  = Enabled   可选: [Enabled, Disabled]
+    - (空)  —— 分隔线 ——
+    - CPU ID  = xxxxx  [禁用]
+    - Microcode Revision  = 000000xx  [禁用]
+    - Chipset  = xxx  [禁用]
+  - (空)  —— 分隔线 ——
+  - Dust Shield Alert  = Disabled   可选: [Disabled, Enabled]
+
+# Power
+  - After Power Loss  = Power Off   可选: [Power Off, Last State, Power On]
+  - Enhanced Power Saving Mode  = Disabled   可选: [Disabled, Enabled]
+  - (空)  —— 分隔线 ——
+  - Intelligent Cooling Engine(ICE)  ▸
+    - (空)  —— 分隔线 ——
+    - ICE Performance Mode  = Better Acoustic Performance   可选: [Better Acoustic Performance, Better Thermal Performance, Full Speed]
+    - ICE Thermal Alert  = Enabled   可选: [Enabled, Disabled]
+  - Automatic Power On  ▸
+    - Wake on LAN  = Automatic   可选: [Automatic, Primary, Disabled]
+    - Wake from Serial Port Ring  = Primary   可选: [Primary, Automatic, Disabled]
+    - Wake Up on Alarm  = Disabled   可选: [Disabled, Single Event, Daily Event, Weekly Event, User Defined]
+    - Startup Sequence  = Primary   可选: [Primary, Automatic]  [禁用]
+    - Alarm Time (HH:MM:SS)  = 00:00:00  [禁用]
+    - Alarm Date (MM/DD/YYYY)  = 01/01/1999  [禁用]
+    - Alarm Day of Week  = Sunday   可选: [Sunday, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday]  [禁用]
+    - User Defined Alarm  ▸  [禁用]
+      - Sunday  = Disabled   可选: [Disabled, Enabled]
+      - Monday  = Disabled   可选: [Disabled, Enabled]
+      - Tuesday  = Disabled   可选: [Disabled, Enabled]
+      - Wednesday  = Disabled   可选: [Disabled, Enabled]
+      - Thursday  = Disabled   可选: [Disabled, Enabled]
+      - Friday  = Disabled   可选: [Disabled, Enabled]
+      - Saturday  = Disabled   可选: [Disabled, Enabled]
+      - User Defined Alarm Time (HH:MM:SS)  = 00:00:00
+
+# Security
+  - Administrator Password  = Not Installed   可选: [Not Installed, Installed]  [禁用]
+  - Power-On Password  = Not Installed   可选: [Not Installed, Installed]  [禁用]
+  - (空)  —— 分隔线 ——
+  - Set Administrator Password  <动作/弹窗: Set Administrator Password>
+  - Set Power-On Password  <动作/弹窗: Set Power-On Password>
+  - (空)  —— 分隔线 ——
+  - Allow Flashing BIOS to a Previous Version  = Yes   可选: [Yes, No]
+  - Require Admin. Pass. when Flashing  = No   可选: [No, Yes]
+  - Windows UEFI Firmware Update  = Enabled   可选: [Enabled, Disabled]
+  - Require POP on System Boot  = Yes   可选: [Yes, No]
+  - Require POP on Restart  = No   可选: [No, Yes]
+  - POP Changeable by User  = Yes   可选: [Yes, No]
+  - Require Admin. Pass. For F12 Boot  = No   可选: [No, Yes]
+  - Smart USB Protection  = Disabled   可选: [Disabled, Read Only, No Access]
+  - (空)  —— 分隔线 ——
+  - Hard Disk Password  ▸
+    - M.2 Drive 1 Password  <动作/弹窗: M.2 Drive 1 Password>
+    - SATA Drive 1 Password  <动作/弹窗: SATA Drive 1 Password>
+    - SATA Drive 2 Password  <动作/弹窗: SATA Drive 2 Password>
+    - Require HDP on System Boot  = Auto   可选: [Auto, No]
+    - (空)  —— 分隔线 ——
+    - Security Erase HDD Data  ▸
+      - (空)  —— 分隔线 ——
+      - Erase M.2 Drive 1 Data  = Enter  [禁用]
+      - Erase SATA Drive 1 Data  = Enter  [禁用]
+      - Erase SATA Drive 2 Data  = Enter  [禁用]
+  - TCG Feature Setup  ▸
+    - (空)  —— 分隔线 ——
+    - TCG Security Device  = Firmware TPM
+    -   Security Chip 2.0  = Enabled   可选: [Enabled, Disabled]
+    -   Clear TCG Security Feature  = NO   可选: [NO, YES]
+    -   Physical Presence for Clear  = Enabled   可选: [Enabled, Disabled]
+  - System Event Log  ▸
+    - View System Event Log  ▸
+      - (空)  —— 分隔线 ——
+      - DATE       TIME       Events  =    [禁用]
+      - 09/14/13   08:47:27   System Event Log Cleared  =    [禁用]
+      - 09/14/13   08:48:38   BIOS updated  =    [禁用]
+      - 09/14/13   09:40:16   BIOS updated  =    [禁用]
+    - Clear System Event Log  <动作/弹窗: Clear System Event Log>
+  - Secure Boot  ▸
+    - System Mode  = User Mode  [禁用]
+    - Secure Boot  = Enabled   可选: [Enabled, Disabled]
+    - (空)  —— 分隔线 ——
+    - Restore Factory Keys  <动作/弹窗: Restore Factory Keys>
+    - Reset Platform to Setup Mode  <动作/弹窗: Reset Platform to Setup Mode>
+    - Enter Audit Mode  <动作/弹窗: Enter Audit Mode>
+    - Enter Deployed Mode  <动作/弹窗: Enter Deployed Mode>
+    - (空)  —— 分隔线 ——
+    - Key Management  <动作/弹窗: Key Management>
+  - (空)  —— 分隔线 ——
+  - Device Guard  = Disabled   可选: [Disabled, Enabled]
+  - Chassis Intrusion Detection  = Disabled   可选: [Disabled, Enabled]
+  - Configuration Change Detection  = Disabled   可选: [Disabled, Enabled]
+  - Password Count Exceeded Error  = Enabled   可选: [Enabled, Disabled]
+
+# Startup
+  - Primary Boot Sequence  ▸
+    - USB FDD:
+    - USB KEY:
+    - M.2:
+    - SATA 1:
+    - SATA 2:
+    - SATA 3:
+    - Network 1:
+    - USB HDD:
+    - USB CDROM:
+    - Other Device:
+  - Automatic Boot Sequence  ▸
+    - Network 1:
+    - M.2:
+    - SATA 1:
+    - SATA 2:
+    - SATA 3
+    - Other Device
+    - USB FDD:
+    - USB HDD:
+    - USB CDROM:
+    - USB KEY:
+  - Error Boot Sequence  ▸
+    - Network 1:
+    - M.2:
+    - SATA 1:
+    - SATA 2:
+    - SATA 3
+    - Other Device
+    - USB FDD:
+    - USB HDD:
+    - USB CDROM:
+    - USB KEY:
+  - Manufacturing Boot Sequence  ▸
+    - Network 1:
+    - M.2:
+    - SATA 1:
+    - SATA 2:
+    - SATA 3
+    - Other Device
+    - Excluded from boot order
+    - USB FDD:
+    - USB HDD:
+    - USB CDROM:
+    - USB KEY:
+  - (空)  —— 分隔线 ——
+  - CSM  = Enabled   可选: [Enabled, Disabled]
+  - Boot Mode  = Auto   可选: [Auto, UEFI Only, Legacy Only]
+  - Boot Priority  = UEFI First   可选: [UEFI First, Legacy First]
+  - Boot Up Num-Lock Status  = On   可选: [On, Off]
+  - Option Keys Display  = Disabled   可选: [Disabled, Enabled]
+  - Option Keys Display Style  = Normal   可选: [Normal, Legacy]
+
+# Exit
+  - Save Changes and Exit  <动作/弹窗: Save Changes and Exit>
+  - Discard Changes and Exit  <动作/弹窗: Discard Changes and Exit>
+  - (空)  —— 分隔线 ——
+  - Load Optimal Defaults  <动作/弹窗: Load Optimal Defaults>
+  - OS Optimized Defaults  = Enabled   可选: [Enabled, Disabled]

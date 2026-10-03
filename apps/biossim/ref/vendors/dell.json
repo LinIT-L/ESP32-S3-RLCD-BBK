@@ -1,0 +1,1062 @@
+{
+  "model": "Dell OptiPlex 7090",
+  "source_url": "https://www.dell.com/support/manuals/en-us/optiplex-7090-sff/d11_optiplex_7090_sff_sm/system-setup-options",
+  "retrieved": "2026-10-02",
+  "data_source_file": "Dell OptiPlex 7090 SFF Service Manual - 'System setup options' 章节 (官方手册表格, 逐表照抄)",
+  "menus": [
+    {
+      "name": "General",
+      "items": [
+        {
+          "name": "System Information",
+          "type": "submenu",
+          "sub": {
+            "name": "System Information",
+            "items": [
+              {
+                "name": "System Information",
+                "type": "separator"
+              },
+              {
+                "name": "BIOS Version",
+                "type": "info",
+                "current": "1.28.0",
+                "disabled": true
+              },
+              {
+                "name": "Service Tag",
+                "type": "info",
+                "current": "J4K2L83",
+                "disabled": true
+              },
+              {
+                "name": "Asset Tag",
+                "type": "info",
+                "current": "",
+                "disabled": true
+              },
+              {
+                "name": "Ownership Tag",
+                "type": "info",
+                "current": "",
+                "disabled": true
+              },
+              {
+                "name": "Manufacture Date",
+                "type": "info",
+                "current": "06/11/2024",
+                "disabled": true
+              },
+              {
+                "name": "Ownership Date",
+                "type": "info",
+                "current": "",
+                "disabled": true
+              },
+              {
+                "name": "Express Service Code",
+                "type": "info",
+                "current": "12345678901",
+                "disabled": true
+              },
+              {
+                "name": "Memory Information",
+                "type": "separator"
+              },
+              {
+                "name": "Memory Installed",
+                "type": "info",
+                "current": "16384 MB",
+                "disabled": true
+              },
+              {
+                "name": "Memory Available",
+                "type": "info",
+                "current": "16000 MB",
+                "disabled": true
+              },
+              {
+                "name": "Memory Speed",
+                "type": "info",
+                "current": "3200 MHz",
+                "disabled": true
+              },
+              {
+                "name": "Memory Channel Mode",
+                "type": "info",
+                "current": "Dual",
+                "disabled": true
+              },
+              {
+                "name": "Memory Technology",
+                "type": "info",
+                "current": "DDR4",
+                "disabled": true
+              },
+              {
+                "name": "DIMM 1 Size",
+                "type": "info",
+                "current": "8192 MB",
+                "disabled": true
+              },
+              {
+                "name": "DIMM 2 Size",
+                "type": "info",
+                "current": "8192 MB",
+                "disabled": true
+              },
+              {
+                "name": "PCI Information",
+                "type": "separator"
+              },
+              {
+                "name": "SLOT2",
+                "type": "info",
+                "current": "Empty",
+                "disabled": true
+              },
+              {
+                "name": "SLOT3",
+                "type": "info",
+                "current": "Empty",
+                "disabled": true
+              },
+              {
+                "name": "SLOT5_M.2",
+                "type": "info",
+                "current": "M.2 PCIe SSD",
+                "disabled": true
+              },
+              {
+                "name": "Processor Information",
+                "type": "separator"
+              },
+              {
+                "name": "Processor Type",
+                "type": "info",
+                "current": "Intel(R) Core(TM) i7-11700",
+                "disabled": true
+              },
+              {
+                "name": "Core Count",
+                "type": "info",
+                "current": "8",
+                "disabled": true
+              },
+              {
+                "name": "Processor ID",
+                "type": "info",
+                "current": "0x0000000000000000",
+                "disabled": true
+              },
+              {
+                "name": "Current Clock Speed",
+                "type": "info",
+                "current": "2500 MHz",
+                "disabled": true
+              },
+              {
+                "name": "Minimum Clock Speed",
+                "type": "info",
+                "current": "800 MHz",
+                "disabled": true
+              },
+              {
+                "name": "Maximum Clock Speed",
+                "type": "info",
+                "current": "4900 MHz",
+                "disabled": true
+              },
+              {
+                "name": "Processor L2 Cache",
+                "type": "info",
+                "current": "4 MB",
+                "disabled": true
+              },
+              {
+                "name": "Processor L3 Cache",
+                "type": "info",
+                "current": "16 MB",
+                "disabled": true
+              },
+              {
+                "name": "HT Capable",
+                "type": "info",
+                "current": "Yes",
+                "disabled": true
+              },
+              {
+                "name": "64-Bit Technology",
+                "type": "info",
+                "current": "Yes",
+                "disabled": true
+              },
+              {
+                "name": "Device Information",
+                "type": "separator"
+              },
+              {
+                "name": "SATA-0",
+                "type": "info",
+                "current": "None",
+                "disabled": true
+              },
+              {
+                "name": "SATA-1",
+                "type": "info",
+                "current": "None",
+                "disabled": true
+              },
+              {
+                "name": "M.2 PCIe SSD-0",
+                "type": "info",
+                "current": "512 GB",
+                "disabled": true
+              },
+              {
+                "name": "LOM MAC Address",
+                "type": "info",
+                "current": "00:00:00:00:00:00",
+                "disabled": true
+              },
+              {
+                "name": "Video Controller",
+                "type": "info",
+                "current": "Intel(R) UHD Graphics 750",
+                "disabled": true
+              },
+              {
+                "name": "Audio Controller",
+                "type": "info",
+                "current": "Realtek ALC3246",
+                "disabled": true
+              },
+              {
+                "name": "Wi-Fi Device",
+                "type": "info",
+                "current": "Intel(R) Wi-Fi 6 AX201",
+                "disabled": true
+              },
+              {
+                "name": "Bluetooth Device",
+                "type": "info",
+                "current": "Intel(R) Bluetooth",
+                "disabled": true
+              }
+            ]
+          },
+          "tip": "System Information 子菜单汇总 BIOS/内存/PCI/处理器/设备信息(只读)。"
+        },
+        {
+          "name": "Boot Sequence",
+          "type": "submenu",
+          "sub": {
+            "name": "Boot Sequence",
+            "items": [
+              {
+                "name": "Boot Mode",
+                "type": "item",
+                "current": "UEFI",
+                "values": [
+                  "UEFI",
+                  "Legacy"
+                ],
+                "tip": "引导模式。UEFI=纯 UEFI 引导(装 Win10/11 首选)；Legacy=传统引导(需 CSM)。"
+              },
+              {
+                "name": "Boot List Option",
+                "type": "item",
+                "current": "UEFI",
+                "values": [
+                  "Legacy",
+                  "UEFI"
+                ]
+              },
+              {
+                "name": "Boot Sequence",
+                "type": "info",
+                "current": "（可启动设备顺序列表：选中设备后用 +/- 或空格调整）",
+                "disabled": true
+              }
+            ]
+          },
+          "tip": "引导顺序。在列表里选中设备后用 +/- 或空格上下移动。"
+        },
+        {
+          "name": "UEFI Boot Path Security",
+          "type": "item",
+          "current": "Always, Except Internal HDD",
+          "values": [
+            "Always, Except Internal HDD",
+            "Always",
+            "Never"
+          ],
+          "tip": "从 F12 启动菜单引导 UEFI 路径时是否要求输入管理员密码。"
+        },
+        {
+          "name": "Date/Time",
+          "type": "item",
+          "current": "MM/DD/YY HH:MM:SS",
+          "values": [
+            "MM/DD/YY HH:MM:SS"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "System Configuration",
+      "items": [
+        {
+          "name": "Integrated NIC",
+          "type": "item",
+          "current": "Enabled with PXE",
+          "values": [
+            "Disabled",
+            "Enabled",
+            "Enabled with PXE"
+          ],
+          "tip": "板载网卡控制。Enabled with PXE=启用并支持 PXE 网络引导。"
+        },
+        {
+          "name": "Enable UEFI Network Stack",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "SATA Operation",
+          "type": "item",
+          "current": "AHCI",
+          "values": [
+            "Disabled",
+            "AHCI",
+            "RAID On"
+          ],
+          "tip": "集成 SATA 硬盘控制器工作模式。AHCI=标准模式(装系统首选)；RAID On=Intel RST/RAID。"
+        },
+        {
+          "name": "Drives",
+          "type": "submenu",
+          "sub": {
+            "name": "Drives",
+            "items": [
+              {
+                "name": "SATA-0",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "SATA-1",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "M.2 PCIe SSD-0",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              }
+            ]
+          },
+          "tip": "启用/禁用板载各类驱动器。"
+        },
+        {
+          "name": "SMART Reporting",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "tip": "系统启动时是否启用 SMART 报告。"
+        },
+        {
+          "name": "USB Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "USB Configuration",
+            "items": [
+              {
+                "name": "Enable USB Boot Support",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Enable Front USB Ports",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Enable Rear USB Ports",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Front USB Configuration",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Rear USB Configuration",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "Audio",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Miscellaneous Devices",
+          "type": "submenu",
+          "sub": {
+            "name": "Miscellaneous Devices",
+            "items": []
+          },
+          "tip": "启用/禁用各种板载设备。"
+        }
+      ]
+    },
+    {
+      "name": "Video",
+      "items": [
+        {
+          "name": "Multi-Display",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Primary Display",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Security",
+      "items": [
+        {
+          "name": "Admin Password",
+          "type": "info",
+          "current": "Not Set",
+          "disabled": true
+        },
+        {
+          "name": "System Password",
+          "type": "info",
+          "current": "Not Set",
+          "disabled": true
+        },
+        {
+          "name": "Internal HDD-0 Password",
+          "type": "info",
+          "current": "Not Set",
+          "disabled": true
+        },
+        {
+          "name": "Password Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Password Configuration",
+            "items": []
+          },
+          "tip": "控制管理员密码与系统密码的最小/最大字符数。"
+        },
+        {
+          "name": "Password Change",
+          "type": "item",
+          "current": "Permitted",
+          "values": [
+            "Permitted",
+            "Denied"
+          ],
+          "tip": "设置管理员密码后, 是否允许更改系统与硬盘密码。"
+        },
+        {
+          "name": "UEFI Capsule Firmware Updates",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "PTT Security",
+          "type": "submenu",
+          "sub": {
+            "name": "PTT Security",
+            "items": [
+              {
+                "name": "PTT On",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "tip": "平台信任技术(PTT)对操作系统的可见性。"
+              },
+              {
+                "name": "Clear",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "PPI ByPass for Clear Command",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Absolute(R)",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Admin Setup Lockout",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Master Password Lockout",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "SMM Security Mitigation",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Intel Software Guard Extensions",
+          "type": "submenu",
+          "sub": {
+            "name": "Intel Software Guard Extensions",
+            "items": [
+              {
+                "name": "Intel SGX Enable",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Enabled",
+                  "Software Controlled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Enclave Memory Size",
+                "type": "item",
+                "current": "128 MB",
+                "values": [
+                  "32 MB",
+                  "64 MB",
+                  "128 MB"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Secure Boot",
+      "items": [
+        {
+          "name": "Secure Boot Enable",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "tip": "启用/禁用安全引导。"
+        },
+        {
+          "name": "Secure Boot Mode",
+          "type": "item",
+          "current": "Deployed Mode",
+          "values": [
+            "Deployed Mode",
+            "Audit Mode"
+          ]
+        },
+        {
+          "name": "Deployed Mode",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Audit Mode",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Expert Key Management",
+          "type": "submenu",
+          "sub": {
+            "name": "Expert Key Management",
+            "items": [
+              {
+                "name": "Expert Key Management",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Custom Mode Key Management",
+                "type": "item",
+                "current": "PK",
+                "values": [
+                  "PK",
+                  "KEK",
+                  "db",
+                  "dbx"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Performance",
+      "items": [
+        {
+          "name": "Multi Core Support",
+          "type": "item",
+          "current": "All",
+          "values": [
+            "All",
+            "1",
+            "2",
+            "3"
+          ],
+          "tip": "启用多个核心。"
+        },
+        {
+          "name": "Intel SpeedStep",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "C-States Control",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Intel TurboBoost",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "HyperThread control",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Power Management",
+      "items": [
+        {
+          "name": "AC Recovery",
+          "type": "item",
+          "current": "Last Power State",
+          "values": [
+            "Power Off",
+            "Power On",
+            "Last Power State"
+          ]
+        },
+        {
+          "name": "Enable Intel Speed Shift Technology",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Auto On Time",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Everyday",
+            "Weekdays",
+            "Selected Days"
+          ]
+        },
+        {
+          "name": "USB Wake Support",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Deep Sleep Control",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled in S4 and S5",
+            "Enabled in S5 Only"
+          ]
+        },
+        {
+          "name": "Wake on LAN/WLAN",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "LAN Only",
+            "WLAN Only",
+            "LAN or WLAN"
+          ]
+        },
+        {
+          "name": "Block Sleep",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "POST Behavior",
+      "items": [
+        {
+          "name": "Numlock LED",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Keyboard Errors",
+          "type": "item",
+          "current": "Report",
+          "values": [
+            "Report",
+            "Do Not Report"
+          ]
+        },
+        {
+          "name": "Fastboot",
+          "type": "item",
+          "current": "Thorough",
+          "values": [
+            "Minimal",
+            "Thorough",
+            "Auto"
+          ],
+          "tip": "设置引导过程的速度。"
+        },
+        {
+          "name": "Extend BIOS POST Time",
+          "type": "item",
+          "current": "0 seconds",
+          "values": [
+            "0 seconds",
+            "5 seconds",
+            "10 seconds"
+          ]
+        },
+        {
+          "name": "Full Screen Logo",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Warnings and Errors",
+          "type": "item",
+          "current": "Prompt on Warnings and Errors",
+          "values": [
+            "Prompt on Warnings and Errors",
+            "Continue on Warnings",
+            "Continue on Warnings and Errors"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Virtualization Support",
+      "items": [
+        {
+          "name": "Virtualization",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "tip": "指定 VMM 是否可使用 Intel 虚拟化技术提供的硬件功能。"
+        },
+        {
+          "name": "VT for Direct I/O",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Wireless",
+      "items": [
+        {
+          "name": "Wireless Device Enable",
+          "type": "submenu",
+          "sub": {
+            "name": "Wireless Device Enable",
+            "items": [
+              {
+                "name": "WLAN",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Bluetooth",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "WWAN",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              }
+            ]
+          },
+          "tip": "启用/禁用内置无线设备。"
+        }
+      ]
+    },
+    {
+      "name": "Maintenance",
+      "items": [
+        {
+          "name": "Service Tag",
+          "type": "info",
+          "current": "J4K2L83",
+          "disabled": true
+        },
+        {
+          "name": "Asset Tag",
+          "type": "item",
+          "current": "",
+          "values": [
+            ""
+          ]
+        },
+        {
+          "name": "SERR Messages",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "BIOS Downgrade",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Data Wipe",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "安全擦除所有内部存储设备中的数据。"
+        },
+        {
+          "name": "BIOS Recovery",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "System Logs",
+      "items": [
+        {
+          "name": "BIOS Events",
+          "type": "submenu",
+          "sub": {
+            "name": "BIOS Events",
+            "items": []
+          },
+          "tip": "显示 BIOS 事件日志。"
+        }
+      ]
+    },
+    {
+      "name": "SupportAssist System Resolution",
+      "items": [
+        {
+          "name": "Auto OS Recovery Threshold",
+          "type": "item",
+          "current": "2",
+          "values": [
+            "Off",
+            "1",
+            "2",
+            "3"
+          ]
+        },
+        {
+          "name": "SupportAssist OS Recovery",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        }
+      ]
+    }
+  ]
+}

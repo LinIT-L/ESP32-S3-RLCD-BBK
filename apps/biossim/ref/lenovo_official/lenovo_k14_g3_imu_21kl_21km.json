@@ -1,0 +1,1354 @@
+{
+  "model": "Lenovo K14 G3 IMU (21KL,21KM)",
+  "source_url": "https://download.lenovo.com/bsco/index.html#/graphicalsimulator/Lenovo%20K14%20G3%20IMU%20(21KL,21KM)",
+  "retrieved": "2026-10-02",
+  "menus": [
+    {
+      "name": "Main",
+      "items": [
+        {
+          "name": "Product Name",
+          "type": "info",
+          "current": "Lenovo K14 G3 IMU"
+        },
+        {
+          "name": "UEFI BIOS Version",
+          "type": "info",
+          "current": "P3CNXXWW"
+        },
+        {
+          "name": "UEFI BIOS Date(Year-Month-Day)",
+          "type": "info",
+          "current": "2023-02-03"
+        },
+        {
+          "name": "Embedded Controller Version",
+          "type": "info",
+          "current": "P3ECXXWW"
+        },
+        {
+          "name": "ME Firmware Version",
+          "type": "info",
+          "current": "16.1.25.2091"
+        },
+        {
+          "name": "Machine Type Model",
+          "type": "info",
+          "current": "21KL"
+        },
+        {
+          "name": "Lenovo SN",
+          "type": "info",
+          "current": "PF123456"
+        },
+        {
+          "name": "Asset Tag",
+          "type": "info",
+          "current": "No Asset Tag"
+        },
+        {
+          "name": "UUID Number",
+          "type": "info",
+          "current": "CB95E7F4-1234-ABCD-1234-ABCD1234ABCD"
+        },
+        {
+          "name": "CPU Type",
+          "type": "info",
+          "current": "Intel(R) Core(TM)"
+        },
+        {
+          "name": "CPU Speed",
+          "type": "info",
+          "current": "1.800GHZ"
+        },
+        {
+          "name": "Installed Memory",
+          "type": "info",
+          "current": "8192 MB"
+        },
+        {
+          "name": "Preinstalled OS license",
+          "type": "info",
+          "current": "NO DPK"
+        },
+        {
+          "name": "OA3 Key ID",
+          "type": "info",
+          "current": "0000000"
+        },
+        {
+          "name": "Hard Disk",
+          "type": "info",
+          "current": "XXXX"
+        },
+        {
+          "name": "UEFI Secure Boot",
+          "type": "info",
+          "current": "Enabled"
+        },
+        {
+          "name": "Language",
+          "type": "info",
+          "current": "English/中文"
+        }
+      ]
+    },
+    {
+      "name": "Config",
+      "items": [
+        {
+          "name": "Network",
+          "type": "submenu",
+          "sub": {
+            "name": "Network",
+            "items": [
+              {
+                "name": "Wake On LAN",
+                "type": "list",
+                "values": [
+                  "Disabled",
+                  "AC Only",
+                  "AC and Battery"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "MAC Address Pass Through",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Wake On LAN from Dock",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Lenovo Cloud Services",
+                "hidden": true,
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Reinstall Windows from Cloud",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "UEFI Wi-Fi Network Boot",
+                "disabled": true,
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Wi-Fi Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "Wi-Fi Configuration",
+                  "items": [
+                    {
+                      "name": "Simulator not Support",
+                      "type": "separator"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "USB",
+          "type": "submenu",
+          "sub": {
+            "name": "USB",
+            "items": [
+              {
+                "name": "Always On USB",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Charge in Battery Mode",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Keyboard",
+          "type": "submenu",
+          "sub": {
+            "name": "Keyboard",
+            "items": [
+              {
+                "name": "F1-F12 as Primary Function",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Fool Proof Fn Ctrl",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Fn and Ctrl Key swap",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Display",
+          "type": "submenu",
+          "sub": {
+            "name": "Display",
+            "items": [
+              {
+                "name": "Graphics Device",
+                "type": "list",
+                "values": [
+                  "Switchable Graphics",
+                  "Discrete Graphics",
+                  "UMA Graphics"
+                ],
+                "current": "Switchable Graphics"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Power",
+          "type": "submenu",
+          "sub": {
+            "name": "Power",
+            "items": [
+              {
+                "name": "Disable Built-in Battery",
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "System will be powered down if you select <Yes>.\nDo you want to proceed?"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "System Performance Mode",
+                "type": "list",
+                "values": [
+                  "Intelligent Cooling",
+                  "Extreme Performance",
+                  "Battery Saving"
+                ],
+                "current": "Intelligent Cooling"
+              },
+              {
+                "name": "Super Boost",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Ultra Quiet Mode",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "One Key Battery",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Flip To Start",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Power On with AC Attach",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Storage",
+          "type": "submenu",
+          "sub": {
+            "name": "Storage",
+            "items": [
+              {
+                "name": "Storage Controller Mode",
+                "type": "list",
+                "values": [
+                  "AHCI",
+                  "RAID"
+                ],
+                "current": "AHCI"
+              }
+            ]
+          }
+        },
+        {
+          "name": "CPU",
+          "type": "submenu",
+          "sub": {
+            "name": "CPU",
+            "items": [
+              {
+                "name": "Intel(R) Hyper-Threading Technology",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Intel(R) ISM",
+          "type": "submenu",
+          "sub": {
+            "name": "Intel(R) ISM",
+            "items": [
+              {
+                "name": "Intel(R) Standard Manageability Control",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled",
+                  "Permanently Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "USB Key Provisioning",
+                "type": "list",
+                "values": [
+                  "Disabled",
+                  "Enabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Console Type",
+                "type": "list",
+                "values": [
+                  "VT100",
+                  "VT100+",
+                  "VT-UTF8",
+                  "PC ANSI"
+                ],
+                "current": "VT100+"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Date/Time",
+      "items": [
+        {
+          "name": "System Date",
+          "type": "datetime",
+          "current": ""
+        },
+        {
+          "name": "System Time",
+          "type": "datetime",
+          "current": ""
+        }
+      ]
+    },
+    {
+      "name": "Security",
+      "items": [
+        {
+          "name": "Password",
+          "type": "submenu",
+          "sub": {
+            "name": "Password",
+            "items": [
+              {
+                "name": "Supervisor Password",
+                "type": "info",
+                "current": "Not Set"
+              },
+              {
+                "name": "User Password",
+                "type": "info",
+                "current": "Not Set"
+              },
+              {
+                "name": "HDD Password",
+                "type": "info",
+                "current": "Not Set"
+              },
+              {
+                "name": "Set Supervisor Password",
+                "type": "action",
+                "dialog": {
+                  "title": "Set Supervisor Password",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "Enter New Password\n|____________\nConfirm New Password\n____________"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Set Hard Disk Password",
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "OK"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "First, set Master Hard Disk Password.\n\n(Simulator not support!!!)"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Set Strong Password",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Security Chip",
+          "type": "submenu",
+          "sub": {
+            "name": "Security Chip",
+            "items": [
+              {
+                "name": "Intel Platform Trust Technology",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Clear Intel PTT Key",
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "Clear Intel PTT Key"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Security Chip",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Clear Security Chip Key",
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "Clear Security Chip Key"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "UEFI BIOS Update Option",
+          "type": "submenu",
+          "sub": {
+            "name": "UEFI BIOS Update Option",
+            "items": [
+              {
+                "name": "Secure RollBack Prevention",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "BIOS Self-Healing",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Virtualization",
+          "type": "submenu",
+          "sub": {
+            "name": "Virtualization",
+            "items": [
+              {
+                "name": "Intel(R) Virtualization Technology",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Intel(R) VT-d Feature",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Enhanced Windows Biometric Security",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "I/O Port Access",
+          "type": "submenu",
+          "sub": {
+            "name": "I/O Port Access",
+            "items": [
+              {
+                "name": "Wireless LAN",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Ethernet LAN",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Wireless WAN",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Bluetooth",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "USB Port",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Memory Card Slot",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Smart Card Slot",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Integrated Camera",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Microphone",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Fingerprint Reader",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Thunderbolt(TM)",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "NFC Device",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Absolute Persistence(R) Module",
+          "type": "submenu",
+          "sub": {
+            "name": "Absolute Persistence(R) Module",
+            "items": [
+              {
+                "name": "Absolute Persistence(R) Module Activation",
+                "type": "list",
+                "values": [
+                  "Disabled",
+                  "Enabled",
+                  "Permanently Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Absolute Persistence(R) Module Activation Status",
+                "type": "info",
+                "current": "Not Activated"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Secure Boot",
+          "type": "submenu",
+          "sub": {
+            "name": "Secure Boot",
+            "items": [
+              {
+                "name": "Secure Boot",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              },
+              {
+                "name": "Secure Boot Status",
+                "type": "info",
+                "current": "Enabled/Disabled"
+              },
+              {
+                "name": "Secure Boot Mode",
+                "type": "info",
+                "current": "User Mode"
+              },
+              {
+                "name": "Secure Boot Key State",
+                "type": "info",
+                "current": "Standard Mode"
+              },
+              {
+                "name": "Reset to Setup Mode",
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "Reset to Setup Mode?"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Restore Factory Keys",
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "Restore Factory Keys?"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Allow Microsoft 3rd Party UEFI CA",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "ThinkShield secure wipe",
+          "type": "submenu",
+          "sub": {
+            "name": "ThinkShield secure wipe",
+            "items": [
+              {
+                "name": "ThinkShield secure wipe",
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Warning",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "Do you want to wipe data from storage device?\nEg. USB Key, Hard Disk."
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "ThinkShield Passwordless Power-On",
+          "type": "submenu",
+          "sub": {
+            "name": "ThinkShield Passwordless Power-On",
+            "items": [
+              {
+                "name": "ThinkShield Passwordless Power-On Authentication",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Enabled"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Reset system to Factory Defaults",
+          "type": "submenu",
+          "sub": {
+            "name": "Reset system to Factory Defaults",
+            "items": [
+              {
+                "name": "Reset system to Factory Defaults",
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "System will be reboot, permanently clear all stored data, and reset to factory default settings.\nAbsolute Persistence Module Permanent Disabled and \nIntel ISM Control Permanent Disabled settings will not reset.\nThis might take several minutes to complete.\nThis may require the screen to be blank.\nThis is normal and you should not interrupt the process.\nWould you like to proceed?"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "Device security",
+          "type": "submenu",
+          "sub": {
+            "name": "Device security",
+            "items": [
+              {
+                "name": "Device Guard",
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Natural File Guard",
+                "disabled": true,
+                "type": "list",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "current": "Disabled"
+              },
+              {
+                "name": "Security Erase HDD1 Data",
+                "disabled": true,
+                "type": "action",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ],
+                  "content": [
+                    {
+                      "ratio": "1.0",
+                      "value": [
+                        {
+                          "type": "plainText",
+                          "value": "All HDD data will be erased and the hard disk password will be deleted.\nDo you really want to continue?"
+                        }
+                      ],
+                      "type": "plainText"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Startup",
+      "items": [
+        {
+          "name": "Boot Mode",
+          "type": "list",
+          "values": [
+            "UEFI",
+            "Legacy Support"
+          ],
+          "current": "UEFI"
+        },
+        {
+          "name": "Boot Priority",
+          "hidden": true,
+          "type": "list",
+          "values": [
+            "UEFI First",
+            "Legacy First"
+          ],
+          "current": "UEFI First"
+        },
+        {
+          "name": "Fast Boot",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "USB Boot",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "PXE Boot to LAN",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "IPV4 PXE First",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "EFI",
+          "type": "separator"
+        },
+        {
+          "name": "Windows Boot Manager",
+          "type": "separator"
+        },
+        {
+          "name": "EFI PXE Network",
+          "type": "separator"
+        }
+      ]
+    },
+    {
+      "name": "Restart",
+      "items": [
+        {
+          "name": "Exit Saving Changes",
+          "type": "action",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Save confirmation changes and exit now?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Exit Discarding Changes",
+          "type": "action",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Setting has not been saved!\nSave before exiting?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Discard Changes",
+          "type": "action",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Load previous configuration?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Save Changes",
+          "type": "action",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Save configuration changes now?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Load Default Settings",
+          "type": "action",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Load default configuration now?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          }
+        },
+        {
+          "name": "OS Optimized Defaults",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        }
+      ]
+    }
+  ],
+  "sim_title": "Setup",
+  "sim_footer": [
+    {
+      "name": "F1",
+      "value": "General Help",
+      "title": "General Help",
+      "buttons": [
+        "Close"
+      ],
+      "content": [
+        {
+          "ratio": "0.5",
+          "value": [
+            {
+              "name": "Navigate",
+              "type": "plainText",
+              "value": "You can navigate within the Basic Input/Output System(BIOS) for ThinkPad Setup using the TrackPoint, Touchpad or Keyboard."
+            }
+          ],
+          "type": "plainText"
+        },
+        {
+          "ratio": "0.5",
+          "value": [
+            {
+              "name": "Troubleshooting",
+              "type": "plainText",
+              "value": "Conflicting BIOS configurations may cause the device to not boot. Try loading the default configuration values to recover. \n${ENTER}More help is  availableon Lenovo eSupport site."
+            }
+          ],
+          "type": "plainText"
+        },
+        {
+          "value": [
+            {
+              "value": "Help(this page)",
+              "name": "F1"
+            },
+            {
+              "value": "Back/Close dialog",
+              "name": "Esc"
+            },
+            {
+              "value": "Select/Open submenu",
+              "name": "Enter"
+            },
+            {
+              "value": "Select/Scroll page",
+              "name": "Up/Down Arrows,or"
+            },
+            {
+              "value": "",
+              "name": "Page Up/Page Down"
+            }
+          ],
+          "type": "zebraStripe"
+        },
+        {
+          "value": [
+            {
+              "value": "Setup defaults",
+              "name": "F9"
+            },
+            {
+              "value": "Move keyboard focus",
+              "name": "Left/Right Arrows"
+            },
+            {
+              "value": "Change Boot Priority Order",
+              "name": "F5/F6"
+            },
+            {
+              "value": "Save & Exit",
+              "name": "F10"
+            }
+          ],
+          "type": "zebraStripe"
+        }
+      ],
+      "hasDialog": true
+    },
+    {
+      "name": "F9",
+      "value": "Setup Defaults",
+      "title": "Setup Confirmation",
+      "buttons": [
+        "Yes",
+        "No"
+      ],
+      "content": [
+        {
+          "ratio": "1.0",
+          "value": [
+            {
+              "type": "plainText",
+              "value": "Load default configuration now?"
+            }
+          ],
+          "type": "plainText"
+        }
+      ],
+      "hasDialog": true
+    },
+    {
+      "name": "Esc",
+      "value": "Exit",
+      "hasDialog": false
+    },
+    {
+      "name": "F10",
+      "value": "Save and Exit",
+      "title": "Setup Confirmation",
+      "buttons": [
+        "Yes",
+        "No"
+      ],
+      "content": [
+        {
+          "ratio": "1.0",
+          "value": [
+            {
+              "type": "plainText",
+              "value": "Save configuration changes and exit now?"
+            }
+          ],
+          "type": "plainText"
+        }
+      ],
+      "hasDialog": true
+    }
+  ]
+}

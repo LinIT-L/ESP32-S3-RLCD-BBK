@@ -1,0 +1,3390 @@
+{
+  "data": [
+    {
+      "name": "Main",
+      "type": "nestedList",
+      "value": [
+        {
+          "value": "Lenovo K14 G3 IMU",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            0
+          ],
+          "name": "Product Name"
+        },
+        {
+          "value": "P3CNXXWW",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            1
+          ],
+          "name": "UEFI BIOS Version"
+        },
+        {
+          "value": "2023-02-03",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            2
+          ],
+          "name": "UEFI BIOS Date(Year-Month-Day)"
+        },
+        {
+          "value": "P3ECXXWW",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            3
+          ],
+          "name": "Embedded Controller Version"
+        },
+        {
+          "value": "16.1.25.2091",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            4
+          ],
+          "name": "ME Firmware Version"
+        },
+        {
+          "value": "21KL",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            5
+          ],
+          "name": "Machine Type Model"
+        },
+        {
+          "value": "PF123456",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            6
+          ],
+          "name": "Lenovo SN"
+        },
+        {
+          "value": "No Asset Tag",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            7
+          ],
+          "name": "Asset Tag"
+        },
+        {
+          "value": "CB95E7F4-1234-ABCD-1234-ABCD1234ABCD",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            8
+          ],
+          "name": "UUID Number"
+        },
+        {
+          "value": "Intel(R) Core(TM)",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            9
+          ],
+          "name": "CPU Type"
+        },
+        {
+          "value": "1.800GHZ",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            10
+          ],
+          "name": "CPU Speed"
+        },
+        {
+          "value": "8192 MB",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            11
+          ],
+          "name": "Installed Memory"
+        },
+        {
+          "value": "NO DPK",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            12
+          ],
+          "name": "Preinstalled OS license"
+        },
+        {
+          "value": "0000000",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            13
+          ],
+          "name": "OA3 Key ID"
+        },
+        {
+          "value": "XXXX",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            14
+          ],
+          "name": "Hard Disk"
+        },
+        {
+          "value": "Enabled",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            15
+          ],
+          "name": "UEFI Secure Boot"
+        },
+        {
+          "value": "English/中文",
+          "type": "zebraStripe",
+          "hidden": false,
+          "index": [
+            0,
+            16
+          ],
+          "name": "Language"
+        }
+      ],
+      "indent": 0,
+      "index": [
+        0
+      ],
+      "hidden": false,
+      "disabled": false,
+      "tips": ""
+    },
+    {
+      "name": "Config",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "Network",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Wake On LAN",
+              "brake": {},
+              "value": [
+                "Disabled",
+                "AC Only",
+                "AC and Battery"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                0,
+                0
+              ],
+              "wmiSupport": true,
+              "wmiName": "WakeOnLAN"
+            },
+            {
+              "name": "MAC Address Pass Through",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                0,
+                1
+              ],
+              "wmiSupport": true,
+              "wmiName": "MACAddressPassThrough"
+            },
+            {
+              "name": "Wake On LAN from Dock",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                0,
+                2
+              ],
+              "wmiSupport": true,
+              "wmiName": "WakeOnLANDock"
+            },
+            {
+              "name": "Lenovo Cloud Services",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": true,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                0,
+                3
+              ],
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    0,
+                    4
+                  ],
+                  "value": [
+                    "Enabled",
+                    "Disabled"
+                  ]
+                }
+              ],
+              "wmiSupport": true,
+              "wmiName": "LenovoCloudServices"
+            },
+            {
+              "name": "Reinstall Windows from Cloud",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                0,
+                4
+              ],
+              "effects": [
+                {
+                  "selected": [
+                    "Enabled",
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Config",
+                    "Network",
+                    "Lenovo Cloud Services"
+                  ],
+                  "index": [
+                    1,
+                    0,
+                    3
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Config",
+                    "Network",
+                    "UEFI Wi-Fi Network Boot"
+                  ],
+                  "index": [
+                    1,
+                    0,
+                    5
+                  ],
+                  "targetDisabled": true
+                }
+              ],
+              "wmiSupport": true,
+              "wmiName": "ReinstallWindowsFromCloud"
+            },
+            {
+              "name": "UEFI Wi-Fi Network Boot",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": true,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                0,
+                5
+              ],
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    4,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                },
+                {
+                  "index": [
+                    1,
+                    0,
+                    4
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Wi-Fi Configuration",
+              "type": "nestedList",
+              "value": [
+                {
+                  "name": "Simulator not Support",
+                  "value": "",
+                  "starTips": false,
+                  "type": "splitBar",
+                  "tips": "",
+                  "hidden": false,
+                  "disabled": false,
+                  "indent": 0,
+                  "whiteSpace": 0,
+                  "index": [
+                    1,
+                    0,
+                    6,
+                    0
+                  ]
+                }
+              ],
+              "indent": 0,
+              "index": [
+                1,
+                0,
+                6
+              ],
+              "hidden": false,
+              "disabled": false,
+              "tips": "",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    4,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            1,
+            0
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "USB",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Always On USB",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                1,
+                0
+              ],
+              "effects": [
+                {
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Config",
+                    "USB",
+                    "Charge in Battery Mode"
+                  ],
+                  "index": [
+                    1,
+                    1,
+                    1
+                  ],
+                  "targetDisabled": false
+                }
+              ],
+              "wmiSupport": true,
+              "wmiName": "AlwaysOnUSB"
+            },
+            {
+              "name": "Charge in Battery Mode",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 1,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                1,
+                1
+              ],
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ],
+              "wmiSupport": true,
+              "wmiName": "ChargeInBatteryMode"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            1,
+            1
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Keyboard",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "F1-F12 as Primary Function",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                2,
+                0
+              ]
+            },
+            {
+              "name": "Fool Proof Fn Ctrl",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                2,
+                1
+              ]
+            },
+            {
+              "name": "Fn and Ctrl Key swap",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                2,
+                2
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            1,
+            2
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Display",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Graphics Device",
+              "brake": {},
+              "value": [
+                "Switchable Graphics",
+                "Discrete Graphics",
+                "UMA Graphics"
+              ],
+              "selected": "Switchable Graphics",
+              "origin": "Switchable Graphics",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                3,
+                0
+              ],
+              "wmiSupport": true,
+              "wmiName": "GraphicsDevice"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            1,
+            3
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Power",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Disable Built-in Battery",
+              "value": {
+                "title": "Setup Confirmation",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "System will be powered down if you select <Yes>.\nDo you want to proceed?"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "Enter",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                4,
+                0
+              ]
+            },
+            {
+              "name": "System Performance Mode",
+              "brake": {},
+              "value": [
+                "Intelligent Cooling",
+                "Extreme Performance",
+                "Battery Saving"
+              ],
+              "selected": "Intelligent Cooling",
+              "origin": "Intelligent Cooling",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                4,
+                1
+              ]
+            },
+            {
+              "name": "Super Boost",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                4,
+                2
+              ]
+            },
+            {
+              "name": "Ultra Quiet Mode",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                4,
+                3
+              ]
+            },
+            {
+              "name": "One Key Battery",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                4,
+                4
+              ]
+            },
+            {
+              "name": "Flip To Start",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                4,
+                5
+              ],
+              "wmiSupport": true,
+              "wmiName": "FlipToStart"
+            },
+            {
+              "name": "Power On with AC Attach",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                4,
+                6
+              ],
+              "wmiSupport": true,
+              "wmiName": "OnByAcAttach"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            1,
+            4
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Storage",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Storage Controller Mode",
+              "brake": {},
+              "value": [
+                "AHCI",
+                "RAID"
+              ],
+              "selected": "AHCI",
+              "origin": "AHCI",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                5,
+                0
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            1,
+            5
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "CPU",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Intel(R) Hyper-Threading Technology",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                6,
+                0
+              ],
+              "wmiSupport": true,
+              "wmiName": "HyperThreadingTechnology"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            1,
+            6
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Intel(R) ISM",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Intel(R) Standard Manageability Control",
+              "brake": [
+                {
+                  "selected": "Permanently Disabled",
+                  "popup": {
+                    "title": "Attention!",
+                    "buttons": [
+                      "Yes",
+                      "No"
+                    ],
+                    "content": [
+                      {
+                        "ratio": "1.0",
+                        "value": [
+                          {
+                            "type": "plainText",
+                            "value": "If Intel Standard Manageability is permanently disabled, you can never enable this setting again.\nDo you really want to continue?\nSelect Yes to permanently disable the Intel Standard Manageability interface.\nSelect No to discontinue the operation."
+                          }
+                        ],
+                        "type": "plainText"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "value": [
+                "Enabled",
+                "Disabled",
+                "Permanently Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                7,
+                0
+              ],
+              "effects": [
+                {
+                  "selected": [
+                    "Permanently Disabled",
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Config",
+                    "Intel(R) ISM",
+                    "USB Key Provisioning"
+                  ],
+                  "index": [
+                    1,
+                    7,
+                    1
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "selected": [
+                    "Permanently Disabled",
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Config",
+                    "Intel(R) ISM",
+                    "Console Type"
+                  ],
+                  "index": [
+                    1,
+                    7,
+                    2
+                  ],
+                  "targetDisabled": false
+                }
+              ]
+            },
+            {
+              "name": "USB Key Provisioning",
+              "brake": {},
+              "value": [
+                "Disabled",
+                "Enabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                7,
+                1
+              ],
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    7,
+                    0
+                  ],
+                  "value": [
+                    "Permanently Disabled",
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Console Type",
+              "brake": {},
+              "value": [
+                "VT100",
+                "VT100+",
+                "VT-UTF8",
+                "PC ANSI"
+              ],
+              "selected": "VT100+",
+              "origin": "VT100+",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                1,
+                7,
+                2
+              ],
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    7,
+                    0
+                  ],
+                  "value": [
+                    "Permanently Disabled",
+                    "Disabled"
+                  ]
+                }
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            1,
+            7
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        }
+      ],
+      "indent": 0,
+      "index": [
+        1
+      ],
+      "hidden": false,
+      "disabled": false,
+      "tips": ""
+    },
+    {
+      "name": "Date/Time",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "System Date",
+          "value": "",
+          "dateConfig": {
+            "$Month": {
+              "type": "select",
+              "value": [
+                "January",
+                "February",
+                "March",
+                "April",
+                "May",
+                "June",
+                "July",
+                "August",
+                "September",
+                "October",
+                "November"
+              ],
+              "selected": "November"
+            },
+            "$Day": {
+              "type": "select",
+              "value": [
+                "01",
+                "02",
+                "20",
+                "31"
+              ],
+              "selected": "20"
+            },
+            "$Year": {
+              "type": "select",
+              "value": [
+                "2009",
+                "2019",
+                "2059"
+              ],
+              "selected": "2019"
+            },
+            "$DepthTips": {
+              "$DepthTips": "<Tab><Shift-Tab>, or <Enter> selects field."
+            }
+          },
+          "formType": "date",
+          "type": "dateTime",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            2,
+            0
+          ]
+        },
+        {
+          "name": "System Time",
+          "value": "",
+          "dateConfig": {
+            "$Hour": {
+              "type": "select",
+              "value": [
+                "00",
+                "17",
+                "23"
+              ],
+              "selected": "17"
+            },
+            "$Minute": {
+              "type": "select",
+              "value": [
+                "00",
+                "30",
+                "59"
+              ],
+              "selected": "30"
+            },
+            "$DepthTips": {
+              "$DepthTips": "<Tab>,<Shift-Tab>, or <Enter> selects field."
+            }
+          },
+          "formType": "time",
+          "type": "dateTime",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            2,
+            1
+          ]
+        }
+      ],
+      "indent": 0,
+      "index": [
+        2
+      ],
+      "hidden": false,
+      "disabled": false,
+      "tips": ""
+    },
+    {
+      "name": "Security",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "Password",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Supervisor Password",
+              "value": "Not Set",
+              "starTips": false,
+              "type": "splitBar",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                0,
+                0
+              ]
+            },
+            {
+              "name": "User Password",
+              "value": "Not Set",
+              "starTips": false,
+              "type": "splitBar",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                0,
+                1
+              ]
+            },
+            {
+              "name": "HDD Password",
+              "value": "Not Set",
+              "starTips": false,
+              "type": "splitBar",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                0,
+                2
+              ]
+            },
+            {
+              "name": "Set Supervisor Password",
+              "value": {
+                "title": "Set Supervisor Password",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "Enter New Password\n|____________\nConfirm New Password\n____________"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "Enter",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                0,
+                3
+              ]
+            },
+            {
+              "name": "Set Hard Disk Password",
+              "value": {
+                "title": "Setup Confirmation",
+                "buttons": [
+                  "OK"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "First, set Master Hard Disk Password.\n\n(Simulator not support!!!)"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "Enter",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                0,
+                4
+              ]
+            },
+            {
+              "name": "Set Strong Password",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                0,
+                5
+              ],
+              "wmiSupport": true,
+              "wmiName": "StrongPassword"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            0
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Security Chip",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Intel Platform Trust Technology",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                1,
+                0
+              ],
+              "effects": [
+                {
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Security",
+                    "Security Chip",
+                    "Clear Intel PTT Key"
+                  ],
+                  "index": [
+                    3,
+                    1,
+                    1
+                  ],
+                  "targetDisabled": false
+                }
+              ]
+            },
+            {
+              "name": "Clear Intel PTT Key",
+              "value": {
+                "title": "Setup Confirmation",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "Clear Intel PTT Key"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "[Enter]",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                1,
+                1
+              ],
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    1,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Security Chip",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                1,
+                2
+              ],
+              "effects": [
+                {
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Security",
+                    "Security Chip",
+                    "Clear Security Chip Key"
+                  ],
+                  "index": [
+                    3,
+                    1,
+                    3
+                  ],
+                  "targetDisabled": false
+                }
+              ],
+              "wmiSupport": true,
+              "wmiName": "SecurityChip"
+            },
+            {
+              "name": "Clear Security Chip Key",
+              "value": {
+                "title": "Setup Confirmation",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "Clear Security Chip Key"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "[Enter]",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                1,
+                3
+              ],
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    1,
+                    2
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            1
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "UEFI BIOS Update Option",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Secure RollBack Prevention",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                2,
+                0
+              ],
+              "wmiSupport": true,
+              "wmiName": "SecureRollBackPrevention"
+            },
+            {
+              "name": "BIOS Self-Healing",
+              "brake": [
+                {
+                  "selected": "Disabled",
+                  "popup": {
+                    "title": "Setup Warning!",
+                    "buttons": [
+                      "Yes",
+                      "No"
+                    ],
+                    "content": [
+                      {
+                        "ratio": "1.0",
+                        "value": [
+                          {
+                            "type": "plainText",
+                            "value": "When Disabled,Your comuter will fail to Self-healed from a BIOS firmware crash.\nDo you really want to Disable this function?"
+                          }
+                        ],
+                        "type": "plainText"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                2,
+                1
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            2
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Virtualization",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Intel(R) Virtualization Technology",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                3,
+                0
+              ],
+              "wmiSupport": true,
+              "wmiName": "VirtualizationTechnology"
+            },
+            {
+              "name": "Intel(R) VT-d Feature",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                3,
+                1
+              ],
+              "wmiSupport": true,
+              "wmiName": "VTdFeature"
+            },
+            {
+              "name": "Enhanced Windows Biometric Security",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                3,
+                2
+              ],
+              "wmiSupport": true,
+              "wmiName": "EnhancedWindowsBiometricSecurity"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            3
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "I/O Port Access",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Wireless LAN",
+              "brake": [
+                {
+                  "selected": "Disabled",
+                  "popup": {
+                    "title": "Attention!",
+                    "buttons": [
+                      "Yes",
+                      "No"
+                    ],
+                    "content": [
+                      {
+                        "ratio": "1.0",
+                        "value": [
+                          {
+                            "type": "plainText",
+                            "value": "If Wireless LAN device is changed to Disabled, Bluethooth device will also be disabled. \nDo you really want to continue?\nSelect Yes to continue to disable Wireless LAN and Bluetooth.\nSelect No to discontinue the operation."
+                          }
+                        ],
+                        "type": "plainText"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                0
+              ],
+              "effects": [
+                {
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Config",
+                    "Network",
+                    "UEFI Wi-Fi Network Boot"
+                  ],
+                  "index": [
+                    1,
+                    0,
+                    5
+                  ],
+                  "targetDisabled": true
+                },
+                {
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Config",
+                    "Network",
+                    "Wi-Fi Configuration"
+                  ],
+                  "index": [
+                    1,
+                    0,
+                    6
+                  ],
+                  "targetDisabled": true
+                },
+                {
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "path": [
+                    "Security",
+                    "I/O Port Access",
+                    "Bluetooth"
+                  ],
+                  "index": [
+                    3,
+                    4,
+                    3
+                  ],
+                  "targetDisabled": true
+                }
+              ],
+              "wmiSupport": true,
+              "wmiName": "WirelessLANAccess"
+            },
+            {
+              "name": "Ethernet LAN",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                1
+              ],
+              "wmiSupport": true,
+              "wmiName": "EthernetLANAccess"
+            },
+            {
+              "name": "Wireless WAN",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                2
+              ],
+              "wmiSupport": true,
+              "wmiName": "WirelessWANAccess"
+            },
+            {
+              "name": "Bluetooth",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                3
+              ],
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    4,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ],
+              "wmiSupport": true,
+              "wmiName": "BluetoothAccess"
+            },
+            {
+              "name": "USB Port",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                4
+              ],
+              "wmiSupport": true,
+              "wmiName": "USBPortAccess"
+            },
+            {
+              "name": "Memory Card Slot",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                5
+              ],
+              "wmiSupport": true,
+              "wmiName": "MemoryCardSlotAccess"
+            },
+            {
+              "name": "Smart Card Slot",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                6
+              ],
+              "wmiSupport": true,
+              "wmiName": "SmartCardSlotAccess"
+            },
+            {
+              "name": "Integrated Camera",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                7
+              ],
+              "wmiSupport": true,
+              "wmiName": "IntegratedCameraAccess"
+            },
+            {
+              "name": "Microphone",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                8
+              ],
+              "wmiSupport": true,
+              "wmiName": "MicrophoneAccess"
+            },
+            {
+              "name": "Fingerprint Reader",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                9
+              ],
+              "wmiSupport": true,
+              "wmiName": "FingerprintReaderAccess"
+            },
+            {
+              "name": "Thunderbolt(TM)",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                10
+              ],
+              "wmiSupport": true,
+              "wmiName": "ThunderboltAccess"
+            },
+            {
+              "name": "NFC Device",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                4,
+                11
+              ],
+              "wmiSupport": true,
+              "wmiName": "NfcAccess"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            4
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Absolute Persistence(R) Module",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Absolute Persistence(R) Module Activation",
+              "brake": [
+                {
+                  "selected": "Permanently Disabled",
+                  "popup": {
+                    "title": "Attention!",
+                    "buttons": [
+                      "Yes",
+                      "No"
+                    ],
+                    "content": [
+                      {
+                        "ratio": "1.0",
+                        "value": [
+                          {
+                            "type": "plainText",
+                            "value": "If Absolute Persistence ® Module Activation is permanently disabled, you can never enable this setting again.\nDo you really want to continue?\nSelect Yes to continue to permanently disable the Absolute Persistence ® Module Activation interface.\nSelect No to discontinue the operation."
+                          }
+                        ],
+                        "type": "plainText"
+                      }
+                    ]
+                  }
+                }
+              ],
+              "value": [
+                "Disabled",
+                "Enabled",
+                "Permanently Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                5,
+                0
+              ]
+            },
+            {
+              "name": "Absolute Persistence(R) Module Activation Status",
+              "value": "Not Activated",
+              "starTips": false,
+              "type": "splitBar",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                5,
+                1
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            5
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Secure Boot",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Secure Boot",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                6,
+                0
+              ],
+              "wmiSupport": true,
+              "wmiName": "SecureBoot"
+            },
+            {
+              "name": "Secure Boot Status",
+              "value": "Enabled/Disabled",
+              "starTips": false,
+              "type": "splitBar",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                6,
+                1
+              ],
+              "depends": [
+                {
+                  "index": [
+                    4,
+                    0
+                  ],
+                  "value": [
+                    "Legacy Support"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Secure Boot Mode",
+              "value": "User Mode",
+              "starTips": false,
+              "type": "splitBar",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                6,
+                2
+              ],
+              "depends": [
+                {
+                  "index": [
+                    4,
+                    0
+                  ],
+                  "value": [
+                    "Legacy Support"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Secure Boot Key State",
+              "value": "Standard Mode",
+              "starTips": false,
+              "type": "splitBar",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                6,
+                3
+              ],
+              "depends": [
+                {
+                  "index": [
+                    4,
+                    0
+                  ],
+                  "value": [
+                    "Legacy Support"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Reset to Setup Mode",
+              "value": {
+                "title": "Setup Confirmation",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "Reset to Setup Mode?"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "Enter",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                6,
+                4
+              ],
+              "depends": [
+                {
+                  "index": [
+                    4,
+                    0
+                  ],
+                  "value": [
+                    "Legacy Support"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Restore Factory Keys",
+              "value": {
+                "title": "Setup Confirmation",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "Restore Factory Keys?"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "Enter",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                6,
+                5
+              ],
+              "depends": [
+                {
+                  "index": [
+                    4,
+                    0
+                  ],
+                  "value": [
+                    "Legacy Support"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Allow Microsoft 3rd Party UEFI CA",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                6,
+                6
+              ],
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    10,
+                    0
+                  ],
+                  "value": [
+                    "Enabled"
+                  ]
+                }
+              ],
+              "wmiSupport": true,
+              "wmiName": "Allow3rdPartyUEFICA"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            6
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "ThinkShield secure wipe",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "ThinkShield secure wipe",
+              "value": {
+                "title": "Setup Warning",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "Do you want to wipe data from storage device?\nEg. USB Key, Hard Disk."
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "Enter",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                7,
+                0
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            7
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "ThinkShield Passwordless Power-On",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "ThinkShield Passwordless Power-On Authentication",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                8,
+                0
+              ],
+              "wmiSupport": true,
+              "wmiName": "ThinkShieldPasswordlessPowerOnAuthentication"
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            8
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Reset system to Factory Defaults",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Reset system to Factory Defaults",
+              "value": {
+                "title": "Setup Confirmation",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "System will be reboot, permanently clear all stored data, and reset to factory default settings.\nAbsolute Persistence Module Permanent Disabled and \nIntel ISM Control Permanent Disabled settings will not reset.\nThis might take several minutes to complete.\nThis may require the screen to be blank.\nThis is normal and you should not interrupt the process.\nWould you like to proceed?"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "Enter",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                9,
+                0
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            9
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        },
+        {
+          "name": "Device security",
+          "type": "nestedList",
+          "value": [
+            {
+              "name": "Device Guard",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": false,
+              "indent": 0,
+              "modifyEffect": [
+                {
+                  "path": [
+                    "Security",
+                    "Secure Boot",
+                    "Allow Microsoft 3rd Party UEFI CA"
+                  ],
+                  "index": [
+                    3,
+                    6,
+                    6
+                  ],
+                  "type": "optionalList",
+                  "value": "Disabled",
+                  "selected": "Enabled"
+                }
+              ],
+              "whiteSpace": 0,
+              "index": [
+                3,
+                10,
+                0
+              ],
+              "effects": [
+                {
+                  "selected": [
+                    "Enabled"
+                  ],
+                  "path": [
+                    "Security",
+                    "Secure Boot",
+                    "Allow Microsoft 3rd Party UEFI CA"
+                  ],
+                  "index": [
+                    3,
+                    6,
+                    6
+                  ],
+                  "targetDisabled": true
+                },
+                {
+                  "selected": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "path": [
+                    "Security",
+                    "Device security",
+                    "Natural File Guard"
+                  ],
+                  "index": [
+                    3,
+                    10,
+                    1
+                  ],
+                  "targetDisabled": true
+                },
+                {
+                  "selected": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "path": [
+                    "Security",
+                    "Device security",
+                    "Security Erase HDD1 Data"
+                  ],
+                  "index": [
+                    3,
+                    10,
+                    2
+                  ],
+                  "targetDisabled": true
+                }
+              ]
+            },
+            {
+              "name": "Natural File Guard",
+              "brake": {},
+              "value": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "type": "optionalList",
+              "tips": "",
+              "hidden": false,
+              "disabled": true,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                10,
+                1
+              ],
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    10,
+                    0
+                  ],
+                  "value": [
+                    "Disabled",
+                    "Enabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Security Erase HDD1 Data",
+              "value": {
+                "title": "Setup Confirmation",
+                "buttons": [
+                  "Yes",
+                  "No"
+                ],
+                "content": [
+                  {
+                    "ratio": "1.0",
+                    "value": [
+                      {
+                        "type": "plainText",
+                        "value": "All HDD data will be erased and the hard disk password will be deleted.\nDo you really want to continue?"
+                      }
+                    ],
+                    "type": "plainText"
+                  }
+                ]
+              },
+              "dialogContent": "Enter",
+              "type": "popupDialog",
+              "tips": "",
+              "hidden": false,
+              "disabled": true,
+              "indent": 0,
+              "whiteSpace": 0,
+              "index": [
+                3,
+                10,
+                2
+              ],
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    10,
+                    0
+                  ],
+                  "value": [
+                    "Disabled",
+                    "Enabled"
+                  ]
+                }
+              ]
+            }
+          ],
+          "indent": 0,
+          "index": [
+            3,
+            10
+          ],
+          "hidden": false,
+          "disabled": false,
+          "tips": ""
+        }
+      ],
+      "indent": 0,
+      "index": [
+        3
+      ],
+      "hidden": false,
+      "disabled": false,
+      "tips": ""
+    },
+    {
+      "name": "Startup",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "Boot Mode",
+          "brake": {},
+          "value": [
+            "UEFI",
+            "Legacy Support"
+          ],
+          "selected": "UEFI",
+          "origin": "UEFI",
+          "type": "optionalList",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "modifyEffect": [
+            {
+              "path": [
+                "Security",
+                "Secure Boot",
+                "Secure Boot"
+              ],
+              "index": [
+                3,
+                6,
+                0
+              ],
+              "type": "optionalList",
+              "value": "Disabled",
+              "selected": "Legacy Support"
+            }
+          ],
+          "whiteSpace": 0,
+          "index": [
+            4,
+            0
+          ],
+          "effects": [
+            {
+              "selected": [
+                "Legacy Support"
+              ],
+              "path": [
+                "Security",
+                "Secure Boot",
+                "Secure Boot Status"
+              ],
+              "index": [
+                3,
+                6,
+                1
+              ],
+              "targetDisabled": false
+            },
+            {
+              "selected": [
+                "Legacy Support"
+              ],
+              "path": [
+                "Security",
+                "Secure Boot",
+                "Secure Boot Mode"
+              ],
+              "index": [
+                3,
+                6,
+                2
+              ],
+              "targetDisabled": false
+            },
+            {
+              "selected": [
+                "Legacy Support"
+              ],
+              "path": [
+                "Security",
+                "Secure Boot",
+                "Secure Boot Key State"
+              ],
+              "index": [
+                3,
+                6,
+                3
+              ],
+              "targetDisabled": false
+            },
+            {
+              "selected": [
+                "Legacy Support"
+              ],
+              "path": [
+                "Security",
+                "Secure Boot",
+                "Reset to Setup Mode"
+              ],
+              "index": [
+                3,
+                6,
+                4
+              ],
+              "targetDisabled": false
+            },
+            {
+              "selected": [
+                "Legacy Support"
+              ],
+              "path": [
+                "Security",
+                "Secure Boot",
+                "Restore Factory Keys"
+              ],
+              "index": [
+                3,
+                6,
+                5
+              ],
+              "targetDisabled": false
+            },
+            {
+              "selected": [
+                "UEFI"
+              ],
+              "path": [
+                "Startup",
+                "Boot Priority"
+              ],
+              "index": [
+                4,
+                1
+              ],
+              "targetDisabled": false
+            }
+          ],
+          "wmiSupport": true,
+          "wmiName": "BootMode"
+        },
+        {
+          "name": "Boot Priority",
+          "brake": {},
+          "value": [
+            "UEFI First",
+            "Legacy First"
+          ],
+          "selected": "UEFI First",
+          "origin": "UEFI First",
+          "type": "optionalList",
+          "tips": "",
+          "hidden": true,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            4,
+            1
+          ],
+          "depends": [
+            {
+              "index": [
+                4,
+                0
+              ],
+              "value": [
+                "UEFI"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Fast Boot",
+          "brake": {},
+          "value": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled",
+          "type": "optionalList",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            4,
+            2
+          ]
+        },
+        {
+          "name": "USB Boot",
+          "brake": {},
+          "value": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled",
+          "type": "optionalList",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            4,
+            3
+          ]
+        },
+        {
+          "name": "PXE Boot to LAN",
+          "brake": {},
+          "value": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled",
+          "type": "optionalList",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            4,
+            4
+          ],
+          "effects": [
+            {
+              "selected": [
+                "Disabled"
+              ],
+              "path": [
+                "Startup",
+                "IPV4 PXE First"
+              ],
+              "index": [
+                4,
+                5
+              ],
+              "targetDisabled": false
+            }
+          ]
+        },
+        {
+          "name": "IPV4 PXE First",
+          "brake": {},
+          "value": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled",
+          "type": "optionalList",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            4,
+            5
+          ],
+          "depends": [
+            {
+              "index": [
+                4,
+                4
+              ],
+              "value": [
+                "Disabled"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "EFI",
+          "value": "",
+          "starTips": false,
+          "type": "splitBar",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            4,
+            6
+          ]
+        },
+        {
+          "name": "Windows Boot Manager",
+          "value": "",
+          "starTips": false,
+          "type": "splitBar",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            4,
+            7
+          ]
+        },
+        {
+          "name": "EFI PXE Network",
+          "value": "",
+          "starTips": false,
+          "type": "splitBar",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            4,
+            8
+          ]
+        }
+      ],
+      "indent": 0,
+      "index": [
+        4
+      ],
+      "hidden": false,
+      "disabled": false,
+      "tips": ""
+    },
+    {
+      "name": "Restart",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "Exit Saving Changes",
+          "value": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Save confirmation changes and exit now?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          },
+          "dialogContent": "",
+          "type": "popupDialog",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            5,
+            0
+          ]
+        },
+        {
+          "name": "Exit Discarding Changes",
+          "value": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Setting has not been saved!\nSave before exiting?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          },
+          "dialogContent": "",
+          "type": "popupDialog",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            5,
+            1
+          ]
+        },
+        {
+          "name": "Discard Changes",
+          "value": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Load previous configuration?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          },
+          "dialogContent": "",
+          "type": "popupDialog",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            5,
+            2
+          ]
+        },
+        {
+          "name": "Save Changes",
+          "value": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Save configuration changes now?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          },
+          "dialogContent": "",
+          "type": "popupDialog",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            5,
+            3
+          ]
+        },
+        {
+          "name": "Load Default Settings",
+          "value": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ],
+            "content": [
+              {
+                "ratio": "1.0",
+                "value": [
+                  {
+                    "type": "plainText",
+                    "value": "Load default configuration now?"
+                  }
+                ],
+                "type": "plainText"
+              }
+            ]
+          },
+          "dialogContent": "",
+          "type": "popupDialog",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            5,
+            4
+          ]
+        },
+        {
+          "name": "OS Optimized Defaults",
+          "brake": {},
+          "value": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled",
+          "type": "optionalList",
+          "tips": "",
+          "hidden": false,
+          "disabled": false,
+          "indent": 0,
+          "whiteSpace": 0,
+          "index": [
+            5,
+            5
+          ],
+          "wmiSupport": true,
+          "wmiName": "OsOptDefault"
+        }
+      ],
+      "indent": 0,
+      "index": [
+        5
+      ],
+      "hidden": false,
+      "disabled": false,
+      "tips": ""
+    }
+  ],
+  "footer": [
+    {
+      "name": "F1",
+      "value": "General Help",
+      "title": "General Help",
+      "buttons": [
+        "Close"
+      ],
+      "content": [
+        {
+          "ratio": "0.5",
+          "value": [
+            {
+              "name": "Navigate",
+              "type": "plainText",
+              "value": "You can navigate within the Basic Input/Output System(BIOS) for ThinkPad Setup using the TrackPoint, Touchpad or Keyboard."
+            }
+          ],
+          "type": "plainText"
+        },
+        {
+          "ratio": "0.5",
+          "value": [
+            {
+              "name": "Troubleshooting",
+              "type": "plainText",
+              "value": "Conflicting BIOS configurations may cause the device to not boot. Try loading the default configuration values to recover. \n${ENTER}More help is  availableon Lenovo eSupport site."
+            }
+          ],
+          "type": "plainText"
+        },
+        {
+          "value": [
+            {
+              "value": "Help(this page)",
+              "name": "F1"
+            },
+            {
+              "value": "Back/Close dialog",
+              "name": "Esc"
+            },
+            {
+              "value": "Select/Open submenu",
+              "name": "Enter"
+            },
+            {
+              "value": "Select/Scroll page",
+              "name": "Up/Down Arrows,or"
+            },
+            {
+              "value": "",
+              "name": "Page Up/Page Down"
+            }
+          ],
+          "type": "zebraStripe"
+        },
+        {
+          "value": [
+            {
+              "value": "Setup defaults",
+              "name": "F9"
+            },
+            {
+              "value": "Move keyboard focus",
+              "name": "Left/Right Arrows"
+            },
+            {
+              "value": "Change Boot Priority Order",
+              "name": "F5/F6"
+            },
+            {
+              "value": "Save & Exit",
+              "name": "F10"
+            }
+          ],
+          "type": "zebraStripe"
+        }
+      ],
+      "hasDialog": true
+    },
+    {
+      "name": "F9",
+      "value": "Setup Defaults",
+      "title": "Setup Confirmation",
+      "buttons": [
+        "Yes",
+        "No"
+      ],
+      "content": [
+        {
+          "ratio": "1.0",
+          "value": [
+            {
+              "type": "plainText",
+              "value": "Load default configuration now?"
+            }
+          ],
+          "type": "plainText"
+        }
+      ],
+      "hasDialog": true
+    },
+    {
+      "name": "Esc",
+      "value": "Exit",
+      "hasDialog": false
+    },
+    {
+      "name": "F10",
+      "value": "Save and Exit",
+      "title": "Setup Confirmation",
+      "buttons": [
+        "Yes",
+        "No"
+      ],
+      "content": [
+        {
+          "ratio": "1.0",
+          "value": [
+            {
+              "type": "plainText",
+              "value": "Save configuration changes and exit now?"
+            }
+          ],
+          "type": "plainText"
+        }
+      ],
+      "hasDialog": true
+    }
+  ],
+  "title": "Setup",
+  "CFG BLT SYS DEFAULT": {
+    "isLoadDefaultMode ": "None"
+  },
+  "CFG BLT SYS PLUGINS": {
+    "Installing Plugins ": "005"
+  },
+  "CFG BLT SYS AUTHOR": "Contributed by Zongquan, v2.0, 2024/06/03",
+  "CFG BLT SYS LOGO": "Lenovo PCSD Service Enablement - DFS Team",
+  "exportFeature": true
+}

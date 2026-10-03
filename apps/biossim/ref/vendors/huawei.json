@@ -1,0 +1,134 @@
+{
+  "model": "HUAWEI MateBook (BIOS Setup Utility)",
+  "source_url": "https://consumer.huawei.com/cn/support/content/zh-cn15883571",
+  "retrieved": "2026-10-02",
+  "data_source_file": "华为官方支持文档: '计算机如何在 BIOS 中设置安全启动'(zh-cn15883571)、'Windows 计算机如何在 BIOS 中设置管理员密码和开机密码'(zh-cn00694834)、'Enabling a PXE device'(en-us15811336)、'查看 BIOS/EC 版本'(en-us00694750)",
+  "menus": [
+    {
+      "name": "信息概览",
+      "items": [
+        {
+          "name": "BIOS 版本",
+          "type": "info",
+          "current": "1.xx",
+          "disabled": true
+        },
+        {
+          "name": "EC 版本",
+          "type": "info",
+          "current": "1.xx",
+          "disabled": true
+        },
+        {
+          "name": "语言",
+          "type": "item",
+          "current": "简体中文",
+          "values": [
+            "English",
+            "简体中文"
+          ],
+          "tip": "切换 BIOS 界面语言。"
+        },
+        {
+          "name": "（分隔线）",
+          "type": "separator"
+        }
+      ]
+    },
+    {
+      "name": "安全设置",
+      "items": [
+        {
+          "name": "安全启动 (Secure Boot)",
+          "type": "item",
+          "current": "开启",
+          "values": [
+            "开启",
+            "关闭"
+          ],
+          "tip": "官方默认开启。装第三方系统/PE 若无法引导，可在此关闭；改完按 F10 保存。"
+        },
+        {
+          "name": "设置管理员密码 (SETUP Administrator Password)",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "进入 BIOS 时需输入，登录后可修改任意配置；不能当开机密码使用。"
+        },
+        {
+          "name": "设置开机密码 (POST Password)",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "开机进入系统或 BIOS 时需输入；不能作为 BIOS 配置密码。丢失只能更换主板。"
+        }
+      ]
+    },
+    {
+      "name": "启动配置",
+      "items": [
+        {
+          "name": "PXE 设备 (PXE Device Enable)",
+          "type": "item",
+          "current": "关闭",
+          "values": [
+            "开启",
+            "关闭"
+          ],
+          "tip": "启用后可用 PXE 网络引导。"
+        },
+        {
+          "name": "可启动设备 (Bootable Device)",
+          "type": "submenu",
+          "sub": {
+            "name": "可启动设备 (Bootable Device)",
+            "items": []
+          },
+          "tip": "启动顺序列表，选中设备后按 F5/F6 上下移动到首位。"
+        }
+      ]
+    },
+    {
+      "name": "退出",
+      "items": [
+        {
+          "name": "保存并退出 (F10)",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "官方文档：按 F10 保存并退出 BIOS。"
+        },
+        {
+          "name": "放弃更改并退出",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
