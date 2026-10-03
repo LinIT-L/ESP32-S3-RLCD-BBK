@@ -20,7 +20,7 @@
 --   tile.bmp 地形 28 格 @20px = grass dirt tree water wall floor sand road
 return {
   dir = "/store/minidayz/",
-  spr_px = 32, spr_n = 180,
+  spr_px = 32, spr_n = 180, spr_cols = 45,
   item_px = 32, item_n = 37,
   tile = 20,
   groups = {

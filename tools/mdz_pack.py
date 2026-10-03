@@ -344,6 +344,21 @@ def write_bmp1(path, rows, w, h):
     open(path, "wb").write(fh + dh + pal + bytes(pix))
 
 
+SPR_COLS = 45          # 精灵图集列数 (180 帧 → 45×4 = 1440×128, 宽度安全低于 IMG_MAX_W)
+
+
+def grid_pack(frames, fs, cols):
+    """把等尺寸帧排成 cols 列的网格。返回 (位图行, 行数)。"""
+    rows = (len(frames) + cols - 1) // cols
+    g = [[0] * (cols * fs) for _ in range(rows * fs)]
+    for i, f in enumerate(frames):
+        r, c = divmod(i, cols)
+        for y in range(fs):
+            for x in range(fs):
+                g[r * fs + y][c * fs + x] = f[y][x]
+    return g, rows
+
+
 def hstack(tiles, th):
     out = []
     for y in range(th):
@@ -410,8 +425,14 @@ def main():
         print("  %-12s %d 帧" % (name, got))
     if not frames:
         raise SystemExit("没取到任何帧 —— 检查 --src")
-    write_bmp1(os.path.join(args.out, "spr.bmp"), hstack(frames, FRAME), FRAME * len(frames), FRAME)
-    print("  spr.bmp  %d 帧 @%dpx" % (len(frames), FRAME))
+    # ⛔ **必须排成网格, 不能排成一条长带** —— 固件 luat_lib_img.c 有
+    #     `#define IMG_MAX_W 2048  // 宽度超过它 img.load 直接拒收(返回 nil)`
+    #    一条长带 = 180×32 = 5760px > 2048 ⇒ 整张图加载失败 ⇒ **人物/僵尸一个都画不出来**
+    #    (2026-10-03 真机实测踩到, 模拟器没这个限制所以本地测不出)。
+    grid, grows = grid_pack(frames, FRAME, SPR_COLS)
+    write_bmp1(os.path.join(args.out, "spr.bmp"), grid, FRAME * SPR_COLS, FRAME * grows)
+    print("  spr.bmp  %d 帧 @%dpx (网格 %d列×%d行 = %dx%d 宽≤2048)"
+          % (len(frames), FRAME, SPR_COLS, grows, FRAME * SPR_COLS, FRAME * grows))
 
     # ---------- 2. 道具 (按 ITEM_PICK 精选, 顺序 = 图标序号) ----------
     icons, items, miss = [], [], []
@@ -465,7 +486,7 @@ def main():
           "--   tile.bmp 地形 %d 格 @20px = %s" % (len(tiles), " ".join(TILE_KINDS)),
           "return {",
           "  dir = \"/store/minidayz/\",",
-          "  spr_px = %d, spr_n = %d," % (FRAME, len(frames)),
+          "  spr_px = %d, spr_n = %d, spr_cols = %d," % (FRAME, len(frames), SPR_COLS),
           "  item_px = %d, item_n = %d," % (FRAME, len(icons)),
           "  tile = 20,",
           "  groups = {"]

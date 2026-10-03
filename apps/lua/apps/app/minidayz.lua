@@ -141,6 +141,7 @@ function RES.enter()
     RES.meta = meta
     RES.dir  = meta.dir or RES.dir
     RES.SPX  = meta.spr_px or 32
+    RES.SPRC = meta.spr_cols or 45
     RES.IPX  = meta.item_px or 32
     RES.TS   = meta.tile or 20
     RES.disp = meta.disp or {}
@@ -159,12 +160,16 @@ function RES.enter()
 end
 
 -- 精灵: 32px 帧取正中 20×20 贴进 20px 的格
--- 从 32px 帧里取正中 size×size 贴出去
+-- 从 32px 帧里取正中 size×size 贴出去。
+-- ⚠ 图集是**网格**排布 (见 mdz_pack.py 的 SPR_COLS): 源坐标要按
+--   行=idx//cols, 列=idx%cols 换算; 写成 `idx*SPX` 只有单行图集才对。
 local function blit_spr_sz(first, dir, phase, sx, sy, size)
     if not RES.spr then return end
+    local cols = RES.SPRC or 45
     local idx = first + (phase % 3) * 4 + (dir % 4)
+    local ix, iy = idx % cols, idx // cols
     local so = (RES.SPX - size) // 2
-    app.img.blit(RES.spr, idx * RES.SPX + so, so, sx, sy, size, size)
+    app.img.blit(RES.spr, ix * RES.SPX + so, iy * RES.SPX + so, sx, sy, size, size)
 end
 -- ⚠ 人物用 24px 而不是 20px: 源帧里的角色有 24px 高, 只取 20px 会把头和脚切掉,
 --   屏幕上就成了"一小坨黑的"。反正动态层本来就标 3×3 邻格, 溢出 2px 是安全的。
@@ -249,7 +254,9 @@ end
 local WORLD = {}
 WORLD.buildings = {}                                    -- { {x0,y0,x1,y1}, ... } 供搜刮布点
 WORLD.towns = {}                                        -- 地点中心 (格坐标), 供僵尸布点
-WORLD.level = 1                                         -- 关卡等级 → 决定地点数量表分支
+WORLD.level = 1                                         -- 关卡等级(岛 1..4) → 地点数量表分支
+WORLD.checkpoints = {}                                  -- 检查站 (官方: 十字路口的 90%)
+WORLD.secret = nil                                      -- 秘密地点地块
 
 -- 地块类型 (对标 ground.gd 的 BlockType 子集)
 local B_EMPTY, B_VILLAGE, B_CITY, B_MILITARY, B_HOSPITAL, B_FIRE, B_SECRET = 0, 1, 2, 3, 4, 5, 6
@@ -266,14 +273,19 @@ local BLD_SIZE = { [B_VILLAGE] = { 5, 8, 4, 6 }, [B_CITY] = { 5, 9, 4, 6 },
                    [B_MILITARY] = { 7, 12, 5, 8 }, [B_HOSPITAL] = { 10, 14, 7, 10 },
                    [B_FIRE] = { 8, 11, 6, 8 }, [B_SECRET] = { 5, 7, 4, 5 } }
 
--- 地点数量表: 对标原版 LEVEL_LOCATION_COUNTS(16×16 网格), 缩到 8×8 后按 ~1/4 取整
---   原版 0 级: village20 city3 military0 hospital1 fire1 secret1
---   原版 3 级: village3  city11 military6 hospital4 fire2 secret1
+-- 地点数量表 = **Bohemia 官方数字** (minidayz.com/blog/mini-dayz-guide-locations)。
+-- 官方是 4 座岛, 每座岛换一张图, 越往后越冷、城市/军营越多、村子越少:
+--   岛1: 20 village / 3 city / 1 fire / 1 hospital / 0 military
+--   岛2: 15 village / 5 city / 2 fire / 2 hospital / 3 military
+--   岛3:  6 village / 10 city/ 3 fire / 3 hospital / 6 military
+--   岛4:  2 village / 11 city/ 2 fire / 4 hospital / 6 military (+ 4 gas)
+-- 官方"岛"整图是 16×16 地块 = 256 块; 掌机是 8×8 = 64 块 ⇒ **按 1/4 缩**, 不足 1 的保底 1。
+-- 字段序: { village, city, military, hospital, fire, secret }
 local LEVEL_COUNTS = {
-    { 6, 1, 0, 1, 1, 1 },      -- 0 级: 乡村多 / 军营为 0
-    { 5, 2, 1, 1, 1, 1 },      -- 1 级
-    { 3, 3, 2, 1, 1, 1 },      -- 2 级
-    { 2, 4, 2, 2, 1, 1 },      -- 3 级: 城市多
+    { 5, 1, 0, 1, 1, 1 },      -- 岛1 (官方无军营)
+    { 4, 1, 1, 1, 1, 1 },      -- 岛2
+    { 2, 3, 2, 1, 1, 1 },      -- 岛3
+    { 1, 3, 2, 1, 1, 1 },      -- 岛4
 }
 
 local BLK = {}                                          -- BLK[by*BLOCKS+bx] = 地块类型
@@ -381,7 +393,18 @@ local function gen_world()
     end
     if #cand > 0 then
         local p = cand[rng(1, #cand)]
-        blk_set(p % 100, p // 100, B_SECRET)
+        local sbx, sby = p % 100, p // 100
+        blk_set(sbx, sby, B_SECRET)
+        WORLD.secret = { bx = sbx, by = sby }
+        -- 官方原文: 秘密地点"从不与任何地点/道路/地图边缘相邻, 总被**湖泊或森林**包围",
+        --   且不显示在小地图上。clear3 已保证 3×3 全空, 这里把外圈补成森林/水。
+        for k = 1, #NBS do
+            local nb = NBS[k]
+            local nx, ny = sbx + nb[1], sby + nb[2]
+            if blk_at(nx, ny) == B_EMPTY then
+                blk_set(nx, ny, (rng(1, 100) <= 70) and B_EMPTY or B_WATER)
+            end
+        end
     end
 
     -- ⑥ 地块 → 瓦片
@@ -487,6 +510,20 @@ local function gen_world()
         end
     end
 
+    -- ⑥b 检查站: 官方原文「地图上的十字路口 **90%** 都是检查站, 必有军人僵尸」。
+    --     它不显示在小地图上, 是"路过就被围"的地方 —— 所以布点必须真的在十字路口。
+    WORLD.checkpoints = {}
+    for by = 0, CFG.BLOCKS - 1 do
+        for bx = 0, CFG.BLOCKS - 1 do
+            if blk_at(bx, by) == B_ROAD_X and rng(1, 10) <= 9 then
+                WORLD.checkpoints[#WORLD.checkpoints + 1] = {
+                    x = bx * CFG.BLOCK + CFG.ROAD_MIN + 1,
+                    y = by * CFG.BLOCK + CFG.ROAD_MIN + 1,
+                }
+            end
+        end
+    end
+
     -- ⑦ 出生点: **落在村口**。
     --   原版一开局就在镇子边上(不是荒地中间) —— 2026-10-03 实测: 落在荒地中心时
     --   首屏全是草+路, 用户第一反应就是"没有僵尸也没有房子"。
@@ -501,23 +538,33 @@ local function gen_world()
         if d < bestd then best, bestd = { cx, cy }, d end
     end
     local sx, sy = mx, my
-    if best then
-        local found = false
-        for r = 6, 26 do
+    -- ⛔ 只判"这一格能站"是不够的: 实测会把玩家塞进**两栋房子之间的墙缝**,
+    --   左右都是墙 → 按左右键一动不动, 看起来像"卡死"。
+    --   所以还要"四邻至少 2 格能走"。并且按 路 > 土路 > 草地 的顺序挑(路一定走得通)。
+    local function try_spawn(kind, rmin, rmax, cx, cy)
+        for r = rmin, rmax do
             for dy = -r, r do
                 for dx = -r, r do
                     if math.abs(dx) == r or math.abs(dy) == r then
-                        local x, y = best[1] + dx, best[2] + dy
-                        local t = tile_at(x, y)
-                        if t == T_ROAD or t == T_DIRT or t == T_GRASS then
-                            sx, sy, found = x, y, true; break
+                        local x, y = cx + dx, cy + dy
+                        if tile_at(x, y) == kind then
+                            local open = 0
+                            for k = 1, #NBS do
+                                if walkable(x + NBS[k][1], y + NBS[k][2]) then open = open + 1 end
+                            end
+                            if open >= 2 then return x, y end
                         end
                     end
                 end
-                if found then break end
             end
-            if found then break end
         end
+        return nil
+    end
+    if best then
+        local x, y = try_spawn(T_ROAD, 5, 30, best[1], best[2])
+        if not x then x, y = try_spawn(T_DIRT, 5, 30, best[1], best[2]) end
+        if not x then x, y = try_spawn(T_GRASS, 5, 30, best[1], best[2]) end
+        if x then sx, sy = x, y end
     end
     WORLD.spawn_x, WORLD.spawn_y = sx, sy
 end
@@ -581,11 +628,11 @@ local TOWN_Z = { [B_VILLAGE] = 2, [B_CITY] = 4, [B_MILITARY] = 5,
                  [B_HOSPITAL] = 3, [B_FIRE] = 2, [B_SECRET] = 2 }
 local WILD_Z = 12
 
-local function spawn_one(zx, zy)
+local function spawn_one(zx, zy, force)
     if not walkable(zx, zy) then return false end
     local d = math.abs(zx - WORLD.spawn_x) + math.abs(zy - WORLD.spawn_y)
     if d < 8 then return false end
-    local k = ZKIND[rng(1, #ZKIND)]
+    local k = force or ZKIND[rng(1, #ZKIND)]
     ZOM.list[#ZOM.list + 1] = {
         x = zx, y = zy, ddx = 0, ddy = 0, sub = 0,
         dir = rng(0, 3), phase = 0, anim = 0,
@@ -609,6 +656,15 @@ function ZOM.spawn(n)
             local x = cx + rng(-9, 9)
             local y = cy + rng(-9, 9)
             if spawn_one(x, y) then put = put + 1 end
+        end
+    end
+    -- ①b 检查站: 官方"必有军人僵尸" → 每站 4 只 z_army
+    for i = 1, #WORLD.checkpoints do
+        local cp = WORLD.checkpoints[i]
+        local put, guard = 0, 0
+        while put < 4 and guard < 240 do
+            guard = guard + 1
+            if spawn_one(cp.x + rng(-4, 4), cp.y + rng(-4, 4), "z_army") then put = put + 1 end
         end
     end
     -- ② 野外
@@ -834,7 +890,10 @@ end
 
 local function hud_cached()
     local wn = P.wpn and item_name_of(P.wpn) or "空手"
-    local key = P.hp .. "|" .. P.food .. "|" .. P.water .. "|" .. wn .. "|" .. #ZOM.list
+    -- ⛔ key 必须带上"会变的东西": 漏了秒数 → 计时器永远停在 0s (实测)。
+    --   按秒取整, 不要用毫秒 (否则每帧都重画状态条, 白白烧帧)。
+    local key = P.hp .. "|" .. P.food .. "|" .. P.water .. "|" .. wn .. "|" ..
+                #ZOM.list .. "|" .. (GAME.elapsed // 1000)
     if GAME.hud_key == key then return end
     GAME.hud_key = key
 

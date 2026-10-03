@@ -534,7 +534,7 @@ static void am_draw_app_icon(ui_ctx_t *ctx, st7305_handle_t *lcd, const os_app_t
 
 /* 子分类条绘制 (y 顶部, 先填白底盖住下方内容残留, 恒固定显示) */
 /* 前置声明: 子分类条的水管弯头用它, 实现在下方 (与左栏选中框同一套) */
-static void am_elbow(st7305_handle_t *lcd, int cx, int cy, int r, int kind, st7305_color_t color);
+static void am_elbow(st7305_handle_t *lcd, int cx, int cy, int r, int kind, int w, st7305_color_t color);
 
 /* 水管框"以内"的填充 —— **只把上两个角做圆角, 下两个角保持方角**。
  *
@@ -594,23 +594,31 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
         int ex0  = sx + 1, ex1 = sx + slot - 2;        /* 水管左右外缘 */
         int ytop = y0;
         bool sel = (s_focus_bar == 1);                 /* 焦点在顶栏 = 选中态 */
+        /* ★ 线宽随状态变 (linit 2026-10-03):
+         *   未选中 = 2px 细框"定位用"; **选中 = 1px** —— 里面已经填满了黑, 2px 边框会显得又粗又笨。 */
+        int  w   = sel ? 1 : 2;
+
         /* 顺序: 填充 → 描框 → 写字。反了的话框会被填充盖掉。 */
         if (sel) {
-            /* 内缩 2px (让开水管壁厚), 上两角圆角半径 = R-2 = 水管内圈弧度, 下两角方角 */
-            am_fill_top_round(lcd, ex0 + 2, ytop + 2, ex1 - 2, ybot - 2,
-                              R - 2, ST7305_COLOR_BLACK);
+            /* 左/上/右各内缩 w 让开边框; **底边不内缩** —— 黑块要一直铺到 ybot,
+             *   和下方各格的分隔线齐平, 看起来才是"这一格坐在栏上"。 */
+            am_fill_top_round(lcd, ex0 + w, ytop + w, ex1 - w, ybot,
+                              R - w, ST7305_COLOR_BLACK);
         }
-        /* 竖线**一插到底**(不留 R), 下横**拉满整宽**, 左下/右下**不打弯头** ⇒ 两下角是方角。 */
-        draw_vline(lcd, ex0,     ytop + R, ybot, ST7305_COLOR_BLACK);   /* 左竖 (2px) */
-        draw_vline(lcd, ex0 + 1, ytop + R, ybot, ST7305_COLOR_BLACK);
-        draw_vline(lcd, ex1 - 1, ytop + R, ybot, ST7305_COLOR_BLACK);   /* 右竖 (2px) */
-        draw_vline(lcd, ex1,     ytop + R, ybot, ST7305_COLOR_BLACK);
-        draw_hline(lcd, ex0 + R, ex1 - R, ytop,     ST7305_COLOR_BLACK); /* 上横 (2px): 让位给上两角 */
-        draw_hline(lcd, ex0 + R, ex1 - R, ytop + 1, ST7305_COLOR_BLACK);
-        draw_hline(lcd, ex0,     ex1,     ybot,     ST7305_COLOR_BLACK); /* 下横 (2px): 满宽, 方角 */
-        draw_hline(lcd, ex0,     ex1,     ybot - 1, ST7305_COLOR_BLACK);
-        am_elbow(lcd, ex0, ytop, R, 1, ST7305_COLOR_BLACK);   /* 左上 外凸向左上 (保留) */
-        am_elbow(lcd, ex1, ytop, R, 3, ST7305_COLOR_BLACK);   /* 右上 外凸向右上 (保留) */
+        /* 竖线一插到底, 左下/右下**不打弯头** ⇒ 两下角是方角。 */
+        for (int k = 0; k < w; k++) {
+            draw_vline(lcd, ex0 + k, ytop + R, ybot, ST7305_COLOR_BLACK);   /* 左竖 */
+            draw_vline(lcd, ex1 - k, ytop + R, ybot, ST7305_COLOR_BLACK);   /* 右竖 */
+            draw_hline(lcd, ex0 + R, ex1 - R, ytop + k, ST7305_COLOR_BLACK); /* 上横 */
+        }
+        /* ★ 下横**只有未选中才画**: 选中时下方开口 (linit: "选中的分类底部不要有黑线") ——
+         *   黑填本身已经铺到 ybot, 再叠一条线只会让底边发胖。 */
+        if (!sel) {
+            draw_hline(lcd, ex0, ex1, ybot,     ST7305_COLOR_BLACK);
+            draw_hline(lcd, ex0, ex1, ybot - 1, ST7305_COLOR_BLACK);
+        }
+        am_elbow(lcd, ex0, ytop, R, 1, w, ST7305_COLOR_BLACK);   /* 左上 外凸向左上 */
+        am_elbow(lcd, ex1, ytop, R, 3, w, ST7305_COLOR_BLACK);   /* 右上 外凸向右上 */
         am_draw_label(lcd, cx, y0 + 5, nm, sel);
     }
 }
@@ -626,7 +634,9 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
  * kind=3: 外凸向右上 (右上弯: 竖线在右 + 上横线在上), 圆心 (cx-r, cy+r).
  * kind=4: 外凸向右下 (右下弯: 竖线在右 + 下横线在下), 圆心 (cx-r, cy-r).
  * 保留到圆心距离 d∈[r-2,r] 的环带像素 (各角朝外凸出的 90° 弧). */
-static void am_elbow(st7305_handle_t *lcd, int cx, int cy, int r, int kind, st7305_color_t color) {
+ * [param w]: 弧带**线宽**(像素)。w=2 是原来的观感(左栏/未选中用), w=1 是细线(选中态用, 2026-10-03 linit)。 */
+static void am_elbow(st7305_handle_t *lcd, int cx, int cy, int r, int kind, int w, st7305_color_t color) {
+    if (w < 1) w = 1;
     int ox, oy, x0, x1, y0, y1, sx, sy;
     if (kind == 1)      { ox = cx + r; oy = cy + r; x0 = cx;    x1 = cx + r; y0 = cy;    y1 = cy + r; sx = -1; sy = -1; }
     else if (kind == 2) { ox = cx + r; oy = cy - r; x0 = cx;    x1 = cx + r; y0 = cy - r; y1 = cy;    sx = -1; sy =  1; }
@@ -640,7 +650,7 @@ static void am_elbow(st7305_handle_t *lcd, int cx, int cy, int r, int kind, st73
             float dy = (float)y - oy;
             if (!((sx * dx >= 0) && (sy * dy >= 0))) continue;
             float d = sqrtf(dx * dx + dy * dy);
-            if (d >= (r - 2) && d <= r) st7305_draw_pixel(lcd, x, y, color);
+            if (d >= (r - w) && d <= r) st7305_draw_pixel(lcd, x, y, color);
         }
     }
 }
@@ -1104,12 +1114,12 @@ static void p_am_render(ui_ctx_t *ctx) {
 
     /* 四角 R3 外凸圆弧弯头 (接触分割线的是右上/右下, 用 kind3/kind4) */
     if (!is_top) { /* 上两角: 仅非顶部项 */
-        am_elbow(lcd, lx, ty, R, 1, ST7305_COLOR_BLACK);   /* 左上: 外凸向左上 */
-        am_elbow(lcd, rx, ty, R, 4, ST7305_COLOR_BLACK);   /* 右上: 外凸向右下 */
+        am_elbow(lcd, lx, ty, R, 1, 2, ST7305_COLOR_BLACK);   /* 左上: 外凸向左上 */
+        am_elbow(lcd, rx, ty, R, 4, 2, ST7305_COLOR_BLACK);   /* 右上: 外凸向右下 */
     }
     if (!is_bot) { /* 下两角: 仅非底部项 */
-        am_elbow(lcd, lx, by + w1, R, 2, ST7305_COLOR_BLACK);  /* 左下: 外凸向左下 */
-        am_elbow(lcd, rx, by + w1, R, 3, ST7305_COLOR_BLACK);  /* 右下: 外凸向右上 */
+        am_elbow(lcd, lx, by + w1, R, 2, 2, ST7305_COLOR_BLACK);  /* 左下: 外凸向左下 */
+        am_elbow(lcd, rx, by + w1, R, 3, 2, ST7305_COLOR_BLACK);  /* 右下: 外凸向右上 */
     }
 }
 
