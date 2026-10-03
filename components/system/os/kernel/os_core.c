@@ -236,9 +236,23 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
 
     const os_module_t *m = os_cur_mod();
     if (!m) { ESP_LOGW(TAG, "action: no active module"); return; }
-    /* HOME (长按返回键3s / 手柄第7键): 强制退出到桌面主菜单 (保留原选中位) */
+    /* HOME (长按返回键3s / 手柄第7键): 退出到桌面主菜单 (保留原选中位) */
     if (a == OS_ACTION_HOME) {
-        os_pop_to_main(ctx);   /* 回主菜单 (内部先清全部弹窗; page_main static 状态保留 → 原位置) */
+        /* ★ 2026-10-03 linit 规范: **全屏游戏 / 独立程序按"退出键"必须先问一句**。
+         *   用户反馈"按退出游戏键都是直接退出" —— 根因就在这里: 短按返回走的是各页自己的
+         *   p_action(已带确认), 而"长按返回 3s"出的 HOME 是**无条件 os_pop_to_main**,
+         *   等于绕过所有确认直接甩回桌面。模拟器游戏之所以有确认, 是它自己在
+         *   eng_task_run_loop 里拦了 HOME/BACK —— 普通应用没有那一层。
+         *   ⚠ 必须带 10 秒超时自动退出: HOME 是"我不管了什么都要出去"的逃生口,
+         *     万一弹窗没人管, 超时兜底保证不会卡死在里面 (与模拟器 eng 同一套语义)。
+         *   非全屏页 (主菜单/设置/应用管家/商店) 仍然直接回桌面, 不添打扰。 */
+        if (m->fullscreen && !m->modal && !s_full_back_dlg && os_dialog_depth() == 0) {
+            s_full_back_dlg = true;
+            os_dialog_confirm_ex(ctx, "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?", /* 退出程序? */
+                                 10000, 0, on_full_back_confirm, NULL);
+            return;
+        }
+        os_pop_to_main(ctx);
         return;
     }
     /* V1.2.x: UI 震动 — 非游戏态下, 方向导航 / 确认 / 返回键触发按键反馈.
@@ -353,11 +367,16 @@ void os_render(ui_ctx_t *ctx)
 {
     /* 屏保: 渲染交给独立监视任务(强制最高级, 不被主循环/游戏阻塞), 此处仅保持
      * 帧持续(needs_redraw), 不再在此刷屏, 避免与监视任务双任务刷屏竞争 */
-    static bool s_prev_ss = false;
+    static bool     s_prev_ss = false;
+    static uint32_t s_wake_ms = 0;
     bool ss_now = os_screensaver_active();
     if (ss_now) { ctx->needs_redraw = true; s_prev_ss = true; return; }
-    bool woke_up = s_prev_ss;     /* 本帧屏保刚退出 → 强制重绘+刷屏一次 */
-    s_prev_ss = false;
+    uint32_t nowms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (s_prev_ss) { s_wake_ms = nowms; s_prev_ss = false; }
+    /* ★ 2026-10-02: 唤醒后**持续**强制重绘 200ms, 不再只靠"退出那一帧"的边沿。
+     *   原因: 屏保监督任务(另一核)可能在唤醒瞬间还画了一帧星空, 把边沿那一帧的页面盖掉
+     *   → 用户看到"按一次键画面定住, 要按第二次才返回"。这里给一个保护窗口兜底。 */
+    bool woke_up = (s_wake_ms != 0) && ((uint32_t)(nowms - s_wake_ms) < 200u);
     if (!ctx->needs_redraw && !woke_up) return;
     if (!ctx->lcd) return;
 

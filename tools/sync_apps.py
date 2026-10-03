@@ -54,7 +54,29 @@ def apps_part():
 #    对应动作: apps/lua/apps 下的包已移出到 backup_lua_apps_20260928/;
 #    C 版已在 components/apps/apps_registry.c 的 s_builtin_apps[] 登记 (工厂内置, 商店不显示)。
 #    ⚠ 要恢复发行 Lua 版: 取消下面 MANIFEST 的注释 + 重跑本脚本 + 撤掉那 10 条内置登记。
-MANIFEST = {}   # 暂空 (数据保留在下方注释里, 恢复时取消注释即可)
+MANIFEST = {
+    # BIOS 装机模拟器（掌机版）: 纯黑白 1bpp，7 家品牌真实菜单结构 + 8 个装机任务。
+    # 数据与电脑版 apps/biossim/biossim.html 同源（tools/biossim_gen_lua.py 生成数据段）。
+    # 源码: ~/Desktop/LinTOS_Lua应用/src/biossim.lua
+    "biossim": ("app", "BIOS模拟器", "系统",
+                "7 家品牌 BIOS 装机模拟: 装 Win11/Linux 要改哪几项, 先在掌机上练", "ICON_DIAG"),
+    # 附近航班雷达 (掌机版): 数据源 adsb.fi 开放接口 (免 key) → 极坐标雷达 + 最近航班列表
+    # + 航班详情卡。源码里带 `--@app need=wifi`: 打开时若未联网, 先弹窗走系统"连接WiFi",
+    # 连上再进 (门禁实现在 components/apps/pages/am_lua.c 的 wl_open()/wl_gate_tick())。
+    # 单文件小游戏示例: 精灵生成 / 按住移动 / 帧计时 / 存档 / 音效 全走桥 API。
+    # 放商店 = 验证"下载安装就能跑"这条链路; 同时双写预装副本便于直接启动。
+    # ★ QQ堂·冒险 (掌机版): 泡泡手感 + 无限分块地图 + 背包/技能成长。
+    # 计划书见 docs/QQ堂冒险-计划书.md (3 遍修订定稿)。参考 qqtang-web 的瓦片码/泡泡/Server 门面。
+    # ★ 《英雄坛说》掌机版 (对标 gmud.online): 全屏 400×300, 原版整图地图 + 原版精灵 + 原版数据。
+    #   数据由 tools/wuxia_gen_data.py 从该站 4 个 JSON 生成 → /store/wuxia_data.lua
+    #   素材由 tools/wuxia_pack.py / wuxia_world_gen.py 打包 → /store/wuxia/
+    "wuxia": ("app", "英雄坛说", "游戏",
+              "原版地图整图 + 原版人物 + 63 张场景: 拜师/行囊/回合战斗/走江湖", "ICON_MINI_GAMES"),
+    "qqtang": ("app", "QQ堂冒险", "游戏",
+               "泡泡炸砖块探无限地牢: 道具/背包/技能升级/越深越难", "ICON_MINI_GAMES"),
+    "planeradar": ("ops", "航班雷达", "运维",
+                   "自动定位当前位置, 扫描附近空域航班: 距离/方位/高度/地速/呼号", "ICON_NETDECT"),
+}
 # MANIFEST = {
 #     "calc":      ("app", "计算器",   "程序", "表达式求值, 支持括号与四则运算",             "ICON_CALC"),
 #     "morse":     ("app", "摩斯电码", "程序", "文本与摩斯码互转, 可发声播放",               "ICON_MORSE"),
@@ -67,6 +89,41 @@ MANIFEST = {}   # 暂空 (数据保留在下方注释里, 恢复时取消注释�
 #     "term":      ("ops", "终端",     "运维", "命令行练习: 4 套系统模拟 + 52 键键盘",     "ICON_TERMINAL"),
 #     "winassist": ("ops", "运维助手", "运维", "远程键鼠操控 Windows 常用面板与诊断命令",   "ICON_WINASSIST"),
 # }
+
+# 商店待装包: 放 SPIFFS 根 (/store/<name>.lua) 让商店"可下载", **不预装**到 apps/{cat}/
+#   (装了就不是"下载安装"了 —— am_store.c 的已装判定就是看 apps/{cat} 里有没有同名文件)
+STORE_ONLY = set()   # ★ 2026-10-03 linit: 商店包与应用副本**二选一** —— 两份会让同一个应用
+                     #   在「商店」和「应用」各出现一次, 看着像"分成两个"。已装的应用只保留
+                     #   /store/apps/<cat>/<name>.lua 一份 (见 targets_of)。
+
+# 能力声明 → LAPP 头部 `--@app need=...`。启动侧据此做门禁:
+#   need=wifi 的应用在未联网时**不直接进**, 先弹确认框 → 复用系统"连接WiFi" → 连上再进
+#   (实现在 components/apps/pages/am_lua.c; 取消/超时则不启动并 toast)。
+NEED = {"planeradar": "wifi"}
+
+
+def targets_of(n):
+    """某个应用要写盘 / 要打包的**全部**路径。
+
+    - 预装副本: apps/lua/apps/{cat}/{n}.lua  → 设备上 /store/apps/{cat}/{n}.lua (应用管家→应用)
+    - 商店包  : apps/lua/{n}.lua            → 设备上 /store/{n}.lua (商店里可下载)
+
+    ⚠ STORE_ONLY 的**两份都写**(2026-10-02 定案)。原因: 整片烧 16MB 会重建整个 SPIFFS,
+      只放商店的话每烧一次应用就没了, 用户得重新去商店装一遍 —— 实测被误判成
+      "应用进去没反应"(其实 /store/apps/app/xxx.lua 不存在 → Lua 页退回文件列表态)。
+      两份内容一致(都过 LAPP 打包), 商店里仍显示"已安装"并可卸载, 语义不变。
+    """
+    inst = os.path.join(DEST_ROOT, MANIFEST[n][0], n + ".lua")
+    if n in STORE_ONLY:
+        store = os.path.normpath(os.path.join(DEST_ROOT, "..", n + ".lua"))
+        return [store, inst]
+    return [inst]
+
+
+def dest_of(n):
+    """兼容旧调用: 打包/校验时的**主**路径"""
+    return targets_of(n)[0]
+
 
 PY = sys.executable
 IDF_SPIFFSGEN = os.path.expanduser(
@@ -97,28 +154,36 @@ def main():
             raise SystemExit("MANIFEST 里没有这个应用: %s (已有: %s)"
                              % (n, ", ".join(MANIFEST)))
 
-    print("① 桌面源码 → 应用安装区")
+    print("① 桌面源码 → 应用安装区 / 商店待装包")
     for n in names:
         cat = MANIFEST[n][0]
         src = os.path.join(SRC_DIR, n + ".lua")
         if not os.path.exists(src):
             raise SystemExit("桌面没有源码: %s" % src)
-        dst_dir = os.path.join(DEST_ROOT, cat)
-        os.makedirs(dst_dir, exist_ok=True)
-        shutil.copy(src, os.path.join(dst_dir, n + ".lua"))
-        print("   %-11s → apps/lua/apps/%s/%s.lua" % (n, cat, n))
+        for t in targets_of(n):
+            os.makedirs(os.path.dirname(t), exist_ok=True)
+            shutil.copy(src, t)
+        if n in STORE_ONLY:
+            print("   %-11s → apps/lua/%s.lua [商店包] + apps/lua/apps/%s/%s.lua [预装]"
+                  % (n, n, cat, n))
+        else:
+            print("   %-11s → apps/lua/apps/%s/%s.lua" % (n, cat, n))
 
     print("② 语法 + 契约闸门")
-    files = [os.path.join(DEST_ROOT, MANIFEST[n][0], n + ".lua") for n in names]
+    files = [t for n in names for t in targets_of(n)]
     run([PY, "tools/lua_check.py"] + files, quiet=False)
 
     print("③ LAPP 打包 (图标取自固件 icons_main.inc, 与主菜单同源)")
     for n in names:
         cat, label, tag, desc, icon = MANIFEST[n]
-        f = os.path.join(DEST_ROOT, cat, n + ".lua")
-        run([PY, "tools/pack_app.py", "pack", f, "--name", label, "--cat", tag,
-             "--desc", desc, "--icon-from-main", icon])
-        print("   ✓ %-11s %s" % (n, label))
+        need = NEED.get(n)
+        for f in targets_of(n):          # 商店包与预装副本都要打 LAPP 头(否则管家读不到名称/图标)
+            cmd = [PY, "tools/pack_app.py", "pack", f, "--name", label, "--cat", tag,
+                   "--desc", desc, "--icon-from-main", icon]
+            if need:
+                cmd += ["--need", need]
+            run(cmd)
+        print("   ✓ %-11s %s%s" % (n, label, ("  (need=%s)" % need) if need else ""))
 
     if args.check_only:
         print("\n[--check-only] 未生成镜像")
@@ -135,6 +200,11 @@ def main():
         quiet=False)
     print("   ✓ build/apps_l.bin (%.2f MB)" % (os.path.getsize(SPIFFS_BIN) / 1048576))
     off = apps_part()[0]
+    store = [n for n in names if n in STORE_ONLY]
+    if store:
+        print("\n商店待装包: %s" % ", ".join(store))
+        print("  设备上的用法: 应用管家 → 商店 → 点它 → 弹「安装 XXX ?」→ 确认 →")
+        print("  复制到 /store/apps/{cat}/ → 回「应用」分类点开即可 (可再卸载)。")
     print("\n完成。烧录时由 merge_flash.sh 把该镜像写到 0x%X (apps 分区, 地址同样读自 partitions.csv)。" % off)
 
 
