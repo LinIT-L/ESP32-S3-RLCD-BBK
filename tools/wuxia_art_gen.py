@@ -186,6 +186,14 @@ def head_ink(mask_rows, res_rows, w, h):
 
 
 def build(src):
+    # ⚠ 极性修正 (2026-10-03, linit 实测"进入界面左右头像颜色反了")：
+    #   male/female_head_res.bmp 的调色板是 palette[0]=黑 / palette[1]=白，
+    #   而 load_1bpp 取的是**调色板索引** ⇒ `res` 原样读出来是"1 = 白"。
+    #   但 pack_hex / app.bmp 的语义是"**1 = 黑(墨)**, 0 = 透明" —— 两者相反，
+    #   原样存下去会在白底反射屏上画成"黑底白图"(整块反相)。
+    #   ⇒ 这两张必须取 ¬res 再存 (= 与 head_ink 的 `mask ∩ ¬res` 同一套极性)。
+    #   `mhead/fhead`(mask) 与 `mport/fport`(mask ∩ ¬res) 本来就对，不动。
+    INVERT = {"mface", "fface"}
     art, meta = {}, []
     for name, (rel, do_crop) in MENU.items():
         p = os.path.join(src, rel)
@@ -193,6 +201,8 @@ def build(src):
             print("  ⚠ 缺素材, 跳过: %s" % rel, file=sys.stderr)
             continue
         w, h, rows = load_1bpp(p)
+        if name in INVERT:
+            rows = [[1 - v for v in row] for row in rows]
         ox = oy = 0
         if do_crop and not is_blank(rows):
             ox, oy, w, h, rows = crop(rows, w, h)

@@ -116,7 +116,7 @@ local ART = {
   check1    = {  8,  6, "fd86c4ac94fc" },
   digit     = { 47,  5, "3622a22223fea7baaefaabbeb622223a237eb6fbbababafe3623a23a23fe" },
   expball   = { 16, 16, "ffeff7cff3aff560c67deffbf7f707fbbffdcff8f7fbeffddf4d8096fdbafffc" },
-  fface     = { 32, 32, "fffc1ffffff007ffffc001ffff8010ffff06887fff08447ffe11823ffe05141ffe24403ffe2a841ffe0b023ffe1788bffe1782bffe07a43ffe13d03ffe21c0bffe95d43ffe13e53ffe8ffabffe2ff83ffcc7719ffbf1c7effdf637dffe27f23ffc0ff81ffbc771eff800800ff0088807f2063027f800000ff849480ff8ec9c2f" },
+  fface     = { 32, 32, "0003e000000ff800003ffe00007fef0000f9778000f7bb8001ee7dc001faebe001dbbfc001d57be001f4fdc001e8774001e87d4001f85bc001ec2fc001de3f40016a2bc001ec1ac00170054001d007c003388e60040e38100209c82001d80dc003f007e004388e1007ff7ff00ff777f80df9cfd807fffff007b6b7f0071363d0" },
   fhead     = { 32, 32, "0003e000000ff800003ffe00007fff0000ffff8000ffff8001ffffc001ffffe001ffffc001ffffe001ffffc001ffffc001ffffc001ffffc001ffffc001ffffc001ffffc001ffffc001ffffc001ffffc003ffffe007fffff003ffffe001ffffc003ffffe007fffff007fffff00ffffff80ffffff807fffff007fffff007fffff0" },
   finger    = { 14, 13, "018002400c80311c43e4800401fc008003808080438021001f00" },
   fp        = { 16,  8, "fff08610bed0bed08e10bef0bef0fff0" },
@@ -126,7 +126,7 @@ local ART = {
   icon1     = {  6,  6, "fc84848484fc" },
   ink       = {  6,  6, "fcf0f0f0c0c0" },
   ink2      = {  3,  3, "e0e0c0" },
-  mface     = { 32, 32, "ffffffffffe081ffff0000fff800001fe060181ffc003007f8304e0fe0181f0fe0353e0fc069080ff84b040ff001000ff200000ff600001ffe00401ffe00601fff00001fff8d741fff89e45ffc19e647f94ffc43f7273903f621e103ec2c0d05e827f8e5f443f3cbf3840f33f0073c03e600f019ee03c91dee0f011de03c1201" },
+  mface     = { 32, 32, "00000000001f7e0000ffff0007ffffe01f9fe7e003ffcff807cfb1f01fe7e0f01fcac1f03f96f7f007b4fbf00ffefff00dfffff009ffffe001ffbfe001ff9fe000ffffe000728be000761ba003e619b806b003bc08d8c6fc09de1efc13d3f2fa17d8071a0bbc0c340c7bf0cc0ff8c3fc19ff0fe611fc36e211f0fee21fc3edfe" },
   mhead     = { 32, 32, "00000000001f7e0000ffff0007ffffe01fffffe003fffff807fffff01ffffff01ffffff03ffffff007fffff00ffffff00dfffff009ffffe001ffffe001ffffe000ffffe0007fffe0007fffe003fffff807fffffc0ffffffc0ffffffc1ffffffe1ffffffe0ffffffc0ffffffc0ffffffc1ffffffe1ffffffe1ffffffe1ffffffe" },
   mport     = { 32, 32, "00000000001f7e0000ffff0007ffffe01f9fe7e003ffcff807cfb1f01fe7e0f01fcac1f03f96f7f007b4fbf00ffefff00dfffff009ffffe001ffbfe001ff9fe000ffffe000728be000761ba003e619b806b003bc08d8c6fc09de1efc13d3f2fa17d8071a0bbc0c340c7bf0cc0ff8c3fc19ff0fe611fc36e211f0fee21fc3edfe" },
   pagedown  = {  8,  4, "80c1e3f7" },
@@ -958,22 +958,46 @@ local function kb_tap()
     end
 end
 
+-- ============================================================================
+-- 进入界面: 只留"标题 + 两张原版主角头像 + 菜单 + 操作提示"。
+--   说明性文字(原版地图/原版人物/场景数)一律不显示 —— 让画面自己说话。
+--   头像用原版 32×32 素材 (ART.mface 男 / ART.fface 女), 与游戏内同源。
+-- ============================================================================
 function UI.entry()
     app.clear(WH)
-    app.mix(148, 46, "英雄坛说", false)
-    app.mix(120, 68, "原版地图 原版人物 63 张场景", false)
-    local y = 120
+
+    -- 标题区: 男女主角头像夹住 24px 中文标题
+    art("mface", 100, 22)
+    app.zh24(152, 26, "英雄坛说", false)
+    art("fface", 268, 22)
+
+    -- 分隔线: 左右两段 + 中间一颗方块 (原版 ART.icon)
+    app.hline(64, 193, 70, BK)
+    app.hline(207, 336, 70, BK)
+    art("icon", 197, 67)
+
+    -- 菜单: 反白=选中, 框外左侧双箭头指示
+    local y = 130
     for i = 1, #ENT do
         local s = (i == GAME.entry_sel)
         local w = app.mixw(ENT[i])
-        local x = 176
-        app.fill(x - 24, y - 4, x + w + 20, y + 19, WH)
-        app.rect(x - 24, y - 4, x + w + 20, y + 19, BK)
-        if s then art("arrow", x - 20, y + 3) end
-        app.mix(x, y, ENT[i], false)
-        y = y + 32
+        local bw = w + 40
+        local bx0 = (400 - bw) / 2
+        local bx1 = bx0 + bw
+        if s then
+            app.fill(bx0, y - 4, bx1, y + 19, BK)
+            app.mix(bx0 + 20, y, ENT[i], true)
+            art("arrowdual", bx0 - 22, y + 3)
+        else
+            app.rect(bx0, y - 4, bx1, y + 19, BK)
+            app.mix(bx0 + 20, y, ENT[i], false)
+        end
+        y = y + 40
     end
-    app.mix(112, 232, "方向键选择   确认=进入   返回=退出", false)
+
+    -- 底部操作提示 (居中)
+    local hint = "方向键选择   确认=进入   返回=退出"
+    app.mix((400 - app.mixw(hint)) / 2, 250, hint, false)
 end
 
 function UI.login()
