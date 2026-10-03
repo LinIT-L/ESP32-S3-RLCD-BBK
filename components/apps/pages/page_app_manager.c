@@ -45,7 +45,12 @@
 #define AM_ICON_X      (AM_CAT_X0 + AM_ICON_GAP + AM_ICON_SIZE / 2)  /* 图标中心 x = 40 (左缘 4px 留白) */
 #define AM_SEL_GAP     2      /* V1.5.x: 选中指示线距图标 2px */
 #define AM_SEL_W       2      /* V1.5.x: 选中指示线宽 2px */
-#define AM_SEL_R       3      /* V1.5.x: 选中指示圆角半径 R3 */
+#define AM_SEL_R       3      /* V1.5.x: 选中指示圆角半径 R3 (左侧四分类栏) */
+/* 子分类当前项的水管框圆角半径。
+ * ⚠ 必须比左栏的 R3 大: 水管壁厚 2px, 所以"**框内**"的圆角半径只有 R-2。
+ *   R=3 时内圈弧度只剩 1px —— 填起来跟正方形没区别, 而 linit 明确要求
+ *   "填充也要保持左上角/右上角的弧度"。R=6 → 内圈 4px, 肉眼清楚。 */
+#define AM_SUB_R       6
 #define AM_GRID_COLS   4      /* 网格列数 */
 #define AM_GRID_ROWS   3      /* 网格可见行数 */
 #define AM_SUB_H       26     /* 顶部子分类条高 */
@@ -531,46 +536,78 @@ static void am_draw_app_icon(ui_ctx_t *ctx, st7305_handle_t *lcd, const os_app_t
 /* 前置声明: 子分类条的水管弯头用它, 实现在下方 (与左栏选中框同一套) */
 static void am_elbow(st7305_handle_t *lcd, int cx, int cy, int r, int kind, st7305_color_t color);
 
+/* 圆角矩形填充 —— ⛔ 别用 fill_rect 代替: 那是**正方形**, 会把水管框的四角弧度盖平
+ * (2026-10-03 linit 报的就是这个: "选中过后不要用正方形, 要填充它那个水管线以内的")。
+ * 每行按圆角裁掉左右两端: 圆心 (x0+r, y0+r) / (x0+r, y1-r) 等, 左端 x = x0 + r - √(r²-dy²)。 */
+static void am_fill_round_rect(st7305_handle_t *lcd, int x0, int y0, int x1, int y1, int r, st7305_color_t c) {
+    if (x1 < x0 || y1 < y0) return;
+    if (r < 0) r = 0;
+    if (r * 2 > (y1 - y0)) r = (y1 - y0) / 2;
+    if (r * 2 > (x1 - x0)) r = (x1 - x0) / 2;
+    for (int y = y0; y <= y1; y++) {
+        int inset = 0;
+        int dy = 0;
+        if (y < y0 + r)      dy = (y0 + r) - y;      /* 上半: 离上圆心 */
+        else if (y > y1 - r) dy = y - (y1 - r);      /* 下半: 离下圆心 */
+        if (dy > 0 && r > 0) {
+            float dx = sqrtf((float)(r * r - dy * dy));
+            inset = r - (int)(dx + 0.5f);
+            if (inset < 0) inset = 0;
+        }
+        draw_hline(lcd, x0 + inset, x1 - inset, y, c);
+    }
+}
+
 static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, int x1) {
     (void)ctx;
     /* 先整条白底, 覆盖拖动/滚动时滑到顶部的图标残留, 保证子分类条固定不被遮挡 */
     fill_rect(lcd, x0, y0, x1, y0 + AM_SUB_H - 1, ST7305_COLOR_WHITE);
     int w = x1 - x0;
     int slot = w / AM_SUB_COUNT;
+    int ybot = y0 + AM_SUB_H - 1;
     for (int i = 0; i < AM_SUB_COUNT; i++) {
         int sx = x0 + i * slot;
         int cx = sx + slot / 2;
-        /* 选中态样式 (2026-10-02 linit 定):
-         *   · 焦点在**顶栏**时 → 当前项整块反色 (黑底白字), 这是唯一的强指示;
-         *   · 焦点在**下面内容区**时 → 当前项不反色, 只用**左右两条竖线**定位;
-         *   · 未选中的项 → **下方各画一条横线**; 当前项**下方不画横线** (给竖线开口)。
-         * ⚠ 原先还画了一个 U 形括号 + 整条底边横线 —— linit 明确要求去掉。 */
         bool cur = (i == s_sub);
-        bool inv = cur && (s_focus_bar == 1);   /* 焦点在顶栏 → 整块反色 (强指示) */
-        if (inv) fill_rect(lcd, sx + 2, y0, sx + slot - 2, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK);
-        am_draw_label(lcd, cx, y0 + 5,
-                      (s_cat == AM_CAT_APP && i == AM_SUB_OPS) ? "\xe5\xa3\x81\xe7\xba\xb8" : s_sub_names[i], inv); /* 应用分类: 运维→壁纸 */
-        if (!inv && cur) {
-            /* ★ 当前项 = **一根 2px 水管线绕出来** (linit 指定照左侧四分类那套做):
-             *   左竖 + 上横 + 右竖 三条线, **下方开口不画线**; 两个上角用 am_elbow()
-             *   90° 外凸圆弧弯头连接 (直边各让位 R). 坐标 y0 就是子分类条顶边,
-             *   所以水管正好把这格圈起来, 与左栏选中观感同族。 */
-            int R  = AM_SEL_R;
-            int ex0 = sx + 1, ex1 = sx + slot - 2;     /* 水管左右外缘 */
-            int ytop = y0, ybot = y0 + AM_SUB_H - 1;
-            draw_vline(lcd, ex0,     ytop + R, ybot, ST7305_COLOR_BLACK);   /* 左竖 (2px) */
-            draw_vline(lcd, ex0 + 1, ytop + R, ybot, ST7305_COLOR_BLACK);
-            draw_vline(lcd, ex1 - 1, ytop + R, ybot, ST7305_COLOR_BLACK);   /* 右竖 (2px) */
-            draw_vline(lcd, ex1,     ytop + R, ybot, ST7305_COLOR_BLACK);
-            draw_hline(lcd, ex0 + R, ex1 - R, ytop,     ST7305_COLOR_BLACK); /* 上横 (2px) */
-            draw_hline(lcd, ex0 + R, ex1 - R, ytop + 1, ST7305_COLOR_BLACK);
-            if (ytop - R >= AM_CAT_Y0 - R) {           /* 上两角外凸圆弧弯头 */
-                am_elbow(lcd, ex0, ytop, R, 1, ST7305_COLOR_BLACK);   /* 左上: 外凸向左上 */
-                am_elbow(lcd, ex1, ytop, R, 3, ST7305_COLOR_BLACK);   /* 右上: 外凸向右上 */
-            }
-        } else if (!cur) {
-            draw_hline(lcd, sx + 4, sx + slot - 5, y0 + AM_SUB_H - 1, ST7305_COLOR_BLACK); /* 未选中: 下方横线 */
+        const char *nm = (s_cat == AM_CAT_APP && i == AM_SUB_OPS)
+                         ? "\xe5\xa3\x81\xe7\xba\xb8" : s_sub_names[i];   /* 应用分类: 运维→壁纸 */
+
+        /* ★ 2026-10-03 linit 定案 —— 当前项的框**永远不变**, 变的只是"框内填不填":
+         *   ① 焦点在顶栏还是在内容区, 画的都是**同一个闭合圆角水管框**
+         *      (左竖 + 上横 + 右竖 + **下横**, 四个角都有弯头), 不再换成一整块黑方块。
+         *      旧版下方是**开口**的, 底部接不上 —— 就是 linit 说的"下面的都没有连接在一起"。
+         *   ② 选中时**不要用正方形填充**: 改成**填在"水管线以内"**, 且四个角保持弧度
+         *      (用 am_fill_round_rect; 旧的 fill_rect 会把左上/右上圆角盖平)。
+         *   ③ 未选中项的下方分隔线**首尾相接连成一条** (旧版两端各留 4px 缺口, 是断的)。 */
+        if (!cur) {
+            draw_hline(lcd, sx, sx + slot - 1, ybot, ST7305_COLOR_BLACK);
+            am_draw_label(lcd, cx, y0 + 5, nm, false);
+            continue;
         }
+
+        int R    = AM_SUB_R;
+        int ex0  = sx + 1, ex1 = sx + slot - 2;        /* 水管左右外缘 */
+        int ytop = y0;
+        bool sel = (s_focus_bar == 1);                 /* 焦点在顶栏 = 选中态 */
+        /* 顺序: 填充 → 描框 → 写字。反了的话框会被填充盖掉。 */
+        if (sel) {
+            /* 内缩 2px (让开水管壁厚), 圆角半径 = R-2 = 水管内圈的弧度 */
+            am_fill_round_rect(lcd, ex0 + 2, ytop + 2, ex1 - 2, ybot - 2,
+                               R - 2, ST7305_COLOR_BLACK);
+        }
+        draw_vline(lcd, ex0,     ytop + R, ybot - R, ST7305_COLOR_BLACK);   /* 左竖 (2px) */
+        draw_vline(lcd, ex0 + 1, ytop + R, ybot - R, ST7305_COLOR_BLACK);
+        draw_vline(lcd, ex1 - 1, ytop + R, ybot - R, ST7305_COLOR_BLACK);   /* 右竖 (2px) */
+        draw_vline(lcd, ex1,     ytop + R, ybot - R, ST7305_COLOR_BLACK);
+        draw_hline(lcd, ex0 + R, ex1 - R, ytop,     ST7305_COLOR_BLACK);    /* 上横 (2px) */
+        draw_hline(lcd, ex0 + R, ex1 - R, ytop + 1, ST7305_COLOR_BLACK);
+        draw_hline(lcd, ex0 + R, ex1 - R, ybot,     ST7305_COLOR_BLACK);    /* 下横 (2px): 封口 */
+        draw_hline(lcd, ex0 + R, ex1 - R, ybot - 1, ST7305_COLOR_BLACK);
+        am_elbow(lcd, ex0, ytop, R, 1, ST7305_COLOR_BLACK);   /* 左上 外凸向左上 */
+        am_elbow(lcd, ex1, ytop, R, 3, ST7305_COLOR_BLACK);   /* 右上 外凸向右上 */
+        am_elbow(lcd, ex0, ybot, R, 2, ST7305_COLOR_BLACK);   /* 左下 外凸向左下 */
+        am_elbow(lcd, ex1, ybot, R, 4, ST7305_COLOR_BLACK);   /* 右下 外凸向右下 */
+        am_draw_label(lcd, cx, y0 + 5, nm, sel);
     }
 }
 
