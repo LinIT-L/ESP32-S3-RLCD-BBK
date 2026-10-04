@@ -58,7 +58,7 @@ MANIFEST = {
     # BIOS 装机模拟器（掌机版）: 纯黑白 1bpp，7 家品牌真实菜单结构 + 8 个装机任务。
     # 数据与电脑版 apps/biossim/biossim.html 同源（tools/biossim_gen_lua.py 生成数据段）。
     # 源码: ~/Desktop/LinTOS_Lua应用/src/biossim.lua
-    "biossim": ("app", "BIOS模拟器", "系统",
+    "biossim": ("ops", "BIOS模拟器", "运维",
                 "7 家品牌 BIOS 装机模拟: 装 Win11/Linux 要改哪几项, 先在掌机上练", "ICON_DIAG"),
     # 附近航班雷达 (掌机版): 数据源 adsb.fi 开放接口 (免 key) → 极坐标雷达 + 最近航班列表
     # + 航班详情卡。源码里带 `--@app need=wifi`: 打开时若未联网, 先弹窗走系统"连接WiFi",

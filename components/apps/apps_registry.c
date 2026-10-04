@@ -81,7 +81,7 @@ static const os_app_t s_builtin_apps[] = {
     /* 商店可下载应用 (默认隐藏, 从应用管家"商店"下载后解隐加入主菜单) */
     { .id="secure",   .label="密钥管理器", .icon_idx=ICON_SECURE, .page=OS_PAGE_PLACEHOLDER_SECURE, .hidden=true, .cat="程序" }, /* 密钥管理器 程序 */
     { .id="fav",   .label="收藏夹", .icon_idx=ICON_FAV, .page=OS_PAGE_FAV, .hidden=true, .cat="程序" }, /* 收藏夹 程序 (ICON_FAV) */
-    { .id="sdr", .label="频谱仪", .icon_idx=ICON_WIFIPROBE, .page=OS_PAGE_SDR, .hidden=true, .cat="系统" }, /* 频谱仪 (new_app.py) */
+    { .id="sdr", .label="频谱仪", .icon_idx=ICON_WIFIPROBE, .page=OS_PAGE_SDR, .hidden=true, .cat="运维" }, /* 频谱仪 运维 (2026-10-03 linit: 原 cat=系统, 改归运维) */
 };
 #define BUILTIN_APP_COUNT (sizeof(s_builtin_apps) / sizeof(s_builtin_apps[0]))
 

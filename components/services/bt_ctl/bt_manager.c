@@ -334,6 +334,24 @@ void bt_manager_poll_auto_reconnect(void)
     /* V1.5.x: 已有扫描在进行 (长按确认键扫描弹窗/添加设备) → 仅挂起自动回连标志,
      * 由扫描完成回调在结果里匹配回连目标连接, 不重复发起扫描 (避免 old-results 扫描风暴). */
     if (bt_manager_is_scanning()) return;
+
+    /* ★ 2026-10-04 修 (实测根因): 原先这里**直接** bt_core_scan(5), 没有确保蓝牙核心已使能。
+     *   本工程的蓝牙是"按需开启 + 预算用尽就关栈省内部 RAM"(见文件头与 bt_reconnect_task),
+     *   所以走到这里时栈往往**是关着的** → esp_hid_scan → esp_ble_gap_set_scan_params
+     *   返回 259 (ESP_ERR_INVALID_STATE) → "scan done: 0 devices" → 配对永远失败。
+     *
+     *   ⛔ 不能在这里直接调 core_ensure_init() 补上: 它会经 esp_bt_controller_init 禁用 cache,
+     *      只有**栈在内部 RAM** 的任务才安全 (见 bt_manager_init 的注释: 放 PSRAM 栈会触发
+     *      esp_task_stack_is_sane_cache_disabled() 断言 → 卡死重启)。本函数由屏保监督等
+     *      上层任务驱动, 栈不保证在内部 RAM。
+     *   ✅ 正解 = 交回 bt_rec 任务: 它的静态栈固定在内部 RAM, 会自己 core_ensure_init()
+     *      再回连 (连不上还会按名字补一次短扫, 行为等价)。
+     *   判据: s_inited 为假就说明栈没起来, 这时候扫是白扫。 */
+    if (!s_inited) {
+        ESP_LOGW(TAG, "[EV] 蓝牙栈未使能 → 交给 bt_rec 任务初始化后再回连 (避免 259)");
+        bt_manager_wake_reconnect();
+        return;
+    }
     bt_core_scan(5);
 }
 
