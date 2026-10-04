@@ -1,0 +1,75 @@
+{
+  "ver": 1,
+  "site": "https://bbk.linit.cn/bbk",
+  "updated": "2026-10-04 10:41:55",
+  "mirrors": [
+    "https://bbk.linit.cn/bbk",
+    "https://bbk.linit.cn/bbk-mirror",
+    "https://gitee.com/LinIT-L/ESP32-S3-RLCD-BBK/raw/master/store"
+  ],
+  "pkgs": [
+    {
+      "name": "bikecomp",
+      "label": "码表",
+      "cat": "app",
+      "ver": 1,
+      "size": 18125,
+      "crc32": "5ea41d4a",
+      "path": "pkgs/bikecomp.lua"
+    },
+    {
+      "name": "earthsurvival",
+      "label": "地球生存",
+      "cat": "app",
+      "ver": 1,
+      "size": 32297,
+      "crc32": "5bec895f",
+      "path": "pkgs/earthsurvival.lua"
+    },
+    {
+      "name": "minidayz",
+      "label": "迷你DayZ",
+      "cat": "app",
+      "ver": 1,
+      "size": 55680,
+      "crc32": "11979efe",
+      "path": "pkgs/minidayz.lua"
+    },
+    {
+      "name": "qqtang",
+      "label": "QQ堂冒险",
+      "cat": "app",
+      "ver": 1,
+      "size": 81773,
+      "crc32": "e413aa54",
+      "path": "pkgs/qqtang.lua"
+    },
+    {
+      "name": "wuxia",
+      "label": "英雄坛说",
+      "cat": "app",
+      "ver": 1,
+      "size": 63947,
+      "crc32": "21991991",
+      "path": "pkgs/wuxia.lua"
+    },
+    {
+      "name": "biossim",
+      "label": "BIOS模拟器",
+      "cat": "ops",
+      "ver": 1,
+      "size": 211533,
+      "crc32": "bdbf774c",
+      "path": "pkgs/biossim.lua"
+    },
+    {
+      "name": "planeradar",
+      "label": "航班雷达",
+      "cat": "ops",
+      "ver": 1,
+      "size": 29339,
+      "crc32": "dafca046",
+      "path": "pkgs/planeradar.lua"
+    }
+  ]
+}
