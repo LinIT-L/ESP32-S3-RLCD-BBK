@@ -68,6 +68,11 @@ static int es8311_read_reg(uint8_t reg, uint8_t *val) {
     return ret;
 }
 
+/* 是否做"全 I2C 总线扫描(0x08..0x77)"。默认关 —— 那一步在无 codec 的板子上要多花约 6 秒。 */
+#ifndef ES8311_I2C_FULL_SCAN
+#define ES8311_I2C_FULL_SCAN 0
+#endif
+
 int es8311_init(int sda, int scl) {
     if (s_initialized) return 0;
 
@@ -93,9 +98,14 @@ int es8311_init(int sda, int scl) {
         return -1;
     }
 
-    /* 扫描 I2C 总线, 确认有哪些设备, 同时判断 ES8311 是否存在 */
-    ESP_LOGI(TAG, "I2C 总线扫描:");
+    /* 探测 ES8311 是否存在。
+     * ★★ 2026-10-05: **原来这里扫 0x08..0x77 共 112 个地址**, 每个不存在/无应答的地址都要
+     *   等满 50ms 超时 ⇒ **无 codec 的板子开机白等 ≈5.6 秒**(实测整机开机多花约 7 秒)。
+     *   现在只探 ES8311 的两个可能地址 0x18 / 0x1A, 各一次、超时 20ms ⇒ 总耗时 < 50ms。
+     *   想再看整条 I2C 总线上有哪些设备时, 把 ES8311_I2C_FULL_SCAN 置 1 (那种场景才值得花几秒)。 */
     bool found = false;
+#if ES8311_I2C_FULL_SCAN
+    ESP_LOGI(TAG, "I2C 总线扫描 (全地址 0x08..0x77):");
     for (int addr = 0x08; addr < 0x78; addr++) {
         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
         i2c_master_start(cmd);
@@ -108,6 +118,22 @@ int es8311_init(int sda, int scl) {
             if (addr == 0x18 || addr == 0x1A) found = true;   /* ES8311 两个可能地址 */
         }
     }
+#else
+    for (int i = 0; i < 2; i++) {
+        int addr = (i == 0) ? 0x18 : 0x1A;
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t err = i2c_master_cmd_begin(s_i2c_port, cmd, pdMS_TO_TICKS(20));
+        i2c_cmd_link_delete(cmd);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "  ES8311 在 0x%02X 有应答", addr);
+            found = true;
+        }
+    }
+    if (!found) ESP_LOGI(TAG, "  I2C 0x18/0x1A 均无应答 (已跳过全总线扫描: 那一步要多花约 6 秒)");
+#endif
 
     if (!found) {
         /* 本机主板未焊 ES8311 (部分机型如此): 标记不存在, 跳过全部寄存器配置.

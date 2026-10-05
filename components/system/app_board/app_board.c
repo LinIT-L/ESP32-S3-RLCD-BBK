@@ -138,7 +138,7 @@ void app_board_init_battery(app_board_t *board)
     esp_err_t bat_ret = board_battery_init();
     board->battery_ok = (bat_ret == ESP_OK);
     if (board->battery_ok) {
-        ESP_LOGI(TAG, "电池 ADC 初始化成功 (GPIO4, 分压200K/100K)");
+        ESP_LOGI(TAG, "电池 ADC 初始化成功 (细节见 board_battery 的日志)");
     } else {
         ESP_LOGW(TAG, "电池 ADC 初始化失败: %s", esp_err_to_name(bat_ret));
     }

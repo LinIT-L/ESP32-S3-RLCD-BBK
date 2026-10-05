@@ -51,8 +51,13 @@ static const char *TAG = "AUDIO";
  * 46 旧板 = PA 功放使能, 新板(NS4168) = CTRL 静音. 仅 NS4168 平台由本驱动当 CTRL 用;
  * ES8311 平台 46 归功放使能, 静音走软静音. */
 #define NS_CTRL_PIN GPIO_NUM_46
-#define I2C_SDA     13
-#define I2C_SCL     14
+/* ★ 2026-10-05 小智模块板 (分支 board/xiaozhi-s3-core): codec 控制 I2C 从 13/14 改到 **38/47**。
+ *   依据: 厂商规格书明写 `ES8311/ES7210 的 I2C_SDA/SCL 连接到 ESP32 的 IO38/IO47`，
+ *   而且这两个脚**没有引出到焊盘**(模块内部走线) —— 固件直接用即可。
+ *   ⛔ **必须改**: 13/14 现在是 **TF 卡的数据线**(TF CLK=13 / D0=14)，
+ *     音频 I2C 再去驱动这两个脚 = **和 TF 卡抢线**，会把卡读挂/读错。 */
+#define I2C_SDA     38
+#define I2C_SCL     47
 
 /* 解码缓冲区 (PSRAM) */
 #define MP3_FRAME_BUF_SIZE  4096        /* MP3 帧数据读取缓冲 */

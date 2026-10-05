@@ -18,12 +18,24 @@ static const char *TAG = "board_battery";
  *
  * ADC 测 BAT_ADC 该点电压，等于 VBAT 的 1/3，软件乘以 3 得电池电压。
  * ⚠️ 官方板（微雪 RLCD-4.2）亦为 200K/100K ÷3，系数一致。
+ *
+ * ★★ 2026-10-05 小智模块板（分支 board/xiaozhi-s3-core）—— **脚位改成 GPIO3**：
+ *   `ESP32-S3-AI-2E` 模块**内部**自带电池分压并接到 **GPIO3**（该脚**没有引出到焊盘**，
+ *   所以规格书上看不到 —— 焊盘 15 那个位置被 `VOP`(功放输出正) 占了，但**芯片内部照常可用**）。
+ *   好处：**外部不用再画分压**，直接从模块读。
+ *   ⚠ GPIO3 = **`ADC1_CH2`**（ESP32-S3 的 ADC1 覆盖 GPIO1..10）。选 ADC1 是对的 ——
+ *     **只有 ADC2 会和 WiFi 抢**，ADC1 在 WiFi 跑着时也能读。旧脚 GPIO4 是 ADC1_CH3，同理。
+ *   ⇒ 顺带 **GPIO4 空出来了**（旧板仍用它，别动 main）。
+ *   ❓ **待校准**：模块内部分压比未知。现暂按 ÷3（= 旧板系数）。上机后拿万用表量一次真实
+ *     VBAT，和固件打印的 mv 对比一下：若固件读数 ≈ 真实值×(3/k)，就把下面的 NUM/DEN 改成 k。
  */
 #define BOARD_BATTERY_ADC_UNIT        ADC_UNIT_1
-#define BOARD_BATTERY_ADC_CHANNEL     ADC_CHANNEL_3
+#define BOARD_BATTERY_ADC_CHANNEL     ADC_CHANNEL_2   /* GPIO3 (模块内部电池分压) */
+#define BOARD_BATTERY_ADC_CH          2               /* 同上, 纯为日志打印 */
+#define BOARD_BATTERY_ADC_GPIO_NAME   "GPIO3"         /* 同上, 纯为日志打印 */
 #define BOARD_BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12
 #define BOARD_BATTERY_SAMPLE_COUNT    8
-#define BOARD_BATTERY_DIVIDER_NUM     3      /* = (2M+1M)/1M, 自制板 2M:1M ÷3 */
+#define BOARD_BATTERY_DIVIDER_NUM     3      /* ❓暂按 ÷3，待用万用表校准 */
 #define BOARD_BATTERY_DIVIDER_DEN     1
 
 /*
@@ -109,7 +121,29 @@ esp_err_t board_battery_init(void)
     board_battery_init_calibration();
 
     s_initialized = true;
-    ESP_LOGI(TAG, "Battery ADC initialized: GPIO4 ADC1_CH3, divider 2M/1M (x3)");
+    ESP_LOGI(TAG, "Battery ADC initialized: %s ADC1_CH%d, divider x%d/%d",
+             BOARD_BATTERY_ADC_GPIO_NAME, BOARD_BATTERY_ADC_CH, 
+             BOARD_BATTERY_DIVIDER_NUM, BOARD_BATTERY_DIVIDER_DEN);
+
+    /* ★ 2026-10-05 一次性自检打印 —— 用来**校准分压比**。
+     * 小智模块的电池分压做在**模块内部**(接 GPIO3)，阻值未知；拿万用表量一下真实 VBAT，
+     * 和下面 "脚上" 那行对比即可算出真实分压比:
+     *     真实分压比 k = 真实 VBAT(mV) / 脚上电压(mV)
+     * 然后把上面的 DIVIDER_NUM/DEN 改成 k 即可 (例: k≈2 → NUM=2, DEN=1)。 */
+    {
+        int raw0 = 0;
+        if (adc_oneshot_read(s_adc_handle, BOARD_BATTERY_ADC_CHANNEL, &raw0) == ESP_OK) {
+            int pin_mv = -1;
+            if (s_calibrated && s_cali_handle) {
+                adc_cali_raw_to_voltage(s_cali_handle, raw0, &pin_mv);
+            }
+            ESP_LOGI(TAG, "电池自检: raw=%d 脚上=%d mV  ⇒ 按现系数(%d/%d)算出 VBAT≈%d mV"
+                          "   [拿万用表量真实 VBAT 对比即可校准]",
+                     raw0, pin_mv,
+                     BOARD_BATTERY_DIVIDER_NUM, BOARD_BATTERY_DIVIDER_DEN,
+                     pin_mv > 0 ? pin_mv * BOARD_BATTERY_DIVIDER_NUM / BOARD_BATTERY_DIVIDER_DEN : -1);
+        }
+    }
     return ESP_OK;
 }
 
