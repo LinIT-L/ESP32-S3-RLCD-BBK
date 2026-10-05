@@ -35,7 +35,7 @@
 
 typedef struct {
     os_app_t app;
-    char     id[48];     /* pkg:xxx.lua */
+    char     id[56];     /* pkg:xxx.lua (fname 最长 48 → "pkg:" 前缀 + NUL 要塞得下) */
     char     label[48];  /* 中文名 */
     char     cat[16];    /* 分类文件夹 engine/game/app */
     char     src[192];   /* 源完整路径 */
@@ -44,6 +44,8 @@ typedef struct {
     int      pref;       /* 推荐安装目标: 0=内置固件 1=TF卡 */
     char     fname[48];  /* 文件名 xxx.lua */
     char     desc[96];   /* LAPP 简介 (无打包则空) */
+    uint8_t  kind;       /* 0=本地已有包(可安装)  1=云端包(需先下载) —— 2026-10-04 */
+    int16_t  ridx;       /* kind=1 时: 对应 am_rstore_get() 的下标 */
 } am_pkg_entry_t;
 static EXT_RAM_BSS_ATTR am_pkg_entry_t s_pkg[AM_PKG_MAX];
 static int s_pkg_n = 0;
@@ -51,6 +53,16 @@ static volatile int s_pkg_scanned = -1;   /* 0=已扫描 (数据可用)  -1=未�
 static volatile bool s_pkg_busy  = false;   /* 后台扫描任务进行中 */
 static volatile bool s_pkg_done  = false;   /* 后台扫描已完成 (UI 线程取货) */
 static bool s_pkg_inst[AM_PKG_MAX]; /* 每包安装状态缓存: 渲染用, 避免每帧 fopen(SD/SPIFFS 慢)致商店卡顿 */
+
+/* ---- 云端包视图 (2026-10-04) ----
+ * 索引里的包**不直接进 s_pkg[]** —— s_pkg[] 是后台扫描任务的产物, 而索引是另一个
+ * 后台任务在稍后才送到的, 两边写同一个数组必炸。这里单独开一张"只读视图",
+ * 由 UI 线程在 am_store_tick() 里按索引重建 (`kind=1`), 渲染/点击都当成普通条目用。
+ * 同一个包一旦被下载到商店源目录, 下次扫描就进了 s_pkg[], 本视图自动把它剔掉。 */
+#define AM_RVIEW_MAX 40
+static EXT_RAM_BSS_ATTR am_pkg_entry_t s_rview[AM_RVIEW_MAX];
+static int  s_rview_n = 0;
+static int  s_rview_synced = -1;    /* 已按 am_rstore_count()=几 建过 (-1=还没建) */
 
 /* 商店包元数据表已移除 (2026-09-19): 原 10 个预置包(Lua 单文件版)已弃用删除。
  * 商店改为"扫到什么列什么", 显示名直接用文件名(以后要中文名可在包内 AppInfo 里带)。 */
@@ -222,6 +234,62 @@ static int am_pkg_find(const os_app_t *a) {
         if (&s_pkg[i].app == a) return i;
     return -1;
 }
+
+/* ---- 云端视图 ---- */
+static int am_rview_find(const os_app_t *a) {
+    for (int i = 0; i < s_rview_n; i++)
+        if (&s_rview[i].app == a) return i;
+    return -1;
+}
+/* 按当前索引重建云端视图 (UI 线程调用; 索引没变就什么都不做)。
+ * ⚠ 已下载到商店源目录的包要**剔掉** —— 否则它会以"云端条目"再出现一次, 同一个包
+ *   在列表里显示两条(一条可安装、一条还在"下载"), 与"商店里两个 BIOS 模拟器"同款 bug。 */
+static void am_store_sync_remote(void) {
+    if (!am_store_ready()) return;
+    int want = am_rstore_count();
+    if (want == s_rview_synced) return;
+    s_rview_n = 0;
+    for (int i = 0; i < want && s_rview_n < AM_RVIEW_MAX; i++) {
+        const am_rpkg_t *rp = am_rstore_get(i);
+        if (!rp || !rp->name[0]) continue;
+        char fn[48];
+        snprintf(fn, sizeof(fn), "%s.lua", rp->name);
+        bool dup = false;
+        for (int k = 0; k < s_pkg_n; k++)
+            if (strcmp(s_pkg[k].fname, fn) == 0) { dup = true; break; }
+        if (dup) continue;                       /* 本地已有 → 走本地那条 */
+        am_pkg_entry_t *e = &s_rview[s_rview_n];
+        memset(e, 0, sizeof(*e));
+        e->kind  = 1;
+        e->ridx  = (int16_t)i;
+        e->pref  = 0;
+        snprintf(e->fname, sizeof(e->fname), "%s", fn);
+        snprintf(e->label, sizeof(e->label), "%s", rp->label);
+        /* ⚠ cat 一律取 "app": 下载完成后本地扫描 (am_pkg_scan) 也是按 "app" 建的条目,
+         *   两边必须同源, 否则"下载前/下载后"的安装目录会不一致。索引里的 cat 暂只作参考。 */
+        snprintf(e->cat,   sizeof(e->cat),   "app");
+        snprintf(e->id,    sizeof(e->id),    "pkg:%s", fn);
+        snprintf(e->src,   sizeof(e->src),   "%s/%s", AM_STORE_SRC2, fn);
+        snprintf(e->dst,   sizeof(e->dst),   "%s/app/%s", AM_STORE_DST, fn);
+        snprintf(e->dst_sd,sizeof(e->dst_sd),"/sdcard/apps/app/%s", fn);
+        e->app.id   = e->id;
+        e->app.label = e->label;
+        e->app.icon_idx = am_store_icon_of(fn);
+        e->app.page   = OS_PAGE_LUA;
+        e->app.hidden = true;
+        e->app.touch_only = false;
+        e->app.cat    = NULL;
+        e->app.reveal = false;
+        s_rview_n++;
+    }
+    s_rview_synced = want;
+}
+/* 总条目数 / 取第 k 条: 前 s_pkg_n 条是本地包, 后面接云端视图 */
+static int am_total_n(void) { return (s_pkg_scanned == 0) ? (s_pkg_n + s_rview_n) : 0; }
+static const am_pkg_entry_t *am_entry(int k) {
+    if (k < 0 || k >= am_total_n()) return NULL;
+    return (k < s_pkg_n) ? &s_pkg[k] : &s_rview[k - s_pkg_n];
+}
 static bool am_pkg_installed(int i) {
     if (i < 0 || i >= s_pkg_n) return false;
     /* 内置(/store/apps) 或 TF 卡(/sdcard/apps) 任一存在即算已安装 —— 必须与
@@ -261,12 +329,40 @@ static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
     os_dialog_pop(ctx);
     ctx->needs_redraw = true;
 }
+/* ========== 商店 云端包: 先下载到商店源目录, 再走普通安装 (2026-10-04) ==========
+ * 下载成功 → 文件落在 /sdcard/store_pkg (或 SPIFFS /store 根) → 与用户自己拷进去的包
+ * **完全等价**, 重扫后就从"云端条目"变成"本地条目", 安装逻辑一行都不用改。 */
+static void am_store_dl_cb(ui_ctx_t *ctx, int result, void *ud) {
+    int rk = (int)(long)ud;
+    if (result != 0) { am_rebuild_keep(); return; }   /* 取消: 弹窗由框架自动关 */
+    int rpos = (rk >= 0 && rk < s_rview_n) ? s_rview[rk].ridx : -1;
+    if (rpos < 0 || !am_rstore_dl_start(rpos))
+        os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe5\xbc\x80\xe5\xa7\x8b\xe4\xb8\x8b\xe8\xbd\xbd"); /* 无法开始下载 */
+    am_rebuild_keep();
+    os_dialog_pop(ctx);
+    ctx->needs_redraw = true;
+}
+/* 云端条目被点 → 弹"下载 XX (123KB)?" */
+static void am_store_download_ask(ui_ctx_t *ctx, int rk) {
+    if (rk < 0 || rk >= s_rview_n) return;
+    const am_rpkg_t *rp = am_rstore_get(s_rview[rk].ridx);
+    char title[72];
+    if (rp)
+        snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s (%uKB)?",   /* 下载 XX (NKB)? */
+                 rp->label, (unsigned)((rp->size + 1023u) / 1024u));
+    else
+        snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s?", s_rview[rk].label);
+    os_dialog_confirm_ex(ctx, title, 0, 0, am_store_dl_cb, (void *)(long)rk);
+}
+
 /* ★ 商店行统一入口 (2026-10-02 linit: "商店只负责安装/卸载, 卸载不负责启动应用"):
- *   已安装 → 弹"卸载 XXX?" ; 未安装 → 弹"安装 XXX?" 。
+ *   已安装 → 弹"卸载 XXX?" ; 未安装 → 弹"安装 XXX?" ; 云端未下载 → 弹"下载 XXX?" 。
  *   **商店里永远不启动应用** —— 要运行请到「应用」分类点它。
  *   (原来已安装时走这里会直接运行, 用户点了按钮却跑起来、卸载还藏在长按里, 等于点不到) */
 void am_store_toggle(ui_ctx_t *ctx, const os_app_t *a) {
     if (!a) return;
+    int rk = am_rview_find(a);
+    if (rk >= 0) { am_store_download_ask(ctx, rk); return; }   /* 云端包: 先下载 */
     int k = am_pkg_find(a);
     if (k < 0) return;
     if (am_pkg_installed(k)) { am_store_uninstall_ask(ctx, a); return; }
@@ -275,6 +371,8 @@ void am_store_toggle(ui_ctx_t *ctx, const os_app_t *a) {
 
 /* 商店选中: 已安装(内置或卡) → 运行; 未安装 → 弹"安装 XXX?" 确认 (目标是应用默认, 不选) */
 void am_store_activate(ui_ctx_t *ctx, const os_app_t *a) {
+    int rk = am_rview_find(a);
+    if (rk >= 0) { am_store_download_ask(ctx, rk); return; }   /* 云端包: 先下载 */
     int k = am_pkg_find(a);
     if (k < 0) return;
     if (am_pkg_installed(k)) {
@@ -322,36 +420,64 @@ void am_store_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a) {
 
 /* ==================== 对外接口 (声明见 am_internal.h) ==================== */
 bool am_store_ready(void) { return s_pkg_scanned == 0; }
-int  am_store_count(void) { return (s_pkg_scanned == 0) ? s_pkg_n : 0; }
+int  am_store_count(void) { return am_total_n(); }
 
 const os_app_t *am_store_app(int k) {
-    return (k >= 0 && k < s_pkg_n) ? &s_pkg[k].app : NULL;
+    const am_pkg_entry_t *e = am_entry(k);
+    return e ? &e->app : NULL;
 }
-bool am_store_owns(const os_app_t *a) { return am_pkg_find(a) >= 0; }
+bool am_store_owns(const os_app_t *a) { return am_pkg_find(a) >= 0 || am_rview_find(a) >= 0; }
 bool am_store_installed_of(const os_app_t *a) {
     int k = am_pkg_find(a);
-    return (k >= 0) && s_pkg_inst[k];   /* 读缓存: 渲染路径不能逐帧 fopen */
+    /* 读缓存: 渲染路径不能逐帧 fopen。云端包 (kind=1) 永远不算"已装"—— 还没下载呢 */
+    return (k >= 0) && s_pkg_inst[k];
 }
 const char *am_store_fname_of(const os_app_t *a) {
     int k = am_pkg_find(a);
-    return (k >= 0) ? s_pkg[k].fname : NULL;
+    if (k >= 0) return s_pkg[k].fname;
+    int r = am_rview_find(a);
+    return (r >= 0) ? s_rview[r].fname : NULL;
 }
-/* 商店包简介 (LAPP `desc=`); 非商店包/无简介返回 NULL。
- * 商店行第二行改用它 —— 原来显示 fname 等于给用户看文件名, 没信息量。 */
-const char *am_store_desc_of(const os_app_t *a) {
+/* 商店行第二行文案: 本地包 → LAPP 简介 (可能 NULL → 不画);
+ *                    云端包 → "未下载 · NKB" (让用户知道点了要下多少) */
+const char *am_store_sub_of(const os_app_t *a) {
     int k = am_pkg_find(a);
-    return (k >= 0 && s_pkg[k].desc[0]) ? s_pkg[k].desc : NULL;
+    if (k >= 0) return s_pkg[k].desc[0] ? s_pkg[k].desc : NULL;
+    int r = am_rview_find(a);
+    if (r < 0) return NULL;
+    const am_rpkg_t *rp = am_rstore_get(s_rview[r].ridx);
+    if (!rp) return NULL;
+    static char s_sub[40];   /* 渲染路径每帧调, 不能 malloc */
+    snprintf(s_sub, sizeof(s_sub), "\xe6\x9c\xaa\xe4\xb8\x8b\xe8\xbd\xbd \xc2\xb7 %uKB",  /* 未下载 · NKB */
+             (unsigned)((rp->size + 1023u) / 1024u));
+    return s_sub;
 }
-/* 目录变化(装入/卸载)后调用: 下次进商店重新扫描 */
-/* 目录变化(装入/卸载)后调用: 下次进商店重新扫描。
+/* 右侧按钮文案: 下载 / 卸载 / 安装 (同一行只会是其中一种) */
+const char *am_store_btn_of(const os_app_t *a) {
+    if (am_rview_find(a) >= 0) return "\xe4\xb8\x8b\xe8\xbd\xbd";        /* 下载 */
+    return am_store_installed_of(a) ? "\xe5\x8d\xb8\xe8\xbd\xbd"          /* 卸载 */
+                                    : "\xe5\xae\x89\xe8\xa3\x85";          /* 安装 */
+}
+/* 目录变化(装入/卸载/下载完成)后调用: 下次进商店重新扫描。
  * ⚠ 不要清 s_pkg_busy —— 扫描任务可能还在跑, 清了就允许**再起一个并发扫描**,
  *   两个任务交错写 s_pkg[] 会产生同名重复条目(2026-10-02 linit 报的"商店里有两个"). */
-void am_store_invalidate(void) { s_pkg_scanned = -1; s_pkg_done = false; }
-
-/* 每帧取货: 后台扫描完成后刷新"安装状态"缓存; 返回 true = UI 应重建列表 */
-bool am_store_tick(void) {
-    if (!s_pkg_done) return false;
+void am_store_invalidate(void) {
+    s_pkg_scanned = -1;
     s_pkg_done = false;
-    am_pkg_cleanup();
-    return true;
+    s_rview_synced = -1;      /* 云端视图也要重算(刚下载的包要从"云端"挪到"本地") */
+}
+
+/* 每帧取货: ① 后台扫描完成 → 刷新安装状态缓存 ② 按索引重建云端视图;
+ * 返回 true = UI 应重建列表 */
+bool am_store_tick(void) {
+    bool changed = false;
+    if (s_pkg_done) {
+        s_pkg_done = false;
+        am_pkg_cleanup();
+        changed = true;
+    }
+    int before = s_rview_n;
+    am_store_sync_remote();
+    if (s_rview_n != before) changed = true;
+    return changed;
 }

@@ -798,6 +798,18 @@ class Sim:
     # (让脚本里的 loading 分支真的被走到)。
     def _fetch_start(self, url, timeout=8000):
         u = str(url)
+        # ★ 本地回环 → **走真实 HTTP**（2026-10-04 加：为了在本地把"应用商店联网下载"
+        #   这条链路跑通 —— 脚本指向 http://127.0.0.1:PORT/... 就能真的拉到文件）。
+        #   其余仍用假 payload，保证既有应用（测速/航班雷达）的回归不变。
+        if u.startswith("http://127.0.0.1") or u.startswith("http://localhost"):
+            try:
+                import urllib.request
+                with urllib.request.urlopen(u, timeout=max(1, int(timeout) // 1000)) as r:
+                    body = r.read()
+                self._fetch = {"url": u, "n": 1, "body_bytes": body, "code": 200}
+            except Exception as e:
+                self._fetch = {"url": u, "n": 1, "err": str(e)}
+            return True
         if "ip.sb" in u:
             payload = FAKE_GEO_IPSB
         elif "ip-api" in u:
@@ -815,6 +827,19 @@ class Sim:
         if st["n"] > 0:
             st["n"] -= 1
             return ("wait",)
+        if "err" in st:
+            err = st["err"]
+            self._fetch = None
+            return ("err", "", -1, err)
+        if "body_bytes" in st:                    # 本地真实 HTTP 的字节体
+            b = st["body_bytes"]
+            self._fetch = None
+            # ⚠ lupa 把 Python str 按 UTF-8 编回 Lua 串 ⇒ 只有**合法 UTF-8**能无损往返。
+            #   商店包是 .lua 文本(UTF-8) ✓ 没问题; 纯二进制要走 hex 通道(见技能)。
+            try:
+                return ("ok", b.decode("utf-8"), 200)
+            except UnicodeDecodeError:
+                return ("ok", b.decode("latin-1"), 200)
         body = st.get("body", FAKE_ADSB)
         self._fetch = None
         return ("ok", body, 200)

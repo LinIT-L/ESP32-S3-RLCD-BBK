@@ -873,14 +873,15 @@ static void am_col_render_list(void) {
                         a ? a->icon_idx : 0, sel);
         am_col_text_l(AM_ROW_TX, y + 6, nm, sel);
         if (s_cat == AM_CAT_STORE) {
-            /* 第二行显示**包简介** (LAPP desc=), 不再显示文件路径/文件名 ——
+            /* 第二行 = 文案 (本地包 → LAPP 简介 desc=; 云端包 → "未下载 · NKB"),
+             * 不再显示文件路径/文件名 ——
              * 用户原话: "模拟器下方不要显示路径名称, 直接显示对应说明"。 */
-            const char *ds = am_store_desc_of(a);
+            const char *ds = am_store_sub_of(a);
             if (ds && ds[0])
                 am_col_text_l(AM_ROW_TX, y + 27,
                               am_col_ellipsis(ds, AM_ROW_BTN_X0 - 4 - AM_ROW_TX), sel);
-            bool inst = am_store_installed_of(a);      /* 读缓存, 不逐帧 fopen */
-            const char *act = inst ? "\xe5\x8d\xb8\xe8\xbd\xbd" : "\xe5\xae\x89\xe8\xa3\x85"; /* 卸载/安装 */
+            /* 按钮文案由商店给 (安装 / 卸载 / 下载) */
+            const char *act = am_store_btn_of(a);
             const int bt = y + (AM_ROW_H - 16) / 2;    /* 按钮垂直居中 */
             am_col_text_l(AM_ROW_BTN_X0, bt, act, sel);
             /* 框必须**完整包住**两字: 文字实占 [bt, bt+15] → 框 [bt-2, bt+17] (上下各留 2px).
@@ -915,6 +916,40 @@ static void am_col_present(st7305_handle_t *lcd, int grid_x0, int content_top, i
     if (win_h <= 0) return;
     st7305_blit_1bit(lcd, grid_x0, content_top, AM_COL_W, win_h,
                      s_col + src_y * AM_COL_BPR);
+}
+
+/* ==== 下载中: 内容区居中进度框 (2026-10-04) ====
+ * ⛔ 不做全屏白底遮罩 —— 全屏刷白 = 12 万次 PSRAM 随机写 ≈ 几十毫秒 (见 1bpp 性能法则)。
+ *    只画一个 ~290x84 的框 (≈2.4 万像素), 列表在框外照旧可见, 反而更清楚"正在下哪个包"。 */
+static void am_draw_dl_overlay(st7305_handle_t *lcd, int grid_x0, int content_top) {
+    const int x1 = UI_SCREEN_W - 16;
+    const int x0 = grid_x0 + 16;
+    const int h  = 84;
+    const int y0 = content_top + (UI_SCREEN_H - content_top - h) / 2;
+    const int y1 = y0 + h;
+    fill_rect(lcd, x0, y0, x1, y1, ST7305_COLOR_WHITE);
+    for (int k = 0; k < 2; k++)              /* 2px 边框, 与弹窗同族 */
+        draw_rect_outline(lcd, x0 + k, y0 + k, x1 - k, y1 - k, ST7305_COLOR_BLACK);
+
+    int pm = am_rstore_dl_permille();
+    char pct[12];
+    if (pm < 0) snprintf(pct, sizeof(pct), "--");
+    else        snprintf(pct, sizeof(pct), "%d%%", pm / 10);
+
+    am_draw_text_l(lcd, x0 + 12, y0 + 8, "\xe6\xad\xa3\xe5\x9c\xa8\xe4\xb8\x8b\xe8\xbd\xbd", false); /* 正在下载 */
+    am_draw_text_l(lcd, x1 - 12 - (int)strlen(pct) * 8, y0 + 8, pct, false);   /* ASCII 步进 8px */
+
+    const char *nm = am_rstore_dl_label();
+    if (!nm || !nm[0]) nm = am_rstore_dl_name();
+    am_draw_text_l(lcd, x0 + 12, y0 + 30, nm ? nm : "?", false);
+
+    /* 进度条 */
+    const int bx0 = x0 + 12, bx1 = x1 - 12, by0 = y0 + 58, by1 = by0 + 10;
+    draw_rect_outline(lcd, bx0, by0, bx1, by1, ST7305_COLOR_BLACK);
+    if (pm > 0) {
+        int fw = ((bx1 - bx0 - 2) * pm) / 1000;
+        if (fw > 0) fill_rect(lcd, bx0 + 1, by0 + 1, bx0 + fw, by1 - 1, ST7305_COLOR_BLACK);
+    }
 }
 
 /* ==== 渲染 ==== */
@@ -1013,11 +1048,10 @@ static void p_am_render(ui_ctx_t *ctx) {
                 const char *id = a ? a->id : "";
                 am_draw_text_l(lcd, grid_x0 + 12, y + 6, nm, sel);
                 if (s_cat == AM_CAT_STORE) {
-                    const char *pf = am_store_fname_of(a);
+                    const char *pf = am_store_sub_of(a);
                     am_draw_text_l(lcd, grid_x0 + 12, y + 27, pf ? pf : id, sel);
-                    bool inst = am_store_installed_of(a);
                     /* 按钮 = 紧贴两字加边框框 (V1.6.x: 去掉 ➕/空框, 框宽正好容纳两字) */
-                    const char *act = inst ? "\xe5\x8d\xb8\xe8\xbd\xbd" : "\xe5\xae\x89\xe8\xa3\x85";
+                    const char *act = am_store_btn_of(a);
                     int txt_w = 32;   /* 两汉字 16px×2 */
                     int bx0 = UI_SCREEN_W - 8 - txt_w;   /* 右缘留 8px 边距 */
                     am_draw_text_l(lcd, bx0, y + 14, act, sel);
@@ -1046,6 +1080,10 @@ static void p_am_render(ui_ctx_t *ctx) {
                   "\xe8\xaf\xa5\xe5\x88\x86\xe7\xb1\xbb\xe6\x9a\x82\xe6\x97\xa0\xe5\xba\x94\xe7\x94\xa8", false);
         /* 该分类暂无应用 */
     }
+
+    /* 下载中: 盖上进度框 (画在列表之上, 但不遮挡整屏) */
+    if (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING)
+        am_draw_dl_overlay(lcd, grid_x0, content_top);
 
     /* 视图切换图标已移除: 改为 长按硬件确认键 3s 切换 (见 p_am_poll/OS_ACTION_BT_SEARCH). */
 
@@ -1311,8 +1349,10 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
     /* 右栏内容 (y < content_top: 顶部状态栏/子分类条区域 → 不触发下方图标) */
     int content_top = am_content_top();
     if (y < content_top) return false;
-    /* 商店后台扫描未完成: 吞掉内容点击, 避免对半成品列表误操作 (状态栏/分类栏仍可用) */
-    if (s_cat == AM_CAT_STORE && !am_store_ready()) return true;
+    /* 商店后台扫描未完成 / 正在下载: 吞掉内容点击, 避免对半成品列表误操作
+     * (状态栏/分类栏仍可用) */
+    if (s_cat == AM_CAT_STORE &&
+        (!am_store_ready() || am_rstore_state() == ARS_DOWNLOADING)) return true;
     if (s_view_grid) {
         int cell_w = (UI_SCREEN_W - AM_CATBAR_W - 8) / AM_GRID_COLS;
         int step_y = (UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS;
@@ -1412,8 +1452,10 @@ static void p_am_poll(ui_ctx_t *ctx) {
     }
     /* 子页没真推入(如 Wi-Fi 门禁拦下)时把"离开管家"标记收回, 否则会累积 */
     if (s_am_leave_child > 0 && ctx->current_page == OS_PAGE_APP_MANAGER) s_am_leave_child = 0;
-    /* 商店卸载: 确认键按满 3s (BT_SEARCH 起点再加 1s) 且未松手 → 弹卸载确认 */
-    if (s_cat == AM_CAT_STORE && s_uninstall_armed && !s_uninstall_fired) {
+    /* 商店卸载: 确认键按满 3s (BT_SEARCH 起点再加 1s) 且未松手 → 弹卸载确认。
+     * 下载中一律禁用 (避免下载途中把列表项换掉/弹框打断)。 */
+    if (s_cat == AM_CAT_STORE && s_uninstall_armed && !s_uninstall_fired &&
+        am_rstore_state() != ARS_DOWNLOADING) {
         if (input_is_held(1)) {
             if ((esp_timer_get_time() / 1000 - s_uninstall_t0) >= 1000) {
                 s_uninstall_armed  = false;
@@ -1437,8 +1479,30 @@ static void p_am_poll(ui_ctx_t *ctx) {
         if (s_cat != AM_CAT_STORE) { am_rebuild_keep(); ctx->needs_redraw = true; }
     }
 
-    /* 商店包后台扫描完成: 一次性清理 SD 独立副本 + 重建列表 (UI 线程取货) */
-    if (am_store_tick()) {
+    /* 商店包后台扫描完成 / 云端索引到达 → 重建列表 (UI 线程取货) */
+    bool store_dirty = am_store_tick();
+    if (s_cat == AM_CAT_STORE) {
+        /* 云端 (2026-10-04): 拉索引 + 处理"下载完成/失败"的状态边沿。
+         * ⚠ 只在商店分类里跑 —— 不去别的页面偷偷联网 (联网弹窗也只在进商店时提示一次)。 */
+        if (am_rstore_tick()) {
+            int rs = am_rstore_state();
+            if (rs == ARS_OK) {
+                os_dialog_toast(ctx, "\xe4\xb8\x8b\xe8\xbd\xbd\xe5\xae\x8c\xe6\x88\x90");   /* 下载完成 */
+                am_rstore_ack();
+                am_store_invalidate();      /* 重扫: 刚下好的包要从"云端"变成"可安装" */
+                am_store_prefetch();
+            } else if (rs == ARS_DLFAIL) {
+                os_dialog_toast(ctx, "\xe4\xb8\x8b\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5");   /* 下载失败 */
+                am_rstore_ack();
+            } else if (rs == ARS_FAIL) {
+                os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe8\x8e\xb7\xe5\x8f\x96\xe5\xba\x94\xe7\x94\xa8\xe5\x88\x97\xe8\xa1\xa8"); /* 无法获取应用列表 */
+            }
+            store_dirty = true;
+        }
+        /* 下载中: 进度框要每帧重画 */
+        if (am_rstore_state() == ARS_DOWNLOADING) ctx->needs_redraw = true;
+    }
+    if (store_dirty) {
         if (s_cat == AM_CAT_STORE) {
             am_rebuild_keep();
             ctx->needs_redraw = true;

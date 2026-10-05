@@ -44,13 +44,40 @@ bool  am_store_ready(void);               /* 扫描完成, 可列出 */
 int   am_store_count(void);
 const os_app_t *am_store_app(int k);      /* 第 k 个包的应用条目 */
 bool  am_store_owns(const os_app_t *a);   /* a 是否商店里的包 */
-bool  am_store_installed_of(const os_app_t *a);   /* 已装? (读缓存, 渲染可安全每帧调用) */
+bool  am_store_installed_of(const os_app_t *a);   /* 已装? (读缓存, 渲染可安全每帧调用; 云端包恒 false) */
 const char *am_store_fname_of(const os_app_t *a); /* 包文件名; 非商店包返回 NULL */
-const char *am_store_desc_of(const os_app_t *a);  /* 包简介 (LAPP desc=); 无则 NULL (商店行第二行显示它) */
+/* 商店行第二行文案: 本地包 → LAPP 简介 desc=; 云端包 → "未下载 · NKB"; 都没有 → NULL */
+const char *am_store_sub_of(const os_app_t *a);
+/* 商店行右侧按钮文案: "下载" (云端未下载) / "卸载" (已装) / "安装" */
+const char *am_store_btn_of(const os_app_t *a);
 void  am_store_activate(ui_ctx_t *ctx, const os_app_t *a);      /* 已装→运行 / 未装→弹安装确认 */
 void  am_store_toggle(ui_ctx_t *ctx, const os_app_t *a);        /* 商店行: 只装/卸, 不启动应用 */
 void  am_store_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a); /* 长按 → 弹卸载确认 */
 void  am_store_invalidate(void);          /* 目录变化 → 下次重扫 */
+
+/* ==================== 商店「云端」 (am_store_net.c, 2026-10-04) ====================
+ * 商店从"只扫本地"升级为"联网拉索引 + 一键下载"。
+ * 索引 = <mirror>/index.json (由 tools/store_build.py 生成), 里面**只存相对 path**
+ * 并内嵌 mirrors[] —— 加源/换源只改服务器上的 json, 固件一行都不用动。
+ * 分工: 本模块只管"拿网络数据 + 落盘到商店源目录"; 列表/确认框/安装全在 am_store.c。
+ * 下载完成后**完全走既有流程**: am_store_invalidate() → 重扫 → 它就变成"本地包"了。
+ * ⚠ `am_rpkg_t` / AM_RPKG_MAX / AM_MIRROR_* 定义在 am_store_json.h (纯 C, 可宿主单测)。 */
+#include "am_store_json.h"
+
+/* 状态机: 0=空闲 1=拉索引中 2=就绪 3=拉索引失败 4=下载中 5=下载成功 6=下载失败 */
+enum { ARS_IDLE = 0, ARS_FETCHING, ARS_READY, ARS_FAIL, ARS_DOWNLOADING, ARS_OK, ARS_DLFAIL };
+
+void  am_rstore_prefetch(void);          /* 已联网且没拉过 → 后台拉索引 (幂等) */
+bool  am_rstore_tick(void);              /* 商店页每帧调; true = 列表该重建 (边沿触发) */
+void  am_rstore_ack(void);               /* UI 处理完 OK/DLFAIL 后回落到 READY */
+int   am_rstore_state(void);             /* ARS_* */
+int   am_rstore_count(void);
+const am_rpkg_t *am_rstore_get(int i);
+bool  am_rstore_dl_start(int i);         /* 后台下载第 i 个包 → 商店源目录 */
+int   am_rstore_dl_permille(void);       /* 0..1000; -1 = 总长未知 */
+const char *am_rstore_dl_name(void);     /* 正在下载的包名 */
+const char *am_rstore_dl_label(void);    /* 正在下载的中文名 */
+int   am_rstore_dl_err(void);            /* 1=HTTP 2=连接 3=写盘 4=校验 */
 
 /* ==================== Lua 程序扫描 (am_lua.c) ==================== */
 void am_lua_prefetch(int cat);            /* 切分类时启动后台扫描 (幂等) */

@@ -12,6 +12,8 @@ idf_component_register(
         "apps_registry.c"
         "pages/am_lua.c"
         "pages/am_store.c"
+        "pages/am_store_json.c"
+        "pages/am_store_net.c"
         "pages/page_app_manager.c"
         "pages/page_book.c"
         "pages/page_calculator.c"
