@@ -6,13 +6,12 @@
  * 输入 PWM 频率应等于 LRA 谐振频率 (常见 150~250Hz), 占空比控制输出强度;
  * EN 高有效, 拉低即关断输出省电. 芯片无寄存器/无探测手段, 上电即用.
  *
- * 接线 (TM6604 SOT23-6):
+ * 接线 (2026-10-04 分支 board/xiaozhi-s3-core, 小智 ESP32-S3-AI-2E 核心模块板):
  *   Pin1 OUT+ ──┐        ┌── Pin3 OUT-
  *   Pin2 GND  ── GND
  *   Pin4 VDD  ── 3.3V
- *   Pin5 PWM  ── GPIO42 (原 DRV2605L SDA 焊盘, LEDC 190Hz 方波)
- *   Pin6 EN   ── GPIO48 (原 EN IO, 保持不变)
- * 注: 原 SCL=GPIO47 空置; 原 GPIO6/LEDC 兜底路径已并入 PWM 主路径.
+ *   Pin5 PWM  ── **GPIO6**  (旧固件里彻底闲置 —— tone_player 改走 I2S 后释放; 原 42→48 两次都作废)
+ *   Pin6 EN   ── (新板震动电源默认常开, 不再由 MCU 控制)
  *
  * V1.4.x: 触发分三档, 互斥仲裁 (后发起停前者):
  *   - 单次 tap  (vibrator_tap): 按键/菜单/拖动反馈
@@ -36,8 +35,25 @@
 typedef enum { VIB_NONE = 0, VIB_TM6604 = 1 } vib_mode_t;
 
 /* ---- TM6604 PWM 直驱 LRA ---- */
-#define VIB_PWM_PIN   GPIO_NUM_42  /* 原 DRV2605L SDA 焊盘; 避开 strapping/ADC 脚 */
-#define VIB_EN_PIN    GPIO_NUM_48  /* 保持原 EN IO (新板震动开关) */
+/* ★★ 2026-10-04 (分支 board/xiaozhi-s3-core) —— 引脚来源已核准: **厂商规格书 v1.0**
+ *
+ * 模块 `ESP32-S3-AI-2E` 只有 **24 个可用 GPIO**:
+ *   0,1,2,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,41,42,43,44
+ * 另有 **12 个被模块内部占用, 一律不可用**:
+ *   IO3=VOP(功放+)      IO21=VBAT            IO35=LGS4056_DONE   IO36=LGS4056_CHRG
+ *   IO37=MIC1P          IO38=MIC1N+codec I2C_SDA                IO39=MIC2P
+ *   IO40=MIC2N          IO45=VBUS_5V         IO46=VON(功放−)
+ *   IO47=VSYS_IN+codec I2C_SCL                                  IO48=VSYS_OUT
+ *
+ * ⛔⛔ **上一版曾把 PWM 挪到 GPIO48 —— 那是错的**: 48 = `VSYS_OUT`, 是模块"电池→系统"
+ *   的**电源通路输出脚**(不接开关时它和 VSYS_IN 要短接)。把它接到 LEDC 输出等于
+ *   拿 PWM 去斩电源输入, 会直接把板子带进不稳定态。
+ * ✅ 现用 **GPIO6** —— 旧固件里**彻底闲置**(`user_config.h`: tone_player 改走 I2S 后 GPIO6 释放;
+ *   全仓无任何引用), 且在模块 24 个可用脚内。
+ *   ⛔ 不要用 GPIO4: 它在旧固件里是**电池 ADC (ADC1_CH3)**(`board_battery.c`),
+ *      拿 LEDC 去驱动会把电量采样搅成垃圾。
+ * ⚠ 原 GPIO42 让给了 LCD 片选(42 同样在 24 个可用脚里 ✓)。 */
+#define VIB_PWM_PIN   GPIO_NUM_6
 #define VIB_TIMER     LEDC_TIMER_1
 #define VIB_CHANNEL   LEDC_CHANNEL_1
 #define VIB_RES       LEDC_TIMER_8_BIT
@@ -59,34 +75,11 @@ static TimerHandle_t s_pat_timer = NULL;
 static void pat_timer_cb(TimerHandle_t t);
 static volatile bool s_music_on;
 
-/* ================= TM6604 EN (GPIO48, 保持原 IO) ================= */
-/* 引脚有效性防护: 仅操作本模组(ESP32-S3-WROOM-1)引出的普通 IO.
- * 22-34 未引出 (含 26), 33-37 为 PSRAM/Flash 专用. */
-static bool vib_pin_supported(int pin) {
-    if (pin < 0 || pin > 48) return false;
-    if (pin >= 22 && pin <= 34) return false;
-    if (pin >= 33 && pin <= 37) return false;
-    return true;
-}
-static bool s_en_cfg = false;   /* EN 引脚仅配置一次, 电平随用随切 */
-static void drv_enable(bool on) {
-    if (!vib_pin_supported(VIB_EN_PIN)) return;
-    if (!s_en_cfg) {
-        gpio_config_t io = {
-            .pin_bit_mask = (1ULL << VIB_EN_PIN),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = false, .pull_down_en = false,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&io);
-        s_en_cfg = true;
-    }
-    gpio_set_level(VIB_EN_PIN, on ? 1 : 0);
-}
-
-/* ================= PWM 输出 (LEDC) ================= */
+/* ================= PWM 输出 (LEDC) =================
+ * ★ 2026-10-04: 原来这里还有一条 "EN 引脚(GPIO48) 随输出开关" 的省电路径。
+ *   新板震动电源默认常开 + GPIO42 归了屏 CS ⇒ EN 与 PWM 合并到 GPIO48 一根线,
+ *   drv_enable()/VIB_EN_PIN 整条删掉 (停止震动 = duty 归 0)。 */
 static bool ledc_init(void) {
-    /* 先复位引脚为纯输出, 清除原 SDA 焊盘可能残留的 OD/上拉配置 */
     gpio_reset_pin(VIB_PWM_PIN);
     ledc_timer_config_t tc = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = VIB_TIMER,
@@ -109,13 +102,11 @@ static void out_set(uint8_t strength01) {   /* strength 0..100 */
     if (duty > VIB_RES_MAX) duty = VIB_RES_MAX;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
-    drv_enable(duty > 0);   /* V1.5.x 省电: EN 随输出开关, 有输出才使能, 空闲拉低 */
 }
 static void out_off(void) {
     if (s_mode == VIB_NONE) return;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
-    drv_enable(false);      /* V1.5.x 省电: 停震立即拉低 TM6604 EN */
 }
 
 /* 定时到点关闭震动 (非阻塞 tap 用) */
@@ -124,7 +115,6 @@ static void tap_timer_cb(TimerHandle_t t) { (void)t; out_off(); }
 /* ================= 对外接口 ================= */
 void vibrator_init(void) {
     if (s_mode != VIB_NONE) return;
-    drv_enable(false);     /* V1.5.x 省电: EN 默认拉低, 震动输出时才拉起 (GPIO48) */
     if (!ledc_init()) {
         ESP_LOGE(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)VIB_PWM_PIN);
         return;
@@ -132,8 +122,8 @@ void vibrator_init(void) {
     s_mode = VIB_TM6604;
     s_tap_timer = xTimerCreate("vib_tap", pdMS_TO_TICKS(50), pdFALSE, NULL, tap_timer_cb);
     s_pat_timer = xTimerCreate("vib_pat", pdMS_TO_TICKS(50), pdFALSE, NULL, pat_timer_cb);
-    ESP_LOGI(TAG, "震动驱动就绪: TM6604 PWM=GPIO%d(%dHz) EN=GPIO%d", (int)VIB_PWM_PIN,
-             VIB_RES_FREQ, (int)VIB_EN_PIN);
+    ESP_LOGI(TAG, "震动驱动就绪: PWM=GPIO%d (%dHz), 电源默认常开 (无 EN 脚)",
+             (int)VIB_PWM_PIN, VIB_RES_FREQ);
 }
 
 bool vibrator_ready(void) { return s_mode != VIB_NONE; }
@@ -144,15 +134,14 @@ void vibrator_set_enabled(bool en) {
     if (!en) {
         s_music_on = false;            /* 音乐震动任务下个循环退出 */
         vibrator_stop_pattern();
-        out_off();                     /* 停震: 内部已拉低 EN */
+        out_off();                     /* 停震: duty 归 0 */
     } else {
-        /* V1.5.x 省电: 开开关不立即拉高 EN, 等首次震动输出时再使能 */
+        /* 开开关不立刻输出, 等首次震动时再设 duty (省电, 且避免上电就抖一下) */
     }
 }
 
 /* V1.2.x: 三个独立震动通道 (UI / 游戏 / 按键模拟) 的开关与触发.
- * 任一通道开 → 硬件总开关开; 全部关 → 关断 TM6604 EN 省电.
- * 上层 (设置-声音震动) 调用这三个 setter 而非 vibrator_set_enabled. */
+ * 任一通道开 → 硬件总开关开; 全部关 → duty 归 0 (新板电源常开, 无法靠 EN 断电). */
 void vibrator_set_ui_enabled(bool en) {
     s_vib_ui = en;
     vibrator_set_enabled(s_vib_ui || s_vib_game || s_key_sim);

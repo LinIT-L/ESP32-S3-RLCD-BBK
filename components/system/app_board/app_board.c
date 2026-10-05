@@ -39,10 +39,12 @@ esp_err_t app_board_init(app_board_t *board)
     if (!board) return ESP_ERR_INVALID_ARG;
     memset(board, 0, sizeof(*board));
 
-    /* 0. 释放深睡时 gpio_hold 锁住的整条 LCD 控制线(41/40/11/12): 深睡为保持猫咪有意锁定.
-     * 若不释放, st7305_init 的硬复位脚翻转不生效 + SPI 总线被 hold 霸住无法初始化. */
+    /* 0. 释放深睡时 gpio_hold 锁住的整条 LCD 控制线(41/42/11/12): 深睡为保持猫咪有意锁定.
+     * 若不释放, st7305_init 的硬复位脚翻转不生效 + SPI 总线被 hold 霸住无法初始化.
+     * ★ 2026-10-04: CS 从 GPIO40 挪到 **GPIO42** (小智核心模块占用 IO40)。这两处必须同步改,
+     *   否则 CS 被 hold 住 → SPI 片选永远拉不动 → 屏全黑。 */
     gpio_hold_dis(GPIO_NUM_41);   /* RST */
-    gpio_hold_dis(GPIO_NUM_40);   /* CS */
+    gpio_hold_dis(GPIO_NUM_42);   /* CS  (原 40) */
     gpio_hold_dis(GPIO_NUM_11);   /* SCK */
     gpio_hold_dis(GPIO_NUM_12);   /* MOSI */
 

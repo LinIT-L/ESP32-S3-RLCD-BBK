@@ -6,7 +6,7 @@
 #define LCD_HEIGHT     300
 
 #define RLCD_DC_PIN    GPIO_NUM_5
-#define RLCD_CS_PIN    GPIO_NUM_40
+#define RLCD_CS_PIN    GPIO_NUM_42   /* 2026-10-04: 小智核心模块占用 IO40 → CS 40→42 */
 #define RLCD_SCK_PIN   GPIO_NUM_11
 #define RLCD_MOSI_PIN  GPIO_NUM_12
 #define RLCD_RST_PIN   GPIO_NUM_41
@@ -16,10 +16,12 @@
 #define ESP32_I2C_SCL_PIN   GPIO_NUM_14
 
 /* 按键 GPIO
- * 已被 LCD 占用: 5(DC),11(SCK),12(MOSI),40(CS),41(RST)
+ * 已被 LCD 占用: 5(DC),11(SCK),12(MOSI),41(RST),**42(CS)**
+ *   (2026-10-04 小智 ESP32-S3 核心模块板: 模块把 IO40 占了 ⇒ 屏 CS 从 40 挪到 42;
+ *    42 原来归震动 PWM, 新板震动电源默认常开 ⇒ 震动只用 GPIO48 一根线, 42 让出)
  * 已被 I2C 占用: 13(SDA),14(SCL)
  * V1.0.70: tone_player 改走 I2S(PCM 合成→ES8311/NS4168), GPIO6 释放为闲置
- * (旧: 6 曾为 tone_player 方波输出, 原 GPIO48 与震动 EN 冲突已移脚, 现 48 归震动)
+ * (旧: 6 曾为 tone_player 方波输出; 原 GPIO48 与旧震动 EN 冲突已移脚, 现 48 归震动 PWM)
  *
  * 板载按键 (来自 Waveshare ESP32-S3-RLCD-4.2 官方文档):
  *   BOOT = GPIO0 (输入, 上拉) → RIGHT

@@ -39,12 +39,22 @@ static gps_config_t       s_cfg;
 static bool               s_ready = false;
 static gps_power_state_t  s_state = GPS_POWER_UNKNOWN;
 
-/* ==== 默认配置 (网表: ESP 43/44 ↔ GPS RXD/TXD, EXTINT=47) ==== */
+/* ==== 默认配置 ====
+ * ★ 2026-10-05 小智模块板 (分支 board/xiaozhi-s3-core):
+ *   TX=43 / RX=44 不变 —— 模块脚 36/37 正是 `RXD0(TXD0)` = **GPIO44/GPIO43**，都在 24 个可用脚内 ✓
+ *   ⛔ **EXTINT 从 47 改成 -1(不接)**: GPIO47 在本模块上**没有引出** ——
+ *      模块内部拿它当 `codec 的 I2C_SCL`，同时焊盘 24 是 `VSYS_IN`(电源开关进)。
+ *      固件再去驱动 47 = 一边搅 codec 控制总线、一边扯电源通路 ⇒ 必须弃用。
+ * ⇒ EXTINT 挪到 **GPIO8**(linit 2026-10-05 定)。选它的理由:
+ *    8/9/16 是模块上仅剩的三个空闲脚, 其中 **16 = `XTAL_32K_N`**(和 15 = `XTAL_32K_P` 是一对)，
+ *    **留给以后上 32.768kHz 晶振做 RTC 低功耗时钟**，所以不用它；
+ *    8 是纯普通 IO(TOUCH8 / ADC1_CH7 / SUBSPICS1，没有第二身份)，拿来当输入最省事。
+ *    (备选 GPIO9; 若以后要撤, 把下面改回 -1 即可。) */
 static const gps_config_t k_default_cfg = {
     .uart_num    = UART_NUM_1,   /* console 是 USB-Serial-JTAG, UART0/1 都空; 用 1 避开 ROM 默认口 */
-    .pin_tx      = 43,
-    .pin_rx      = 44,
-    .pin_extint  = 47,
+    .pin_tx      = 43,           /* 模块脚 37 (TXD0) */
+    .pin_rx      = 44,           /* 模块脚 36 (RXD0) */
+    .pin_extint  = 8,            /* 原 47 在模块上不可用 ⇒ 挪到 8 */
     .baud        = 921600,
     .drive_extint = false,       /* 默认不驱动 EXTINT: 极性未确认, 悬空/误电平会自己叫醒模块 */
 };

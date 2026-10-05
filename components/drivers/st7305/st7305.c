@@ -777,7 +777,7 @@ st7305_config_t st7305_default_config(void) {
         .spi_host = SPI2_HOST,
         .spi_mosi = 12,
         .spi_sclk = 11,
-        .spi_cs = 40,
+        .spi_cs = 42,     /* 2026-10-04: 小智核心模块占用 IO40 → CS 40→42 (与 user_config.h 同步) */
         .spi_freq = 60,   /* ST7305 最大支持 60MHz, 提高刷新率 */
     };
 }

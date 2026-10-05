@@ -56,16 +56,25 @@ static int  sd_full_remount(uint8_t format_if_needed);
  * 之前误用 SPI 模式是错的, GPIO 17 不是 CS, 是 CD (卡检测) 等其他用途
  *
  * 硬件接法 (SD 卡座 SD1, 1-bit SD 模式):
- *   CMD  - GPIO21
- *   CLK  - GPIO38
- *   D0   - GPIO39
+ *   CLK  - **GPIO13**   (SCK)
+ *   CMD  - **GPIO10**   (MOSI)
+ *   D0   - **GPIO14**   (MISO)
  *   D1/D2/D3 - NC (1-bit 模式不用)
- *   CD   - GPIO17 (卡检测, 可选, 这里不用)
+ *   CD   - 不用 (软件探测)
+ *
+ * ★ 2026-10-05 小智模块板换脚 (分支 board/xiaozhi-s3-core):
+ *   旧三根 21/38/39 在 `ESP32-S3-AI-2E` 模块上分别是 焊盘23 `VBAT` / 模块内部 codec 的
+ *   `I2C_SDA` / 焊盘32 `MIC2P` —— **一根都不能用**。新脚 13/10/14 全在 24 个可用 GPIO 内。
+ *   ⚠ 尤其 **不能再用 GPIO38**: 它是模块内部 ES8311/ES7210 的 I2C 数据线,
+ *     拿 SDMMC 去驱动会把 codec 的控制总线打乱。
+ *   ✅ **实测定案**(2026-10-05 真机): 下面这三条是正确的 ——
+ *     `CLK=13 CMD=10 D0=14` 一次认到卡, 25MHz 挂载成功, 容量 3.75GiB。
+ *     (中途曾按反馈把 CMD/D0 对调成 14/10, 反而认不到; 是排列自检把它们试回来的。)
  */
-#define SD_CMD  GPIO_NUM_21
-#define SD_CLK  GPIO_NUM_38
-#define SD_D0   GPIO_NUM_39
-/* CD (卡检测) 在 GPIO17, 暂不用 (ESP-IDF SDMMC 也不强制) */
+#define SD_CLK  GPIO_NUM_13
+#define SD_CMD  GPIO_NUM_10
+#define SD_D0   GPIO_NUM_14
+/* CD (卡检测) 不用: 走软件探测 (见 sd_quick_probe) */
 
 static bool s_mounted = false;
 static char s_mount_point[16] = "/sdcard";
@@ -163,6 +172,121 @@ esp_err_t sd_remount(void)
  * SDMMC 是 ESP32-S3 内置的 SD 卡专用硬件控制器, 比 SPI 快得多 (最高 40MHz)
  * 之前一直用 SPI 模式, 引脚虽然是 21/38/39 但走 SPI 协议卡根本不应答
  */
+/* ★ 2026-10-05: "到底有没有插卡"的**快速探测** + **引脚排列自检**。
+ *
+ * 动机 (linit 反馈):
+ *   ① 板上没接 TF 卡时, 原来 25M→20M→5M→400k 四档重试 + 失败探测会让启动日志刷一整屏
+ *      `ESP_ERR_TIMEOUT` 加"可能原因 / 建议格式化"—— **没插卡不是错误**。
+ *   ② 但卡确实插了却认不到, 最难查的是"**三根线哪根接哪个脚**"—— 板子刚焊/飞线时最容易错,
+ *      而反复"改固件→烧录→看日志"几轮很痛苦。
+ *
+ * 做法:
+ *   1. 先用 **400 kHz**(SD 规范"识别阶段"频率, 只要卡和线是通的就必然应答)
+ *      按固件里 `SD_CLK/SD_CMD/SD_D0` 的顺序试一次。
+ *   2. 不行 ⇒ 把**这三根脚的所有排列(6 种)**都试一遍, 谁通就把正确顺序打进日志,
+ *      **并且本次就直接用那一组继续挂载** —— 一次上电就把"接线顺序"问题解决掉, 不用来回烧。
+ *   3. 6 种全不通 ⇒ 只打一行 INFO + 引脚体检; **不再走四档重试、不再刷错误**(无卡时零噪音)。
+ *
+ * ⚠ 只读: 卡识别 (CMD0/CMD8/ACMD41 + 读 CSD/CID) 不含写操作, 不会动卡上数据。
+ * ⚠ 与 sd_probe_fail_reason() 的区别: 那个是"挂载失败后查原因"(5000kHz + 读 LBA0 判 exFAT),
+ *   这个是"挂载之前先确认有没有卡", 更轻, 所以分开写。
+ * ⚠ 排列自检只在启动跑一次, 拿到能用的组合就停; 6 次全试约 0.9 s (仅无卡时)。
+ *   接线确认好之后, 把 SD_PIN_PERM_SCAN 置 0 即可关掉。 */
+#define SD_PIN_PERM_SCAN 1
+
+/* 本次实际使用的三根脚 (排列自检可能改写它们) */
+static int s_pin_clk = SD_CLK, s_pin_cmd = SD_CMD, s_pin_d0 = SD_D0;
+
+/* 按指定三根脚做一次 400kHz 卡识别 */
+static esp_err_t sd_probe_pins(int clk, int cmd, int d0) {
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = 400;
+    host.flags = SDMMC_HOST_FLAG_1BIT;
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.width = 1;
+    slot.clk = clk; slot.cmd = cmd; slot.d0 = d0;
+    slot.d1 = slot.d2 = slot.d3 = -1;
+    slot.cd = -1; slot.wp = -1; slot.flags = 0;
+
+    esp_err_t r = ESP_FAIL;
+    if (sdmmc_host_init() != ESP_OK) return ESP_FAIL;
+    if (sdmmc_host_init_slot(SDMMC_HOST_SLOT_1, &slot) == ESP_OK) {
+        sdmmc_card_t *card = heap_caps_malloc(sizeof(sdmmc_card_t), MALLOC_CAP_INTERNAL);
+        if (card) {
+            r = sdmmc_card_init(&host, card);
+            heap_caps_free(card);
+        }
+    }
+    sdmmc_host_deinit();   /* 必须放掉 host, 否则接下来正常挂载会 "already initialized" */
+    return r;
+}
+
+static esp_err_t sd_quick_probe(void) {
+    /* 1. 先按固件里写的顺序试 */
+    if (sd_probe_pins(SD_CLK, SD_CMD, SD_D0) == ESP_OK) {
+        s_pin_clk = SD_CLK; s_pin_cmd = SD_CMD; s_pin_d0 = SD_D0;
+        return ESP_OK;
+    }
+
+#if SD_PIN_PERM_SCAN
+    /* 2. 穷举这三根脚的 6 种排列 */
+    const int  cand[3] = { SD_CLK, SD_CMD, SD_D0 };
+    const char *nm[3]  = { "CLK",   "CMD",   "D0"   };
+    ESP_LOGW(TAG, "按固件定义认不到卡 ⇒ 开始穷举三根脚 %d/%d/%d 的所有排列...",
+             SD_CLK, SD_CMD, SD_D0);
+    for (int a = 0; a < 3; a++) {
+        for (int b = 0; b < 3; b++) {
+            if (b == a) continue;
+            int c = 3 - a - b;
+            if (a == 0 && b == 1) continue;        /* 这一组上面已经试过 */
+            esp_err_t r = sd_probe_pins(cand[a], cand[b], cand[c]);
+            ESP_LOGW(TAG, "  试 %s=IO%-2d  %s=IO%-2d  %s=IO%-2d   -> %s",
+                     nm[0], cand[a], nm[1], cand[b], nm[2], cand[c],
+                     r == ESP_OK ? "★★ 认到卡了!" : "认不到");
+            if (r == ESP_OK) {
+                s_pin_clk = cand[a]; s_pin_cmd = cand[b]; s_pin_d0 = cand[c];
+                ESP_LOGW(TAG, "  ⇒⇒ 正确接法: CLK=IO%d  CMD=IO%d  D0=IO%d"
+                              "  (本次已按这组继续挂载)",
+                         s_pin_clk, s_pin_cmd, s_pin_d0);
+                return ESP_OK;
+            }
+        }
+    }
+    ESP_LOGW(TAG, "  6 种排列全认不到 ⇒ 不是【三根脚接错顺序】的问题");
+#endif
+    return ESP_FAIL;
+}
+
+/* ★ 2026-10-05: 探测失败时的**引脚体检** —— 直接回答"是不是我接的有问题"。
+ *
+ * 做法: 把三根线先当**输入 + 内部上拉**读一次电平。判据:
+ *   电平 = 1  → 该脚悬空或外部有上拉/被卡座内部上拉拉起 ⇒ 接线"通"、上拉"有"
+ *   电平 = 0  → 该脚被**拉到地**: 接错脚 / 焊短路 / 或该脚被别的外设驱动为低
+ *
+ * ⚠ 只能判"被拉死/短路", 判不出"虚焊/断线"(断了会浮空读到 1)。
+ *   真正的 SD 规范要求: **CMD 与 D0 各一个 10k 上拉到 3V3**; CLK 不需要上拉。
+ *   没有外部上拉时卡常见症状就是"400kHz 都认不到"。 */
+static void sd_pin_health_check(void) {
+    const int  pins[3] = { s_pin_clk, s_pin_cmd, s_pin_d0 };
+    const char *nm[3]  = { "CLK",   "CMD",   "D0 "  };
+    for (int i = 0; i < 3; i++) {
+        gpio_config_t io = {
+            .pin_bit_mask = (1ULL << pins[i]),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io);
+        vTaskDelay(pdMS_TO_TICKS(3));
+        int lv = gpio_get_level(pins[i]);
+        ESP_LOGW(TAG, "  引脚体检 %s = IO%-2d  电平=%d  %s",
+                 nm[i], pins[i], lv,
+                 lv ? "(悬空/有上拉 ✓)" : "(被拉到地 ✗ 接错脚/短路/被别的外设占用)");
+    }
+    ESP_LOGW(TAG, "  ⚠ 体检判不出【虚焊 / 断线】(断了会浮空读到 1) —— 重点查 CMD 与 D0 是否各有一个 10k 上拉到 3V3");
+}
+
 esp_err_t sd_mount(void) {
     if (s_mounted) {
         ESP_LOGI(TAG, "已挂载, 跳过");
@@ -170,11 +294,22 @@ esp_err_t sd_mount(void) {
     }
 
     ESP_LOGI(TAG, "=== sd_mount 开始 (SDMMC 1-bit 模式) ===");
-    ESP_LOGI(TAG, "  SD 引脚: CLK=%d CMD=%d D0=%d", SD_CLK, SD_CMD, SD_D0);
+    ESP_LOGI(TAG, "  SD 引脚: CLK=%d CMD=%d D0=%d", s_pin_clk, s_pin_cmd, s_pin_d0);
     ESP_LOGI(TAG, "  堆剩余: %u 字节, DMA内部: %u 字节 (最大块 %u)",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+
+    /* 0. 先确认有没有卡 —— 没卡就安静跳过, 不刷错误 (2026-10-05) */
+    if (sd_quick_probe() != ESP_OK) {
+        s_mnt_state = SD_MNT_NO_CARD;
+        s_cid_name[0] = '\0';
+        s_card = NULL;
+        ESP_LOGI(TAG, "未检测到 TF 卡 (无卡座 / 未插卡) —— 跳过 SD 初始化");
+        sd_pin_health_check();      /* 顺手做一次引脚体检, 便于判"是接线问题还是真没卡" */
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "检测到 TF 卡, 开始按速度梯度挂载...");
 
     /* 1. 快速挂载 (V1.0.61): 优先 25MHz (1-bit 标准最高), 失败依次降速
      *    2026-09-30: 末尾补一档 **400kHz** —— 这是 SD 规范规定的"识别阶段"频率,
@@ -216,9 +351,9 @@ esp_err_t sd_mount(void) {
 
         sdmmc_slot_config_t slot_cfg = SDMMC_SLOT_CONFIG_DEFAULT();
         slot_cfg.width = 1;        /* 1-bit 模式 */
-        slot_cfg.clk = SD_CLK;     /* GPIO 38 */
-        slot_cfg.cmd = SD_CMD;     /* GPIO 21 */
-        slot_cfg.d0 = SD_D0;       /* GPIO 39 */
+        slot_cfg.clk = s_pin_clk;  /* 见顶部 SD_CLK (排列自检可能改写) */
+        slot_cfg.cmd = s_pin_cmd;
+        slot_cfg.d0  = s_pin_d0;
         slot_cfg.d1 = -1;          /* 1-bit 模式不用 */
         slot_cfg.d2 = -1;
         slot_cfg.d3 = -1;
@@ -294,11 +429,12 @@ esp_err_t sd_mount(void) {
         sdmmc_host_deinit();
     }
 
+    /* 走到这里说明**卡是被识别到的**, 只是挂载失败 —— 这才是真该报的错误。
+     * (没插卡的情况已经在 sd_quick_probe() 那一步安静返回了。) */
     ESP_LOGE(TAG, "=== sd_mount 全部 %d 次尝试都失败 ===", retry_count);
-    ESP_LOGE(TAG, "  可能原因:");
-    ESP_LOGE(TAG, "    - TF 卡没插好 (接触不良)");
-    ESP_LOGE(TAG, "    - TF 卡文件系统不识别 (不是 FAT32/exFAT)");
-    ESP_LOGE(TAG, "    - TF 卡损坏");
+    ESP_LOGE(TAG, "  卡已被识别但挂载失败 ⇒ 不是没插卡, 可能是:");
+    ESP_LOGE(TAG, "    - 文件系统不识别 (要 FAT32; 固件不支持 exFAT)");
+    ESP_LOGE(TAG, "    - 卡损坏 / 需要重新格式化");
     ESP_LOGE(TAG, "  建议: 进菜单 → TF卡 → 格式化TF卡");
     /* 2026-09-29: 探测失败原因 (无卡 / exFAT / 无文件系统) 供 UI 显示 */
     sd_probe_fail_reason();
