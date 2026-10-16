@@ -188,20 +188,28 @@ static const char *dlg_ret_text(const os_dlg_stack_t *d) {
 
 /* 画一行 (3.3 样式): 选中=黑底白字居中; 未选=白底黑字居中 (强制白底防残留) */
 static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
-                         int abs_y, const char *text, bool selected) {
+                         int abs_y, const char *text, bool selected, bool is_footer) {
     /* ★★★ 2026-10-16 裁剪(linit): 内容区之外的行一律不画。
      *   修复"滑动时内容越过弹窗边框、框外留残影"。
      *   ⚠ 底部固定行(返回/取消/退出)在内容区裁剪边界之下 ⇒ 必须豁免, 否则会被裁掉。 */
-    bool is_footer_row = (L->footer_y >= 0 && abs_y >= L->footer_y);
     int y0c = abs_y, y1c = abs_y + DLG_LINE_H - 2;      /* 本行绘制范围 */
     bool full = true;
     int y0v = y0c, y1v = y1c;
-    if (!is_footer_row) {                                /* 仅内容行参与裁剪 */
+    if (!is_footer) {        /* ★ 仅内容行裁剪; 底部固定行由调用方显式标记, 不靠 y 猜 */
         if (y1c < L->clip_top) return;                   /* 整行在上边界之上 */
         if (y0c > L->clip_bottom) return;                /* 整行在下边界之下 */
         full = (y0c >= L->clip_top && y1c <= L->clip_bottom);   /* 完全可见才写字 */
         y0v = (y0c < L->clip_top) ? L->clip_top : y0c;
         y1v = (y1c > L->clip_bottom) ? L->clip_bottom : y1c;
+    }
+    /* ★★★ 绝对钳制(linit 2026-10-16): 不论布局怎么算, 行绘制范围绝不越出弹窗框。
+     *   上边 = 框顶+2 (边框粗 2px), 下边 = 框底-2 ⇒ 拖动时内容永远不会画到框外。 */
+    {
+        int box_top = L->y + 2, box_bot = L->y + L->h - 2;
+        if (y1v < box_top || y0v > box_bot) return;     /* 行完全在框外 */
+        if (y0v < box_top) { y0v = box_top; full = false; }
+        if (y1v > box_bot) { y1v = box_bot; full = false; }
+        if (y0c < box_top || y1c > box_bot) full = false;
     }
 
     int x0 = L->x + 6, x1 = L->x + L->w - 6;
@@ -375,7 +383,7 @@ static void dlg_render(ui_ctx_t *ctx) {
         int row_y = L.content_y0 + i * DLG_LINE_H + L.px;
         /* 裁剪: 行完全在可视区外(上下)则跳过; 部分出界由 dlg_draw_row 自己不越界即可 */
         if (row_y + DLG_LINE_H <= L.clip_top || row_y >= L.clip_bottom) continue;
-        dlg_draw_row(lcd, &L, row_y, d->items[idx], (!touch_scheme && idx == d->sel));
+        dlg_draw_row(lcd, &L, row_y, d->items[idx], (!touch_scheme && idx == d->sel), false);
         /* 行最右侧删除"×" (row_x): 与行反相 */
         if (d->row_x) {
             bool sel = (!touch_scheme && idx == d->sel);
@@ -389,7 +397,7 @@ static void dlg_render(ui_ctx_t *ctx) {
     if (!is_confirm && L.footer_y >= 0 && d->count > 0) {
         if (L.content_count > 0)
             draw_hline(lcd, L.x + 6, L.x + L.w - 6, L.footer_y - 1, ST7305_COLOR_BLACK);
-        dlg_draw_row(lcd, &L, L.footer_y, dlg_ret_text(d), (!touch_scheme && d->sel == L.content_count));
+        dlg_draw_row(lcd, &L, L.footer_y, dlg_ret_text(d), (!touch_scheme && d->sel == L.content_count), true);
     }
 
     /* 滚动条: 内容超出可见区时右侧竖条 + 滑块 */
