@@ -71,11 +71,11 @@ uint64_t board_wake_mask(void);
 /* ★★★ 逐项外设开关(排查屏冲突用): 1=启用, 0=不启动。
  *   用法: 一次只把一个改回 1, 烧录后看屏还亮不亮 ⇒ 亮=它不冲突, 黑=它就是冲突源。
  *   ⛔ 排查完**全部改回 1**(即恢复正常全功能)。 */
-#define LINTOS_USE_SD        1    /* ← 本轮测试项: SD 卡 */
+#define LINTOS_USE_SD     1    /* ← 本轮测试项: SD 卡 */
 #define LINTOS_USE_INPUT     1    /* ← 本轮: 只加按键 */    /* ← 待测: 按键 */
 #define LINTOS_USE_TOUCH     0    /* ← 微雪无触摸: 保持关闭 */    /* 触摸(微雪无触摸, 先关) */
 #define LINTOS_USE_AUDIO     1    /* ← 本轮: 加音频 */    /* ← 待测: 音频 */
-#define LINTOS_USE_BATTERY   1    /* ← 本轮: 加电池 */
+#define LINTOS_USE_BATTERY     1    /* ← 本轮: 加电池 */
 #define LINTOS_USE_GPS       0    /* 微雪无 GPS */
 #define LINTOS_LCD_ONLY      0    /* 兼容旧开关: 1=全部跳过 */
 
