@@ -14,6 +14,11 @@
 extern "C" {
 #endif
 
+/* ★★★ 配置格式版本 (linit 2026-10-16): 只要"配置语义"有变化就 +1。
+ *   固件启动时比对 NVS 里的 cfg_ver, 不一致 ⇒ 自动作废旧存档(尤其 en_mask),
+ *   彻底避免"刷固件后触摸/按键行为变了"这类问题。 */
+#define HWCFG_VER 4
+
 /* 板型 */
 enum { HW_BOARD_XIAOZHI = 0, HW_BOARD_WEIXUE = 1, HW_BOARD_HOMEMADE = 2 };
 

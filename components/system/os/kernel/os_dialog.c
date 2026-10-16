@@ -131,13 +131,14 @@ static void dlg_layout(const os_dlg_stack_t *d, dlg_layout_t *L) {
     L->scroll = 0;
     if (d->sel >= L->visible && d->sel < L->content_count)
         L->scroll = d->sel - L->visible + 1;
-    /* 跟手子像素偏移: 只对可滚动列表生效; 顶/底边界处夹到 0 */
+    /* 跟手子像素偏移: 只对可滚动列表生效 */
     L->px = d->scroll_px;
     if (L->content_count <= L->visible) L->px = 0;
-    if ((d->sel == 0 && L->px > 0) || (d->sel >= L->content_count - 1 && L->px < 0))
-        L->px = 0;
-    if (L->px < -DLG_LINE_H + 1) L->px = -DLG_LINE_H + 1;
-    if (L->px > DLG_LINE_H - 1)  L->px = DLG_LINE_H - 1;
+    /* ★★★ 2026-10-16 改(linit): 去掉"边界硬归零" ⇒ 到顶/到底仍可继续拉(留给回弹), 
+     *   并把可视位移放宽到 1.5 行, 手感连续; 松手后由拖动层衰减回弹归零。 */
+    int pxmax = DLG_LINE_H + DLG_LINE_H / 2;
+    if (L->px < -pxmax) L->px = -pxmax;
+    if (L->px >  pxmax) L->px =  pxmax;
 }
 
 /* 当前弹窗可视行数 (拖动跟手判定: 内容超一屏才滚动) */
@@ -188,13 +189,22 @@ static const char *dlg_ret_text(const os_dlg_stack_t *d) {
 /* 画一行 (3.3 样式): 选中=黑底白字居中; 未选=白底黑字居中 (强制白底防残留) */
 static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
                          int abs_y, const char *text, bool selected) {
+    /* ★★★ 2026-10-16 裁剪(linit): 内容区之外的行一律不画。
+     *   修复"滑动时内容越过弹窗边框、框外留残影" —— 之前 layout 算了 clip 边界但没应用。 */
+    int y0c = abs_y, y1c = abs_y + DLG_LINE_H - 2;      /* 本行绘制范围 */
+    if (y1c < L->clip_top) return;                       /* 整行在上边界之上 */
+    if (y0c > L->clip_bottom) return;                    /* 整行在下边界之下 */
+    bool full = (y0c >= L->clip_top && y1c <= L->clip_bottom);   /* 完全可见才写字 */
+    int y0v = (y0c < L->clip_top) ? L->clip_top : y0c;
+    int y1v = (y1c > L->clip_bottom) ? L->clip_bottom : y1c;
+
     int x0 = L->x + 6, x1 = L->x + L->w - 6;
     const char *t = text;
     if (text_width(text) > x1 - x0) t = text_clip(text, x1 - x0);   /* 超长只显示前20英文/10中文 */
     int top = abs_y + (DLG_LINE_H - 24) / 2;   /* 单行 24px 字垂直居中 */
     if (selected) {
-        fill_rect(lcd, x0, abs_y, x1 - 1, abs_y + DLG_LINE_H - 2, ST7305_COLOR_BLACK);
-        draw_text_centered(lcd, top, t, true);
+        fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_BLACK);
+        if (full) draw_text_centered(lcd, top, t, true);
     } else {
         fill_rect(lcd, x0, abs_y, x1 - 1, abs_y + DLG_LINE_H - 2, ST7305_COLOR_WHITE);
         draw_text_centered(lcd, top, t, false);
@@ -617,6 +627,16 @@ static void dlg_poll(ui_ctx_t *ctx) {
      * 保证平滑连续且选中项随拖动手高 '跟手'. */
     static int s_drag_last_y = -1;
     static bool s_drag_active = false;
+    /* ★★★ 2026-10-16 松手回弹(linit): 非拖动状态下子像素偏移按 ×0.8 衰减到 0 ——
+     *   越界拉出的余量弹回、行内偏移吸附整行 (<2px 归零)。项目"跟手滚动"铁律。 */
+    {
+        os_dlg_stack_t *dr = top();
+        if (!s_drag_active && dr && !dr->no_footer && dr->scroll_px != 0) {
+            dr->scroll_px = (int)((float)dr->scroll_px * 0.8f);
+            if (dr->scroll_px > -2 && dr->scroll_px < 2) dr->scroll_px = 0;
+            ctx->needs_redraw = true;
+        }
+    }
     int tx, ty;
     if (input_get_touch_pos(&tx, &ty)) {
         if (s_drag_last_y < 0) { s_drag_last_y = ty; s_drag_active = false; }
@@ -636,9 +656,9 @@ static void dlg_poll(ui_ctx_t *ctx) {
                 while (dd->scroll_px >= DLG_LINE_H && dd->sel > 0) {
                     dd->sel--; dd->scroll_px -= DLG_LINE_H; moved = true;
                 }
-                /* 顶/底边界: 超出部分抵消并在原地显示边界行 */
-                if (dd->sel <= 0 && dd->scroll_px > 0) dd->scroll_px = 0;
-                if (dd->sel >= max_sel && dd->scroll_px < 0) dd->scroll_px = 0;
+                /* ★ 顶/底边界(改): 不再硬归零, 保留最多 1 行余量 ⇒ 可继续拉, 松手弹回 */
+                if (dd->sel <= 0 && dd->scroll_px > DLG_LINE_H) dd->scroll_px = DLG_LINE_H;
+                if (dd->sel >= max_sel && dd->scroll_px < -DLG_LINE_H) dd->scroll_px = -DLG_LINE_H;
                 if (moved || dy != 0) ctx->needs_redraw = true;
             }
         }
@@ -648,7 +668,7 @@ static void dlg_poll(ui_ctx_t *ctx) {
             s_drag_active = false;
             os_dlg_stack_t *dd = top();
             if (dd) {
-                dd->scroll_px = 0;   /* 松手吸附: 内容回正到选中窗口 */
+                /* 松手: 不直接置 0 ⇒ 交给顶部回弹衰减(越界弹回 + 吸附整行) */
                 ctx->needs_redraw = true;
             }
         }

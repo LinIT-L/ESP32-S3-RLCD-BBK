@@ -100,6 +100,15 @@ void hw_cfg_rescan(void) {
 int hw_cfg_init(void) {
     /* ★★★ 版型锁定(linit 2026-10-16): NVS 已有有效板型 ⇒ 沿用, 不再重探。
      *   刷固件/重启都不会改变已锁定的方案; 仅首次或设置里"重新自检"才探测。 */
+    /* ★★★ 配置版本校验: 固件里的 HWCFG_VER 与 NVS 存的不一致 ⇒ 旧存档一律作废。
+     *   这样"刷固件"绝不会再让触摸/按键行为变样(旧 en_mask 会被重置为默认)。 */
+    uint8_t nvs_ver = cfg_get_u8("cfg_ver", 0);
+    if (nvs_ver != HWCFG_VER) {
+        cfg_set_u8("en_mask", 0xFF);            /* 清掉可能误关核心项的旧掩码 */
+        cfg_set_u8("cfg_ver", HWCFG_VER);
+        ESP_LOGW(TAG, "配置版本 %u→%u ⇒ 已重置旧存档(en_mask)", nvs_ver, HWCFG_VER);
+    }
+
     uint8_t locked = cfg_get_u8("board_lock", 0xFF);
     int b;
     if (locked <= HW_BOARD_HOMEMADE) {
