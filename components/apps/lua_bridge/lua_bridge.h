@@ -18,6 +18,8 @@
 #include <stdint.h>
 #include <time.h>
 #include <dirent.h>
+#include <sys/stat.h>       /* app.fs.size/mkdir: stat / mkdir / S_ISREG */
+#include <errno.h>          /* app.fs.mkdir: EEXIST (已存在视为成功, 幂等) */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
@@ -106,6 +108,7 @@ extern bool s_tone_inited;
 
 /* ---- 模块注册契约 ---- */
 void lua_bridge_setup(lua_State *L);
+
 void lua_mod_consts_register(lua_State *L);
 void lua_mod_gfx_register(lua_State *L);
 void lua_mod_input_register(lua_State *L);

@@ -42,7 +42,9 @@
   "按住移动"类逻辑必须用 press:N + rpt:MS + release 来测; 光 key:N 只是瞬时边沿。
 """
 import argparse
+import math
 import os
+import struct
 import sys
 
 import lupa
@@ -152,6 +154,11 @@ class Sim:
         self.exited = False
         self.sbar_invert = False        # app.sbar(v) 记录: 暗底页面应置 true, 退出还原
         self.toast_msg, self.toast_until = "", 0     # app.dlg.toast 提示 (叠加层)
+        # ---- app.dlg 确认框/列表 (对应固件 os_dialog 的弹窗层) ----
+        # 固件里弹窗是**独立一层**, 触摸先被它消费, 页面 app.touch() 拿不到 —— 这里同样模拟。
+        self.dlg_state = None        # {kind,title,items,count,sel} 或 None
+        self.dlg_result = None       # None=还没选; 0=确定; -1=取消; 1..n=列表下标
+        self.dlg_consumed = False    # 本次按下是否已被弹窗消费 (防同一按重复触发)
         self.cdc_queue = []
         self.lua = lupa.LuaRuntime(unpack_returned_tuples=True)
         self.app = self.lua.table()
@@ -591,6 +598,15 @@ class Sim:
                                   str(p), bytes.fromhex(str(hexd))), True)[1],
                               append=lambda p, d: True,
                               remove=lambda p: self.fs.pop(str(p), None) is not None,
+                              # ★ size/mkdir 必须与固件 luat_lib_fs.c 同步:
+                              #   分块地图要落到 /sdcard/Map/tiles/, Lua 侧建目录只能靠 mkdir;
+                              #   size 用来在 read 之前判"这块会不会超 512 KB 上限"。
+                              size=lambda p: len(self.fs[str(p)]) if str(p) in self.fs else None,
+                              # ★ read_at 是省级地图包的基石 (整省打一个 18MB 的 bin,
+                              #   按索引的 (off,size) 精确读块)。与固件同契约:
+                              #   off/len 越界或文件不存在返回 nil。
+                              read_at=lambda p, o, n: self._fs_read_at(str(p), int(o), int(n)),
+                              mkdir=lambda p: self._fs_mkdir(str(p)),
                               listdir=lambda d: self._listdir(d))
         # ⚠ 必须与固件一致(page_lua.c): 命名空间是**固定的** "luaapp"，
         #    签名里没有 sp 参数 —— get_int(key) / set_int(key,v) / get_str(key) / set_str(key,v)
@@ -625,7 +641,20 @@ class Sim:
         )
         a.db = self.lua.table(set=lambda k, v: True, get=lambda k: None,
                               seti=lambda k, v: True, geti=lambda k: None, del_=lambda k: True)
-        a.net = self.lua.table(is_connected=lambda: True, get_ip=lambda: "192.168.1.23",
+        # 与固件 os_sources.c 同一份源清单 (app.net.mirrors)
+        # ★ 环境变量 LIN_FAKE_MIRROR 可以覆盖它 → 本地起个 http.server 就能把
+        #   "联网下载地图包/应用" 整条链路 (含流式落盘) 在电脑上真跑一遍,
+        #   不用烧到机器上试错。例: LIN_FAKE_MIRROR=http://127.0.0.1:8899
+        _MIRRORS = [os.environ.get("LIN_FAKE_MIRROR") or "https://bbk.linit.cn/bbk",
+                    "https://gitee.com/LinIT-L/ESP32-S3-RLCD-BBK/raw/master/store"]
+        def _mirrors():
+            t = self.lua.table()
+            for i, u in enumerate(_MIRRORS):
+                t[i + 1] = u
+            return t
+
+        a.poly = lambda d, w=1, ct=0, cb=299: self._poly(d, w, ct, cb)
+        a.net = self.lua.table(mirrors=_mirrors,is_connected=lambda: True, get_ip=lambda: "192.168.1.23",
                                http_get=lambda *ar: self._http_get(*ar),
                                ping=lambda ip, c=4, t=500: self._ping(ip, c),
                                port=lambda ip, p, ms=300: int(p) in (80, 443, 8080, 22, 21, 445) and
@@ -635,7 +664,9 @@ class Sim:
                                ipinfo=lambda: ("192.168.1.23", "255.255.255.0", "192.168.1.1",
                                                "192.168.1.1", "WIFI_STA_DEF", "A4:5E:60:AA:BB:CC"),
                                vendor=lambda mac: VENDOR_MAP.get(str(mac)[:8].upper()),
-                               fetch_start=lambda url, t=8000: self._fetch_start(url, t),
+                               fetch_start=lambda url, t=8000, p=None:
+                                   self._fetch_start(url, t, p),
+                               fetch_got=lambda: self._fetch_got(),
                                fetch_poll=lambda: self._fetch_poll())
         # JSON 模块 (与固件 luat_lib_json.c 同契约: 只物化用得到的字段)
         a.json = self.lua.table(pick=lambda b, k="", f="", m=200: self._json_pick(b, k, f, m),
@@ -649,9 +680,24 @@ class Sim:
                                 probe_stop=lambda: True,
                                 probe_count=lambda: len(FAKE_PROBES), probe_info=lambda i: self._probe_info(i),
                                 cur_ssid=lambda: "LinTOS-Home", connecting=lambda: False,
-                                connect=lambda s, p="": True, clear_saved=lambda: None)
-        # 弹窗模块 app.dlg: 与固件 os_dialog 同款 (居中 + 2px 框 + 12px 内边距 + 高 40)
-        a.dlg = self.lua.table(toast=lambda msg, ms=0: self._dlg_toast(msg, ms))
+                                connect=lambda s, p="": True, clear_saved=lambda: None,
+                                setup=lambda: None, connected=lambda: True)
+        # 弹窗模块 app.dlg: 与固件 os_dialog 同款。
+        #   toast   = 2px 框 + 12px 内边距 + 高 40, 0.5s 自动关
+        #   confirm = 小确认模板 (宽 max(140,文字+24) 高 74, 左确定/右取消)
+        #   list    = 350×250 列表模板 (行高 40 + 底部"返回"行)
+        #   结果走**轮询式** app.dlg.result() (nil=还没选), 与固件契约一致。
+        a.dlg = self.lua.table(toast=lambda msg, ms=0: self._dlg_toast(msg, ms),
+                               confirm=lambda msg: self._dlg_confirm(msg),
+                               list=lambda t, items, sel=0: self._dlg_list(t, items, sel),
+                               result=lambda: self.dlg_result)
+        # GPS: 字段与固件 luat_lib_gps.c **逐项对齐** (整数定标, 不用浮点传经纬度)。
+        # 假轨迹绕莆田市中心画圈 + 高度缓升缓降 —— 这样地图应用的
+        # 移动距离 / 爬升高度 / 当前配速 / 卫星数 全都能动起来被验证。
+        a.gps = self.lua.table(start=lambda: True,
+                               fix=lambda: self._gps_fix(),
+                               demo=lambda on=None: True,
+                               reset=lambda: None)
         a.hid = self.lua.table(start=lambda: True, stop=lambda: True, connected=lambda: True,
                                running=lambda: True, cdc_connected=lambda: True,
                                key=lambda m, k: None, key_str=lambda s: None,
@@ -700,8 +746,16 @@ class Sim:
 
     def _touch(self):
         if self.touch_xy is None:
+            self.dlg_consumed = False
             return None
-        return (int(self.touch_xy[0]), int(self.touch_xy[1]))
+        x, y = int(self.touch_xy[0]), int(self.touch_xy[1])
+        if self.dlg_state is not None:
+            # 固件: 弹窗是独立一层, 触摸先被 dlg_touch 消费 → 下面的页面拿不到 app.touch()
+            if not self.dlg_consumed:
+                self.dlg_consumed = True
+                self._dlg_touch(x, y)
+            return None
+        return (x, y)
 
     def _touch_start(self):
         if self.touch_xy is None or self.touch_from is None:
@@ -753,7 +807,53 @@ class Sim:
         """预置几个白板存档 (路径/命名与固件 WB_DIR 一致: /sdcard/App/图片/wbHHMMSSSS.bmp)。
 
         内容是真 1-bit BMP (62 字节头 + 每行 52 字节), 画一条对角线 → 载入后能看出确实读了文件。
+        ★ 另外放一个 `/sdcard` 挂载标记: 真机上 `app.fs.exists("/sdcard")` 走 VFS
+          `access()` —— 卡没插时挂载点不存在, 应用据此拒绝加载 (地图应用就是这么判的)。
+          模拟器没有 VFS, 用这个键代替"卡已插上"。
         """
+        self.fs["/sdcard"] = b""
+        # 地图数据包 (若已编译) → /sdcard/Map/。应用**只认 TF 卡**, 没卡就拒绝加载,
+        # 所以模拟器必须把它们放在 TF 路径下, 而不是 /store/。
+        self.fs["/sdcard/Map"] = b""
+        # ★ LIN_SIM_NOMAP=1: 故意**不**挂地图 → 应用进入"未找到地图包"状态,
+        #   于是能测"联网下载"那条分支 (配合 LIN_FAKE_MIRROR 指向本地 http.server)。
+        if os.environ.get("LIN_SIM_NOMAP"):
+            self.nomap = True
+            return
+        # 数据在 dist/map/ (build/ 会被 fullclean 清掉), 兼容旧的 build/map/
+        MROOTS = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "map"),
+                  os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build", "map")]
+        for mroot in MROOTS:
+            if not os.path.isdir(mroot):
+                continue
+            for fn in sorted(os.listdir(mroot)):
+                if fn.endswith(".ltm") and ("/sdcard/Map/" + fn) not in self.fs:
+                    try:
+                        self.fs["/sdcard/Map/" + fn] = open(os.path.join(mroot, fn), "rb").read()
+                    except OSError:
+                        pass
+        # ★ 省级**单文件包** (fj.json 索引 + fj.bin 数据体) 也要挂进来 ——
+        #   否则"分块地图"这条主链路在电脑上完全测不到 (只有烧到真机才知道对不对)。
+        #   索引 <json> 与数据体 <bin> 同名不同后缀, 扫一遍目录即可。
+        for mroot in MROOTS:
+            for sub in sorted(os.listdir(mroot)) if os.path.isdir(mroot) else []:
+                sd = os.path.join(mroot, sub)
+                if not os.path.isdir(sd):
+                    continue
+                base = None
+                for fn in sorted(os.listdir(sd)):
+                    if fn.endswith(".json"):
+                        base = fn[:-5]
+                        break
+                if not base:
+                    continue
+                for fn in (base + ".json", base + ".bin"):
+                    fp = os.path.join(sd, fn)
+                    if os.path.isfile(fp) and ("/sdcard/Map/" + fn) not in self.fs:
+                        try:
+                            self.fs["/sdcard/Map/" + fn] = open(fp, "rb").read()
+                        except OSError:
+                            pass
         DIR = "/sdcard/App/图片"
         rowb, off = 52, 62
         for name, k in (("wb09300001.bmp", 1), ("wb14300007.bmp", 2), ("wb18120012.bmp", 3)):
@@ -796,8 +896,9 @@ class Sim:
     # ---- 异步 HTTPS (app.net.fetch_start / fetch_poll) ----
     # 固件把它丢到后台任务, 脚本每帧 poll; 模拟器用"隔两帧再给结果"复现这个节奏
     # (让脚本里的 loading 分支真的被走到)。
-    def _fetch_start(self, url, timeout=8000):
+    def _fetch_start(self, url, timeout=8000, path=None):
         u = str(url)
+        self._fetch_path = str(path) if path else None
         # ★ 本地回环 → **走真实 HTTP**（2026-10-04 加：为了在本地把"应用商店联网下载"
         #   这条链路跑通 —— 脚本指向 http://127.0.0.1:PORT/... 就能真的拉到文件）。
         #   其余仍用假 payload，保证既有应用（测速/航班雷达）的回归不变。
@@ -819,8 +920,18 @@ class Sim:
         self._fetch = {"url": u, "n": 2, "body": payload}
         return True
 
+    def _fetch_got(self):
+        # ⚠ 计数器用 _got_n, 别用 _fetch_got —— 和方法同名会被属性覆盖,
+        #   报 "'int' object is not callable"。
+        return int(getattr(self, "_got_n", 0))
+
     def _fetch_poll(self):
-        """返回 1 或 3 个值 —— 必须是 tuple, lupa 才会展开成多返回值。"""
+        """返回 1 / 3 / 4 个值 —— 必须是 tuple, lupa 才会展开成多返回值。
+
+        ★ 与固件同契约: 给了 path 就是**流式落盘** —— body 返回 nil, 第 4 个值是
+          已写字节数。固件那边这会真的 18 MB 边收边写, 所以模拟器也必须真的
+          落到 self.fs[path] 里, 否则"下载完能不能读块"这条链路在电脑上根本测不到。
+        """
         st = getattr(self, "_fetch", None)
         if not st:
             return ("idle",)
@@ -833,16 +944,20 @@ class Sim:
             return ("err", "", -1, err)
         if "body_bytes" in st:                    # 本地真实 HTTP 的字节体
             b = st["body_bytes"]
-            self._fetch = None
-            # ⚠ lupa 把 Python str 按 UTF-8 编回 Lua 串 ⇒ 只有**合法 UTF-8**能无损往返。
-            #   商店包是 .lua 文本(UTF-8) ✓ 没问题; 纯二进制要走 hex 通道(见技能)。
-            try:
-                return ("ok", b.decode("utf-8"), 200)
-            except UnicodeDecodeError:
-                return ("ok", b.decode("latin-1"), 200)
-        body = st.get("body", FAKE_ADSB)
+        else:
+            b = st.get("body", FAKE_ADSB).encode("utf-8")
         self._fetch = None
-        return ("ok", body, 200)
+        self._got_n = len(b)
+        if getattr(self, "_fetch_path", None):
+            self.fs["%s" % self._fetch_path] = b       # 流式: 直接进"文件系统"
+            self._fetch_path = None
+            return ("ok", None, 200, len(b))
+        # ⛔⛔ 必须返回 **bytes**, 不能返回 str。
+        #   lupa 把 Python `str` 按 UTF-8 编回 Lua 串 ⇒ 二进制 (地图 .ltm) 会被改成
+        #   替换字符, 于是 `#body` 变大、fletcher16 不符 → 下载永远失败。
+        #   Python `bytes` 到 Lua 串是**逐字节精确**的。
+        #   (设备端不存在这个问题: 那边本来就是裸字节。)
+        return ("ok", b, 200)
 
     # ---- JSON (app.json.*) ----
     # 契约与固件一致: pick 只保留白名单字段, 缺字段则键不出现 (与 lua_setfield 不写该键等价)
@@ -915,9 +1030,162 @@ class Sim:
         self.toast_until = self.ms + (int(ms) if int(ms) > 0 else 500)
         self.redraw_pending = True
 
+    # ---- app.dlg.confirm / list / result ----
+    def _dlg_confirm(self, msg):
+        self.dlg_state = {"kind": "confirm", "title": str(msg),
+                          "items": ["确定", "取消"], "count": 2, "sel": 0}
+        self.dlg_result = None
+        self.redraw_pending = True
+
+    def _dlg_list(self, title, items, sel=0):
+        try:
+            n = len(items)
+        except Exception:
+            n = 0
+        its = [str(items[i + 1]) for i in range(n)]
+        self.dlg_state = {"kind": "list", "title": str(title), "items": its,
+                          "count": n, "sel": int(sel)}
+        self.dlg_result = None
+        self.redraw_pending = True
+        return n
+
+    def _gps_fix(self):
+        """假 GPS 快照 (字段/定标与固件 luat_lib_gps.c 一致)。
+
+        绕莆田市中心画圈 + 高度缓升缓降: 让 移动距离/爬升高度/当前配速/卫星 都能动,
+        否则地图应用的指标条在模拟器里永远是 "--"。
+        """
+        t = self.ms / 1000.0
+        lat = 25433500 + int(2500 * math.sin(t / 40.0))       # 微度 (±0.0025° ≈ 280 m)
+        lon = 119011000 + int(2500 * math.cos(t / 40.0))
+        kmh10 = 216 + int(58 * math.sin(t * 0.45))            # 0.1 km/h
+        alt = 32 + int(18 * math.sin(t / 25.0))               # 米, 用来验证"爬升迟滞"
+        hh, mm, ss = self._clock()
+        return {
+            "valid": True, "demo": True, "has_time": True, "has_date": True,
+            "lat_e6": lat, "lon_e6": lon,
+            "kmh10": kmh10,
+            # mps100 = m/s × 100。kmh10 是 0.1km/h ⇒ m/s = kmh10/36 ⇒ mps100 = kmh10/36*100
+            "mps100": int(kmh10 / 36.0 * 100 + 0.5),
+            "crs10": int((t * 40) % 3600), "alt_m": alt, "alt_dm": alt * 10,
+            "hdop100": 80, "sats": 11, "quality": 1, "dim": 3,
+            "hh": hh, "mm": mm, "ss": ss, "yy": 2026, "mo": 10, "dd": 5,
+            "age_ms": 0, "sentences": 120, "badcs": 0,
+        }
+
+    def _dlg_geom(self):
+        d = self.dlg_state
+        if d is None:
+            return None
+        if d["kind"] == "confirm":
+            w = max(140, self.textw(d["title"]) + 24)
+            w = min(w, W - 40)
+            h = 74
+        else:
+            w, h = W - 50, H - 50
+        return (W - w) // 2, (H - h) // 2, w, h
+
+    def _dlg_touch(self, x, y):
+        """弹窗命中 (对齐 os_dialog.c dlg_touch): 左=确定/选中行, 右=取消。"""
+        g = self._dlg_geom()
+        if not g:
+            return
+        x0, y0, w, h = g
+        d = self.dlg_state
+        if x < x0 or x > x0 + w - 1:
+            return                              # 落在弹窗外 → 忽略 (固件也是 return false)
+        if d["kind"] == "confirm":
+            by, bot = y0 + 36, y0 + h - 3
+            if by <= y <= bot:
+                # ⚠ 与固件一致: 左"确定"→0, 右"取消"→**1** (不是 -1!);
+                #   -1 只在"超时/BACK/列表返回行"时出现。之前这里写成 -1 会掩盖真机 bug。
+                self.dlg_result = 0 if x < x0 + w // 2 else 1
+                self.dlg_state = None
+            return
+        # 列表: 底部"返回"行 → -1; 内容行 → **0 基**下标 (固件 dlg_finish_top 传的是 d->sel)
+        foot = y0 + h - 4 - 40
+        if y >= foot:
+            self.dlg_result = -1
+            self.dlg_state = None
+            return
+        idx = (y - (y0 + 4)) // 40
+        if 0 <= idx < d["count"]:
+            self.dlg_result = idx
+            self.dlg_state = None
+
+    def _draw_dlg_overlay(self):
+        """把 app.dlg 的确认框/列表按固件 os_dialog 的小确认/列表模板叠到帧缓冲上。"""
+        g = self._dlg_geom()
+        if not g:
+            return
+        x0, y0, w, h = g
+        d = self.dlg_state
+        self.fill(x0, y0, x0 + w - 1, y0 + h - 1, False)          # 白底
+        for k in range(2):                                        # 2px 黑边框
+            self.hline(x0 + k, x0 + w - 1 - k, y0 + k, True)
+            self.hline(x0 + k, x0 + w - 1 - k, y0 + h - 1 - k, True)
+            self.vline(x0 + k, y0 + k, y0 + h - 1 - k, True)
+            self.vline(x0 + w - 1 - k, y0 + k, y0 + h - 1 - k, True)
+        if d["kind"] == "confirm":
+            # 小确认模板: 标题 24px @ y+7; 横杠 y+36/+37 连左右边框;
+            # 正中竖线从横杠到底边框内 2px; 确定/取消 各自半边居中 @ y+43
+            self.textc(y0 + 7, d["title"], False)
+            mid = x0 + w // 2
+            by, bot = y0 + 36, y0 + h - 3
+            self.hline(x0, x0 + w - 1, by, True)
+            self.hline(x0, x0 + w - 1, by + 1, True)
+            self.vline(mid, by, bot, True)
+            self.vline(mid + 1, by, bot, True)
+            bx0, bx1 = x0 + 2, x0 + w - 3
+            cx0, cx1 = (bx0 + mid - 1) // 2, (mid + 2 + bx1) // 2
+            ty = by + 7
+            s0, s1 = d["items"][0], d["items"][1]
+            self.text(cx0 - self.textw(s0) // 2, ty, s0, False)
+            self.text(cx1 - self.textw(s1) // 2, ty, s1, False)
+            return
+        # 列表模板: 标题栏 + 行高 40 + 底部固定"返回"行 + 分隔线
+        self.textc(y0 + 8, d["title"], False)
+        self.hline(x0 + 2, x0 + w - 3, y0 + 34, True)
+        foot = y0 + h - 4 - 40
+        self.hline(x0 + 2, x0 + w - 3, foot - 2, True)
+        cy = y0 + 4
+        for i in range(d["count"]):
+            sel = (i == d["sel"])
+            if sel:
+                self.fill(x0 + 6, cy, x0 + w - 7, cy + 38, True)
+            self.textc(cy + 8, d["items"][i], sel)
+            cy += 40
+        self.textc(foot + 8, "返回", False)
+
     def _clock(self):
         """本地墙上时钟 (时, 分, 秒)。固定 14:30 便于复现截图 (固件走 time()/localtime)。"""
         return (14, 30, 0)
+
+    def _fs_read_at(self, p, off, n):
+        """按偏移读一段 —— 与固件 luat_lib_fs.c 的 app.fs.read_at 同契约。
+
+        ⚠ 二进制必须原样返回 bytes: 地图块是纯二进制, 一旦被当 UTF-8 解码就会
+          在 Lua 侧拿到替换字符 (U+FFFD), 于是"块能解出来但坐标全错"。
+        """
+        b = self.fs.get(p)
+        if b is None or off < 0 or n <= 0 or off >= len(b):
+            return None
+        return b[off:off + n]
+
+    def _fs_mkdir(self, p):
+        """与固件一致: 逐级创建 (mkdir -p), 已存在也返回 true。
+
+        ⚠ 模拟器的 fs 是 {路径: 字节} 的**扁平字典**, 没有真正的目录 —— 沿用已有的
+          "挂载标记"约定: 目录 = 一个映射到空串的键。于是 `exists("/sdcard/Map/tiles")`
+          能查到, 而 `_listdir` 会把它作为条目列出来 (和真机一致)。
+        """
+        p = str(p).rstrip("/")
+        if not p:
+            return False
+        parts = p.split("/")
+        for i in range(2, len(parts) + 1):           # 从 "/a" 起逐级建
+            self.fs.setdefault("/".join(parts[:i]), b"")
+        return True
 
     def _listdir(self, d):
         """与固件一致: 返回**数组** (1..n 的条目名, 跳过 "." 开头), 不是 {名=值} 表。
@@ -974,6 +1242,56 @@ class Sim:
                 if i < len(b) and (b[i] >> (7 - (col & 7))) & 1:
                     self.px(x + col, y + row, True)
 
+    @staticmethod
+    def _poly_alg(self, x0, y0, x1, y1, ct, cb):
+        """一段: 与固件 poly_seg 逐行同算法 (主轴 + 同类行程合并 + 裁剪)"""
+        def hl(xa, xb, y):
+            if xb < xa: xa, xb = xb, xa
+            xa, xb = max(xa, 0), min(xb, W - 1)
+            if xa <= xb and ct <= y <= cb: self.hline(xa, xb, y, True)
+        def vl(x, ya, yb):
+            if yb < ya: ya, yb = yb, ya
+            ya, yb = max(ya, ct), min(yb, cb)
+            if ya <= yb and 0 <= x <= W - 1: self.vline(x, ya, yb, True)
+        dx, dy = x1 - x0, y1 - y0
+        adx, ady = abs(dx), abs(dy)
+        sx = 1 if dx >= 0 else -1
+        sy = 1 if dy >= 0 else -1
+        if adx >= ady:
+            d, x, run = 2 * ady - adx, x0, x0
+            while x != x1:
+                if d > 0:
+                    hl(run, x, y0); run = x + sx; y0 += sy; d -= 2 * adx
+                d += 2 * ady; x += sx
+            hl(run, x1, y0)
+        else:
+            d, y, run = 2 * adx - ady, y0, y0
+            while y != y1:
+                if d > 0:
+                    vl(x0, run, y); run = y + sy; x0 += sx; d -= 2 * ady
+                d += 2 * adx; y += sy
+            vl(x0, run, y1)
+
+    def _poly(self, hexraw, w=1, ct=0, cb=299):
+        """app.poly(raw[, w[, ct, cb]]): 一次调用画整条折线 (点串为小端 i2 对)"""
+        try:
+            b = bytes.fromhex(str(hexraw))
+        except ValueError:
+            return
+        n = len(b) // 8                      # 每点 8 字节: i4 x + i4 y (与固件 l_poly 一致)
+        if n < 2:
+            return
+        pts = [struct.unpack_from("<ii", b, i * 8) for i in range(n)]
+        w = int(w or 1); ct = int(ct); cb = int(cb)
+        for i in range(n - 1):
+            x0, y0 = pts[i]; x1, y1 = pts[i + 1]
+            self._poly_alg(self, x0, y0, x1, y1, ct, cb)
+            if w >= 2:
+                if abs(x1 - x0) >= abs(y1 - y0):
+                    self._poly_alg(self, x0, y0 + 1, x1, y1 + 1, ct, cb)
+                else:
+                    self._poly_alg(self, x0 + 1, y0, x1 + 1, y1, ct, cb)
+
     def _patch_binary_channels(self):
         """二进制安全补丁: lupa 默认把 Lua 串按 UTF-8 解码成 Python str, 内容一旦含非 UTF-8
         字节 (1-bit BMP 里的 0x90/0xFF) 就 UnicodeDecodeError —— 且异常发生在"进入 Python
@@ -992,6 +1310,11 @@ class Sim:
             app.fs.write = function(p, d)
               if type(d) ~= "string" then return _w(p, d) end
               return _w(p, _hex(d))
+            end
+            local _p = app.poly
+            app.poly = function(d, w, ct, cb)
+              if type(d) ~= "string" then return _p(d, w, ct, cb) end
+              return _p(_hex(d), w, ct, cb)
             end
             local _r = app.bmpr
             app.bmpr = function(x, y, w, h, d)
@@ -1012,6 +1335,16 @@ class Sim:
         self._patch_binary_channels()      # 必须在脚本求值后打 (要包住脚本里拿到的 app.*)
 
     def call(self, name, *args):
+        # ★ 弹窗在固件里是**独立一层** (os_dialog 是单独的 page 模块): 触摸由它自己消费,
+        #   不依赖页面是否调 app.touch()。而页面在等结果时通常会提前 return (我们的地图
+        #   应用就是这样), 于是模拟器里没人消费那次触摸 → 弹窗永远关不掉。
+        #   所以这里在每次 poll 前先让"弹窗层"吃一次触摸, 与固件行为对齐。
+        if name == "poll" and self.touch_xy is not None:
+            if self.dlg_state is not None and not self.dlg_consumed:
+                self.dlg_consumed = True
+                self._dlg_touch(int(self.touch_xy[0]), int(self.touch_xy[1]))
+        elif self.touch_xy is None:
+            self.dlg_consumed = False
         f = self.globals[name]
         if f is None:
             return None
@@ -1044,6 +1377,7 @@ class Sim:
 
     def render_frame(self, label, outdir, scale=2, idx=0):
         self._draw_toast_overlay()
+        self._draw_dlg_overlay()
         img = Image.new("1", (W, H), 1)
         px = img.load()
         for y in range(H):

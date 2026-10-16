@@ -126,6 +126,23 @@ void sdrv_draw_channels(st7305_handle_t *lcd, const sdrv_info_t *in);
 void sdrv_draw_waterfall(st7305_handle_t *lcd, const uint8_t *bmp);
 void sdrv_draw_hint(st7305_handle_t *lcd, const char *left, const char *right);
 
+/* ★ 2026-10-14 新视觉: 顶栏**无标题无分隔线**(左=当前源/页名, 右=频段), 底栏改全局软键栏。
+ *   软键栏几何与全项目一致 (同 page_netdect / page_logdiag): 盖子线 273 / 谷线 294 /
+ *   左右键贴边距 16px 纯文字无框; 中间凹口放状态字。 */
+#define SDRV_SOFT_LID     273
+#define SDRV_SOFT_VALLEY  294
+#define SDRV_SOFT_KEYY    277
+#define SDRV_SOFT_MARGIN  16
+void sdrv_draw_topbar(st7305_handle_t *lcd, const char *title, const char *right);
+void sdrv_draw_softbar(st7305_handle_t *lcd, const char *left, const char *right, const char *mid);
+
+/* ★ 2026-10-14 视图轮播: 3 个视图名横向排, 中间放大、两侧缩小; dx = 跟手位移(px)。
+ *   这是"拖全屏卡片"的视觉载体 —— 拖动时名字按 1:1 平移, 松手吸附到最近一项。 */
+void sdrv_draw_carousel(st7305_handle_t *lcd, const char *const *nm, int n, int sel, int dx);
+/* ★ 谱线水平偏移(px): 上方拖动调频时让**曲线跟手平移**(1:1), 松手才真正换频+更新数据。
+ *   雷达/SDR 通用做法: 先"图形平移"给即时反馈, 再重采数据。 */
+void sdrv_set_trace_shift(int px);
+
 /* ---------------- 按功能分屏 (一屏只干一件事, 不拼合) ----------------
  * linit 2026-10-02: "根据不同的功能显示不同的频谱 UI, 不要上面太多字和频谱拼在一起"。 */
 void sdrv_draw_modebar(st7305_handle_t *lcd, const char *title);   /* 顶部标题 + 3px 横线 */

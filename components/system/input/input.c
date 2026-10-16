@@ -3,11 +3,12 @@
  * @brief 按键输入处理 - 非阻塞状态机: 短按/长按
  */
 #include "input.h"
-/* 按键引脚 (Waveshare ESP32-S3-RLCD-4.2): BOOT=GPIO0(右), KEY=GPIO18(左/确认) */
-#define BTN_GPIO_LEFT   ((gpio_num_t)CFG_BTN_LEFT)
-#define BTN_GPIO_RIGHT  ((gpio_num_t)CFG_BTN_RIGHT)
+#include "board_pins.h"
+/* 按键引脚 ★2026-10-13 新载板: SW1=GPIO1(PWR) SW2=GPIO0(右) SW3=GPIO4(左/确认) */
+#define BTN_GPIO_LEFT   (board_pins_get()->btn_left)   /* ★ 按板型表 */
+#define BTN_GPIO_RIGHT  (board_pins_get()->btn_right)
 /* V1.0.68: 软关机键 GPIO1: 短按=确认, 长按0.5s=返回主菜单, 长按2s=软关机 */
-#define BTN_GPIO_PWR    ((gpio_num_t)CFG_BTN_PWR)
+#define BTN_GPIO_PWR    (board_pins_get()->btn_pwr)
 extern void wp_power_pin_init(void);   /* [电源收拢] 电源模块(sleep.c): 开机键唤醒引脚初始化(唯一唤醒源) */
 #define POWER_HOLD_MS   2000
 #define PWR_SHORT_MS    500    /* V1.5.x: 开关键短按判定阈值 — 按住<0.5s 松手=锁屏(短按);
@@ -24,7 +25,6 @@ extern void wp_power_pin_init(void);   /* [电源收拢] 电源模块(sleep.c): 
 #include "vibrator.h"   /* V1.2.x: 游戏震动 (joypad 边沿 / 退出键) */
 #include "tone_player.h" /* 引擎按键点击音 (引擎优化"按键声音"开关) */
 #include "gesture_back.h" /* 系统导航手势识别器: 底部上滑=返回 / 状态栏长按=回桌面 */
-#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 #define TAG "INPUT"
 #define DEBOUNCE_MS 30
@@ -200,6 +200,23 @@ bool input_scheme_touch(void)
  * 否则会被误判为"无输入"而提前休眠. 标志位方式对时钟无依赖, 由 main 每帧消费. */
 static bool s_activity_flag = false;
 void input_mark_activity(void) { s_activity_flag = true; s_last_any_ms = now_ms(); }
+
+/* ★ 2026-10-09 (linit 要求: "正在玩不睡, 但按电源键要能锁屏"):
+ *   "游戏里一直按着键" 与 "真实输入事件" 必须**分成两个通道**, 不能共用一个时钟。
+ *   原来二者都刷 s_last_any_ms ⇒ 后果:
+ *     ① 游戏中按住键(或按键脚悬空假按)每帧刷新它, 屏保监督任务判"有人操作"
+ *        ⇒ **按电源键进屏保后下一拍立刻被踢出来** = "锁屏键进不去动态壁纸";
+ *     ② 空闲时钟永不老化 ⇒ 自动睡眠也永不触发。
+ *   现在: 真实事件 → input_mark_activity(); 按住游戏键 → input_mark_game_held(),
+ *   它只用于"别自动进屏保", **不参与"退出屏保"的判定**。 */
+static volatile bool s_game_held = false;
+void input_mark_game_held(bool held)
+{
+    /* 放下手柄(按住→松开)算一次真实事件: 重新计时, 于是"放下手柄 N 分钟后睡"仍成立 */
+    if (s_game_held && !held) s_last_any_ms = now_ms();
+    s_game_held = held;
+}
+bool input_game_key_held(void) { return s_game_held; }
 bool input_consume_activity(void) { bool a = s_activity_flag; s_activity_flag = false; return a; }
 
 /* V1.2.x: 游戏中"退出键"反馈 — BACK/HOME 不在 joypad 位图内, 单独在此触发游戏震动
@@ -224,10 +241,17 @@ void input_init(void) {
     };
     esp_err_t _ret = gpio_config(&io_conf);
     ESP_LOGI(TAG, "GPIO ret=%d K%d B%d P%d", _ret,
-             gpio_get_level(GPIO_NUM_18), gpio_get_level(GPIO_NUM_0),
+             gpio_get_level(GPIO_NUM_4), gpio_get_level(GPIO_NUM_0),
              gpio_get_level(GPIO_NUM_1));
 
-    /* 触摸面板 (V1.0.65): 未检测到芯片时 read 恒返回 false, 零开销 */
+    /* 触摸面板 (V1.0.65): 未检测到芯片时 read 恒返回 false, 零开销
+     * ★ 2026-10-16: 引脚由本层从 board_pins.h 下发 (换板只改那一个文件) ——
+     *   以前触摸引脚写死在 touch_panel.h, 微雪板上与 LCD_DC 撞成同一个 GPIO5,
+     *   I2C 把该脚设成开漏+上拉 → LCD DC 恒 3.3V、"设置不刷新"。 */
+    {
+        tp_pins_t tp = { BOARD_TP_SDA, BOARD_TP_SCL, BOARD_TP_INT, BOARD_TP_RST };
+        touch_panel_set_pins(&tp);
+    }
     touch_panel_init();
     /* V1.0.69: 运行时分清两套机型, 物理键语义按有没有触摸屏分支. */
     s_has_touch = touch_panel_is_present();   /* 开机检测一次 */
@@ -374,12 +398,12 @@ static void touch_read_once(tp_point_t *pt) {
             s_touch_cached.pressed = false;
             s_touch_multi[0].pressed = false;
             s_touch_cached_count = 0;
-            ESP_LOGW("INPUT", "触摸连续 %d 次读失败, 强制释放触摸状态",
+            ESP_LOGD("INPUT", "触摸连续 %d 次读失败, 强制释放触摸状态",
                      (int)s_touch_fail_count);
         }
         if (s_touch_fail_count >= TOUCH_FAIL_RECOVER_N) {
             s_touch_fail_count = 0;
-            ESP_LOGW("INPUT", "触摸连续 %d 次读失败, 请求看门狗恢复",
+            ESP_LOGD("INPUT", "触摸连续 %d 次读失败, 请求看门狗恢复",
                      (int)TOUCH_FAIL_RECOVER_N);
             touch_panel_request_recover();
         }
@@ -494,7 +518,7 @@ static void touch_jump_filter(tp_point_t *pt, bool pressed) {
             uint32_t now_ms2 = xTaskGetTickCount() * portTICK_PERIOD_MS;
             if (now_ms2 - s_jump_log_ms >= 1000) {
                 s_jump_log_ms = now_ms2;
-                ESP_LOGW("INPUT", "触摸跳变被滤除: (%d,%d)->(%d,%d)",
+                ESP_LOGD("INPUT", "触摸跳变被滤除: (%d,%d)->(%d,%d)",
                          (int)s_flt_rx, (int)s_flt_ry, (int)pt->x, (int)pt->y);
             }
             pt->x = s_flt_rx;   /* 保持上一帧, 不采用跳变点 */
@@ -646,7 +670,7 @@ static menu_action_t touch_gesture_poll(void) {
                 int adx = dx < 0 ? -dx : dx;
                 int ady = dy < 0 ? -dy : dy;
                 if (adx < 10 && ady < 10) {
-                    ESP_LOGW(TAG, "触摸状态超时 9s 复位 (可能芯片读失败导致状态残留)");
+                    ESP_LOGD(TAG, "触摸状态超时 9s 复位 (可能芯片读失败导致状态残留)");
                     s_tg_state = TG_IDLE;
                     s_tg_long_fired = false;
                     s_touch_down = false;
@@ -847,7 +871,7 @@ menu_action_t input_get_action(void) {
                     return nav[i].act;
                 }
                 /* 从未松开过就"按下" = 连接伊始即卡住(坏映射/键码残留), 忽略, 防止菜单 runaway */
-                ESP_LOGW(TAG, "nav键%d 未见过松开即按下, 疑似卡住, 忽略", (int)nav[i].key);
+                ESP_LOGD(TAG, "nav键%d 未见过松开即按下, 疑似卡住, 忽略", (int)nav[i].key);
             } else if (nav[i].rpt && new_db && st[i].debounced && st[i].released_seen) {
                 /* V1.0.39: LEFT 长按 500ms 发射 MENU_ACTION_LONG_LEFT (仅 1 次, 长按期间不再发射).
                  * 优先级最高, 在长按重复之前处理, 避免被正常 repeat 抢走动作. */
@@ -1109,8 +1133,9 @@ uint8_t input_get_held_gb_joypad(void) {
     } else {
         s_jp_prev = j;   /* 非游戏态: 仅同步, 不产生震动 */
     }
-    /* 任意游戏键按住 (低电平有效: 位=0 即按下) = 活动中, 刷新休眠计时.
-     * 这样"正在玩不睡, 放下手柄 3 分钟睡", 对所有游戏界面一致生效. */
-    if (j != 0xFF) input_mark_activity();
+    /* 任意游戏键按住 (低电平有效: 位=0 即按下) = "正在玩不睡".
+     * ⚠ 走 input_mark_game_held() 而非 input_mark_activity(): 前者只抑制"自动进屏保",
+     *   不参与"退出屏保"判定 —— 否则游戏中按电源键进的屏保会被"键还按着"立刻踢出来。 */
+    input_mark_game_held(j != 0xFF);
     return j;
 }

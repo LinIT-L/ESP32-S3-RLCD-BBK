@@ -395,8 +395,8 @@ def main():
                     "OS_PAGE_SETTINGS_BT", "OS_PAGE_SETTINGS_SD", "OS_PAGE_SETTINGS_INFO",
                     "OS_PAGE_BTINFO", "OS_PAGE_KEY_CONFIG", "OS_PAGE_VOLUME",
                     "OS_PAGE_RETURN_GAME", "OS_PAGE_GAME_SETTINGS",
-                    # 容器/演示页: 由代码内部 os_push 打开 (Lua 宿主、LVGL 自检), 不进应用表
-                    "OS_PAGE_LUA", "OS_PAGE_LVGL_DEMO"):
+                    # 容器/演示页: 由代码内部 os_push 打开 (Lua 宿主), 不进应用表
+                    "OS_PAGE_LUA"):
             continue   # 系统内部页/子页/容器页, 正常无应用入口
         warns.append("[W] 页面 %s 已注册 (%s) 但没有任何应用指向它 —— 忘了加进应用表?"
                      % (page, ", ".join(sorted(set(page2reg_alldef[page])))))

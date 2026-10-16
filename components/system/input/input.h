@@ -60,6 +60,10 @@ void input_set_gamemode_cb(input_gamemode_cb_t cb);
  * 刷新休眠计时 (游戏输入不经 os 物理键/触摸, 否则会被误判空闲提前休眠).
  * input_mark_activity() 由输入层调用; input_consume_activity() 由 main 每帧消费. */
 void input_mark_activity(void);
+/* ★ 2026-10-09: "游戏里按住键" 的独立通道 (不算真实输入事件, 只抑制自动进屏保)。
+ *   详见 input.c 的说明。 */
+void input_mark_game_held(bool held);
+bool input_game_key_held(void);
 bool input_consume_activity(void);
 /* V1.5.x: 统一"最近输入"毫秒时间戳 — 由任意输入(手柄/物理键/触摸/joypad)刷新.
  * 桌面主循环与阻塞游戏循环共同据此判定休眠, 口径一致不漂移. 0 表示从未有输入. */

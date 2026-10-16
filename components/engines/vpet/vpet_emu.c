@@ -372,7 +372,7 @@ static void vpet_emu_task(void *arg) {
         }
     }
 
-    ESP_LOGW(TAG, "vpet emu task exiting");
+    ESP_LOGD(TAG, "vpet emu task exiting");
     tone_stop();
     vpet_k0_pin(2, false); vpet_k0_pin(1, false); vpet_k0_pin(0, false);
     esp_task_wdt_delete(NULL);
@@ -388,7 +388,7 @@ esp_err_t vpet_emu_background_init(st7305_handle_t *lcd) {
     if (!s_rom) {
         s_rom = heap_caps_malloc(VPET_ROM_MAX_BYTES / 2 * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
         if (!s_rom) {
-            ESP_LOGE(TAG, "PSRAM ROM 缓冲分配失败");
+            ESP_LOGD(TAG, "PSRAM ROM 缓冲分配失败");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -409,21 +409,21 @@ esp_err_t vpet_emu_start(const char *path) {
     /* 读取 ROM: 小端字节流 → 大端 16 位指令字 (rom.js 语义) */
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGE(TAG, "ROM 打开失败: %s", path);
+        ESP_LOGD(TAG, "ROM 打开失败: %s", path);
         return ESP_ERR_NOT_FOUND;
     }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (len <= 0 || len > VPET_ROM_MAX_BYTES || (len & 1)) {
-        ESP_LOGE(TAG, "ROM 尺寸非法: %ld bytes", len);
+        ESP_LOGD(TAG, "ROM 尺寸非法: %ld bytes", len);
         fclose(f);
         return ESP_ERR_INVALID_SIZE;
     }
     uint8_t *raw = malloc((size_t)len);
     if (!raw) { fclose(f); return ESP_ERR_NO_MEM; }
     if (fread(raw, 1, (size_t)len, f) != (size_t)len) {
-        ESP_LOGE(TAG, "ROM 读取失败: %s", path);
+        ESP_LOGD(TAG, "ROM 读取失败: %s", path);
         free(raw); fclose(f);
         return ESP_FAIL;
     }
@@ -461,7 +461,7 @@ esp_err_t vpet_emu_start(const char *path) {
                                                8192, NULL, 3, &s_task, 1);
         if (r != pdPASS) {
             s_task = NULL;
-            ESP_LOGE(TAG, "无法创建模拟任务");
+            ESP_LOGD(TAG, "无法创建模拟任务");
             return ESP_ERR_NO_MEM;
         }
     }

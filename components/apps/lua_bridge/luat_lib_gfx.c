@@ -336,6 +336,86 @@ static int l_mixw(lua_State *L) {
     return 1;
 }
 
+/* ============ app.poly(raw[, w[, ct, cb]]): 一次调用画**整条折线** ============
+ *
+ * ★ 为什么必须进固件 (2026-10-05 实测):
+ *   Lua 侧逐段 Bresenham 时, **每一次 hline/vline 都是一次 Lua↔C 跨界调用**。
+ *   实测一帧城市路网要 6221 次调用, 却只落 17465 个像素 —— **平均每次只画 2.8 px**,
+ *   因为一条路被抽稀成很多 3 px 的小段, 每段还要按"y 一变就收 run"切成 1~2 px 的小段。
+ *   把"折线游走 + 同 y 行程合并 + 边界裁剪"整段搬进 C 之后, **每条折线只剩 1 次调用**。
+ *
+ * raw  = 小端点串, 每点 **8 字节**: i4 x, i4 y (**屏幕坐标**, 可以远超屏幕, 内部会裁)
+ *        (用 i4 不用 i2: 长路的远端能离屏上万像素, i2 的 ±32767 会溢出)
+ * w    = 线宽 1/2 (2 时沿**法向**偏移再画一遍 —— 一律 +1 y 的话竖线不会增粗, 只是被拉长)
+ * ct/cb= 上下裁剪边界 (地图页要避开状态栏, 默认整屏)
+ *
+ * ⚠ 与 map.lua 原来的 seg()/seg_w() **逐行同算法**, 所以画面不变, 只是调用少了。
+ * ⚠ 用 memcpy 取 i2: Lua 字符串**不保证 2 字节对齐**, 直接转 int16_t* 是 UB。
+ */
+static void poly_hl(st7305_handle_t *lcd, int xa, int xb, int y, int ct, int cb) {
+    if (xb < xa) { int t = xa; xa = xb; xb = t; }
+    if (xa < 0) xa = 0;
+    if (xb > ST7305_WIDTH - 1) xb = ST7305_WIDTH - 1;
+    if (xa > xb || y < ct || y > cb) return;
+    draw_hline(lcd, xa, xb, y, ST7305_COLOR_BLACK);
+}
+
+static void poly_vl(st7305_handle_t *lcd, int x, int ya, int yb, int ct, int cb) {
+    if (yb < ya) { int t = ya; ya = yb; yb = t; }
+    if (ya < ct) ya = ct;
+    if (yb > cb) yb = cb;
+    if (ya > yb || x < 0 || x > ST7305_WIDTH - 1) return;
+    draw_vline(lcd, x, ya, yb, ST7305_COLOR_BLACK);
+}
+
+static void poly_seg(st7305_handle_t *lcd, int x0, int y0, int x1, int y1, int ct, int cb) {
+    int dx = x1 - x0, dy = y1 - y0;
+    int adx = dx < 0 ? -dx : dx;
+    int ady = dy < 0 ? -dy : dy;
+    int sx = dx < 0 ? -1 : 1;
+    int sy = dy < 0 ? -1 : 1;
+    if (adx >= ady) {
+        int d = 2 * ady - adx, x = x0, run = x0;
+        while (x != x1) {
+            if (d > 0) { poly_hl(lcd, run, x, y0, ct, cb); run = x + sx; y0 += sy; d -= 2 * adx; }
+            d += 2 * ady;
+            x += sx;
+        }
+        poly_hl(lcd, run, x1, y0, ct, cb);
+    } else {
+        int d = 2 * adx - ady, y = y0, run = y0;
+        while (y != y1) {
+            if (d > 0) { poly_vl(lcd, x0, run, y, ct, cb); run = y + sy; x0 += sx; d -= 2 * ady; }
+            d += 2 * adx;
+            y += sy;
+        }
+        poly_vl(lcd, x0, run, y1, ct, cb);
+    }
+}
+
+static int l_poly(lua_State *L) {
+    size_t len = 0;
+    const char *d = luaL_checklstring(L, 1, &len);
+    int w  = (int)luaL_optinteger(L, 2, 1);
+    int ct = (int)luaL_optinteger(L, 3, 0);
+    int cb = (int)luaL_optinteger(L, 4, ST7305_HEIGHT - 1);
+    int n  = (int)(len / 8);
+    if (n < 2 || !s_lcd) return 0;
+    int32_t cx, cy, x1, y1;
+    memcpy(&cx, d, 4); memcpy(&cy, d + 4, 4);        /* 第 0 点 */
+    for (int i = 0; i < n - 1; i++) {
+        memcpy(&x1, d + (i + 1) * 8, 4);
+        memcpy(&y1, d + (i + 1) * 8 + 4, 4);
+        poly_seg(s_lcd, cx, cy, x1, y1, ct, cb);
+        if (w >= 2) {                                 /* 粗线: 沿法向偏移再画一遍 */
+            if (abs(x1 - cx) >= abs(y1 - cy)) poly_seg(s_lcd, cx, cy + 1, x1, y1 + 1, ct, cb);
+            else                              poly_seg(s_lcd, cx + 1, cy, x1 + 1, y1, ct, cb);
+        }
+        cx = x1; cy = y1;
+    }
+    return 0;
+}
+
 void lua_mod_gfx_register(lua_State *L)
 {
     lua_pushcfunction(L, l_clear);               lua_setfield(L, -2, "clear");
@@ -363,4 +443,5 @@ void lua_mod_gfx_register(lua_State *L)
     lua_pushcfunction(L, l_mix);                 lua_setfield(L, -2, "mix");
     lua_pushcfunction(L, l_mixc);                lua_setfield(L, -2, "mixc");
     lua_pushcfunction(L, l_mixw);                lua_setfield(L, -2, "mixw");
+    lua_pushcfunction(L, l_poly);                lua_setfield(L, -2, "poly");
 }

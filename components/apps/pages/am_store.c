@@ -79,7 +79,9 @@ static int am_pkg_prefer(const char *fname) { (void)fname; return 0; }
  * 这里给已知包名一个小映射, 未知包沿用默认。 */
 static int am_store_icon_of(const char *fname) {
     static const struct { const char *f; int ic; } T[] = {
-        { "biossim.lua", ICON_DIAG },      /* BIOS 装机模拟器 */
+        { "biossim.lua", ICON_BIOSSIM },          /* BIOS 装机模拟器 (原借 ICON_DIAG) */
+        { "planeradar.lua", ICON_PLANERADAR },    /* 航班雷达 (2026-10-15 补: 漏了这条 →
+                                                   *   商店里一直显示"迷你游戏"默认图标) */
     };
     for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++)
         if (strcmp(T[i].f, fname) == 0) return T[i].ic;
@@ -188,7 +190,7 @@ static void am_pkg_scan(void) {
             }
             w++;
         }
-        if (w != s_pkg_n) ESP_LOGW(TAG, "商店包去重: %d -> %d 条", s_pkg_n, w);
+        if (w != s_pkg_n) ESP_LOGD(TAG, "商店包去重: %d -> %d 条", s_pkg_n, w);
         s_pkg_n = w;
     }
     s_pkg_scanned = 0;   /* 全部填充完成, UI 才可见数据 */
@@ -210,7 +212,7 @@ void am_store_prefetch(void) {
     if (xTaskCreatePinnedToCore(am_pkg_scan_task, "pkgscan", 8192, NULL, 3, NULL, 0) != pdPASS) {
         s_pkg_busy = false;
         s_pkg_done = false;
-        ESP_LOGE(TAG, "商店扫描任务创建失败(内存不足?), 保留上次结果并允许重试");
+        ESP_LOGD(TAG, "商店扫描任务创建失败(内存不足?), 保留上次结果并允许重试");
     }
 }
 /* 商店源清理 (V1.6.x): 商店"本地源" = /store 根目录的 .lua 待装包; "已安装"只认

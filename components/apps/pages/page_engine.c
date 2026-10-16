@@ -19,7 +19,9 @@
 #include "gb_emu.h"
 #include "gbc_emu.h"
 #include "nes_emu.h"
+#if LINTOS_ENABLE_MD   /* ★ 2026-07-13: MD 默认停用(省 715KB), 见 os.h */
 #include "md_emu.h"
+#endif
 #include "sms_emu.h"
 #include "lavax_emu.h"
 #include "vpet_emu.h"
@@ -223,11 +225,14 @@ static void egs_load(void) {
         if (svc_nvs_get_u8(h, "vk", &v) == ESP_OK && v <= 2) s_evk = v;
         if (svc_nvs_get_u8(h, "aa", &v) == ESP_OK && v <= 1) s_aaf = v;   /* 抗锯齿 */
         if (svc_nvs_get_u8(h, "gr", &v) == ESP_OK && v <= 1) s_gray = v;  /* 灰度 */
-        if (svc_nvs_get_u8(h, "vo", &v) == ESP_OK && v < AUDIO_VOL_STEPS) s_evo = v;
         if (svc_nvs_get_u8(h, "esd", &v) == ESP_OK && v <= 1) s_esnd = v; /* 按键声音 */
         if (svc_nvs_get_u8(h, "evb", &v) == ESP_OK && v <= 1) s_evib = v; /* 触摸震动 */
         svc_nvs_close(h);
     }
+    /* ★ 2026-10-14 音量统一: 引擎优化的"音量"就是**全局音量**, 不再单独存档。
+     *   原来这里读自己的 "vo" 档位, 且 eng_task_run_loop 进游戏时还把它强行写回全局
+     *   ⇒ "设置里调好的音量, 一进游戏就变"。现在只做"显示档位 = 全局音量换算"。 */
+    s_evo = (uint8_t)audio_player_vol_to_step(audio_player_get_volume());
     /* 应用到全局输入层 (引擎游戏模式按键点击音 / 震动) */
     input_set_engine_sound(s_esnd != 0);
     input_set_engine_vib(s_evib != 0);
@@ -235,7 +240,7 @@ static void egs_load(void) {
 static void egs_save(void) {
     svc_cfg_set_u8(EGSET_NS, "dm", s_edm);   svc_cfg_set_u8(EGSET_NS, "vk", s_evk);
     svc_cfg_set_u8(EGSET_NS, "aa", s_aaf);   svc_cfg_set_u8(EGSET_NS, "gr", s_gray);
-    svc_cfg_set_u8(EGSET_NS, "vo", s_evo);
+    /* ⛔ 不再存 "vo": 音量统一由 audio_player 持久化 (见 egs_load 注释) */
     svc_cfg_set_u8(EGSET_NS, "esd", s_esnd); svc_cfg_set_u8(EGSET_NS, "evb", s_evib);
 }
 static const char *edm_name(void){ return s_edm==0?"\xe7\x82\xb9\xe5\xaf\xb9\xe7\x82\xb9":(s_edm==2?"\xe6\x8b\x89\xe4\xbc\xb8":"\xe5\x85\xa8\xe5\xb1\x8f"); } /*点对点/拉伸/全屏*/
@@ -284,7 +289,7 @@ static void eng_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
     else if (item == 1) s_evk = (uint8_t)((s_evk + 1) % 3);
     else if (item == 2) s_aaf ^= 1;       /* 抗锯齿 */
     else if (item == 3) s_gray ^= 1;      /* 灰度 */
-    else if (item == 4) {   /* 音量档位 0-9 循环, 联调统一音量 */
+    else if (item == 4) {   /* 音量档位 0-9 循环 → 调全局音量 (统一入口自己落盘) */
         s_evo = (uint8_t)((s_evo + 1) % AUDIO_VOL_STEPS);
         audio_player_set_volume(audio_player_vol_to_percent((int)s_evo));
     }
@@ -369,8 +374,6 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
     input_set_gamepad_gamemode(true);   /* V1.2.x: 标记真正进入游戏, 允许手柄返回/退出键退出 */
     /* 屏幕虚拟按键: 引擎优化"虚拟按键"设置 (0=关 1/2=开) */
     virtual_keys_set_enabled(s_evk != 0);
-    /* 应用引擎优化的统一音量档位 (0-9) 到全局音频 */
-    audio_player_set_volume(audio_player_vol_to_percent((int)s_evo));
     /* 应用引擎优化: 灰度总开关 + 抗锯齿档位.
      * 灰度开 → 按抗锯齿选 4档(aa=0)/5档(aa=1)点聚灰度; 灰度关 → 纯黑白.
      * GB/GBC/NES 共用 board_shim 灰度. */
@@ -435,7 +438,7 @@ static void gb_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char 
     gb_emu_rom_t rom;
     if (gb_emu_load_rom(path, &rom) != ESP_OK) {
         gb_emu_set_progress_cb(NULL);
-        ESP_LOGE(TAG, "GB ROM 加载失败: %s", path);
+        ESP_LOGD(TAG, "GB ROM 加载失败: %s", path);
         return;
     }
     eng_loading_draw(100, s_load_text);         /* 读取完成 → 100% */
@@ -443,7 +446,7 @@ static void gb_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char 
     input_set_gamepad_nav_enabled(false);
     esp_err_t st = gb_emu_start(&rom);   /* 启动模拟任务 (非阻塞) */
     if (st != ESP_OK) {
-        ESP_LOGE(TAG, "GB 启动失败: %s", esp_err_to_name(st));
+        ESP_LOGD(TAG, "GB 启动失败: %s", esp_err_to_name(st));
     } else {
         gb_emu_set_fullscreen((int)s_edm);   /* 显示模式 */
         eng_loop_ops_t ops = { gb_emu_set_joypad, gb_emu_pause, gb_emu_resume };
@@ -467,7 +470,7 @@ static void gbc_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char
     gbc_emu_set_progress_cb(NULL);              /* 加载完成, 移除回调 */
     eng_loading_draw(100, s_load_text);         /* 补齐到 100% 再进游戏, 避免 70% 就开局 */
     if (st != ESP_OK) {
-        ESP_LOGE(TAG, "GBC 启动失败: %s", esp_err_to_name(st));
+        ESP_LOGD(TAG, "GBC 启动失败: %s", esp_err_to_name(st));
     } else {
         gbc_emu_set_fullscreen((int)s_edm);   /* 显示模式 */
         eng_loop_ops_t ops = { gbc_emu_set_joypad, gbc_emu_pause, gbc_emu_resume };
@@ -488,7 +491,7 @@ static void nes_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char
     nes_emu_set_progress_cb(NULL);              /* 加载完成, 移除回调 */
     eng_loading_draw(100, s_load_text);         /* 补齐到 100% 再进游戏 */
     if (st != ESP_OK) {
-        ESP_LOGE(TAG, "NES 启动失败: %s", esp_err_to_name(st));
+        ESP_LOGD(TAG, "NES 启动失败: %s", esp_err_to_name(st));
     } else {
         nes_emu_set_fullscreen((int)s_edm);   /* 显示模式 */
         eng_loop_ops_t ops = { nes_emu_set_joypad, nes_emu_pause, nes_emu_resume };
@@ -533,7 +536,7 @@ static void lavax_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const ch
     const char *run = path;
     if (!wqx_ends_lav(path)) {
         if (wqx_resolve_lav(path, lav, sizeof(lav)) != 0) {
-            ESP_LOGE(TAG, "文曲星: %s 内未找到 .lav", path);
+            ESP_LOGD(TAG, "文曲星: %s 内未找到 .lav", path);
             input_set_gamepad_nav_enabled(true);
             input_set_gamepad_gamemode(false);
             os_dialog_toast(ctx, "\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0\xe6\xb8\xb8\xe6\x88\x8f"); /* 未找到游戏 */
@@ -556,7 +559,7 @@ static void vpet_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const cha
     ESP_LOGI(TAG, "启动暴龙机: %s", path);
     input_set_gamepad_nav_enabled(false);
     esp_err_t st = vpet_emu_start(path);   /* 启动模拟任务 (非阻塞) */
-    if (st != ESP_OK) ESP_LOGE(TAG, "VPET 启动失败: %s", esp_err_to_name(st));
+    if (st != ESP_OK) ESP_LOGD(TAG, "VPET 启动失败: %s", esp_err_to_name(st));
     else {
         vpet_emu_set_display((int)s_edm, s_gray != 0);   /* 显示模式 + 灰度 */
         eng_loop_ops_t ops = { vpet_emu_set_joypad, vpet_emu_pause, vpet_emu_resume };
@@ -643,6 +646,7 @@ static const os_module_t s_mod_nes = {
     .fullscreen = false,
 };
 
+#if LINTOS_ENABLE_MD
 /* ==== MD/Genesis 页面 ==== */
 static void md_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char *name) {
     (void)p; (void)name;
@@ -654,7 +658,7 @@ static void md_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char 
     md_emu_set_progress_cb(NULL);
     eng_loading_draw(100, s_load_text);
     if (st != ESP_OK) {
-        ESP_LOGE(TAG, "MD 启动失败: %s", esp_err_to_name(st));
+        ESP_LOGD(TAG, "MD 启动失败: %s", esp_err_to_name(st));
     } else {
         md_emu_set_fullscreen((int)s_edm);
         eng_loop_ops_t ops = { md_emu_set_joypad, md_emu_pause, md_emu_resume };
@@ -685,6 +689,7 @@ static const os_module_t s_mod_md = {
     .poll       = md_poll,
     .fullscreen = false,
 };
+#endif
 
 /* ==== SMS/GG 页面 ==== */
 static void sms_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char *name) {
@@ -697,7 +702,7 @@ static void sms_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char
     sms_emu_set_progress_cb(NULL);
     eng_loading_draw(100, s_load_text);
     if (st != ESP_OK) {
-        ESP_LOGE(TAG, "SMS 启动失败: %s", esp_err_to_name(st));
+        ESP_LOGD(TAG, "SMS 启动失败: %s", esp_err_to_name(st));
     } else {
         sms_emu_set_fullscreen((int)s_edm);
         eng_loop_ops_t ops = { sms_emu_set_joypad, sms_emu_pause, sms_emu_resume };
@@ -786,7 +791,7 @@ static void ab_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char 
     /* ArduBoy 虚拟按键: 十字方向 + A/B (STANDARD) */
     virtual_keys_set_layout(VK_LAYOUT_STANDARD);
     esp_err_t st = arduboy_avr_start(path);   /* 启动模拟任务 (非阻塞) */
-    if (st != ESP_OK) ESP_LOGE(TAG, "ArduBoy 启动失败: %s", esp_err_to_name(st));
+    if (st != ESP_OK) ESP_LOGD(TAG, "ArduBoy 启动失败: %s", esp_err_to_name(st));
     else {
         arduboy_avr_set_fullscreen((int)s_edm);   /* 显示模式 (引擎优化) */
         eng_loop_ops_t ops = { arduboy_avr_set_joypad, arduboy_avr_pause, arduboy_avr_resume };
@@ -823,7 +828,9 @@ void os_page_engine_register_all(void) {
     os_register(&s_mod_gb);
     os_register(&s_mod_gbc);
     os_register(&s_mod_nes);
+#if LINTOS_ENABLE_MD
     os_register(&s_mod_md);
+#endif
     os_register(&s_mod_sms);
     os_register(&s_mod_lavax);
     os_register(&s_mod_vpet);

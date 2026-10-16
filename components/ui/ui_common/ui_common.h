@@ -77,6 +77,11 @@ void draw_icon_bitmap_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w
 void draw_main_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx);
 /* 取主菜单图标原始 1bpp 位图 (MSB-first, 1=黑), 供离屏整列预渲染等场景直接嵌入 */
 const uint8_t *ui_main_icon_bitmap(int icon_idx, int *w, int *h);
+
+/* ★ 2026-10-15 "图标跟着应用走": 注册一块 64×64 (512B) 外来图标 (LAPP 自带位图),
+ * 返回可用下标 (>= MAIN_ICON_COUNT, 与内置图标同一套绘制路径); 同图自动复用;
+ * 表满返回 -1。⚠ 返回的下标只在本次开机有效, 不要写 NVS 长期保存。 */
+int ui_icon_register_extra(const uint8_t *bmp512);
 /* 通用 1bpp 位图缩放直写 (同主图标朝向), 供嵌入自定义位图 (如诊断器件图标) */
 void draw_1bpp_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h,
                          int src_w, int src_h, const uint8_t *src);

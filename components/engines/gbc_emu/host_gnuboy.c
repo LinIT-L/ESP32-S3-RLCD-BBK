@@ -18,7 +18,7 @@ void die(char *fmt, ...)
     char buf[160];
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    ESP_LOGE(TAG, "die: %s", buf);
+    ESP_LOGD(TAG, "die: %s", buf);
     /* 与 esp-box-emu 一致: 不终止模拟, 避免坏 ROM 直接重启设备 */
 }
 

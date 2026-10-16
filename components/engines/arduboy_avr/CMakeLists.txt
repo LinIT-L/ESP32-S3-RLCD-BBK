@@ -43,8 +43,8 @@ idf_component_register(
         "avr/simavr/cores"
         "avr/simavr/cores/avr"
         "avr/simavr/parts"
-    PRIV_REQUIRES "st7305" "freertos" "esp_timer" "driver" "audio_player" "virtual_keys"
-    "cheater" "board_shim" "input" "bt_ctl"
+    PRIV_REQUIRES "st7305" "freertos" "esp_timer" "driver" "audio_player" "virtual_keys" "bt_ctl" "input"
+    "cheater" "board_shim"  
 )
 
 # 启用未用外设的 stub 实现 (见 *_stub.c), 关闭其真实实现

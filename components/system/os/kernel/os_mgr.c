@@ -85,7 +85,7 @@ void os_mgr_init(void)
             s_crash_count++;
             svc_nvs_set_u32(h, "crash_count", s_crash_count);
             svc_nvs_commit(h);
-            ESP_LOGW(TAG, "检测到异常复位 (reason=%d), 累计异常复位=%u",
+            ESP_LOGD(TAG, "检测到异常复位 (reason=%d), 累计异常复位=%u",
                      (int)r, (unsigned)s_crash_count);
         }
         svc_nvs_close(h);
@@ -112,7 +112,7 @@ static void mem_tick(ui_ctx_t *ctx)
     if (s_low_mem_bytes && s_mem_internal < s_low_mem_bytes) {
         if (!s_warned_low) {
             s_warned_low = true;
-            ESP_LOGW(TAG, "内部内存低: %u < %u, 触发引擎回收",
+            ESP_LOGD(TAG, "内部内存低: %u < %u, 触发引擎回收",
                      (unsigned)s_mem_internal, (unsigned)s_low_mem_bytes);
             /* 【改】系统级告警不再弹 toast(防止全屏引擎下点不掉/吞输入), 仅日志记录 */
 #if CONFIG_OS_MGR_LIFE
@@ -167,7 +167,7 @@ static void power_tick(ui_ctx_t *ctx, uint32_t now_ms)
         if (!s_bat_warned) {
             s_bat_warned = true;
             /* 【改】低电量告警不弹 toast(用户要求"不要显示电量低", 且防止全屏引擎下点不掉), 仅日志 */
-            ESP_LOGW(TAG, "电量低: %d%%, 建议尽快充电", (int)bat.percent);
+            ESP_LOGD(TAG, "电量低: %d%%, 建议尽快充电", (int)bat.percent);
         }
     } else if (bat.percent >= 20) {
         s_bat_warned = false;

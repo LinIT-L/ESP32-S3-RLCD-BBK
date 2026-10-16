@@ -142,49 +142,51 @@ static int tick_y(int i) { return sdrv_y_of_db(s_top - (float)(60 - s_tick_rel[i
 
 void sdrv_draw_scale(st7305_handle_t *lcd)
 {
+    /* ★ 2026-10-15 linit: 最底下那格原来是中文"本底", 改成数字 **0**。
+     *   理由: ① 四格统一成 0/20/40/60, 一眼就是"高于本底多少 dB"(相对刻度);
+     *         ② 两个汉字 32px 会顶到绘图区左边 (PLOT_X0=32), 单个数字只有 8px, 干净。
+     *   (当初写"本底"是怕只写 0 被当成 0dBm 绝对功率 —— 但 60/40/20 已说明是相对量。) */
     for (int i = 0; i < 4; i++) {
-        bool floor_row = (s_tick_rel[i] == 0);
         char b[8];
-        if (floor_row) snprintf(b, sizeof b, "本");
-        else           snprintf(b, sizeof b, "%d", s_tick_rel[i]);
-        int y = tick_y(i) - (floor_row ? 8 : 5);
+        snprintf(b, sizeof b, "%d", s_tick_rel[i]);
+        int y = tick_y(i) - 5;
         if (y < SDRV_PLOT_Y0) y = SDRV_PLOT_Y0;
-        if (y > SDRV_PLOT_Y1 - 16) y = SDRV_PLOT_Y1 - 16;
-        if (floor_row) ui_text16(lcd, 1, y, b, false);
-        else {
-            int w = sdrv_ascii_w(b);
-            sdrv_ascii(lcd, (w < 26 ? 26 - w : 0), y, b, false);
-        }
+        if (y > SDRV_PLOT_Y1 - 12) y = SDRV_PLOT_Y1 - 12;
+        int w = sdrv_ascii_w(b);
+        sdrv_ascii(lcd, (w < 26 ? 26 - w : 0), y, b, false);
     }
 }
 
 void sdrv_draw_grid(st7305_handle_t *lcd, const sdrv_info_t *in)
 {
-    for (int i = 0; i < 4; i++) {
-        int y = tick_y(i);
-        if (s_tick_rel[i] == 0) draw_hline(lcd, SDRV_PLOT_X0, SDRV_PLOT_X1, y, ST7305_COLOR_BLACK);
-        else                    dotted_hline(lcd, SDRV_PLOT_X0, SDRV_PLOT_X1, y, 1, 4);
-    }
-    int n = sdrv_axis_ticks(in->span_mhz);
-    for (int i = 0; i < n; i++) {
-        int x = sdrv_axis_tick_x(i, n);
-        bool mid = (i == n / 2);
+    (void)in;
+    /* ★ 2026-10-14 linit: "虚线做成一格一格的正方形" —— 横竖都是 **32px 间距**
+     *   (绘图区 368×128 ⇒ 横 11 格 / 竖 4 格), 一律点阵 (1bpp 靠"点/实"分层级)。 */
+    for (int y = SDRV_PLOT_Y0 + 8; y <= SDRV_PLOT_Y1 - 4; y += 32)
+        dotted_hline(lcd, SDRV_PLOT_X0, SDRV_PLOT_X1, y, 1, 4);
+    for (int x = SDRV_PLOT_X0; x <= SDRV_PLOT_X1; x += 32)
         for (int y = SDRV_PLOT_Y0; y <= SDRV_PLOT_Y1; y++)
             if ((y % 4) == 0) ui_draw_pixel(lcd, x, y, ST7305_COLOR_BLACK);
-        if (mid)
-            for (int y = SDRV_PLOT_Y0; y <= SDRV_PLOT_Y1; y++)
-                if ((y % 2) == 1) ui_draw_pixel(lcd, x, y, ST7305_COLOR_BLACK);
-    }
 }
 
 /* 谱线: 只有线不填面积 (实填/点阵填充在本底偏高时都会糊成一片黑, 实测过) */
+static int s_tr_shift;                     /* 谱线水平偏移 (上方拖动调频的跟手预览) */
+void sdrv_set_trace_shift(int px) { s_tr_shift = px; }
+
 void sdrv_draw_trace(st7305_handle_t *lcd, const float *db, int n)
 {
+    /* ⛔ 必须判空: "空白优先"会传 NULL 进来 (2026-10-14 漏判 ⇒ 打开就重启) */
+    if (!db || n <= 0) return;
     int prev = -1;
     for (int i = 0; i < n; i++) {
         int x = SDRV_PLOT_X0 + i;
         if (x > SDRV_PLOT_X1) break;
-        int y = sdrv_y_of_db(db[i]);
+        int si = i - s_tr_shift;           /* ★ 内容跟手平移 (拖动调频时的像素零头) */
+        /* ⛔ 越界不要 "跳过不画" —— 那会在拖动方向的反侧留一条空白竖条。
+         *   夹到边界 = 边缘值延展, 视觉上跟手更顺 (实测)。 */
+        if (si < 0) si = 0;
+        if (si >= n) si = n - 1;
+        int y = sdrv_y_of_db(db[si]);
         if (y < SDRV_PLOT_Y0) y = SDRV_PLOT_Y0;
         if (y > SDRV_PLOT_Y1) y = SDRV_PLOT_Y1;
         int a = y, b2 = (prev >= 0) ? prev : y;
@@ -197,11 +199,15 @@ void sdrv_draw_trace(st7305_handle_t *lcd, const float *db, int n)
 
 void sdrv_draw_hold(st7305_handle_t *lcd, const float *hold, int n)
 {
+    if (!hold || n <= 0) return;      /* 同上: 判空 */
     for (int i = 0; i < n; i++) {
         if ((i % 3) == 2) continue;
         int x = SDRV_PLOT_X0 + i;
         if (x > SDRV_PLOT_X1) break;
-        int y = sdrv_y_of_db(hold[i]);
+        int si = i - s_tr_shift;                       /* 与谱线同步平移 */
+        if (si < 0) si = 0;
+        if (si >= n) si = n - 1;
+        int y = sdrv_y_of_db(hold[si]);
         if (y <= SDRV_PLOT_Y0) y = SDRV_PLOT_Y0 + 1;
         ui_draw_pixel(lcd, x, y, ST7305_COLOR_BLACK);
         if ((i & 1) == 0) ui_draw_pixel(lcd, x, y - 1, ST7305_COLOR_BLACK);
@@ -292,13 +298,10 @@ void sdrv_draw_channels(st7305_handle_t *lcd, const sdrv_info_t *in)
 void sdrv_draw_waterfall(st7305_handle_t *lcd, const uint8_t *bmp)
 {
     if (!bmp) return;
-    ui_text16(lcd, 1, SDRV_WF_Y0 + 1, "强", false);
-    ui_text16(lcd, 1, SDRV_WF_Y0 + SDRV_WF_H - 18, "弱", false);
-    for (int y = SDRV_WF_Y0 + 18; y < SDRV_WF_Y0 + SDRV_WF_H - 20; y += 6) {
-        int k = (y - (SDRV_WF_Y0 + 18)) / 6;
-        int m = 5 - k / 3; if (m < 1) m = 1;
-        for (int i = 0; i < m; i++) ui_draw_pixel(lcd, 6 + i * 3, y, ST7305_COLOR_BLACK);
-    }
+    /* ★ 轴与瀑布之间的分隔基线 (2px): 明确切开"频谱区"与"时间轴" */
+    draw_hline(lcd, 6, SDRV_W - 7, SDRV_WF_Y0 - 3, ST7305_COLOR_BLACK);
+    draw_hline(lcd, 6, SDRV_W - 7, SDRV_WF_Y0 - 2, ST7305_COLOR_BLACK);
+    /* ⛔ 2026-10-14 linit: 瀑布左侧的「强/弱」标注与强度刻度不要显示 */
     st7305_draw_bitmap_1bit(lcd, SDRV_PLOT_X0, SDRV_WF_Y0, SDRV_PLOT_W, SDRV_WF_H, bmp);
 }
 
@@ -408,6 +411,64 @@ void sdrv_draw_notice(st7305_handle_t *lcd, const char *line1, const char *line2
 /* ============================ 按功能分屏 ============================
  * 一屏只干一件事: 全景只看图; 信道只看 13 根柱; 蓝牙只看三条; 干扰只看三行指示。
  * 不再把"图 + 统计 + 结论 + 建议"拼在一屏里。 */
+
+/* 顶栏: 左=当前源/页名 (16px) · 右=频段 (11px) —— **不画标题横线** */
+void sdrv_draw_topbar(st7305_handle_t *lcd, const char *title, const char *right)
+{
+    if (title && *title) ui_text16(lcd, 6, 1, title, false);
+    if (right && *right) {
+        int w = sdrv_ascii_w(right);
+        sdrv_ascii(lcd, SDRV_W - 6 - w, 4, right, false);
+    }
+}
+
+/* 底栏软键栏 (与 netdect / logdiag 同套): 盖子线 + 左右斜坡 + 谷线; 凹口放状态字 */
+void sdrv_draw_softbar(st7305_handle_t *lcd, const char *left, const char *right, const char *mid)
+{
+    int wl = (left && *left) ? ui_text16w(left) : 0;
+    int wr = (right && *right) ? ui_text16w(right) : 0;
+    if (wl) ui_text16(lcd, SDRV_SOFT_MARGIN, SDRV_SOFT_KEYY, left, false);
+    if (wr) ui_text16(lcd, SDRV_W - SDRV_SOFT_MARGIN - wr, SDRV_SOFT_KEYY, right, false);
+    if (mid && *mid) {
+        int w = sdrv_ascii_w(mid);
+        sdrv_ascii(lcd, (SDRV_W - w) / 2, SDRV_SOFT_VALLEY - 13, mid, false);
+    }
+    int Lend = wl ? (SDRV_SOFT_MARGIN + wl + 12) : 40;
+    int Rstart = wr ? (SDRV_W - SDRV_SOFT_MARGIN - wr - 12) : (SDRV_W - 40);
+    draw_hline(lcd, 0, Lend, SDRV_SOFT_LID, ST7305_COLOR_BLACK);
+    draw_hline(lcd, Rstart, SDRV_W - 1, SDRV_SOFT_LID, ST7305_COLOR_BLACK);
+    int slope = SDRV_SOFT_VALLEY - SDRV_SOFT_LID;
+    if (Lend + slope < Rstart - slope)
+        draw_hline(lcd, Lend + slope, Rstart - slope, SDRV_SOFT_VALLEY, ST7305_COLOR_BLACK);
+    for (int d = 0; d <= slope && d < 40; d++) {
+        ui_draw_pixel(lcd, Lend + d, SDRV_SOFT_LID + d, ST7305_COLOR_BLACK);
+        ui_draw_pixel(lcd, Rstart - d, SDRV_SOFT_LID + d, ST7305_COLOR_BLACK);
+    }
+}
+
+void sdrv_draw_carousel(st7305_handle_t *lcd, const char *const *nm, int n, int sel, int dx)
+{
+    const int step = 76;                       /* 项间距 (靠中间一点, 保证两边文字显示全) */
+    const int base = SDRV_SOFT_VALLEY - 18;    /* 16px 字的顶 (按 linit 要求上移 3px) */
+    /* ★ 2026-10-14 linit: 下面这条是"当前在第几页"的指示器, **不是 1:1 跟手** ——
+     *   上面拖满一屏(400px) ⇒ 下面正好走 **一个项间距**(即两个名字之间的距离),
+     *   比例 ≈ step/SDRV_W (76/400)。原来直接把 s_slide(±400) 当位移用,
+     *   一拖名字就全飞出凹口 ⇒ 看起来"滑动时没有名字"。 */
+    const int cdx = dx * step / SDRV_W;
+    for (int k = -1; k <= 1; k++) {
+        /* ★ 环形轮播: 首尾相接 ⇒ **名字永远都在** (linit: "只显示两个")
+         *   ⛔ 原来是线性的 (i<0 就跳过) ⇒ 停在第一页时左边没有上一项, 只画得出 2 个。 */
+        int i = (sel + k + n) % n;
+        /* ★ 方向: 手指往右拖(dx>0) → 内容跟着往右 → 左边的项移进来 (同向) */
+        int vx = k * step + cdx;
+        if (vx < -190 || vx > 190) continue;
+        int w = ui_text16w(nm[i]);
+        int x = SDRV_W / 2 + vx - w / 2;
+        /* ★ 拖动时三个名字都画出来 (linit: "提前加载所有菜单文字, 别等松手才显示");
+         *   超出凹口的部分由**软键栏的线**盖住 (绘制顺序: 轮播 → 涂白 → 软键栏)。 */
+        ui_text16(lcd, x, base, nm[i], false);
+    }
+}
 
 void sdrv_draw_modebar(st7305_handle_t *lcd, const char *title)
 {

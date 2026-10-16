@@ -91,7 +91,7 @@ esp_err_t lavax_emu_background_init(st7305_handle_t *lcd)
                                 MALLOC_CAP_SPIRAM);
     if (!s_vm_ram)
     {
-        ESP_LOGE(TAG, "PSRAM 分配失败: VM %d + local %d bytes",
+        ESP_LOGD(TAG, "PSRAM 分配失败: VM %d + local %d bytes",
                  (int)lavaxvm_vm_ram_size(), (int)lavaxvm_local_ram_size());
         return ESP_ERR_NO_MEM;
     }
@@ -101,7 +101,7 @@ esp_err_t lavax_emu_background_init(st7305_handle_t *lcd)
     bmpdata_buf = heap_caps_malloc(SCREEN_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
     if (!bmpdata_buf)
     {
-        ESP_LOGE(TAG, "PSRAM 屏缓冲分配失败 (%d bytes)", SCREEN_BUFFER_SIZE);
+        ESP_LOGD(TAG, "PSRAM 屏缓冲分配失败 (%d bytes)", SCREEN_BUFFER_SIZE);
         heap_caps_free(s_vm_ram); s_vm_ram = NULL;
         return ESP_ERR_NO_MEM;
     }
@@ -109,7 +109,7 @@ esp_err_t lavax_emu_background_init(st7305_handle_t *lcd)
     s_gray = heap_caps_malloc(GRAY_SIZE, MALLOC_CAP_SPIRAM);
     if (!s_gray)
     {
-        ESP_LOGE(TAG, "PSRAM 灰度缓冲分配失败 (%d bytes)", GRAY_SIZE);
+        ESP_LOGD(TAG, "PSRAM 灰度缓冲分配失败 (%d bytes)", GRAY_SIZE);
         heap_caps_free(s_vm_ram); s_vm_ram = NULL;
         heap_caps_free(bmpdata_buf); bmpdata_buf = NULL;
         return ESP_ERR_NO_MEM;
@@ -122,7 +122,7 @@ esp_err_t lavax_emu_background_init(st7305_handle_t *lcd)
     patbuf     = heap_caps_malloc(0x400,              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!func_stack || !circle_buf || !patbuf)
     {
-        ESP_LOGE(TAG, "LavaX 运行缓冲分配失败 (func_stack=%p circle=%p patbuf=%p)",
+        ESP_LOGD(TAG, "LavaX 运行缓冲分配失败 (func_stack=%p circle=%p patbuf=%p)",
                  (void*)func_stack, (void*)circle_buf, (void*)patbuf);
         if (func_stack) { heap_caps_free(func_stack); func_stack = NULL; }
         if (circle_buf) { heap_caps_free(circle_buf); circle_buf = NULL; }
@@ -141,7 +141,7 @@ esp_err_t lavax_emu_background_init(st7305_handle_t *lcd)
                       (uint8_t *)s_vm_ram + lavaxvm_vm_ram_size(),
                       lavaxvm_local_ram_size()))
     {
-        ESP_LOGE(TAG, "LavaXVM init failed: %s",
+        ESP_LOGD(TAG, "LavaXVM init failed: %s",
                  lavaxvm_last_error() ? lavaxvm_last_error() : "?");
         heap_caps_free(s_vm_ram); s_vm_ram = NULL;
         heap_caps_free(bmpdata_buf); bmpdata_buf = NULL;
@@ -203,7 +203,7 @@ esp_err_t lavax_emu_load_and_run(const char *lav_path)
     pLAVA = TaskOpen((char *)lav_path);
     if (!pLAVA)
     {
-        ESP_LOGE(TAG, "无法加载游戏: %s", lav_path);
+        ESP_LOGD(TAG, "无法加载游戏: %s", lav_path);
         return ESP_ERR_NOT_FOUND;
     }
 

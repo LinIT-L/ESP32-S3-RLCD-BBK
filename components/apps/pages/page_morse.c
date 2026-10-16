@@ -252,6 +252,7 @@ static const os_module_t s_mod_morse = {
     .touch     = morse_touch,
     .poll      = morse_poll,
     .fullscreen = true,
+    .exit_confirm = true,   /* 返回键先弹"退出程序?"确认 (2026-10-14 全局规范) */
 };
 
 void os_page_morse_register(void) { os_register(&s_mod_morse); }

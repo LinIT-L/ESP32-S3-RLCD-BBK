@@ -411,7 +411,7 @@ static void p_main_poll(ui_ctx_t *ctx)
         if (s_tail_pend && now >= s_tail_pend) {
             s_tail_pend = 0;
             s_tail_last = now;
-            vibrator_tap_ui(10, 100);
+            vibrator_tap_ui(10, 100);   /* ★TM6604: 强度拉满, 问题在触发方式 */   /* ★试验: 原100=占空比255(纯DC)可能驱动不了马达 ⇒ 试50% */   /* ★2026-10-13 原 10ms 马达转不起来, 手感上"没有震动"; 35ms 可感知 */
         }
 
         int grid = mod_wrap(lroundf(s_main.cam_cur));
@@ -436,10 +436,10 @@ static void p_main_poll(ui_ctx_t *ctx)
                     uint32_t want = s_tail_last + gap;
                     if (s_tail_seq == 0) {
                         s_tail_last = now;
-                        vibrator_tap_ui(10, 100);
+                        vibrator_tap_ui(10, 100);   /* ★TM6604: 强度拉满, 问题在触发方式 */   /* ★试验: 原100=占空比255(纯DC)可能驱动不了马达 ⇒ 试50% */   /* ★2026-10-13 原 10ms 马达转不起来, 手感上"没有震动"; 35ms 可感知 */
                     } else if (now >= want) {
                         s_tail_last = now;
-                        vibrator_tap_ui(10, 100);
+                        vibrator_tap_ui(10, 100);   /* ★TM6604: 强度拉满, 问题在触发方式 */   /* ★试验: 原100=占空比255(纯DC)可能驱动不了马达 ⇒ 试50% */   /* ★2026-10-13 原 10ms 马达转不起来, 手感上"没有震动"; 35ms 可感知 */
                     } else {
                         s_tail_pend = want;                  /* 延迟兜底 */
                     }
@@ -449,7 +449,7 @@ static void p_main_poll(ui_ctx_t *ctx)
                     s_tail_seq = 0;
                     if (now - s_vib_grid_ts >= 25) {
                         s_vib_grid_ts = now;
-                        vibrator_tap_ui(10, 100);
+                        vibrator_tap_ui(10, 100);   /* ★TM6604: 强度拉满, 问题在触发方式 */   /* ★试验: 原100=占空比255(纯DC)可能驱动不了马达 ⇒ 试50% */   /* ★2026-10-13 原 10ms 马达转不起来, 手感上"没有震动"; 35ms 可感知 */
                     }
                 }
                 s_vib_grid_last = grid;

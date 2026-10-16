@@ -28,7 +28,7 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # CONFIG_SPIRAM_RODATA=y
 # 非必要数据尽量放 PSRAM: ALWAYSINTERNAL 阈值调小 (≤此值才保留内部), 内部预留调小
 # 以腾出 ≥32KB 连续内部块给 BBK 引擎 sys_ram (动态分配).
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512   # ★2026-10-16 内存优化: 只让 <=512B 的碎块留内部, 其余优先 PSRAM
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=8192
 # V2.x 内存精简: WiFi/lwIP 的收发缓冲优先分配到 PSRAM (分配失败自动回退内部 RAM),
 # 从而释放内部 DRAM 给 BBK/模拟器。S3 的 PSRAM 支持 DMA, 功能不受影响, 仅有极微延迟。

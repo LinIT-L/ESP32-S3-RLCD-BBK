@@ -33,7 +33,7 @@ static esp_err_t es8311_write_reg(uint8_t reg, uint8_t val) {
     esp_err_t ret = i2c_master_cmd_begin(s_i2c_port, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C 写入 0x%02x=0x%02x 失败: %s", reg, val, esp_err_to_name(ret));
+        ESP_LOGD(TAG, "I2C 写入 0x%02x=0x%02x 失败: %s", reg, val, esp_err_to_name(ret));
     }
     return ret;
 }
@@ -49,7 +49,7 @@ static int es8311_read_reg(uint8_t reg, uint8_t *val) {
     esp_err_t ret = i2c_master_cmd_begin(s_i2c_port, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C 读 0x%02x 地址阶段失败: %s", reg, esp_err_to_name(ret));
+        ESP_LOGD(TAG, "I2C 读 0x%02x 地址阶段失败: %s", reg, esp_err_to_name(ret));
         *val = 0;
         return ret;
     }
@@ -62,7 +62,7 @@ static int es8311_read_reg(uint8_t reg, uint8_t *val) {
     ret = i2c_master_cmd_begin(s_i2c_port, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C 读 0x%02x 数据阶段失败: %s", reg, esp_err_to_name(ret));
+        ESP_LOGD(TAG, "I2C 读 0x%02x 数据阶段失败: %s", reg, esp_err_to_name(ret));
         *val = 0;
     }
     return ret;
@@ -89,12 +89,12 @@ int es8311_init(int sda, int scl) {
     };
     esp_err_t ret = i2c_param_config(s_i2c_port, &conf);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C 配置失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "I2C 配置失败: %s", esp_err_to_name(ret));
         return -1;
     }
     ret = i2c_driver_install(s_i2c_port, I2C_MODE_MASTER, 0, 0, 0);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "I2C 驱动安装失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "I2C 驱动安装失败: %s", esp_err_to_name(ret));
         return -1;
     }
 
@@ -141,7 +141,7 @@ int es8311_init(int sda, int scl) {
         s_present = false;
         s_initialized = true;
         s_started = false;
-        ESP_LOGW(TAG, "未检测到 ES8311 (0x18/0x1A 无响应), 本机无此芯片, 跳过初始化 (无 DAC 扬声器输出)");
+        ESP_LOGD(TAG, "未检测到 ES8311 (0x18/0x1A 无响应), 本机无此芯片, 跳过初始化 (无 DAC 扬声器输出)");
         return 0;
     }
     s_present = true;
@@ -295,14 +295,44 @@ int es8311_set_sample_rate(int sample_rate) {
     return 0;
 }
 
+/* ★★ 音量寄存器上限 (dB 曲线封顶, 2026-10-14 linit: "太大的会破音") ★★
+ * REG32: 0x00=静音(-95.5dB) · **0xBF=0dB(满刻度, 不再往上借数字增益)** · 0xFF=+32dB(削波)。
+ * 上一版照官方 `percent*256/100-1` 铺满到 0xFF, 结果 88% 就 +16.5dB、100% 是 +32dB
+ * ⇒ **满刻度素材(音乐)直接削波破音**。官方组件(esp_codec_dev)之所以敢用满量程, 是因为它用
+ * `esp_codec_dev_hw_gain_t` 把功放(PA)的**模拟增益**也算进总增益里一起补偿;
+ * 我们这台 PA 增益固定且没标定, 所以取保守且正确的做法:
+ *   **数字端封顶 0dB(0xBF)不借增益 ⇒ 结构上不可能削波**, 响度靠收窄 dB 范围来提。
+ * 可调: 想再响一点可把 AUDIO_VOL_REG_MAX 调到 0xCB(+6dB, 会轻度削波) —— 不建议。 */
+#ifndef AUDIO_VOL_REG_MAX
+#define AUDIO_VOL_REG_MAX 0xBF        /* 0xBF = 0dB 满刻度 (不借 +32dB, 免破音) */
+#endif
+/* 动态范围(dB): 100%→0dB, 1%→-AUDIO_VOL_DB_RANGE。范围越小, 中低档越响。
+ * 40dB = "能调小但都能听清" 的折中 (原来铺 95.5dB ⇒ 50% 就 -48dB 才显得"没声")。 */
+#ifndef AUDIO_VOL_DB_RANGE
+#define AUDIO_VOL_DB_RANGE 40
+#endif
+
 int es8311_set_volume(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
-    /* REG32: DAC 数字音量.
-     * 0x00=静音(-96dB), 0xC0≈0dB(标称), 0xFF=+32dB(削波!)
-     * 将 0-100% 映射到 0x00-0xC0 (0dB 不削波) */
-    uint8_t reg = (uint8_t)(((uint32_t)percent * 0xC0) / 100);
-    return es8311_write_reg(0x32, reg) == ESP_OK ? 0 : -1;
+    /* ★★ REG32: DAC 数字音量 — dB 线性, 封顶 0dB ★★
+     *   衰减(dB) = AUDIO_VOL_DB_RANGE × (100 - percent) / 100
+     *   REG32    = 0xBF - 衰减 × 2          (寄存器 0.5dB/步, 0xBF = 0dB)
+     *   100% -> 0xBF =   0.0dB (满刻度, 不削波)
+     *    88% -> 0xB6 =  -4.5dB   (6 档, 比改之前的旧曲线响 ~7.5dB)
+     *    68% -> 0xA6 = -12.5dB   (1 档)
+     *    50% -> 0x97 = -20.0dB
+     *     1% -> 0x70 = -39.5dB ; 0% = 真静音(0x00) */
+    int reg;
+    if (percent == 0) {
+        reg = 0x00;                                  /* 0% = 真静音 */
+    } else {
+        int atten_half_db = (100 - percent) * AUDIO_VOL_DB_RANGE * 2 / 100;   /* 半dB 步 */
+        reg = 0xBF - atten_half_db;
+        if (reg > AUDIO_VOL_REG_MAX) reg = AUDIO_VOL_REG_MAX;   /* 封顶 (默认 0xBF=0dB) */
+        if (reg < 1) reg = 1;
+    }
+    return es8311_write_reg(0x32, (uint8_t)reg) == ESP_OK ? 0 : -1;
 }
 
 void es8311_shutdown(void) {
@@ -311,4 +341,39 @@ void es8311_shutdown(void) {
     es8311_write_reg(0x00, 0x00);  /* Power down */
     s_initialized = false;
     s_started = false;
+}
+
+/* ================= 运行时诊断 API (remcon 串口排查用, 2026-10-09) =================
+ * 用途: "芯片认到了但没声音" 时, 把寄存器**真值**打出来, 判断:
+ *   ① 我们写的值到底进没进去 (reg 0x00/0x01/0x05/0x09/0x0D/0x0E/0x12/0x13/0x14/0x32/0x37)
+ *   ② 芯片是否被复位成默认值 (疑似 MCLK 缺失/掉电)
+ *   ③ 现场用 `esw` 直接改寄存器试听, 定位是哪一位的问题
+ * 输出统一带 "ESREG " 前缀, 便于主机侧 grep。 */
+int es8311_peek(uint8_t reg, uint8_t *val)
+{
+    if (!val) return -1;
+    return (es8311_read_reg(reg, val) == ESP_OK) ? 0 : -1;
+}
+
+int es8311_poke(uint8_t reg, uint8_t val)
+{
+    return (es8311_write_reg(reg, val) == ESP_OK) ? 0 : -1;
+}
+
+int es8311_dump_regs(void)
+{
+    if (!s_present) {
+        ESP_LOGD(TAG, "ESREG absent (未探测到芯片)");
+        return 0;
+    }
+    ESP_LOGI(TAG, "ESREG begin addr=0x%02X init=%d started=%d",
+             ES8311_ADDR, (int)s_initialized, (int)s_started);
+    int ok = 0;
+    for (uint8_t reg = 0x00; reg <= 0x4E; reg++) {
+        uint8_t v = 0;
+        if (es8311_read_reg(reg, &v) == ESP_OK) ok++;
+        ESP_LOGI(TAG, "ESREG %02X=%02X", reg, v);
+    }
+    ESP_LOGI(TAG, "ESREG end ok=%d/79", ok);
+    return ok;
 }

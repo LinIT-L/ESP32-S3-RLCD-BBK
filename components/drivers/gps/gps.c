@@ -54,11 +54,15 @@ static const gps_config_t k_default_cfg = {
     .uart_num    = UART_NUM_1,   /* console 是 USB-Serial-JTAG, UART0/1 都空; 用 1 避开 ROM 默认口 */
     .pin_tx      = 43,           /* 模块脚 37 (TXD0) */
     .pin_rx      = 44,           /* 模块脚 36 (RXD0) */
-    /* ★★★ 2026-10-16 **必须 -1(不接)**: 之前写成 8 ⇒ **和震动脚 GPIO8 撞脚**!
-     *   GPS 待机/唤醒时会在 EXTINT 上输出脉冲(上升沿) ⇒ TM6604 被触发 ⇒ **震动一直震**。
-     *   本板 EXTINT 没接(模块上 47 未引出), GPS 主用 UART RX 唤醒, 不需要 EXTINT。 */
-    .pin_extint  = -1,
-    .baud        = 921600,
+    .pin_extint  = 18,           /* ★2026-10-13 linit 指定 GPIO18(⚠U3 音频座 5 脚也是 18) */            /* 原 47 在模块上不可用 ⇒ 挪到 8 */
+    /* ★ 2026-10-09: 921600 → **9600**。
+     * 原因: 开机时 app_board 就把模块送进 `UBX-RXM-PMREQ(backup)`, 而 backup 模式
+     * **不保留接收机配置** —— 唤醒后模块回到 u-blox 出厂默认 **9600 波特率**。
+     * 固件若仍按 921600 收, 收到的是乱码(实测"线路探测 OK 收到 256 字节"但
+     * NMEA 句子数=0、地图页显示"句子=0 查线/波特率")。
+     * 1Hz NMEA 每句几百字节, 9600 完全够用, 所以直接统一用 9600, 不再需要唤醒后重配。
+     * (若将来模块被固化到 921600, 改回这里即可; 或加"唤醒后 UBX-CFG-PRT 重配"流程。) */
+    .baud        = 9600,
     .drive_extint = false,       /* 默认不驱动 EXTINT: 极性未确认, 悬空/误电平会自己叫醒模块 */
 };
 
@@ -102,13 +106,38 @@ int gps_read(uint8_t *buf, size_t max_len, uint32_t timeout_ms)
     return n;
 }
 
+/* ★ 2026-10-09: 自动波特率 ------------------------------------------------
+ * 背景: 开机就把模块送进 UBX-RXM-PMREQ(backup), 而 backup 会丢接收机配置 ⇒ 唤醒后
+ * 波特率可能回到 u-blox 出厂 9600, 也可能被厂商固化在别的值。**靠固定值猜只会一直收乱码**
+ * (实测: 探测单次就读到 256 字节 ⇒ 线上速率远高于 9600, 却解析不出一句 NMEA)。
+ * 做法: 挨个试常见波特率, 谁先看到 UBX 同步头(B5 62)或 NMEA 头($G) 就用谁。
+ * ⚠ 必须在 gps_sleep() 之前完成 —— 否则 PMREQ 发不出去, 模块会一直连续跟踪(~10mA)。 */
+static uint32_t gps_autobaud(void)
+{
+    static const uint32_t cand[] = { 9600, 38400, 57600, 115200, 230400, 921600 };
+    uint8_t buf[128];
+    for (size_t i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+        uart_set_baudrate(s_cfg.uart_num, cand[i]);
+        uart_flush_input(s_cfg.uart_num);
+        for (int k = 0; k < 4; k++) {                 /* 4 × 60ms ≈ 240ms / 候选 */
+            int n = uart_read_bytes(s_cfg.uart_num, buf, sizeof(buf), pdMS_TO_TICKS(60));
+            for (int j = 0; j + 1 < n; j++) {
+                if (buf[j] == 0xB5 && buf[j + 1] == 0x62) return cand[i];               /* UBX */
+                if (buf[j] == '$' && (buf[j + 1] == 'G' || buf[j + 1] == 'P')) return cand[i]; /* NMEA */
+            }
+        }
+    }
+    uart_set_baudrate(s_cfg.uart_num, s_cfg.baud);
+    return s_cfg.baud;                                 /* 全都不认 → 保持配置值 */
+}
+
 esp_err_t gps_init(const gps_config_t *cfg)
 {
     s_cfg = cfg ? *cfg : k_default_cfg;
 
     esp_err_t e = uart_driver_install(s_cfg.uart_num, GPS_RX_BUF, GPS_TX_BUF, 0, NULL, 0);
     if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "UART%d 驱动安装失败: %s", (int)s_cfg.uart_num, esp_err_to_name(e));
+        ESP_LOGD(TAG, "UART%d 驱动安装失败: %s", (int)s_cfg.uart_num, esp_err_to_name(e));
         return e;
     }
     const uart_config_t uc = {
@@ -137,6 +166,18 @@ esp_err_t gps_init(const gps_config_t *cfg)
 
     s_ready = true;
     s_state = GPS_POWER_ACTIVE;
+
+    /* 定出模块真实波特率 (见 gps_autobaud 注释)。这一步也是最好的"接线是否通"判据:
+     * 打出来的实测值就是模块当前在用的速率, 认不出来说明线/供电有问题。 */
+    uint32_t real = gps_autobaud();
+    if (real != s_cfg.baud) {
+        ESP_LOGD(TAG, "自动波特率: 配置 %u → 实测 %u bps (模块已改用它)",
+                 (unsigned)s_cfg.baud, (unsigned)real);
+        s_cfg.baud = real;
+    } else {
+        ESP_LOGI(TAG, "自动波特率: %u bps 确认", (unsigned)real);
+    }
+
     ESP_LOGI(TAG, "初始化完成: TX=G%d RX=G%d EXTINT=%s%d @%u bps",
              s_cfg.pin_tx, s_cfg.pin_rx, s_cfg.drive_extint ? "驱动" : "监听",
              s_cfg.pin_extint, (unsigned)s_cfg.baud);
@@ -166,7 +207,7 @@ esp_err_t gps_sleep(void)
         s_state = GPS_POWER_SLEEP;
         ESP_LOGI(TAG, "已送 UBX-RXM-PMREQ ×3 → 软件待机 (backup+force, 唤醒源=UART RX; 待机电流 46µA)");
     } else {
-        ESP_LOGW(TAG, "UBX-RXM-PMREQ 发送失败: %s", esp_err_to_name(last));
+        ESP_LOGD(TAG, "UBX-RXM-PMREQ 发送失败: %s", esp_err_to_name(last));
     }
     return last;
 }

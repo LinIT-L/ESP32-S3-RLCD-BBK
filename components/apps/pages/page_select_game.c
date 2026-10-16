@@ -94,16 +94,16 @@ static void on_game_select(ui_ctx_t *ctx, os_pane_t *p,
     const char *run = path;
     if (!gam_ends_gam(path)) {
         if (gam_find_in(path, resolved, sizeof(resolved), 0)) run = resolved;
-        else { ESP_LOGW(TAG, "未找到 .gam: %s", path); return; }
+        else { ESP_LOGD(TAG, "未找到 .gam: %s", path); return; }
     }
     ESP_LOGI(TAG, "启动: %s", run);
     esp_err_t r = gam4980_emu_init(ctx->lcd);
     if (r != ESP_OK) {
-        ESP_LOGE(TAG, "emu 初始化失败: %s", esp_err_to_name(r));
+        ESP_LOGD(TAG, "emu 初始化失败: %s", esp_err_to_name(r));
         return;
     }
     if (gam4980_emu_load(run) != 0) {
-        ESP_LOGE(TAG, "游戏加载失败: %s", run);
+        ESP_LOGD(TAG, "游戏加载失败: %s", run);
         return;
     }
     /* 引擎优化应用到引擎 (显示模式/虚拟按键/游戏内状态栏/抗锯齿) */

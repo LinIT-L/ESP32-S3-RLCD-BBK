@@ -12,7 +12,7 @@
  * 后台引擎线程执行扫描, 渲染每帧读取共享状态.
  */
 #include "os.h"
-#include "os_hw.h"      /* os_hw_request/release (进入即开WiFi, 退出即关) */
+#include "os_hw.h"      /* os_hw_lease_acquire/release (进入强制开 WiFi, 退出按原状态还原) */
 #include "ui_common.h"
 #include "input.h"
 #include "os_net.h"
@@ -103,6 +103,8 @@ static TaskHandle_t s_task;
 #define ND_TASK_STACK 8192                       /* 32KB (内部RAM, 按需 malloc/free) */
 static volatile bool s_stop = false;   /* 退出即停止扫描 (勿在阻塞 socket 上 vTaskDelete) */
 static volatile bool s_cancel_step = false; /* 中断当前步骤扫描(保留已采结果, 进暂停态), 由底部「取消」置位, nd_pause 清除 */
+/* 临时占用 WiFi: 进入强制打开, 退出按进入前状态还原 (原本开→继续开, 原本关→关掉) */
+static os_hw_lease_t s_wifi_lease;
 static volatile int  s_gen = 0;        /* 扫描代次: 重新进入使在途任务作废 */
 static int  s_mine = 0;
 static bool s_wait_start = true;       /* 进入时先弹"连接网络"确认再扫描 */
@@ -1422,14 +1424,15 @@ static void netdect_render(ui_ctx_t *ctx){
 
 static void netdect_action(ui_ctx_t*ctx,os_action_t a){
     if(s_wait_start && a==OS_ACTION_BACK){
-        /* 密码/连接中/失败 → 返回列表 (保留扫描结果, 不重扫); 列表 → 退出页面 */
+        /* 密码/连接中/失败 → 返回列表 (保留扫描结果, 不重扫); 列表 → 弹"退出程序?"确认, 确认才退 */
         if(s_conn==1 || s_conn==2 || s_conn==3){
             s_conn=0; s_ssid[0]=0; s_pass[0]=0; s_pas=0;
             ctx->needs_redraw=true; return;
         }
-        os_pop(ctx); return;
+        os_request_exit_confirm(ctx); return;
     }
-    if(a==OS_ACTION_BACK||a==OS_ACTION_HOME){ os_pop(ctx); return; }
+    if(a==OS_ACTION_BACK){ os_request_exit_confirm(ctx); return; }   /* 确认后才退出 (防误触丢扫描结果) */
+    if(a==OS_ACTION_HOME){ os_pop(ctx); return; }
     if(s_wait_start){
         if(s_conn==0){
             int c=wifi_manager_get_scan_count(); if(c>10)c=10;
@@ -1593,7 +1596,7 @@ static void netdect_enter(ui_ctx_t*ctx){
     s_step=ST_NET;s_prog=0;s_done=false;s_nhost=0;s_scrollpx=0;s_rptpx=0;s_rpt_nlin=0;
     s_step_done=false; s_step_go=false; s_finished=0; s_view=0;   /* 清掉上次停留状态 */
     s_status[0]=0; s_ssid[0]=s_pass[0]=0; s_pas=0; s_conn=0;
-    os_hw_request(OS_HW_WIFI);             /* 进入即打开 WiFi (引用计数, 退出再释放) */
+    os_hw_lease_acquire(&s_wifi_lease, OS_HW_WIFI);   /* 进入即强制打开 WiFi (原本已开则不重复计数) */
     s_wait_start=true;                     /* 进场即显示网络页(不再闪信息页) */
     s_use_sys=false; s_prev_conn=wifi_manager_is_connected();
     s_enter_pending=false;
@@ -1608,7 +1611,7 @@ static void nd_enter_do(ui_ctx_t *ctx){
 static void netdect_exit(ui_ctx_t*ctx){
     s_stop=true;
     wifi_manager_scan_stop();
-    os_hw_release(OS_HW_WIFI);             /* 退出即关闭 WiFi (打开才加载, 返回应用管家=真正退出) */
+    os_hw_lease_release(&s_wifi_lease, OS_HW_WIFI);   /* 退出还原: 原本开就继续开, 原本关才关掉 */
     ctx->needs_redraw=true;
 }
 

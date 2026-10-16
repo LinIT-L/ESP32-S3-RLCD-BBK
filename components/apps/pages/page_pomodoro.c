@@ -537,6 +537,7 @@ static const os_module_t s_mod_pomodoro = {
     .touch     = p_pomodoro_touch,
     .poll      = p_pomodoro_poll,
     .fullscreen = true,
+    .exit_confirm = true,   /* 返回键先弹"退出程序?"确认 (2026-10-14 全局规范) */
 };
 
 void os_page_pomodoro_register(void) { os_register(&s_mod_pomodoro); }

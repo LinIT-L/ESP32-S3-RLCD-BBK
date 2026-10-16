@@ -55,7 +55,7 @@ static const os_app_t s_builtin_apps[] = {
     { .id="diag",      .label="电脑诊断", .icon_idx=ICON_DIAG,      .page=OS_PAGE_DIAGNOSIS, .hidden=true, .cat="运维" }, /* 电脑诊断 运维 */
     { .id="logdiag",   .label="日志诊断", .icon_idx=ICON_LOGDIAG,   .page=OS_PAGE_LOGDIAO,   .hidden=true, .cat="运维" }, /* 日志诊断 运维 */
     { .id="term",      .label="终端",     .icon_idx=ICON_TERMINAL,  .page=OS_PAGE_TERMINAL,  .hidden=true, .cat="运维" }, /* 终端 运维 */
-    { .id="winassist", .label="运维助手", .icon_idx=ICON_WINASSIST, .page=OS_PAGE_WINASSIST, .hidden=true, .cat="运维" }, /* 运维助手 运维 */
+    { .id="winassist", .label="Win工具台", .icon_idx=ICON_WINASSIST, .page=OS_PAGE_WINASSIST, .hidden=true, .cat="运维" }, /* Win工具台 运维 (2026-10-15 linit: 原名"运维助手") */
     /* 文件浏览器不再作为独立应用: 已融合进 存储→浏览文件 (page_storage.c 内, 快扫/删除/进退) */
     { .id="usb_bt",  .label="USB\xe8\x93\x9d\xe7\x89\x99",      .icon_idx=ICON_USB_BT, .page=OS_PAGE_USB_BT, .hidden=true, .cat="\xe8\xbf\x90\xe7\xbb\xb4" }, /* USB蓝牙 运维 (默认隐藏, 从应用管家进) */
     { .id="usb_net", .label="USB\xe7\xbd\x91\xe5\x8d\xa1", .icon_idx=ICON_USB_NET, .page=OS_PAGE_USB_NET, .hidden=true, .cat="\xe8\xbf\x90\xe7\xbb\xb4" }, /* USB网卡共享 运维 (默认隐藏, 从应用管家) */
@@ -64,7 +64,9 @@ static const os_app_t s_builtin_apps[] = {
     { .id="gb",      .label="GB",    .icon_idx=ICON_GB,  .page=OS_PAGE_GB_GAME,       .hidden=true, .reveal=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f" }, /* GB 游戏 */
     { .id="gbc",     .label="GBC",   .icon_idx=ICON_GBC, .page=OS_PAGE_GBC_GAME,      .hidden=true, .reveal=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f" }, /* GBC 游戏 */
     { .id="nes",     .label="NES",   .icon_idx=ICON_NES, .page=OS_PAGE_NES_GAME,      .hidden=true, .reveal=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f" }, /* NES 游戏 */
+#if LINTOS_ENABLE_MD
     { .id="md",      .label="MD",    .icon_idx=ICON_MD, .page=OS_PAGE_MD_GAME,       .hidden=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f" }, /* MD/Genesis 游戏 (Gwenesis) */
+#endif
 
     { .id="sms",     .label="SMS",   .icon_idx=ICON_SMS, .page=OS_PAGE_SMS_GAME,      .hidden=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f" }, /* SMS/GG 游戏 (SMSPlus, 独立图标 index37) */
 
@@ -81,7 +83,7 @@ static const os_app_t s_builtin_apps[] = {
     /* 商店可下载应用 (默认隐藏, 从应用管家"商店"下载后解隐加入主菜单) */
     { .id="secure",   .label="密钥管理器", .icon_idx=ICON_SECURE, .page=OS_PAGE_PLACEHOLDER_SECURE, .hidden=true, .cat="程序" }, /* 密钥管理器 程序 */
     { .id="fav",   .label="收藏夹", .icon_idx=ICON_FAV, .page=OS_PAGE_FAV, .hidden=true, .cat="程序" }, /* 收藏夹 程序 (ICON_FAV) */
-    { .id="sdr", .label="频谱仪", .icon_idx=ICON_WIFIPROBE, .page=OS_PAGE_SDR, .hidden=true, .cat="运维" }, /* 频谱仪 运维 (2026-10-03 linit: 原 cat=系统, 改归运维) */
+    { .id="sdr", .label="频谱仪", .icon_idx=ICON_SDR, .page=OS_PAGE_SDR, .hidden=true, .cat="运维" }, /* 频谱仪 运维 (2026-10-03 linit: 原 cat=系统, 改归运维) */
 };
 #define BUILTIN_APP_COUNT (sizeof(s_builtin_apps) / sizeof(s_builtin_apps[0]))
 
@@ -124,7 +126,7 @@ void apps_register_all(void)
     os_page_logdiag_register();       /* 日志诊断 */
     os_page_netdect_register();       /* 网络分析 */
     os_page_wifiprobe_register();     /* Wi-Fi 万用表 */
-    os_page_winassist_register();     /* 运维助手 */
+    os_page_winassist_register();     /* Win工具台 (原名 运维助手) */
     os_page_morse_register();         /* 摩斯密码 */
     os_page_pomodoro_register();      /* 番茄钟 */
 #endif
@@ -147,12 +149,12 @@ void apps_register_all(void)
             const os_app_t *a = &s_builtin_apps[i];
             if (a->page < 0) continue;
             if (!os_page_registered((int)a->page)) {
-                ESP_LOGE("OSAPP", "[自检] 应用 %s 的页面 %d 未注册 → 点它会打不开!",
+                ESP_LOGD("OSAPP", "[自检] 应用 %s 的页面 %d 未注册 → 点它会打不开!",
                          a->id ? a->id : "?", (int)a->page);
                 bad++;
             }
         }
-        if (bad) ESP_LOGE("OSAPP", "[自检] 共 %d 个应用页面未注册, 请检查注册调用是否被条件编译关掉", bad);
+        if (bad) ESP_LOGD("OSAPP", "[自检] 共 %d 个应用页面未注册, 请检查注册调用是否被条件编译关掉", bad);
         else     ESP_LOGI("OSAPP", "[自检] 内置应用页面注册完整 (%d 个)", (int)BUILTIN_APP_COUNT);
     }
 

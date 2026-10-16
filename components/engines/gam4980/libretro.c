@@ -166,7 +166,7 @@ bool gam4980_flash_init_step(void) {
     g_flash_init_offset += chunk;
     if (g_flash_init_offset >= 0x200000) {
         g_flash_inited = true;
-        ESP_LOGE("INIT", "flash 懒初始化完成 (2MB)");
+        ESP_LOGD("INIT", "flash 懒初始化完成 (2MB)");
     }
     return g_flash_inited;
 }
@@ -819,7 +819,7 @@ static bool retro_mem_alloc(void)
     if (sys_flash)   { heap_caps_free(sys_flash);   sys_flash   = NULL; }
     if (sys_rom_8)   { heap_caps_free(sys_rom_8);   sys_rom_8   = NULL; }
     if (sys_rom_e)   { heap_caps_free(sys_rom_e);   sys_rom_e   = NULL; }
-    ESP_LOGE("INIT", "内存分配失败: sys_ram=%p sys_flash=%p sys_rom_8=%p sys_rom_e=%p (内部空闲=%u PSRAM空闲=%u)",
+    ESP_LOGD("INIT", "内存分配失败: sys_ram=%p sys_flash=%p sys_rom_8=%p sys_rom_e=%p (内部空闲=%u PSRAM空闲=%u)",
              (void*)sys_ram, (void*)sys_flash, (void*)sys_rom_8, (void*)sys_rom_e,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -873,7 +873,7 @@ static void sys_init(const char *romdir)
     
     if (sys_part && sys_part->size >= 4 * 1024 * 1024) {
         /* flash 读取: 8.BIN 在偏移 0, E.BIN 在偏移 2MB, 各 2MB */
-        ESP_LOGE("INIT", "从 flash 分区读取 ROM (addr=0x%lx, size=%luKB)",
+        ESP_LOGD("INIT", "从 flash 分区读取 ROM (addr=0x%lx, size=%luKB)",
                  (unsigned long)sys_part->address, (unsigned long)sys_part->size / 1024);
         
         const size_t rom_size = 0x200000;  /* 2MB */
@@ -896,7 +896,7 @@ static void sys_init(const char *romdir)
             if (g_boot_progress_cb) g_boot_progress_cb(pct, "Loading 8.BIN");
             taskYIELD();
         }
-        ESP_LOGE("INIT", "8.BIN 从 flash 读取 %u/0x200000, rom_8[0]=0x%02x",
+        ESP_LOGD("INIT", "8.BIN 从 flash 读取 %u/0x200000, rom_8[0]=0x%02x",
                  (unsigned)total_read, sys_rom_8[0]);
 
         /* 读取 E.BIN: flash 偏移 2MB, 进度 40-80% */
@@ -910,20 +910,20 @@ static void sys_init(const char *romdir)
             if (g_boot_progress_cb) g_boot_progress_cb(pct, "Loading E.BIN");
             taskYIELD();
         }
-        ESP_LOGE("INIT", "E.BIN 从 flash 读取 %u/0x200000, rom_e[0]=0x%02x",
+        ESP_LOGD("INIT", "E.BIN 从 flash 读取 %u/0x200000, rom_e[0]=0x%02x",
                  (unsigned)total_read, sys_rom_e[0]);
 
         free(tmp_buf);
     } else {
         /* flash system 分区未找到 - 必须烧录 system.bin 到 0x900000 */
-        ESP_LOGE("INIT", "flash system 分区未找到! 请烧录 system.bin 到 0x900000");
+        ESP_LOGD("INIT", "flash system 分区未找到! 请烧录 system.bin 到 0x900000");
         error_msg("GAM4980: Flash system partition not found");
         environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
         return;
     }
 
     /* 验证入口点: PC=0x350 在 page 0x03, 映射到 rom_e[0x1fff00+0x50] */
-    ESP_LOGE("INIT", "入口点 rom_e[0x1fff50..5f]: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+    ESP_LOGD("INIT", "入口点 rom_e[0x1fff50..5f]: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
         sys_rom_e[0x1fff50], sys_rom_e[0x1fff51], sys_rom_e[0x1fff52], sys_rom_e[0x1fff53],
         sys_rom_e[0x1fff54], sys_rom_e[0x1fff55], sys_rom_e[0x1fff56], sys_rom_e[0x1fff57],
         sys_rom_e[0x1fff58], sys_rom_e[0x1fff59], sys_rom_e[0x1fff5a], sys_rom_e[0x1fff5b],
@@ -956,7 +956,7 @@ static void sys_init(const char *romdir)
     s_cpu.iy = 0;
     s_cpu.sp = 0xff;
     s_cpu.status = 0x04;
-    ESP_LOGE("INIT", "CPU 初始: pc=0x%04x sp=0x%02x, 开始 OS 启动循环", s_cpu.pc, s_cpu.sp);
+    ESP_LOGD("INIT", "CPU 初始: pc=0x%04x sp=0x%02x, 开始 OS 启动循环", s_cpu.pc, s_cpu.sp);
 
     // Run initialize instructions
     // XXX: SysStart set _MTCT to 0xfe just before 'main'.
@@ -983,18 +983,18 @@ static void sys_init(const char *romdir)
         }
         taskYIELD();
         if (_iters > 500000) {
-            ESP_LOGE("INIT", "OS 启动超时! pc=0x%04x MTCT=0x%02x", s_cpu.pc, s_ram[_MTCT]);
+            ESP_LOGD("INIT", "OS 启动超时! pc=0x%04x MTCT=0x%02x", s_cpu.pc, s_ram[_MTCT]);
             if (g_boot_progress_cb)
                 g_boot_progress_cb(100, "启动超时");
             break;
         }
     }
     s_bk_sys_d = s_bk_tab[0xd];
-    ESP_LOGE("INIT", "OS 启动完成! bk_sys_d=0x%04x iters=%d", s_bk_sys_d, _iters);
+    ESP_LOGD("INIT", "OS 启动完成! bk_sys_d=0x%04x iters=%d", s_bk_sys_d, _iters);
 
     /* flash 初始化标记: PSRAM BSS 上电全 0, 需填充为 0xFF (flash 擦除态) */
     g_flash_inited = false;
-    ESP_LOGE("INIT", "flash 将在游戏主循环中懒初始化");
+    ESP_LOGD("INIT", "flash 将在游戏主循环中懒初始化");
 
     if (s_bk_sys_d == 0x0e88) { /* 4988 */
         _joyk[RETRO_DEVICE_ID_JOYPAD_Y] = KEY_Z;

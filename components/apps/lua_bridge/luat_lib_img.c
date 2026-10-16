@@ -182,7 +182,7 @@ static int l_img_blit(lua_State *L) {
         static int dbg_n = 0;
         if (dbg_n < 24) {
             dbg_n++;
-            ESP_LOGW(TAG, "blit#%d src=%dx%d sx=%d sy=%d dx=%d dy=%d w=%d h=%d mode=%d strd=%d",
+            ESP_LOGD(TAG, "blit#%d src=%dx%d sx=%d sy=%d dx=%d dy=%d w=%d h=%d mode=%d strd=%d",
                      dbg_n, im->w, im->h, sx, sy, dx, dy, w, h, mode, im->stride);
         }
     }

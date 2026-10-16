@@ -8,10 +8,8 @@ idf_component_register(
         input
         ui_common
         virtual_keys
-        board_shim
         cheater
         bt_ctl
         web_gamepad
         audio_player
-        fonts
 )

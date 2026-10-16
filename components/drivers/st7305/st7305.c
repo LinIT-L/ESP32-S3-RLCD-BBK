@@ -9,7 +9,6 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "st7305.h"
-#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 #define TAG "ST7305"
 
@@ -52,14 +51,12 @@ static inline void rst_set(st7305_handle_t *dev, int level) {
     gpio_set_level(dev->rst_gpio, level);
 }
 
-static uint32_t s_spi_bytes = 0;   /* ★ 诊断: 实际写出的像素字节数 */
 static void spi_write_byte(st7305_handle_t *dev, uint8_t byte) {
     spi_transaction_t t = {
         .length = 8,
         .tx_buffer = &byte,
     };
     spi_device_polling_transmit(dev->spi, &t);
-    s_spi_bytes++;
 }
 
 static void send_cmd(st7305_handle_t *dev, uint8_t cmd) {
@@ -139,11 +136,6 @@ esp_err_t st7305_init(st7305_handle_t *out, const st7305_config_t *config) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* ★ 真相日志: 打印驱动**实际收到**的引脚(之前只印证了代码文本, 没印证运行期) */
-    ESP_LOGW(TAG, "★收到配置: DC=%d CS=%d SCK=%d MOSI=%d RST=%d @%dMHz",
-             config->dc_gpio, config->spi_cs, config->spi_sclk, config->spi_mosi,
-             config->rst_gpio, config->spi_freq);
-
     *out = (st7305_handle_t){
         .dc_gpio = config->dc_gpio,
         .rst_gpio = config->rst_gpio,
@@ -168,21 +160,13 @@ esp_err_t st7305_init(st7305_handle_t *out, const st7305_config_t *config) {
              (void*)out->fb, FB_BYTES,
              esp_ptr_internal(out->fb) ? "SRAM" : "PSRAM");
 
-    /* ★★★ 2026-10-16 修复重启循环: rst_gpio = -1(本板 RESET 只 10k 上拉、不接 MCU) 时
-     *   无条件 `1ULL << rst_gpio` 会生成**非法掩码** ⇒ gpio_config 失败 ⇒
-     *   ESP_ERROR_CHECK abort ⇒ **开不了机、反复重启**(实测)。改成"有才配"。 */
-    uint64_t io_mask = 0;
-    if (out->dc_gpio  >= 0) io_mask |= (1ULL << out->dc_gpio);
-    if (out->rst_gpio >= 0) io_mask |= (1ULL << out->rst_gpio);
-    if (io_mask) {
-        gpio_config_t io = {
-            .pin_bit_mask = io_mask,
-            .mode = GPIO_MODE_OUTPUT,
-        };
-        ESP_ERROR_CHECK(gpio_config(&io));
-    }
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << out->dc_gpio) | (1ULL << out->rst_gpio),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
 
-    if (out->rst_gpio >= 0) st7305_hw_reset(out);   /* RST 没接就跳过硬件复位 */
+    st7305_hw_reset(out);
 
     spi_bus_config_t bus = {
         .mosi_io_num = out->spi_mosi,
@@ -607,14 +591,6 @@ static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb) 
     };
     spi_device_polling_transmit(dev->spi, &t);
 
-    /* ★ 诊断: 每送出一整帧(15000B)打印一次累计字节数 —— 证实"数据真的发到屏上了" */
-    {
-        static uint32_t s_frames = 0;
-        s_frames++;
-        ESP_LOGW(TAG, "送屏 #%lu: 本帧 %d B, 累计单字节写入 %lu", (unsigned long)s_frames,
-                 FB_BYTES, (unsigned long)s_spi_bytes);
-    }
-
     uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t0);
     if (elapsed > 15000) {  /* >15ms 时打日志, 正常应该是 12-15ms */
         ESP_LOGW(TAG, "flush slow: %lu us", (unsigned long)elapsed);
@@ -796,15 +772,13 @@ esp_err_t st7305_flush_rotated(st7305_handle_t *dev, uint8_t rot, uint8_t *work_
 
 st7305_config_t st7305_default_config(void) {
     return (st7305_config_t){
-        /* ★★★ 2026-10-16 修正: 小智板的屏引脚(与 LinTOS0.71 能亮版完全一致)。
-         *   之前这里是 5/41/12/11/42/60 = **微雪的值** ⇒ 小智板全黑(而且 init 还"成功")。 */
-        .dc_gpio = CFG_LCD_DC,
-        .rst_gpio = CFG_LCD_RST,   /* 小智载板 RST 只经 10k 上拉, 不接 MCU */
+        .dc_gpio = 5,
+        .rst_gpio = 41,
         .spi_host = SPI2_HOST,
-        .spi_mosi = CFG_LCD_MOSI,
-        .spi_sclk = CFG_LCD_SCK,
-        .spi_cs = CFG_LCD_CS,
-        .spi_freq = CFG_LCD_FREQ_MHZ,   /* 新载板跑 30MHz */
+        .spi_mosi = 12,
+        .spi_sclk = 11,
+        .spi_cs = 42,     /* 2026-10-04: 小智核心模块占用 IO40 → CS 40→42 (与 user_config.h 同步) */
+        .spi_freq = 60,   /* ST7305 最大支持 60MHz, 提高刷新率 */
     };
 }
 

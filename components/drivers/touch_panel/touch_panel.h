@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "driver/gpio.h"
-#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,11 +24,21 @@ extern "C" {
  * 因此无需映射到 400x300 屏幕坐标.
  */
 
-/* ==== 触摸面板引脚定义 (可在此修改) ==== */
-#define TP_SDA_PIN   ((gpio_num_t)CFG_TP_SDA)
-#define TP_SCL_PIN   ((gpio_num_t)CFG_TP_SCL)
-#define TP_INT_PIN   ((gpio_num_t)CFG_TP_INT)
-#define TP_RST_PIN   ((gpio_num_t)CFG_TP_RST)
+/* ==== 触摸面板引脚 ====
+ * ★ 2026-10-16: 引脚改由**上层**在 init 前设定 (见 board_pins.h 的板型表),
+ *   驱动自己不关心"哪块板" —— 这样也避免 drivers 反向依赖 system。
+ *   下面这组只是**默认值** (不调 set_pins 时用它, 等于原来的小智模块板接线)。 */
+#define TP_SDA_PIN   (-1)   /* ⛔ 默认"未配置": 以前是 5, 恰好=微雪 LCD RS! 由上层 set_pins 下发 */
+#define TP_SCL_PIN   (-1)
+#define TP_INT_PIN   (-1)   /* ⛔ 以前是 12, 恰好=微雪 LCD MOSI! */
+#define TP_RST_PIN   (-1)
+
+typedef struct {
+    int sda, scl, intr, rst;
+} tp_pins_t;
+
+/* 设定本板触摸引脚 (必须在 touch_panel_init() 之前调; 不调则用上面默认值) */
+void touch_panel_set_pins(const tp_pins_t *pins);
 
 /* ==== 面板分辨率默认值 (原始坐标最大值) ====
  * GT911 会从配置寄存器 0x8048/0x804A 精确读出, 覆盖此默认值;

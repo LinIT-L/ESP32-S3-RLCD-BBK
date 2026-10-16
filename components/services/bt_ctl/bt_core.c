@@ -61,7 +61,7 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
                 s_cbs.on_connected(true, param->open.dev);
             }
         } else {
-            ESP_LOGE(TAG, "OPEN failed!");
+            ESP_LOGD(TAG, "OPEN failed!");
             if (s_cbs.on_connected) {
                 s_cbs.on_connected(false, param->open.dev);
             }
@@ -132,7 +132,7 @@ static void scan_task(void *arg)
         s_scan_count = results_len;
         ESP_LOGI(TAG, "scan done: %u results", (unsigned)results_len);
     } else {
-        ESP_LOGE(TAG, "scan failed: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "scan failed: %s", esp_err_to_name(err));
         if (results) {
             esp_hid_scan_results_free(results);
         }
@@ -165,12 +165,12 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
         /* 兜底: 若上层异常路径残留了 esp_hid_gap 静态状态(信号量未清),
          * esp_hid_gap_init 会报 "Already initialised"。复位后重试一次即可恢复,
          * 避免蓝牙永久卡"初始化中"(实测 bug, 见 bt_core_deinit 注释)。 */
-        ESP_LOGW(TAG, "esp_hid_gap_init failed (%s), 复位残留状态后重试", esp_err_to_name(err));
+        ESP_LOGD(TAG, "esp_hid_gap_init failed (%s), 复位残留状态后重试", esp_err_to_name(err));
         esp_hid_gap_deinit();
         err = esp_hid_gap_init(HIDH_BLE_MODE);
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_hid_gap_init failed: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "esp_hid_gap_init failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -179,7 +179,7 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
      * esp_hidh_init 内部会注册 BLE GATT 事件, 需 gattc 回调先就绪. */
     err = esp_ble_gattc_register_callback(esp_hidh_gattc_event_handler);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "gattc register failed: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "gattc register failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -191,12 +191,12 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
     err = esp_hidh_init(&config);
     if (err != ESP_OK) {
         /* 兜底: 若 esp_hidh 静态状态残留(异常路径未走 deinit), 复位后重试一次。 */
-        ESP_LOGW(TAG, "esp_hidh_init failed (%s), 复位残留状态后重试", esp_err_to_name(err));
+        ESP_LOGD(TAG, "esp_hidh_init failed (%s), 复位残留状态后重试", esp_err_to_name(err));
         esp_hidh_deinit();
         err = esp_hidh_init(&config);
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_hidh_init failed: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "esp_hidh_init failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -208,11 +208,11 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
     {
         const uint8_t *oa = esp_bt_dev_get_address();
         if (oa) {
-            ESP_LOGW(TAG, "本机BLE地址: %02x:%02x:%02x:%02x:%02x:%02x (手柄据此识别主机)",
+            ESP_LOGD(TAG, "本机BLE地址: %02x:%02x:%02x:%02x:%02x:%02x (手柄据此识别主机)",
                      oa[0], oa[1], oa[2], oa[3], oa[4], oa[5]);
         }
         int bn = esp_ble_get_bond_device_num();
-        ESP_LOGW(TAG, "本地已保存绑定数: %d", bn);
+        ESP_LOGD(TAG, "本地已保存绑定数: %d", bn);
     }
     ESP_LOGI(TAG, "HID host init done (ready)");
     return true;
@@ -260,7 +260,7 @@ void bt_core_deinit(void)
         hidh_ret = esp_hidh_deinit();
     }
     if (hidh_ret != ESP_OK) {
-        ESP_LOGW(TAG, "esp_hidh_deinit 未成功(%s), 放弃本次拆栈以保蓝牙可用", esp_err_to_name(hidh_ret));
+        ESP_LOGD(TAG, "esp_hidh_deinit 未成功(%s), 放弃本次拆栈以保蓝牙可用", esp_err_to_name(hidh_ret));
         s_conn_dev  = NULL;
         s_connected = false;
         return;   /* s_gap_inited/s_hidh_init 保持 true → 下次 enable 幂等复用, 不会废掉底层 */
@@ -295,7 +295,7 @@ void bt_core_scan(int duration_sec)
     s_scanning = true;
     BaseType_t ok = xTaskCreate(scan_task, "bt_scan", 6 * 1024, NULL, 2, &s_scan_task);
     if (ok != pdPASS) {
-        ESP_LOGE(TAG, "failed to create scan task");
+        ESP_LOGD(TAG, "failed to create scan task");
         s_scanning = false;
     }
 }
@@ -328,7 +328,7 @@ bool bt_core_connect(const esp_hid_scan_result_t *r)
     }
     esp_hidh_dev_t *dev = esp_hidh_dev_open(r->bda, r->transport, r->ble.addr_type);
     if (!dev) {
-        ESP_LOGE(TAG, "open failed");
+        ESP_LOGD(TAG, "open failed");
         return false;
     }
     return true;
@@ -348,7 +348,7 @@ bool bt_core_connect_by_name(const char *name)
     esp_err_t err = esp_hid_scan(5, &n, &res);
     if (err != ESP_OK || !res) {
         if (res) esp_hid_scan_results_free(res);
-        ESP_LOGW(TAG, "按名字重解析[%s]: 扫描失败(%s)", name, esp_err_to_name(err));
+        ESP_LOGD(TAG, "按名字重解析[%s]: 扫描失败(%s)", name, esp_err_to_name(err));
         return false;
     }
 
@@ -361,7 +361,7 @@ bool bt_core_connect_by_name(const char *name)
             break;
         }
     }
-    if (!ok) ESP_LOGW(TAG, "按名字重解析[%s]: 扫到 %u 条结果但无同名设备", name, (unsigned)n);
+    if (!ok) ESP_LOGD(TAG, "按名字重解析[%s]: 扫到 %u 条结果但无同名设备", name, (unsigned)n);
     esp_hid_scan_results_free(res);
     return ok;
 }
@@ -382,7 +382,7 @@ bool bt_core_remove_bond(const uint8_t bd_addr[6])
 {
     if (!bd_addr) return false;
     esp_err_t err = esp_ble_remove_bond_device((uint8_t *)bd_addr);
-    ESP_LOGW(TAG, "remove_bond %02x:%02x:%02x:%02x:%02x:%02x -> %s",
+    ESP_LOGD(TAG, "remove_bond %02x:%02x:%02x:%02x:%02x:%02x -> %s",
              bd_addr[0], bd_addr[1], bd_addr[2], bd_addr[3], bd_addr[4], bd_addr[5],
              esp_err_to_name(err));
     return (err == ESP_OK);

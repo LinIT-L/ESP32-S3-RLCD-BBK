@@ -300,7 +300,11 @@ def check(path, verbose=False):
     # ⚠ 正则类检查一律跑在**剥掉注释**的源码上 (等长, 行号不变)。
     #   否则注释里写 `app.text (24px 高)` 这种说明文字会被当成真调用 → 假报警。
     code = blank_comments(src)
-    problems = contract_findings(code) + glyph_findings(code)
+    # ★ 2026-10-12: `_*.lua` = 公共库 (项目约定: 放 apps/ 根, 不进应用列表),
+    #   库本就不该有 render/poll/action ⇒ 只做语法 + 字库检查, 跳过契约检查。
+    #   (否则每加一个公共库都要在闸门里报"缺少全局 render()")
+    _is_lib = os.path.basename(path).startswith("_")
+    problems = ([] if _is_lib else contract_findings(code)) + glyph_findings(code)
     if problems:
         print("  ✗ %-22s 契约: %d 个问题" % (name, len(problems)))
         for p in problems:

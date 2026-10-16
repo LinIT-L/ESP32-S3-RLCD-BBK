@@ -48,6 +48,9 @@ LAYER_RANK = {
 ALLOW_INVERSIONS = {
     # wallpapers(ui) 需要蓝牙/音频/输入做电源与屏保, 属 ui→services 倒置;
     # 彻底修法: 把电源部分拆出 services/power, 由 os 回调驱动 (P5 待做).
+    # ★ 2026-10-13: wallpapers 的深睡按键定义已改为引用 board_pins(引脚唯一真相源),
+    #   属 ui→system 倒置; 与下面那批 ui→services 同性质(技术债登记)。
+    ("wallpapers", "board_pins"),
     ("wallpapers", "bt_ctl"),
     ("wallpapers", "audio_player"),
     ("wallpapers", "board_shim"),

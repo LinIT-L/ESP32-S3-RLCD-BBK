@@ -9,7 +9,7 @@
 #define MAIN_ICON_W 64
 #define MAIN_ICON_H 64
 #define MAIN_ICON_BYTES ((64*64)/8)
-#define MAIN_ICON_COUNT 34
+#define MAIN_ICON_COUNT 37
 
 typedef enum {
     ICON_APP_MGR = 0,
@@ -46,6 +46,9 @@ typedef enum {
     ICON_SMS = 31,
     ICON_FAV = 32,
     ICON_BIKE = 33,
+    ICON_SDR = 34,
+    ICON_BIOSSIM = 35,
+    ICON_PLANERADAR = 36,
 } icon_id_t;
 
 #endif /* ICONS_MAIN_ENUM_H */

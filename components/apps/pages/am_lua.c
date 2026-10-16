@@ -89,6 +89,7 @@ static bool     s_wg_connect = false;   /* 下一帧开"连接WiFi"弹窗 */
 static uint32_t s_wg_t0      = 0;
 
 static void wl_gate_abort(ui_ctx_t *ctx) {
+    ESP_LOGI(TAG, "gate abort (ask=%d wait=%d conn=%d)", s_wg_ask, s_wg_wait, s_wg_connect);
     s_wg_path[0] = 0; s_wg_ask = false; s_wg_wait = false; s_wg_connect = false;
     os_dialog_toast(ctx, "\xe8\xaf\xa5\xe5\xba\x94\xe7\x94\xa8\xe9\x9c\x80\xe8\xa6\x81 Wi-Fi"); /* 该应用需要 Wi-Fi */
 }
@@ -106,18 +107,29 @@ static void wl_gate_launch(ui_ctx_t *ctx) {
 static void wl_gate_confirm_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     s_wg_ask = false;
+    ESP_LOGI(TAG, "gate confirm cb: result=%d", result);
     if (result != 0) { wl_gate_abort(ctx); return; }   /* 取消 → 不启动 */
-    s_wg_wait = true;
-    s_wg_connect = true;                /* 交给 tick 开连网弹窗 (见上面第 3 条) */
+    s_wg_connect = true;                /* 确定 → 下一帧打开**系统网络模块**的连接界面 */
 }
 static void wl_gate_tick(ui_ctx_t *ctx) {
-    if (s_wg_connect) {                 /* 用户点了"确定" → 下一帧进连网流程 */
+    if (s_wg_connect) {                 /* 用户点了"去设置" → 下一帧开系统连网流程 */
         s_wg_connect = false;
         s_wg_t0 = (uint32_t)(esp_timer_get_time() / 1000);
-        settings_wifi_connect_open(ctx);   /* ★ 唯一入口: 内部按需 request, 别自己开 */
+        s_wg_wait = true;               /* 配完连上后继续把应用启动起来 */
+        settings_wifi_connect_open(ctx);   /* ★ 唯一入口: 系统网络模块的连接流程 */
         return;
     }
-    if (!s_wg_wait) return;
+    if (!s_wg_wait) {
+        /* ★★ 2026-10-15 自愈 (修"弹窗自动关闭后再点没反应"): 确认框被**不回调的路径**
+         *   清掉时 (os_dialog_clear_all / 屏保回主页 / 直接 os_dialog_pop 都不走回调),
+         *   s_wg_ask 会永远卡 true → 之后所有点按被吞。发现"ask 但弹窗已不在"就地复位。 */
+        if (s_wg_ask && os_dialog_depth() <= 0) {
+            ESP_LOGW(TAG, "gate 自愈: 确认框已被外部清掉, 复位门禁状态");
+            s_wg_ask = false;
+            s_wg_path[0] = 0;
+        }
+        return;
+    }
     if (wifi_manager_is_connected()) { wl_gate_launch(ctx); return; }
     /* 还在连(扫描/输密码/关联) 或有弹窗在 → 继续等; 否则=用户退出了连网流程 */
     bool alive = wifi_manager_is_connecting() || os_dialog_depth() > 0;
@@ -129,17 +141,25 @@ static void wl_gate_tick(ui_ctx_t *ctx) {
 static const os_service_t s_svc_lua_gate = { .name = "lua_wifi_gate", .tick = wl_gate_tick };
 void am_lua_gate_register(void) { os_register_service(&s_svc_lua_gate); }
 
-/* 门禁 + 启动的唯一落地处: need_wifi 且未联网 → 弹窗; 否则直接进 Lua 页。 */
+/* 门禁 + 启动的唯一落地处 (2026-10-15 linit 定: **联网归网络模块** —— 本函数不再自己
+ * 联网/弹连接流程, 只做两件事: ① 没配过网络 → 引导去设置; ② 配过 → 等模块连上再启动)。 */
 static void wl_open(ui_ctx_t *ctx, const char *path, bool need_wifi) {
     if (!path || !path[0]) return;
     if (need_wifi && !wifi_manager_is_connected()) {
-        ESP_LOGI(TAG, "Wi-Fi 门禁: %s 需要联网, 先问用户", path);
         if (s_wg_ask || s_wg_wait) return;           /* 已在门禁流程中 → 吞掉重复点按 */
         snprintf(s_wg_path, sizeof(s_wg_path), "%s", path);
-        s_wg_ask = true;
-        os_dialog_confirm_ex(ctx,
-            "\xe8\xaf\xa5\xe5\xba\x94\xe7\x94\xa8\xe9\x9c\x80\xe8\xa6\x81 Wi-Fi\xef\xbc\x8c\xe6\x98\xaf\xe5\x90\xa6\xe8\xbf\x9e\xe6\x8e\xa5\xef\xbc\x9f", /* 该应用需要 Wi-Fi，是否连接？ */
-            0, -1, wl_gate_confirm_cb, NULL);
+        if (!wifi_manager_has_saved()) {
+            ESP_LOGI(TAG, "Wi-Fi 门禁: %s 需要联网且从未配置 → 引导设置", path);
+            s_wg_ask = true;
+            os_dialog_confirm_ex(ctx,
+                "\xe8\xaf\xa5\xe5\xba\x94\xe7\x94\xa8\xe9\x9c\x80\xe8\xa6\x81 Wi-Fi\xef\xbc\x8c\xe6\x98\xaf\xe5\x90\xa6\xe5\x8e\xbb\xe8\xae\xbe\xe7\xbd\xae\xe8\x81\x94\xe7\xbd\x91\xef\xbc\x9f", /* 该应用需要 Wi-Fi，是否去设置联网？ */
+                0, -1, wl_gate_confirm_cb, NULL);
+            return;
+        }
+        ESP_LOGI(TAG, "Wi-Fi 门禁: %s 需要联网, 等网络模块连上", path);
+        s_wg_wait = true;
+        s_wg_t0 = (uint32_t)(esp_timer_get_time() / 1000);
+        os_dialog_toast_ms(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c...", 1500); /* 正在连接网络... */
         return;
     }
     os_page_lua_set_boot(path);
@@ -164,10 +184,13 @@ void am_lua_open_path(ui_ctx_t *ctx, const char *path) {
     bool need = (apppack_parse(path, &m) == ESP_OK) && m.need_wifi;
     wl_open(ctx, path, need);
 }
-/* LAPP 里的 icon= 是 64×64 位图 (打包器从主图标表取)。os_app_t 只有 icon_idx,
- * 没有"自带位图"字段 → 这里做**反查**: 逐张比对主图标表, 命中就用那个下标,
- * 于是 `pack_app.py --icon-from-main ICON_XXX` 打的图标在管家/主菜单能正确显示。
- * 自定义位图 (TF 侧手绘) 匹配不上 → 回退 ICON_MINI_GAMES (小游戏机图标)。 */
+/* LAPP 里的 icon= 是 64×64 位图 (打包器从主图标表取)。
+ * ★★ 2026-10-15 "图标跟着应用走" (linit: 以后从服务器下发新应用不该为图标改固件):
+ *   ① 先**反查**主图标表 —— 命中就用那个下标 (内置图标走原路, ABI 不变);
+ *   ② 查不到 (服务器上新应用的自定义图标) → 注册进**运行时外来图标表**,
+ *      返回 >= MAIN_ICON_COUNT 的新下标, 主菜单/管家/离屏列都能直接画;
+ *   ③ 只有表满 (32 张) 才回退 ICON_MINI_GAMES。
+ *   于是"上传新包到服务器 → 下载安装 → 图标正确显示"全链路不需要刷固件。 */
 static int am_lua_icon_idx(const apppack_meta_t *m) {
     if (m->has_icon) {
         for (int i = 0; i < MAIN_ICON_COUNT; i++) {
@@ -176,6 +199,8 @@ static int am_lua_icon_idx(const apppack_meta_t *m) {
             if (b && w == MAIN_ICON_W && h == MAIN_ICON_H &&
                 memcmp(b, m->icon, APPPACK_ICON_BYTES) == 0) return i;
         }
+        int ex = ui_icon_register_extra(m->icon);
+        if (ex >= 0) return ex;
     }
     return ICON_MINI_GAMES;
 }
@@ -208,6 +233,20 @@ static bool am_lua_scan(int cat, bool bg) {
             if (nm[0] == '.') continue;
             size_t len = strlen(nm);
             if (len <= 5 || strcasecmp(nm + len - 4, ".lua") != 0) continue;
+            /* ★ 2026-10-09: **同名去重** (原来根本没有 —— 本文件开头的"合并去重"注释是错的)。
+             *   两个 base 都扫, 同一应用在 SPIFFS(/store/apps) 与 TF(/sdcard/apps) 各放一份时,
+             *   应用管家会出现**两条**: 一条叫 `map`, 另一条套了「」叫 `「map」`, 用户会当成
+             *   两个应用 (而且 tF 那份常是旧版 ⇒ "有一个退不出来")。
+             *   规则: /store/apps 优先 —— 它是应用商店的安装目标, 也是烧 apps_l.bin 的落点;
+             *   /sdcard/apps 里同名的直接跳过 (TF 独有的应用仍然照常出现, 不受影响)。 */
+            {
+                bool dup = false;
+                for (int j = 0; j < *pn; j++) {
+                    const char *id = L[j].id;
+                    if (strncmp(id, "lua:", 4) == 0 && strcmp(id + 4, nm) == 0) { dup = true; break; }
+                }
+                if (dup) continue;
+            }
             if (*pn >= AM_LUA_MAX) break;
             int k = (*pn)++;
             snprintf(L[k].id, sizeof(L[k].id), "lua:%s", nm);
@@ -268,7 +307,7 @@ static void am_lua_scan_async(int cat) {
     if (xTaskCreatePinnedToCore(am_lua_scan_task, "am_luascan", 8192, (void *)(long)cat, 3, NULL, 0) != pdPASS) {
         s_lua_busy = false;
         s_lua_done = false;
-        ESP_LOGE(TAG, "Lua 扫描任务创建失败(内存不足?), 允许重试");
+        ESP_LOGD(TAG, "Lua 扫描任务创建失败(内存不足?), 允许重试");
     }
 }
 

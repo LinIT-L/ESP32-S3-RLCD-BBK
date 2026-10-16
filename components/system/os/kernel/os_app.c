@@ -161,7 +161,7 @@ void os_app_set_hidden(const char *id, bool hide) {
 void os_app_register(const os_app_t *app)
 {
     if (!app || !app->id || s_app_count >= OS_APP_MAX) {
-        ESP_LOGW(TAG, "register: bad app or full");
+        ESP_LOGD(TAG, "register: bad app or full");
         return;
     }
     /* 同 id 覆盖 (商店更新安装) */

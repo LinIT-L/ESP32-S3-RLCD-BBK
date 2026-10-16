@@ -176,3 +176,6 @@ const char *wqx_game_data_root_in_folder(const char *scope, int idx, char *out, 
 #endif
 
 #endif /* SD_SCAN_H */
+
+/* ★ 2026-10-16: app_board 按板型表下发 SD(SDMMC 1-bit) 引脚 */
+void sd_scan_apply_pins(int clk, int cmd, int d0);

@@ -20,6 +20,7 @@
 #include "bt_manager.h"   /* os_confirm_exit_blocking: 手柄退出确认直读电平 */
 #include "esp_timer.h"
 #include "esp_attr.h"
+#include "esp_log.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -406,6 +407,7 @@ static bool s_cb_handled = false;
 static void dlg_finish_top(ui_ctx_t *ctx, int result) {
     os_dlg_stack_t *d = top();
     if (!d) return;
+    ESP_LOGI(TAG, "finish: result=%d title=\"%s\"", result, d->title);
     os_dialog_cb_t cb = d->cb;
     void *ud = d->ud;
     s_cb_handled = false;
@@ -672,17 +674,20 @@ void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg) {
     if (s_top < 0) os_push(ctx, OS_PAGE_DIALOG);   /* 首层: 打开弹窗页 */
     s_stack[++s_top] = *dlg;                       /* 整体拷贝, 含回调/ud/自定义 */
     s_stack[s_top].open_ms = now_ms();             /* 记录打开时刻 (供超时) */
+    ESP_LOGI(TAG, "push: \"%s\" top=%d", s_stack[s_top].title, s_top);
     s_cb_handled = true;   /* cb 内调用=下一步同窗替换, 不自动关闭父层 */
 }
 
 /* 覆盖当前层内容 (刷新/下一步, 不加深层级) 已由调用方改为 pop+push 组合实现, 此 API 删除. */
 void os_dialog_clear_all(ui_ctx_t *ctx) {
+    ESP_LOGI(TAG, "clear_all: top=%d (无回调直清!)", s_top);
     while (s_top >= 0) os_dialog_pop(ctx);
     s_toast_msg[0] = 0;
     ctx->needs_redraw = true;
 }
 
 void os_dialog_pop(ui_ctx_t *ctx) {
+    ESP_LOGI(TAG, "pop: top=%d (无回调直弹!)", s_top);
     if (s_top > 0) {
         s_top--;   /* 弹栈, 恢复父弹窗 (sel 已在各自层保存) */
     } else if (s_top == 0) {

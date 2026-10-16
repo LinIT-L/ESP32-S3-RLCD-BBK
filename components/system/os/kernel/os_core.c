@@ -73,10 +73,10 @@ void os_init(ui_ctx_t *ctx, st7305_handle_t *lcd)
 void os_register(const os_module_t *mod)
 {
     if (!mod || mod->page_id < 0 || mod->page_id >= OS_PAGE_COUNT) {
-        ESP_LOGW(TAG, "register: bad page id");
+        ESP_LOGD(TAG, "register: bad page id");
         return;
     }
-    if (s_module_set[mod->page_id]) ESP_LOGW(TAG, "page %d dup -> %s override", mod->page_id, mod->name);
+    if (s_module_set[mod->page_id]) ESP_LOGD(TAG, "page %d dup -> %s override", mod->page_id, mod->name);
     s_modules[mod->page_id]    = mod;
     s_module_set[mod->page_id] = true;
     ESP_LOGI(TAG, "register %s (page %d)", mod->name, mod->page_id);
@@ -84,7 +84,7 @@ void os_register(const os_module_t *mod)
 
 void os_register_service(const os_service_t *svc)
 {
-    if (!svc || s_service_count >= OS_SERVICE_MAX) { ESP_LOGW(TAG, "service full"); return; }
+    if (!svc || s_service_count >= OS_SERVICE_MAX) { ESP_LOGD(TAG, "service full"); return; }
     s_services[s_service_count++] = svc;
     ESP_LOGI(TAG, "service +%s", svc->name);
 }
@@ -98,7 +98,7 @@ static const os_module_t *os_cur_mod(void)
 bool os_push(ui_ctx_t *ctx, os_page_t page)
 {
     if (page < 0 || page >= OS_PAGE_COUNT || !s_module_set[page]) {
-        ESP_LOGW(TAG, "push: page %d not registered", (int)page);
+        ESP_LOGD(TAG, "push: page %d not registered", (int)page);
         return false;
     }
     const os_module_t *m = s_modules[page];
@@ -131,20 +131,35 @@ bool os_push(ui_ctx_t *ctx, os_page_t page)
     ctx->needs_redraw = true;
     ESP_LOGI(TAG, "push -> %s", m->name);
     if (d_enter >= 5000)
-        ESP_LOGW(TAG, "打开慢: push -> %s 的 on_enter 用了 %llu us", m->name, d_enter);
+        ESP_LOGD(TAG, "打开慢: push -> %s 的 on_enter 用了 %llu us", m->name, d_enter);
     return true;
 }
 
 void os_pop(ui_ctx_t *ctx)
 {
-    if (s_stack_top < 0) { ESP_LOGW(TAG, "pop: stack empty, stay"); return; }
+    if (s_stack_top < 0) { ESP_LOGD(TAG, "pop: stack empty, stay"); return; }
     os_page_t parent = s_back_stack[s_stack_top--];
 
     const os_module_t *m = s_cur_mod;
     bool was_overlay = m && m->modal;
-    if (m && m->on_exit) m->on_exit(ctx);
-
     const os_module_t *pm = (parent >= 0 && parent < OS_PAGE_COUNT) ? s_modules[parent] : NULL;
+
+    /* ★★ 2026-10-14 linit 反馈"确认退出后要干等 0.5 秒才真的退" —— 根因:
+     *   `os_pop` 原来是**先跑本页 on_exit, 再切父页**, 而 on_exit 里有几百 ms 的阻塞动作
+     *   (关 WiFi = `esp_wifi_stop()`+`esp_wifi_deinit()`, 拆 USB HID, 卸载引擎/字体)。
+     *   渲染在本帧末尾才发生 ⇒ 屏幕上那一页一直挂着, 用户看到的就是"卡半秒才退"。
+     *   修法: **全屏应用页退出时, 先把父页切上来刷一帧(画面立刻变), 再执行阻塞的 on_exit**。
+     *   顺序对调只影响"先清理后建页"的时序; 菜单层(非全屏)pop 频繁且 on_exit 很轻, 保持原序不加开销。 */
+    bool late_exit = m && m->on_exit && !was_overlay && m->fullscreen;
+
+    /* 退出耗时体检 —— ≥30ms 打一行, 定位是哪一段慢 (配合 late_exit 修法验证) */
+    uint64_t t_pop0 = (uint64_t)esp_timer_get_time();
+    uint64_t d_exit = 0;
+    if (m && m->on_exit && !late_exit) {
+        m->on_exit(ctx);
+        d_exit = (uint64_t)esp_timer_get_time() - t_pop0;
+    }
+
     s_cur_mod        = pm;
     ctx->cur         = pm;
     ctx->current_page = pm ? (int)parent : -1;
@@ -160,6 +175,25 @@ void os_pop(ui_ctx_t *ctx)
      * 需标记背景脏, 下次渲染时先重绘最底层非模态页再叠加弹窗. */
     if (was_overlay && m && m->fullscreen) s_bg_dirty = true;
     ctx->needs_redraw = true;
+
+    if (late_exit) {
+        /* ① 先把父页刷上屏 —— 用户确认退出后**立刻**看到界面变化, 不再干等 */
+        os_render(ctx);
+        /* ② 再做阻塞的退出清理 (关射频/拆 USB/卸载引擎); 画面已经切走, 卡这段无所谓 */
+        uint64_t t_ex = (uint64_t)esp_timer_get_time();
+        m->on_exit(ctx);
+        d_exit = (uint64_t)esp_timer_get_time() - t_ex;
+        ctx->needs_redraw = true;   /* 清理可能改了全局态(如 fullscreen/theme), 收尾再刷一帧 */
+    }
+
+    {   /* 退出慢体检: ≥30ms 打一行 */
+        uint64_t d_all = (uint64_t)esp_timer_get_time() - t_pop0;
+        if (d_all >= 30000)
+            ESP_LOGW(TAG, "退出慢: %s.on_exit=%llums%s 合计=%llums",
+                     m ? m->name : "-", (unsigned long long)(d_exit / 1000),
+                     late_exit ? " (已改成先刷屏后清理)" : "",
+                     (unsigned long long)(d_all / 1000));
+    }
     ESP_LOGI(TAG, "pop -> page %d", (int)parent);
 }
 
@@ -235,7 +269,7 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
     }
 
     const os_module_t *m = os_cur_mod();
-    if (!m) { ESP_LOGW(TAG, "action: no active module"); return; }
+    if (!m) { ESP_LOGD(TAG, "action: no active module"); return; }
     /* HOME (长按返回键3s / 手柄第7键): 退出到桌面主菜单 (保留原选中位) */
     if (a == OS_ACTION_HOME) {
         /* ★ 2026-10-03 linit 规范: **全屏游戏 / 独立程序按"退出键"必须先问一句**。
@@ -266,16 +300,22 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
          a == OS_ACTION_CONFIRM || a == OS_ACTION_BACK)) {
         vibrator_tap_ui(18, 100);
     }
-    /* 全屏应用按返回 → 退出确认弹窗 (确认退出 / 10秒自动退出 / 返回取消).
-     * 门控: 仅"游戏(分类引擎)"拦截弹"退出程序?"——引擎进 eng_task_run_loop 时
-     * input_set_gamepad_gamemode(true) 使 input_is_game_mode() 为真; 普通应用程序
-     * (如虚拟键鼠)不在此拦截, 改由各自页面 p_action 处理返回(如先弹选择菜单).
-     * 用户规范: 游戏中只有分类引擎游戏才弹"退出程序?", 应用程序不需要. */
+    /* ① 引擎(分类游戏)按返回 → 退出确认弹窗 (确认退出 / 10秒自动退出 / 返回取消).
+     * 门控: input_is_game_mode() 为真 (引擎进 eng_task_run_loop 时置位). 原逻辑保持不动. */
     if (a == OS_ACTION_BACK && m->fullscreen && !m->modal && !s_full_back_dlg
         && input_is_game_mode()) {
         s_full_back_dlg = true;
         os_dialog_confirm_ex(ctx, "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?", /* 退出程序? */
                              10000, 0, on_full_back_confirm, NULL);
+        return;
+    }
+    /* ② ★ 2026-10-14 linit 全局规范: **应用页按硬件返回键也要先弹"退出程序?"确认, 确认才退**.
+     * 由模块声明 `.exit_confirm = true` 开启 (应用页默认开)。
+     * 不开启的三类排除项见 os.h 的 os_module_t::exit_confirm 注释:
+     *   引擎类 / 弹窗类 / 页内 BACK 自带语义或已自建确认 (它们自行调 os_request_exit_confirm)。
+     * 引擎跑在游戏态, 上面 ① 已先返回, 不会重复弹。 */
+    if (a == OS_ACTION_BACK && m->exit_confirm && !m->modal) {
+        os_request_exit_confirm(ctx);
         return;
     }
     if (m->action) { m->action(ctx, a); return; }
@@ -315,8 +355,40 @@ bool os_handle_touch(ui_ctx_t *ctx, int x, int y)
     return false;
 }
 
+/* ==== 全屏应用"退出确认"统一入口 (linit 2026-10-14) ====
+ * 无线探测 / 网络检测 / 电脑诊断 这类全屏应用: 按硬件返回键先弹"退出程序?", **确认才退出**。
+ * 各页只在"真要退出"的那一处调本函数 —— 页内 BACK 的其它语义(关详情/回上一步/回列表)不受影响。
+ * ⚠ 不能在弹窗回调里直接 `os_pop` 页面: 回调是在 `dlg_finish_top()` 内部跑的, 此刻栈顶**还是弹窗层**,
+ *   直接弹会把弹窗弹掉、应用却留着。所以只置 pending, 由下一帧 `os_tick` 统一弹页面。 */
+static bool s_exit_ask_open    = false;
+static bool s_exit_ask_pending = false;
+
+static void on_exit_ask(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    s_exit_ask_open = false;
+    if (result == 0) {                      /* 0=确定退出; 1/-1(取消/返回)=留在原页 */
+        s_exit_ask_pending = true;
+        if (ctx) ctx->needs_redraw = true;
+    }
+}
+
+void os_request_exit_confirm(ui_ctx_t *ctx) {
+    if (!ctx) return;
+    if (s_exit_ask_open || s_exit_ask_pending) return;   /* 已弹/已排队, 防重复 */
+    s_exit_ask_open = true;
+    os_dialog_confirm_ex(ctx, "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?", /* 退出程序? */
+                         0, -1, on_exit_ask, NULL);
+}
+
 void os_tick(ui_ctx_t *ctx)
 {
+    /* 全屏应用退出确认: 弹窗已关 → 这一帧才真正退页面 (见 os_request_exit_confirm 注释) */
+    if (s_exit_ask_pending) {
+        s_exit_ask_pending = false;
+        if (os_dialog_depth() <= 0 && !ctx->modal_active) os_pop(ctx);
+        ctx->needs_redraw = true;
+    }
+
     /* V1.7.x: 全局 toast 超时清理 — 任意页面/弹窗上提示 1s 自动关+重绘 (不依赖 DIALOG 页 poll) */
     os_dialog_toast_tick(ctx);
 
@@ -448,7 +520,7 @@ void os_render(ui_ctx_t *ctx)
         uint64_t d_frame = t_now - t_frame0;
         uint64_t d_flush = t_now - t_flush0;
         if (d_frame >= 50000)
-            ESP_LOGW(TAG, "render 慢: 总 %llu us = 绘制 %llu + flush %llu (page=%d %s)",
+            ESP_LOGD(TAG, "render 慢: 总 %llu us = 绘制 %llu + flush %llu (page=%d %s)",
                      d_frame, d_frame - d_flush, d_flush, ctx->current_page, m ? m->name : "-");
     }
     ctx->needs_redraw = false;

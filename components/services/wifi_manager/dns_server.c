@@ -138,7 +138,7 @@ static int parse_dns_request(char *req, size_t req_len, char *dns_reply, size_t 
     for (int qd_i = 0; qd_i < qd_count; qd_i++) {
         char *name_end_ptr = parse_dns_name(cur_qd_ptr, name, sizeof(name));
         if (name_end_ptr == NULL) {
-            ESP_LOGE(TAG, "Failed to parse DNS question: %s", cur_qd_ptr);
+            ESP_LOGD(TAG, "Failed to parse DNS question: %s", cur_qd_ptr);
             return -1;
         }
 
@@ -208,7 +208,7 @@ void dns_server_task(void *pvParameters)
 
         int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
         if (sock < 0) {
-            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+            ESP_LOGD(TAG, "Unable to create socket: errno %d", errno);
             break;
         }
         handle->sock = sock;   /* V1.0.67: 记录, stop 时先 shutdown 释放端口 */
@@ -216,7 +216,7 @@ void dns_server_task(void *pvParameters)
 
         int err = bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
         if (err < 0) {
-            ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
+            ESP_LOGD(TAG, "Socket unable to bind: errno %d", errno);
         }
         ESP_LOGI(TAG, "Socket bound, port %d", DNS_PORT);
 
@@ -249,11 +249,11 @@ void dns_server_task(void *pvParameters)
 
                 ESP_LOGI(TAG, "Received %d bytes from %s | DNS reply with len: %d", len, addr_str, reply_len);
                 if (reply_len <= 0) {
-                    ESP_LOGE(TAG, "Failed to prepare a DNS reply");
+                    ESP_LOGD(TAG, "Failed to prepare a DNS reply");
                 } else {
                     int err = sendto(sock, reply, reply_len, 0, (struct sockaddr *)&source_addr, sizeof(source_addr));
                     if (err < 0) {
-                        ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+                        ESP_LOGD(TAG, "Error occurred during sending: errno %d", errno);
                         break;
                     }
                 }
@@ -261,7 +261,7 @@ void dns_server_task(void *pvParameters)
         }
 
         if (handle->sock >= 0) {
-            ESP_LOGE(TAG, "Shutting down socket");
+            ESP_LOGD(TAG, "Shutting down socket");
             close(handle->sock);
             handle->sock = -1;
         }

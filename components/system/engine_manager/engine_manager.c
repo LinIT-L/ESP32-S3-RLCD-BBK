@@ -44,7 +44,7 @@ static void engine_mem_leak_check(void)
     d_ps  = (int64_t)free_ps  - (int64_t)s_base_psram;
     if (d_int < -(int64_t)TAG_MEM_BASE_INTERNAL_MIN ||
         d_ps  < -(int64_t)TAG_MEM_BASE_PSRAM_MIN) {
-        ESP_LOGW(TAG, "[LEAK] 返回主菜单检测到内存未完全释放: 内部空闲比基线少 %lld (基线%u), "
+        ESP_LOGD(TAG, "[LEAK] 返回主菜单检测到内存未完全释放: 内部空闲比基线少 %lld (基线%u), "
                  "PSRAM 空闲比基线少 %lld (基线%u) — 引擎可能未成功卸载", (long long)(-d_int),
                  (unsigned)s_base_internal, (long long)(-d_ps), (unsigned)s_base_psram);
     } else {
@@ -68,8 +68,10 @@ extern esp_err_t lavax_emu_background_init(st7305_handle_t *lcd);
 extern void lavax_emu_unload(void);
 extern esp_err_t vpet_emu_background_init(st7305_handle_t *lcd);
 extern void vpet_emu_unload(void);
+#if LINTOS_ENABLE_MD
 extern esp_err_t md_emu_background_init(void);
 extern void md_emu_unload(void);
+#endif
 extern esp_err_t sms_emu_background_init(void);
 extern void sms_emu_unload(void);
 
@@ -85,8 +87,10 @@ static void e_lavax_load(st7305_handle_t *lcd)   { (void)lavax_emu_background_in
 static void e_lavax_unload(void)                 { lavax_emu_unload(); }
 static void e_vpet_load(st7305_handle_t *lcd)    { (void)vpet_emu_background_init(lcd); }
 static void e_vpet_unload(void)                  { vpet_emu_unload(); }
+#if LINTOS_ENABLE_MD
 static void e_md_load(st7305_handle_t *lcd)      { (void)lcd; md_emu_background_init(); }
 static void e_md_unload(void)                    { md_emu_unload(); }
+#endif
 static void e_sms_load(st7305_handle_t *lcd)     { (void)lcd; sms_emu_background_init(); }
 static void e_sms_unload(void)                   { sms_emu_unload(); }
 
@@ -98,7 +102,9 @@ static const engine_desc_t s_engines[ENGINE_COUNT] = {
     [ENGINE_ARDUBOY] = { ENGINE_ARDUBOY, "arduboy", e_arduboy_load, e_arduboy_unload },
     [ENGINE_LAVAX]   = { ENGINE_LAVAX,   "lavax",   e_lavax_load,   e_lavax_unload },
     [ENGINE_VPET]    = { ENGINE_VPET,    "vpet",    e_vpet_load,    e_vpet_unload },
+#if LINTOS_ENABLE_MD
     [ENGINE_MD]      = { ENGINE_MD,      "md",      e_md_load,      e_md_unload },
+#endif
     [ENGINE_SMS]     = { ENGINE_SMS,     "sms",     e_sms_load,     e_sms_unload },
 };
 

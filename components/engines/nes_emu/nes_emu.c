@@ -48,7 +48,11 @@ static const char *TAG = "nes_emu";
 #define NES_EMU_Y_OFFSET ((BOARD_RLCD_HEIGHT - NES_VISIBLE_HEIGHT) / 2)
 
 EXT_RAM_BSS_ATTR static StackType_t s_nes_task_stack[NES_EMU_TASK_STACK_SIZE / sizeof(StackType_t)];
-static StaticTask_t s_nes_task_tcb;
+/* ★ 必须在内部 RAM: 本组件 linker.lf 用 `* (extram_bss)` 把整库 .bss 扫进 PSRAM,
+     *   而 FreeRTOS 的 xPortCheckValidTCBMem() 要求 TCB 在内部 RAM ——
+     *   之前 TCB 被一起扫进 PSRAM, 一开游戏就 assert 重启(2026-10-09 修)。
+     *   DRAM_ATTR = .dram1 段 -> dram0_data(内部), 且不是 .bss, 不会被扫走。 */
+static DRAM_ATTR StaticTask_t s_nes_task_tcb;
 
 extern uint8_t *nes_video_shade_packed;
 extern volatile bool nes_video_frame_ready;
@@ -114,7 +118,7 @@ static void nes_emu_load_sram(void)
     if (fread(&magic, 1, 4, f) != 4 || fread(&size, 1, 4, f) != 4 ||
         magic != NES_SRAM_MAGIC || size > sram_len) {
         fclose(f);
-        ESP_LOGW(TAG, "sram 头不匹配, 跳过加载 %s", s_save_path);
+        ESP_LOGD(TAG, "sram 头不匹配, 跳过加载 %s", s_save_path);
         return;
     }
     size_t rd = fread(nes_context->rominfo->sram, 1, size, f);
@@ -292,18 +296,18 @@ esp_err_t nes_emu_background_init(void)
         s_event_inited = true;
     }
     if (osd_init() != 0) {
-        ESP_LOGE(TAG, "osd_init 失败");
+        ESP_LOGD(TAG, "osd_init 失败");
         return ESP_FAIL;
     }
     vidinfo_t video;
     osd_getvideoinfo(&video);
     if (vid_init(video.default_width, video.default_height, video.driver) != 0) {
-        ESP_LOGE(TAG, "vid_init 失败");
+        ESP_LOGD(TAG, "vid_init 失败");
         return ESP_FAIL;
     }
     nes_context = nes_create();
     if (!nes_context) {
-        ESP_LOGE(TAG, "nes_create 失败");
+        ESP_LOGD(TAG, "nes_create 失败");
         return ESP_ERR_NO_MEM;
     }
     event_set_system(system_nes);
@@ -355,14 +359,14 @@ esp_err_t nes_emu_start(const char *path)
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGE(TAG, "打开失败: %s", path);
+        ESP_LOGD(TAG, "打开失败: %s", path);
         return ESP_FAIL;
     }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (sz <= 0 || sz > 2 * 1024 * 1024) {
-        ESP_LOGE(TAG, "ROM 大小异常: %ld", sz);
+        ESP_LOGD(TAG, "ROM 大小异常: %ld", sz);
         fclose(f);
         return ESP_FAIL;
     }
@@ -377,7 +381,7 @@ esp_err_t nes_emu_start(const char *path)
     if (rd != (size_t)sz) {
         heap_caps_free(nes_rom_data);
         nes_rom_data = NULL;
-        ESP_LOGE(TAG, "读取不完整: %u/%ld", (unsigned)rd, sz);
+        ESP_LOGD(TAG, "读取不完整: %u/%ld", (unsigned)rd, sz);
         return ESP_FAIL;
     }
     nes_rom_size = (size_t)sz;
@@ -394,7 +398,7 @@ esp_err_t nes_emu_start(const char *path)
     if (s_progress_cb) s_progress_cb(50);
 
     if (nes_insertcart(path, nes_context) != 0) {
-        ESP_LOGE(TAG, "nes_insertcart 失败: %s", path);
+        ESP_LOGD(TAG, "nes_insertcart 失败: %s", path);
         heap_caps_free(nes_rom_data);
         nes_rom_data = NULL;
         return ESP_FAIL;

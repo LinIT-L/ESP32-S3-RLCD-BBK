@@ -52,7 +52,7 @@ fav_engine_t favorites_engine_for_path(const char *path) {
 /* 将全部引擎的收藏序列化后写入 NVS(数据库), 不再写 appdata */
 static void save_all(void) {
     uint8_t *buf = heap_caps_malloc(FAV_BLOB_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf) { ESP_LOGE(TAG, "无内存写收藏"); return; }
+    if (!buf) { ESP_LOGD(TAG, "无内存写收藏"); return; }
     memcpy(buf, "FAVB", 4);
     buf[4] = 1;
     uint32_t off = 5;
@@ -72,7 +72,7 @@ static void save_all(void) {
         esp_err_t ec = svc_nvs_commit(h);
         svc_nvs_close(h);
         if (er == ESP_OK && ec == ESP_OK) ESP_LOGI(TAG, "收藏已写入 NVS (+%uB)", (unsigned)off);
-        else ESP_LOGE(TAG, "收藏写 NVS 失败");
+        else ESP_LOGD(TAG, "收藏写 NVS 失败");
     }
     heap_caps_free(buf);
 }
@@ -134,7 +134,7 @@ bool favorites_contains(fav_engine_t e, const char *path) {
 
 bool favorites_toggle(fav_engine_t e, const char *path) {
     if (e < 0 || e >= FAV_ENGINE_MAX) return false;
-    if (!path || path[0] == '\0') { ESP_LOGW(TAG, "拒绝空路径"); return false; }
+    if (!path || path[0] == '\0') { ESP_LOGD(TAG, "拒绝空路径"); return false; }
     int found = -1;
     for (int i = 0; i < s_count[e]; i++)
         if (strcmp(s_paths[e][i], path) == 0) { found = i; break; }
@@ -149,7 +149,7 @@ bool favorites_toggle(fav_engine_t e, const char *path) {
         ESP_LOGI(TAG, "已取消收藏: %s (剩余 %d)", path, s_count[e]);
         return false;
     }
-    if (s_count[e] >= FAVORITES_MAX) { ESP_LOGW(TAG, "收藏已满 (%d)", FAVORITES_MAX); return false; }
+    if (s_count[e] >= FAVORITES_MAX) { ESP_LOGD(TAG, "收藏已满 (%d)", FAVORITES_MAX); return false; }
     strncpy(s_paths[e][s_count[e]], path, FAVORITES_PATH_MAX - 1);
     s_paths[e][s_count[e]][FAVORITES_PATH_MAX - 1] = '\0';
     s_path_ptrs[e][s_count[e]] = s_paths[e][s_count[e]];
@@ -161,9 +161,9 @@ bool favorites_toggle(fav_engine_t e, const char *path) {
 
 bool favorites_add(fav_engine_t e, const char *path) {
     if (e < 0 || e >= FAV_ENGINE_MAX) return false;
-    if (!path || path[0] == '\0') { ESP_LOGW(TAG, "拒绝空路径"); return false; }
-    if (favorites_contains(e, path)) { ESP_LOGW(TAG, "已在列表中: %s", path); return false; }
-    if (s_count[e] >= FAVORITES_MAX) { ESP_LOGW(TAG, "已满 (%d)", FAVORITES_MAX); return false; }
+    if (!path || path[0] == '\0') { ESP_LOGD(TAG, "拒绝空路径"); return false; }
+    if (favorites_contains(e, path)) { ESP_LOGD(TAG, "已在列表中: %s", path); return false; }
+    if (s_count[e] >= FAVORITES_MAX) { ESP_LOGD(TAG, "已满 (%d)", FAVORITES_MAX); return false; }
     size_t plen = strnlen(path, FAVORITES_PATH_MAX - 1);
     memcpy(s_paths[e][s_count[e]], path, plen);
     s_paths[e][s_count[e]][plen] = '\0';
@@ -205,7 +205,7 @@ void favorites_prune_missing(void) {
         for (int i = s_count[e] - 1; i >= 0; i--) {
             struct stat st;
             if (stat(s_paths[e][i], &st) != 0) {
-                ESP_LOGW(TAG, "清理失效收藏: %s", s_paths[e][i]);
+                ESP_LOGD(TAG, "清理失效收藏: %s", s_paths[e][i]);
                 favorites_remove((fav_engine_t)e, s_paths[e][i]);
             }
         }

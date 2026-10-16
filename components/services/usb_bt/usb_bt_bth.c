@@ -69,7 +69,7 @@ static int host_rcv_pkt(uint8_t *data, uint16_t len)
         free(rp);
         break;
     default:
-        ESP_LOGW(TAG, "Unknown HCI type 0x%02x", type);
+        ESP_LOGD(TAG, "Unknown HCI type 0x%02x", type);
         break;
     }
     return 0;
@@ -147,21 +147,21 @@ void tusb_bth_init(void)
 {
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     if (esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT) != ESP_OK) {
-        ESP_LOGE(TAG, "release classic bt memory failed");
+        ESP_LOGD(TAG, "release classic bt memory failed");
         return;
     }
     if (esp_bt_controller_init(&bt_cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "controller init failed");
+        ESP_LOGD(TAG, "controller init failed");
         return;
     }
     if (esp_bt_controller_enable(ESP_BT_MODE_BLE) != ESP_OK) {
-        ESP_LOGE(TAG, "controller enable failed");
+        ESP_LOGD(TAG, "controller enable failed");
         return;
     }
     evt_sem = xSemaphoreCreateBinary();
     acl_sem = xSemaphoreCreateBinary();
     if (!evt_sem || !acl_sem) {
-        ESP_LOGE(TAG, "sem create failed");
+        ESP_LOGD(TAG, "sem create failed");
         return;
     }
     esp_vhci_host_register_callback(&vhci_host_cb);

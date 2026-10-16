@@ -10,6 +10,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <stdio.h>
+
 static const char *TAG = "ES7210";
 
 /* 寄存器 */
@@ -57,7 +59,7 @@ static int es7210_write_reg(uint8_t reg, uint8_t val) {
     esp_err_t ret = i2c_master_cmd_begin(s_port, cmd, pdMS_TO_TICKS(100));
     i2c_cmd_link_delete(cmd);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C 写 0x%02x=0x%02x 失败: %s", reg, val, esp_err_to_name(ret));
+        ESP_LOGD(TAG, "I2C 写 0x%02x=0x%02x 失败: %s", reg, val, esp_err_to_name(ret));
     }
     return (ret == ESP_OK) ? 0 : -1;
 }
@@ -114,7 +116,7 @@ int es7210_init(int i2c_port) {
     /* 探测地址 0x40..0x43 (读寄存器, 比空写 ACK 更可靠) */
     s_addr = (uint8_t)es7210_probe(i2c_port);
     if (s_addr == 0) {
-        ESP_LOGE(TAG, "未找到 ES7210 (0x40-0x43 均无响应)");
+        ESP_LOGD(TAG, "未找到 ES7210 (0x40-0x43 均无响应)");
         return -1;
     }
     ESP_LOGI(TAG, "ES7210 地址 0x%02X, 初始化 16kHz ADC...", s_addr);
@@ -153,9 +155,19 @@ int es7210_init(int i2c_port) {
     es7210_write_reg(ES7210_LRCK_DIVH_REG04, 0x01);
     es7210_write_reg(ES7210_LRCK_DIVL_REG05, 0x00);
 
-    /* 增益: 30dB (0x0A | 0x10) */
-    for (uint8_t r = ES7210_MIC1_GAIN_REG43; r <= ES7210_MIC4_GAIN_REG46; r++) {
-        es7210_write_reg(r, 0x1A);
+    /* ★★★ 2026-10-14 关键修复: REG01 (CLOCK_OFF) 是 **ADC 时钟域的总闸**。
+     *   之前这里写完 0x3F(全部关) 就再也没打开过 ⇒ ADC 时钟一直关着 ⇒ 芯片根本不做转换,
+     *   SDOUT 上永远是 0 ⇒ 录音样点 "peak=0 且没有任何本底噪声"(诡异的精确 0 就是这么来的)。
+     *   ⛔ 正确顺序(照 ESPHome es7210 官方驱动 configure_mic_gain_): **先把时钟域打开,
+     *      再写该通道的 PGA 增益**; 关着时钟写增益是不生效的。
+     *   掩码: MIC1/2 域 = 0x0b(bit0,1,3) · MIC3/4 域 = 0x15(bit0,2,4)。 */
+    for (int ch = 0; ch < 4; ch++) {
+        uint8_t clk_mask = (ch < 2) ? 0x0B : 0x15;
+        uint8_t pwr_reg  = (ch < 2) ? ES7210_MIC12_POWER_REG4B : ES7210_MIC34_POWER_REG4C;
+        es7210_update_reg_bit(ES7210_CLOCK_OFF_REG01, clk_mask, 0x00);          /* 时钟域开 */
+        es7210_write_reg(pwr_reg, 0x00);
+        es7210_update_reg_bit((uint8_t)(ES7210_MIC1_GAIN_REG43 + ch), 0x10, 0x10); /* 使能 PGA */
+        es7210_update_reg_bit((uint8_t)(ES7210_MIC1_GAIN_REG43 + ch), 0x0F, 0x0A); /* 增益 30dB */
     }
 
     /* 上电: MIC 电源 + ADC/PGA + 偏置 */
@@ -172,7 +184,17 @@ int es7210_init(int i2c_port) {
     es7210_write_reg(ES7210_RESET_REG00, 0x41);
 
     s_initialized = true;
-    ESP_LOGI(TAG, "ES7210 初始化完成");
+    {   /* 初始化后立刻回读一次关键寄存器: 现场就能看出哪一步没落下去 */
+        uint8_t r00 = 0, r01 = 0, r02 = 0, r11 = 0, r43 = 0, r4b = 0;
+        es7210_read_reg(ES7210_RESET_REG00, &r00);
+        es7210_read_reg(ES7210_CLOCK_OFF_REG01, &r01);
+        es7210_read_reg(ES7210_MAINCLK_REG02, &r02);
+        es7210_read_reg(ES7210_SDP_INTERFACE1_REG11, &r11);
+        es7210_read_reg(ES7210_MIC1_GAIN_REG43, &r43);
+        es7210_read_reg(ES7210_MIC12_POWER_REG4B, &r4b);
+        ESP_LOGI(TAG, "ES7210 初始化完成 (回读 00=%02X 01=%02X 02=%02X 11=%02X 43=%02X 4B=%02X)",
+                 r00, r01, r02, r11, r43, r4b);
+    }
     return 0;
 }
 
@@ -183,3 +205,34 @@ void es7210_deinit(void) {
     s_initialized = false;
     ESP_LOGI(TAG, "ES7210 已关闭");
 }
+
+/* ================= 运行时诊断 (2026-10-14) =================
+ * 背景: 频谱仪"音频"页里 ES7210 初始化成功、I2S RX 也在跑, 但样点恒为 0。
+ *       排查时分两步走: ① 寄存器能不能读回我们写的值 (I2C/配置层)
+ *                     ② I2S RX 到底有没有拿到非 0 样点 (数据层) */
+int es7210_peek(uint8_t reg, uint8_t *val) {
+    if (!s_initialized || !s_addr) return -1;
+    return es7210_read_reg(reg, val);
+}
+
+int es7210_poke(uint8_t reg, uint8_t val) {
+    if (!s_initialized || !s_addr) return -1;
+    return es7210_write_reg(reg, val);
+}
+
+int es7210_dump_regs(void) {
+    if (!s_initialized || !s_addr) { printf("ES7210 not init\r\n"); return 0; }
+    int ok = 0;
+    for (uint8_t r = 0x00; r <= 0x4C; r++) {
+        uint8_t v = 0;
+        if (es7210_read_reg(r, &v) == 0) {
+            printf("%02X=%02X ", r, v);
+            ok++;
+            if ((r & 0x07) == 0x07) printf("\r\n");
+        }
+    }
+    printf("\r\ndump ok=%d\r\n", ok);
+    return ok;
+}
+
+int es7210_address(void) { return s_addr; }

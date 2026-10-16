@@ -64,7 +64,11 @@ static const char *TAG = "gbc_emu";
 
 /* V1.0.53: 任务栈 PSRAM 静态, 不占内部 RAM */
 EXT_RAM_BSS_ATTR static StackType_t s_gbc_task_stack[GBC_EMU_TASK_STACK_SIZE / sizeof(StackType_t)];
-static StaticTask_t s_gbc_task_tcb;
+/* ★ 必须在内部 RAM: 本组件 linker.lf 用 `* (extram_bss)` 把整库 .bss 扫进 PSRAM,
+     *   而 FreeRTOS 的 xPortCheckValidTCBMem() 要求 TCB 在内部 RAM ——
+     *   之前 TCB 被一起扫进 PSRAM, 一开游戏就 assert 重启(2026-10-09 修)。
+     *   DRAM_ATTR = .dram1 段 -> dram0_data(内部), 且不是 .bss, 不会被扫走。 */
+static DRAM_ATTR StaticTask_t s_gbc_task_tcb;
 
 /* === 核心全局 (esp-box-emu gameboy.cpp/gbc_shared_memory.cpp 定义) === */
 uint32_t frame = 0;
@@ -161,7 +165,7 @@ static void gbc_emu_load_sram(void)
     if (fread(&magic, 1, 4, f) != 4 || fread(&size, 1, 4, f) != 4 ||
         magic != GB_SRAM_MAGIC || size > sram_len) {
         fclose(f);
-        ESP_LOGW(TAG, "sram 头不匹配, 跳过加载 %s", s_save_path);
+        ESP_LOGD(TAG, "sram 头不匹配, 跳过加载 %s", s_save_path);
         return;
     }
     size_t rd = fread(ram.sbank, 1, size, f);
@@ -370,13 +374,13 @@ esp_err_t gbc_emu_background_init(void)
 {
     if (s_core_mem_allocated) return ESP_OK;
     if (!board_rlcd_is_initialized()) {
-        ESP_LOGE(TAG, "RLCD is not initialized");
+        ESP_LOGD(TAG, "RLCD is not initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
 #define GB_ALLOC(size, var, name) do { \
     var = heap_caps_malloc((size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); \
-    if (!var) { ESP_LOGE(TAG, "分配 %s 失败 (%d B)", name, (int)(size)); goto fail; } \
+    if (!var) { ESP_LOGD(TAG, "分配 %s 失败 (%d B)", name, (int)(size)); goto fail; } \
     memset(var, 0, (size)); \
 } while (0)
 
@@ -385,7 +389,7 @@ esp_err_t gbc_emu_background_init(void)
      * (32KB, 内部最大连续块 ~39KB 可容纳). PSRAM 随机访问 + 缓存抖动是
      * GB/GBC 只有 40-57fps 的主因. */
     s_wram = heap_caps_malloc(32 * 1024, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!s_wram) { ESP_LOGE(TAG, "分配 wram 失败 (内部 RAM 不足), 回退 PSRAM"); }
+    if (!s_wram) { ESP_LOGD(TAG, "分配 wram 失败 (内部 RAM 不足), 回退 PSRAM"); }
     if (!s_wram) {
         s_wram = heap_caps_malloc(32 * 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
@@ -525,7 +529,7 @@ esp_err_t gbc_emu_start(const char *path)
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGE(TAG, "打开失败: %s", path);
+        ESP_LOGD(TAG, "打开失败: %s", path);
         return ESP_FAIL;
     }
     fseek(f, 0, SEEK_END);
@@ -534,7 +538,7 @@ esp_err_t gbc_emu_start(const char *path)
     /* 下限 0x150: ROM 头需 0x149 字节, 过小文件会让 gnuboy rom_load 越界读 header
      * (与 gbc_emu_start_data 的 size < 0x150 校验保持一致, 防损坏小文件喂垃圾头) */
     if (sz < 0x150 || sz > 8 * 1024 * 1024) {
-        ESP_LOGE(TAG, "ROM 大小异常: %ld", sz);
+        ESP_LOGD(TAG, "ROM 大小异常: %ld", sz);
         fclose(f);
         return ESP_FAIL;
     }
@@ -560,7 +564,7 @@ esp_err_t gbc_emu_start(const char *path)
     fclose(f);
     if (rd != (size_t)sz) {
         heap_caps_free(data);
-        ESP_LOGE(TAG, "读取不完整: %u/%ld", (unsigned)rd, sz);
+        ESP_LOGD(TAG, "读取不完整: %u/%ld", (unsigned)rd, sz);
         return ESP_FAIL;
     }
     if (s_progress_cb) s_progress_cb(70);   /* 读取完成, 开始初始化引擎 */

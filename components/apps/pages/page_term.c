@@ -61,6 +61,10 @@ static int   s_cur = 0;
 static kbd_t g_kbd;
 static int   s_press = -1;
 static int   s_bar_ofs = 0;
+/* ★ 命令列表(横向)惯性: 拖动是 1:1 跟手, 但原来**没有惯性**, 松手就"啪"地停住;
+ *   加上速度衰减后才有"顺滑一滑"的手感 (linit: "只是上页下一页的滑动, 不是流畅的滑动")。
+ *   注意: 左右那两个箭头仍然是整页跳 40px —— 那是"翻页"按钮, 与拖动是两回事。 */
+static float s_bar_v   = 0.0f;
 
 /* 命令栏 */
 static const char *const s_bar[] = {
@@ -561,6 +565,16 @@ static void p_term_action(ui_ctx_t *ctx, os_action_t a) {
 }
 
 static void p_term_poll(ui_ctx_t *ctx) {
+    /* 命令列表横向惯性: 拖动期间由 dx 直接跟手, 松手后按速度滑行并衰减 */
+    if(!s_dragout && s_bar_v != 0.0f){
+        int mx=bar_maxofs();
+        s_bar_ofs += (int)s_bar_v;
+        if(s_bar_ofs<0){ s_bar_ofs=0; s_bar_v=0.0f; }
+        if(s_bar_ofs>mx){ s_bar_ofs=mx; s_bar_v=0.0f; }
+        s_bar_v *= 0.82f;
+        if(s_bar_v>-0.6f && s_bar_v<0.6f) s_bar_v=0.0f;
+        ctx->needs_redraw = true;
+    }
     uint32_t tw = xTaskGetTickCount()*portTICK_PERIOD_MS;
     static uint32_t tw_last = 0;
     if((tw/500)!=(tw_last/500)){ tw_last=tw; ctx->needs_redraw=true; }
@@ -571,6 +585,27 @@ static void p_term_poll(ui_ctx_t *ctx) {
         if(s_scroll>mx){ s_scroll=(float)mx; s_scrv=0.0f; }
         if(s_scroll<0){ s_scroll=0.0f; s_scrv=0.0f; ctx->needs_redraw=true; }
         ctx->needs_redraw=true;
+    }
+    /* ★★ 松手回弹对齐整行 (linit 2026-10-14: "滚动哪怕字体只有一半也可以显示,
+     *    只不过放下手弹回到完整的那一排") ★★
+     *   拖动/惯性期间照旧保留**半行**的顺滑跟手; 惯性停下后, 再把顶层对齐到最近的整行。
+     *   用"每帧走剩余距离的 1/3"做缓动, 视觉上是顺滑回弹而不是硬跳。 */
+    if(!s_dragout && s_scrv==0.0f){
+        int sc=(int)s_scroll, frac=sc % HM_ROW;
+        if(frac!=0){
+            int target = (frac > HM_ROW/2) ? (sc - frac + HM_ROW) : (sc - frac);
+            int xH=TM_OUT_H-GB_H; int tot=s_nlines*HM_ROW; int mx=tot>xH?tot-xH:0;
+            if(target>mx) target=mx;
+            if(target<0)  target=0;
+            int diff=target-sc;
+            if(diff!=0){
+                int step=diff/3;
+                if(step==0) step=(diff>0)?2:-2;
+                if((diff>0 && step>diff) || (diff<0 && step<diff)) step=diff;
+                s_scroll+=(float)step;
+                ctx->needs_redraw=true;
+            }
+        }
     }
     int tx,ty; bool down=input_get_touch_pos(&tx,&ty);
     static bool d=false, dbar=false, moved=false;
@@ -611,8 +646,12 @@ static void p_term_poll(ui_ctx_t *ctx) {
             if(dy0 <= -HM_ROW*2){ s_help_page=(s_help_page+1)%hp; s_drag_y0=ty; ctx->needs_redraw=true; }
             else if(dy0 >= HM_ROW*2){ s_help_page=(s_help_page+hp-1)%hp; s_drag_y0=ty; ctx->needs_redraw=true; }
         } else {
-            s_scroll = s_drag_sc0 - (float)(ty - s_drag_y0);
-            s_scrv = (float)(-dy);
+            /* ★ 方向修正 (linit 2026-10-14: "终端的上下拖动方向是反的") ★
+             * s_scroll = "距最新行的偏移"(0=贴底看最新). 手指**往下拖**要把内容往下拉,
+             * 于是看到更早的历史 ⇒ s_scroll 应当**增大**; 原来写成减号, 一拖就往新内容跑, 手感是反的。
+             * 惯性初速同步取 +dy, 方向才一致。 */
+            s_scroll = s_drag_sc0 + (float)(ty - s_drag_y0);
+            s_scrv = (float)(dy);
             int xH=TM_OUT_H-GB_H; int tot=s_nlines*HM_ROW; int mx=tot>xH?tot-xH:0;
             if(s_scroll>mx) s_scroll=(float)mx;
             if(s_scroll<0)  s_scroll=0.0f;
@@ -624,6 +663,7 @@ static void p_term_poll(ui_ctx_t *ctx) {
         int dx=tx-dbar_lx; dbar_lx=tx; if(dx<0)dbar_dist+=-dx; else dbar_dist+=dx;
         int no=s_bar_ofs-dx; if(no<0)no=0; if(no>bar_maxofs())no=bar_maxofs();
         if(no!=s_bar_ofs){ s_bar_ofs=no; ctx->needs_redraw=true; }
+        s_bar_v = (float)(-dx) * 0.5f;                    /* 松手后作为惯性初速 */
         if(dbar_dist>8) moved=true;
     }
 }
@@ -638,6 +678,7 @@ static const os_module_t s_mod_term = {
     .touch      = p_term_touch,
     .poll       = p_term_poll,
     .fullscreen = true,   /* 隐藏状态栏; 应用页, 按返回直接退出 (不弹确认框) */
+    .exit_confirm = true,   /* 返回键先弹"退出程序?"确认 (2026-10-14 全局规范) */
     .swipe_back_disabled = true,  /* 全屏终端屏蔽上滑退出, 仅返回键触发确认 (统一由内核设置) */
 };
 

@@ -24,6 +24,23 @@
  *   fbinfo                       → 帧缓冲指针/字节数/CRC (确认抓屏是否可用)
  *   fbdump                       → **抓屏**: 把 400×300 1bpp 帧缓冲以 base64 打印
  *                                  (主机侧 tools/fb_png.py 解码成 PNG)
+ *   audio                        → 音频链路诊断: 音量/静音/功放/平台/I2S 状态 + ES8311 全寄存器回读
+ *                                  (排查"芯片认到了但没声音"; 输出带 ADIAG / ESREG 前缀)
+ *   vol [0-100]                  → 读音量; 带参数则现场设音量 (分辨"音量=0"还是"通路没开")
+ *   esr <reg>                    → 回读 ES8311 单个寄存器
+ *   esw <reg> <val>              → 写 ES8311 寄存器 (现场试听定位)
+ *   es7 [reg]                    → 回读 **ES7210**(麦克风 ADC) 寄存器; 不带参数 = 全量 0x00~0x4C
+ *   es7w <reg> <val>             → 写 ES7210 寄存器
+ *   mic [ms]                     → **麦克风链路一条龙诊断**: 起麦(16k)→连抓样点→报 peak/min/max/rms
+ *                                  (分离"起麦失败" / "样点恒 0" / "样点极弱" 三种故障)
+ *   beep [freq] [ms]             → **纯音测试**: 绕过 MP3/解码/SD 直接让 codec 出声,
+ *                                  用来一刀切开"固件问题"与"喇叭/功放硬件问题"
+ *   gps                          → GPS 电源状态 (待机 46µA / 跟踪 ~10mA) + 引脚
+ *   wifi [on|off|status|conn|set &lt;ssid&gt; &lt;pass&gt;]
+ *                                → 射频开关 / 状态 / 用 NVS 已存配置连 / **写入凭据并连接**
+ *                                  (set 是"掌机上打密码太痛苦"的免打字配网入口)
+ *   pm                           → 电源管理诊断: DFS 目标频率 + **PM 锁表**
+ *                                  (有 API 锁=降不了频, 有 SLEEP 锁=进不了浅睡)
  *   nes <path>                   → 直接拉起 NES ROM (自动复现崩溃)
  *   scan                         → 扫描 /sdcard/nes 下列出 .nes
  *   wait <ms>                    → 读任务 sleep ms (脚本节奏)
@@ -46,6 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -64,6 +82,13 @@
 #include "os_hw.h"       /* wifi 命令: 走资源管家开/关射频 (与页面同一记账) */
 #include "wifi_manager.h"
 #include "input.h"   /* input_mark_activity(): remcon 注入按键也算"有人在用" */
+#include "audio_player.h"  /* audio/vol: 音频链路诊断 + 音量现场调节 (2026-10-09) */
+#include "es8311.h"        /* esr/esw: ES8311 寄存器现场回读/改写 */
+#include "es7210.h"        /* es7/es7w/mic: ES7210 (麦克风 ADC) 寄存器回读 + 录音链路诊断 */
+#include "tone_player.h"   /* beep: 纯音测试 (绕过 MP3/解码/SD, 分离固件 vs 喇叭硬件) */
+#include "gps.h"           /* gps: 查 GPS 电源状态 (待机 46µA / 跟踪 ~10mA) */
+#include "esp_pm.h"        /* pm: 打印 PM 配置 + 锁表 (看 DFS/浅睡是否被驱动锁住) */
+#include "board_battery.h" /* bat: 电池 raw/脚上mV/分压系数/VBAT 现场核对 (2026-10-14) */
 
 #define RC_TAG      "remcon"
 #define RC_LINE_MAX 256
@@ -178,10 +203,69 @@ static char *rc_next(char **rest){
     return tok;
 }
 
+/* ===== 麦克风链路诊断 (2026-10-14) =====
+ * 小智模块是 **ES8311(喇叭 DAC) + ES7210(麦克风 ADC) 两颗独立芯片**, 共一条 I2S 总线:
+ *   "ES7210 初始化完成" 只证明 **I2C 通**, 完全不代表 ADC 有数据往 ESP32 送。
+ * 本命令把"有没有数据"和"数据是什么"一次量出来 —— 只报事实, 不做推断。 */
+static void rc_mic_probe(int ms)
+{
+    static int16_t *buf;
+    /* ⚠ 需求字节 = frames × 2(立体声) × 2(int16) = frames × 4 —— 申请时别漏了立体声那 2 倍,
+     *   否则 audio_player_mic_read() 会往堆里多写 8KB (我第一版就踩了, 直接 StoreProhibited)。 */
+    if (!buf) buf = heap_caps_malloc(4096 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!buf) { printf("MIC_ERR no mem\r\n"); return; }
+
+    bool was = audio_player_mic_active();
+    if (!was && audio_player_mic_start(16000) != 0) {
+        printf("MIC_ERR start fail (es7210 addr=0x%02X)\r\n", es7210_address());
+        return;
+    }
+    int64_t t0 = esp_timer_get_time() / 1000;
+    long n = 0;
+    int64_t ss = 0;                      /* ⚠ 必须 64 位: 32767² × 40960 早已超 int32 (ESP32 的 long) */
+    int pk = 0, mn = 0, mx = 0, reads = 0, empty = 0;
+    /* 分声道统计: ES7210 非 TDM 时 SDOUT1 左槽 = MIC1 / 右槽 = MIC2,
+     * 两路幅度差很多 ⇒ 说明只焊了一个咪头(另一个槽是空脚/噪声)。 */
+    long ln = 0, rn = 0;
+    int64_t lss = 0, rss = 0, ldc = 0, rdc = 0;
+    int lpk = 0, rpk = 0;
+    while (esp_timer_get_time() / 1000 - t0 < ms) {
+        int g = audio_player_mic_read(buf, 4096, 50);
+        if (g <= 0) { empty++; continue; }
+        reads++;
+        for (int k = 0; k < g; k++) {
+            int vl = buf[2 * k], vr = buf[2 * k + 1];
+            ldc += vl; rdc += vr;
+            lss += (int64_t)vl * vl; rss += (int64_t)vr * vr;
+            int al = vl < 0 ? -vl : vl;
+            int ar = vr < 0 ? -vr : vr;
+            if (al > lpk) lpk = al;
+            if (ar > rpk) rpk = ar;
+            ln++; rn++;
+            if (vl < mn) mn = vl;
+            if (vl > mx) mx = vl;
+            if (vr < mn) mn = vr;
+            if (vr > mx) mx = vr;
+            int a = al > ar ? al : ar;
+            if (a > pk) pk = a;
+            ss += (int64_t)vl * vl + (int64_t)vr * vr;
+            n += 2;
+        }
+    }
+    printf("MIC addr=0x%02X %ldms n=%ld reads=%d empty=%d peak=%d min=%d max=%d rms=%ld\r\n",
+           es7210_address(), (long)(esp_timer_get_time() / 1000 - t0), n, reads, empty,
+           pk, mn, mx, n ? (long)sqrtf((float)((double)ss / (double)n)) : -1L);
+    printf("MICCH L(dBFS)=%.1f rms=%ld dc=%ld peak=%d | R(dBFS)=%.1f rms=%ld dc=%ld peak=%d\r\n",
+           ln ? 20.0f * log10f(sqrtf((float)((double)lss / (double)ln)) / 32768.0f + 1e-9f) : -99.0f,
+           ln ? (long)sqrtf((float)((double)lss / (double)ln)) : -1L, ln ? (long)(ldc / ln) : 0L, lpk,
+           rn ? 20.0f * log10f(sqrtf((float)((double)rss / (double)rn)) / 32768.0f + 1e-9f) : -99.0f,
+           rn ? (long)sqrtf((float)((double)rss / (double)rn)) : -1L, rn ? (long)(rdc / rn) : 0L, rpk);
+    if (!was) audio_player_mic_stop();
+}
+
 /* ===== 立即执行 (在字符串读任务上下文, 不外发到 UI) =====
  * 注意: 必须在内部复制一份再用 —— 调用方 rc_exec 里的 buf 已被 rc_next 在
  * 命令名后写过 '\0', 直接传进去会丢掉后面所有参数(如 "shutdown auto" 变成 "shutdown")。 */
-static void rc_cmd_mt(void);   /* 内部 RAM 运行时归属审计 (定义见文件后部) */
 static void rc_cmd_immediate(const char *line){
     char args[RC_LINE_MAX];
     snprintf(args, sizeof(args), "%s", line);
@@ -236,10 +320,131 @@ static void rc_cmd_immediate(const char *line){
             char ssid[33] = "", pass[65] = "";
             wifi_manager_get_saved(ssid, sizeof(ssid), pass, sizeof(pass));
             if (!ssid[0]) printf("WIFI conn: 无已存配置\r\n");
-            else          printf("WIFI conn %s ok=%d\r\n", ssid, (int)wifi_manager_connect(ssid, pass));
+            else { (void)os_hw_request(OS_HW_WIFI);   /* 占住引用计数, 否则连上后没人持有会被拆掉 */
+                   printf("WIFI conn %s ok=%d\r\n", ssid, (int)wifi_manager_connect(ssid, pass)); }
+        } else if (wa && strcmp(wa, "set") == 0) {
+            /* wifi set <ssid> <pass>  (2026-10-09)
+             * 用途: 在掌机上用软键盘打 WiFi 密码很痛苦; 烧过整片镜像清了 nvs 之后
+             * 更是必须重配。直接从串口写凭据 + 连接, 配完即用。
+             * ⚠ 密码会进 NVS 也会出现在串口日志里 —— 仅调试用, 别在公开环境跑。 */
+            char *ss = rc_next(&rest), *ps = rc_next(&rest);
+            if (!ss || !ps) {
+                printf("RC_ERR wifi set <ssid> <pass>\r\n");
+            } else {
+                printf("WIFI set ssid='%s' 连接中...\r\n", ss);
+                fflush(stdout);
+                (void)os_hw_request(OS_HW_WIFI);   /* 占住引用计数, 否则连上后没人持有会被拆掉 */
+                bool ok = wifi_manager_connect(ss, ps);
+                /* 连接是异步的: 轮询最多 ~20s, 好让串口一次看到结果 */
+                for (int i = 0; i < 80 && !wifi_manager_is_connected(); i++)
+                    vTaskDelay(pdMS_TO_TICKS(250));
+                char ip[20] = "-";
+                wifi_manager_get_ip(ip, sizeof(ip));
+                printf("WIFI set '%s' start=%d connected=%d ip=%s\r\n",
+                       ss, (int)ok, (int)wifi_manager_is_connected(), ip);
+            }
         } else {
             printf("WIFI on ok=%d\r\n", (int)os_hw_request(OS_HW_WIFI));
         }
+    } else if (strcmp(cmd, "audio") == 0) {
+        /* 音频链路诊断 (2026-10-09): 软件状态 + ES8311 全寄存器回读, 排"没声音"用 */
+        audio_player_diag();
+    } else if (strcmp(cmd, "vol") == 0) {
+        /* vol            → 读当前音量(0-100)
+         * vol <0..100>   → 现场设音量 (用来分辨"音量=0"还是"通路没开") */
+        char *vs = rc_next(&rest);
+        if (!vs) printf("AUDIOVOL %d\r\n", audio_player_get_volume());
+        else {
+            audio_player_set_volume(atoi(vs));
+            printf("AUDIOVOL set %s -> %d\r\n", vs, audio_player_get_volume());
+        }
+    } else if (strcmp(cmd, "esr") == 0) {
+        /* esr <reg> → 回读 ES8311 单个寄存器; reg 收 十进制/0x 十六进制 */
+        char *rs = rc_next(&rest);
+        if (!rs) { printf("RC_ERR esr <reg>\r\n"); }
+        else {
+            uint8_t v = 0;
+            int reg = (int)strtol(rs, NULL, 0);
+            if (es8311_peek((uint8_t)reg, &v) == 0) printf("ESREG %02X=%02X\r\n", reg & 0xFF, v);
+            else                                   printf("RC_ERR esr i2c %02X\r\n", reg & 0xFF);
+        }
+    } else if (strcmp(cmd, "esw") == 0) {
+        /* esw <reg> <val> → 写 ES8311 寄存器 (现场试听定位用) */
+        char *rs = rc_next(&rest), *vs = rc_next(&rest);
+        if (!rs || !vs) { printf("RC_ERR esw <reg> <val>\r\n"); }
+        else {
+            int reg = (int)strtol(rs, NULL, 0), val = (int)strtol(vs, NULL, 0);
+            int rc = es8311_poke((uint8_t)reg, (uint8_t)val);
+            printf("ESW %02X=%02X -> %s\r\n", reg & 0xFF, val & 0xFF, rc == 0 ? "ok" : "fail");
+        }
+    } else if (strcmp(cmd, "es7") == 0) {
+        /* es7 [reg] → 回读 ES7210 (麦克风 ADC) 寄存器; 不带参数 = 全部 0x00~0x4C */
+        char *rs = rc_next(&rest);
+        if (!rs) {
+            es7210_dump_regs();
+        } else {
+            uint8_t v = 0;
+            int reg = (int)strtol(rs, NULL, 0);
+            if (es7210_peek((uint8_t)reg, &v) == 0) printf("ES7210REG %02X=%02X\r\n", reg & 0xFF, v);
+            else                                   printf("RC_ERR es7 i2c %02X\r\n", reg & 0xFF);
+        }
+    } else if (strcmp(cmd, "es7w") == 0) {
+        /* es7w <reg> <val> → 写 ES7210 寄存器 (现场试) */
+        char *rs = rc_next(&rest), *vs = rc_next(&rest);
+        if (!rs || !vs) { printf("RC_ERR es7w <reg> <val>\r\n"); }
+        else {
+            int reg = (int)strtol(rs, NULL, 0), val = (int)strtol(vs, NULL, 0);
+            int rc = es7210_poke((uint8_t)reg, (uint8_t)val);
+            printf("ES7210W %02X=%02X -> %s\r\n", reg & 0xFF, val & 0xFF, rc == 0 ? "ok" : "fail");
+        }
+    } else if (strcmp(cmd, "mic") == 0) {
+        /* mic [ms] → **麦克风链路一条龙诊断**: 起麦(16k) → 连续抓样点 → 报峰值/最小/最大/有效值。
+         *   一刀切开三种"没数据": ①起麦失败 ②I2S RX 拿到的样点恒 0 (codec→ESP 的数据线没波形)
+         *   ③有样点但幅度极低 (增益/偏置问题)。 */
+        char *ms = rc_next(&rest);
+        rc_mic_probe(ms ? atoi(ms) : 400);
+    } else if (strcmp(cmd, "beep") == 0) {        /* beep [freq] [ms] [amp] → 纯音测试 (2026-10-09)
+         * 走 tone_player → audio_player_feed_pcm → I2S → codec → 功放 → 喇叭,
+         * **完全绕过 MP3 解码与 TF 卡**。用途: 一刀切开"固件问题"与"喇叭/功放硬件问题"。
+         * 默认 1000Hz / 300ms / amp=6000(最大), **连响 5 次**(每次间隔 200ms) —— 
+         * 音量拉满 + 五连响, 现场绝不会听漏。 */
+        char *fs = rc_next(&rest), *ms = rc_next(&rest), *as = rc_next(&rest);
+        int f   = fs ? atoi(fs) : 1000;
+        int d   = ms ? atoi(ms) : 300;
+        int amp = as ? atoi(as) : 6000;
+        if (f   < 50   || f   > 8000) f   = 1000;
+        if (d   < 50   || d   > 3000) d   = 300;
+        if (amp < 1    || amp > 6000) amp = 6000;
+        printf("BEEP %dHz %dms amp=%d x5 ready=%d\r\n", f, d, amp, (int)tone_player_ready());
+        fflush(stdout);
+        for (int i = 0; i < 5; i++) {
+            tone_beep_amp(f, d, amp);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        printf("BEEP_END\r\n");
+    } else if (strcmp(cmd, "gps") == 0) {
+        /* gps → GPS (MAX-M10S) 电源状态 + 引脚 (排查耗电: 待机 46µA vs 跟踪 ~10mA/峰值25mA) */
+        const gps_config_t *gc = gps_default_config();
+        gps_power_state_t st = gps_power_state();
+        const char *sn = (st == GPS_POWER_ACTIVE) ? "ACTIVE(~10mA,peak25mA)"
+                       : (st == GPS_POWER_SLEEP)  ? "SLEEP(46uA)" : "UNKNOWN";
+        printf("GPS pwr=%s ready=%d tx=%d rx=%d extint=%d baud=%lu\r\n",
+               sn, (int)gps_is_ready(), gc ? gc->pin_tx : -1, gc ? gc->pin_rx : -1,
+               gc ? gc->pin_extint : -1, (unsigned long)(gc ? gc->baud : 0));
+    } else if (strcmp(cmd, "pm") == 0) {
+        /* pm → 电源管理诊断 (2026-10-09): DFS 目标频率 + **当前锁表**。
+         * 锁表里出现 API 级锁 = CPU 降不了频; 出现 SLEEP 锁 = 进不了浅睡。
+         * 这是"待机耗电大"最直接的证据来源。 */
+        esp_pm_config_t pcfg;
+        memset(&pcfg, 0, sizeof(pcfg));
+        if (esp_pm_get_configuration(&pcfg) == ESP_OK) {
+            printf("PM max_freq=%dMHz min_freq=%dMHz light_sleep=%d\r\n",
+                   pcfg.max_freq_mhz, pcfg.min_freq_mhz, (int)pcfg.light_sleep_enable);
+        } else {
+            printf("PM not enabled\r\n");
+        }
+        esp_pm_dump_locks(stdout);
+        printf("PM_END\r\n");
     } else if (strcmp(cmd, "audit") == 0) {
         /* 内存详细审计 (并入资源管家): 分类堆积 + 所有任务栈水位 + 堆块 */
         os_housekeeper_mem_audit();
@@ -260,14 +465,14 @@ static void rc_cmd_immediate(const char *line){
     } else if (strcmp(cmd, "blk") == 0) {
         /* 内部堆块级 dump: 定位具体模块/静态缓冲占用 */
         heap_caps_dump(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-    } else if (strcmp(cmd, "mt") == 0) {
-        /* 内部 RAM **运行时归属**审计 (2026-10-16): 谁在用内部堆 */
-        rc_cmd_mt();
     } else if (strcmp(cmd, "stack") == 0) {
         printf("STACK mine=%u\r\n",
                (unsigned)uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()));
     } else if (strcmp(cmd, "uptime") == 0) {
         printf("UPTIME %.1fs\r\n", (double)esp_timer_get_time() / 1e6);
+    } else if (strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0) {
+        /* 电池分压/满量程校准用: raw / 脚上 mV / 系数 / VBAT / 百分比 (日志行前缀 BATDIAG) */
+        board_battery_diag();
     } else if (strcmp(cmd, "tasks") == 0) {
         char *buf = (char *)malloc(4096 * 2);
         if (!buf) printf("RC_ERR tasks oom\r\n");
@@ -398,143 +603,12 @@ static void rc_cmd_immediate(const char *line){
             fflush(stdout);
         }
     } else if (strcmp(cmd, "help") == 0) {
-        printf("CMDS: hello echo reboot shutdown loglevel mem blk mt audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait help\r\n");
+        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait bat esr esw es7 es7w mic help\r\n");
     }
     fflush(stdout);
 }
 
-/* ================== mt: 内部 RAM 运行时归属审计 ==================
- * 回答"**到底是什么程序在用内部 RAM**"的设备侧命令 (2026-10-16)。
- * 静态占用(编译期 .bss/.data/IRAM) → 主机命令 `python tools/mem_audit.py`
- * 运行时占用(堆) → 本命令:
- *   ① 内部堆的每个 region (起止地址), 看堆到底覆盖了哪些 SRAM
- *   ② 每个任务: 栈基址 / 栈总大小(从堆块反查) / 剩余水位 / 空隙浪费率
- *   ③ 内部堆每个已分配块 → 归属到「某任务栈」或「非栈」, 两者分别求和
- *   ④ 非栈块中 ≥1KB 的逐条列出 (拿去和源码里的缓冲尺寸对号)
- * 说明: 非栈块没有归属信息, 要看"哪个函数分配的"需开 CONFIG_HEAP_TRACING;
- *       本命令的定位是**先量出谁占大头**, 不做逐次分配追踪。 */
-#define MT_MAX_TASK   24
-#define MT_MAX_REGION  8
-#define MT_MAX_BIG    40
-typedef struct { const char *name; uint32_t base; uint32_t size; uint32_t hwm; } mt_task_t;
-typedef struct { uint32_t start, end; } mt_region_t;
-static mt_task_t  s_mt_task[MT_MAX_TASK];
-static int        s_mt_n;
-static mt_region_t s_mt_reg[MT_MAX_REGION];
-static int        s_mt_reg_n;
-static uint32_t   s_mt_stack_bytes, s_mt_other_bytes, s_mt_other_blocks;
-static uint32_t   s_mt_big[MT_MAX_BIG];
-static int        s_mt_big_n;
-
-static bool mt_region_cb(walker_heap_into_t hi, walker_block_info_t bi, void *ud)
-{
-    (void)bi; (void)ud;
-    for (int i = 0; i < s_mt_reg_n; i++)
-        if (s_mt_reg[i].start == (uint32_t)hi.start) return true;
-    if (s_mt_reg_n < MT_MAX_REGION) {
-        s_mt_reg[s_mt_reg_n].start = (uint32_t)hi.start;
-        s_mt_reg[s_mt_reg_n].end   = (uint32_t)hi.end;
-        s_mt_reg_n++;
-    }
-    return true;
-}
-
-static bool mt_attr_cb(walker_heap_into_t hi, walker_block_info_t bi, void *ud)
-{
-    (void)hi; (void)ud;
-    if (!bi.used) return true;
-    uint32_t a = (uint32_t)bi.ptr;
-    for (int i = 0; i < s_mt_n; i++) {
-        if (!s_mt_task[i].size) continue;
-        if (a >= s_mt_task[i].base && a < s_mt_task[i].base + s_mt_task[i].size) {
-            s_mt_stack_bytes += bi.size;
-            return true;
-        }
-    }
-    s_mt_other_bytes += bi.size;
-    s_mt_other_blocks++;
-    if (bi.size >= 1024 && s_mt_big_n < MT_MAX_BIG) s_mt_big[s_mt_big_n++] = (uint32_t)bi.size;
-    return true;
-}
-
-static int mt_cmp_desc(const void *a, const void *b)
-{
-    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
-    return (x < y) ? 1 : (x > y ? -1 : 0);
-}
-
-static void rc_cmd_mt(void)
-{
-    /* ---- ① 堆 region (先走一遍, 拿到堆的范围; 后面反查栈块大小要靠它做保护) ---- */
-    s_mt_reg_n = 0;
-    heap_caps_walk(MALLOC_CAP_INTERNAL, mt_region_cb, NULL);
-    printf("MT regions=%d\r\n", s_mt_reg_n);
-    for (int i = 0; i < s_mt_reg_n; i++) {
-        uint32_t sz = s_mt_reg[i].end - s_mt_reg[i].start;
-        printf("MT  region 0x%08x..0x%08x %7u B (%u KB)\r\n",
-               (unsigned)s_mt_reg[i].start, (unsigned)s_mt_reg[i].end,
-               (unsigned)sz, (unsigned)(sz / 1024));
-    }
-
-    /* ---- ② 任务表: 栈基址 / 栈大小 / 水位 ---- */
-    TaskStatus_t *st = (TaskStatus_t *)heap_caps_malloc(MT_MAX_TASK * sizeof(TaskStatus_t),
-                                                       MALLOC_CAP_SPIRAM);
-    if (!st) { printf("MT_ERR oom\r\n"); return; }
-    UBaseType_t n = uxTaskGetSystemState(st, MT_MAX_TASK, NULL);
-    s_mt_n = 0;
-    for (UBaseType_t i = 0; i < n && s_mt_n < MT_MAX_TASK; i++) {
-        if (!st[i].pxStackBase) continue;
-        uint32_t base = (uint32_t)st[i].pxStackBase;
-        uint32_t sz = 0;
-        /* ★只有地址落在**内部堆 region** 里才能反查块大小, 否则
-         *  heap_caps_get_containing_block_size 会断言崩 → 静态栈(PSRAM/.bss)一律记 0 */
-        for (int r = 0; r < s_mt_reg_n; r++)
-            if (base >= s_mt_reg[r].start && base < s_mt_reg[r].end) {
-                sz = (uint32_t)heap_caps_get_containing_block_size((void *)base);
-                break;
-            }
-        s_mt_task[s_mt_n].name = st[i].pcTaskName;
-        s_mt_task[s_mt_n].base = base;
-        s_mt_task[s_mt_n].size = sz;
-        s_mt_task[s_mt_n].hwm  = (uint32_t)st[i].usStackHighWaterMark;
-        s_mt_n++;
-    }
-    free(st);
-
-    /* ---- ③ 归属统计 ---- */
-    s_mt_stack_bytes = s_mt_other_bytes = 0; s_mt_other_blocks = 0; s_mt_big_n = 0;
-    heap_caps_walk(MALLOC_CAP_INTERNAL, mt_attr_cb, NULL);
-
-    uint32_t total_used = heap_caps_get_total_size(MALLOC_CAP_INTERNAL)
-                        - heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    printf("MT internal_used=%u  任务栈=%u (%.1f%%)  非栈=%u (%.1f%%)  [块开销/差 %d]\r\n",
-           (unsigned)total_used, (unsigned)s_mt_stack_bytes,
-           total_used ? (double)s_mt_stack_bytes * 100.0 / total_used : 0.0,
-           (unsigned)s_mt_other_bytes,
-           total_used ? (double)s_mt_other_bytes * 100.0 / total_used : 0.0,
-           (int)total_used - (int)(s_mt_stack_bytes + s_mt_other_bytes));
-
-    printf("MT tasks (name base size free_water waste):\r\n");
-    uint32_t tsum = 0;
-    for (int i = 0; i < s_mt_n; i++) {
-        const mt_task_t *t = &s_mt_task[i];
-        int waste = t->size ? (int)((uint64_t)t->hwm * 100 / t->size) : -1;
-        tsum += t->size;
-        printf("MT  %-12s 0x%08x %7u %7u %4d%%\r\n",
-               t->name ? t->name : "?", (unsigned)t->base,
-               (unsigned)t->size, (unsigned)t->hwm, waste);
-    }
-    printf("MT task_stacks_total=%u\r\n", (unsigned)tsum);
-
-    /* ---- ④ 非栈大块 (去重后按大小降序) ---- */
-    qsort(s_mt_big, s_mt_big_n, sizeof(uint32_t), mt_cmp_desc);
-    printf("MT nonstack_blocks=%u  >=1KB 共 %d 块:\r\n",
-           (unsigned)s_mt_other_blocks, s_mt_big_n);
-    for (int i = 0; i < s_mt_big_n; i++) printf("MT  big %u\r\n", (unsigned)s_mt_big[i]);
-    printf("MT_DONE\r\n");
-}
-
-
+/* ===== 注入队列 ===== */
 static void rc_enqueue(const rc_cmd_t *c){
     if (s_q) xQueueSend(s_q, c, pdMS_TO_TICKS(100));
 }
@@ -562,6 +636,13 @@ static void scan_nes_tree(const char *dir) {
 
 /* 解析并派发一条命令: 立即命令直执行; UI 命令入队 */
 static void rc_exec(const char *line){
+    /* ★ 2026-10-09: 任何一条 remcon 命令都算"有人在用", 刷新空闲计时。
+     * 背景: 原来只有 `key` 命令调 input_mark_activity() ⇒ 远程跑回归时
+     * page/nes/app/音频诊断等**不刷新**, 设备按"最后一次物理按键"起算 5 分钟
+     * 空闲超时 → 自动关机(深睡), USB 串口直接消失, 把长会话打断(实测踩了两次)。
+     * 这里放在入口, 一劳永逸覆盖全部命令(含尚未新增的)。
+     * input_mark_activity() 只是两次赋值, 任意任务上下文安全。 */
+    input_mark_activity();
     char buf[RC_LINE_MAX];
     snprintf(buf, sizeof(buf), "%s", line);
     char *rest = buf;
@@ -580,14 +661,19 @@ static void rc_exec(const char *line){
         strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0 ||
         strcmp(cmd, "loglevel") == 0 || strcmp(cmd, "heap") == 0 ||
         strcmp(cmd, "mem") == 0 || strcmp(cmd, "blk") == 0 ||
-        strcmp(cmd, "mt") == 0 ||
         strcmp(cmd, "audit") == 0 || strcmp(cmd, "stack") == 0 ||
         strcmp(cmd, "uptime") == 0 || strcmp(cmd, "tasks") == 0 ||
+        strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0 ||
         strcmp(cmd, "ls") == 0 || strcmp(cmd, "wifi") == 0 ||
         strcmp(cmd, "cat") == 0 || strcmp(cmd, "rm") == 0 ||
         strcmp(cmd, "cp") == 0 || strcmp(cmd, "diag") == 0 ||
         strcmp(cmd, "help") == 0 || strcmp(cmd, "shutdown") == 0 ||
         strcmp(cmd, "fbinfo") == 0 || strcmp(cmd, "fbdump") == 0 ||
+        strcmp(cmd, "audio") == 0 || strcmp(cmd, "vol") == 0 ||
+        strcmp(cmd, "esr") == 0 || strcmp(cmd, "esw") == 0 ||
+        strcmp(cmd, "es7") == 0 || strcmp(cmd, "es7w") == 0 || strcmp(cmd, "mic") == 0 ||
+        strcmp(cmd, "beep") == 0 ||
+        strcmp(cmd, "gps") == 0 || strcmp(cmd, "pm") == 0 ||
         strcmp(cmd, "pwr") == 0 || strcmp(cmd, "poweroff") == 0 ||
         strcmp(cmd, "sleep") == 0) {
         rc_cmd_immediate(line);   /* 传原始行(含参数); buf 已被 rc_next 截断 */
@@ -607,6 +693,21 @@ static void rc_exec(const char *line){
                 rc_enqueue(&m); return;
             }
         printf("RC_ERR unknown action '%s'\r\n", an);
+    } else if (strcmp(cmd, "sdrstat") == 0) {
+        extern void sdr_test_stat(void);
+        sdr_test_stat();
+    } else if (strcmp(cmd, "sdrpan") == 0) {
+        /* 测试钩子: 注入"上方拖动调频"(谱线跟手平移) */
+        char *v = rc_next(&rest);
+        extern void sdr_test_pan(int dx);
+        sdr_test_pan(v ? atoi(v) : 100);
+        printf("SDRPAN %d\r\n", v ? atoi(v) : 100);
+    } else if (strcmp(cmd, "sdrslide") == 0) {
+        /* 测试钩子: 注入"下方拖动翻页"(整页预渲染+合成); 0 = 结束并恢复实时 */
+        char *v = rc_next(&rest);
+        extern void sdr_test_slide(int dx);
+        sdr_test_slide(v ? atoi(v) : -80);
+        printf("SDRSLIDE %d\r\n", v ? atoi(v) : -80);
     } else if (strcmp(cmd, "tap") == 0) {
         char *sx = rc_next(&rest), *sy = rc_next(&rest);
         if (!sx || !sy) { printf("RC_ERR tap <x> <y>\r\n"); return; }
@@ -700,7 +801,7 @@ void remcon_tick(ui_ctx_t *ctx){
 
 void remcon_init(void){
     s_q = xQueueCreate(RC_QUEUE_LEN, sizeof(rc_cmd_t));
-    if (!s_q) { ESP_LOGE(RC_TAG, "queue create failed"); return; }
+    if (!s_q) { ESP_LOGD(RC_TAG, "queue create failed"); return; }
     BaseType_t ok = xTaskCreatePinnedToCore(rc_task, "remcon", 5120, NULL, 2, NULL, 1);
     ESP_LOGI(RC_TAG, "remote console up, task=%s", ok == pdPASS ? "ok" : "fail");
 }

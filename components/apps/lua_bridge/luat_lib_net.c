@@ -5,9 +5,27 @@
  * 加新 API: 本文件写 static int l_xxx(lua_State *L), 再在文件末尾的 register 里加一行。
  */
 #include "lua_bridge.h"
+#include "os_sources.h"
+#include "net_client.h"     /* 唯一 HTTP 客户端: 本文件只做参数搬运 + 状态映射 */
 
 
 /* ---- app.net.* : 网络状态 / HTTP / ping ---- */
+/* app.net.mirrors() → { "https://bbk.linit.cn/bbk", ... }
+ *
+ * 分发包的**镜像源清单**, 取自固件里的 os_sources.c —— 应用商店 (am_store_net.c)
+ * 用的就是同一份, 所以"加源/换源/调顺序"只改固件一处, 商店与 Lua 应用自动同步。
+ * Lua 侧用法: 依次试 mirrors[i] .. "/maps.json", 第一个通的就用它下地图包。
+ * (index.json / maps.json 里也各带一份 mirrors[], 那是运行期的, 会覆盖这份引导列表。) */
+static int l_net_mirrors(lua_State *L) {
+    int n = os_sources_count();
+    lua_newtable(L);
+    for (int i = 0; i < n; i++) {
+        lua_pushstring(L, os_sources_get(i));
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
 static int l_net_is_connected(lua_State *L) {
     lua_pushboolean(L, wifi_manager_is_connected());
     return 1;
@@ -19,6 +37,9 @@ static int l_net_get_ip(lua_State *L) {
     return 0;
 }
 
+/* app.net.http_get(host, port, path[, timeout]) → body 或 nil
+ * ★ 2026-10-15 "联网统一收口": 本函数原来是**第三套** esp_http_client 实现 (同步阻塞)。
+ *   现在改成 net_client 的同步包装 —— 行为不变 (调用方仍阻塞等结果), 但底层只剩一个客户端。 */
 static int l_net_http_get(lua_State *L) {
     const char *host = luaL_checkstring(L, 1);
     int port = (int)luaL_optinteger(L, 2, 80);
@@ -26,21 +47,18 @@ static int l_net_http_get(lua_State *L) {
     int timeout = (int)luaL_optinteger(L, 4, 5000);
     char url[320];
     snprintf(url, sizeof(url), "http://%s:%d%s", host, port, path);
-    esp_http_client_config_t cfg = {
-        .url = url, .timeout_ms = timeout,
-        .buffer_size = 2048, .disable_auto_redirect = false,
-    };
-    esp_http_client_handle_t cl = esp_http_client_init(&cfg);
-    if (!cl) return 0;
-    esp_err_t e = esp_http_client_perform(cl);
-    if (e == ESP_OK) {
-        /* ★ 2026-10-02: 4KB 缓冲搬 PSRAM —— 纯 socket 读(无 DMA/无禁 cache 窗口),
-         *   留在内部 RAM 纯属浪费(本项目内部 RAM 最紧张, 见 docs/内部RAM预算…) */
-        EXT_RAM_BSS_ATTR static char body[4097];
-        int n = esp_http_client_read_response(cl, body, sizeof(body) - 1);
-        if (n > 0) { body[n] = 0; lua_pushstring(L, body); esp_http_client_cleanup(cl); return 1; }
-    }
-    esp_http_client_cleanup(cl);
+    /* 4KB 缓冲搬 PSRAM —— 纯 socket 读(无 DMA/无禁 cache 窗口), 内部 RAM 更该省着用 */
+    EXT_RAM_BSS_ATTR static char body[4097];
+    netc_req_t r = { 0 };
+    r.url = url; r.timeout_ms = timeout > 0 ? timeout : 5000;
+    r.body = body; r.body_cap = sizeof(body);
+    if (!netc_start(&r)) return 0;
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    while (netc_busy() && (uint32_t)(esp_timer_get_time() / 1000) - t0 < (uint32_t)r.timeout_ms + 2000)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    int n = (netc_state() == NETC_DONE) ? netc_len() : 0;
+    netc_reset();
+    if (n > 0) { lua_pushlstring(L, body, (size_t)n); return 1; }
     return 0;
 }
 
@@ -173,110 +191,70 @@ static int l_net_ping(lua_State *L) {
  * 直接在 poll() 里调会把整个 UI 冻住(帧率掉到 0, 连返回键都不响应)。
  * 这里把请求丢到后台任务, 脚本每帧 fetch_poll() 看结果, UI 全程不掉帧。
  *
- *   app.net.fetch_start(url[, timeout_ms]) -> bool   启动一次 GET (http:// 或 https://)
- *   app.net.fetch_poll() -> "wait"                   还没回来
- *                        -> "ok", body, status      成功 (body 最多 16KB)
- *                        -> "err", "", errcode, errname  失败 (esp_err_t + 名字, 如 ESP_ERR_HTTP_CONNECT)
- *                        -> "idle"                  没有请求
+ *   app.net.fetch_start(url[, timeout_ms[, path]]) -> bool   启动一次 GET
+ *       不传 path  → 结果留在内存 (≤ NET_BODY_MAX), fetch_poll 拿到 body
+ *       **传 path** → **边收边写文件** (PSRAM 里不驻留整个包, 上限只受 TF 卡空间限制)
+ *                     见下面「流式落盘」的说明
+ *   app.net.fetch_poll() -> "wait"                         还没回来
+ *                        -> "ok", body, status              成功 (非流式)
+ *                        -> "ok", nil,  status, nbytes      成功 (流式, 第 4 个值是字节数)
+ *                        -> "err", "", errcode, errname     失败 (esp_err_t + 名字)
+ *                        -> "idle"                          没有请求
+ *   app.net.fetch_got()  -> 已收字节数 (流式模式下用来画进度条)
  * 同一时刻只允许一个请求; 结果被 poll 取走后状态回 idle。 */
-#define NET_URL_MAX   256
-#define NET_BODY_MAX  16384
-
-static char            s_fetch_url[NET_URL_MAX];              /* 内部 RAM: 小 */
-static int             s_fetch_timeout = 8000;
-static volatile int    s_fetch_state;     /* 0=idle 1=running 2=ok 3=err */
-static volatile int    s_fetch_len, s_fetch_status, s_fetch_err;
-/* ★ 16KB 缓冲放 PSRAM: 纯 socket 读, 无 DMA/无禁 cache 窗口, 内部 RAM 更该省着用 */
+/* ★★ 2026-10-15 "联网统一收口" (linit): 请求执行全部交给 **net_client** (唯一 HTTP 客户端)。
+ *   本文件只剩两件事: 参数搬运 + 状态映射 —— Lua 侧契约**一行未改**
+ *   (fetch_start 返回 bool / fetch_poll 返回 wait|ok|err|idle / fetch_got 返回字节数)。
+ *   net_client 的**单请求槽**天然实现了原来那句"同一时刻只允许一个请求"。 */
+#define NET_BODY_MAX  (128 * 1024)   /* 内存落点上限: 地图索引 fj.json 有 47KB */
+/* ★ PSRAM: 纯 socket 读, 无 DMA/无禁 cache 窗口, 内部 RAM 更该省着用 */
 static EXT_RAM_BSS_ATTR char s_fetch_body[NET_BODY_MAX + 1];
+static bool s_fetch_streaming;       /* 本次请求是否流式落盘 (决定 poll 返回几个值) */
 
-static void l_net_fetch_task(void *arg) {
-    (void)arg;
-    /* 诊断 (28674 = ESP_ERR_HTTP_CONNECT 时最可能是"内部堆连续块不够"):
-     * mbedtls 的 TLS in-buffer 在 context 里 **一次性 calloc**, 需要一整块连续内部 RAM
-     * (本项目 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384 → 至少要 16KB 连续)。
-     * BT + WiFi 同时开着时内部堆只剩 20KB/最大块 13KB → calloc 失败 → 握手直接失败,
-     * 对外就表现为 ESP_ERR_HTTP_CONNECT。这行日志一眼就能判定。 */
-    ESP_LOGI(TAG, "fetch 前: 内部 free=%u largest=%u psram=%u (url=%s)",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), s_fetch_url);
-    esp_http_client_config_t cfg = {
-        .url = s_fetch_url, .timeout_ms = s_fetch_timeout,
-        .buffer_size = 1024,   /* 2048→1024: 内部 RAM 最紧张, 省 1KB (响应体我们自己拼) */
-        .disable_auto_redirect = false,
-        .crt_bundle_attach = esp_crt_bundle_attach,   /* https 用系统证书包 */
-        .keep_alive_enable = false,
-    };
-    int total = 0, status = 0;
-    esp_err_t e = ESP_FAIL;
-    esp_http_client_handle_t cl = esp_http_client_init(&cfg);
-    if (cl) {
-        e = esp_http_client_open(cl, 0);
-        if (e == ESP_OK) {
-            esp_http_client_fetch_headers(cl);
-            status = esp_http_client_get_status_code(cl);
-            for (;;) {
-                int n = esp_http_client_read(cl, s_fetch_body + total, NET_BODY_MAX - total);
-                if (n <= 0) break;
-                total += n;
-                if (total >= NET_BODY_MAX) break;
-            }
-        }
-        esp_http_client_close(cl);
-        esp_http_client_cleanup(cl);
-    }
-    s_fetch_body[total] = 0;
-    if (e != ESP_OK)
-        ESP_LOGE(TAG, "fetch 失败: e=%d(%s) http=%d len=%d url=%s",
-                 (int)e, esp_err_to_name(e), status, total, s_fetch_url);
-    else
-        ESP_LOGI(TAG, "fetch 成功: http=%d len=%d url=%s", status, total, s_fetch_url);
-    s_fetch_len = total; s_fetch_status = status; s_fetch_err = (int)e;
-    __sync_synchronize();                 /* 先写完数据再放状态, 读侧才看不到半截 */
-    s_fetch_state = (e == ESP_OK) ? 2 : 3;
-    vTaskDelete(NULL);
-}
 
 static int l_net_fetch_start(lua_State *L) {
     const char *url = luaL_checkstring(L, 1);
     int timeout = (int)luaL_optinteger(L, 2, 8000);
-    if (s_fetch_state == 1) { lua_pushboolean(L, false); return 1; }  /* 上一个还在跑 */
+    const char *path = luaL_optstring(L, 3, NULL);
     /* ★★ 必须先联网才能发请求 (2026-10-02 实机踩到整机 reboot):
      *   lwip 是 `wifi_manager_enable()` 里的 esp_netif_init() 建的 —— **从没联过网时
      *   g_tcpip_mbox 是空的**, 这时 getaddrinfo 会直接
      *   `assert failed: tcpip_send_msg_wait_sem (Invalid mbox)` → panic → 重启。
-     *   实机回溯: l_net_fetch_task → esp_http_client_open → getaddrinfo → tcpip_send_msg_wait_sem。
-     *   ⇒ 未连接一律拒绝启动, 返回 false, 由脚本显示"未联网"。
-     * (另外: 全工程没有任何 esp_netif_deinit/tcpip_deinit —— lwip 起来之后不会再拆,
-     *  所以"连接过就一直安全"; 只需守住"第一次"。) */
+     *   ⇒ 未连接一律拒绝启动, 返回 false, 由脚本显示"未联网"。(连接过就一直安全) */
     if (!wifi_manager_is_connected()) { lua_pushboolean(L, false); return 1; }
-    snprintf(s_fetch_url, sizeof(s_fetch_url), "%s", url);
-    s_fetch_timeout = timeout > 0 ? timeout : 8000;
-    s_fetch_len = 0; s_fetch_status = 0; s_fetch_err = 0;
-    s_fetch_state = 1;
-    /* 任务栈要内部 RAM: TLS 握手期间会短暂关中断/走 wifi 驱动, 与"禁 cache 不能跑 PSRAM 栈"同源 */
-    if (xTaskCreatePinnedToCore(l_net_fetch_task, "lua_http", 8192, NULL, 4, NULL, 0) != pdPASS) {
-        s_fetch_state = 3; s_fetch_err = -1;
-        lua_pushboolean(L, false);
-        return 1;
-    }
-    lua_pushboolean(L, true);
+    netc_req_t r = { 0 };
+    r.url = url;
+    r.timeout_ms = timeout > 0 ? timeout : 8000;
+    if (path && path[0]) { r.sink_path = path; s_fetch_streaming = true; }   /* 流式落盘 */
+    else { r.body = s_fetch_body; r.body_cap = (int)sizeof(s_fetch_body); s_fetch_streaming = false; }
+    /* net_client 忙 (上一次还在跑) 或参数不合法 → false, 与原来"上一个还在跑"语义一致 */
+    lua_pushboolean(L, netc_start(&r));
+    return 1;
+}
+
+/* app.net.fetch_got() -> 已收字节数 (流式下载画进度条用; 非流式也能看"收了多少") */
+static int l_net_fetch_got(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)netc_got());
     return 1;
 }
 
 static int l_net_fetch_poll(lua_State *L) {
-    int st = s_fetch_state;
-    if (st == 1) { lua_pushstring(L, "wait"); return 1; }
-    if (st == 2) {
-        s_fetch_state = 0;
+    netc_state_t st = netc_state();
+    if (st == NETC_RUN) { lua_pushstring(L, "wait"); return 1; }
+    if (st == NETC_DONE) {
+        int n = netc_len(), code = netc_http();
+        bool streaming = s_fetch_streaming;
+        netc_reset();
         lua_pushstring(L, "ok");
-        lua_pushlstring(L, s_fetch_body, (size_t)s_fetch_len);
-        lua_pushinteger(L, s_fetch_status);
-        return 3;
+        if (streaming) lua_pushnil(L);                       /* 流式: body 在文件里 */
+        else lua_pushlstring(L, s_fetch_body, (size_t)n);
+        lua_pushinteger(L, code);
+        if (streaming) lua_pushinteger(L, n);                /* 第 4 个值: 落盘字节数 */
+        return streaming ? 4 : 3;
     }
-    if (st == 3) {
-        int code = s_fetch_err;
-        s_fetch_state = 0;
+    if (st == NETC_ERR) {
+        int code = netc_err();
+        netc_reset();
         lua_pushstring(L, "err");
         lua_pushstring(L, "");
         lua_pushinteger(L, code);
@@ -291,10 +269,12 @@ void lua_mod_net_register(lua_State *L)
 {
     lua_newtable(L);
     lua_pushcfunction(L, l_net_is_connected);    lua_setfield(L, -2, "is_connected");
+    lua_pushcfunction(L, l_net_mirrors);         lua_setfield(L, -2, "mirrors");
     lua_pushcfunction(L, l_net_get_ip);          lua_setfield(L, -2, "get_ip");
     lua_pushcfunction(L, l_net_http_get);        lua_setfield(L, -2, "http_get");
     lua_pushcfunction(L, l_net_fetch_start);     lua_setfield(L, -2, "fetch_start");
     lua_pushcfunction(L, l_net_fetch_poll);      lua_setfield(L, -2, "fetch_poll");
+    lua_pushcfunction(L, l_net_fetch_got);       lua_setfield(L, -2, "fetch_got");
     lua_pushcfunction(L, l_net_ping);            lua_setfield(L, -2, "ping");
     lua_pushcfunction(L, l_net_port);            lua_setfield(L, -2, "port");
     lua_pushcfunction(L, l_net_arp);             lua_setfield(L, -2, "arp");

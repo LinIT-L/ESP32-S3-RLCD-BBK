@@ -2,6 +2,7 @@
 #include "gps.h"          /* GPS (MAX-M10S) 驱动 API: gps_init/gps_sleep */
 
 #include "esp_log.h"
+#include "board_pins.h"   /* 板型表: 引脚下发 */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -43,47 +44,42 @@ esp_err_t app_board_init(app_board_t *board)
      * 若不释放, st7305_init 的硬复位脚翻转不生效 + SPI 总线被 hold 霸住无法初始化.
      * ★ 2026-10-04: CS 从 GPIO40 挪到 **GPIO42** (小智核心模块占用 IO40)。这两处必须同步改,
      *   否则 CS 被 hold 住 → SPI 片选永远拉不动 → 屏全黑。 */
-    /* ★★★ 2026-10-16 关键修复: 解深睡锁的引脚必须是**本板(小智)实际用的**。
-     *   之前这里是 41/42/11/12 = 微雪(原40)/新载板的值 ⇒ 小智屏的 DC7/SCK9/MOSI10
-     *   **从没被解锁** ⇒ 冻在深睡电平 ⇒ **开机全黑但串口正常**(文档明写过的坑)。
-     *   小智真值(与 LinTOS0.71 一致): DC7 CS11 SCK9 MOSI10(RST不接) + 震动8 */
-    gpio_hold_dis(GPIO_NUM_7);    /* LCD DC/RS */
-    gpio_hold_dis(GPIO_NUM_11);   /* LCD CS  */
-    gpio_hold_dis(GPIO_NUM_9);    /* LCD SCK */
-    gpio_hold_dis(GPIO_NUM_10);   /* LCD MOSI */
-    /* ★★★ 2026-10-16 修复"一直震动": 必须在**全工程最早的位置**把震动脚确定拉低。
-     *   0.8 这一版缺了这 4 行 ⇒ GPIO8 开机后**浮空** ⇒ TM6604 是**边沿触发**驱动芯片,
-     *   浮空/噪声被反复误触发 ⇒ 一直震 (0.71 里这 4 行是"开机只抖一下"的关键修复)。 */
-    /* ★★★ 2026-10-16 关键: **不要用 gpio_reset_pin()** —— 它会把该脚配成
-     *   "输入 + 内部上拉", 对 TM6604(边沿触发) 来说**上拉=一个上升沿** ⇒ 又触发一次震动;
-     *   而且烧录时 ROM 下载模式该脚浮空, 同样会被噪声误触发(马达会锁住一直转)。
-     *   这里直接配"输出、无上拉无下拉、低电平" —— 不给它任何边沿。 */
-    gpio_hold_dis(GPIO_NUM_8);
-    {
-        gpio_config_t vib0 = {
-            .pin_bit_mask = (1ULL << 8),
-            .mode         = GPIO_MODE_OUTPUT,
-            .pull_up_en   = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_ENABLE,   /* 上电即被拉低, 杜绝浮空误触发 */
-            .intr_type    = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&vib0);
-        gpio_set_level(GPIO_NUM_8, 0);
-    }
-    gpio_hold_dis(GPIO_NUM_12);   /* 触摸 INT */
-    gpio_hold_dis(GPIO_NUM_6);    /* 触摸 RST */
-    gpio_hold_dis(GPIO_NUM_5);    /* 触摸 SDA */
-    gpio_hold_dis(GPIO_NUM_13);   /* 触摸 SCL */
-    gpio_hold_dis(GPIO_NUM_1); gpio_hold_dis(GPIO_NUM_0); gpio_hold_dis(GPIO_NUM_4);  /* 按键 */
+    gpio_hold_dis(GPIO_NUM_41);   /* RST */
+    gpio_hold_dis(GPIO_NUM_42);   /* CS  (原 40) */
+    gpio_hold_dis(GPIO_NUM_11);   /* SCK */
+    gpio_hold_dis(GPIO_NUM_12);   /* MOSI */
 
     /* 1. 初始化 LCD (必须最先, 显示开机 Logo) */
+    /* ★★★ 2026-10-16 关键修复: 从板型表把引脚**下发**给驱动。
+     *   之前这段被 `git checkout` 误清掉 ⇒ 屏一直用驱动默认值(小智的 7/11/9/10)
+     *   去驱微雪的屏(5/40/11/12) ⇒ 全黑。v1.3(能亮)的电池日志是 GPIO4、我们却是 GPIO3,
+     *   就是"没下发"的铁证。 */
+    const board_pins_t *bp = board_pins_get();
     st7305_config_t lcd_cfg = st7305_default_config();
+    lcd_cfg.dc_gpio  = bp->lcd_dc;
+    lcd_cfg.spi_cs   = bp->lcd_cs;
+    lcd_cfg.spi_sclk = bp->lcd_sck;
+    lcd_cfg.spi_mosi = bp->lcd_mosi;
+    lcd_cfg.rst_gpio = bp->lcd_rst;
+    if (bp->lcd_freq_mhz > 0) lcd_cfg.spi_freq = bp->lcd_freq_mhz;
+    audio_player_apply_pins(bp->i2s_mclk, bp->i2s_bclk, bp->i2s_ws, bp->i2s_dout,
+                            bp->i2s_din, bp->codec_sda, bp->codec_scl, bp->pa_pin);
+    board_battery_set_channel(bp->bat_adc_chan);
+    if (bp->sd_bus == 0) sd_scan_apply_pins(bp->sd_clk, bp->sd_cmd, bp->sd_d0);
+    ESP_LOGW(TAG, "板型=%s → LCD DC=%d CS=%d SCK=%d MOSI=%d RST=%d @%dMHz",
+             bp->name, lcd_cfg.dc_gpio, lcd_cfg.spi_cs, lcd_cfg.spi_sclk,
+             lcd_cfg.spi_mosi, lcd_cfg.rst_gpio, lcd_cfg.spi_freq);
     esp_err_t ret = st7305_init(&board->lcd, &lcd_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ST7305 初始化失败: %s", esp_err_to_name(ret));
         return ret;
     }
     ESP_LOGI(TAG, "ST7305 初始化成功");
+    /* ★★★ 2026-10-16 关键修复(第2处): 屏保门禁。
+     *   wallpapers.c 屏保激活时会 st7305_set_flush_blocked(true), 此后**所有普通
+     *   st7305_flush 在第一行就 return ESP_OK(静默丢弃)** ⇒ 屏收不到任何数据 ⇒ 全黑且无报错。
+     *   开机这里强制打开一次, 保证 boot 阶段一定刷得出去。 */
+    st7305_set_flush_blocked(false);
 
     /* 2. 挂载 TF 卡 —— V1.6.x: 改为**后台异步**。
      * 原同步挂载在"没插卡"时会跑满 3 次重试(实测 ~490ms), 白占启动路径;

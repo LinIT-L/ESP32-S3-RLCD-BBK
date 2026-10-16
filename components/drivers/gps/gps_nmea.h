@@ -70,6 +70,8 @@ bool gps_nmea_is_demo(void);
 /* 起后台任务: 循环 gps_read() → gps_nmea_feed(). 幂等, 重复调用不会起两个.
  * 返回 ESP_ERR_INVALID_STATE 表示 gps_init() 还没做. */
 esp_err_t gps_service_start(void);
+/* ★ 2026-10-09: 停掉后台解析任务 (任务自己退出)。退出地图等应用时调用, 别让任务常驻。 */
+void      gps_service_stop(void);
 
 #ifdef __cplusplus
 }

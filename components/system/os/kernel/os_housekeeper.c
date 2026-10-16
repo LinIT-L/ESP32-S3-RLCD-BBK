@@ -56,7 +56,7 @@ void os_housekeeper_sync(void)
     ESP_LOGI(TAG, "sweep done: int_free=%d largest=%d nblock=%d",
              (int)hi.total_free_bytes, (int)hi.largest_free_block, (int)hi.free_blocks);
     if (hi.largest_free_block < (32 * 1024) && hi.total_free_bytes < (40 * 1024))
-        ESP_LOGW(TAG, "内部堆紧张! free=%d largest=%d — 某模块可能未释放",
+        ESP_LOGD(TAG, "内部堆紧张! free=%d largest=%d — 某模块可能未释放",
                  (int)hi.total_free_bytes, (int)hi.largest_free_block);
 }
 

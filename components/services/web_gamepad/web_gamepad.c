@@ -271,7 +271,7 @@ esp_err_t web_gamepad_start(void)
         esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         esp_netif_ip_info_t ip;
         if (!sta || esp_netif_get_ip_info(sta, &ip) != ESP_OK || ip4_addr_isany(&ip.ip)) {
-            ESP_LOGE(TAG, "局域网模式需要设备先连接 WiFi (STA), 未取到局域网 IP");
+            ESP_LOGD(TAG, "局域网模式需要设备先连接 WiFi (STA), 未取到局域网 IP");
             return ESP_ERR_INVALID_STATE;
         }
         ESP_RETURN_ON_ERROR(board_battery_init(), TAG, "init battery monitor failed");

@@ -40,14 +40,14 @@ esp_err_t gb_emu_load_rom(const char *path, gb_emu_rom_t *rom)
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGE(TAG, "打开失败: %s", path);
+        ESP_LOGD(TAG, "打开失败: %s", path);
         return ESP_FAIL;
     }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (sz < 0x150 || sz > 8 * 1024 * 1024) {
-        ESP_LOGE(TAG, "ROM 大小异常: %ld", sz);
+        ESP_LOGD(TAG, "ROM 大小异常: %ld", sz);
         fclose(f);
         return ESP_FAIL;
     }
@@ -76,7 +76,7 @@ esp_err_t gb_emu_load_rom(const char *path, gb_emu_rom_t *rom)
     fclose(f);
     if (rd != (size_t)sz) {
         heap_caps_free(data);
-        ESP_LOGE(TAG, "读取不完整: %u/%ld", (unsigned)rd, sz);
+        ESP_LOGD(TAG, "读取不完整: %u/%ld", (unsigned)rd, sz);
         return ESP_FAIL;
     }
 

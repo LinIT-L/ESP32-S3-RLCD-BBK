@@ -3,7 +3,7 @@
 idf_component_register(
     SRCS "sd_scan.c"
     INCLUDE_DIRS "."
-    REQUIRES board_cfg sdmmc fatfs esp_driver_gpio esp_driver_sdmmc
+    REQUIRES sdmmc fatfs esp_driver_gpio esp_driver_sdmmc
     PRIV_REQUIRES nvs_flash
 )
 

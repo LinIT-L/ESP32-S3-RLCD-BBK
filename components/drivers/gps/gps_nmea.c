@@ -51,6 +51,7 @@ static int     s_line_len;
 
 static bool    s_demo;
 static bool    s_task_running;
+static volatile bool s_stop_req;   /* 2026-10-09: 让服务任务优雅退出 (Lua 应用退出时用) */
 
 /* ---- 时基 ---- */
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
@@ -84,7 +85,7 @@ void gps_nmea_demo(bool on)
         s_fix.hdop        = 0.8f;
     }
     fix_unlock();
-    ESP_LOGW(TAG, "演示模式 %s", on ? "开 (不读 UART)" : "关");
+    ESP_LOGD(TAG, "演示模式 %s", on ? "开 (不读 UART)" : "关");
 }
 
 bool gps_nmea_is_demo(void)
@@ -391,7 +392,7 @@ static void gps_service_task(void *arg)
     uint8_t buf[FEED_CHUNK];
     ESP_LOGI(TAG, "服务任务启动 (%s)", s_demo ? "演示模式" : "读 UART");
 
-    while (1) {
+    while (!s_stop_req) {              /* ★ 2026-10-09: 可被 gps_service_stop() 叫停 */
         if (s_demo) {
             demo_step();
             vTaskDelay(pdMS_TO_TICKS(DEMO_TICK_MS));
@@ -404,12 +405,24 @@ static void gps_service_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(200));        /* 驱动未就绪 → 退避, 别忙等 */
         }
     }
+    s_task_running = false;
+    s_stop_req = false;
+    ESP_LOGI(TAG, "服务任务已停止");
+    vTaskDelete(NULL);
+}
+
+/* ★ 2026-10-09: 停服务 (供 Lua 应用退出时调用)。最多等 ~600ms 让任务自己退出。 */
+void gps_service_stop(void)
+{
+    if (!s_task_running) return;
+    s_stop_req = true;
+    for (int i = 0; i < 60 && s_task_running; i++) vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 esp_err_t gps_service_start(void)
 {
     if (!gps_is_ready()) {
-        ESP_LOGE(TAG, "gps_init() 尚未成功, 不能起服务");
+        ESP_LOGD(TAG, "gps_init() 尚未成功, 不能起服务");
         return ESP_ERR_INVALID_STATE;
     }
     if (s_task_running) return ESP_OK;
@@ -432,7 +445,7 @@ esp_err_t gps_service_start(void)
         }
     }
     if (got == 0) {
-        ESP_LOGW(TAG, "1.2s 内没收到任何字节 —— 检查 V_IO(pin7) 是否接 3V3 / TX-RX 是否交叉 / 波特率");
+        ESP_LOGD(TAG, "1.2s 内没收到任何字节 —— 检查 V_IO(pin7) 是否接 3V3 / TX-RX 是否交叉 / 波特率");
     } else {
         ESP_LOGI(TAG, "线路探测 OK: 收到 %d 字节", got);
     }

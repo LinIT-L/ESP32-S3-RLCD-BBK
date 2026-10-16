@@ -545,8 +545,9 @@ static void wp_action(ui_ctx_t *ctx, os_action_t a)
         }
         break;
     case OS_ACTION_BACK:
+        /* 先关详情窗; 真到"要退出"这一层时弹统一"退出程序?"确认框 (确认才退) */
         if (s_view == WP_VIEW_AP && s_detail) { s_detail = false; ctx->needs_redraw = true; }
-        else os_pop(ctx);
+        else os_request_exit_confirm(ctx);
         break;
     default:
         break;

@@ -25,7 +25,8 @@ idf_component_register(
  "services/svc_statusbar.c"
  "services/svc_modtool.c"
  INCLUDE_DIRS "include"
- REQUIRES st7305 ui_common input touch_panel audio_player tone_player vibrator engine_manager gam4980 gb_emu gbc_emu nes_emu md_emu sms_emu lavax arduboy_avr vpet book_reader wallpapers usb_hid usb_bt usb_net wifi_manager fonts kbd_lib sd_scan board_battery espsdr esp_netif lwip spi_flash nvs_flash svc_cfg svc_nvs esp_system bt_ctl web_gamepad usbh_msc vpet virtual_keys board_shim keyvault calc 
+ # ★ 2026-10-13: md_emu 默认停用(省 715KB), 恢复见 os.h 的 LINTOS_ENABLE_MD
+    REQUIRES sms_emu arduboy_avr st7305 ui_common input touch_panel audio_player tone_player vibrator engine_manager gam4980 gb_emu gbc_emu nes_emu lavax book_reader wallpapers usb_hid usb_bt usb_net wifi_manager fonts kbd_lib sd_scan board_battery espsdr esp_netif lwip spi_flash nvs_flash svc_cfg svc_nvs esp_system bt_ctl web_gamepad usbh_msc vpet virtual_keys board_shim keyvault calc 
  esp_http_client favorites esp_timer lua
 )
 

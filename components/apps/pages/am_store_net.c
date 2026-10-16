@@ -35,18 +35,20 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "am_internal.h"
+#include "os_sources.h"
 #include "am_store_json.h"
 #include "sd_scan.h"
 #include "wifi_manager.h"
+#include "net_client.h"
 
 #define TAG "AMSTORENET"
 
 #define AM_IDX_MAX      (16 * 1024)         /* index.json 正文上限 */
 #define AM_DL_MAX       (2 * 1024 * 1024)   /* 单包上限 (防服务器给错东西跑飞) */
-#define AM_DL_CHUNK     2048
 
 /* 商店源目录: 与 am_store.c 的 AM_STORE_SRC1/SRC2 必须一致 */
 #define AM_SRC_SPIFFS   "/store"
@@ -65,10 +67,12 @@ static int  s_mir_n = 0;
 static EXT_RAM_BSS_ATTR am_rpkg_t s_rpkg[AM_RPKG_MAX];
 static int  s_rpkg_n = 0;
 static volatile bool s_fetched = false;  /* 拉过至少一次 (成功或失败), 防重入 */
+#define RETRY_MS      10000              /* 索引拉取失败后的重试退避 */
+static volatile bool     s_retry_wait;   /* true = 上次失败, 等退避到点 */
+static volatile uint32_t s_retry_ms;     /* 上次失败时刻 (ms, esp_timer) */
 
 /* 缓冲: 索引正文放 PSRAM (纯 socket 读); 落盘块**必须内部 RAM** (见文件头 ③) */
 static EXT_RAM_BSS_ATTR char s_idx[AM_IDX_MAX + 1];
-static char s_dl_buf[AM_DL_CHUNK];
 
 /* 拼 URL: 手写长度运算, 不用 snprintf / strncat ——
  *   snprintf 在"源是长度未知的指针"时会被 -Wformat-truncation 一直警告;
@@ -96,13 +100,14 @@ static void am_idx_task(void *arg) {
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     /* ★ 第 0 步: 先拿任意一个镜像的 body 当"引导" —— 但 mirrors[] 就在 body 里,
-     *   所以得先试一个已知源。做法: 依次试**已知缺省源**里的第一个 + 已经解析出来的
-     *   mirrors (首次运行时 s_mir_n 为 0, 用内置的 == store_build.py 的默认主源)。
-     *   内置源通了, 它返回的 mirrors[] 就覆盖/扩展后续要用的源列表。 */
-    static const char *k_boot = "https://bbk.linit.cn/bbk";
+     *   所以得先试一个已知源。做法: 先铺**固件内置源清单** (os_sources.c —— 商店与
+     *   Lua 地图应用共用的唯一真相源), 再用上次 index.json 解析出的 mirrors 补位。
+     *   首次运行时 s_mir_n 为 0, 纯靠内置源; 内置源通了, 它返回的 mirrors[]
+     *   就覆盖/扩展后续要用的源列表 (所以"加源"通常连固件都不用刷)。 */
     char tries[AM_MIRROR_MAX + 1][AM_MIRROR_LEN];
     int  ntry = 0;
-    snprintf(tries[ntry++], AM_MIRROR_LEN, "%s", k_boot);
+    for (int i = 0; i < os_sources_count() && ntry < AM_MIRROR_MAX + 1; i++)
+        snprintf(tries[ntry++], AM_MIRROR_LEN, "%s", os_sources_get(i));
     for (int i = 0; i < s_mir_n && ntry < AM_MIRROR_MAX + 1; i++)
         snprintf(tries[ntry++], AM_MIRROR_LEN, "%s", s_mir[i]);
 
@@ -110,33 +115,22 @@ static void am_idx_task(void *arg) {
     for (int i = 0; i < ntry; i++) {
         char url[AM_MIRROR_LEN + 32];
         url3(url, sizeof(url), tries[i], "/index.json", NULL);
-        esp_http_client_config_t cfg = {
-            .url = url, .timeout_ms = 10000,
-            .buffer_size = 1024,                 /* 内部 RAM 最紧张, 响应体我们自己拼 */
-            .disable_auto_redirect = false,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .keep_alive_enable = false,
-        };
+        /* ★ 2026-10-15 联网收口: 改走 net_client (唯一 HTTP 客户端), 不再自己建 client/任务 */
+        netc_req_t r = { 0 };
+        r.url = url; r.timeout_ms = 10000;
+        r.body = s_idx; r.body_cap = AM_IDX_MAX;      /* 索引 ≤16KB, 一份内存就够 */
         int total = 0, status = 0;
         esp_err_t e = ESP_FAIL;
-        esp_http_client_handle_t cl = esp_http_client_init(&cfg);
-        if (cl) {
-            e = esp_http_client_open(cl, 0);
-            if (e == ESP_OK) {
-                esp_http_client_fetch_headers(cl);
-                status = esp_http_client_get_status_code(cl);
-                if (status == 200) {
-                    for (;;) {
-                        int n = esp_http_client_read(cl, s_idx + total, AM_IDX_MAX - total);
-                        if (n <= 0) break;
-                        total += n;
-                        if (total >= AM_IDX_MAX) break;
-                    }
-                }
-            }
-            esp_http_client_close(cl);
-            esp_http_client_cleanup(cl);
+        if (netc_start(&r)) {
+            uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+            while (netc_busy() && (uint32_t)(esp_timer_get_time() / 1000) - t0 < 15000)
+                vTaskDelay(pdMS_TO_TICKS(50));
+            if (netc_state() == NETC_DONE) { e = ESP_OK; }
+            else e = (esp_err_t)(netc_err() ? netc_err() : ESP_FAIL);
+            status = netc_http(); total = netc_len();
+            netc_reset();
         }
+        if (total >= AM_IDX_MAX) total = AM_IDX_MAX - 1;
         if (total > 0) s_idx[total] = 0; else s_idx[0] = 0;
         ESP_LOGI(TAG, "引导源%d: e=%d http=%d len=%d url=%s", i, (int)e, status, total, url);
         if (total > 0 && status == 200) {
@@ -154,27 +148,41 @@ static void am_idx_task(void *arg) {
                 break;
             }
             rc = pr;
-            ESP_LOGW(TAG, "索引解析失败 rc=%d (跳过 %d 条)", pr, am_store_json_skipped());
+            ESP_LOGD(TAG, "索引解析失败 rc=%d (跳过 %d 条)", pr, am_store_json_skipped());
         }
     }
     if (rc == 0) {
         __sync_synchronize();          /* 先写完数据, 再放状态 */
         s_state = ARS_READY;
     } else {
-        ESP_LOGE(TAG, "索引拉取/解析全部失败 rc=%d", rc);
+        ESP_LOGW(TAG, "索引拉取/解析全部失败 rc=%d (10s 后允许重试)", rc);
+        /* ★ 2026-10-15: 失败后必须**允许重试** —— 原来 s_fetched 一直是 true,
+         *   于是"第一次没拉到就永远待添加, 只能重启"。改成置回 false + 退避计时,
+         *   由 am_rstore_prefetch() 隔 RETRY_MS 再试一次 (服务器抖动/刚开机没网都能自愈)。 */
+        s_retry_ms = (uint32_t)(esp_timer_get_time() / 1000);
         s_state = ARS_FAIL;
+        s_fetched = false;
+        s_retry_wait = true;
     }
     vTaskDelete(NULL);
 }
 
+#define RETRY_MS        10000      /* 索引拉取失败后多久允许重试 */
+static volatile bool     s_retry_wait;
+static volatile uint32_t s_retry_ms;
+
 void am_rstore_prefetch(void) {
     if (s_fetched || s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) return;
+    /* ★ 失败退避: 上电/服务器抖动导致第一次没拉到 → 隔 RETRY_MS 再试, 不必重启 */
+    if (s_retry_wait &&
+        (uint32_t)(esp_timer_get_time() / 1000) - s_retry_ms < RETRY_MS) return;
     if (!wifi_manager_is_connected()) return;   /* ★ 见文件头 ①: 没联网一律不发请求 */
+    s_retry_wait = false;
     s_fetched = true;
     s_state = ARS_FETCHING;
     /* 任务栈必须内部 RAM (TLS 会短暂禁中断; 8KB 与 luat_lib_net 的 fetch 任务同规格) */
     if (xTaskCreatePinnedToCore(am_idx_task, "am_idx", 8192, NULL, 4, NULL, 0) != pdPASS) {
-        ESP_LOGE(TAG, "索引任务创建失败(内存不足)");
+        ESP_LOGD(TAG, "索引任务创建失败(内存不足)");
         s_state = ARS_FAIL;
         s_fetched = false;
     }
@@ -206,25 +214,8 @@ void am_rstore_ack(void) {
     if (s_state == ARS_OK || s_state == ARS_DLFAIL) s_state = ARS_READY;
 }
 
-/* ==================== crc32 (zlib/以太网, 半字节表) ====================
- * 必须与 tools/store_build.py 的 binascii.crc32 **逐位一致**, 否则一装就"校验失败"。
- * 这里用 16 项半字节表 (64 字节 flash) 而不是 256 项全表 (1KB) —— 空间换一点点 CPU。
- * 表与算法已用 tools/store_parse_test.py 对**全部真实包**逐一比对过。 */
-static const uint32_t CRC_T[16] = {
-    0x00000000u, 0x1DB71064u, 0x3B6E20C8u, 0x26D930ACu,
-    0x76DC4190u, 0x6B6B51F4u, 0x4DB26158u, 0x5005713Cu,
-    0xEDB88320u, 0xF00F9344u, 0xD6D6A3E8u, 0xCB61B38Cu,
-    0x9B64C2B0u, 0x86D3D2D4u, 0xA00AE278u, 0xBDBDF21Cu,
-};
-static uint32_t crc32_upd(uint32_t crc, const uint8_t *p, size_t n) {
-    crc = ~crc;
-    while (n--) {
-        crc ^= *p++;
-        crc = (crc >> 4) ^ CRC_T[crc & 0x0Fu];
-        crc = (crc >> 4) ^ CRC_T[crc & 0x0Fu];
-    }
-    return ~crc;
-}
+/* crc32 已移到 net_client (netc_crc32): 下载时 want_crc=true, 收完直接比 —— 
+ * 全工程共用同一份实现, 保证与 tools/store_build.py 的 binascii.crc32 一致。 */
 
 /* ==================== 后台: 下载一个包 ==================== */
 static void am_dl_task(void *arg) {
@@ -246,62 +237,46 @@ static void am_dl_task(void *arg) {
 
     int rc = 0;   /* 0=OK 1=HTTP 2=连接 3=写盘 4=校验 */
     uint32_t crc = 0;
-    int total = 0, status = 0, clen = 0;
-    FILE *out = NULL;
+    int total = 0, status = 0;
 
     for (int i = 0; i < s_mir_n && rc == 0; i++) {
         char url[AM_MIRROR_LEN + 128];
         url3(url, sizeof(url), s_mir[i], "/", pk->path);
-        if (i > 0) ESP_LOGW(TAG, "换源重试: %s", url);
+        if (i > 0) ESP_LOGD(TAG, "换源重试: %s", url);
 
-        esp_http_client_config_t cfg = {
-            .url = url, .timeout_ms = 15000,
-            .buffer_size = 1024,
-            .disable_auto_redirect = false,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .keep_alive_enable = false,
-        };
-        esp_http_client_handle_t cl = esp_http_client_init(&cfg);
-        if (!cl) { rc = 2; break; }
-        esp_err_t e = esp_http_client_open(cl, 0);
-        if (e != ESP_OK) { rc = 2; goto next; }
-        clen = (int)esp_http_client_fetch_headers(cl);
-        status = esp_http_client_get_status_code(cl);
-        if (status != 200) { rc = 1; goto next; }
-        if (clen > 0) s_permille = 0;
-
-        out = fopen(dst, "wb");
-        if (!out) { rc = 3; goto next; }
-        crc = 0; total = 0;
-        for (;;) {
-            int n = esp_http_client_read(cl, s_dl_buf, AM_DL_CHUNK);
-            if (n < 0) { rc = 2; break; }
-            if (n == 0) break;
-            crc = crc32_upd(crc, (const uint8_t *)s_dl_buf, (size_t)n);
-            if (fwrite(s_dl_buf, 1, (size_t)n, out) != (size_t)n) { rc = 3; break; }
-            total += n;
-            if (clen > 0) s_permille = (int)((int64_t)total * 1000 / clen);
-            if (total > AM_DL_MAX) { rc = 3; break; }
+        /* ★ 2026-10-15 联网收口: 流式落盘 + crc32 全交给 net_client;
+         *   本任务只剩"等 + 报进度 + 校验", 不再自己建 client 与读循环。 */
+        netc_req_t r = { 0 };
+        r.url = url; r.timeout_ms = 15000;
+        r.sink_path = dst;
+        r.want_crc = true;                       /* 边收边算 crc32, 收完直接比 */
+        status = 0;
+        if (!netc_start(&r)) { rc = 2; break; }  /* 客户端忙 → 当连接失败 */
+        s_permille = 0;
+        uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+        while (netc_busy() && (uint32_t)(esp_timer_get_time() / 1000) - t0 < 180000) {
+            int g = netc_got();
+            if (pk->size > 0) s_permille = (int)((int64_t)g * 1000 / (int64_t)pk->size);
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
-        fclose(out);
-        out = NULL;
-    next:
-        esp_http_client_close(cl);
-        esp_http_client_cleanup(cl);
+        status = netc_http(); total = netc_len(); crc = netc_crc32();
+        if (netc_state() == NETC_DONE)             rc = 0;
+        else if (status != 0 && status != 200)     rc = 1;    /* HTTP 非 200 */
+        else                                       rc = 2;    /* 连接/超时/截断 */
+        netc_reset();
         /* ★ 必须同时比 size 和 crc32: 只比 size 挡不住"截断成等长的错误内容",
          *   只比 crc 又不够直观 (长度变了 crc 也会变, 但 size 一眼看出差多少) */
         if (rc == 0 && (total != (int)pk->size || crc != pk->crc)) {
-            ESP_LOGE(TAG, "校验失败: 收到 %d B crc=%08x / 期望 %u B crc=%08x",
+            ESP_LOGD(TAG, "校验失败: 收到 %d B crc=%08x / 期望 %u B crc=%08x",
                      total, (unsigned)crc, (unsigned)pk->size, (unsigned)pk->crc);
             rc = 4;
         }
     }
-    if (out) fclose(out);
     if (rc != 0) {
         remove(dst);      /* 不许留半个包在商店源目录里 (会被当成"待安装") */
         s_dl_err = rc;
         s_permille = -1;
-        ESP_LOGE(TAG, "下载失败 rc=%d (%s)", rc, dst);
+        ESP_LOGD(TAG, "下载失败 rc=%d (%s)", rc, dst);
         __sync_synchronize();
         s_state = ARS_DLFAIL;
     } else {
@@ -320,7 +295,7 @@ bool am_rstore_dl_start(int i) {
     s_permille = -1;
     s_state = ARS_DOWNLOADING;
     if (xTaskCreatePinnedToCore(am_dl_task, "am_dl", 8192, (void *)(intptr_t)i, 4, NULL, 0) != pdPASS) {
-        ESP_LOGE(TAG, "下载任务创建失败(内存不足)");
+        ESP_LOGD(TAG, "下载任务创建失败(内存不足)");
         s_state = ARS_READY;
         return false;
     }

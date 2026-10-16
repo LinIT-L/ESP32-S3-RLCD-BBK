@@ -100,9 +100,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         static int s_retry = 0;
         if (!s_suppress_reconnect && s_ssid[0] && s_retry < 5) {
             s_retry++;
+            /* ★ 2026-10-09: 重连时**逐步放开发射功率**。
+             *   首次连接故意用 8.5dBm(34) 压住"一开 WiFi 就把 3V3 拉黑屏"的冲击;
+             *   但连不上多半是信噪比不够 (本机实测 RSSI ≈ -71dBm, 8.5dBm 太勉强),
+             *   于是逐次放开: 1 次 8.5dBm → 2~3 次 15.5dBm(62) → 4~5 次 19.5dBm(78)。
+             *   连上后保持当期功率; 下次 enable() 会复位回 8.5dBm。 */
+            int8_t want = (s_retry >= 4) ? 78 : ((s_retry >= 2) ? 62 : 34);
+            esp_wifi_set_max_tx_power(want);
             s_connecting = true;
             snprintf(s_status, sizeof(s_status), "连接中...");
-            ESP_LOGW(TAG, "Wi-Fi 连接失败, %ds后重试 (%d/5)", 1, s_retry);
+            ESP_LOGD(TAG, "Wi-Fi 连接失败, 1s后重试 (%d/5, TX=%d/4dBm)", s_retry, (int)want);
             vTaskDelay(pdMS_TO_TICKS(1000));
             esp_wifi_connect();
         } else {
@@ -110,7 +117,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             if (s_connecting) {
                 s_connecting = false;
                 snprintf(s_status, sizeof(s_status), "连接失败");
-                ESP_LOGW(TAG, "Wi-Fi 连接失败");
+                ESP_LOGD(TAG, "Wi-Fi 连接失败");
             } else {
                 snprintf(s_status, sizeof(s_status), "已断开");
             }
@@ -188,7 +195,7 @@ bool wifi_manager_scan_start(void) {
      *   (`wifi:Coexist: Wi-Fi connect fail, apply reconnect coex policy` → 1s 重试 1/5..5/5)。
      *   所以: 蓝牙关着才用"快速扫描"提速; 蓝牙开着交回 IDF 默认。 */
     if (bt_manager_is_enabled()) {
-        ESP_LOGW(TAG, "蓝牙开启中 → 扫描用 IDF 默认时序 (不覆盖 scan_time, 保 coex 交错)");
+        ESP_LOGD(TAG, "蓝牙开启中 → 扫描用 IDF 默认时序 (不覆盖 scan_time, 保 coex 交错)");
     } else {
         cfg.scan_time.active.min = 40;    /* 蓝牙关: 快速主动扫描, 全 13 信道 1~2s */
         cfg.scan_time.active.max = 200;
@@ -196,12 +203,12 @@ bool wifi_manager_scan_start(void) {
     esp_err_t ret = esp_wifi_scan_start(&cfg, false);
     if (ret != ESP_OK) {
         /* 状态未就绪/忙: 延迟重试一次 (刚开 WiFi 常见), 仍失败才返回 false */
-        ESP_LOGW(TAG, "扫描启动失败: %s, 200ms 后重试", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "扫描启动失败: %s, 200ms 后重试", esp_err_to_name(ret));
         vTaskDelay(pdMS_TO_TICKS(200));
         ret = esp_wifi_scan_start(&cfg, false);
     }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "扫描启动失败: %s (s_enabled=%d)", esp_err_to_name(ret), s_enabled);
+        ESP_LOGD(TAG, "扫描启动失败: %s (s_enabled=%d)", esp_err_to_name(ret), s_enabled);
         s_suppress_reconnect = false;
         return false;
     }
@@ -229,9 +236,11 @@ const wifi_ap_record_t *wifi_manager_get_scan_records(void) {
     return s_ap_count > 0 ? s_ap : NULL;
 }
 
+/* 网络自愈监督任务 (定义在文件后部, 此处前置声明) */
+static void wifi_supervisor_task(void *arg);
+
 void wifi_manager_init(void) {
     if (s_inited) return;
-
     load_cfg();
 
     ESP_LOGI(TAG, "初始化 WiFi 子系统 (STA)...");
@@ -244,7 +253,7 @@ void wifi_manager_init(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t ret = esp_wifi_init(&cfg);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_wifi_init 失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "esp_wifi_init 失败: %s", esp_err_to_name(ret));
         return;
     }
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
@@ -253,7 +262,32 @@ void wifi_manager_init(void) {
                                         wifi_event_handler, NULL, NULL);
     esp_wifi_set_mode(WIFI_MODE_STA);
     s_inited = true;
+    /* 网络自愈监督任务 (只建一次): 持久重连, 见 wifi_supervisor_task */
+    static bool s_sup_started = false;
+    if (!s_sup_started) {
+        s_sup_started = true;
+        xTaskCreate(wifi_supervisor_task, "wifi_sup", 3072, NULL, 3, NULL);
+    }
     ESP_LOGI(TAG, "WiFi 子系统初始化完成 (STA)");
+}
+
+/* ★ 2026-10-09: 用**已保存的凭据**给 STA 配置并发起连接。
+ * 前提: esp_wifi 已 start。返回 true = connect 已发起 (连接结果是异步的, 看事件)。 */
+static bool sta_connect_saved(void)
+{
+    if (s_ssid[0] == '\0') return false;
+    wifi_config_t cfg = { 0 };
+    memcpy(cfg.sta.ssid, s_ssid, sizeof(cfg.sta.ssid) - 1);
+    cfg.sta.ssid[sizeof(cfg.sta.ssid) - 1] = '\0';
+    memcpy(cfg.sta.password, s_pass, sizeof(cfg.sta.password) - 1);
+    cfg.sta.password[sizeof(cfg.sta.password) - 1] = '\0';
+    cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    if (esp_wifi_set_config(WIFI_IF_STA, &cfg) != ESP_OK) return false;
+    esp_wifi_disconnect();          /* 清掉旧状态, 保证这次 connect 真的重连 */
+    s_connecting = true;
+    snprintf(s_status, sizeof(s_status), "连接中...");
+    if (esp_wifi_connect() != ESP_OK) { s_connecting = false; return false; }
+    return true;
 }
 
 bool wifi_manager_enable(void) {
@@ -264,7 +298,7 @@ bool wifi_manager_enable(void) {
     /* V1.0.67: 网页手柄可能切过 AP 模式, 这里强制回 STA */
     esp_wifi_set_mode(WIFI_MODE_STA);
     if (esp_wifi_start() != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi 启动失败");
+        ESP_LOGD(TAG, "WiFi 启动失败");
         return false;
     }
     /* 关闭 WiFi 省电: 省电会间歇休眠射频, 导致扫描时快时慢/卡死在"扫描中".
@@ -280,15 +314,24 @@ bool wifi_manager_enable(void) {
     esp_err_t tp_ret = esp_wifi_set_max_tx_power(TX_PWR_QUARTER_DBM);
     int8_t tp_now = 0;
     if (tp_ret == ESP_OK && esp_wifi_get_max_tx_power(&tp_now) == ESP_OK) {
-        ESP_LOGW(TAG, "TX 功率限制: %d (1/4dBm) = %.1f dBm — 降低开 WiFi 的电流冲击",
+        ESP_LOGD(TAG, "TX 功率限制: %d (1/4dBm) = %.1f dBm — 降低开 WiFi 的电流冲击",
                  (int)tp_now, tp_now / 4.0);
     } else {
-        ESP_LOGW(TAG, "TX 功率限制失败: %s (继续, 但功耗冲击未缓解)",
+        ESP_LOGD(TAG, "TX 功率限制失败: %s (继续, 但功耗冲击未缓解)",
                  esp_err_to_name(tp_ret));
     }
 
     s_enabled = true;
     ESP_LOGI(TAG, "WiFi 射频已启动 (省电已关闭)");
+
+    /* ★ 2026-10-09 linit 需求: **打开 WiFi 就自动连上"上次保存的密码"**。
+     *   原来 enable() 只"开射频"不连网 —— 上层(应用商店门禁 / 设置页)各自再连一次,
+     *   既重复、又要和扫描抢状态, 还出现过"门禁看到 conn=0 就反复弹确认框"。
+     *   现在统一收口在 enable(): 只要有存的凭据且当前没连, 立刻发起连接。 */
+    if (!s_connected && !s_connecting && s_ssid[0]) {
+        if (sta_connect_saved()) ESP_LOGI(TAG, "已自动连接保存的 WiFi: %s", s_ssid);
+        else                     ESP_LOGD(TAG, "自动连接保存的 WiFi 失败: %s", s_ssid);
+    }
     return true;
 }
 
@@ -319,6 +362,36 @@ bool wifi_manager_disable(void) {
 bool wifi_manager_is_enabled(void) { return s_enabled; }
 bool wifi_manager_is_connected(void) { return s_connected; }
 bool wifi_manager_is_connecting(void) { return s_connecting; }
+
+/* ★ 2026-10-15 linit "联网归网络模块管": 是否配过网络 (有保存凭据).
+ * 门禁/商店据此判断"能不能等" —— 有配置就等模块自己连, 没配置才引导去设置。 */
+bool wifi_manager_has_saved(void) { return s_ssid[0] != '\0'; }
+
+/* ★ 2026-10-15: 网络模块自愈监督任务 —— **持久重连** (原来事件里只重试 5 次就永久放弃,
+ * 之后设备一直离线到用户手动重连 = "打开一直是离线" 的根因之一)。
+ * 每 5s 检查: 已开射频 + 有配置 + 未连且没在连 + 不在扫描 → 主动重连。 */
+static void wifi_supervisor_task(void *arg) {
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (s_enabled && s_ssid[0] && !s_connected && !s_connecting && !s_suppress_reconnect) {
+            ESP_LOGI(TAG, "网络自愈: 主动重连 %s", s_ssid);
+            sta_connect_saved();
+        }
+    }
+}
+
+/* ★ 2026-10-15: 开机自动联网 —— 有保存凭据就把射频拉起来并连上,
+ * 上层(应用/商店)只管查 is_connected, **不再各自联网**。
+ * 没配过网络则完全不动 (不开射频, 保持省电)。 */
+void wifi_manager_autostart(void) {
+    if (!s_inited) wifi_manager_init();
+    if (!s_inited) return;
+    if (s_ssid[0] == '\0') { ESP_LOGI(TAG, "开机自动联网: 未配置网络, 保持射频关闭"); return; }
+    if (!wifi_manager_enable()) { ESP_LOGW(TAG, "开机自动联网: 射频启动失败"); return; }
+    ESP_LOGI(TAG, "开机自动联网: 已发起连接 %s", s_ssid);
+}
+
 
 bool wifi_manager_consume_connected_event(void) {
     bool v = s_connected_just_now;

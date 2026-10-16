@@ -11,6 +11,7 @@
 #define OS_HW_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,18 @@ bool os_hw_request(os_hw_id_t id);
 void os_hw_release(os_hw_id_t id);
 /* 服务当前是否处于启动(活跃)状态 */
 bool os_hw_is_active(os_hw_id_t id);
+/* 底层模块的**真实运行态** (不只看调度器计数, 用于判断"用户自己开着的"设备) */
+bool os_hw_is_real_on(os_hw_id_t id);
+
+/* ==== 临时占用 (linit 2026-10-14, 全系统统一口径) ====
+ * 应用进入时**强制打开**网卡/蓝牙, 退出时按**进入前的状态**还原:
+ *   原本就开 → 保持开 (不参与引用计数, 退出时不动它);
+ *   原本关闭 → 由本次占用 request 起来, 退出时 release 关掉。
+ * 用法: 页面/服务持有一个静态 os_hw_lease_t, on_enter 逐个 acquire, on_exit 逐个 release。
+ * acquire 幂等 (同一 lease 重复 acquire 不会重复计数)。⛔ 不要再用裸 request/release 配对。 */
+typedef struct { uint8_t held; } os_hw_lease_t;   /* 位图: bit(i) = 本次由我们持有 */
+void os_hw_lease_acquire(os_hw_lease_t *l, os_hw_id_t id);
+void os_hw_lease_release(os_hw_lease_t *l, os_hw_id_t id);
 
 #ifdef __cplusplus
 }

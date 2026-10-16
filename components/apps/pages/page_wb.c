@@ -742,6 +742,7 @@ static const os_module_t s_mod_wb = {
     .touch      = p_wb_touch,
     .poll       = p_wb_poll,
     .fullscreen = true,
+    .exit_confirm = true,   /* 返回键先弹"退出程序?"确认 (2026-10-14 全局规范) */
     .swipe_back_disabled = true,  /* 全屏白板绘图页屏蔽上滑退出, 避免误退 (统一由内核设置) */
 };
 

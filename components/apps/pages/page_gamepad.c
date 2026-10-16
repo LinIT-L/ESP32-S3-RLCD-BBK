@@ -246,7 +246,7 @@ static void conn_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
              *   已映射过的手柄重连 → 只提示"连接成功", 不再强拉进向导(要重映射可从菜单进)。 */
             char pnm[33];
             if (bt_manager_take_map_pending(pnm, sizeof pnm)) {
-                ESP_LOGW(TAG, "[EV] 新手柄 '%s' 连接成功 -> 衔接按键映射", pnm);
+                ESP_LOGD(TAG, "[EV] 新手柄 '%s' 连接成功 -> 衔接按键映射", pnm);
                 start_key_mapping(ctx);
             } else {
                 ESP_LOGI(TAG, "[EV] 手柄已映射过, 连接成功不打扰(不弹映射向导)");
@@ -349,7 +349,7 @@ static void enter_connect_dlg(ui_ctx_t *ctx, const bt_device_t *dev) {
         nd.on_key  = conn_dlg_key;
         os_dialog_push(ctx, &nd);
     }
-    ESP_LOGW(TAG, "[EV] 发起连接: name=%s addr=%02x:%02x:%02x:%02x:%02x:%02x type=%d",
+    ESP_LOGD(TAG, "[EV] 发起连接: name=%s addr=%02x:%02x:%02x:%02x:%02x:%02x type=%d",
              s_conn_dev.name, s_conn_dev.bd_addr[0], s_conn_dev.bd_addr[1], s_conn_dev.bd_addr[2],
              s_conn_dev.bd_addr[3], s_conn_dev.bd_addr[4], s_conn_dev.bd_addr[5],
              (int)s_conn_dev.addr_type);
@@ -588,7 +588,7 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         /* ★ "每个按键只映射一次": 这个物理键本轮已经映射过了 → 用户手上没有"新键"可指
          *   (典型: 没有 Start/Select 的手柄)。**不再让他重复按同一个键**, 直接保存结束。 */
         if (phys >= 0 && phys < 32 && (s_map_used & (1u << phys))) {
-            ESP_LOGW(TAG, "按键映射: 键[%s]本轮已映射过 → 判定没有更多键, 提前完成",
+            ESP_LOGD(TAG, "按键映射: 键[%s]本轮已映射过 → 判定没有更多键, 提前完成",
                      bt_manager_phys_name((phys_t)phys));
             s_capture_armed = false;
             s_capture_phys = -1;
@@ -667,7 +667,7 @@ static void on_forget_confirm(ui_ctx_t *ctx, int result, void *ud) {
     if (bt_manager_forget_device(s_forget_name)) {
         os_dialog_pop(ctx);   /* 先关确认框回手柄菜单 (toast 会置 handled 阻止自动关) */
         os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\xbf\x98\xe8\xae\xb0\xe6\xad\xa4\xe6\x89\x8b\xe6\x9f\x84"); /* 已忘记此手柄 */
-        ESP_LOGW(TAG, "[EV] 用户忘记手柄: %s", nm);
+        ESP_LOGD(TAG, "[EV] 用户忘记手柄: %s", nm);
     }
 }
 
@@ -764,7 +764,7 @@ static void p_gamepad_enter(ui_ctx_t *ctx) {
     /* ★ 被"连接后自动映射"点名进来的 → 直接在菜单之上打开按键映射向导 */
     if (s_want_map) {
         s_want_map = false;
-        ESP_LOGW(TAG, "[EV] 自动进入按键映射 (连接后自动映射)");
+        ESP_LOGD(TAG, "[EV] 自动进入按键映射 (连接后自动映射)");
         start_key_mapping(ctx);
     }
 }
@@ -778,12 +778,14 @@ static void p_gamepad_enter(ui_ctx_t *ctx) {
 static void p_gamepad_exit(ui_ctx_t *ctx) {
     (void)ctx;
     if (s_map_active) {
-        ESP_LOGW(TAG, "[EV] 带着未完成的映射离开手柄页 → 取消映射并恢复手柄导航");
+        ESP_LOGD(TAG, "[EV] 带着未完成的映射离开手柄页 → 取消映射并恢复手柄导航");
     }
     s_map_active = false;
     s_capture_armed = false;
     s_capture_phys = -1;
     input_set_gamepad_nav_enabled(true);   /* ★ 幂等兜底: 无论如何都把导航恢复 */
+    /* ★ 本页**不走** os_hw_lease 还原蓝牙: 退出后手柄连接仍要继续用, 蓝牙不能关
+     *   (linit 2026-10-14: 手柄页除外)。 */
 }
 
 static const os_module_t s_mod_gamepad = {

@@ -86,6 +86,7 @@ static uint32_t s_bat_check_ms = 0;   /* 电量评估节流时间戳 (每 10 秒
 #include "os_mgr.h"
 #include "wallpapers.h"
 #include "sleep.h"
+#include "power_stat.h"   /* power_stat_init(): 电源统计 (设置→休眠与电源→电池信息) */
 #include "bt_manager.h"
 #include "wifi_manager.h"
 #include "usb_hid.h"
@@ -250,11 +251,11 @@ static void os_shell_loop(ui_ctx_t *ctx) {
                     if (bat.percent == 255 && s_bat_low_remind != 1) {
                         s_bat_low_remind = 1;   /* 未接模块: 仅提示一次 */
                         os_dialog_toast(ctx, "\xe6\x9c\xaa\xe6\xa3\x80\xe6\xb5\x8b\xe5\x88\xb0\xe7\x94\xb5\xe9\x87\x8f\xef\xbc\x88\xe4\xb8\x8d\xe6\x8c\x82\xe6\x9c\xba\xef\xbc\x89"); /* 未检测到电量（不关机） */
-                        ESP_LOGW("BAT", "未检测到电量模块, 仅提示 (不关机)");
+                        ESP_LOGD("BAT", "未检测到电量模块, 仅提示 (不关机)");
                     } else if (low && s_bat_low_remind != 0) {
                         s_bat_low_remind = 0;   /* 低电: 提示一次 */
                         os_dialog_toast(ctx, "\xe7\x94\xb5\xe9\x87\x8f\xe4\xbd\x8e\xef\xbc\x8c\xe5\x85\x88\xe5\x85\x85\xe7\x94\xb5"); /* 电量低，先充电 */
-                        ESP_LOGW("BAT", "电量低 %d%%, 请充电 (不关机)", (int)bat.percent);
+                        ESP_LOGD("BAT", "电量低 %d%%, 请充电 (不关机)", (int)bat.percent);
                     }
                 }
             }
@@ -316,6 +317,11 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
      * 初始化后立刻送"软件待机"(UBX-RXM-PMREQ), 把常驻 25~30mA 降到 µA 级.
      * 模块化: 驱动在 components/drivers/gps (gps.h API), 板级封装在 app_board. */
     app_board_init_gps(board);
+    /* ★★ 2026-10-15 linit "联网归网络模块管": 开机由**网络模块**自动联网 ——
+     *   有保存凭据就拉起射频并连接, 之后断线重连全归它的自愈任务。
+     *   应用/商店只管查 wifi_manager_is_connected(), 不再各自弹门禁去连网
+     *   (原来没人主动开射频 ⇒ 不手动进设置页就一直"未联网")。 */
+    wifi_manager_autostart();
     if (usb_bt_is_active()) {
         /* USB-BT 激活 (开机早期进 BTH 模式): 蓝牙控制器供 USB 蓝牙适配器独占,
          * 不启动手柄蓝牙, 直接初始化 BTH. 这是官方 usb_dongle 方式(开机早期进),
@@ -349,6 +355,10 @@ void app_main(void)
      * 不足(碰一下)判为误触, 直接回深睡(不返回); 自动关机 / 上电启动直接放行。 */
     wp_power_wake_gate();
 
+    /* 电源统计: 结算上次深睡时长, 起新的"醒着段" (设置→休眠与电源→电池信息)。
+     * 必须早调: 放在门控之后、其它初始化之前, 免得把初始化耗时也算进上一段睡眠。 */
+    power_stat_init();
+
     /* V1.0.90: 自动保存日志到 TF (串口照常打印, 同时缓存进 /sdcard/log/bbk.log) */
     svc_log_init();
     /* ★ 版本管理整合 (2026-10-02): 开机横幅带版本 + git 提交 + 构建时刻。
@@ -376,7 +386,7 @@ void app_main(void)
     app_board_t board;
     esp_err_t ret = app_board_init(&board);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "硬件初始化失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "硬件初始化失败: %s", esp_err_to_name(ret));
         return;
     }
     g_lcd = board.lcd;

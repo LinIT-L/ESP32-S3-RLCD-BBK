@@ -39,11 +39,11 @@ typedef struct {
     int      pin_tx;         /* ESP TX → GPS RXD, 默认 43 */
     int      pin_rx;         /* ESP RX ← GPS TXD, 默认 44 */
     int      pin_extint;     /* GPS EXTINT, 默认 47 (不用填 -1) */
-    uint32_t baud;           /* 默认 921600 */
+    uint32_t baud;           /* 默认 9600 (backup 唤醒后会丢配置回到出厂默认, 见 gps.c) */
     bool     drive_extint;   /* true=把 EXTINT 当输出(可主动脉冲唤醒); false=输入+上拉(默认) */
 } gps_config_t;
 
-/* 默认配置 (GPIO43/44 + EXTINT 47, 921600) */
+/* 默认配置 (GPIO43/44 + EXTINT 8, 9600) */
 const gps_config_t *gps_default_config(void);
 
 /* 初始化 UART/GPIO 并置 ACTIVE. cfg=NULL → 用默认配置. */

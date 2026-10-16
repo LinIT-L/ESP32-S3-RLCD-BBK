@@ -201,7 +201,9 @@ static int l_json_pick(lua_State *L) {
     const char *akey = luaL_optstring(L, 2, "");
     const char *fields = luaL_optstring(L, 3, "");
     int max = (int)luaL_optinteger(L, 4, 200);
-    if (max <= 0 || max > 512) max = 200;
+    /* ★ 上限 512 → 2048: 省级地图包的 tiles 清单轻松上百条 (0.2° 网格一省数百块),
+     *   512 会在**静默**处截断 —— 表现为"地图下了一半, 后面全是空白"。 */
+    if (max <= 0 || max > 2048) max = 200;
 
     /* 字段白名单 */
     char want[JSK_FIELD_MAX][JSK_KEY_MAX];

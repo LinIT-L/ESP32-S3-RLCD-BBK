@@ -143,17 +143,17 @@ static bool prepare_rx(void)
      * 若 WiFi 没起, 直接报错并提示上层 (不再徒劳重试, 避免刷一堆 wifi 驱动报错)。 */
     wifi_mode_t mode;
     if (esp_wifi_get_mode(&mode) != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi 未初始化: 请由上层先 wifi_manager_enable() —— "
+        ESP_LOGD(TAG, "WiFi 未初始化: 请由上层先 wifi_manager_enable() —— "
                       "本固件因 SDR 的 64KB 采集区, 无法自行 init WiFi (会 NO_MEM)");
         return false;
     }
     esp_wifi_disconnect();          /* 先断开, 免得 STA 还连着 AP 抢射频 */
     esp_wifi_set_mode(WIFI_MODE_NULL);
     esp_err_t e = esp_wifi_start();
-    if (e != ESP_OK && e != ESP_ERR_WIFI_CONN) ESP_LOGW(TAG, "esp_wifi_start: %s", esp_err_to_name(e));
+    if (e != ESP_OK && e != ESP_ERR_WIFI_CONN) ESP_LOGD(TAG, "esp_wifi_start: %s", esp_err_to_name(e));
     esp_wifi_set_ps(WIFI_PS_NONE);
     e = esp_wifi_set_promiscuous(true);
-    if (e != ESP_OK) ESP_LOGW(TAG, "set_promiscuous: %s", esp_err_to_name(e));
+    if (e != ESP_OK) ESP_LOGD(TAG, "set_promiscuous: %s", esp_err_to_name(e));
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
     /* PHY 上电序列 (顺序照抄官方, 不要调换) */
@@ -260,9 +260,9 @@ int espsdr_capture(unsigned n, unsigned divider)
     REG_WRITE(SRAM_OWNER_REG, s_owner_saved);
     s_have_owner = false;
 
-    if (!done) { ESP_LOGW(TAG, "采集超时 (%u µs)", (unsigned)s_last_us); return -1; }
+    if (!done) { ESP_LOGD(TAG, "采集超时 (%u µs)", (unsigned)s_last_us); return -1; }
     if (IQ_BUFFER[0] == SENTINEL || IQ_BUFFER[n - 1] == SENTINEL) {
-        ESP_LOGW(TAG, "缓冲未被写入 (modem 没动) —— 检查 PHY 是否就绪");
+        ESP_LOGD(TAG, "缓冲未被写入 (modem 没动) —— 检查 PHY 是否就绪");
         return -1;
     }
 
@@ -278,7 +278,7 @@ int espsdr_capture(unsigned n, unsigned divider)
                 if (IQ_BUFFER[j] != SENTINEL) { hi = j; break; }
             }
             s_overrun_hi = (int)hi;
-            ESP_LOGE(TAG, "⚠ modem 越写采集区: 首个越写字 #%u, 最高 #%u "
+            ESP_LOGD(TAG, "⚠ modem 越写采集区: 首个越写字 #%u, 最高 #%u "
                           "(本次 n=%u, 窗口 %u 字) —— 采集区不能再缩小!",
                      bad, hi, n, APERTURE_WORDS);
             return -1;

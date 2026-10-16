@@ -28,7 +28,6 @@
 #include "esp_log.h"
 #include <stdlib.h>
 #include <string.h>
-#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 #define TAG "VIB"
 
@@ -54,7 +53,7 @@ typedef enum { VIB_NONE = 0, VIB_TM6604 = 1 } vib_mode_t;
  *   ⛔ 不要用 GPIO4: 它在旧固件里是**电池 ADC (ADC1_CH3)**(`board_battery.c`),
  *      拿 LEDC 去驱动会把电量采样搅成垃圾。
  * ⚠ 原 GPIO42 让给了 LCD 片选(42 同样在 24 个可用脚里 ✓)。 */
-#define VIB_PWM_PIN   ((gpio_num_t)CFG_VIB_PWM)   /* ★ 唯一真相源: board_cfg.h */
+#define VIB_PWM_PIN   GPIO_NUM_8   /* ★2026-10-13 新载板: 震动改 GPIO8 */
 #define VIB_TIMER     LEDC_TIMER_1
 #define VIB_CHANNEL   LEDC_CHANNEL_1
 #define VIB_RES       LEDC_TIMER_8_BIT
@@ -85,21 +84,7 @@ static volatile bool s_music_on;
  *   新板震动电源默认常开 + GPIO42 归了屏 CS ⇒ EN 与 PWM 合并到 GPIO48 一根线,
  *   drv_enable()/VIB_EN_PIN 整条删掉 (停止震动 = duty 归 0)。 */
 static bool ledc_init(void) {
-    /* ★★★ 2026-10-16 关键修复: **删掉 gpio_reset_pin(VIB_PWM_PIN)** ——
-     *   它把该脚重配成"输入+内部上拉", 对 TM6604(**边沿触发**) 就是**一个上升沿** ⇒
-     *   马达被触发 ⇒ 表现为"logo 画完(紧接着 vibrator_init)就开始一直震"。
-     *   改为"输出 + 禁上拉 + 使能下拉 + 低电平", 全程不给它任何边沿。 */
-    {
-        gpio_config_t vib0 = {
-            .pin_bit_mask = (1ULL << VIB_PWM_PIN),
-            .mode         = GPIO_MODE_OUTPUT,
-            .pull_up_en   = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_ENABLE,
-            .intr_type    = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&vib0);
-        gpio_set_level(VIB_PWM_PIN, 0);
-    }
+    gpio_reset_pin(VIB_PWM_PIN);
     ledc_timer_config_t tc = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = VIB_TIMER,
         .duty_resolution = VIB_RES, .freq_hz = VIB_RES_FREQ, .clk_cfg = LEDC_AUTO_CLK,
@@ -148,7 +133,7 @@ static void tap_timer_cb(TimerHandle_t t) { (void)t; out_off(); }
 void vibrator_init(void) {
     if (s_mode != VIB_NONE) return;
     if (!ledc_init()) {
-        ESP_LOGE(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)VIB_PWM_PIN);
+        ESP_LOGD(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)VIB_PWM_PIN);
         return;
     }
     s_mode = VIB_TM6604;
@@ -327,7 +312,7 @@ void vibrator_music_mode(bool en) {
         if (s_music_task == NULL) {
             if (xTaskCreate(music_task, "vib_music", 2048, NULL, 3, &s_music_task) != pdPASS) {
                 s_music_on = false;
-                ESP_LOGE(TAG, "音乐震动任务创建失败");
+                ESP_LOGD(TAG, "音乐震动任务创建失败");
             }
         }
     } else {

@@ -26,6 +26,13 @@ int es8311_set_sample_rate(int sample_rate);
 /* 设置音量 (0-100) */
 int es8311_set_volume(int percent);
 
+/* === 运行时诊断 API (供 remcon 串口排查, 2026-10-09) ===
+ * 背景: "初始化全成功、就是没声音" 时, 唯一能确认 codec 是否真被配好/寄存器是否真的写进去
+ * 的办法就是**回读**。这三个 API 让串口可以直接读/写任意寄存器, 用于现场定位。 */
+int es8311_peek(uint8_t reg, uint8_t *val);   /* 读一个寄存器, 0=成功 */
+int es8311_poke(uint8_t reg, uint8_t val);    /* 写一个寄存器, 0=成功 */
+int es8311_dump_regs(void);                   /* 回读 0x00~0x4E 并打印, 返回成功条数 */
+
 /* 关闭/休眠 */
 void es8311_shutdown(void);
 

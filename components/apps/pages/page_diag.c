@@ -679,7 +679,7 @@ static void p_diag_action(ui_ctx_t *ctx, os_action_t action) {
         dConfirmSelect();
         break;
     case OS_ACTION_BACK:
-        if (g_stage == D_ST_DEV) { os_pop(ctx); return; }   /* 最顶层: 返回上一页 */
+        if (g_stage == D_ST_DEV) { os_request_exit_confirm(ctx); return; }   /* 最顶层: 弹"退出程序?"确认, 确认才退 */
         dStepBack();
         break;
     default: break;

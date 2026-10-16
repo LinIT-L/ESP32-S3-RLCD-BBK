@@ -2,5 +2,5 @@
 idf_component_register(
     SRCS "cheater.c" "cheat_ui.c" "cheat_float.c"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES "esp_common" "heap" "st7305" "input" "bt_ctl" "ui_common" "fonts" "vibrator"
+    PRIV_REQUIRES "esp_common" "heap" "st7305" "input" "bt_ctl" "ui_common"  "vibrator" "fonts"
 )

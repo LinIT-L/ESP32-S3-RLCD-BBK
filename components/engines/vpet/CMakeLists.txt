@@ -14,12 +14,14 @@ idf_component_register(
         "${CMAKE_SOURCE_DIR}/components/services/tone_player"
         "${CMAKE_SOURCE_DIR}/components/ui/virtual_keys"
     REQUIRES
+    input
+    bt_ctl
         "st7305"
         "tone_player"
         "virtual_keys"
         "cheater"
         "board_shim"
-        "input"
-        "bt_ctl"
+        
+        
         "fatfs"
 )

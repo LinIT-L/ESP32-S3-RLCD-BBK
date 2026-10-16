@@ -15,12 +15,26 @@
 #include "gps.h"
 #include "gps_nmea.h"
 
-/* app.gps.start() → bool: 初始化 UART 并起后台解析任务 (幂等) */
+/* app.gps.start() → bool: 初始化 UART、**唤醒模块**、起后台解析任务 (幂等)
+ * ★ 2026-10-09 修: 原来漏了 gps_wakeup() —— 开机时 app_board 已经把 GPS 送进
+ *   "软件待机(46µA)", 不唤醒的话它是睡着的, 服务起来的 1.2s 线路探测一个字节都
+ *   收不到 ⇒ 应用永远显示"无 GPS 数据"。启动顺序必须是 唤醒 → 再起服务。 */
 static int l_gps_start(lua_State *L) {
     esp_err_t e = ESP_OK;
     if (!gps_is_ready()) e = gps_init(NULL);
+    if (e == ESP_OK) e = gps_wakeup();
     if (e == ESP_OK) e = gps_service_start();
     lua_pushboolean(L, e == ESP_OK);
+    return 1;
+}
+
+/* app.gps.stop() → bool: 停后台解析任务 + **把模块送回待机** (2026-10-09)
+ * 应用退出时务必调用: 否则解析任务常驻, 且 GPS 会保持 ~10mA 连续跟踪
+ * (待机只需 46µA) —— 直接吃电池。 */
+static int l_gps_stop(lua_State *L) {
+    gps_service_stop();
+    gps_sleep();
+    lua_pushboolean(L, true);
     return 1;
 }
 
@@ -86,6 +100,7 @@ void lua_mod_gps_register(lua_State *L)
 {
     lua_newtable(L);
     lua_pushcfunction(L, l_gps_start);   lua_setfield(L, -2, "start");
+    lua_pushcfunction(L, l_gps_stop);    lua_setfield(L, -2, "stop");
     lua_pushcfunction(L, l_gps_fix);     lua_setfield(L, -2, "fix");
     lua_pushcfunction(L, l_gps_demo);    lua_setfield(L, -2, "demo");
     lua_pushcfunction(L, l_gps_reset);   lua_setfield(L, -2, "reset");

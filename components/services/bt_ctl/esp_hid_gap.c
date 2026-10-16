@@ -183,7 +183,7 @@ static void add_bt_scan_result(esp_bd_addr_t bda, esp_bt_cod_t *cod, esp_bt_uuid
         if (r->name == NULL && name && name_len) {
             char *name_s = (char *)malloc(name_len + 1);
             if (name_s == NULL) {
-                ESP_LOGE(TAG, "Malloc result name failed!");
+                ESP_LOGD(TAG, "Malloc result name failed!");
                 return;
             }
             memcpy(name_s, name, name_len);
@@ -201,7 +201,7 @@ static void add_bt_scan_result(esp_bd_addr_t bda, esp_bt_cod_t *cod, esp_bt_uuid
 
     r = (esp_hid_scan_result_t *)malloc(sizeof(esp_hid_scan_result_t));
     if (r == NULL) {
-        ESP_LOGE(TAG, "Malloc bt_hidh_scan_result_t failed!");
+        ESP_LOGD(TAG, "Malloc bt_hidh_scan_result_t failed!");
         return;
     }
     r->transport = ESP_HID_TRANSPORT_BT;
@@ -215,7 +215,7 @@ static void add_bt_scan_result(esp_bd_addr_t bda, esp_bt_cod_t *cod, esp_bt_uuid
         char *name_s = (char *)malloc(name_len + 1);
         if (name_s == NULL) {
             free(r);
-            ESP_LOGE(TAG, "Malloc result name failed!");
+            ESP_LOGD(TAG, "Malloc result name failed!");
             return;
         }
         memcpy(name_s, name, name_len);
@@ -252,7 +252,7 @@ static void add_ble_scan_result(esp_bd_addr_t bda, esp_ble_addr_type_t addr_type
     }
     esp_hid_scan_result_t *r = (esp_hid_scan_result_t *)malloc(sizeof(esp_hid_scan_result_t));
     if (r == NULL) {
-        ESP_LOGE(TAG, "Malloc ble_hidh_scan_result_t failed!");
+        ESP_LOGD(TAG, "Malloc ble_hidh_scan_result_t failed!");
         return;
     }
     r->transport = ESP_HID_TRANSPORT_BLE;
@@ -266,7 +266,7 @@ static void add_ble_scan_result(esp_bd_addr_t bda, esp_ble_addr_type_t addr_type
         char *name_s = (char *)malloc(name_len + 1);
         if (name_s == NULL) {
             free(r);
-            ESP_LOGE(TAG, "Malloc result name failed!");
+            ESP_LOGD(TAG, "Malloc result name failed!");
             return;
         }
         memcpy(name_s, name, name_len);
@@ -283,12 +283,12 @@ static void add_ble_scan_result(esp_bd_addr_t bda, esp_ble_addr_type_t addr_type
 static void add_ble_scan_result(const uint8_t *bda, uint8_t addr_type, uint16_t appearance, uint8_t *name, uint8_t name_len, int rssi)
 {
     if (find_scan_result(bda, ble_scan_results)) {
-        ESP_LOGW(TAG, "Result already exists!");
+        ESP_LOGD(TAG, "Result already exists!");
         return;
     }
     esp_hid_scan_result_t *r = (esp_hid_scan_result_t *)malloc(sizeof(esp_hid_scan_result_t));
     if (r == NULL) {
-        ESP_LOGE(TAG, "Malloc ble_hidh_scan_result_t failed!");
+        ESP_LOGD(TAG, "Malloc ble_hidh_scan_result_t failed!");
         return;
     }
     r->transport = ESP_HID_TRANSPORT_BLE;
@@ -302,7 +302,7 @@ static void add_ble_scan_result(const uint8_t *bda, uint8_t addr_type, uint16_t 
         char *name_s = (char *)malloc(name_len + 1);
         if (name_s == NULL) {
             free(r);
-            ESP_LOGE(TAG, "Malloc result name failed!");
+            ESP_LOGD(TAG, "Malloc result name failed!");
             return;
         }
         memcpy(name_s, name, name_len);
@@ -544,7 +544,7 @@ static void bt_gap_event_handler(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_para
         break;
     }
     default:
-        ESP_LOGW(TAG, "BT GAP EVENT %s", bt_gap_evt_str(event));
+        ESP_LOGD(TAG, "BT GAP EVENT %s", bt_gap_evt_str(event));
         break;
     }
 }
@@ -567,13 +567,13 @@ static esp_err_t init_bt_gap(void)
     esp_bt_gap_set_pin(pin_type, 0, pin_code);
 
     if ((ret = esp_bt_gap_register_callback(bt_gap_event_handler)) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_bt_gap_register_callback failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bt_gap_register_callback failed: %d", ret);
         return ret;
     }
 
     // Allow BT devices to connect back to us
     if ((ret = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE)) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_bt_gap_set_scan_mode failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bt_gap_set_scan_mode failed: %d", ret);
         return ret;
     }
     return ret;
@@ -583,7 +583,7 @@ static esp_err_t start_bt_scan(uint32_t seconds)
 {
     esp_err_t ret = ESP_OK;
     if ((ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, (int)(seconds / 1.28), 0)) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_bt_gap_start_discovery failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bt_gap_start_discovery failed: %d", ret);
         return ret;
     }
     return ret;
@@ -643,7 +643,7 @@ static void ble_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_p
      * */
     case ESP_GAP_BLE_AUTH_CMPL_EVT:
         if (!param->ble_security.auth_cmpl.success) {
-            ESP_LOGE(TAG, "BLE GAP AUTH ERROR: 0x%x", param->ble_security.auth_cmpl.fail_reason);
+            ESP_LOGD(TAG, "BLE GAP AUTH ERROR: 0x%x", param->ble_security.auth_cmpl.fail_reason);
         } else {
             ESP_LOGI(TAG, "BLE GAP AUTH SUCCESS");
         }
@@ -692,7 +692,7 @@ static esp_err_t init_ble_gap(void)
     esp_err_t ret;
 
     if ((ret = esp_ble_gap_register_callback(ble_gap_event_handler)) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ble_gap_register_callback failed: %d", ret);
+        ESP_LOGD(TAG, "esp_ble_gap_register_callback failed: %d", ret);
         return ret;
     }
     return ret;
@@ -711,13 +711,13 @@ static esp_err_t start_ble_scan(uint32_t seconds)
 {
     esp_err_t ret = ESP_OK;
     if ((ret = esp_ble_gap_set_scan_params(&hid_scan_params)) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ble_gap_set_scan_params failed: %d", ret);
+        ESP_LOGD(TAG, "esp_ble_gap_set_scan_params failed: %d", ret);
         return ret;
     }
     WAIT_BLE_CB();
 
     if ((ret = esp_ble_gap_start_scanning(seconds)) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ble_gap_start_scanning failed: %d", ret);
+        ESP_LOGD(TAG, "esp_ble_gap_start_scanning failed: %d", ret);
         return ret;
     }
     return ret;
@@ -759,42 +759,42 @@ esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
     uint32_t passkey = 1234;//ESP_IO_CAP_OUT
 
     if ((ret = esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, 1)) != ESP_OK) {
-        ESP_LOGE(TAG, "GAP set_security_param AUTHEN_REQ_MODE failed: %d", ret);
+        ESP_LOGD(TAG, "GAP set_security_param AUTHEN_REQ_MODE failed: %d", ret);
         return ret;
     }
 
     if ((ret = esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, 1)) != ESP_OK) {
-        ESP_LOGE(TAG, "GAP set_security_param IOCAP_MODE failed: %d", ret);
+        ESP_LOGD(TAG, "GAP set_security_param IOCAP_MODE failed: %d", ret);
         return ret;
     }
 
     if ((ret = esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, 1)) != ESP_OK) {
-        ESP_LOGE(TAG, "GAP set_security_param SET_INIT_KEY failed: %d", ret);
+        ESP_LOGD(TAG, "GAP set_security_param SET_INIT_KEY failed: %d", ret);
         return ret;
     }
 
     if ((ret = esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, 1)) != ESP_OK) {
-        ESP_LOGE(TAG, "GAP set_security_param SET_RSP_KEY failed: %d", ret);
+        ESP_LOGD(TAG, "GAP set_security_param SET_RSP_KEY failed: %d", ret);
         return ret;
     }
 
     if ((ret = esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, 1)) != ESP_OK) {
-        ESP_LOGE(TAG, "GAP set_security_param MAX_KEY_SIZE failed: %d", ret);
+        ESP_LOGD(TAG, "GAP set_security_param MAX_KEY_SIZE failed: %d", ret);
         return ret;
     }
 
     if ((ret = esp_ble_gap_set_security_param(ESP_BLE_SM_SET_STATIC_PASSKEY, &passkey, sizeof(uint32_t))) != ESP_OK) {
-        ESP_LOGE(TAG, "GAP set_security_param SET_STATIC_PASSKEY failed: %d", ret);
+        ESP_LOGD(TAG, "GAP set_security_param SET_STATIC_PASSKEY failed: %d", ret);
         return ret;
     }
 
     if ((ret = esp_ble_gap_set_device_name(device_name)) != ESP_OK) {
-        ESP_LOGE(TAG, "GAP set_device_name failed: %d", ret);
+        ESP_LOGD(TAG, "GAP set_device_name failed: %d", ret);
         return ret;
     }
 
     if ((ret = esp_ble_gap_config_adv_data(&ble_adv_data)) != ESP_OK) {
-        ESP_LOGE(TAG, "GAP config_adv_data failed: %d", ret);
+        ESP_LOGD(TAG, "GAP config_adv_data failed: %d", ret);
         return ret;
     }
 
@@ -829,24 +829,24 @@ static esp_err_t init_low_level(uint8_t mode)
 #endif
     ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
     if (ret) {
-        ESP_LOGE(TAG, "esp_bt_controller_mem_release failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bt_controller_mem_release failed: %d", ret);
         return ret;
     }
     ret = esp_bt_controller_init(&bt_cfg);
     if (ret) {
-        ESP_LOGE(TAG, "esp_bt_controller_init failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bt_controller_init failed: %d", ret);
         return ret;
     }
 
     ret = esp_bt_controller_enable(mode);
     if (ret) {
-        ESP_LOGE(TAG, "esp_bt_controller_enable failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bt_controller_enable failed: %d", ret);
         return ret;
     }
 
     ret = esp_nimble_init();
     if (ret) {
-        ESP_LOGE(TAG, "esp_nimble_init failed: %d", ret);
+        ESP_LOGD(TAG, "esp_nimble_init failed: %d", ret);
         return ret;
     }
 
@@ -1077,19 +1077,19 @@ static esp_err_t init_low_level(uint8_t mode)
     {
         ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
         if (ret) {
-            ESP_LOGE(TAG, "esp_bt_controller_mem_release failed: %d", ret);
+            ESP_LOGD(TAG, "esp_bt_controller_mem_release failed: %d", ret);
             return ret;
         }
     }
     ret = esp_bt_controller_init(&bt_cfg);
     if (ret) {
-        ESP_LOGE(TAG, "esp_bt_controller_init failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bt_controller_init failed: %d", ret);
         return ret;
     }
 
     ret = esp_bt_controller_enable(mode);
     if (ret) {
-        ESP_LOGE(TAG, "esp_bt_controller_enable failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bt_controller_enable failed: %d", ret);
         return ret;
     }
 
@@ -1099,13 +1099,13 @@ static esp_err_t init_low_level(uint8_t mode)
 #endif
     ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg);
     if (ret) {
-        ESP_LOGE(TAG, "esp_bluedroid_init failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bluedroid_init failed: %d", ret);
         return ret;
     }
 
     ret = esp_bluedroid_enable();
     if (ret) {
-        ESP_LOGE(TAG, "esp_bluedroid_enable failed: %d", ret);
+        ESP_LOGD(TAG, "esp_bluedroid_enable failed: %d", ret);
         return ret;
     }
 #if CONFIG_BT_HID_HOST_ENABLED
@@ -1132,24 +1132,24 @@ esp_err_t esp_hid_gap_init(uint8_t mode)
 {
     esp_err_t ret;
     if (!mode || mode > ESP_BT_MODE_BTDM) {
-        ESP_LOGE(TAG, "Invalid mode given!");
+        ESP_LOGD(TAG, "Invalid mode given!");
         return ESP_FAIL;
     }
 
     if (bt_hidh_cb_semaphore != NULL) {
-        ESP_LOGE(TAG, "Already initialised");
+        ESP_LOGD(TAG, "Already initialised");
         return ESP_FAIL;
     }
 
     bt_hidh_cb_semaphore = xSemaphoreCreateBinary();
     if (bt_hidh_cb_semaphore == NULL) {
-        ESP_LOGE(TAG, "xSemaphoreCreateMutex failed!");
+        ESP_LOGD(TAG, "xSemaphoreCreateMutex failed!");
         return ESP_FAIL;
     }
 
     ble_hidh_cb_semaphore = xSemaphoreCreateBinary();
     if (ble_hidh_cb_semaphore == NULL) {
-        ESP_LOGE(TAG, "xSemaphoreCreateMutex failed!");
+        ESP_LOGD(TAG, "xSemaphoreCreateMutex failed!");
         vSemaphoreDelete(bt_hidh_cb_semaphore);
         bt_hidh_cb_semaphore = NULL;
         return ESP_FAIL;

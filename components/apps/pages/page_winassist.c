@@ -1,5 +1,5 @@
 /**
- * page_winassist.c — 运维助手 (基于「仿真键鼠」模板改造).
+ * page_winassist.c — Win工具台 (基于「仿真键鼠」模板改造; 2026-10-15 前叫"运维助手").
  *
  * USB 复合(进入): HID 键盘 + 鼠标 + CDC 串口 (os_hid_start).
  * 界面:
@@ -293,7 +293,7 @@ static void ws_action(ui_ctx_t *ctx, os_action_t action) {
 }
 static void ws_enter(ui_ctx_t *ctx) {
     esp_err_t ret = os_hid_start();
-    if (ret != ESP_OK) { ESP_LOGE(TAG, "运维助手 USB 启动失败: %s", esp_err_to_name(ret)); os_pop(ctx); return; }
+    if (ret != ESP_OK) { ESP_LOGD(TAG, "运维助手 USB 启动失败: %s", esp_err_to_name(ret)); os_pop(ctx); return; }
     gesture_back_enable(false);
     s_tp_active = false;
 }
@@ -310,6 +310,7 @@ static const os_module_t s_mod_winassist = {
     .on_enter = ws_enter, .on_exit = ws_exit,
     .render = ws_render, .action = ws_action, .touch = ws_touch, .poll = ws_poll,
     .fullscreen = true,
+    .exit_confirm = true,   /* 返回键先弹"退出程序?"确认 (2026-10-14 全局规范) */
     .swipe_back_disabled = true,  /* 全屏运维助手屏蔽上滑退出 (统一由内核设置) */
 };
 void os_page_winassist_register(void) { os_register(&s_mod_winassist); }

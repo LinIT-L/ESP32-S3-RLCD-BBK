@@ -142,7 +142,7 @@ static void mp3_scan_files(void) {
     if (!s_files) {
         s_files = heap_caps_malloc(MAX_MP3_FILES * MP3_FNAME_LEN, MALLOC_CAP_SPIRAM);
         if (!s_files) s_files = malloc(MAX_MP3_FILES * MP3_FNAME_LEN);
-        if (!s_files) { ESP_LOGE(TAG, "MP3 列表内存不足"); return; }
+        if (!s_files) { ESP_LOGD(TAG, "MP3 列表内存不足"); return; }
     }
     s_count = 0;
     DIR *dir = opendir(MP3_DIR);
@@ -257,7 +257,7 @@ static int mp3_play_at(int idx) {
     if (ret == 0) {
         s_in_player = true;
     } else {
-        ESP_LOGE(TAG, "播放失败: %s", path);
+        ESP_LOGD(TAG, "播放失败: %s", path);
     }
     return ret;
 }

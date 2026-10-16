@@ -22,7 +22,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC_DIR = os.path.expanduser("~/Desktop/LinTOS_Lua应用/src")
+SRC_DIR = os.path.expanduser("~/Desktop/LinTOS/src")   # 2026-10-15 linit 桌面重构: LinTOS_Lua应用 → LinTOS
 DEST_ROOT = os.path.join(ROOT, "apps", "lua", "apps")     # SPIFFS 根 (含 apps/ 一层)
 SPIFFS_BIN = os.path.join(ROOT, "build", "apps_l.bin")
 
@@ -58,8 +58,10 @@ MANIFEST = {
     # BIOS 装机模拟器（掌机版）: 纯黑白 1bpp，7 家品牌真实菜单结构 + 8 个装机任务。
     # 数据与电脑版 apps/biossim/biossim.html 同源（tools/biossim_gen_lua.py 生成数据段）。
     # 源码: ~/Desktop/LinTOS_Lua应用/src/biossim.lua
+    # 图标: 2026-10-15 linit 要求换独立图标 (原借 ICON_DIAG=17 电脑诊断) →
+    #   ICON_BIOSSIM(=35, 当天追加进 icons_main.inc, PNG=完美图标/应用管家/运维/BIOS模拟器.png)
     "biossim": ("ops", "BIOS模拟器", "运维",
-                "7 家品牌 BIOS 装机模拟: 装 Win11/Linux 要改哪几项, 先在掌机上练", "ICON_DIAG"),
+                "7 家品牌 BIOS 装机模拟: 装 Win11/Linux 要改哪几项, 先在掌机上练", "ICON_BIOSSIM"),
     # 附近航班雷达 (掌机版): 数据源 adsb.fi 开放接口 (免 key) → 极坐标雷达 + 最近航班列表
     # + 航班详情卡。源码里带 `--@app need=wifi`: 打开时若未联网, 先弹窗走系统"连接WiFi",
     # 连上再进 (门禁实现在 components/apps/pages/am_lua.c 的 wl_open()/wl_gate_tick())。
@@ -85,8 +87,10 @@ MANIFEST = {
     #   瓦片改成 32px(linit 定: 原版 60px 缩到 32px 这一档) + 相机跟随。
     "earthsurvival": ("app", "地球生存", "游戏",
                       "开源移植: 吃光能量球, 躲开敌人与鲨鱼, 水和流沙会耗能量", "ICON_MINI_GAMES"),
+    # 图标: 2026-10-15 linit 要求换独立图标 (原借 ICON_NETDECT=27 网络检测) →
+    #   ICON_PLANERADAR(=36, 当天追加进 icons_main.inc, PNG=完美图标/应用管家/运维/航班雷达.png)
     "planeradar": ("ops", "航班雷达", "运维",
-                   "自动定位当前位置, 扫描附近空域航班: 距离/方位/高度/地速/呼号", "ICON_NETDECT"),
+                   "自动定位当前位置, 扫描附近空域航班: 距离/方位/高度/地速/呼号", "ICON_PLANERADAR"),
     # ★ 码表 (自行车码表, 第一版): 纯本机 GPS, **不依赖 Garmin**。
     #   数据链: MAX-M10S → gps.c(传输) → gps_nmea.c(解析) → app.gps.*(Lua 桥) → bikecomp.lua
     #   三页: 码表 / 轨迹 / GPS 诊断(上机调线就看这页)。GPS 未接好时自动降级成内置模拟。
@@ -94,6 +98,14 @@ MANIFEST = {
     #   图标 ICON_BIKE 是程序化线描 (64×64, 墨量 0.17), 不是彩色缩图。
     "bikecomp": ("app", "码表", "程序",
                  "自行车码表: GPS 速度/里程/轨迹, 心率栏已预留", "ICON_BIKE"),
+    # ★ 矢量离线地图: 数据是 tools/map_vec.py 从 OSM(Overpass) + terrarium DEM 编译出来的
+    #   **矢量包** .ltm (只有折线点串, 不是图片), 放在 apps/lua/map/ → 设备上 /store/map/。
+    #   设备端 map.lua 按当前缩放选 LOD 档实时投影+画线, 所以一份数据覆盖全部 zoom, 任意
+    #   放大都清晰、文字永远是固件 16px 点阵。
+    #   ⚠ 图标走**独立 PNG** (tools/gen_map_icon.py 程序化线描), 不放进 main_icons[] ——
+    #     那张表的下标 = ABI (main_icon_index() 有重映射表), 往里插会动到既有应用。
+    "map": ("app", "矢量地图", "工具",
+            "离线矢量地图: 道路/等高线双图层, 任意缩放不糊, GPS 定位", "assets/icons/map_app.png"),
 }
 # MANIFEST = {
 #     "calc":      ("app", "计算器",   "程序", "表达式求值, 支持括号与四则运算",             "ICON_CALC"),
@@ -197,7 +209,13 @@ def main():
         need = NEED.get(n)
         for f in targets_of(n):          # 商店包与预装副本都要打 LAPP 头(否则管家读不到名称/图标)
             cmd = [PY, "tools/pack_app.py", "pack", f, "--name", label, "--cat", tag,
-                   "--desc", desc, "--icon-from-main", icon]
+                   "--desc", desc]
+            # 图标两种来源: "ICON_XXX" = 取固件 main_icons[] 同源位图; "*.png" = 独立图片,
+            # 打进 .lua 自己的 LAPP 前奏 (不碰固件图标表, 不动 ABI)。
+            if icon.endswith(".png"):
+                cmd += ["--icon", os.path.join(ROOT, icon)]
+            else:
+                cmd += ["--icon-from-main", icon]
             if need:
                 cmd += ["--need", need]
             run(cmd)

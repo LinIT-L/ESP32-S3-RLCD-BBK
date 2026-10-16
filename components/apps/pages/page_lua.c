@@ -107,12 +107,12 @@ void lua_probe_stage(int stage, const char *info) {
 static void lua_probe_print_once(void) {
     esp_reset_reason_t r = esp_reset_reason();
     if (s_probe_magic == LUA_PROBE_MAGIC)
-        ESP_LOGW("LUAPROBE", "上次复位前: 阶段=%u '%s' 任务=%s 栈余=%u词(≈%uB) 内部堆=%u PSRAM=%u | 复位原因=%d",
+        ESP_LOGD("LUAPROBE", "上次复位前: 阶段=%u '%s' 任务=%s 栈余=%u词(≈%uB) 内部堆=%u PSRAM=%u | 复位原因=%d",
                  (unsigned)s_probe_stage, s_probe_info, s_probe_task,
                  (unsigned)s_probe_stack, (unsigned)s_probe_stack * 4u,
                  (unsigned)s_probe_int, (unsigned)s_probe_ps, (int)r);
     else
-        ESP_LOGW("LUAPROBE", "无探针记录 | 本次复位原因=%d", (int)r);
+        ESP_LOGD("LUAPROBE", "无探针记录 | 本次复位原因=%d", (int)r);
 }
 
 /* 开机延迟复读: 复位瞬间 USB CDC 重枚举, 早期启动日志必丢 (实测 0.26s→5.1s 空档),
@@ -136,6 +136,7 @@ void lua_probe_boot_report(void) {
 
 st7305_handle_t *s_lcd = NULL;
 ui_ctx_t   *s_lua_ctx = NULL;   /* RUN 态可重绘上下文 */
+
 
 typedef enum { LUA_MODE_LIST, LUA_MODE_RUN } lua_mode_t;
 
@@ -221,14 +222,14 @@ static void lua_report_error(ui_ctx_t *ctx, const char *name) {
     snprintf(s_err_banner, sizeof(s_err_banner), "%s(): %s", name, m ? m : "?");
     s_err_banner_until = now + LUA_ERR_BANNER_MS;      /* 每次出错都续期 */
     if (s_err_streak <= 1) {
-        ESP_LOGE(TAG, "Lua %s() 错误: %s", name, m ? m : "(null)");
+        ESP_LOGD(TAG, "Lua %s() 错误: %s", name, m ? m : "(null)");
         snprintf(s_err, sizeof(s_err), "%s: %s", name, m ? m : "?");
         s_err_pending = true;
     } else if ((s_err_streak % 30) == 0) {
-        ESP_LOGW(TAG, "Lua %s() 连续出错 %d 次: %s", name, s_err_streak, m ? m : "(null)");
+        ESP_LOGD(TAG, "Lua %s() 连续出错 %d 次: %s", name, s_err_streak, m ? m : "(null)");
     }
     if (s_err_streak >= LUA_ERR_MAX) {
-        ESP_LOGE(TAG, "Lua %s() 连续出错 %d 次 → 退回列表", name, s_err_streak);
+        ESP_LOGD(TAG, "Lua %s() 连续出错 %d 次 → 退回列表", name, s_err_streak);
         lua_stop(ctx);
     }
 }
@@ -364,23 +365,23 @@ static bool lua_load_run(const char *path) {
     lua_probe_stage(5, "load_run 入口");
     if (s_L) lua_close(s_L);
     s_L = lua_newstate(lua_psram_alloc, NULL, (unsigned)esp_timer_get_time());
-    if (!s_L) { ESP_LOGE(TAG, "lua_newstate 失败"); return false; }
+    if (!s_L) { ESP_LOGD(TAG, "lua_newstate 失败"); return false; }
     lua_probe_stage(6, "newstate 成功");
     luaL_openlibs(s_L);
     lua_setup_globals(s_L);
     lua_probe_stage(7, "openlibs+bridge 成功");
 
     FILE *f = fopen(path, "rb");
-    if (!f) { ESP_LOGE(TAG, "打开失败: %s", path);
+    if (!f) { ESP_LOGD(TAG, "打开失败: %s", path);
         snprintf(s_err, sizeof(s_err), "\xe6\x97\xa0\xe6\xb3\x95\xe6\x89\x93\xe5\xbc\x80"); /* 无法打开 */
         s_err_pending = true; lua_close(s_L); s_L = NULL; return false; }
     lua_probe_stage(8, "fopen 成功");
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); ESP_LOGE(TAG, "空文件: %s", path);
+    if (sz <= 0) { fclose(f); ESP_LOGD(TAG, "空文件: %s", path);
         snprintf(s_err, sizeof(s_err), "\xe7\xa9\xba\xe6\x96\x87\xe4\xbb\xb6"); /* 空文件 */
         s_err_pending = true; lua_close(s_L); s_L = NULL; return false; }
     char *buf = heap_caps_malloc((size_t)sz, MALLOC_CAP_SPIRAM);
-    if (!buf) { fclose(f); ESP_LOGE(TAG, "PSRAM 分配 %ldB 失败", sz);
+    if (!buf) { fclose(f); ESP_LOGD(TAG, "PSRAM 分配 %ldB 失败", sz);
         snprintf(s_err, sizeof(s_err), "\xe5\x86\x85\xe5\xad\x98\xe4\xb8\x8d\xe8\xb6\xb3"); /* 内存不足 */
         s_err_pending = true; lua_close(s_L); s_L = NULL; return false; }
     size_t rd = fread(buf, 1, (size_t)sz, f);
@@ -392,7 +393,7 @@ static bool lua_load_run(const char *path) {
     lua_probe_stage(10, "loadbuffer 完成");
     if (rc != LUA_OK || lua_pcall(s_L, 0, 0, 0) != LUA_OK) {
         const char *m = lua_tostring(s_L, -1);
-        ESP_LOGE(TAG, "执行失败: %s", m ? m : "(null)");
+        ESP_LOGD(TAG, "执行失败: %s", m ? m : "(null)");
         snprintf(s_err, sizeof(s_err), "%s", m ? m : "Lua error");
         s_err_pending = true;
         lua_close(s_L); s_L = NULL;
@@ -450,7 +451,7 @@ static void lua_stop(ui_ctx_t *ctx) {
         lua_getglobal(s_L, "on_exit");
         if (lua_isfunction(s_L, -1)) {
             if (lua_pcall(s_L, 0, 0, 0) != LUA_OK)
-                ESP_LOGW(TAG, "on_exit 错误: %s", lua_tostring(s_L, -1) ? lua_tostring(s_L, -1) : "(null)");
+                ESP_LOGD(TAG, "on_exit 错误: %s", lua_tostring(s_L, -1) ? lua_tostring(s_L, -1) : "(null)");
         }
         lua_close(s_L);
     }

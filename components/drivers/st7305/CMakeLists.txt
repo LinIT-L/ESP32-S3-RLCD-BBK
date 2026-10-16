@@ -4,5 +4,5 @@
 idf_component_register(
     SRCS "st7305.c"
     INCLUDE_DIRS "."
-    REQUIRES board_cfg driver esp_timer
+    REQUIRES driver esp_timer
 )

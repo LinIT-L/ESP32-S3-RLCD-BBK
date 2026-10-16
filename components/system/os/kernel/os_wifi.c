@@ -5,14 +5,18 @@
 #include "os_hw.h"
 #include "wifi_probe.h"
 
+/* 临时占用 WiFi: 进入强制打开, 退出按**进入前的状态**还原
+ * (linit 2026-10-14: 原来是开就继续开, 原来是关才关掉)。 */
+static os_hw_lease_t s_wifi_lease;
+
 esp_err_t os_wifi_probe_init(void) {
-    os_hw_request(OS_HW_WIFI);   /* 申请 WiFi 硬件 (失败不致命, 兼容原行为) */
+    os_hw_lease_acquire(&s_wifi_lease, OS_HW_WIFI);   /* 进入即开 (原本已开则不重复计数) */
     return wifi_probe_init();
 }
 
 esp_err_t os_wifi_probe_deinit(void) {
     esp_err_t e = wifi_probe_deinit();
-    os_hw_release(OS_HW_WIFI);
+    os_hw_lease_release(&s_wifi_lease, OS_HW_WIFI);   /* 只有本次由我们开的才关 */
     return e;
 }
 

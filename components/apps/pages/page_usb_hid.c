@@ -5,7 +5,7 @@
  *   - 4 种布局: 运维键鼠 / 28键紧凑键盘 / 52键全键盘+触控板 / 纯触控板
  *   - 键盘触摸点键 -> os_hid_key_tap(); Ctrl/Alt/Shift/Caps/Fn 为开关键
  *   - 触控板: 单点=左键, 按住滑动=移鼠标(随速度加速), 按住不动500ms=右键
- *   - 确认 = 布局切换菜单, 返回 = 退出(停止 HID 恢复串口)
+ *   - 确认 = 布局切换菜单; 返回 = 弹出该菜单(二级菜单), 只有点菜单里的"退出"才退出
  *   - 私有 state 全部 static 留本文件.
  */
 #include "os.h"
@@ -706,8 +706,30 @@ static const char *const s_layout_names[4] = {
     "\xe7\xba\xaf\xe8\xa7\xa6\xe6\x8e\xa7\xe6\x9d\xbf",            /* 纯触控板 */
 };
 
-/* 选择菜单"返回"/底部"退出"/弹窗态按 BACK → 直接退出键鼠页 (不弹确认框).
- * 用户需求: 点下方退出直接退出, 硬件返回键按一次直接退出, 不需要退出确认. */
+static void hid_layout_cb(ui_ctx_t *ctx, int result, void *ud);
+
+/* 布局菜单内的 BACK 拦截: 只关掉菜单回到键盘页, **不退出**。
+ * (linit 2026-10-14: 进入键鼠后按硬件返回键不能立马退出, 要先弹二级菜单;
+ *  只有点菜单里的"退出"行才是真退出。) 返回 true = 已消费, 弹窗层不再走默认 finish(-1)。 */
+static bool hid_menu_on_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)d; (void)ud;
+    if (a != OS_ACTION_BACK) return false;
+    os_dialog_clear_all(ctx);      /* 关掉二级菜单, 回到键盘页 */
+    ctx->needs_redraw = true;
+    return true;
+}
+
+/* 打开二级菜单 ("选择键盘" 布局列表) 并挂上 BACK 拦截。
+ * 底部固定"退出"行 → 回调 result=-1 → 真退出键鼠页。 */
+static void hid_open_layout_menu(ui_ctx_t *ctx) {
+    os_dialog_list(ctx, "\xe9\x80\x89\xe6\x8b\xa9\xe9\x94\xae\xe7\x9b\x98",  /* 选择键盘 */
+                   s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
+    os_dlg_stack_t *d = os_dialog_top_mut(ctx);
+    if (d) d->on_key = hid_menu_on_key;
+}
+
+/* 选择菜单底部"退出"行 → -1 → 退出键鼠页 (触发 p_hid_exit 恢复串口/上滑返回).
+ * 注: 菜单内按 BACK 已被 hid_menu_on_key 消费, 不会走到这里。 */
 static void hid_layout_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     if (result < 0) {
@@ -726,7 +748,7 @@ static void hid_layout_cb(ui_ctx_t *ctx, int result, void *ud) {
 static void p_hid_enter(ui_ctx_t *ctx) {
     esp_err_t ret = os_hid_start();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "USB HID 启动失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "USB HID 启动失败: %s", esp_err_to_name(ret));
         os_pop(ctx);
         return;
     }
@@ -734,8 +756,9 @@ static void p_hid_enter(ui_ctx_t *ctx) {
     gesture_back_enable(false);
     hid_ui_reset();
     ESP_LOGI(TAG, "USB HID 已启动");
-    /* 3.3 交互: 进入即弹出"键鼠布局"列表弹窗选择布局; 底部固定"返回"退出键鼠页 */
-    os_dialog_list(ctx, "\xe9\x80\x89\xe6\x8b\xa9\xe9\x94\xae\xe7\x9b\x98",  /* 选择键盘 */ s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
+    /* 3.3 交互: 进入即弹出"键鼠布局"二级菜单选择布局;
+     * 菜单底部"退出"= 真退出, 菜单内 BACK = 只关菜单回到键盘。 */
+    hid_open_layout_menu(ctx);
 }
 
 static void p_hid_exit(ui_ctx_t *ctx) {
@@ -777,14 +800,15 @@ static void p_hid_render(ui_ctx_t *ctx) {
 static void p_hid_action(ui_ctx_t *ctx, os_action_t a) {
     switch (a) {
     case OS_ACTION_CONFIRM:
-        /* 确认键 → 弹出"选择键盘"列表菜单 (切换布局); 菜单内按返回/底部"退出"直接退出 */
-        os_dialog_list(ctx, "\xe9\x80\x89\xe6\x8b\xa9\xe9\x94\xae\xe7\x9b\x98",  /* 选择键盘 */
-                       s_layout_names, 4, s_hid_layout, hid_layout_cb, NULL);
+        /* 确认键 → 弹出"选择键盘"二级菜单 (切换布局) */
+        hid_open_layout_menu(ctx);
         break;
     case OS_ACTION_BACK:
-        /* 硬件/手柄返回键 → 直接退出键鼠页 (不弹菜单/确认框); 切换布局改由确认键弹菜单 */
-        os_dialog_clear_all(ctx);
-        os_pop(ctx);
+        /* 硬件/手柄返回键 → **不直接退出**, 而是弹出二级菜单 ("选择键盘");
+         * 只有点菜单里的"退出"行才真退出 (hid_layout_cb result<0)。
+         * 菜单已开着时本函数收不到 BACK (被弹窗层 + on_key 消费)。 */
+        if (os_modal_active(ctx)) break;
+        hid_open_layout_menu(ctx);
         break;
     default:
         break;

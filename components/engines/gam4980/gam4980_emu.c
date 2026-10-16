@@ -1182,7 +1182,7 @@ void gam4980_emu_background_init(st7305_handle_t *lcd) {
     BaseType_t ret = xTaskCreatePinnedToCore(background_init_task, "emu_init",
                                               GAM4980_BG_INIT_STACK_SIZE, NULL, 1, NULL, 1);
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "background_init 任务创建失败: 内部空闲=%u 块=%u",
+        ESP_LOGD(TAG, "background_init 任务创建失败: 内部空闲=%u 块=%u",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return;
@@ -1367,7 +1367,7 @@ int gam4980_emu_load(const char *path) {
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGE(TAG, "打开失败: %s", path);
+        ESP_LOGD(TAG, "打开失败: %s", path);
         return -1;
     }
 
@@ -1378,7 +1378,7 @@ int gam4980_emu_load(const char *path) {
      * 原 4MB 预检过宽: 超容文件会被下方流式 fread 越过 sys_flash 缓冲写坏 PSRAM. */
     long max_gam = (long)gam4980_retro_rom_capacity();
     if (sz <= 0 || sz > max_gam) {
-        ESP_LOGE(TAG, "文件大小异常: %ld (上限 %ld)", sz, max_gam);
+        ESP_LOGD(TAG, "文件大小异常: %ld (上限 %ld)", sz, max_gam);
         fclose(f);
         return -1;
     }
@@ -1387,7 +1387,7 @@ int gam4980_emu_load(const char *path) {
      * 直接复用 sys_flash 目标区, 由 fread 流式读入. */
     uint8_t *buf = gam4980_retro_rom_target();
     if (!buf) {
-        ESP_LOGE(TAG, "目标区不可用");
+        ESP_LOGD(TAG, "目标区不可用");
         fclose(f);
         return -1;
     }
@@ -1411,7 +1411,7 @@ int gam4980_emu_load(const char *path) {
     fclose(f);
 
     if (total_read != (size_t)sz) {
-        ESP_LOGE(TAG, "读取不完整: %u/%ld", (unsigned)total_read, sz);
+        ESP_LOGD(TAG, "读取不完整: %u/%ld", (unsigned)total_read, sz);
         return -1;
     }
     ESP_LOGI(TAG, "读取 .gam: %s (%ld 字节)", path, sz);
@@ -1429,7 +1429,7 @@ int gam4980_emu_load(const char *path) {
     gam4980_set_boot_progress_cb(boot_progress_cb_mapped);
     if (g_lcd) boot_progress_cb(85, "\xe5\x88\x9d\xe5\xa7\x8b\xe5\x8c\x96\xe5\xbc\x95\xe6\x93\x8e"); /* 初始化引擎 */
     if (!retro_load_game(&game)) {
-        ESP_LOGE(TAG, "加载失败: %s", path);
+        ESP_LOGD(TAG, "加载失败: %s", path);
         gam4980_set_boot_progress_cb(NULL);
         return -1;
     }
@@ -1495,7 +1495,7 @@ void gam4980_set_statusbar_cb(gam4980_statusbar_cb_t cb) {
 static game_exit_result_t gam4980_exit_confirm_dialog(void) {
     if (s_exit_confirm_cb)
         return s_exit_confirm_cb(g_lcd) ? GAME_EXIT_CONFIRMED : GAME_EXIT_CANCEL;
-    ESP_LOGW(TAG, "退出确认回调未注入 → 直接退出 (检查 os 侧注入)");
+    ESP_LOGD(TAG, "退出确认回调未注入 → 直接退出 (检查 os 侧注入)");
     return GAME_EXIT_CONFIRMED;
 }
 
@@ -1723,7 +1723,7 @@ static void make_save_path(const char *rom_path, char *out, size_t out_size) {
 void gam4980_emu_save_state(const char *rom_path) {
     if (!rom_path) return;
     if (!g_core_initialized) {
-        ESP_LOGW(TAG, "save_state: 引擎未初始化, 跳过");
+        ESP_LOGD(TAG, "save_state: 引擎未初始化, 跳过");
         return;
     }
     char path[160];
@@ -1733,7 +1733,7 @@ void gam4980_emu_save_state(const char *rom_path) {
     uint8_t *buf = (uint8_t *)heap_caps_malloc(SAVE_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) buf = (uint8_t *)malloc(SAVE_SIZE);
     if (!buf) {
-        ESP_LOGE(TAG, "save_state: 分配 %d 字节失败", SAVE_SIZE);
+        ESP_LOGD(TAG, "save_state: 分配 %d 字节失败", SAVE_SIZE);
         return;
     }
 
@@ -1743,7 +1743,7 @@ void gam4980_emu_save_state(const char *rom_path) {
     /* 写入文件: 8 字节头 (magic + size) + 32KB 数据 = 0x8008 字节 */
     FILE *f = fopen(path, "wb");
     if (!f) {
-        ESP_LOGE(TAG, "save_state: 打开失败 %s (errno=%d)", path, errno);
+        ESP_LOGD(TAG, "save_state: 打开失败 %s (errno=%d)", path, errno);
         free(buf);
         return;
     }
@@ -1758,14 +1758,14 @@ void gam4980_emu_save_state(const char *rom_path) {
     if (written == SAVE_SIZE) {
         ESP_LOGI(TAG, "save_state: 存档已保存 %s (%d 字节)", path, (int)(SAVE_SIZE + 8));
     } else {
-        ESP_LOGE(TAG, "save_state: 写入不完整 %u/%u", (unsigned)written, (unsigned)SAVE_SIZE);
+        ESP_LOGD(TAG, "save_state: 写入不完整 %u/%u", (unsigned)written, (unsigned)SAVE_SIZE);
     }
 }
 
 void gam4980_emu_load_state(const char *rom_path) {
     if (!rom_path) return;
     if (!g_core_initialized) {
-        ESP_LOGW(TAG, "load_state: 引擎未初始化, 跳过");
+        ESP_LOGD(TAG, "load_state: 引擎未初始化, 跳过");
         return;
     }
     char path[160];
@@ -1784,40 +1784,40 @@ void gam4980_emu_load_state(const char *rom_path) {
     const off_t OLD_SIZE = 0x14000 + 8;              /* 0x14008 = 81928 */
     const size_t ARCHIVE_BYTES = 0x8000;             /* 真正需要的存档数据 = 32KB */
     if (st.st_size != NEW_SIZE && st.st_size != OLD_SIZE) {
-        ESP_LOGW(TAG, "load_state: 文件大小异常 %lld, 期望 %d 或 %d",
+        ESP_LOGD(TAG, "load_state: 文件大小异常 %lld, 期望 %d 或 %d",
                  (long long)st.st_size, (int)NEW_SIZE, (int)OLD_SIZE);
         return;
     }
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGE(TAG, "load_state: 打开失败 %s", path);
+        ESP_LOGD(TAG, "load_state: 打开失败 %s", path);
         return;
     }
     uint32_t magic = 0, size = 0;
     if (fread(&magic, 1, 4, f) != 4 || fread(&size, 1, 4, f) != 4 ||
         magic != SAVE_MAGIC) {
-        ESP_LOGE(TAG, "load_state: 文件头 magic 不匹配 magic=0x%08x", magic);
+        ESP_LOGD(TAG, "load_state: 文件头 magic 不匹配 magic=0x%08x", magic);
         fclose(f);
         return;
     }
     /* 旧版 size 字段可能是 0x14000, 新版是 0x8000, 这里不强校验, 兼容读取 */
     bool from_old = (st.st_size == OLD_SIZE);
     if (from_old) {
-        ESP_LOGW(TAG, "load_state: 检测到旧版 80KB 存档, 提取前 32KB 加载");
+        ESP_LOGD(TAG, "load_state: 检测到旧版 80KB 存档, 提取前 32KB 加载");
     }
 
     uint8_t *buf = (uint8_t *)heap_caps_malloc(ARCHIVE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) buf = (uint8_t *)malloc(ARCHIVE_BYTES);
     if (!buf) {
-        ESP_LOGE(TAG, "load_state: 分配 %d 字节失败", ARCHIVE_BYTES);
+        ESP_LOGD(TAG, "load_state: 分配 %d 字节失败", ARCHIVE_BYTES);
         fclose(f);
         return;
     }
     size_t rd = fread(buf, 1, ARCHIVE_BYTES, f);
     fclose(f);
     if (rd != ARCHIVE_BYTES) {
-        ESP_LOGE(TAG, "load_state: 读取不完整 %u/%u", (unsigned)rd, (unsigned)ARCHIVE_BYTES);
+        ESP_LOGD(TAG, "load_state: 读取不完整 %u/%u", (unsigned)rd, (unsigned)ARCHIVE_BYTES);
         free(buf);
         return;
     }

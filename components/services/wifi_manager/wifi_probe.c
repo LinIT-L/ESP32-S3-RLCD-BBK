@@ -134,13 +134,13 @@ esp_err_t wifi_probe_init(void)
     if (s_inited) return ESP_OK;
     if (!wifi_manager_is_enabled()) {
         if (!wifi_manager_enable()) {
-            ESP_LOGE(TAG, "无法启动 WiFi 射频");
+            ESP_LOGD(TAG, "无法启动 WiFi 射频");
             return ESP_ERR_INVALID_STATE;
         }
     }
     esp_err_t err = esp_wifi_set_promiscuous_rx_cb(&promisc_rx);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "set promiscuous rx cb: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "set promiscuous rx cb: %s", esp_err_to_name(err));
         return err;
     }
     memset(s_ch, 0, sizeof(s_ch));
@@ -165,7 +165,7 @@ esp_err_t wifi_probe_scan(void)
         if (!wifi_manager_enable()) return ESP_ERR_INVALID_STATE;
     }
     if (!wifi_manager_scan_start()) {
-        ESP_LOGE(TAG, "主动扫描启动失败");
+        ESP_LOGD(TAG, "主动扫描启动失败");
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -239,7 +239,7 @@ esp_err_t wifi_probe_attack_start(wp_atk_t kind, const uint8_t *target_bssid)
     s_attack_active = true;
     return ESP_OK;
 #else
-    ESP_LOGW(TAG, "主动攻击未启用 (S3 法规固件限制源帧注入); 已预留接口");
+    ESP_LOGD(TAG, "主动攻击未启用 (S3 法规固件限制源帧注入); 已预留接口");
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }

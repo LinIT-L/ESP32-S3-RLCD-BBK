@@ -19,7 +19,7 @@ MAP 顺序即 main_icons[] 下标, 亦即 ICON_* 枚举值. 新增图标请在�
 import os
 from PIL import Image
 
-SRC = "/Users/linit/Desktop"
+SRC = "/Users/linit/Desktop/LinTOS"   # 2026-10-15 linit 桌面重构: 完美图标/其他图标 移入 LinTOS/
 DST_INC = os.path.join(os.path.dirname(__file__), "../../components/ui/ui_common/icons_main.inc")
 DST_H   = os.path.join(os.path.dirname(__file__), "../../components/ui/ui_common/icons_main_enum.h")
 W = H = 64
@@ -62,6 +62,12 @@ MAP = [
     ("ICON_FAV",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u6536\u85cf\u5939.png"),      # 32 \u6536\u85cf\u5939
     # 33 码表 (自行车码表, bikecomp.lua). 图标是程序化线描 (tools 里生成后存桌面), 不是缩图.
     ("ICON_BIKE",        "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u5e94\u7528/\u7801\u8868.png"),        # 33 \u7801\u8868
+    # 34 频谱仪 (SDR, 2026-10-15 linit: 原来借用 ICON_WIFIPROBE=29 的"无线探测"图标, 现独立出来)
+    ("ICON_SDR",         "\u5b8c\u7f8e\u56fe\u6807/\u5e94\u7528\u7ba1\u5bb6/\u8fd0\u7ef4/\u9891\u8c31\u4eea.png"),  # 34 \u9891\u8c31\u4eea
+    # 35 BIOS 模拟器 (biossim.lua, 2026-10-15: 原借 ICON_DIAG=17 电脑诊断图标, 现独立)
+    ("ICON_BIOSSIM",     "完美图标/应用管家/运维/BIOS模拟器.png"),  # 35 BIOS模拟器
+    # 36 航班雷达 (planeradar.lua, 2026-10-15 linit: 原借 ICON_NETDECT=27 网络检测图标, 现独立)
+    ("ICON_PLANERADAR",  "完美图标/应用管家/运维/航班雷达.png"),  # 36 航班雷达
 ]
 
 TRANSFER_PNG = "\u5b8c\u7f8e\u56fe\u6807/\u72b6\u6001\u680f/\u6570\u636e\u4f20\u8f93.png"

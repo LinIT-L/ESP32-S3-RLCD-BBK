@@ -383,7 +383,7 @@ static void arduboy_avr_task(void *arg)
 
         /* CPU 停机/崩溃: 结束运行 */
         if (s_avr->state == cpu_Done || s_avr->state == cpu_Crashed) {
-            ESP_LOGW(TAG, "AVR halted (state=%d), stopping", (int)s_avr->state);
+            ESP_LOGD(TAG, "AVR halted (state=%d), stopping", (int)s_avr->state);
             break;
         }
 
@@ -422,7 +422,7 @@ static void arduboy_avr_task(void *arg)
         }
     }
 
-    ESP_LOGW(TAG, "arduboy AVR task exiting (state=%d)", s_avr ? (int)s_avr->state : -1);
+    ESP_LOGD(TAG, "arduboy AVR task exiting (state=%d)", s_avr ? (int)s_avr->state : -1);
     /* 注销任务看门狗: 任务退出后若不注销, TWDT 会每 5s 持续触发 (日志刷屏),
      * 且残留订阅会让后续误判任务仍在运行. */
     esp_task_wdt_delete(NULL);   /* NULL = 注销当前任务 */
@@ -542,7 +542,7 @@ static esp_err_t arduboy_avr_init(void)
         avr_irq_register_notify(s_aud_oc1a, arduboy_avr_audio_pb5_hook, NULL);
         AB_LOG(1, "audio: Timer1 OC1A hook attached");
     } else {
-        ESP_LOGW(TAG, "audio: Timer1 OC1A IRQ 不可用, 声音关闭");
+        ESP_LOGD(TAG, "audio: Timer1 OC1A IRQ 不可用, 声音关闭");
         s_audio_enabled = false;
     }
 #endif
@@ -602,7 +602,7 @@ esp_err_t arduboy_avr_start(const char *path)
     s_paused = false;
 
     if (!arduboy_avr_load_hex(path)) {
-        ESP_LOGE(TAG, "hex 加载失败: %s", path);
+        ESP_LOGD(TAG, "hex 加载失败: %s", path);
         return ESP_FAIL;
     }
 
@@ -620,7 +620,7 @@ esp_err_t arduboy_avr_start(const char *path)
                                                16384, NULL, 3, &s_task, 1);
         if (r != pdPASS) {
             s_task = NULL;
-            ESP_LOGE(TAG, "无法创建模拟任务");
+            ESP_LOGD(TAG, "无法创建模拟任务");
             return ESP_ERR_NO_MEM;
         }
     }

@@ -81,7 +81,7 @@ esp_err_t apppack_parse(const char *path, apppack_meta_t *out)
                     int got = b64decode(v, out->icon, (int)APPPACK_ICON_BYTES);
                     out->has_icon = (got == (int)APPPACK_ICON_BYTES);
                     if (!out->has_icon && got >= 0)
-                        ESP_LOGW(TAG, "icon 尺寸异常 %d B (期望 %u), 忽略",
+                        ESP_LOGD(TAG, "icon 尺寸异常 %d B (期望 %u), 忽略",
                                  got, (unsigned)APPPACK_ICON_BYTES);
                 }
 #undef KEY_IS

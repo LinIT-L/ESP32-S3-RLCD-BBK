@@ -234,7 +234,17 @@ void font_book_select(int style, int size_px) {
     if (px < 16) px = 16;
     if (px > 32) px = 32;
     s_ui_px = (uint8_t)px;
-    s_ui16 = (px == 16);               /* 16 直接用 font_zh16, 其余用 font_zh 缩放 */
+    /* ★ 基准字库选择: 取"缩放比更接近整数倍"的那套。
+     * 原先 `s_ui16 = (px==16)` ⇒ 32px 走 font_zh(24px) 的 **1.333 倍**放大, 笔画会断/发糊;
+     * 改后 32px 走 font_zh16(16px) 的 **2 倍**, 干净得多。
+     * 16px→原生宋体, 24px→原生粗宋; 其余按 |px%基准| 谁更接近整数倍 (打平取大基准)。 */
+    if (px == 16)      s_ui16 = true;
+    else if (px == 24) s_ui16 = false;
+    else {
+        int r16 = px % 16; int e16 = (r16 > 8)  ? (16 - r16) : r16;
+        int r24 = px % 24; int e24 = (r24 > 12) ? (24 - r24) : r24;
+        s_ui16 = (e16 < e24);
+    }
     s_ui_cell_w = s_ui_cell_h = (uint8_t)px;
     s_ui_ascii_w = (uint8_t)(px * 8 / 16); if (s_ui_ascii_w < 4) s_ui_ascii_w = 4;
     s_ui_ascii_h = (uint8_t)px;
@@ -340,7 +350,7 @@ bool font_book_select_file(const char *path) {
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGW(TAG, "无法打开字库: %s", path);
+        ESP_LOGD(TAG, "无法打开字库: %s", path);
         s_error = "无法打开字库文件";
         return false;
     }
@@ -350,7 +360,7 @@ bool font_book_select_file(const char *path) {
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (fsize < (long)sizeof(book_font_header_t) || fsize > 4 * 1024 * 1024) {
-        ESP_LOGW(TAG, "字库文件大小异常: %ld", fsize);
+        ESP_LOGD(TAG, "字库文件大小异常: %ld", fsize);
         fclose(f);
         s_error = "字库文件大小异常";
         return false;
@@ -359,7 +369,7 @@ bool font_book_select_file(const char *path) {
     /* 分配 PSRAM 缓冲 */
     uint8_t *buf = heap_caps_malloc((size_t)fsize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) {
-        ESP_LOGE(TAG, "PSRAM 分配失败 (%ld bytes)", fsize);
+        ESP_LOGD(TAG, "PSRAM 分配失败 (%ld bytes)", fsize);
         fclose(f);
         s_error = "内存不足";
         return false;
@@ -368,7 +378,7 @@ bool font_book_select_file(const char *path) {
     size_t got = fread(buf, 1, (size_t)fsize, f);
     fclose(f);
     if ((long)got != fsize) {
-        ESP_LOGW(TAG, "读取不完整: %zu/%ld", got, fsize);
+        ESP_LOGD(TAG, "读取不完整: %zu/%ld", got, fsize);
         free(buf);
         s_error = "读取不完整";
         return false;
@@ -376,7 +386,7 @@ bool font_book_select_file(const char *path) {
 
     /* 校验 magic */
     if (memcmp(buf, FONT_MAGIC, 8) != 0) {
-        ESP_LOGW(TAG, "字库魔数错误: %s", path);
+        ESP_LOGD(TAG, "字库魔数错误: %s", path);
         free(buf);
         s_error = "字库魔数错误";
         return false;
@@ -392,7 +402,7 @@ bool font_book_select_file(const char *path) {
     s_sd_active = true;
 
     if (!font_bind(buf, s_sd_buf_size)) {
-        ESP_LOGW(TAG, "字库绑定失败: %s", path);
+        ESP_LOGD(TAG, "字库绑定失败: %s", path);
         s_sd_active = false;
         /* 不立即释放, 让错误信息可查; 下次加载会替换 */
         s_error = "字库绑定失败";

@@ -23,7 +23,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"        /* esp_restart (卡死看门狗强制重启) */
-#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 static const char *TAG = "SDSCAN";
 
@@ -72,9 +71,38 @@ static int  sd_full_remount(uint8_t format_if_needed);
  *     `CLK=13 CMD=10 D0=14` 一次认到卡, 25MHz 挂载成功, 容量 3.75GiB。
  *     (中途曾按反馈把 CMD/D0 对调成 14/10, 反而认不到; 是排列自检把它们试回来的。)
  */
-#define SD_CLK  ((gpio_num_t)CFG_SD_CLK)
-#define SD_CMD  ((gpio_num_t)CFG_SD_CMD)
-#define SD_D0   ((gpio_num_t)CFG_SD_D0)
+/* ★★ 2026-10-13 新载板: 旧的 SDMMC 引脚(13/10/14) **与触摸 SCL(13)、LCD MOSI(10) 撞车**,
+ *   一初始化就把 LCD/触摸的脚抢走 ⇒ 屏黑 + 触摸读不到 + 卡也认不到(0x107)。
+ *   新板 SD 是 **SPI 接法**: MOSI=15 / SCK=16 / MISO=17(linit 提供), CS 待确认。
+ *   ⇒ 先整段停用 SD, 让 LCD/触摸恢复; 确认 CS 后再按 SPI 重接。改 1 恢复(需同时改回引脚)。 */
+#ifndef SD_SCAN_ENABLE
+#define SD_SCAN_ENABLE 1
+#endif
+/* ★★ 2026-10-13 新载板(网表 SD1 座): 三个脚正好是 SDMMC 1-bit 的 CLK/CMD/D0
+ *   SD座 pin5=GPIO16(SCK)→CLK · pin3=GPIO15(MOSI)→CMD · pin7=GPIO17(MISO)→D0
+ *   旧值 13/10/14 **与触摸 SCL(13)、LCD MOSI(10) 撞车** ⇒ 曾导致屏黑+触摸失效。
+ *   CS(DAT3,pin2) 经 R8 上拉到 3.3V、不接 MCU ⇒ 用 1-bit SD 模式无需 CS ✔ */
+#define SD_CLK  GPIO_NUM_16
+#define SD_CMD  GPIO_NUM_15
+#define SD_D0   GPIO_NUM_17
+
+/* ★ 2026-10-16: SD 引脚按板型表下发 (小智=CLK16/CMD15/D0 17; 微雪=CLK38/CMD21/D0 39)。
+ * 驱动不反向依赖上层 ⇒ 由 app_board 调本函数传入。 */
+static int s_sd_clk = 16, s_sd_cmd = 15, s_sd_d0 = 17;
+/* 本次实际使用的三根脚 (排列自检可能改写) —— ★ 初值必须=默认板型, 不能用 -1:
+ *   挂载路径读的是这三个, 给 -1 会直接配不出槽 ⇒ 卡认不到 (2026-10-16 踩过: SD=- 0MB) */
+static int s_pin_clk = 16, s_pin_cmd = 15, s_pin_d0 = 17;
+void sd_scan_apply_pins(int clk, int cmd, int d0) {
+    if (clk >= 0) s_sd_clk = clk;
+    if (cmd >= 0) s_sd_cmd = cmd;
+    if (d0  >= 0) s_sd_d0  = d0;
+    /* 排列自检的起点也同步 (否则它还拿上电默认值去试) */
+    s_pin_clk = s_sd_clk; s_pin_cmd = s_sd_cmd; s_pin_d0 = s_sd_d0;
+}
+
+/* ★ 排列自检结果 {clk,cmd,d0}; 全 0 = 未找到 */
+static int  s_ok_perm[3];
+static void sd_probe_permutations(void);
 /* CD (卡检测) 不用: 走软件探测 (见 sd_quick_probe) */
 
 static bool s_mounted = false;
@@ -104,52 +132,91 @@ const char *sd_get_mnt_state_str(void)
 
 /* 探测"卡在但挂不上"的原因: 直接按 SD 协议初始化卡 + 读 LBA0 判文件系统.
  * 只在 sd_mount 全部尝试失败后调用一次; **只读**, 不会动卡上的数据。 */
+/* ★★ 2026-10-13 新载板: 15/16/17 三个脚到底哪个是 CLK/CMD/D0 未知 ⇒ **启动时轮询 6 种排列**,
+ *   哪种能初始化卡就报出来(并把结果记进 s_ok_perm, 供挂载复用)。一次刷机即可定案。 */
+
+static void sd_probe_permutations(void)
+{
+    const int pins[3] = { 15, 16, 17 };
+    int n = 0;
+    for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++)
+    for (int k = 0; k < 3; k++) {
+        if (i==j || j==k || i==k) continue;
+        n++;
+        sdmmc_host_deinit();
+        sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+        host.max_freq_khz = 400;             /* 超低速, 只看有没有响应 */
+        host.flags = SDMMC_HOST_FLAG_1BIT;
+        sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+        slot.width = 1;
+        slot.clk = pins[i]; slot.cmd = pins[j]; slot.d0 = pins[k];
+        slot.d1 = slot.d2 = slot.d3 = -1; slot.cd = -1; slot.wp = -1; slot.flags = 0;
+        int ok = (sdmmc_host_init() == ESP_OK &&
+                  sdmmc_host_init_slot(SDMMC_HOST_SLOT_1, &slot) == ESP_OK);
+        if (ok) {
+            sdmmc_card_t *c = heap_caps_malloc(sizeof(sdmmc_card_t), MALLOC_CAP_INTERNAL);
+            ok = (c && sdmmc_card_init(&host, c) == ESP_OK);
+            if (ok) {
+                s_ok_perm[0]=pins[i]; s_ok_perm[1]=pins[j]; s_ok_perm[2]=pins[k];
+                ESP_LOGD(TAG, "★★ SD 排列自检 [%d/6] ✅ 可用: CLK=%d CMD=%d D0=%d (卡=%s)",
+                         n, pins[i], pins[j], pins[k], c->cid.name);
+                free(c); sdmmc_host_deinit(); return;
+            }
+            if (c) free(c);
+        }
+        ESP_LOGD(TAG, "   SD 排列自检 [%d/6] ✗ CLK=%d CMD=%d D0=%d", n, pins[i], pins[j], pins[k]);
+    }
+    ESP_LOGD(TAG, "★★ SD 排列自检: 6 种排列全部失败 ⇒ 卡未插/接触不良/焊接");
+}
+
 static void sd_probe_fail_reason(void)
 {
+    if (s_ok_perm[0] == 0) sd_probe_permutations();   /* ★先找出正确排列 */
     s_cid_name[0] = '\0';
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.max_freq_khz = 5000;             /* 低速探测, 成功率高 */
     host.flags = SDMMC_HOST_FLAG_1BIT;
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     slot.width = 1;
-    slot.clk = SD_CLK; slot.cmd = SD_CMD; slot.d0 = SD_D0;
+    slot.clk = s_sd_clk; slot.cmd = s_sd_cmd; slot.d0 = s_sd_d0;
     slot.d1 = slot.d2 = slot.d3 = -1;
     slot.cd = -1; slot.wp = -1; slot.flags = 0;
 
     if (sdmmc_host_init() != ESP_OK || sdmmc_host_init_slot(SDMMC_HOST_SLOT_1, &slot) != ESP_OK) {
         s_mnt_state = SD_MNT_NO_CARD;
-        ESP_LOGW(TAG, "[探测] SDMMC host/slot 初始化失败 → 判定: 卡无响应");
+        ESP_LOGD(TAG, "[探测] SDMMC host/slot 初始化失败 → 判定: 卡无响应");
         sdmmc_host_deinit();
         return;
     }
     sdmmc_card_t *card = heap_caps_malloc(sizeof(sdmmc_card_t), MALLOC_CAP_INTERNAL);
     if (!card) {
         s_mnt_state = SD_MNT_NO_CARD;
-        ESP_LOGW(TAG, "[探测] 卡结构体分配失败");
+        ESP_LOGD(TAG, "[探测] 卡结构体分配失败");
         sdmmc_host_deinit();
         return;
     }
     if (sdmmc_card_init(&host, card) != ESP_OK) {
         s_mnt_state = SD_MNT_NO_CARD;
-        ESP_LOGW(TAG, "[探测] 卡不响应 → 判定: 未插好/接触不良/CMD-CLK-D0 接线");
+        ESP_LOGD(TAG, "[探测] 卡不响应 → 判定: 未插好/接触不良/CMD-CLK-D0 接线");
     } else {
         snprintf(s_cid_name, sizeof(s_cid_name), "%s", card->cid.name);
         uint8_t *buf = heap_caps_malloc(512, MALLOC_CAP_DMA);
         if (buf && sdmmc_read_sectors(card, buf, 0, 1) == ESP_OK) {
             if (memcmp(buf + 3, "EXFAT   ", 8) == 0) {
                 s_mnt_state = SD_MNT_EXFAT;
-                ESP_LOGW(TAG, "[探测] 卡=%s 是 exFAT (固件 FATFS 不支持) → 请格式化为 FAT32",
+                ESP_LOGD(TAG, "[探测] 卡=%s 是 exFAT (固件 FATFS 不支持) → 请格式化为 FAT32",
                          s_cid_name);
             } else if (buf[510] == 0x55 && buf[511] == 0xAA) {
                 s_mnt_state = SD_MNT_NO_FS;
-                ESP_LOGW(TAG, "[探测] 卡=%s 有分区表但挂不上 (非 FAT / 损坏)", s_cid_name);
+                ESP_LOGD(TAG, "[探测] 卡=%s 有分区表但挂不上 (非 FAT / 损坏)", s_cid_name);
             } else {
                 s_mnt_state = SD_MNT_NO_FS;
-                ESP_LOGW(TAG, "[探测] 卡=%s 无 FAT 引导记录 → 未格式化或不兼容", s_cid_name);
+                ESP_LOGD(TAG, "[探测] 卡=%s 无 FAT 引导记录 → 未格式化或不兼容", s_cid_name);
             }
         } else {
             s_mnt_state = SD_MNT_NO_CARD;
-            ESP_LOGW(TAG, "[探测] 卡=%s 就绪但扇区读失败", s_cid_name);
+            ESP_LOGD(TAG, "[探测] 卡=%s 就绪但扇区读失败", s_cid_name);
         }
         if (buf) free(buf);
     }
@@ -183,7 +250,7 @@ esp_err_t sd_remount(void)
  *
  * 做法:
  *   1. 先用 **400 kHz**(SD 规范"识别阶段"频率, 只要卡和线是通的就必然应答)
- *      按固件里 `SD_CLK/SD_CMD/SD_D0` 的顺序试一次。
+ *      按固件里 `s_sd_clk/s_sd_cmd/s_sd_d0` 的顺序试一次。
  *   2. 不行 ⇒ 把**这三根脚的所有排列(6 种)**都试一遍, 谁通就把正确顺序打进日志,
  *      **并且本次就直接用那一组继续挂载** —— 一次上电就把"接线顺序"问题解决掉, 不用来回烧。
  *   3. 6 种全不通 ⇒ 只打一行 INFO + 引脚体检; **不再走四档重试、不再刷错误**(无卡时零噪音)。
@@ -195,8 +262,7 @@ esp_err_t sd_remount(void)
  *   接线确认好之后, 把 SD_PIN_PERM_SCAN 置 0 即可关掉。 */
 #define SD_PIN_PERM_SCAN 1
 
-/* 本次实际使用的三根脚 (排列自检可能改写它们) */
-static int s_pin_clk = SD_CLK, s_pin_cmd = SD_CMD, s_pin_d0 = SD_D0;
+/* 本次实际使用的三根脚 (排列自检可能改写它们) 的声明已提前到 s_sd_* 旁边 */
 
 /* 按指定三根脚做一次 400kHz 卡识别 */
 static esp_err_t sd_probe_pins(int clk, int cmd, int d0) {
@@ -223,37 +289,41 @@ static esp_err_t sd_probe_pins(int clk, int cmd, int d0) {
 }
 
 static esp_err_t sd_quick_probe(void) {
+#if !SD_SCAN_ENABLE
+    ESP_LOGD("SDSCAN", "新载板: SD 暂未启用(旧 SDMMC 脚 13/10/14 与触摸 SCL、LCD MOSI 撞车) ⇒ 已跳过");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     /* 1. 先按固件里写的顺序试 */
-    if (sd_probe_pins(SD_CLK, SD_CMD, SD_D0) == ESP_OK) {
-        s_pin_clk = SD_CLK; s_pin_cmd = SD_CMD; s_pin_d0 = SD_D0;
+    if (sd_probe_pins(s_sd_clk, s_sd_cmd, s_sd_d0) == ESP_OK) {
+        s_pin_clk = s_sd_clk; s_pin_cmd = s_sd_cmd; s_pin_d0 = s_sd_d0;
         return ESP_OK;
     }
 
 #if SD_PIN_PERM_SCAN
     /* 2. 穷举这三根脚的 6 种排列 */
-    const int  cand[3] = { SD_CLK, SD_CMD, SD_D0 };
+    const int  cand[3] = { s_sd_clk, s_sd_cmd, s_sd_d0 };
     const char *nm[3]  = { "CLK",   "CMD",   "D0"   };
-    ESP_LOGW(TAG, "按固件定义认不到卡 ⇒ 开始穷举三根脚 %d/%d/%d 的所有排列...",
-             SD_CLK, SD_CMD, SD_D0);
+    ESP_LOGD(TAG, "按固件定义认不到卡 ⇒ 开始穷举三根脚 %d/%d/%d 的所有排列...",
+             s_sd_clk, s_sd_cmd, s_sd_d0);
     for (int a = 0; a < 3; a++) {
         for (int b = 0; b < 3; b++) {
             if (b == a) continue;
             int c = 3 - a - b;
             if (a == 0 && b == 1) continue;        /* 这一组上面已经试过 */
             esp_err_t r = sd_probe_pins(cand[a], cand[b], cand[c]);
-            ESP_LOGW(TAG, "  试 %s=IO%-2d  %s=IO%-2d  %s=IO%-2d   -> %s",
+            ESP_LOGD(TAG, "  试 %s=IO%-2d  %s=IO%-2d  %s=IO%-2d   -> %s",
                      nm[0], cand[a], nm[1], cand[b], nm[2], cand[c],
                      r == ESP_OK ? "★★ 认到卡了!" : "认不到");
             if (r == ESP_OK) {
                 s_pin_clk = cand[a]; s_pin_cmd = cand[b]; s_pin_d0 = cand[c];
-                ESP_LOGW(TAG, "  ⇒⇒ 正确接法: CLK=IO%d  CMD=IO%d  D0=IO%d"
+                ESP_LOGD(TAG, "  ⇒⇒ 正确接法: CLK=IO%d  CMD=IO%d  D0=IO%d"
                               "  (本次已按这组继续挂载)",
                          s_pin_clk, s_pin_cmd, s_pin_d0);
                 return ESP_OK;
             }
         }
     }
-    ESP_LOGW(TAG, "  6 种排列全认不到 ⇒ 不是【三根脚接错顺序】的问题");
+    ESP_LOGD(TAG, "  6 种排列全认不到 ⇒ 不是【三根脚接错顺序】的问题");
 #endif
     return ESP_FAIL;
 }
@@ -281,14 +351,23 @@ static void sd_pin_health_check(void) {
         gpio_config(&io);
         vTaskDelay(pdMS_TO_TICKS(3));
         int lv = gpio_get_level(pins[i]);
-        ESP_LOGW(TAG, "  引脚体检 %s = IO%-2d  电平=%d  %s",
+        ESP_LOGD(TAG, "  引脚体检 %s = IO%-2d  电平=%d  %s",
                  nm[i], pins[i], lv,
                  lv ? "(悬空/有上拉 ✓)" : "(被拉到地 ✗ 接错脚/短路/被别的外设占用)");
     }
-    ESP_LOGW(TAG, "  ⚠ 体检判不出【虚焊 / 断线】(断了会浮空读到 1) —— 重点查 CMD 与 D0 是否各有一个 10k 上拉到 3V3");
+    ESP_LOGD(TAG, "  ⚠ 体检判不出【虚焊 / 断线】(断了会浮空读到 1) —— 重点查 CMD 与 D0 是否各有一个 10k 上拉到 3V3");
 }
 
 esp_err_t sd_mount(void) {
+    sd_probe_permutations();   /* ★开机先找正确排列(插着卡时 6 种全试) */
+#if !SD_SCAN_ENABLE
+    ESP_LOGD("SDSCAN", "新载板: SD 暂未启用(旧 SDMMC 脚 13/10/14 与触摸 SCL、LCD MOSI 撞车) ⇒ 已跳过");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+#if !SD_SCAN_ENABLE
+    ESP_LOGD("SDSCAN", "新载板: SD 暂未启用(旧 SDMMC 引脚与 LCD/触摸撞车), 见 sd_scan.c");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     if (s_mounted) {
         ESP_LOGI(TAG, "已挂载, 跳过");
         return ESP_OK;
@@ -352,7 +431,7 @@ esp_err_t sd_mount(void) {
 
         sdmmc_slot_config_t slot_cfg = SDMMC_SLOT_CONFIG_DEFAULT();
         slot_cfg.width = 1;        /* 1-bit 模式 */
-        slot_cfg.clk = s_pin_clk;  /* 见顶部 SD_CLK (排列自检可能改写) */
+        slot_cfg.clk = s_pin_clk;  /* 见顶部 s_sd_clk (排列自检可能改写) */
         slot_cfg.cmd = s_pin_cmd;
         slot_cfg.d0  = s_pin_d0;
         slot_cfg.d1 = -1;          /* 1-bit 模式不用 */
@@ -369,7 +448,7 @@ esp_err_t sd_mount(void) {
             /* 2026-09-30: 先判空再解引用 —— IDF 在 ESP_OK 时保证回填 card, 但崩一次代价太大,
              * 这里补一道防线 (s_cid_name / 容量 / print_info 三处都要用 s_card)。 */
             if (!s_card) {
-                ESP_LOGE(TAG, "  挂载返回 OK 但 card 句柄为空 → 按失败处理");
+                ESP_LOGD(TAG, "  挂载返回 OK 但 card 句柄为空 → 按失败处理");
                 esp_vfs_fat_sdcard_unmount(s_mount_point, NULL);
                 sdmmc_host_deinit();
                 s_mounted = false;
@@ -382,7 +461,7 @@ esp_err_t sd_mount(void) {
                      (unsigned long long)((uint64_t)s_card->csd.capacity * 512));
             /* 诊断提示: 高档位能挂上 = 电源/走线 OK; 只有低档位能挂上 = 信号完整性问题 */
             if (attempt > 0) {
-                ESP_LOGW(TAG, "  ⚠ 只在 %lu kHz 才挂上 —— 说明 25MHz 下信号/电源不足,"
+                ESP_LOGD(TAG, "  ⚠ 只在 %lu kHz 才挂上 —— 说明 25MHz 下信号/电源不足,"
                               " 优先补: 卡座 VDD 就近 10µF+0.1µF / 3V3 主轨储能 / CLK 串 22Ω",
                          (unsigned long)speeds_khz[attempt]);
             }
@@ -416,14 +495,14 @@ esp_err_t sd_mount(void) {
                 } else if (errno == EEXIST) {
                     /* 已存在, 正常 */
                 } else {
-                    ESP_LOGW(TAG, "  创建目录失败: %s errno=%d", need_dirs[i], errno);
+                    ESP_LOGD(TAG, "  创建目录失败: %s errno=%d", need_dirs[i], errno);
                 }
             }
 
             return ESP_OK;
         }
 
-        ESP_LOGW(TAG, "  [尝试 %d] 挂载失败: %s (0x%x)",
+        ESP_LOGD(TAG, "  [尝试 %d] 挂载失败: %s (0x%x)",
                  attempt + 1, esp_err_to_name(ret), ret);
         s_card = NULL;
         /* 失败后释放 host, 下次重试能重新初始化 */
@@ -432,11 +511,11 @@ esp_err_t sd_mount(void) {
 
     /* 走到这里说明**卡是被识别到的**, 只是挂载失败 —— 这才是真该报的错误。
      * (没插卡的情况已经在 sd_quick_probe() 那一步安静返回了。) */
-    ESP_LOGE(TAG, "=== sd_mount 全部 %d 次尝试都失败 ===", retry_count);
-    ESP_LOGE(TAG, "  卡已被识别但挂载失败 ⇒ 不是没插卡, 可能是:");
-    ESP_LOGE(TAG, "    - 文件系统不识别 (要 FAT32; 固件不支持 exFAT)");
-    ESP_LOGE(TAG, "    - 卡损坏 / 需要重新格式化");
-    ESP_LOGE(TAG, "  建议: 进菜单 → TF卡 → 格式化TF卡");
+    ESP_LOGD(TAG, "=== sd_mount 全部 %d 次尝试都失败 ===", retry_count);
+    ESP_LOGD(TAG, "  卡已被识别但挂载失败 ⇒ 不是没插卡, 可能是:");
+    ESP_LOGD(TAG, "    - 文件系统不识别 (要 FAT32; 固件不支持 exFAT)");
+    ESP_LOGD(TAG, "    - 卡损坏 / 需要重新格式化");
+    ESP_LOGD(TAG, "  建议: 进菜单 → TF卡 → 格式化TF卡");
     /* 2026-09-29: 探测失败原因 (无卡 / exFAT / 无文件系统) 供 UI 显示 */
     sd_probe_fail_reason();
     return ESP_FAIL;
@@ -465,7 +544,7 @@ int sd_unmount_vfs_keep_card(void) {
 
     esp_err_t ret = esp_vfs_fat_unregister_path(s_mount_point);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "[卸载VFS] esp_vfs_fat_unregister_path 失败: %s (0x%x)",
+        ESP_LOGD(TAG, "[卸载VFS] esp_vfs_fat_unregister_path 失败: %s (0x%x)",
                  esp_err_to_name(ret), ret);
     }
 
@@ -505,14 +584,14 @@ int sd_remount_vfs_from_card(void) {
         &fs
     );
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[重挂VFS] esp_vfs_fat_register_cfg 失败: %s (0x%x)",
+        ESP_LOGD(TAG, "[重挂VFS] esp_vfs_fat_register_cfg 失败: %s (0x%x)",
                  esp_err_to_name(ret), ret);
         return -2;
     }
 
     FRESULT fres = f_mount(fs, drive_str, 1);
     if (fres != FR_OK) {
-        ESP_LOGE(TAG, "[重挂VFS] f_mount 失败: %d", fres);
+        ESP_LOGD(TAG, "[重挂VFS] f_mount 失败: %d", fres);
         esp_vfs_fat_unregister_path(s_mount_point);
         return -3;
     }
@@ -562,7 +641,7 @@ int scan_bbk_games(char out[][64], int max_out) {
     /* 尝试挂载 (失败时尝试小频率) */
     if (!s_mounted) {
         if (sd_mount() != ESP_OK) {
-            ESP_LOGW(TAG, "SD 卡未挂载, 扫描跳过");
+            ESP_LOGD(TAG, "SD 卡未挂载, 扫描跳过");
             return 0;
         }
     }
@@ -572,25 +651,25 @@ int scan_bbk_games(char out[][64], int max_out) {
     /* 检查目录是否存在 */
     struct stat st;
     if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        ESP_LOGW(TAG, "目录不存在: %s (stat失败, 尝试重新挂载SD卡)", dir_path);
+        ESP_LOGD(TAG, "目录不存在: %s (stat失败, 尝试重新挂载SD卡)", dir_path);
         /* NVS flash 写操作可能导致 SDMMC 传输超时, FATFS 状态失效
          * s_mounted 仍为 true 但实际不可用, 需要重新挂载 */
         sd_unmount();
         if (sd_mount() != ESP_OK) return 0;
         if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-            ESP_LOGW(TAG, "重新挂载后目录仍不存在: %s", dir_path);
+            ESP_LOGD(TAG, "重新挂载后目录仍不存在: %s", dir_path);
             return 0;
         }
     }
 
     DIR *dir = opendir(dir_path);
     if (!dir) {
-        ESP_LOGW(TAG, "打开目录失败: %s (opendir失败, 尝试重新挂载SD卡)", dir_path);
+        ESP_LOGD(TAG, "打开目录失败: %s (opendir失败, 尝试重新挂载SD卡)", dir_path);
         sd_unmount();
         if (sd_mount() != ESP_OK) return 0;
         dir = opendir(dir_path);
         if (!dir) {
-            ESP_LOGW(TAG, "重新挂载后仍无法打开目录: %s", dir_path);
+            ESP_LOGD(TAG, "重新挂载后仍无法打开目录: %s", dir_path);
             return 0;
         }
     }
@@ -660,14 +739,14 @@ static void sort_names_alpha(char items[][64], int n) {
 static DIR *open_dir_with_remount(const char *dir_path) {
     struct stat st;
     if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        ESP_LOGW(TAG, "目录不存在: %s (尝试重新挂载SD卡)", dir_path);
+        ESP_LOGD(TAG, "目录不存在: %s (尝试重新挂载SD卡)", dir_path);
         sd_unmount();
         if (sd_mount() != ESP_OK) return NULL;
         if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
     }
     DIR *dir = opendir(dir_path);
     if (!dir) {
-        ESP_LOGW(TAG, "打开目录失败: %s (尝试重新挂载SD卡)", dir_path);
+        ESP_LOGD(TAG, "打开目录失败: %s (尝试重新挂载SD卡)", dir_path);
         sd_unmount();
         if (sd_mount() != ESP_OK) return NULL;
         dir = opendir(dir_path);
@@ -683,7 +762,7 @@ int scan_bbk_folders(char out[][64], int max_out) {
     }
     DIR *dir = open_dir_with_remount("/sdcard/gam");
     if (!dir) {
-        ESP_LOGW(TAG, "scan_bbk_folders: 无法打开 /sdcard/gam");
+        ESP_LOGD(TAG, "scan_bbk_folders: 无法打开 /sdcard/gam");
         return 0;
     }
     int n = 0;
@@ -842,7 +921,7 @@ static int scan_folders_in_dir(const char *dir_path, char out[][64], int max_out
     }
     DIR *dir = open_dir_with_remount(dir_path);
     if (!dir) {
-        ESP_LOGW(TAG, "scan_folders_in_dir: 无法打开 %s", dir_path);
+        ESP_LOGD(TAG, "scan_folders_in_dir: 无法打开 %s", dir_path);
         return 0;
     }
     int n = 0;
@@ -1074,7 +1153,7 @@ static void sd_watcher_task(void *arg) {
         if (now - last_remount_attempt < interval) continue;
         last_remount_attempt = now;
 
-        ESP_LOGW(TAG, "[SD Watcher] 未挂载, 尝试补挂(%ums)...", interval);
+        ESP_LOGD(TAG, "[SD Watcher] 未挂载, 尝试补挂(%ums)...", interval);
         /* 重挂前确保 host 已彻底释放 (sd_mount 内部会重新初始化) */
         sdmmc_host_deinit();
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1084,7 +1163,7 @@ static void sd_watcher_task(void *arg) {
         } else {
             /* 无卡/失败: 逐级退避 15s→30s→60s→120s, 封顶, 减少反复无效挂载 */
             if (interval < 120000) interval *= 2;
-            ESP_LOGW(TAG, "[SD Watcher] 补挂失败, 退避至 %ums 后再试", interval);
+            ESP_LOGD(TAG, "[SD Watcher] 补挂失败, 退避至 %ums 后再试", interval);
         }
     }
     vTaskDelete(NULL);
@@ -1103,10 +1182,10 @@ void sd_watcher_set_paused(bool paused) {
  * 若正补挂 → Cache disabled ... accessed → 整机重启. 用户指令: 屏蔽 TF 检测, 不强制挂载.
  * 恢复时: 取消 return, 恢复下方创建逻辑即可. */
 void sd_watcher_start(void) {
-    ESP_LOGW(TAG, "[SD Watcher] 测试版已禁用(不自动补挂 TF)");
+    ESP_LOGD(TAG, "[SD Watcher] 测试版已禁用(不自动补挂 TF)");
     return;
     if (s_sd_watcher_h) {
-        ESP_LOGW(TAG, "[SD Watcher] 已存在, 跳过");
+        ESP_LOGD(TAG, "[SD Watcher] 已存在, 跳过");
         return;
     }
     /* 优先级: 1 (与 UI 相同, 时间片轮转; V1.0.41: 从 5 降到 1, 不抢占 UI) */
@@ -1114,7 +1193,7 @@ void sd_watcher_start(void) {
         sd_watcher_task, "sd_watcher",
         3072, NULL, 1, &s_sd_watcher_h);
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "[SD Watcher] 创建失败: %d", ret);
+        ESP_LOGD(TAG, "[SD Watcher] 创建失败: %d", ret);
         s_sd_watcher_h = NULL;
     } else {
         ESP_LOGI(TAG, "[SD Watcher] 创建成功");
@@ -1131,7 +1210,7 @@ static void sd_full_unmount(void) {
     if (s_mounted && s_card) {
         esp_err_t ret = esp_vfs_fat_sdcard_unmount(s_mount_point, s_card);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "[卸载] VFS 卸载失败: %s (0x%x)", esp_err_to_name(ret), ret);
+            ESP_LOGD(TAG, "[卸载] VFS 卸载失败: %s (0x%x)", esp_err_to_name(ret), ret);
         }
     }
     s_mounted = false;
@@ -1149,6 +1228,10 @@ static void sd_full_unmount(void) {
 /* 完全重新挂载 (SDMMC 模式)
  * ESP-IDF 的 esp_vfs_fat_sdmmc_mount() 内部会处理 SDMMC 总线初始化 */
 static int sd_full_remount(uint8_t format_if_needed) {
+#if !SD_SCAN_ENABLE
+    ESP_LOGD("SDSCAN", "新载板: SD 暂未启用(旧 SDMMC 脚 13/10/14 与触摸 SCL、LCD MOSI 撞车) ⇒ 已跳过");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
         .format_if_mount_failed = format_if_needed,
         .max_files = 5,
@@ -1161,9 +1244,9 @@ static int sd_full_remount(uint8_t format_if_needed) {
 
     sdmmc_slot_config_t slot_cfg = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_cfg.width = 1;
-    slot_cfg.clk = SD_CLK;
-    slot_cfg.cmd = SD_CMD;
-    slot_cfg.d0 = SD_D0;
+    slot_cfg.clk = s_sd_clk;
+    slot_cfg.cmd = s_sd_cmd;
+    slot_cfg.d0 = s_sd_d0;
     slot_cfg.d1 = -1;
     slot_cfg.d2 = -1;
     slot_cfg.d3 = -1;
@@ -1173,7 +1256,7 @@ static int sd_full_remount(uint8_t format_if_needed) {
 
     esp_err_t ret = esp_vfs_fat_sdmmc_mount(s_mount_point, &host, &slot_cfg, &mount_cfg, &s_card);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "挂载失败: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGD(TAG, "挂载失败: %s (0x%x)", esp_err_to_name(ret), ret);
         s_card = NULL;
         return -2;
     }
@@ -1233,7 +1316,7 @@ bool sd_format_start_async(void)
     s_fmt_result = 0;
     s_fmt_stage = "\xe5\x87\x86\xe5\xa4\x87";   /* 准备 */
     if (xTaskCreatePinnedToCore(sd_format_task, "sd_fmt", 8192, NULL, 4, NULL, 0) != pdPASS) {
-        ESP_LOGE(TAG, "格式化任务创建失败 (内存不足?)");
+        ESP_LOGD(TAG, "格式化任务创建失败 (内存不足?)");
         s_fmt_running = false;
         return false;
     }
@@ -1241,15 +1324,19 @@ bool sd_format_start_async(void)
 }
 
 int sd_format_and_create_dirs(void) {
-    ESP_LOGW(TAG, "========== 开始格式化 TF 卡 (SDMMC 模式) ==========");
-    ESP_LOGW(TAG, "[进度 ⑧] 完全卸载旧挂载...");
+#if !SD_SCAN_ENABLE
+    ESP_LOGD("SDSCAN", "新载板: SD 暂未启用(旧 SDMMC 脚 13/10/14 与触摸 SCL、LCD MOSI 撞车) ⇒ 已跳过");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+    ESP_LOGD(TAG, "========== 开始格式化 TF 卡 (SDMMC 模式) ==========");
+    ESP_LOGD(TAG, "[进度 ⑧] 完全卸载旧挂载...");
     s_fmt_pct = 3; s_fmt_stage = "\xe5\x8d\xb8\xe8\xbd\xbd\xe4\xb8\xad";  /* 卸载中 */
 
     /* 1. 完全卸载 */
     sd_full_unmount();
 
     /* 2. 探测卡 (低速) */
-    ESP_LOGW(TAG, "[进度 ⑨] 探测卡 (5MHz 低速, SDMMC)...");
+    ESP_LOGD(TAG, "[进度 ⑨] 探测卡 (5MHz 低速, SDMMC)...");
     s_fmt_pct = 6; s_fmt_stage = "\xe6\x8e\xa2\xe6\xb5\x8b\xe5\x8d\xa1";  /* 探测卡 */
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.max_freq_khz = 5000;  /* 5MHz 低速更稳 */
@@ -1257,9 +1344,9 @@ int sd_format_and_create_dirs(void) {
 
     sdmmc_slot_config_t slot_cfg = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_cfg.width = 1;
-    slot_cfg.clk = SD_CLK;
-    slot_cfg.cmd = SD_CMD;
-    slot_cfg.d0 = SD_D0;
+    slot_cfg.clk = s_sd_clk;
+    slot_cfg.cmd = s_sd_cmd;
+    slot_cfg.d0 = s_sd_d0;
     slot_cfg.d1 = -1;
     slot_cfg.d2 = -1;
     slot_cfg.d3 = -1;
@@ -1267,22 +1354,22 @@ int sd_format_and_create_dirs(void) {
     slot_cfg.wp = -1;
     slot_cfg.flags = 0;
 
-    ESP_LOGW(TAG, "[进度 ⑩] 初始化 SDMMC 主机...");
+    ESP_LOGD(TAG, "[进度 ⑩] 初始化 SDMMC 主机...");
     esp_err_t ret = sdmmc_host_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[进度 ⑩] SDMMC 主机初始化失败: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGD(TAG, "[进度 ⑩] SDMMC 主机初始化失败: %s (0x%x)", esp_err_to_name(ret), ret);
         return -2;
     }
 
-    ESP_LOGW(TAG, "[进度 ⑪] 初始化 SDMMC slot (GPIO 38/21/39)...");
+    ESP_LOGD(TAG, "[进度 ⑪] 初始化 SDMMC slot (GPIO 38/21/39)...");
     ret = sdmmc_host_init_slot(SDMMC_HOST_SLOT_1, &slot_cfg);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[进度 ⑪] SDMMC slot 失败: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGD(TAG, "[进度 ⑪] SDMMC slot 失败: %s (0x%x)", esp_err_to_name(ret), ret);
         sdmmc_host_deinit();
         return -2;
     }
 
-    ESP_LOGW(TAG, "[进度 ⑫] 探测 SD 卡...");
+    ESP_LOGD(TAG, "[进度 ⑫] 探测 SD 卡...");
     /* V1.0.68: 修复格式化失效: sdmmc_card_init 需要调用方提供 card 结构体地址,
      * 之前传 NULL 导致写入空指针/探测必然失败, "格式化"实际从未执行. */
     sdmmc_card_t card_struct;
@@ -1290,8 +1377,8 @@ int sd_format_and_create_dirs(void) {
     sdmmc_card_t *card = &card_struct;
     ret = sdmmc_card_init(&host, card);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[进度 ⑫] 探测 SD 卡失败: %s (0x%x)", esp_err_to_name(ret), ret);
-        ESP_LOGE(TAG, "         可能原因: TF 卡没插 / 接触不良 / 卡损坏");
+        ESP_LOGD(TAG, "[进度 ⑫] 探测 SD 卡失败: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGD(TAG, "         可能原因: TF 卡没插 / 接触不良 / 卡损坏");
         sdmmc_host_deinit();
         return -3;
     }
@@ -1300,7 +1387,7 @@ int sd_format_and_create_dirs(void) {
     sdmmc_card_print_info(stdout, card);
 
     /* 3. 物理擦除 (彻底清除所有数据) */
-    ESP_LOGW(TAG, "[进度 ⑬] 物理擦除卡 (这可能需要数十秒)...");
+    ESP_LOGD(TAG, "[进度 ⑬] 物理擦除卡 (这可能需要数十秒)...");
     uint32_t sector_count = card->csd.capacity;
     ESP_LOGI(TAG, "         总扇区: %lu", (unsigned long)sector_count);
     /* 2026-10-01: 改成**分块擦除** —— 单次全卡擦除有两个问题:
@@ -1320,7 +1407,7 @@ int sd_format_and_create_dirs(void) {
                 ret = sdmmc_erase_sectors(card, (size_t)sec, (size_t)n, SDMMC_DISCARD_ARG);
             }
             if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "[进度 ⑬] 擦除失败 @扇区 %lu: %s (0x%x)",
+                ESP_LOGD(TAG, "[进度 ⑬] 擦除失败 @扇区 %lu: %s (0x%x)",
                          (unsigned long)sec, esp_err_to_name(ret), ret);
                 sdmmc_host_deinit();
                 return -4;
@@ -1331,24 +1418,24 @@ int sd_format_and_create_dirs(void) {
     ESP_LOGI(TAG, "[进度 ⑬] 擦除完成 (分块, 进度 10%%→70%%)");
 
     /* 4. 释放 host, 准备重新挂载 */
-    ESP_LOGW(TAG, "[进度 ⑭] 释放 host, 等待卡稳定...");
+    ESP_LOGD(TAG, "[进度 ⑭] 释放 host, 等待卡稳定...");
     s_fmt_pct = 72; s_fmt_stage = "\xe7\xad\x89\xe5\x8d\xa1\xe7\xa8\xb3\xe5\xae\x9a"; /* 等卡稳定 */
     sdmmc_host_deinit();
     vTaskDelay(pdMS_TO_TICKS(500));
 
     /* 5. 重新挂载 (format_if_mount_failed=true 触发 mkfs) */
-    ESP_LOGW(TAG, "[进度 ⑮] 重新挂载 (format_if_mount_failed=true 触发 mkfs)...");
+    ESP_LOGD(TAG, "[进度 ⑮] 重新挂载 (format_if_mount_failed=true 触发 mkfs)...");
     s_fmt_pct = 80; s_fmt_stage = "\xe5\x86\x99\xe6\x96\x87\xe4\xbb\xb6\xe7\xb3\xbb\xe7\xbb\x9f"; /* 写文件系统 */
     int rc = sd_full_remount(1);
     if (rc != 0) {
-        ESP_LOGE(TAG, "[进度 ⑮] 挂载失败 rc=%d", rc);
-        ESP_LOGE(TAG, "         可能原因: mkfs 失败 / 卡读写出错");
+        ESP_LOGD(TAG, "[进度 ⑮] 挂载失败 rc=%d", rc);
+        ESP_LOGD(TAG, "         可能原因: mkfs 失败 / 卡读写出错");
         return -5;
     }
     ESP_LOGI(TAG, "[进度 ⑮] mkfs + 挂载成功");
 
     /* 6. 创建 gam, screensaver 目录 */
-    ESP_LOGW(TAG, "[进度 ⑯] 创建 gam, screensaver 目录...");
+    ESP_LOGD(TAG, "[进度 ⑯] 创建 gam, screensaver 目录...");
     s_fmt_pct = 92; s_fmt_stage = "\xe5\xbb\xba\xe7\x9b\xae\xe5\xbd\x95"; /* 建目录 */
     int dir_err = 0;
     const char *dirs[] = { "/sdcard/gam", "/sdcard/screensaver", "/sdcard/dict",
@@ -1370,19 +1457,19 @@ int sd_format_and_create_dirs(void) {
         } else if (errno == EEXIST) {
             ESP_LOGI(TAG, "         目录已存在: %s", tmp);
         } else {
-            ESP_LOGW(TAG, "         创建目录失败: %s errno=%d", tmp, errno);
+            ESP_LOGD(TAG, "         创建目录失败: %s errno=%d", tmp, errno);
             dir_err++;
         }
     }
     if (dir_err > 0) {
-        ESP_LOGE(TAG, "[进度 ⑮] 部分目录创建失败 (%d 个)", dir_err);
+        ESP_LOGD(TAG, "[进度 ⑮] 部分目录创建失败 (%d 个)", dir_err);
         /* 不返回失败 - 目录可能下次挂载时会自动建 */
     } else {
         ESP_LOGI(TAG, "[进度 ⑮] 目录创建完成");
     }
 
     s_fmt_pct = 100; s_fmt_stage = "\xe5\xae\x8c\xe6\x88\x90"; /* 完成 */
-    ESP_LOGW(TAG, "========== 格式化完成 ==========");
+    ESP_LOGD(TAG, "========== 格式化完成 ==========");
     return 0;
 }
 
@@ -1394,7 +1481,7 @@ int sd_format_and_create_dirs(void) {
  *       容易因为时钟频率/状态残留导致 remount 失败, 误报"请格式化"
  */
 int sd_get_info(uint64_t *total_bytes, uint64_t *free_bytes) {
-    ESP_LOGW(TAG, "[卡信息] 进入, s_mounted=%d, s_card=%p, heap_free=%u",
+    ESP_LOGD(TAG, "[卡信息] 进入, s_mounted=%d, s_card=%p, heap_free=%u",
              s_mounted, s_card, (unsigned)esp_get_free_heap_size());
 
     /* 1. 优先直接读 VFS info (如果已挂载且 card 有效) */
@@ -1409,18 +1496,18 @@ int sd_get_info(uint64_t *total_bytes, uint64_t *free_bytes) {
                      (unsigned long long)total, (unsigned long long)free);
             return 0;
         }
-        ESP_LOGW(TAG, "[卡信息] VFS info 失败: %s (0x%x), 尝试 remount",
+        ESP_LOGD(TAG, "[卡信息] VFS info 失败: %s (0x%x), 尝试 remount",
                  esp_err_to_name(ret), ret);
         /* VFS info 失败, 落入下面的 remount 路径 */
     }
 
     /* 2. 未挂载 或 VFS info 失败: 重新挂载 */
-    ESP_LOGW(TAG, "[卡信息] 重新挂载中...");
+    ESP_LOGD(TAG, "[卡信息] 重新挂载中...");
     sd_full_unmount();
     int rc = sd_full_remount(0);  /* format_if_needed=0, 不自动 mkfs */
-    ESP_LOGW(TAG, "[卡信息] remount rc=%d, heap_free=%u", rc, (unsigned)esp_get_free_heap_size());
+    ESP_LOGD(TAG, "[卡信息] remount rc=%d, heap_free=%u", rc, (unsigned)esp_get_free_heap_size());
     if (rc != 0) {
-        ESP_LOGE(TAG, "[卡信息] 挂载失败 rc=%d", rc);
+        ESP_LOGD(TAG, "[卡信息] 挂载失败 rc=%d", rc);
         s_mounted = false;
         s_card = NULL;
         return -1;
@@ -1429,7 +1516,7 @@ int sd_get_info(uint64_t *total_bytes, uint64_t *free_bytes) {
     uint64_t total = 0, free = 0;
     int ret = esp_vfs_fat_info(s_mount_point, &total, &free);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[卡信息] VFS info 失败: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGD(TAG, "[卡信息] VFS info 失败: %s (0x%x)", esp_err_to_name(ret), ret);
         return -2;
     }
     if (total_bytes) *total_bytes = total;
@@ -1450,7 +1537,7 @@ const char *bbk_game_path(int idx, char *out, size_t out_size) {
     const char *dir_path = "/sdcard/gam";
     DIR *dir = opendir(dir_path);
     if (!dir) {
-        ESP_LOGW(TAG, "bbk_game_path: opendir失败, 尝试重新挂载SD卡");
+        ESP_LOGD(TAG, "bbk_game_path: opendir失败, 尝试重新挂载SD卡");
         sd_unmount();
         if (sd_mount() != ESP_OK) return NULL;
         dir = opendir(dir_path);
@@ -1503,7 +1590,7 @@ static int scan_files_by_ext(const char *dir_path, const char *ext,
     }
     DIR *dir = open_dir_with_remount(dir_path);
     if (!dir) {
-        ESP_LOGW(TAG, "scan_files_by_ext: 无法打开 %s", dir_path);
+        ESP_LOGD(TAG, "scan_files_by_ext: 无法打开 %s", dir_path);
         return 0;
     }
     int n = 0;
@@ -1611,7 +1698,7 @@ int scan_path(const char *path, file_entry_t *out, int max_out) {
 
     if (!s_mounted) {
         if (sd_mount() != ESP_OK) {
-            ESP_LOGW(TAG, "scan_path: SD 未挂载");
+            ESP_LOGD(TAG, "scan_path: SD 未挂载");
             return -1;
         }
     }
@@ -1619,17 +1706,17 @@ int scan_path(const char *path, file_entry_t *out, int max_out) {
     /* 检查路径存在 */
     struct stat st;
     if (stat(path, &st) != 0) {
-        ESP_LOGW(TAG, "scan_path: 路径不存在: %s", path);
+        ESP_LOGD(TAG, "scan_path: 路径不存在: %s", path);
         return 0;
     }
     if (!S_ISDIR(st.st_mode)) {
-        ESP_LOGW(TAG, "scan_path: 不是目录: %s", path);
+        ESP_LOGD(TAG, "scan_path: 不是目录: %s", path);
         return -1;
     }
 
     DIR *dir = opendir(path);
     if (!dir) {
-        ESP_LOGW(TAG, "scan_path: 打开失败: %s (errno=%d)", path, errno);
+        ESP_LOGD(TAG, "scan_path: 打开失败: %s (errno=%d)", path, errno);
         return 0;
     }
 
@@ -1697,13 +1784,13 @@ int scan_screensaver_images(char paths[][128], int max_paths) {
     const char *dir_path = "/sdcard/screensaver";
     struct stat st;
     if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        ESP_LOGW(TAG, "屏保目录不存在: %s", dir_path);
+        ESP_LOGD(TAG, "屏保目录不存在: %s", dir_path);
         return 0;
     }
 
     DIR *dir = opendir(dir_path);
     if (!dir) {
-        ESP_LOGW(TAG, "打开屏保目录失败: %s", dir_path);
+        ESP_LOGD(TAG, "打开屏保目录失败: %s", dir_path);
         return 0;
     }
 
@@ -1740,7 +1827,7 @@ int sd_rename_file(const char *old_path, const char *new_path) {
         return 0;
     }
     
-    ESP_LOGE(TAG, "文件重命名失败: %s -> %s, errno=%d", old_path, new_path, errno);
+    ESP_LOGD(TAG, "文件重命名失败: %s -> %s, errno=%d", old_path, new_path, errno);
     return -1;
 }
 

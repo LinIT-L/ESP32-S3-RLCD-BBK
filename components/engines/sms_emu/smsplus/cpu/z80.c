@@ -3396,7 +3396,7 @@ void z80_load_szhvc(void)
   if (szhvc_loaded) return;
   szhvc_loaded = 1;
   const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "appdata");
-  if (!part) { ESP_LOGE("Z80", "appdata 分区缺失, SZHVC 表无法加载"); return; }
+  if (!part) { ESP_LOGD("Z80", "appdata 分区缺失, SZHVC 表无法加载"); return; }
   const void *a = NULL;
   static esp_partition_mmap_handle_t h1, h2;
   if (esp_partition_mmap(part, 0x580000, 0x20000, ESP_PARTITION_MMAP_DATA, &a, &h1) == ESP_OK) {

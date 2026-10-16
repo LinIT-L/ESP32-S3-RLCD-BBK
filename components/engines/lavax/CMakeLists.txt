@@ -25,12 +25,13 @@ idf_component_register(
         "${CMAKE_SOURCE_DIR}/components/system/input"
         "${CMAKE_SOURCE_DIR}/components/ui/virtual_keys"
     REQUIRES
+    bt_ctl
         "st7305"
         "input"
         "virtual_keys"
         "cheater"
         "board_shim"
-        "bt_ctl"
+        
         "fatfs"
         "fonts"
 )

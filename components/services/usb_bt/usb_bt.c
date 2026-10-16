@@ -89,7 +89,7 @@ esp_err_t usb_bt_start(void)
 {
     esp_err_t ret = usb_composite_enter_bth();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "进入 USB-BT 设备失败: %s, 清标记回串口模式", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "进入 USB-BT 设备失败: %s, 清标记回串口模式", esp_err_to_name(ret));
         usb_bt_set_active(false);
         return ret;
     }

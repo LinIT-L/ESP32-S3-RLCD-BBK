@@ -21,11 +21,11 @@ idf_component_register(
         "gwenesis/src/io"
         "gwenesis/src/savestate"
     REQUIRES
-        shared_memory
-        input
+    st7305
+    shared_memory
+    input
         audio_player
         board_shim
-        st7305
         esp_timer
         freertos
         heap

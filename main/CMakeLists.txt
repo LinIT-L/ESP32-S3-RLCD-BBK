@@ -5,6 +5,7 @@ idf_component_register(
     SRCS "main.c" "remcon.c" "lua_launch.c"
     INCLUDE_DIRS "."
     REQUIRES
+    board_pins
         self_test
         input
         app_board
@@ -20,6 +21,8 @@ idf_component_register(
         board_battery
         book_reader
         tone_player
+        audio_player   # 2026-10-09: remcon 加 audio/vol/esr/esw 音频诊断命令
+        gps            # 2026-10-09: remcon 加 gps 电源状态诊断 (耗电排查)
         vibrator
         engine_manager
         board_shim

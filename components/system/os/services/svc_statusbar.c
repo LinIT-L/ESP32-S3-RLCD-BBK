@@ -66,12 +66,14 @@ static void svc_draw_battery(st7305_handle_t *lcd, int x, int y, uint8_t percent
         }
         return;
     }
-    /* 显示规则 (linit 2026-09-20): ≥80% 一律满格, ≤10% 一律空格,
-     * 中间按百分比线性分档. 解决"满电静置回落到 4.05V → 少一格"的观感问题. */
+    /* 显示规则 (linit 2026-10-13 定案): ≥70% 一律满格, ≤10% 一律空格,
+     * 10%~70% 之间 -> 剩余 5 档 (idx 1..5) 平均分布, 每档跨 12 个百分点:
+     *   11-21 → 1 格 · 22-33 → 2 格 · 34-45 → 3 格 · 46-57 → 4 格 · 58-69 → 5 格
+     * 解决"满电静置回落到 ~4.05V → 少一格"的观感问题. */
     int idx;
-    if (percent >= 80)      idx = BAT_ICON_N - 1;   /* ≥80% 一律满格 */
+    if (percent >= 70)      idx = BAT_ICON_N - 1;   /* ≥70% 一律满格 */
     else if (percent <= 10) idx = 0;                /* ≤10% 一律空格 */
-    else                    idx = (int)(percent * BAT_ICON_N / 100);
+    else                    idx = 1 + (int)(((int)percent - 10) * (BAT_ICON_N - 2) / 60);
     if (idx >= BAT_ICON_N) idx = BAT_ICON_N - 1;
     if (s_inv) svc_blit_inv(lcd, x, y, BAT_ICON_W, BAT_ICON_H, (BAT_ICON_W + 7) / 8, bat_icon[idx]);
     else       st7305_draw_bitmap_1bit(lcd, x, y, BAT_ICON_W, BAT_ICON_H, bat_icon[idx]);
@@ -210,10 +212,12 @@ static void svc_render(ui_ctx_t *ctx)
     bool wifi_on = s_ops && s_ops->wifi_enabled && s_ops->wifi_enabled();
     bool wifi_conn = s_ops && s_ops->wifi_connected && s_ops->wifi_connected();
     if (wifi_on && wifi_conn) {
-        svc_draw_status_icon(lcd, right_x - STATUS_ICON_W, text_y,
+        /* ★ 2026-10-15: 目标框按**图标自身尺寸 (16×16 方形)** 画, 不再套 STATUS_ICON_W(32) ——
+         *   否则 16 宽源图被横向拉成 2 倍, 弧线糊成一团 (linit: "WiFi 图标太丑")。 */
+        svc_draw_status_icon(lcd, right_x - WIFI_ICON_W, text_y,
                              WIFI_ICON_W, WIFI_ICON_H, (WIFI_ICON_W + 7) / 8,
-                             STATUS_ICON_W, STATUS_ICON_H, wifi12_icon);
-        right_x -= STATUS_ICON_W + GAP;
+                             WIFI_ICON_W, WIFI_ICON_H, wifi12_icon);
+        right_x -= WIFI_ICON_W + GAP;
     }
     if (usb_bt_is_running()) {
         const char *s = "BLE";

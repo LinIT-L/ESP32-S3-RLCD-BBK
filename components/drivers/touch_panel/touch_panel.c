@@ -14,6 +14,15 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 
+/* ---- 本板触摸引脚 (★ 2026-10-16: 由上层 touch_panel_set_pins() 设定) ----
+ * 默认值 = 原来写死的小智模块板接线; 微雪原板由 input.c 从 board_pins.h 下发。 */
+static tp_pins_t s_pins = { -1, -1, -1, -1 };   /* ⛔ 未配置 → init 直接跳过, 一个脚都不碰 */
+
+void touch_panel_set_pins(const tp_pins_t *pins) {
+    if (pins) s_pins = *pins;
+}
+
+
 #define TAG "TOUCH"
 
 #define TP_I2C_PORT   I2C_NUM_1
@@ -138,23 +147,23 @@ static esp_err_t tp_i2c_write16(uint16_t reg, const uint8_t *buf, size_t len) {
 
 static void gt911_reset(void) {
     /* INT / RST 先设为输出, 走 Goodix 上电复位时序 */
-    gpio_set_direction(TP_INT_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_direction(TP_RST_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(s_pins.intr, GPIO_MODE_OUTPUT);
+    gpio_set_direction(s_pins.rst, GPIO_MODE_OUTPUT);
 
-    gpio_set_level(TP_INT_PIN, 0);
-    gpio_set_level(TP_RST_PIN, 0);
+    gpio_set_level(s_pins.intr, 0);
+    gpio_set_level(s_pins.rst, 0);
     vTaskDelay(pdMS_TO_TICKS(1));
 
-    gpio_set_level(TP_RST_PIN, 1);   /* 拉高 RST */
+    gpio_set_level(s_pins.rst, 1);   /* 拉高 RST */
     vTaskDelay(pdMS_TO_TICKS(6));
 
-    gpio_set_level(TP_INT_PIN, 0);   /* INT 保持低电平选地址 */
+    gpio_set_level(s_pins.intr, 0);   /* INT 保持低电平选地址 */
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    gpio_set_level(TP_INT_PIN, 1);   /* 释放 INT */
+    gpio_set_level(s_pins.intr, 1);   /* 释放 INT */
     vTaskDelay(pdMS_TO_TICKS(5));
 
-    gpio_set_direction(TP_INT_PIN, GPIO_MODE_INPUT);  /* 恢复为输入(上拉) */
+    gpio_set_direction(s_pins.intr, GPIO_MODE_INPUT);  /* 恢复为输入(上拉) */
 }
 
 /* ==================== 初始化 ==================== */
@@ -162,39 +171,46 @@ static void gt911_reset(void) {
 static tp_chip_t tp_probe_chip(void);   /* 定义在下方 (探测芯片) */
 
 tp_chip_t touch_panel_init(void) {
+    /* ★ 2026-10-16: 本板没有触摸面板时上层给 -1 ⇒ **直接跳过, 一个引脚都不碰**。
+     *   微雪原板 GPIO5 是 LCD RS, 以前这里无条件把默认的 GPIO5 配成 I2C SDA
+     *   (开漏+上拉) ⇒ RS 恒 3.3V、屏"设置不刷新"。 */
+    if (s_pins.sda < 0 || s_pins.scl < 0) {
+        ESP_LOGI(TAG, "本板未接触摸 (SDA/SCL 未设定), 跳过触摸初始化");
+        return TP_CHIP_NONE;
+    }
     /* I2C_NUM_1 独立总线 */
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = TP_SDA_PIN,
-        .scl_io_num = TP_SCL_PIN,
+        .sda_io_num = s_pins.sda,
+        .scl_io_num = s_pins.scl,
         .sda_pullup_en = true,
         .scl_pullup_en = true,
         .master.clk_speed = TP_I2C_FREQ,
     };
     esp_err_t ret = i2c_param_config(TP_I2C_PORT, &conf);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C 配置失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "I2C 配置失败: %s", esp_err_to_name(ret));
         return TP_CHIP_NONE;
     }
     ret = i2c_driver_install(TP_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "I2C 驱动安装失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "I2C 驱动安装失败: %s", esp_err_to_name(ret));
         return TP_CHIP_NONE;
     }
 
     /* RST 输出(初始低), INT 输入+上拉 */
     gpio_config_t rst_cfg = {
-        .pin_bit_mask = (1ULL << TP_RST_PIN),
+        .pin_bit_mask = (1ULL << s_pins.rst),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = false,
         .pull_down_en = false,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&rst_cfg);
-    gpio_set_level(TP_RST_PIN, 0);
+    gpio_set_level(s_pins.rst, 0);
 
     gpio_config_t int_cfg = {
-        .pin_bit_mask = (1ULL << TP_INT_PIN),
+        .pin_bit_mask = (1ULL << s_pins.intr),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = true,
         .pull_down_en = false,
@@ -204,14 +220,14 @@ tp_chip_t touch_panel_init(void) {
 
     /* 先做 GT911 复位时序 (对 CST816/FT6236 无害, 只是把 RST 拉高) */
     gt911_reset();
-    gpio_set_level(TP_RST_PIN, 1);
+    gpio_set_level(s_pins.rst, 1);
     vTaskDelay(pdMS_TO_TICKS(80));   /* 等触摸芯片上电就绪 */
 
     /* 按地址探测芯片 */
     tp_probe_chip();
 
     if (s_chip == TP_CHIP_NONE) {
-        ESP_LOGW(TAG, "未检测到触摸芯片 (GT911/CST816/FT6236)");
+        ESP_LOGD(TAG, "未检测到触摸芯片 (GT911/CST816/FT6236)");
     } else {
         const char *names[] = {"?", "GT911", "CST816", "FT6236"};
         ESP_LOGI(TAG, "触摸芯片: %s (I2C addr=0x%02X, 分辨率=%dx%d)",
@@ -279,7 +295,7 @@ static bool wd_wait_idle(void) {
     uint32_t t0 = xTaskGetTickCount();
     while (s_busy > 0) {
         if ((uint32_t)(xTaskGetTickCount() - t0) > pdMS_TO_TICKS(WD_RECOVER_WAIT)) {
-            ESP_LOGW(TAG, "等总线空闲超时 (busy=%d)", s_busy);
+            ESP_LOGD(TAG, "等总线空闲超时 (busy=%d)", s_busy);
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -297,7 +313,7 @@ static bool wd_recover_throttle(void) {
     if (!s_wd_window_full) return true;                    /* 窗口未满, 不节流 */
     uint32_t oldest = s_wd_recover_times[s_wd_recover_idx];
     if (now - oldest < WD_THROTTLE_MS) {
-        ESP_LOGE(TAG, "3分钟内恢复次数过多, 节流暂停 (避免反复重启)");
+        ESP_LOGD(TAG, "3分钟内恢复次数过多, 节流暂停 (避免反复重启)");
         return false;
     }
     return true;
@@ -312,18 +328,18 @@ void touch_panel_recover(void);   /* 前向声明 (soft_recover 需要) */
 
 /* 软恢复: 只做 RST 脉冲, 不重装 I2C (总线没卡死时最快恢复) */
 static void touch_panel_soft_recover(void) {
-    ESP_LOGW(TAG, "看门狗: 触摸异常, 软复位芯片 (RST 脉冲)");
+    ESP_LOGD(TAG, "看门狗: 触摸异常, 软复位芯片 (RST 脉冲)");
     if (s_chip == TP_CHIP_GT911) {
         gt911_reset();
     } else if (s_chip != TP_CHIP_NONE) {
-        gpio_set_direction(TP_RST_PIN, GPIO_MODE_OUTPUT);
-        gpio_set_level(TP_RST_PIN, 0);
+        gpio_set_direction(s_pins.rst, GPIO_MODE_OUTPUT);
+        gpio_set_level(s_pins.rst, 0);
         vTaskDelay(pdMS_TO_TICKS(5));
-        gpio_set_level(TP_RST_PIN, 1);
+        gpio_set_level(s_pins.rst, 1);
         vTaskDelay(pdMS_TO_TICKS(60));
     }
     if (s_addr && !tp_i2c_probe(s_addr)) {
-        ESP_LOGW(TAG, "软复位后无 ACK, 升级为完整恢复");
+        ESP_LOGD(TAG, "软复位后无 ACK, 升级为完整恢复");
         touch_panel_recover();
     }
 }
@@ -331,7 +347,7 @@ static void touch_panel_soft_recover(void) {
 /* 运行时重探测触摸芯片 (供应用管家重检; 轻量 — 仅重扫 I2C 地址/读 ID, 不重装驱动) */
 bool touch_panel_reprobe(void) {
     tp_probe_chip();
-    if (s_chip == TP_CHIP_NONE) { ESP_LOGW(TAG, "触摸重探测: 仍未检测到芯片"); return false; }
+    if (s_chip == TP_CHIP_NONE) { ESP_LOGD(TAG, "触摸重探测: 仍未检测到芯片"); return false; }
     const char *names[] = {"?", "GT911", "CST816", "FT6236"};
     ESP_LOGI(TAG, "触摸重探测: %s", names[s_chip]);
     return true;
@@ -342,26 +358,26 @@ bool touch_panel_reprobe(void) {
  * 必须在看门狗任务里调用 (s_recovering 已置位, 总线已空闲). */
 void touch_panel_recover(void) {
     if (!wd_wait_idle()) return;
-    ESP_LOGW(TAG, "执行完整恢复 (RST 脉冲 + 重装 I2C + 重探测)");
+    ESP_LOGD(TAG, "执行完整恢复 (RST 脉冲 + 重装 I2C + 重探测)");
     /* 1. 复位芯片 */
     if (s_chip == TP_CHIP_GT911) {
         gt911_reset();
     } else {
-        gpio_set_direction(TP_RST_PIN, GPIO_MODE_OUTPUT);
-        gpio_set_level(TP_RST_PIN, 0);
+        gpio_set_direction(s_pins.rst, GPIO_MODE_OUTPUT);
+        gpio_set_level(s_pins.rst, 0);
         vTaskDelay(pdMS_TO_TICKS(5));
-        gpio_set_level(TP_RST_PIN, 1);
+        gpio_set_level(s_pins.rst, 1);
         vTaskDelay(pdMS_TO_TICKS(60));
     }
     /* 2. 重装 I2C 驱动 (SDA 被从机拉低卡死时, 重装可清掉总线状态) */
     esp_err_t del = i2c_driver_delete(TP_I2C_PORT);
     if (del != ESP_OK && del != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "i2c_driver_delete 返回 %s, 继续", esp_err_to_name(del));
+        ESP_LOGD(TAG, "i2c_driver_delete 返回 %s, 继续", esp_err_to_name(del));
     }
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = TP_SDA_PIN,
-        .scl_io_num = TP_SCL_PIN,
+        .sda_io_num = s_pins.sda,
+        .scl_io_num = s_pins.scl,
         .sda_pullup_en = true,
         .scl_pullup_en = true,
         .master.clk_speed = TP_I2C_FREQ,
@@ -369,13 +385,13 @@ void touch_panel_recover(void) {
     i2c_param_config(TP_I2C_PORT, &conf);
     esp_err_t ins = i2c_driver_install(TP_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
     if (ins != ESP_OK && ins != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "i2c_driver_install 失败: %s", esp_err_to_name(ins));
+        ESP_LOGD(TAG, "i2c_driver_install 失败: %s", esp_err_to_name(ins));
         return;
     }
     /* 3. 重新探测 */
     tp_probe_chip();
     if (s_chip == TP_CHIP_NONE) {
-        ESP_LOGE(TAG, "恢复后仍未探测到触摸芯片");
+        ESP_LOGD(TAG, "恢复后仍未探测到触摸芯片");
     } else {
         ESP_LOGI(TAG, "触摸恢复成功: %s", s_chip == TP_CHIP_GT911 ? "GT911" :
                  s_chip == TP_CHIP_CST816 ? "CST816" : "FT6236");
@@ -405,7 +421,7 @@ static void touch_watchdog_task(void *arg) {
         else if (stuck >= WD_STUCK_MS) { do_soft = true; }
         if (!do_full && !do_soft) continue;
 
-        ESP_LOGW(TAG, "看门狗判定异常: fails=%u/%u stuck=%ums %s",
+        ESP_LOGD(TAG, "看门狗判定异常: fails=%u/%u stuck=%ums %s",
                  (unsigned)fails, (unsigned)reads, (unsigned)stuck,
                  do_full ? "→完整恢复" : "→软恢复");
         if (!wd_recover_throttle()) continue;

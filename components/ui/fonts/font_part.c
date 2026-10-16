@@ -25,13 +25,13 @@ const uint8_t *font_part_map(size_t off, size_t len)
         if (s_offs[i] == off && s_lens[i] == len) return s_addrs[i];
     }
     if (s_n >= FONT_MAP_MAX) {
-        ESP_LOGE(TAG, "mmap 槽位已满 (%d), off=0x%x", FONT_MAP_MAX, (unsigned)off);
+        ESP_LOGD(TAG, "mmap 槽位已满 (%d), off=0x%x", FONT_MAP_MAX, (unsigned)off);
         return NULL;
     }
     if (!s_part) {
         s_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "appdata");
         if (!s_part) {
-            ESP_LOGE(TAG, "找不到 appdata 分区 (off=0x%x len=0x%x)", (unsigned)off, (unsigned)len);
+            ESP_LOGD(TAG, "找不到 appdata 分区 (off=0x%x len=0x%x)", (unsigned)off, (unsigned)len);
             return NULL;
         }
     }
@@ -39,7 +39,7 @@ const uint8_t *font_part_map(size_t off, size_t len)
     esp_err_t e = esp_partition_mmap(s_part, off, len, ESP_PARTITION_MMAP_DATA,
                                      &p, &s_handles[s_n]);
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "esp_partition_mmap 失败: %s (0x%x), off=0x%x len=0x%x",
+        ESP_LOGD(TAG, "esp_partition_mmap 失败: %s (0x%x), off=0x%x len=0x%x",
                  esp_err_to_name(e), e, (unsigned)off, (unsigned)len);
         return NULL;
     }

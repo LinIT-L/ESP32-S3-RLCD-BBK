@@ -27,7 +27,7 @@ int bp_lut_init(void)
 
     const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "appdata");
     if (!p) {
-        ESP_LOGE(TAG, "找不到 appdata 分区");
+        ESP_LOGD(TAG, "找不到 appdata 分区");
         return -1;
     }
 
@@ -36,7 +36,7 @@ int bp_lut_init(void)
     esp_err_t e = esp_partition_mmap(p, BP_LUT_OFF, BP_LUT_LEN, ESP_PARTITION_MMAP_DATA,
                                      &addr, &handle);
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "esp_partition_mmap 失败: %s (off=0x%x len=0x%x)",
+        ESP_LOGD(TAG, "esp_partition_mmap 失败: %s (off=0x%x len=0x%x)",
                  esp_err_to_name(e), BP_LUT_OFF, BP_LUT_LEN);
         return -1;
     }

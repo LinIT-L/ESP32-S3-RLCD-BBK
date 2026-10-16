@@ -176,11 +176,15 @@ fi
 SPIFFS_BIN="${BUILD_DIR}/apps_l.bin"
 APPS_SRC="${PROJECT_DIR}/apps/lua"
 # APPS_SIZE / APPS_OFF 已由上方 partitions.csv 解析得出
+# ★★ 2026-10-14 linit: **默认不把 Lua 应用打进 16MB 固件** ——
+#   Lua 应用走 TF 卡 / 应用商店**后装**, 固件里 apps 分区保持空 SPIFFS。
+#   需要出"预置演示机/测试机"固件时才显式开:  LINTOS_BAKE_LUA_APPS=1 ./build.sh
 # ⚠ 陷阱 (2026-09-29 排查发现): 源目录不在时**不能默默沿用上一版 apps_l.bin** ——
-#   那会把早已下架的应用/旧脚本一起烧回设备 (应用管家会多出"C版+Lua版"重复条目),
-#   而且没有任何提示。现状(2026-09-29): Lua 应用已全部下架, apps 分区应为空。
-if [ ! -d "${APPS_SRC}" ]; then
-    echo "[提示] 未找到 ${APPS_SRC} → 生成**空** apps 镜像 (不沿用旧镜像)"
+#   那会把早已下架的应用/旧脚本一起烧回设备 (应用管家会多出"C版+Lua版"重复条目), 而且没有提示。
+if [ "${LINTOS_BAKE_LUA_APPS:-0}" = "1" ] && [ -d "${APPS_SRC}" ]; then
+    echo "[提示] LINTOS_BAKE_LUA_APPS=1 → 预置 Lua 应用进 apps 分区"
+else
+    echo "[提示] 默认不预置 Lua 应用 (要预置: LINTOS_BAKE_LUA_APPS=1 ./build.sh) → 生成空 apps 镜像"
     APPS_SRC="$(mktemp -d)"
     trap 'rm -rf "${APPS_SRC}"' EXIT
 fi

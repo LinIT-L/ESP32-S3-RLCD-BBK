@@ -35,7 +35,7 @@ static void font_zh_bind(void) {
     d = font_part_map(FONT_SLOT_ZH_OFF, FONT_SLOT_ZH_LEN);
     len = FONT_SLOT_ZH_LEN;
     if (!d || len < 12 || memcmp(d, "ZH1FNT01", 8) != 0) {
-        ESP_LOGW(TAG, "zh 绑定失败: d=%p len=%u", (void *)d, (unsigned)len);
+        ESP_LOGD(TAG, "zh 绑定失败: d=%p len=%u", (void *)d, (unsigned)len);
         return;
     }
     uint32_t n = (uint32_t)d[8] | ((uint32_t)d[9] << 8) |

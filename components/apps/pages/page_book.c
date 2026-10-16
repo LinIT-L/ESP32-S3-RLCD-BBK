@@ -56,8 +56,11 @@ static void bs_load(void) {
     nvs_handle_t h;
     if (svc_nvs_open(BNS, NVS_READONLY, &h) == ESP_OK) {
         int32_t v;
-        if (svc_nvs_get_i32(h, "fs", &v) == ESP_OK && v >= 0 && v <= 3) s_bs_fontsize = (int)v;
-        if (svc_nvs_get_i32(h, "ft", &v) == ESP_OK && v >= 0 && v <= 1) s_bs_font = (int)v;
+        /* 字号三档: 0=16 1=24 2=32。旧存档 0..3 = 20/24/28/32 → 20→16, 24→24, 28/32→32 */
+        if (svc_nvs_get_i32(h, "fs", &v) == ESP_OK)
+            s_bs_fontsize = (v <= 0) ? 0 : (v == 1) ? 1 : 2;
+        /* 字体: 0=仿宋 1=黑体 ≥2=TF 字库索引 (linit 保留, 以后读 TF 卡字体) */
+        if (svc_nvs_get_i32(h, "ft", &v) == ESP_OK && v >= 0) s_bs_font = (int)v;
         if (svc_nvs_get_i32(h, "pn", &v) == ESP_OK && v >= 0 && v <= 1) s_bs_pagenum = (int)v;
         if (svc_nvs_get_i32(h, "mg", &v) == ESP_OK && v >= 0 && v <= 2) s_bs_margin = (int)v;
         if (svc_nvs_get_i32(h, "lh", &v) == ESP_OK && v >= 0 && v <= 2) s_bs_lineh = (int)v;
@@ -77,6 +80,7 @@ static void bs_save(void) {
     svc_cfg_set_i32(BNS, "in", s_bs_indent);
     svc_cfg_set_i32(BNS, "rt", s_bs_rot);
 }
+static int  bs_size_reader_idx(void);   /* 前置声明 (定义在下方): 三档字号 → 阅读器内部档位 */
 static void bs_apply(void) {
     int style = (s_bs_font >= 2) ? 0 : s_bs_font;   /* TF 字库时不传内置 style, 防越界 */
     if (s_bs_font >= 2 && s_bs_tfname[0]) {
@@ -84,8 +88,8 @@ static void bs_apply(void) {
         font_book_select_file(p);
     }
     book_reader_set_settings(false, 1, false, s_bs_pagenum != 0, s_bs_rot,
-                             style, s_bs_fontsize, s_bs_margin, s_bs_lineh, s_bs_gap,
-                             s_bs_indent);
+                             style, bs_size_reader_idx(), s_bs_margin, s_bs_lineh,
+                             s_bs_gap, s_bs_indent);
 }
 
 /* ==== 书架旋转 (自包含) ====
@@ -122,7 +126,15 @@ static void book_rotation_ensure(ui_ctx_t *ctx) {
     if (ctx && ctx->lcd)
         st7305_set_rotation(ctx->lcd, rot, portrait ? s_book_pfb : s_book_flip);
     s_bp.list_y = portrait ? (24 + 4) : 30;   /* 竖屏: 状态栏(24)下方; 横屏: 状态栏(24)+4 */
-    if (ctx) ctx->map_touch = NULL;
+    /* ★★ 2026-10-14 修"阅读里弹窗的确认/取消点不动" ★★
+     * 原来这里把 map_touch 置 NULL, 只靠本页 touch 里手动 book_touch_map —— 但 **os_dialog 弹窗层
+     * 拿不到那次映射**: 弹窗布局走 ui_screen_w/h()(竖屏 300×400), 触摸却是【物理坐标】(400×300)
+     * ⇒ 命中全错, 弹窗按钮点了没反应。
+     * 交给内核 map_touch 后, os_core 在分发前统一换算, **弹窗层与页面层同享** (见 os_handle_touch 注释),
+     * 于是弹窗与页面用同一套逻辑坐标 ✓。
+     * ⚠ 挂了它之后, 本页 touch 处理器**不要再自己调 book_touch_map** (会二次映射);
+     *   但 poll 里读 input_get_touch_pos() 的拖动路径**仍要自己映射** (那条路不走内核分发)。 */
+    if (ctx) ctx->map_touch = book_touch_map;
 }
 
 /* 阅读优化右栏渲染 (3.3: 全角空格对齐冒号, 选中反色) */
@@ -136,8 +148,19 @@ static void book_pad(char *buf, size_t len, int target, const char *name, const 
         pos += snprintf(buf + pos, len - (size_t)pos, "%s", BS_FULL);
     snprintf(buf + pos, len - (size_t)pos, "%s: %s", name, val);
 }
+/* 字号三档 (linit 2026-10-14 定):
+ *   0 = 16px  → 原生 font_zh16 (宋体), 最清晰
+ *   1 = 24px  → 原生 font_zh  (粗宋), 最清晰
+ *   2 = 32px  → font_zh16 的 **2 倍整数放大** (笔画干净; 不用 24→32 的 1.33 倍, 那会断笔)
+ * ⛔ 20px / 28px 已去掉 —— 它们是"既非原生、又非整数倍"的两档, 缩放最糊。 */
 static const char *bs_fs_name(void) {
-    switch (s_bs_fontsize) { case 0: return "20"; case 2: return "28"; case 3: return "32"; default: return "24"; }
+    static const char *n[3] = { "16", "24", "32" };
+    return n[(s_bs_fontsize < 0) ? 1 : (s_bs_fontsize > 2) ? 2 : s_bs_fontsize];
+}
+/* → 阅读器内部档位 (其表 {16,20,24,28,32}): 16→0, 24→2, 32→4 */
+static int bs_size_reader_idx(void) {
+    static const int t[3] = { 0, 2, 4 };
+    return t[(s_bs_fontsize < 0) ? 1 : (s_bs_fontsize > 2) ? 2 : s_bs_fontsize];
 }
 static const char *bs_font_name(void) { return s_bs_font ? "\xe9\xbb\x91\xe4\xbd\x93" : "\xe4\xbb\xbf\xe5\xae\x8b"; } /* 黑体/仿宋 */
 static const char *bs_on_off(int v) { return v ? "\xe5\xbc\x80" : "\xe5\x85\xb3"; } /* 开/关 */
@@ -323,6 +346,11 @@ static void bs_wheel_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     int tx, ty;
     static int s_w_last = -1, s_w_acc = 0;
     if (input_get_touch_pos(&tx, &ty)) {
+        /* ★★ 2026-10-14 修"竖屏下滚轮上下滑动方向不对" ★★
+         * 本函数走 poll, **不经过内核触摸分发**, 所以拿到的还是**物理坐标**;
+         * 竖屏(90/270°)时"逻辑纵向"其实对应物理横向 ⇒ 不换算就会轴向/正负都错。
+         * 这里必须和第 137 行挂给内核的 map_touch 用同一套映射。 */
+        book_touch_map(&tx, &ty);
         if (s_w_last < 0) { s_w_last = ty; s_w_acc = 0; }
         else {
             s_w_acc += ty - s_w_last;
@@ -363,12 +391,12 @@ static void bs_wheel_push(ui_ctx_t *ctx) {
     os_dialog_push(ctx, &dlg);
 }
 
-/* 字号 (4档) */
+/* 字号 (3 档: 16/24/32) */
 static void bs_wheel_commit_size(void) { s_bs_fontsize = s_bs_wheel_idx; bs_save(); bs_apply(); }
 static void bs_size_wheel_open(ui_ctx_t *ctx) {
-    static const char *opts[] = { "20", "24", "28", "32" };
-    for (int i = 0; i < 4; i++) s_bs_wheel_opts[i] = opts[i];
-    s_bs_wheel_n = 4;
+    static const char *opts[] = { "16", "24", "32" };
+    for (int i = 0; i < 3; i++) s_bs_wheel_opts[i] = opts[i];
+    s_bs_wheel_n = 3;
     s_bs_wheel_idx = s_bs_fontsize;
     s_bs_wheel_commit = bs_wheel_commit_size;
     bs_wheel_push(ctx);
@@ -410,9 +438,9 @@ static void bs_font_wheel_open(ui_ctx_t *ctx) {
 static void p_book_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
     (void)p;
     switch (item) {
-    case 0: bs_size_wheel_open(ctx); return;    /* 字号 → 滚轮 */
-    case 1: bs_font_wheel_open(ctx); return;    /* 字体 → 滚轮 */
-    case 2: s_bs_pagenum ^= 1; break;           /* 显示页码 点击切换 */
+    case 0: bs_size_wheel_open(ctx); return;    /* 字号(16/24/32) → 滚轮 */
+    case 1: bs_font_wheel_open(ctx); return;    /* 字体(仿宋/黑体/TF 字库) → 滚轮 */
+    case 2: s_bs_pagenum ^= 1; break;           /* 显示进度 点击切换 */
     case 3: s_bs_margin = (s_bs_margin + 1) % 3; break;   /* 边距 点击循环 */
     case 4: s_bs_lineh = (s_bs_lineh + 1) % 3; break;     /* 行高 点击循环 */
     case 5: s_bs_gap = (s_bs_gap + 1) % 3; break;       /* 字距 紧凑/标准/宽松 */
@@ -516,9 +544,8 @@ static void book_shelf_render(ui_ctx_t *ctx) {
     }
 }
 
-/* 触摸命中 (物理坐标 → book_touch_map 映射为逻辑坐标再命中, 与渲染坐标系一致) */
+/* 触摸命中 (坐标**已由内核 ctx->map_touch(=book_touch_map) 换算成逻辑坐标**, 与渲染同系) */
 static bool book_shelf_touch(ui_ctx_t *ctx, int x, int y) {
-    book_touch_map(&x, &y);   /* 物理 → 逻辑 (自包含, 页内映射) */
     const int list_y = s_bp.list_y > 0 ? s_bp.list_y : 30;
     if (y < list_y || y >= ui_screen_h() - 4) return false;
     if (x < SL_LEFT_W) {
@@ -628,7 +655,7 @@ static void p_book_enter(ui_ctx_t *ctx) {
         s_bp.all_label = NULL;
         /* 侧栏首项「阅读优化」(3.3): 选中后右栏内联显示阅读设置 */
         s_bp.settings_label = "\xe9\x98\x85\xe8\xaf\xbb\xe4\xbc\x98\xe5\x8c\x96"; /* 阅读优化 */
-        s_bp.settings_count = 8;
+        s_bp.settings_count = 8;   /* 字号/字体/显示进度/边距/行高/字距/段落缩进/旋转方向 */
         s_bp.settings_render = p_book_settings_render;
         s_bp.on_settings_select = p_book_settings_select;
         /* 侧栏「最近阅读」: 设备级兜底, 右栏显示最近打开的书 */
@@ -701,7 +728,7 @@ static void p_book_action(ui_ctx_t *ctx, os_action_t a) {
         return;
     }
     if (os_pane_action(ctx, &s_bp, a)) return;
-    if (a == OS_ACTION_BACK) os_pop(ctx);
+    if (a == OS_ACTION_BACK) os_request_exit_confirm(ctx);   /* 书架最外层: 确认后才退 */
 }
 
 static bool p_book_touch(ui_ctx_t *ctx, int x, int y) {

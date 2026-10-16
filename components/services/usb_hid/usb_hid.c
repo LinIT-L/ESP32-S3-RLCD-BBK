@@ -221,7 +221,7 @@ static esp_err_t usb_mode_enter(const uint8_t *config_desc, const char **strings
     /* 释放 Serial/JTAG (与虚拟键鼠一致的切换序列), 稍等稳定 */
     esp_err_t sj_ret = usb_serial_jtag_driver_uninstall();
     if (sj_ret != ESP_OK) {
-        ESP_LOGE(TAG, "卸载 Serial/JTAG 失败: %s", esp_err_to_name(sj_ret));
+        ESP_LOGD(TAG, "卸载 Serial/JTAG 失败: %s", esp_err_to_name(sj_ret));
         esp_log_set_vprintf(prev);
         return sj_ret;
     }
@@ -241,7 +241,7 @@ static esp_err_t usb_mode_enter(const uint8_t *config_desc, const char **strings
     esp_err_t ret = tinyusb_driver_install(&cfg);
     if (ret != ESP_OK) {
         /* 失败: 装回 Serial/JTAG 驱动, 恢复原控制台, 避免串口永久失效 */
-        ESP_LOGE(TAG, "进入 TinyUSB 模式失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "进入 TinyUSB 模式失败: %s", esp_err_to_name(ret));
         usb_serial_jtag_driver_config_t sj_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
         usb_serial_jtag_driver_install(&sj_cfg);
         esp_log_set_vprintf(prev);
@@ -339,7 +339,7 @@ esp_err_t usb_hid_start(void)
         s_running = true;
         ESP_LOGI(TAG, "键鼠模式已启用 (HID 键盘+鼠标+CDC, 控制台走 CDC)");
     } else {
-        ESP_LOGE(TAG, "键鼠模式启动失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "键鼠模式启动失败: %s", esp_err_to_name(ret));
     }
     return ret;
 }

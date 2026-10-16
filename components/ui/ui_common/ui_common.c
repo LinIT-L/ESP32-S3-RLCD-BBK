@@ -5,6 +5,7 @@
 #include "ui_common.h"
 #include <string.h>
 #include <math.h>
+#include "esp_heap_caps.h"   /* ui_icon_register_extra: 外来图标放 PSRAM */
 #include "font_zh16.h"
 
 /* 当前逻辑屏幕尺寸: 默认横屏 400×300; 书库旋转左/右时切为竖屏 300×400 (os_pane/os_dialog 布局按此重排). */
@@ -609,9 +610,37 @@ int draw_text_wrapped(st7305_handle_t *lcd, int x0, int x1, int y0,
 /* icon_idx 即 main_icons[] 下标 (语义化 ICON_* 枚举值). 历史上曾有一张 tbl[32]
  * 兼容重映射表, 导致"应用管家离屏列"与"主菜单"对同一下标画出不同图标; 现已删除,
  * 单一入口: 所有路径都直接用 main_icons[icon_idx]. */
+/* ★★ 2026-10-15 "图标跟着应用走" (linit: 以后从服务器下发新应用, 不该为了图标改固件):
+ *   LAPP 头里本来就自带 64×64 位图 (--@app icon=), 但老实现只会拿它去**反查**主图标表,
+ *   查不到就固定回退 ICON_MINI_GAMES —— 于是"服务器上新应用用新图标"永远显示成小游戏机。
+ *   现在加一层**运行时外来图标表** (PSRAM, 下标从 MAIN_ICON_COUNT 开始),
+ *   查不到就把它注册进来并返回新下标, 主菜单/管家/离屏列三条绘制路径都能画。
+ *   ⚠ 这些下标只在**本次开机**有效 (注册顺序来自扫描), 不要写进 NVS 长期保存。 */
+#define UI_EXTRA_ICON_MAX 32
+static const uint8_t *s_extra_icon[UI_EXTRA_ICON_MAX];
+static int            s_extra_icon_n;
+
+int ui_icon_register_extra(const uint8_t *bmp512) {
+    if (!bmp512) return -1;
+    for (int i = 0; i < s_extra_icon_n; i++)                 /* 去重: 同图复用同一下标 */
+        if (memcmp(s_extra_icon[i], bmp512, MAIN_ICON_BYTES) == 0)
+            return MAIN_ICON_COUNT + i;
+    if (s_extra_icon_n >= UI_EXTRA_ICON_MAX) return -1;
+    uint8_t *cp = (uint8_t *)heap_caps_malloc(MAIN_ICON_BYTES, MALLOC_CAP_SPIRAM);
+    if (!cp) return -1;
+    memcpy(cp, bmp512, MAIN_ICON_BYTES);
+    s_extra_icon[s_extra_icon_n] = cp;
+    return MAIN_ICON_COUNT + s_extra_icon_n++;
+}
+/* 下标 → 位图 (内置表 + 外来表) */
+static const uint8_t *icon_bmp_of(int icon_idx) {
+    if (icon_idx < 0) return NULL;
+    if (icon_idx < MAIN_ICON_COUNT) return main_icons[icon_idx];
+    int e = icon_idx - MAIN_ICON_COUNT;
+    return (e < s_extra_icon_n) ? s_extra_icon[e] : NULL;
+}
 static int main_icon_index(int icon_idx) {
-    if (icon_idx < 0 || icon_idx >= MAIN_ICON_COUNT) return 0;
-    return icon_idx;
+    return icon_bmp_of(icon_idx) ? icon_idx : 0;
 }
 void draw_icon_bitmap(st7305_handle_t *lcd, int cx, int cy, int size, int icon_idx) {
     draw_icon_bitmap_stretched(lcd, cx, cy, size, size, icon_idx);
@@ -619,10 +648,10 @@ void draw_icon_bitmap(st7305_handle_t *lcd, int cx, int cy, int size, int icon_i
 static void ui_blit_scaled(st7305_handle_t *dev, int x0, int y0, int dst_w, int dst_h,
                            int src_w, int src_h, const uint8_t *src);   /* 前向声明 */
 void draw_icon_bitmap_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx) {
-    int mi = main_icon_index(icon_idx);
-    if (mi < 0 || mi >= MAIN_ICON_COUNT) return;
+    const uint8_t *b = icon_bmp_of(icon_idx);
+    if (!b) return;
     ui_blit_scaled(lcd, cx - size_w / 2, cy - size_h / 2, size_w, size_h,
-                   MAIN_ICON_W, MAIN_ICON_H, main_icons[mi]);
+                   MAIN_ICON_W, MAIN_ICON_H, b);
 }
 /* 高性能 1bpp 缩放直写: 直接操作 ST7305 fb (PSRAM), 跳过 st7305_draw_pixel 逐点开销.
  * 速度比逐点缩放快 5-10x, 主菜单轮盘多图标渲染流畅性的关键.
@@ -653,17 +682,18 @@ static void ui_blit_scaled(st7305_handle_t *dev, int x0, int y0, int dst_w, int 
 }
 
 void draw_main_icon_stretched(st7305_handle_t *lcd, int cx, int cy, int size_w, int size_h, int icon_idx) {
-    if (icon_idx < 0 || icon_idx >= MAIN_ICON_COUNT) return;
+    const uint8_t *b = icon_bmp_of(icon_idx);
+    if (!b) return;
     ui_blit_scaled(lcd, cx - size_w / 2, cy - size_h / 2, size_w, size_h,
-                   MAIN_ICON_W, MAIN_ICON_H, main_icons[icon_idx]);
+                   MAIN_ICON_W, MAIN_ICON_H, b);
 }
 /* 取主菜单图标原始 1bpp 位图 (供离屏整列预渲染直接嵌入, 不做缩放) */
 const uint8_t *ui_main_icon_bitmap(int icon_idx, int *w, int *h) {
-    int mi = main_icon_index(icon_idx);
-    if (mi < 0 || mi >= MAIN_ICON_COUNT) return NULL;
+    const uint8_t *b = icon_bmp_of(icon_idx);
+    if (!b) return NULL;
     if (w) *w = MAIN_ICON_W;
     if (h) *h = MAIN_ICON_H;
-    return main_icons[mi];
+    return b;
 }
 /* 通用 1bpp 位图缩放直写 (与主图标同款朝向/缩放), 供诊断等自绘页嵌入自定义图标.
  * src: src_w x src_h 1bpp, MSB-first. */

@@ -1,0 +1,60 @@
+{
+  "ver": 2,
+  "mirrors": [
+    "https://bbk.linit.cn/bbk",
+    "https://gitee.com/LinIT-L/ESP32-S3-RLCD-BBK/raw/master/store"
+  ],
+  "mirror": "https://bbk.linit.cn/bbk",
+  "updated": "2026-10-05",
+  "packs": [
+    {
+      "id": "fj",
+      "label": "福建省",
+      "files": [
+        "maps/fj.bin",
+        "maps/fj.json"
+      ]
+    },
+    {
+      "id": "putian",
+      "label": "莆田市区",
+      "files": [
+        "maps/putian_road.ltm",
+        "maps/putian_contour.ltm",
+        "maps/putian_poi.ltm"
+      ]
+    }
+  ],
+  "files": [
+    {
+      "t": "bin",
+      "path": "maps/fj.bin",
+      "size": 19996510,
+      "f16": -1
+    },
+    {
+      "t": "index",
+      "path": "maps/fj.json",
+      "size": 48033,
+      "f16": 7688
+    },
+    {
+      "t": "road",
+      "path": "maps/putian_road.ltm",
+      "size": 192128,
+      "f16": 2704
+    },
+    {
+      "t": "contour",
+      "path": "maps/putian_contour.ltm",
+      "size": 139960,
+      "f16": 50202
+    },
+    {
+      "t": "poi",
+      "path": "maps/putian_poi.ltm",
+      "size": 4887,
+      "f16": 64646
+    }
+  ]
+}

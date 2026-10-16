@@ -319,7 +319,7 @@ int keyvault_verify_pin(const char *pin) {
     kv_nvs_set_u32(KV_NVS_FAILS, s_fails);
     size_t idx = (s_fails >= 1 && s_fails <= 4) ? (s_fails - 1) : 3;
     s_lock_until_ms = now_ms() + s_lock_seconds[idx] * 1000UL;
-    ESP_LOGW(TAG, "PIN 错误 %u 次, 锁定 %u 秒", (unsigned)s_fails, (unsigned)s_lock_seconds[idx]);
+    ESP_LOGD(TAG, "PIN 错误 %u 次, 锁定 %u 秒", (unsigned)s_fails, (unsigned)s_lock_seconds[idx]);
     return 1;
 }
 void keyvault_unlock_secret(const char *pin, uint8_t key[KV_KEY_LEN]) { kv_derive_key(pin, key); }

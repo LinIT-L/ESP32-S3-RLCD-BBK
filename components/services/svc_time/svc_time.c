@@ -48,7 +48,7 @@ void svc_time_ntp_sync(void)
     if (s_ntp_inited || ntp_load_day() == ntp_day_now()) return;   /* 已校过/当天已校 */
     esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     esp_sntp_set_time_sync_notification_cb(ntp_sync_cb);   /* 校时成功回调 (init 前设置) */
-    if (esp_netif_sntp_init(&cfg) != ESP_OK) { ESP_LOGW(TAG, "NTP 初始化失败"); return; }
+    if (esp_netif_sntp_init(&cfg) != ESP_OK) { ESP_LOGD(TAG, "NTP 初始化失败"); return; }
     esp_netif_sntp_start();
     s_ntp_inited = true;
     ESP_LOGI(TAG, "NTP 校时已启动 (每天首次联网)");

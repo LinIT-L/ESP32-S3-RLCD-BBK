@@ -20,12 +20,12 @@ idf_component_register(
         "."
         "third_party/gnuboy/include"
     REQUIRES
+    st7305
+    input
+    bt_ctl
         board_shim
         audio_player
         cheater
-        st7305
-        input
-        bt_ctl
         esp_timer
         esp_partition
         esp_system

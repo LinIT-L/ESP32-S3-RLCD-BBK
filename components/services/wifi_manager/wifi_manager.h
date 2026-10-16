@@ -27,6 +27,13 @@ bool wifi_manager_is_enabled(void);
 bool wifi_manager_is_connected(void);
 bool wifi_manager_is_connecting(void);
 
+/* ★ 2026-10-15 (联网归网络模块): 是否配过网络 (有保存凭据) */
+bool wifi_manager_has_saved(void);
+
+/* ★ 2026-10-15: 开机自动联网 —— 有凭据则拉起射频并连接 (main 启动时调一次).
+ * 之后连接/断线重连全由本模块的自愈任务负责, 上层只管查 is_connected。 */
+void wifi_manager_autostart(void);
+
 /* V1.0.46: 消费"刚刚连接成功"事件 (供菜单弹 0.5s 提示), 返回 true=本次刚连上 */
 bool wifi_manager_consume_connected_event(void);
 

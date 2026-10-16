@@ -36,7 +36,7 @@ esp_err_t usbh_msc_start(void) {
     /* 1) 切换到纯 MSC (U盘) 设备 (卸载 Serial/JTAG, 装 TinyUSB, 全程压制日志) */
     esp_err_t ret = usb_composite_enter_msc();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "进入挂载设备失败: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "进入挂载设备失败: %s", esp_err_to_name(ret));
         svc_log_console_suspend(false);
         return ret;
     }
@@ -48,7 +48,7 @@ esp_err_t usbh_msc_start(void) {
         };
         ret = tinyusb_msc_install_driver(&dc);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "tinyusb_msc_install_driver 失败: %s", esp_err_to_name(ret));
+            ESP_LOGD(TAG, "tinyusb_msc_install_driver 失败: %s", esp_err_to_name(ret));
             usb_composite_exit();
             svc_log_console_suspend(false);
             return ret;
@@ -64,7 +64,7 @@ esp_err_t usbh_msc_start(void) {
         };
         ret = tinyusb_msc_new_storage_sdmmc(&cfg, &s_storage);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "tinyusb_msc_new_storage_sdmmc 失败: %s", esp_err_to_name(ret));
+            ESP_LOGD(TAG, "tinyusb_msc_new_storage_sdmmc 失败: %s", esp_err_to_name(ret));
             usb_composite_exit();
             svc_log_console_suspend(false);
             return ret;
@@ -83,7 +83,7 @@ void usbh_msc_stop(void) {
     if (s_storage) {
         esp_err_t r = tinyusb_msc_delete_storage(s_storage);
         if (r != ESP_OK) {
-            ESP_LOGE(TAG, "tinyusb_msc_delete_storage 失败: %s", esp_err_to_name(r));
+            ESP_LOGD(TAG, "tinyusb_msc_delete_storage 失败: %s", esp_err_to_name(r));
         }
         s_storage = NULL;
     }

@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>LinTOS 频谱仪 · 上方波形拖动跟手 仿真器</title>
+<style>
+  *{ box-sizing:border-box; }
+  body{ margin:0; padding:18px 20px 40px; background:#2b2f33; color:#dfe3e6;
+        font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1{ font-size:16px; margin:0 0 4px; font-weight:600; }
+  .sub{ color:#96a0a8; font-size:12px; margin-bottom:14px; max-width:1180px; }
+  .wrap{ display:flex; gap:22px; align-items:flex-start; flex-wrap:wrap; }
+  #panel{ width:min(780px, calc(100vw - 430px)); aspect-ratio:4/3;
+          image-rendering:pixelated;
+          background:#fff; border-radius:2px; box-shadow:0 6px 22px rgba(0,0,0,.45); cursor:grab; touch-action:none; }
+  #panel.dragging{ cursor:grabbing; }
+  .side{ width:340px; }
+  fieldset{ border:1px solid #454c52; border-radius:8px; padding:10px 12px 12px; margin:0 0 12px; }
+  legend{ font-size:12px; color:#9fb0bb; padding:0 4px; }
+  .row{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  button{ background:#39424a; color:#e6edf2; border:1px solid #4d5962; border-radius:6px;
+          padding:6px 11px; font-size:13px; cursor:pointer; }
+  button.on{ background:#2f6f4f; border-color:#3f8b64; }
+  button:hover{ filter:brightness(1.12); }
+  table{ width:100%; border-collapse:collapse; font:12px/1.75 ui-monospace,Menlo,monospace; }
+  td{ padding:1px 0; } td:last-child{ text-align:right; color:#8fd6a8; }
+  .note{ font-size:12px; color:#8d979e; margin-top:8px; }
+  .verdict{ margin-top:10px; padding:8px 10px; border-radius:6px; font-size:12.5px; line-height:1.55; }
+  .bad{ background:#4a2b2b; color:#f0b9b9; } .good{ background:#23402f; color:#a9e5c1; }
+</style>
+</head>
+<body>
+<h1>LinTOS 频谱仪 · 上方波形「左右拖动」跟手仿真</h1>
+<div class="sub">400×300 面板 1:1 复刻（几何/字位/底栏与固件一致）。在上面谱区按住拖动 = 真机手指拖动。
+真机 DSP 是 <b>20Hz</b>（每 50ms 才出一帧新数据）—— 卡顿就出在这儿。切换下面两种算法对比手感。</div>
+
+<div class="wrap">
+  <canvas id="panel" width="400" height="300"></canvas>
+  <div class="side">
+    <fieldset>
+      <legend>拖动算法</legend>
+      <button id="mWin" class="on">新②窗口滑动：连续 + 数据全真（推荐）</button>
+      <button id="mNew">新①：1:1 像素 + 整数MHz换频（= 现固件）</button>
+      <button id="mOld">旧：触摸里直接换频</button>
+      <div class="row">
+        <button class="sp" data-sp="80">span 80</button>
+        <button class="sp" data-sp="40">span 40</button>
+        <button class="sp" data-sp="20">span 20</button>
+        <button class="sp" data-sp="10">span 10</button>
+      </div>
+      <div class="note">旧算法：手指一动就换频（45ms 节流），像素平移只剩零点几像素
+        ⇒ 画面 45ms 不动，然后整幅跳一大格。</div>
+    </fieldset>
+    <fieldset>
+      <legend>实时量（拖动时盯这里）</legend>
+      <table>
+        <tr><td>DSP 帧率</td><td id="v-fps">–</td></tr>
+        <tr><td>渲染帧率</td><td id="v-rfps">–</td></tr>
+        <tr><td>手指累计位移</td><td id="v-finger">0 MHz</td></tr>
+        <tr><td>已生效（写进 PHY）</td><td id="v-applied">0 MHz</td></tr>
+        <tr><td><b>画面像素偏移</b></td><td id="v-disp">0 px</td></tr>
+        <tr><td>中心频率</td><td id="v-fc">2437 MHz</td></tr>
+        <tr><td><b>每帧画面跳变</b></td><td id="v-step">0 px</td></tr>
+        <tr><td>本底 / 峰值 dB</td><td id="v-db">–</td></tr>
+      </table>
+      <div id="verdict" class="verdict good">–</div>
+    </fieldset>
+    <fieldset>
+      <legend>说明</legend>
+      <div class="note">
+        · 谱区左右拖 = 调中心频率；向左拖 = 往高频看（内容跟着手走）。<br>
+        · 底部视图名位移 = 整页拖动位移 × 76/400（拖满一屏 = 走一个项间距）。<br>
+        · 「每帧画面跳变」= 卡顿的直接来源：旧算法每帧跳几十像素，新算法用像素平移抹平。
+      </div>
+    </fieldset>
+  </div>
+</div>
+
+<div id="dbg" style="position:fixed;left:-9999px"></div>
+<script>
+window.onerror=function(m,s,l){ var d=document.getElementById('dbg'); if(d) d.textContent='ERR '+m+' @'+l; };
+</script>
+<script>
+/* ===== 面板几何（与 page_sdr.c / sdr_view.h 一致） ===== */
+const W=400,H=300;
+const PLOT_X0=32,PLOT_X1=399,PLOT_Y0=22,PLOT_Y1=150,PLOT_W=PLOT_X1-PLOT_X0+1;
+const AXIS_LINE=152,AXIS_TICK=153,AXIS_TXT_Y=155;
+const WF_Y0=183,WF_H=89;
+const SOFT_LID=273,SOFT_VALLEY=294,SOFT_KEYY=277,SOFT_MARGIN=16;
+
+const cv=document.getElementById('panel'), g=cv.getContext('2d',{alpha:false});
+g.imageSmoothingEnabled=false;
+
+/* URL 参数（放最前面，后面 setSpan/setAlgo 初始化要用）:
+ *   ?algo=win|new|old   初始算法     ?span=80|40|20|10   初始跨度
+ *   ?autodrag=-120      自动拖 120px ?frames=200         确定性快照(同步跑 200 帧) */
+const QS=new URLSearchParams(location.search);
+const AUTO_TOTAL=parseFloat(QS.get('autodrag')||'0')||0;
+const FRAMES=parseInt(QS.get('frames')||'0',10)||0;
+
+/* ===== “物理世界”: 2.4G 频段模型（绝对频率 → dBm） ===== */
+const AP=[{f:2412,p:-44,w:11},{f:2437,p:-38,w:11},{f:2462,p:-47,w:11},
+          {f:2424,p:-58,w:9},{f:2452,p:-62,w:9},{f:2484,p:-55,w:10},{f:2472,p:-66,w:8}];
+const BLE=[2402,2426,2480];
+function phySpec(f,t){
+  let v=-96;
+  for(const a of AP){ const d=(f-a.f)/a.w;
+    if(Math.abs(d)<2.2) v=Math.max(v, a.p + 3*Math.sin(t*0.7+a.f*0.11) - 10*d*d); }
+  for(let i=0;i<3;i++) if(Math.abs(f-BLE[i])<1.6 && (Math.floor(t*2)+i)%3===0)
+    v=Math.max(v,-70+6*Math.sin(t*5+i));
+  return v;
+}
+
+/* ===== 状态 =====
+ * 账目只用两个量, 单位统一成 MHz (固件也是这么记的):
+ *   fingerMhz  —— 手指累计位移 (MHz 当量)
+ *   appliedMhz —— 已经写进 PHY **并且已经画到屏上**的量
+ * 画面像素偏移 = (fingerMhz - appliedMhz) 折算成像素 ⇒ 拖动期间恒等于"还没上屏的位移" */
+const S={ span:80, fc:2437, fc0:2437,
+  fingerMhz:0, appliedMhz:0, disp:0,
+  /* 窗口滑动模式用: tunedMhz = “硬件”实际调谐中心(采集带宽 80MHz 恒宽)；
+     viewMhz = 显示窗口中心(浮点)；renderedMhz = 上一帧渲染用的窗口中心 */
+  tunedMhz:2437, viewMhz:2437, renderedMhz:2437, clipPx:0,
+  cols:new Float32Array(PLOT_W).fill(-200),
+  wf:new Uint8Array(WF_H*PLOT_W),
+  dragging:false, lastX:0, algo:'win', floor:-92,
+  dspMs:0, dspN:0, dspFps:0, dspWin:0, renN:0, renFps:0, renWin:0,
+  lastFrameJump:0 };
+
+/* ===== 静态层缓存（网格 + 底栏）—— 不缓存会自己卡，那就不是公平测试了 ===== */
+const gridLayer=document.createElement('canvas'); gridLayer.width=W; gridLayer.height=H;
+(function(){
+  const c=gridLayer.getContext('2d');
+  c.fillStyle='#fff'; c.fillRect(0,0,W,H); c.fillStyle='#111'; c.fillRect(0,0,0,0);
+  for(let y=PLOT_Y0+8;y<=PLOT_Y1-4;y+=32)
+    for(let x=PLOT_X0;x<=PLOT_X1;x++) if(x%4<1) c.fillRect(x,y,1,1);
+  for(let x=PLOT_X0;x<=PLOT_X1;x+=32)
+    for(let y=PLOT_Y0;y<=PLOT_Y1;y++) if(y%4===0) c.fillRect(x,y,1,1);
+})();
+const barLayer=document.createElement('canvas'); barLayer.width=W; barLayer.height=H;
+(function(){
+  const c=barLayer.getContext('2d');
+  const F='17px "PingFang SC","Microsoft YaHei",sans-serif';
+  c.fillStyle='#111'; c.textBaseline='top';
+  c.fillRect(0,SOFT_LID,16+34+12+1,1); c.fillRect(W-16-34-12,SOFT_LID,W-(W-16-34-12),1);
+  const L=16+34+12, R=W-16-34-12, n=SOFT_VALLEY-SOFT_LID;
+  for(let d=0;d<=n;d++){ c.fillRect(L+d,SOFT_LID+d,1,1); c.fillRect(R-d,SOFT_LID+d,1,1); }
+  c.fillRect(L+n,R-n,1,1);
+})();
+
+/* ===== 瀑布: 直接写 ImageData, 一次 putImageData 贴上去 ===== */
+const wfImg=g.createImageData(PLOT_W,WF_H);
+(function(){ const d=wfImg.data; for(let i=0;i<WF_H*PLOT_W;i++){ d[i*4]=255;d[i*4+1]=255;d[i*4+2]=255;d[i*4+3]=255; } })();
+
+/* ===== 绘制原语 ===== */
+function txt(s,x,y,size,black,align){ g.fillStyle=black?'#111':'#fff';
+  g.font=(size>=14?'"PingFang SC","Microsoft YaHei",sans-serif':'ui-monospace,Menlo,monospace').replace(/^/,size+'px ');
+  g.font=size+'px '+(size>=14?'"PingFang SC","Microsoft YaHei",sans-serif':'ui-monospace,Menlo,monospace');
+  g.textAlign=align||'left'; g.fillStyle=black?'#111':'#fff'; g.fillText(s,x,y); g.textAlign='left'; }
+function hline(x0,x1,y,c){ c.fillRect(x0,y,x1-x0+1,1); }
+function vline(x,y0,y1,c){ c.fillRect(x,y0,1,y1-y0+1); }
+function dbY(db,top,bot){ let t=(db-bot)/(top-bot); t=t<0?0:t>1?1:t; return PLOT_Y1-Math.round(t*(PLOT_Y1-PLOT_Y0)); }
+
+/* ===== 交互（= 真机触摸） ===== */
+function setSpan(v){ S.span=v; resetDrag(); if(S.algo==='win') recenterWin();
+  document.querySelectorAll('.sp').forEach(b=>b.classList.toggle('on',+b.dataset.sp===v)); }
+function resetDrag(){ S.fc0=S.fc; S.fingerMhz=0; S.appliedMhz=0; S.disp=0; S.lastFrameJump=0; }
+function recenterWin(){ S.tunedMhz=S.fc; S.viewMhz=S.fc; S.renderedMhz=S.fc; S.disp=0; }
+function setAlgo(a){ S.algo=a; resetDrag(); if(a==='win') recenterWin();
+  document.getElementById('mWin').classList.toggle('on',a==='win');
+  document.getElementById('mNew').classList.toggle('on',a==='new');
+  document.getElementById('mOld').classList.toggle('on',a==='old');
+  const el=document.getElementById('verdict');
+  if(a==='win'){ el.className='verdict good';
+    el.textContent='显示窗口在 80MHz 采集带宽内**连续滑动**（浮点 MHz，无整数跳变）：只做像素平移、不用写 PHY ⇒ 60fps 连续跟手；窗口快滑到采集边缘时才在后台换一次频。数据全程是真的。'; }
+  else if(a==='new'){ el.className='verdict bad';
+    el.textContent='拖动期间靠像素平移，但换频只能落在整数 MHz 上、且被节流到 DSP 节拍（20Hz）⇒ 谱线每 50ms 才前进一次，看上去一顿一顿。'; }
+  else { el.className='verdict bad';
+    el.textContent='手指一动就直接换频（45ms 节流）、像素平移只剩零头 ⇒ 画面 45ms 一动不动、然后整幅跳一大格。'; } }
+document.querySelectorAll('.sp').forEach(b=>b.onclick=()=>setSpan(+b.dataset.sp));
+document.getElementById('mWin').onclick=()=>setAlgo('win');
+document.getElementById('mNew').onclick=()=>setAlgo('new');
+document.getElementById('mOld').onclick=()=>setAlgo('old');
+setSpan(parseFloat(QS.get('span')||'80')||80); setAlgo(QS.get('algo')||'win');
+
+const px2mhz=px=>px*S.span/PLOT_W;
+const mhz2px=m =>m*PLOT_W/S.span;
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+let lastRetune=0;
+
+/* 一次拖动增量 —— 鼠标事件与 ?autodrag= 演示走同一条路 */
+function applyDragDx(dx){
+  const dMhz = px2mhz(dx);
+  if(S.algo==='win'){
+    /* 窗口连续滑动: 显示窗口中心直接在浮点 MHz 上走, 不碰 PHY。
+     * 画面偏移 = 窗口相对"上一帧渲染位置"的位移 ⇒ 拖动期间恒为 1:1。 */
+    S.viewMhz -= dMhz;                                    // 手指右拖 ⇒ 窗口往低频走
+    S.disp = clamp(mhz2px(S.viewMhz - S.renderedMhz), -48, 48);
+    return;
+  }
+  S.fingerMhz += dMhz;                                    // 手指右拖 ⇒ 内容右移 ⇒ 左边缘露出更低频率
+  if(S.algo==='old'){
+    // 旧: 手指在动时就换频 (45ms 节流), 像素平移只剩零头
+    const now=performance.now();
+    const pend=S.fingerMhz-S.appliedMhz;
+    if(Math.abs(pend)>=1 && now-lastRetune>=45){
+      const m=Math.round(pend);
+      S.appliedMhz+=m; S.fc=Math.round(S.fc0-S.appliedMhz);
+      S.lastFrameJump=Math.abs(Math.round(mhz2px(m))); lastRetune=now;
+    }
+    S.disp=clamp(mhz2px(S.fingerMhz-S.appliedMhz),-32,32);
+  } else {
+    // 新①: 拖动期间只做像素平移, 换频留到 DSP 节拍 (与数据刷新同帧)
+    S.disp=clamp(mhz2px(S.fingerMhz-S.appliedMhz),-48,48);
+  }
+}
+
+/* ?autodrag 的实时演示（非快照模式才走定时器） */
+function evX(e){ const r=cv.getBoundingClientRect(); return (e.clientX-r.left)/(r.width/W); }
+function evY(e){ const r=cv.getBoundingClientRect(); return (e.clientY-r.top)/(r.height/H); }
+
+cv.addEventListener('pointerdown',e=>{
+  const y=evY(e); if(y<PLOT_Y0||y>AXIS_LINE) return;
+  S.dragging=true; S.lastX=evX(e); resetDrag(); cv.classList.add('dragging');
+  cv.setPointerCapture?.(e.pointerId); e.preventDefault(); });
+
+window.addEventListener('pointermove',e=>{
+  if(!S.dragging) return;
+  const x=evX(e), dx=x-S.lastX; S.lastX=x;
+  applyDragDx(dx);
+  e.preventDefault(); });
+
+/* ?autodrag 的实时演示（非快照模式才走定时器） */
+if(AUTO_TOTAL && !FRAMES){
+  let i=0; S.dragging=true; resetDrag();
+  const id=setInterval(()=>{ applyDragDx(AUTO_TOTAL/30); if(++i>=30) clearInterval(id); },16);
+}
+
+function endDrag(){
+  if(!S.dragging) return; S.dragging=false; cv.classList.remove('dragging');
+  if(S.algo==='win'){ S.renderedMhz=S.viewMhz; S.disp=0; return; }   // 窗口停在哪就是哪
+  const m=Math.round(S.fingerMhz-S.appliedMhz);      // 松手把欠账结清
+  if(m){ S.appliedMhz+=m; S.fc=Math.round(S.fc0-S.appliedMhz); }
+  resetDrag();
+}
+window.addEventListener('pointerup',endDrag);
+window.addEventListener('pointercancel',endDrag);
+
+/* ===== DSP 帧（20Hz）: “硬件”出数据 ===== */
+function dspTick(now){
+  if(now-S.dspMs<50) return;
+  const dt=now-S.dspMs; S.dspMs=now; S.dspN++; S.dspWin+=dt;
+  if(S.dspWin>=500){ S.dspFps=Math.round(S.dspN*1000/S.dspWin); S.dspN=0; S.dspWin=0; }
+
+  if(S.algo==='win'){
+    /* 窗口滑动: 只要窗口还在 80MHz 采集带内就**不需要碰 PHY**;
+     * 快滑到边缘了才在后台把这一次换频补上（换频发生在两帧之间, 画面位置不动）。 */
+    const margin=Math.max(0.5,(80-S.span)/2-2);
+    if(Math.abs(S.viewMhz-S.tunedMhz)>margin) S.tunedMhz=Math.round(S.viewMhz);
+    S.renderedMhz=S.viewMhz;          // ★ 本帧数据就是按这个窗口算的
+    S.disp=0;                         // ★ 偏移归零与"新数据上屏"同帧发生 ⇒ 看不见接缝
+    S.lastFrameJump=0;
+  }
+  else if(S.algo==='new'){
+    const pend=S.fingerMhz-S.appliedMhz;
+    if(Math.abs(pend)>=1){
+      const m=Math.round(pend);
+      S.appliedMhz+=m; S.fc=Math.round(S.fc0-S.appliedMhz);
+      S.lastFrameJump=Math.abs(Math.round(mhz2px(m)));   // ← 每帧跳这么多像素 = 卡顿
+    } else S.lastFrameJump=0;
+    S.disp=clamp(mhz2px(S.fingerMhz-S.appliedMhz),-48,48);
+  }
+
+  /* 本帧谱线: 窗口中心 = win模式用 viewMhz, 其它用 fc */
+  const winC = (S.algo==='win') ? S.viewMhz : S.fc;
+  const capC = (S.algo==='win') ? S.tunedMhz : S.fc;
+  const fLo = winC - S.span/2, t = now/1000;
+  S.clipPx = 0;
+  for(let i=0;i<PLOT_W;i++){
+    const f0=fLo+S.span*i/PLOT_W, f1=fLo+S.span*(i+1)/PLOT_W;
+    let mx=-200; const n=Math.max(1,Math.round((f1-f0)/0.25));
+    for(let k=0;k<n;k++){
+      let f=f0+(f1-f0)*k/n;
+      const over=Math.abs(f-capC)-40;                  // 超出采集带宽 ⇒ 只能拿边缘数据顶(并标记)
+      if(over>0){ f=capC+Math.sign(f-capC)*40; S.clipPx++; }
+      mx=Math.max(mx, phySpec(f,t)+(Math.random()-0.5)*2.4);
+    }
+    S.cols[i]+=(mx-S.cols[i])*(S.dragging?1.0:0.25);
+  }
+  const srt=Float32Array.from(S.cols).sort();
+  S.floor+=((srt[srt.length>>1]+0.5)-S.floor)*0.15;
+
+  S.wf.copyWithin(0,PLOT_W);                               // 瀑布推一行
+  const thr=S.floor+10;
+  for(let i=0;i<PLOT_W;i++) S.wf[(WF_H-1)*PLOT_W+i]= S.cols[i]>=thr?1:0;
+}
+
+/* ===== 渲染 ===== */
+function draw(){
+  g.fillStyle='#fff'; g.fillRect(0,0,W,H);
+  g.drawImage(gridLayer,0,0);
+
+  const top=S.floor+60, bot=S.floor-10;
+  /* 左侧刻度 */
+  const marks=[[60,'60'],[40,'40'],[20,'20'],[0,'0']];   // 最底格用数字 0（不同"本底"，见 2026-10-15）
+  for(const [rel,lb] of marks){
+    let y=dbY(top-(60-rel),top,bot)-5;
+    y=Math.max(PLOT_Y0,Math.min(PLOT_Y1-12,y));
+    txt(lb, 30, y, 12,true,'right');
+  }
+  /* 谱线（带像素偏移） */
+  let prev=-1;
+  g.fillStyle='#111';
+  for(let i=0;i<PLOT_W;i++){
+    let si=i-S.disp; if(si<0)si=0; if(si>=PLOT_W)si=PLOT_W-1;   // 边界夹取(=固件, 不留空白条)
+    const y=Math.max(PLOT_Y0,Math.min(PLOT_Y1,dbY(S.cols[si],top,bot)));
+    if(prev<0) vline(PLOT_X0+i,y,y,g); else vline(PLOT_X0+i,Math.min(prev,y),Math.max(prev,y),g);
+    prev=y;
+  }
+  /* 频率轴 */
+  const dispC = (S.algo==='win') ? S.viewMhz : S.fc;
+  g.fillStyle='#111'; hline(0,W-1,AXIS_LINE,g);
+  const lo=dispC-S.span/2, ticks=S.span/10+1;
+  for(let i=0;i<ticks;i++){
+    const x=PLOT_X0+Math.round(i*(PLOT_W-1)/(ticks-1));
+    vline(x,AXIS_TICK,AXIS_TICK+2,g);
+    if(i%2===0){
+      const lb=String(Math.round(lo+S.span*i/(ticks-1)));
+      txt(lb, clamp(x, 14, W-14), AXIS_TXT_Y, 12, true, 'center');
+    }
+  }
+  /* 瀑布: 写 ImageData 后整块贴 */
+  const d=wfImg.data;
+  for(let r=0;r<WF_H;r++) for(let i=0;i<PLOT_W;i++){
+    const v=S.wf[r*PLOT_W+i]?17:255, o=(r*PLOT_W+i)*4;
+    d[o]=v; d[o+1]=v; d[o+2]=v; d[o+3]=255;
+  }
+  g.putImageData(wfImg, PLOT_X0-S.disp, WF_Y0);
+  /* 瀑布分隔线 */
+  g.fillStyle='#111'; hline(6,W-7,WF_Y0-3,g); hline(6,W-7,WF_Y0-2,g);
+  /* 底栏 */
+  g.drawImage(barLayer,0,0);
+  const names=['波形','信道','蓝牙','音频'], step=76, cdx=Math.round(S.disp*step/W);
+  for(let k=-1;k<=1;k++){
+    const i=((0+k)+names.length)%names.length, vx=k*step+cdx;
+    if(vx<-190||vx>190) continue;
+    txt(names[i], W/2+vx, SOFT_VALLEY-18, 17,true,'center');
+  }
+  txt('设置',SOFT_MARGIN,SOFT_KEYY,17,true);
+  txt('冻结',W-SOFT_MARGIN,SOFT_KEYY,17,true,'right');
+  txt('2.4G 波形',6,1,17,true);
+  txt(Math.round(dispC-S.span/2)+'-'+Math.round(dispC+S.span/2)+'MHz',W-6,4,12,true,'right');
+}
+
+/* ===== 数据面板 ===== */
+const f=(v,n)=>((Math.abs(v)<0.05?0:v).toFixed(n||0));
+function panel(){
+  document.getElementById('v-fps').textContent  = S.dspFps+' 帧/秒';
+  document.getElementById('v-rfps').textContent = S.renFps+' 帧/秒';
+  document.getElementById('v-finger').textContent=f(S.fingerMhz,1)+' MHz';
+  document.getElementById('v-applied').textContent=f(S.appliedMhz,1)+' MHz';
+  document.getElementById('v-disp').textContent =f(S.disp,1)+' px';
+  document.getElementById('v-fc').textContent   =(S.algo==='win'? S.viewMhz.toFixed(1) : S.fc)+' MHz'+
+      (S.algo==='win' ? '（采集中心 '+S.tunedMhz+'）' : '');
+  document.getElementById('v-step').textContent =S.lastFrameJump+' px';
+  let mx=-999; for(let i=0;i<PLOT_W;i++) if(S.cols[i]>mx) mx=S.cols[i];
+  document.getElementById('v-db').textContent = f(S.floor,1)+' / '+f(mx,1);
+}
+let lastP=0, frameN=0;
+function loop(now){
+  frameN++;
+  const dbg=document.getElementById('dbg'); if(dbg) dbg.textContent='frames='+frameN;
+  dspTick(now); draw();
+  S.renN++;
+  if(now-lastP>250){ S.renFps=S.renN; S.renN=0; panel(); lastP=now; }
+  requestAnimationFrame(loop);
+}
+
+if(FRAMES){
+  /* 确定性快照: 同步跑 N 帧, 前 30 帧均匀注入 ?autodrag */
+  for(let i=1;i<=FRAMES;i++){
+    if(AUTO_TOTAL && i<=30){ S.dragging=true; applyDragDx(AUTO_TOTAL/30); }
+    dspTick(i*16.7); draw();
+  }
+  S.renFps=60; S.dspFps=20; panel();
+} else {
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>

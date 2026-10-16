@@ -172,7 +172,9 @@ static int l_dlg_toast(lua_State *L) {          /* app.dlg.toast(msg[, ms]) */
 }
 
 #define LUA_DLG_RESULT_NONE  (-2)
-#define LUA_DLG_ITEM_MAX     12
+#define LUA_DLG_ITEM_MAX     60      /* 2026-10-15: 12→60 —— 省/市选择这类长列表要走标准弹窗
+                                      * (C 侧 DLG_MAX_ITEMS 本来就是 60, 桥原来卡在 12)。
+                                      * 静态开销: 60×30B = 1.8KB, 可接受。 */
 #define LUA_DLG_ITEM_LEN     30
 static volatile int s_dlg_result = LUA_DLG_RESULT_NONE;
 static char         s_dlg_items[LUA_DLG_ITEM_MAX][LUA_DLG_ITEM_LEN];

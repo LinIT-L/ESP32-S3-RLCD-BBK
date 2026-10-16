@@ -222,7 +222,7 @@ static void mount_worker_task(void *arg) {
     if (rc1 != 0) {
         sd_watcher_set_paused(false);
         s_mount_result = M_MOUNT_FAIL1;
-        ESP_LOGE(TAG, "挂载失败: 卸载 VFS 失败");
+        ESP_LOGD(TAG, "挂载失败: 卸载 VFS 失败");
         vTaskDelete(NULL);
         return;
     }
@@ -238,7 +238,7 @@ static void mount_worker_task(void *arg) {
         sd_remount_vfs_from_card();
         sd_watcher_set_paused(false);
         s_mount_result = M_MOUNT_FAIL2;
-        ESP_LOGE(TAG, "挂载失败: usbh_msc_start %s", esp_err_to_name(rc2));
+        ESP_LOGD(TAG, "挂载失败: usbh_msc_start %s", esp_err_to_name(rc2));
         vTaskDelete(NULL);
         return;
     }
@@ -309,7 +309,7 @@ static void mount_btn_cb(ui_ctx_t *ctx, int result, void *ud) {
         os_dialog_mark_handled(ctx);      /* 保持弹窗 (显示图标), 卸载完成后再关 */
         if (xTaskCreate(unmount_worker_task, "unmount", 3072, NULL, 5, &s_mount_task) != pdPASS) {
             s_unmounting = false;
-            ESP_LOGE(TAG, "卸载后台任务创建失败");
+            ESP_LOGD(TAG, "卸载后台任务创建失败");
         }
         return;
     }
@@ -339,7 +339,7 @@ static void sd_mount_confirm(ui_ctx_t *ctx, int result, void *ud) {
     s_unmounting = false;
     if (xTaskCreate(mount_worker_task, "mount", 3072, NULL, 5, &s_mount_task) != pdPASS) {
         s_mount_result = M_MOUNT_FAIL2;              /* 任务创建失败按挂载失败处理 */
-        ESP_LOGE(TAG, "挂载后台任务创建失败");
+        ESP_LOGD(TAG, "挂载后台任务创建失败");
     }
 }
 

@@ -1,6 +1,8 @@
 /* macoui.c — IEEE OUI 字典查询, 数据在 appdata os_db 槽. */
 #include "macoui.h"
 #include <string.h>
+#include <stdio.h>
+#include <esp_heap_caps.h>
 
 typedef struct {
     uint8_t  oui[3];
@@ -28,14 +30,34 @@ bool macoui_lookup(const uint8_t oui[3], const char **vendor) {
     return false;
 }
 
-/* oui_db 由 CMake EMBED_FILES 内嵌进本组件固件(不再独立 appdata 区) */
-extern const uint8_t oui_db_bin_start[] asm("_binary_oui_db_bin_start");
-extern const uint8_t oui_db_bin_end[]   asm("_binary_oui_db_bin_end");
+/* ★ 2026-10-13 (linit 要求优化体积): oui_db.bin **不再 EMBED 进固件**(原 294 KB),
+ *   改为**首次查询时从 TF 卡读进 PSRAM** —— 与 fonts/font_part.c 同一套路。
+ *   卡上没有该文件时 macoui_open() 失败 ⇒ macoui_lookup() 返回 false,
+ *   上层显示"未知厂商" ⇒ 优雅降级, 不影响任何其它功能。
+ *   文件位置(二选一, 存在即可): /sdcard/oui_db.bin 或 /sdcard/wifi/oui_db.bin */
+#define MACOUI_PATH_A "/sdcard/oui_db.bin"
+#define MACOUI_PATH_B "/sdcard/wifi/oui_db.bin"
+#define MACOUI_MAX_SZ (512 * 1024)
 
-/* 打开 + 解析内嵌数据 (首次调用触发). */
+/* 打开 + 解析 TF 卡上的数据 (首次调用触发). */
 bool macoui_open(void) {
-    const uint8_t *p = oui_db_bin_start;
-    size_t avail = (size_t)(oui_db_bin_end - oui_db_bin_start);
+    static uint8_t *s_buf  = NULL;      /* 常驻 PSRAM, 不释放(记录指针指向它) */
+    static size_t   s_blen = 0;
+    if (!s_buf) {
+        FILE *f = fopen(MACOUI_PATH_A, "rb");
+        if (!f) f = fopen(MACOUI_PATH_B, "rb");
+        if (!f) return false;
+        if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+        long sz = ftell(f);
+        if (sz < 12 || sz > MACOUI_MAX_SZ || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+        s_buf = (uint8_t *)heap_caps_malloc((size_t)sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_buf) { fclose(f); return false; }
+        s_blen = fread(s_buf, 1, (size_t)sz, f);
+        fclose(f);
+        if (s_blen != (size_t)sz) return false;
+    }
+    const uint8_t *p = s_buf;
+    size_t avail = s_blen;
     if (avail < 12 || memcmp(p, "OUID", 4) != 0) return false;
     uint32_t count = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
     uint32_t nsz   = (uint32_t)p[8] | ((uint32_t)p[9] << 8) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);

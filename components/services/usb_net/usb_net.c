@@ -191,7 +191,7 @@ esp_err_t usb_net_start(void)
     /* 进入 RNDIS 网卡设备 (USB 层, 卸载 Serial/JTAG + 装 TinyUSB net) */
     esp_err_t ret = usb_composite_enter_net();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "进入 USB RNDIS 网卡失败: %s, 已回串口模式", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "进入 USB RNDIS 网卡失败: %s, 已回串口模式", esp_err_to_name(ret));
         return ret;
     }
     s_net_running = true;   /* 状态栏据此显示 NET 标记 */

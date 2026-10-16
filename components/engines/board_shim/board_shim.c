@@ -160,7 +160,7 @@ void board_rlcd_set_gbc_frame_source(const uint16_t *buf, int w, int h, int mode
         s_nes_internal = heap_caps_malloc(packed + NES_FB_BYTES + 4,
                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!s_nes_internal) {
-            ESP_LOGE(TAG, "GBC 内部暂存分配失败 (%d B)", packed + NES_FB_BYTES + 4);
+            ESP_LOGD(TAG, "GBC 内部暂存分配失败 (%d B)", packed + NES_FB_BYTES + 4);
             return;
         }
         s_nes_packed_bytes = packed;
@@ -409,7 +409,7 @@ esp_err_t board_shim_gb_stage_alloc(void)
                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     if (!m) {
-        ESP_LOGE(TAG, "GB stage 分配失败 (%d B)", ST7305_WIDTH * ST7305_HEIGHT / 8);
+        ESP_LOGD(TAG, "GB stage 分配失败 (%d B)", ST7305_WIDTH * ST7305_HEIGHT / 8);
         return ESP_ERR_NO_MEM;
     }
     s_fb_stage = m;

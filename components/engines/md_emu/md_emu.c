@@ -42,7 +42,11 @@ extern void md_emu_savestate_save(const char *path);
 extern uint8_t *boxemu_current_frame(void);
 
 EXT_RAM_BSS_ATTR static StackType_t s_md_task_stack[MD_EMU_TASK_STACK_SIZE / sizeof(StackType_t)];
-static StaticTask_t s_md_task_tcb;
+/* ★ 必须在内部 RAM: 本组件 linker.lf 用 `* (extram_bss)` 把整库 .bss 扫进 PSRAM,
+     *   而 FreeRTOS 的 xPortCheckValidTCBMem() 要求 TCB 在内部 RAM ——
+     *   之前 TCB 被一起扫进 PSRAM, 一开游戏就 assert 重启(2026-10-09 修)。
+     *   DRAM_ATTR = .dram1 段 -> dram0_data(内部), 且不是 .bss, 不会被扫走。 */
+static DRAM_ATTR StaticTask_t s_md_task_tcb;
 
 static uint8_t *s_rom_data = NULL;
 static size_t   s_rom_size = 0;
@@ -181,7 +185,7 @@ esp_err_t md_emu_start(const char *path)
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        ESP_LOGE(TAG, "ROM 打开失败: %s", path);
+        ESP_LOGD(TAG, "ROM 打开失败: %s", path);
         return ESP_ERR_NOT_FOUND;
     }
     fseek(f, 0, SEEK_END);
@@ -189,7 +193,7 @@ esp_err_t md_emu_start(const char *path)
     fseek(f, 0, SEEK_SET);
     if (sz <= 0 || sz > 8 * 1024 * 1024) {
         fclose(f);
-        ESP_LOGE(TAG, "ROM 尺寸异常: %ld", sz);
+        ESP_LOGD(TAG, "ROM 尺寸异常: %ld", sz);
         return ESP_ERR_INVALID_SIZE;
     }
     s_rom_size = (size_t)sz;

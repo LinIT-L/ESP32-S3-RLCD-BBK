@@ -207,7 +207,7 @@ static void nvs_init_handle(void)
     if (svc_nvs_open(NVS_NS, NVS_READWRITE, &s_nvs) == ESP_OK) {
         s_nvs_open = true;
     } else {
-        ESP_LOGW(TAG, "nvs namespace %s open failed", NVS_NS);
+        ESP_LOGD(TAG, "nvs namespace %s open failed", NVS_NS);
     }
 }
 
@@ -308,7 +308,7 @@ void bt_manager_poll_auto_reconnect(void)
      *   (唤醒: 进手柄页 / 按任意键 / 下次开机)。原"退避 30/60/120/300s 封顶后继续
      *   循环"是常驻耗电, 已取消。 */
     if (s_auto_reconnect_pending && !rc_budget_left()) {
-        ESP_LOGW(TAG, "[EV] 回连预算用尽且未连上 → 关射频省电 (等唤醒)");
+        ESP_LOGD(TAG, "[EV] 回连预算用尽且未连上 → 关射频省电 (等唤醒)");
         s_auto_reconnect_pending = false;
         s_rc_target_valid = false;
         bt_manager_disable();
@@ -328,7 +328,7 @@ void bt_manager_poll_auto_reconnect(void)
     s_rc_target_valid = true;
     s_auto_reconnect_pending = true;
     rc_budget_start();
-    ESP_LOGW(TAG, "[EV] 回连目标: name=\'%s\' addr=%02x:%02x:%02x:%02x:%02x:%02x (名字优先)",
+    ESP_LOGD(TAG, "[EV] 回连目标: name=\'%s\' addr=%02x:%02x:%02x:%02x:%02x:%02x (名字优先)",
              s_rc_target_name, s_rc_target_addr[0], s_rc_target_addr[1], s_rc_target_addr[2],
              s_rc_target_addr[3], s_rc_target_addr[4], s_rc_target_addr[5]);
     /* V1.5.x: 已有扫描在进行 (长按确认键扫描弹窗/添加设备) → 仅挂起自动回连标志,
@@ -348,7 +348,7 @@ void bt_manager_poll_auto_reconnect(void)
      *      再回连 (连不上还会按名字补一次短扫, 行为等价)。
      *   判据: s_inited 为假就说明栈没起来, 这时候扫是白扫。 */
     if (!s_inited) {
-        ESP_LOGW(TAG, "[EV] 蓝牙栈未使能 → 交给 bt_rec 任务初始化后再回连 (避免 259)");
+        ESP_LOGD(TAG, "[EV] 蓝牙栈未使能 → 交给 bt_rec 任务初始化后再回连 (避免 259)");
         bt_manager_wake_reconnect();
         return;
     }
@@ -460,7 +460,7 @@ static void gpm_load(void)
         memset(&s_gpm, 0, sizeof(s_gpm));
         s_gpm.magic = GPM_MAGIC;
         s_gpm.count = 0;
-        ESP_LOGW(TAG, "[EV] 手柄档案表: 空表 (无存档或 magic 不符)");
+        ESP_LOGD(TAG, "[EV] 手柄档案表: 空表 (无存档或 magic 不符)");
         return;
     }
     if (s_gpm.count < 0) s_gpm.count = 0;
@@ -475,7 +475,7 @@ static void gpm_load(void)
             memcpy(e->gbmap,  s_gb,  sizeof(e->gbmap));
             e->mapped = true;
             gpm_save();
-            ESP_LOGW(TAG, "[EV] 手柄档案表: 迁移旧配置 → \'%s\'", e->name);
+            ESP_LOGD(TAG, "[EV] 手柄档案表: 迁移旧配置 → \'%s\'", e->name);
         }
     }
     ESP_LOGI(TAG, "[EV] 手柄档案表: 载入 %d 条 (上限 %d)", s_gpm.count, GPM_MAX);
@@ -686,7 +686,7 @@ bool bt_manager_forget_device(const char *name)
         s_rc_target_valid = false;
         s_auto_reconnect_pending = false;
     }
-    ESP_LOGW(TAG, "[EV] 已忘记手柄 \'%s\' (历史+档案已删, 回连已停)", name);
+    ESP_LOGD(TAG, "[EV] 已忘记手柄 \'%s\' (历史+档案已删, 回连已停)", name);
     return true;
 }
 
@@ -857,7 +857,7 @@ static void on_connected_cb(bool connected, esp_hidh_dev_t *dev)
             bt_manager_reset_key_map();
             bt_manager_reset_sup_map();
             bt_manager_reset_gb_map();
-            ESP_LOGW(TAG, "[EV] 手柄档案表已满, \'%s\' 只能用默认映射", nm);
+            ESP_LOGD(TAG, "[EV] 手柄档案表已满, \'%s\' 只能用默认映射", nm);
         }
         snprintf(s_last_conn_name, sizeof(s_last_conn_name), "%s", nm);
         s_last_conn_name_valid = true;
@@ -869,7 +869,7 @@ static void on_connected_cb(bool connected, esp_hidh_dev_t *dev)
         if (!prof_ready) {
             s_map_pending = true;
             snprintf(s_map_pending_name, sizeof s_map_pending_name, "%s", nm);
-            ESP_LOGW(TAG, "[EV] 手柄 \'%s\' 无映射档案 → 待做按键映射 (等 UI 引导)", nm);
+            ESP_LOGD(TAG, "[EV] 手柄 \'%s\' 无映射档案 → 待做按键映射 (等 UI 引导)", nm);
         }
         s_pending_new = false;
 
@@ -924,7 +924,7 @@ static bool rc_try_connect_now(const esp_hid_scan_result_t *rr)
 
     s_pending_new = !bt_manager_is_known_device(rr->bda, rr->name);
     snprintf(s_pending_name, sizeof s_pending_name, "%s", rr->name ? rr->name : "");
-    ESP_LOGW(TAG, "[EV] 回连命中(边扫边连): name=%s addr=%02x:%02x 新手柄=%d",
+    ESP_LOGD(TAG, "[EV] 回连命中(边扫边连): name=%s addr=%02x:%02x 新手柄=%d",
              rr->name ? rr->name : "-", rr->bda[0], rr->bda[1], s_pending_new);
     s_connecting = true;
     s_auto_reconnect_pending = false;   /* 已发起: 结果由 on_connected 收敛 */
@@ -978,7 +978,7 @@ static void on_scan_done_cb(void)
                 }
                 rr = rr->next;
             }
-            ESP_LOGW(TAG, "[EV] 本轮扫描未命中回连目标 (剩 %dms 预算)",
+            ESP_LOGD(TAG, "[EV] 本轮扫描未命中回连目标 (剩 %dms 预算)",
                      (int)(s_rc_budget_until - esp_timer_get_time() / 1000));
             s_auto_reconnect_pending = false;   /* 交给预算机制, 不在此放弃 */
             s_rc_target_valid = false;
@@ -1023,7 +1023,7 @@ static void on_scan_result_cb(const esp_hid_scan_result_t *r)
      *   命中即 return —— 连接由 on_connected 收敛; UI 层(scan_dlg_poll)看到连上会
      *   自己停扫并关掉弹窗, 所以这里不需要也不应该去动扫描状态。 */
     if (rc_try_connect_now(r)) {
-        ESP_LOGW(TAG, "[EV] 边扫边连命中, 提前发起连接(不再等整轮扫描)");
+        ESP_LOGD(TAG, "[EV] 边扫边连命中, 提前发起连接(不再等整轮扫描)");
         return;
     }
 
@@ -1342,7 +1342,7 @@ static void bt_connect_task(void *arg)
     bt_conn_arg_t *a = (bt_conn_arg_t *)arg;
     if (a) {
         if (!bt_core_connect(&a->r)) {
-            ESP_LOGW(TAG, "异步连接失败(超时/不在范围)");
+            ESP_LOGD(TAG, "异步连接失败(超时/不在范围)");
             s_connecting = false;   /* 复位"连接中", 允许后续重试 */
         }
         free(a);
@@ -1485,11 +1485,11 @@ void bt_manager_enable(void)
     if (!stack || !xTaskCreateStatic((TaskFunction_t)bt_manager_init, "bt_init",
                                      words, NULL, 1, stack, &bt_task_buf)) {
         s_init_task_running = false;
-        ESP_LOGE(TAG, "bt_init 任务创建失败, 蓝牙不可用");
+        ESP_LOGD(TAG, "bt_init 任务创建失败, 蓝牙不可用");
         return;
     }
     xSemaphoreTake(s_init_done_sem, pdMS_TO_TICKS(20000));
-    if (!s_inited) ESP_LOGW(TAG, "蓝牙核心未就绪 (超时/失败), 下次 enable 重试");
+    if (!s_inited) ESP_LOGD(TAG, "蓝牙核心未就绪 (超时/失败), 下次 enable 重试");
 }
 
 void bt_manager_disable(void)
@@ -1571,7 +1571,7 @@ static void bt_reconnect_task(void *arg)
          *   不再按 60/120/240/300s 无限重试 (linit: "不要盲目的一直连接")。 */
         if (!s_boot_win_active &&
             (int64_t)(esp_timer_get_time() / 1000) > s_rc_retry_until) {
-            ESP_LOGW(TAG, "[EV] 断连回连预算用尽 → 关射频省电 (等唤醒)");
+            ESP_LOGD(TAG, "[EV] 断连回连预算用尽 → 关射频省电 (等唤醒)");
             bt_manager_disable();
             continue;
         }
@@ -1633,7 +1633,7 @@ void bt_manager_start_boot_reconnect(uint32_t window_ms)
     }
     bt_manager_enable();   /* 惰性完整初始化 (映射/NVS/核心/回连任务) */
     if (!s_full_init_done) {
-        ESP_LOGW(TAG, "开机回连: 完整初始化未完成, 窗口跳过");
+        ESP_LOGD(TAG, "开机回连: 完整初始化未完成, 窗口跳过");
         return;
     }
     if (window_ms == 0) window_ms = BT_BOOT_RECONNECT_WINDOW_MS;

@@ -4,11 +4,11 @@ idf_component_register(
   SRC_DIRS "." "src" "smsplus" "smsplus/cpu" "smsplus/sound"
   PRIV_INCLUDE_DIRS "." "smsplus" "smsplus/cpu" "smsplus/sound"
   REQUIRES
-        shared_memory
-        input
+  st7305
+  shared_memory
+  input
         audio_player
         board_shim
-        st7305
         esp_timer
         freertos
         heap

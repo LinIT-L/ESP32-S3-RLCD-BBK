@@ -34,8 +34,8 @@
 #else
 static const char *TAG = "bt_map";
 #define BT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
-#define BT_LOGE(...) ESP_LOGE(TAG, __VA_ARGS__)
-#define BT_LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
+#define BT_LOGE(...) ESP_LOGD(TAG, __VA_ARGS__)
+#define BT_LOGW(...) ESP_LOGD(TAG, __VA_ARGS__)
 #endif
 
 /* ========================================================================

@@ -23,6 +23,19 @@ static int l_wifi_connect(lua_State *L) {      /* connect(ssid[, pass]) -> bool 
     return 1;
 }
 
+/* ★ 2026-10-15 linit "联网归网络模块": app.wifi.setup() 打开**系统网络模块**的连接流程
+ * (扫描 + 输密码 + 保存重连全归它), 应用只提供入口、不自己连网。
+ * 另有 app.wifi.connected(): 是否已联网 (只读查询, 门禁/离线提示用)。 */
+static int l_wifi_setup(lua_State *L) {
+    (void)L;
+    if (s_lua_ctx) settings_wifi_connect_open(s_lua_ctx);
+    return 0;
+}
+static int l_wifi_connected(lua_State *L) {
+    lua_pushboolean(L, wifi_manager_is_connected());
+    return 1;
+}
+
 
 
 /* ---- app.wifi.* : 无线探测 ---- */
@@ -128,6 +141,8 @@ void lua_mod_wifi_register(lua_State *L)
     lua_pushcfunction(L, l_wifi_cur_ssid);       lua_setfield(L, -2, "cur_ssid");
     lua_pushcfunction(L, l_wifi_connecting);     lua_setfield(L, -2, "connecting");
     lua_pushcfunction(L, l_wifi_connect);        lua_setfield(L, -2, "connect");
+    lua_pushcfunction(L, l_wifi_setup);          lua_setfield(L, -2, "setup");
+    lua_pushcfunction(L, l_wifi_connected);      lua_setfield(L, -2, "connected");
     lua_pushcfunction(L, l_wifi_clear_saved);    lua_setfield(L, -2, "clear_saved");
     lua_setfield(L, -2, "wifi");
 }

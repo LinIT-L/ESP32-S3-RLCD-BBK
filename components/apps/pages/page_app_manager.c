@@ -82,26 +82,22 @@ static const char *const s_sub_names[AM_SUB_COUNT] = {
  *   "商店 → 点开某个应用 → 返回商店" 不会再提示一遍 (那份 on_exit/on_enter 是子页往返)。
  * ⚠ 不要自己 os_hw_request(OS_HW_WIFI): settings_wifi_connect_open() 内部按需 request
  *   并记账, 用户取消时才会 release。 */
-static bool s_store_wifi_asked   = false;
-static bool s_store_wifi_connect = false;  /* 下一帧开连网流程 */
+static bool s_store_wifi_asked   = false;   /* 商店联网提示只弹一次 */
 static int  s_am_leave_child     = 0;      /* >0 = 本次离开管家是进了自己推的子页 */
-/* ⚠ 连网弹窗**不能在这个回调里开**: 回调返回后 os_dialog 还要收掉当前确认框,
- *   同期再 push 会被顶掉 (实测: 点了"确定"界面停在确认框、扫描在后台空跑)。
- *   与 Lua 应用门禁 (am_lua.c wl_gate_tick) 同一处理: 挂个标志, 下一帧再开。 */
-static void am_store_wifi_cb(ui_ctx_t *ctx, int result, void *ud) {
-    (void)ctx; (void)ud;
-    if (result != 0) return;                       /* 取消: 本地包照常可看 */
-    s_store_wifi_connect = true;
-}
+/* 商店联网门禁 (2026-10-15 linit "联网归网络模块"): 商店**不自己连网** ——
+ * 已配过就等网络模块连上 (toast 提示一下), 没配过就引导去设置。
+ * 连上后云端索引由 am_rstore 自己拉 (它也只看 is_connected)。 */
 static void am_store_wifi_gate(ui_ctx_t *ctx) {
-    ESP_LOGI(TAG, "商店门禁: asked=%d conn=%d", (int)s_store_wifi_asked, (int)wifi_manager_is_connected());
     if (s_store_wifi_asked) return;
     s_store_wifi_asked = true;
     if (wifi_manager_is_connected()) return;
-    ESP_LOGI(TAG, "商店门禁 -> 弹连接确认框");
-    os_dialog_confirm_ex(ctx,
-        "\xe5\x95\x86\xe5\xba\x97\xe9\x9c\x80\xe8\xa6\x81\xe8\x81\x94\xe7\xbd\x91, \xe7\x8e\xb0\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5 Wi-Fi?", /* 商店需要联网, 现在连接 Wi-Fi? */
-        0, -1, am_store_wifi_cb, NULL);
+    if (wifi_manager_has_saved()) {
+        ESP_LOGI(TAG, "商店门禁: 等网络模块连上");
+        os_dialog_toast_ms(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c...", 1500); /* 正在连接网络... */
+    } else {
+        ESP_LOGI(TAG, "商店门禁: 未配置网络 → 引导设置");
+        os_dialog_toast_ms(ctx, "\xe6\x9c\xaa\xe9\x85\x8d\xe7\xbd\xae\xe7\xbd\x91\xe7\xbb\x9c: \xe5\x88\xb0\xe8\xae\xbe\xe7\xbd\xae\xe9\x87\x8c\xe8\xbf\x9e Wi-Fi", 2500); /* 未配置网络: 到设置里连 Wi-Fi */
+    }
 }
 
 /* ==== 页面状态 ==== */
@@ -171,15 +167,23 @@ static void am_rebuild(void);          /* 常规重建: 相机对齐到焦点行
 void am_rebuild_keep(void);   /* 对外接口 */     /* 返回重建: 保留原滚动位置 */
 static bool am_has_sub(void);          /* 是否有顶部子分类条 (应用/商店) */
 
-/* 子分类是否匹配应用 */
+/* 子分类是否匹配应用
+ * ★ 2026-10-15 linit: **商店要有"壁纸"、不要"系统"** —— 子分类条是应用管家/商店共用,
+ *   所以索引 3 按当前页取不同含义 (商店=壁纸包, 管家=系统类应用)。
+ * ★ 同时修正旧错配: 管家"运维"页签原标签写"壁纸"、且按 cat="壁纸" 过滤 ——
+ *   而实际应用用的是 cat="运维" (10 个), 结果那个页签永远是空的、运维应用只能靠"全部"看到。 */
 static bool app_match_sub(const os_app_t *a) {
     if (!a || !a->cat) return (s_sub == AM_SUB_ALL);
     if (s_sub == AM_SUB_ALL) return true;
     const char *c = a->cat;
     if (s_sub == AM_SUB_GAME && strcmp(c, "\xe6\xb8\xb8\xe6\x88\x8f") == 0) return true;  /* 游戏 */
     if (s_sub == AM_SUB_PROG && (strcmp(c, "\xe7\xa8\x8b\xe5\xba\x8f") == 0 || strcmp(c, "\xe8\xbd\xaf\xe4\xbb\xb6") == 0)) return true; /* 程序/软件 */
-    if (s_sub == AM_SUB_SYS  && (strcmp(c, "\xe7\xb3\xbb\xe7\xbb\x9f") == 0 || strcmp(c, "\xe5\xb7\xa5\xe5\x85\xb7") == 0)) return true;  /* 系统/工具 */
-    if (s_sub == AM_SUB_OPS  && strcmp(c, "\xe5\xa3\x81\xe7\xba\xb8") == 0) return true;  /* 应用分类: 运维→壁纸 */
+    if (s_sub == AM_SUB_SYS) {
+        if (s_cat == AM_CAT_STORE) return strcmp(c, "\xe5\xa3\x81\xe7\xba\xb8") == 0;      /* 商店: 壁纸 */
+        return (strcmp(c, "\xe7\xb3\xbb\xe7\xbb\x9f") == 0 ||                                  /* 系统 */
+                strcmp(c, "\xe5\xb7\xa5\xe5\x85\xb7") == 0);                                   /* 工具 */
+    }
+    if (s_sub == AM_SUB_OPS  && strcmp(c, "\xe8\xbf\x90\xe7\xbb\xb4") == 0) return true;  /* 运维 */
     if (s_sub == AM_SUB_STUDY&& strcmp(c, "\xe5\xad\xa6\xe4\xb9\xa0") == 0) return true;  /* 学习 */
     return false;
 }
@@ -562,6 +566,14 @@ static void am_fill_top_round(st7305_handle_t *lcd, int x0, int y0, int x1, int 
     }
 }
 
+/* 子分类页签文字 (索引 3 = 商店"壁纸" / 管家"系统"; 其余照 s_sub_names) */
+static const char *am_sub_name(int i) {
+    if (i == AM_SUB_SYS)
+        return (s_cat == AM_CAT_STORE) ? "\xe5\xa3\x81\xe7\xba\xb8"      /* 壁纸 */
+                                       : "\xe7\xb3\xbb\xe7\xbb\x9f";     /* 系统 */
+    return s_sub_names[i];
+}
+
 static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, int x1) {
     (void)ctx;
     /* 先整条白底, 覆盖拖动/滚动时滑到顶部的图标残留, 保证子分类条固定不被遮挡 */
@@ -573,8 +585,7 @@ static void am_draw_subbar(ui_ctx_t *ctx, st7305_handle_t *lcd, int x0, int y0, 
         int sx = x0 + i * slot;
         int cx = sx + slot / 2;
         bool cur = (i == s_sub);
-        const char *nm = (s_cat == AM_CAT_APP && i == AM_SUB_OPS)
-                         ? "\xe5\xa3\x81\xe7\xba\xb8" : s_sub_names[i];   /* 应用分类: 运维→壁纸 */
+        const char *nm = am_sub_name(i);
 
         /* ★ 2026-10-03 linit 定案 —— 当前项的框**永远不变**, 变的只是"框内填不填":
          *   ① 焦点在顶栏还是在内容区, 画的都是**同一个闭合圆角水管框**
@@ -984,7 +995,7 @@ static void p_am_render(ui_ctx_t *ctx) {
             s_col_dirty = false;
             uint64_t d_col = (uint64_t)esp_timer_get_time() - t_col0;
             if (d_col >= 10000)
-                ESP_LOGW(TAG, "整列预渲染 %llu us (条目=%d 网格=%d 列高=%d)",
+                ESP_LOGD(TAG, "整列预渲染 %llu us (条目=%d 网格=%d 列高=%d)",
                          d_col, s_list_n, (int)s_view_grid, s_col_h);
         }
         int row_h = AM_ROW_H;
@@ -1445,11 +1456,6 @@ static int am_idx_at(int tx, int ty, int content_top) {
 
 /* ==== 每帧轮询: 触摸上下拖动 (相机跟手 + 惯性甩动 + 网格吸附, 仿主菜单) ==== */
 static void p_am_poll(ui_ctx_t *ctx) {
-    /* 商店联网门禁: 用户点了"确定" → 这一帧(确认框已收)再开连网流程 */
-    if (s_store_wifi_connect) {
-        s_store_wifi_connect = false;
-        settings_wifi_connect_open(ctx);           /* ★ 唯一入口: 内部按需 os_hw_request */
-    }
     /* 子页没真推入(如 Wi-Fi 门禁拦下)时把"离开管家"标记收回, 否则会累积 */
     if (s_am_leave_child > 0 && ctx->current_page == OS_PAGE_APP_MANAGER) s_am_leave_child = 0;
     /* 商店卸载: 确认键按满 3s (BT_SEARCH 起点再加 1s) 且未松手 → 弹卸载确认。

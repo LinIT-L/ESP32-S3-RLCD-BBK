@@ -26,6 +26,7 @@
 
 #ifdef __cplusplus
 extern "C" {
+
 #endif
 
 /* ==== 动作码（语义与旧 menu_action_t 一致, 避免改 main.c/input.c/各引擎交互） ==== */
@@ -73,7 +74,15 @@ typedef enum {
     OS_PAGE_STORAGE,           /* 存储管理 (3.3: 浏览/挂载/格式化/信息) */
     OS_PAGE_GBC_GAME,          /* GBC 游戏 */
     OS_PAGE_NES_GAME,          /* NES 游戏 */
-    OS_PAGE_MD_GAME,           /* MD/Genesis 游戏 (Gwenesis) */
+    OS_PAGE_MD_GAME,           /* MD/Genesis 游戏 (Gwenesis) — 已停用, 见 LINTOS_ENABLE_MD */
+
+    /* ★ 2026-10-13 (linit 决定): **MD/Genesis 模拟器默认不再编入固件**。
+     *   理由: 它占 **715 KB**(全固件第二大) 却**完全没有页面处理器**(死代码),
+     *         注册项也已 hidden ⇒ 纯占体积。把这里改回 1 即可恢复(需同时把
+     *         CMakeLists 里被删掉的 md_emu 加回 os/apps 两个组件的 REQUIRES)。 */
+#ifndef LINTOS_ENABLE_MD
+#define LINTOS_ENABLE_MD 0
+#endif
     OS_PAGE_SMS_GAME,          /* SMS/GG 游戏 (SMSPlus) */
     OS_PAGE_ARDUBOY_GAME,      /* ArduBoy 游戏 */
     OS_PAGE_DIAGNOSIS,         /* 故障诊断 */
@@ -86,7 +95,7 @@ typedef enum {
     OS_PAGE_DIALOG,            /* 通用弹窗 (modal 覆盖页, 由 os_dialog 驱动) */
     OS_PAGE_USB_BT,            /* USB 蓝牙适配器 (USB-BT) */
     OS_PAGE_USB_NET,           /* USB 网卡共享 (有线/USB-RNDIS) */
-    OS_PAGE_WINASSIST,         /* 运维助手 (USB 键鼠+串口+U盘复合) */
+    OS_PAGE_WINASSIST,         /* Win工具台 (USB 键鼠+串口+U盘复合; 原名 运维助手) */
     OS_PAGE_PLACEHOLDER_SECURE,/* 占位应用: 安全密码机 (开发中) */
     OS_PAGE_PLACEHOLDER_ALARM, /* 占位应用: 闹钟 (开发中) */
     OS_PAGE_MODTOOL,           /* 修改机: 游戏内存搜索修改工具 */
@@ -97,7 +106,6 @@ typedef enum {
     OS_PAGE_NETDECT,           /* 网络分析: 主机发现/端口服务/弱口令/报告 */
     OS_PAGE_FAV,               /* 收藏夹: 账号/密码 一键模拟键盘输入 */
     OS_PAGE_LUA,               /* Lua 单文件程序 (可放到内存卡运行) */
-    OS_PAGE_LVGL_DEMO,         /* LVGL 演示页 (验证 LVGL 移植层: 控件+动画+中文字体) */
     OS_PAGE_SDR,                   /* 频谱仪 (new_app.py 生成) */
     OS_PAGE_COUNT
 } os_page_t;
@@ -125,6 +133,15 @@ struct os_module {
      * 统一设置 gesture_back_enable(!swipe_back_disabled), 不依赖各页自行开关,
      * 避免某页 exit 被跳过导致全局上滑返回卡死. (V1.1.0: 开关已迁到 gesture_back 模块) */
     bool swipe_back_disabled;
+    /* ★ 2026-10-14 linit 全局规范: **应用页按硬件返回键要先弹"退出程序?"确认, 确认才退**。
+     * true = 内核统一拦 BACK 弹确认 (应用页默认应设 true)。
+     * 不设 (=false, 排除项) 的三类:
+     *   ① 引擎类   —— 走游戏态那条分支 (冻结帧确认 + 10s 超时自动退);
+     *   ② 弹窗类   —— 无页面内容的弹窗页 (usb_bt/usb_net/modtool 等), BACK 只关弹窗;
+     *   ③ 自带确认 —— 页内 BACK 有自己的语义 (关详情/回上一步/回列表) 或已自建确认
+     *                 (usb_hid 二级菜单 / lua 脚本可控确认), 它们在"真要退出"处自行调
+     *                 `os_request_exit_confirm()`。 */
+    bool exit_confirm;
 };
 
 /* ==== 全局服务契约 — 状态栏/音量/电量 等, 不占页面栈, 可在任意页面上方叠加 ==== */
@@ -243,6 +260,13 @@ void os_dialog_wheel(ui_ctx_t *ctx, const char *const *items, int n, int sel,
  * 手柄 LEFT=确定/RIGHT=取消 黑块选择, CONFIRM=当前选中项, BACK=取消(松手守卫),
  * 触摸弹窗内左=确定 右=取消. 阻塞直到用户决定. 返回 true=确认退出. */
 bool os_confirm_exit_blocking(st7305_handle_t *lcd);
+
+/* ★ 全屏应用"退出确认"统一入口 (2026-10-14): 无线探测/网络检测/电脑诊断 等全屏应用,
+ * 按硬件返回键先弹"退出程序?"(左确定/右取消), **确认后才退**。
+ * 各页只在"真要退出"那一处调本函数 (页内 BACK 的其它语义不受影响);
+ * 真正 os_pop 延迟到下一帧由 os_tick 执行 (弹窗回调里直接弹栈会只弹掉弹窗层)。 */
+void os_request_exit_confirm(ui_ctx_t *ctx);
+
 void os_dialog_toast(ui_ctx_t *ctx, const char *msg);   /* 0.5s 自动关闭 (2026-09-22 规范) */
 void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms); /* 自定义时长 toast (0=默认 0.5s) */
 void os_dialog_draw_overlay(ui_ctx_t *ctx);             /* 全局顶层 toast 覆盖: os_render flush 前调用 */
