@@ -1,0 +1,8 @@
+# V2.x 内存精简: 整库 BSS/common 段搬到 PSRAM (IDF 内置 extram_bss 方案)。
+# 需 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y (本项目已开)。
+# gnuboy 核心本身已全面 PSRAM 指针化, 此处把静态 BSS 一并外置。
+[mapping:gbc_emu_extram_bss]
+archive: libgbc_emu.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)

@@ -1,0 +1,637 @@
+{
+  "model": "Lenovo Legion Pro 7 16IRX8H (82WQ)",
+  "source_url": "https://download.lenovo.com/bsco/legacy/index.html?gfile=Lenovo%20Legion%20Pro%207%2016IRX8H%20(82WQ)",
+  "retrieved": "2026-10-02",
+  "menus": [
+    {
+      "name": "Information",
+      "items": [
+        {
+          "name": "Product Name",
+          "type": "info",
+          "current": "Lenovo Legion Pro 7 16IRX8H"
+        },
+        {
+          "name": "BIOS Version",
+          "type": "info",
+          "current": "KWCNXXWW"
+        },
+        {
+          "name": "EC Version",
+          "type": "info",
+          "current": "KWECXXWW"
+        },
+        {
+          "name": "MTM",
+          "type": "info",
+          "current": "82WQ"
+        },
+        {
+          "name": "Lenovo SN",
+          "type": "info",
+          "current": "PF123456"
+        },
+        {
+          "name": "UUID Number",
+          "type": "info",
+          "current": "CB95E7F4-1234-ABCD-1234-ABCD1234ABCD"
+        },
+        {
+          "name": "CPU",
+          "type": "info",
+          "current": "Intel(R) Core(TM)"
+        },
+        {
+          "name": "System Memory",
+          "type": "info",
+          "current": "8192 MB"
+        },
+        {
+          "name": "NVME SSD",
+          "type": "info",
+          "current": "XXXX"
+        },
+        {
+          "name": "Preinstalled OS license",
+          "type": "info",
+          "current": "NO DPK"
+        },
+        {
+          "name": "OA3 Key ID",
+          "type": "info",
+          "current": "0000000"
+        },
+        {
+          "name": "Secure Boot",
+          "type": "info",
+          "current": "Enabled"
+        },
+        {
+          "name": "Language",
+          "type": "list",
+          "values": [
+            "English",
+            "中文"
+          ],
+          "current": "English"
+        }
+      ]
+    },
+    {
+      "name": "Configuration",
+      "items": [
+        {
+          "name": "System Time",
+          "type": "datetime",
+          "fields": {
+            "Hour": {
+              "values": [
+                "00",
+                "17",
+                "23"
+              ],
+              "current": "17@HRS",
+              "isList": true
+            },
+            "Minute": {
+              "values": [
+                "00",
+                "30",
+                "59"
+              ],
+              "current": "30@MINS",
+              "isList": true
+            },
+            "Second": {
+              "values": [
+                "00",
+                "30",
+                "59"
+              ],
+              "current": "51@@down",
+              "isList": true
+            }
+          }
+        },
+        {
+          "name": "System Date",
+          "type": "datetime",
+          "fields": {
+            "Month": {
+              "values": [
+                "JAN",
+                "FEB",
+                "MAR",
+                "APR",
+                "MAY",
+                "JUN",
+                "JUL",
+                "AUG",
+                "SEP",
+                "OCT",
+                "NOV"
+              ],
+              "current": "AUG@",
+              "isList": true
+            },
+            "Day": {
+              "values": [
+                "01",
+                "02",
+                "20",
+                "31"
+              ],
+              "current": "12@",
+              "isList": true
+            },
+            "DayOfWeek": {
+              "values": [
+                "MON",
+                "TUE",
+                "WED",
+                "THU",
+                "FRI",
+                "SAT",
+                "SUN"
+              ],
+              "current": "WED@@up",
+              "isList": true
+            },
+            "Year": {
+              "values": [
+                "2009",
+                "2019",
+                "2059"
+              ],
+              "current": "2020@@down",
+              "isList": true
+            }
+          }
+        },
+        {
+          "name": "Wireless LAN",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Storage Controller Mode",
+          "type": "list",
+          "values": [
+            "AHCI"
+          ],
+          "current": "AHCI"
+        },
+        {
+          "name": "Graphic Device",
+          "type": "list",
+          "values": [
+            "Dynamic Graphics",
+            "Desicrete Graphics"
+          ],
+          "current": "Dynamic Graphics"
+        },
+        {
+          "name": "Intel(R) Virtualization Technology",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Intel(R) VT-d Feature",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "* Unselectable for Device Guard",
+          "type": "separator"
+        },
+        {
+          "name": "Intel(R) Hyper-Threading Technology",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "BIOS Back Flash",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Disabled"
+        },
+        {
+          "name": "Fool Proof Fn Ctrl",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Always On USB",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Charge in Battery Mode",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Disable Built-in Battery",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "System Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Flip to Boot",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Disabled"
+        },
+        {
+          "name": "BIOS Self-Healing",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Restore Default Overclocking",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Disabled"
+        },
+        {
+          "name": "Instant boot",
+          "type": "list",
+          "values": [
+            "Adapter and Type-C Power Delivery",
+            "Adapter",
+            "Type-C Power Delivery",
+            "Disabled"
+          ],
+          "current": "Disabled"
+        },
+        {
+          "name": "Active Atom Cores",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Legacy Game Compatibility Mode",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Disabled"
+        },
+        {
+          "name": "CPU Unlock",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "GPU Overclocking",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Performance Mode Fan Level",
+          "type": "list",
+          "values": [
+            "",
+            ""
+          ],
+          "current": ""
+        },
+        {
+          "name": "Smart Mode",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        }
+      ]
+    },
+    {
+      "name": "Security",
+      "items": [
+        {
+          "name": "Administrator Password",
+          "type": "info",
+          "current": "Not Set"
+        },
+        {
+          "name": "User Password",
+          "type": "info",
+          "current": "Not Set"
+        },
+        {
+          "name": "HDD Password",
+          "type": "info",
+          "current": "Not Set"
+        },
+        {
+          "name": "Set Administrator Password",
+          "type": "action",
+          "current": "",
+          "dialog": {
+            "title": "Set Administrator Password",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Set Hard Disk Passwords",
+          "type": "action",
+          "current": "",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "OK"
+            ]
+          }
+        },
+        {
+          "name": "Security Erase NVME SSD1 Data",
+          "type": "action"
+        },
+        {
+          "name": "Intel Platform Trust Technology",
+          "type": "info",
+          "current": "MFG MODE"
+        },
+        {
+          "name": "Device Guard",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Disabled"
+        },
+        {
+          "name": "Secure Boot",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "Secure Boot Status",
+          "type": "info",
+          "current": "Enabled"
+        },
+        {
+          "name": "Platform Mode",
+          "type": "info",
+          "current": "User Mode"
+        },
+        {
+          "name": "Secure Boot Mode",
+          "type": "info",
+          "current": "Standard"
+        },
+        {
+          "name": "Reset to Setup Mode",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Restore Factory Keys",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "* Unselectable for Device Guard",
+          "type": "separator"
+        }
+      ]
+    },
+    {
+      "name": "Boot",
+      "items": [
+        {
+          "name": "USB Boot",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "PXE Boot to LAN",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "IPV4 PXE First",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        },
+        {
+          "name": "EFI",
+          "type": "bootorder",
+          "entries": [
+            "EFI PXE Network",
+            "Windows Boot Manager"
+          ]
+        },
+        {
+          "name": "* Unselectable for Device Guard",
+          "type": "separator"
+        }
+      ]
+    },
+    {
+      "name": "Exit",
+      "items": [
+        {
+          "name": "Exit Saving Changes",
+          "type": "action",
+          "current": "",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Exit Discarding Changes",
+          "type": "action",
+          "current": "",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Discard Changes",
+          "type": "action",
+          "current": "",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Save Changes",
+          "type": "action",
+          "current": "",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Load Default Settings",
+          "type": "action",
+          "current": "",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "OS Optimized Defaults",
+          "type": "list",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ],
+          "current": "Enabled"
+        }
+      ]
+    }
+  ],
+  "non_rendered_schema_sections": [
+    "Setup Menu Information System Summary",
+    "Setup Menu Configuration USB Legacy",
+    "Setup Menu Configuration Intel VMD Controller",
+    "Setup Menu Configuration Intel Virtual Technology",
+    "Setup Menu Configuration Hotkey Mode",
+    "Setup Menu Configuration System Performance Mode",
+    "Setup Menu Configuration Thermal Mode",
+    "Setup Menu Configuration OneKeyBattery",
+    "Setup Menu Configuration Enhance Memory",
+    "Setup Menu Configuration DPTF",
+    "Setup Menu Security Security Chip",
+    "Setup Menu Security Clear Security Chip Key",
+    "Setup Menu Security Clear Intel PTT Key",
+    "Setup Menu Security Natural File Guard",
+    "Setup Menu Security Intel SGX",
+    "Setup Menu Security Intel SGX Intel SGX",
+    "Setup Menu Security Intel SGX Current state",
+    "Setup Menu Security Intel SGX Owner EPOCH Change",
+    "Setup Menu Security I/O Port Access",
+    "Setup Menu Security I/O Port Access Ethernet LAN",
+    "Setup Menu Security I/O Port Access Wireless WAN",
+    "Setup Menu Security I/O Port Access Bluetooth",
+    "Setup Menu Security I/O Port Access USB Port",
+    "Setup Menu Security I/O Port Access Memory Card Slot",
+    "Setup Menu Security I/O Port Access Smart Card Slot",
+    "Setup Menu Security I/O Port Access Integrated Camera",
+    "Setup Menu Security I/O Port Access Microphone",
+    "Setup Menu Security I/O Port Access Fingerprint Reader",
+    "Setup Menu Security I/O Port Access Thunderbolt(TM) 3",
+    "Setup Menu Security I/O Port Access NFC Device",
+    "Setup Menu Boot Boot Mode",
+    "Setup Menu Boot Fast Boot",
+    "Setup Menu Boot Boot Priority"
+  ]
+}

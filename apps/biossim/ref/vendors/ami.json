@@ -1,0 +1,656 @@
+{
+  "model": "AMI Aptio Setup Utility (Aptio V)",
+  "source_url": "https://www.axiomtek.com/Download/Download/CEM860/CEM860%20User's%20Manual%20VA1_%2011-21-2011.pdf",
+  "retrieved": "2026-10-02",
+  "data_source_file": "AMI Aptio BIOS Setup 官方风格手册 (Axiomtek CEM860 User's Manual, Ch.4 'AMI BIOS Setup Utility' 逐项); 菜单栏结构另参 ASRock IMB-1235 / ADLINK AXE-7440GW 手册",
+  "menus": [
+    {
+      "name": "Main",
+      "items": [
+        {
+          "name": "BIOS Vendor",
+          "type": "info",
+          "current": "American Megatrends Inc.",
+          "disabled": true
+        },
+        {
+          "name": "Core Version",
+          "type": "info",
+          "current": "5.x",
+          "disabled": true
+        },
+        {
+          "name": "Compliancy",
+          "type": "info",
+          "current": "UEFI 2.x; PI 1.x",
+          "disabled": true
+        },
+        {
+          "name": "Project Version",
+          "type": "info",
+          "current": "Aptio V",
+          "disabled": true
+        },
+        {
+          "name": "Build Date",
+          "type": "info",
+          "current": "01/01/2020",
+          "disabled": true
+        },
+        {
+          "name": "Access Level",
+          "type": "info",
+          "current": "Administrator",
+          "disabled": true
+        },
+        {
+          "name": "System Language",
+          "type": "item",
+          "current": "English",
+          "values": [
+            "English",
+            "简体中文"
+          ],
+          "tip": "选择系统默认语言。"
+        },
+        {
+          "name": "System Date",
+          "type": "item",
+          "current": "03/17/2019",
+          "values": [
+            "MM/DD/YY"
+          ]
+        },
+        {
+          "name": "System Time",
+          "type": "item",
+          "current": "02:55:20",
+          "values": [
+            "HH:MM:SS"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Advanced",
+      "items": [
+        {
+          "name": "Launch PXE OpROM",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ],
+          "tip": "系统启动时是否启用板载网卡的 Boot ROM 功能(PXE 网络引导)。"
+        },
+        {
+          "name": "Launch Storage OpROM",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ],
+          "tip": "是否启用传统大容量存储设备(UEFI/legacy Option ROM)引导。"
+        },
+        {
+          "name": "ACPI Settings",
+          "type": "submenu",
+          "sub": {
+            "name": "ACPI Settings",
+            "items": [
+              {
+                "name": "ACPI Sleep State",
+                "type": "item",
+                "current": "S3 (Suspend to RAM)",
+                "values": [
+                  "Suspend Disabled",
+                  "S1 (CPU Stop Clock)",
+                  "S3 (Suspend to RAM)"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "Trusted Computing",
+          "type": "submenu",
+          "sub": {
+            "name": "Trusted Computing",
+            "items": [
+              {
+                "name": "TPM Support",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "tip": "启用/禁用 TPM。禁用后操作系统将看不到 TPM(需重置平台)。"
+              }
+            ]
+          }
+        },
+        {
+          "name": "CPU Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "CPU Configuration",
+            "items": [
+              {
+                "name": "Brand String",
+                "type": "info",
+                "current": "Intel(R) Core(TM) Processor",
+                "disabled": true
+              },
+              {
+                "name": "Intel Virtualization Technology",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Hyper-Threading",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Active Processor Cores",
+                "type": "item",
+                "current": "All",
+                "values": [
+                  "All",
+                  "1",
+                  "2",
+                  "4"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "SATA Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "SATA Configuration",
+            "items": [
+              {
+                "name": "SATA Controller(s)",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "SATA Mode Selection",
+                "type": "item",
+                "current": "AHCI Mode",
+                "values": [
+                  "IDE Mode",
+                  "AHCI Mode",
+                  "RAID Mode"
+                ],
+                "tip": "SATA 工作模式：IDE=老兼容；AHCI=标准(首选)；RAID=Intel RST。"
+              }
+            ]
+          }
+        },
+        {
+          "name": "PCH-FW Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "PCH-FW Configuration",
+            "items": []
+          },
+          "tip": "显示 ME 固件版本/模式/类型/SKU。"
+        },
+        {
+          "name": "USB Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "USB Configuration",
+            "items": [
+              {
+                "name": "Legacy USB Support",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled",
+                  "Auto"
+                ],
+                "tip": "传统操作系统下的 USB 支持。Auto=无 USB 设备时关闭传统支持。"
+              },
+              {
+                "name": "USB 3.0 Support",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "H/W Monitor",
+          "type": "submenu",
+          "sub": {
+            "name": "H/W Monitor",
+            "items": []
+          },
+          "tip": "显示系统/CPU 温度、风扇转速、各路电压(+3.3V/VCORE/+12V/+1.05V)。"
+        },
+        {
+          "name": "Super IO Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Super IO Configuration",
+            "items": [
+              {
+                "name": "Serial Port 0 Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "Serial Port 0 Configuration",
+                  "items": [
+                    {
+                      "name": "Serial Port",
+                      "type": "item",
+                      "current": "Enabled",
+                      "values": [
+                        "Enabled",
+                        "Disabled"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Serial Port 1 Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "Serial Port 1 Configuration",
+                  "items": [
+                    {
+                      "name": "Serial Port",
+                      "type": "item",
+                      "current": "Enabled",
+                      "values": [
+                        "Enabled",
+                        "Disabled"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Parallel Port Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "Parallel Port Configuration",
+                  "items": [
+                    {
+                      "name": "Parallel Port",
+                      "type": "item",
+                      "current": "Disabled",
+                      "values": [
+                        "Enabled",
+                        "Disabled"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Chipset",
+      "items": [
+        {
+          "name": "System Agent (SA) Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "System Agent (SA) Configuration",
+            "items": [
+              {
+                "name": "Graphics Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "Graphics Configuration",
+                  "items": [
+                    {
+                      "name": "Primary Display",
+                      "type": "item",
+                      "current": "IGFX",
+                      "values": [
+                        "IGFX",
+                        "PEG",
+                        "PCI",
+                        "SG"
+                      ]
+                    },
+                    {
+                      "name": "Primary IGFX Boot Display",
+                      "type": "item",
+                      "current": "CRT",
+                      "values": [
+                        "CRT",
+                        "DDI1",
+                        "LFP",
+                        "DDI3",
+                        "DDI2"
+                      ]
+                    },
+                    {
+                      "name": "Secondary IGFX Boot Display",
+                      "type": "item",
+                      "current": "Disabled",
+                      "values": [
+                        "Disabled",
+                        "CRT",
+                        "DDI1",
+                        "LFP",
+                        "DDI3",
+                        "DDI2"
+                      ]
+                    },
+                    {
+                      "name": "LCD Panel Type",
+                      "type": "item",
+                      "current": "VBIOS Default",
+                      "values": [
+                        "VBIOS Default"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Memory Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "Memory Configuration",
+                  "items": []
+                },
+                "tip": "显示内存信息。"
+              }
+            ]
+          }
+        },
+        {
+          "name": "PCH-IO Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "PCH-IO Configuration",
+            "items": [
+              {
+                "name": "Wake on LAN",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Disabled",
+                  "Enabled"
+                ],
+                "tip": "是否允许集成网卡唤醒系统。"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Security",
+      "items": [
+        {
+          "name": "Administrator Password",
+          "type": "info",
+          "current": "Not Installed",
+          "disabled": true
+        },
+        {
+          "name": "User Password",
+          "type": "info",
+          "current": "Not Installed",
+          "disabled": true
+        },
+        {
+          "name": "Set Administrator Password",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Set User Password",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Secure Boot",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Key Management",
+          "type": "submenu",
+          "sub": {
+            "name": "Key Management",
+            "items": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "Boot",
+      "items": [
+        {
+          "name": "Setup Prompt Timeout",
+          "type": "item",
+          "current": "1",
+          "values": [
+            "1",
+            "3",
+            "5",
+            "65535"
+          ],
+          "tip": "等待进入 Setup 的秒数。65535(0xFFFF)=无限等待。"
+        },
+        {
+          "name": "Bootup NumLock State",
+          "type": "item",
+          "current": "On",
+          "values": [
+            "On",
+            "Off"
+          ]
+        },
+        {
+          "name": "Quiet Boot",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Fast Boot",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "CSM16 Module Version",
+          "type": "info",
+          "current": "07.64",
+          "disabled": true
+        },
+        {
+          "name": "Boot Option Priorities",
+          "type": "submenu",
+          "sub": {
+            "name": "Boot Option Priorities",
+            "items": []
+          },
+          "tip": "设置 Boot Option #1/#2… 启动优先级。"
+        }
+      ]
+    },
+    {
+      "name": "Save & Exit",
+      "items": [
+        {
+          "name": "Save Changes and Exit",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Discard Changes and Exit",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Save Changes and Reset",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Discard Changes and Reset",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Save Changes",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Discard Changes",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Restore Defaults",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "载入全部选项的默认值。"
+        },
+        {
+          "name": "Save as User Defaults",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Restore User Defaults",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Boot Override",
+          "type": "submenu",
+          "sub": {
+            "name": "Boot Override",
+            "items": []
+          },
+          "tip": "从指定设备直接启动。"
+        }
+      ]
+    }
+  ]
+}

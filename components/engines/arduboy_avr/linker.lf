@@ -1,0 +1,9 @@
+# V2.x 内存精简: 整库 BSS/common 段搬到 PSRAM (IDF 内置 extram_bss 方案)。
+# 需 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y (本项目已开)。
+# 注意: 本组件解释器核心对 PSRAM 延迟敏感 (见 CMakeLists 的 simavr_mem_override.h),
+# 若实测帧率明显下降, 删掉本文件即可回退到内部 DRAM。
+[mapping:arduboy_avr_extram_bss]
+archive: libarduboy_avr.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)

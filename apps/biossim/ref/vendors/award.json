@@ -1,0 +1,947 @@
+{
+  "model": "Award BIOS (Phoenix/Award CMOS Setup Utility)",
+  "source_url": "https://gl.manuals.plus/m/562ee3f9f59c7ed8db8bf52ce488d7d15c82077c6395f62f1caf72100e95b9c5",
+  "retrieved": "2026-10-02",
+  "data_source_file": "Award BIOS 官方手册(AWARD BIOS SETUP 章) + Gigabyte 8IRXP / Biostar N4SIE-A7 官方主板手册 'Award BIOS CMOS Setup Utility' 主菜单与子菜单",
+  "menus": [
+    {
+      "name": "Standard CMOS Features",
+      "items": [
+        {
+          "name": "Date (mm:dd:yy)",
+          "type": "item",
+          "current": "Fri, Jan 7, 2000",
+          "values": [
+            "mm:dd:yy"
+          ]
+        },
+        {
+          "name": "Time (hh:mm:ss)",
+          "type": "item",
+          "current": "00:00:00",
+          "values": [
+            "hh:mm:ss"
+          ]
+        },
+        {
+          "name": "IDE Primary Master",
+          "type": "submenu",
+          "sub": {
+            "name": "IDE Primary Master",
+            "items": []
+          },
+          "tip": "回车进入，设置 PIO/UDMA/容量(mode)等。"
+        },
+        {
+          "name": "IDE Primary Slave",
+          "type": "submenu",
+          "sub": {
+            "name": "IDE Primary Slave",
+            "items": []
+          }
+        },
+        {
+          "name": "IDE Secondary Master",
+          "type": "submenu",
+          "sub": {
+            "name": "IDE Secondary Master",
+            "items": []
+          }
+        },
+        {
+          "name": "IDE Secondary Slave",
+          "type": "submenu",
+          "sub": {
+            "name": "IDE Secondary Slave",
+            "items": []
+          }
+        },
+        {
+          "name": "Drive A",
+          "type": "item",
+          "current": "1.44M, 3.5 in.",
+          "values": [
+            "None",
+            "360K, 5.25 in.",
+            "1.2M, 5.25 in.",
+            "720K, 3.5 in.",
+            "1.44M, 3.5 in.",
+            "2.88M, 3.5 in."
+          ]
+        },
+        {
+          "name": "Drive B",
+          "type": "item",
+          "current": "None",
+          "values": [
+            "None",
+            "360K, 5.25 in.",
+            "1.2M, 5.25 in.",
+            "720K, 3.5 in.",
+            "1.44M, 3.5 in.",
+            "2.88M, 3.5 in."
+          ]
+        },
+        {
+          "name": "Video",
+          "type": "item",
+          "current": "EGA/VGA",
+          "values": [
+            "EGA/VGA",
+            "CGA 40",
+            "CGA 80",
+            "MONO"
+          ]
+        },
+        {
+          "name": "Halt On",
+          "type": "item",
+          "current": "All, But Keyboard",
+          "values": [
+            "All Errors",
+            "No Errors",
+            "All, But Keyboard",
+            "All, But Diskette",
+            "All, But Disk/Key"
+          ]
+        },
+        {
+          "name": "Base Memory",
+          "type": "info",
+          "current": "640K",
+          "disabled": true
+        },
+        {
+          "name": "Total Memory",
+          "type": "info",
+          "current": "65536K",
+          "disabled": true
+        },
+        {
+          "name": "Extended Memory",
+          "type": "info",
+          "current": "64512K",
+          "disabled": true
+        }
+      ]
+    },
+    {
+      "name": "Advanced BIOS Features",
+      "items": [
+        {
+          "name": "Virus Warning",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "CPU L1 & L2 Cache",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "CPU L2 Cache ECC Checking",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Quick Power On Self Test",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "First Boot Device",
+          "type": "item",
+          "current": "Floppy",
+          "values": [
+            "Floppy",
+            "LS120",
+            "HDD-0",
+            "SCSI",
+            "CDROM",
+            "HDD-1",
+            "HDD-2",
+            "HDD-3",
+            "ZIP100",
+            "USB-FDD",
+            "USB-ZIP",
+            "USB-CDROM",
+            "USB-HDD",
+            "LAN",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Second Boot Device",
+          "type": "item",
+          "current": "HDD-0",
+          "values": [
+            "Floppy",
+            "LS120",
+            "HDD-0",
+            "SCSI",
+            "CDROM",
+            "HDD-1",
+            "HDD-2",
+            "HDD-3",
+            "ZIP100",
+            "USB-FDD",
+            "USB-ZIP",
+            "USB-CDROM",
+            "USB-HDD",
+            "LAN",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Third Boot Device",
+          "type": "item",
+          "current": "LS120",
+          "values": [
+            "Floppy",
+            "LS120",
+            "HDD-0",
+            "SCSI",
+            "CDROM",
+            "HDD-1",
+            "HDD-2",
+            "HDD-3",
+            "ZIP100",
+            "USB-FDD",
+            "USB-ZIP",
+            "USB-CDROM",
+            "USB-HDD",
+            "LAN",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Boot Other Device",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Swap Floppy Drive",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Boot Up Floppy Seek",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Boot Up NumLock Status",
+          "type": "item",
+          "current": "On",
+          "values": [
+            "On",
+            "Off"
+          ]
+        },
+        {
+          "name": "Gate A20 Option",
+          "type": "item",
+          "current": "Fast",
+          "values": [
+            "Fast",
+            "Normal"
+          ]
+        },
+        {
+          "name": "Typematic Rate Setting",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Security Option",
+          "type": "item",
+          "current": "Setup",
+          "values": [
+            "Setup",
+            "System"
+          ]
+        },
+        {
+          "name": "OS Select For DRAM > 64MB",
+          "type": "item",
+          "current": "Non-OS2",
+          "values": [
+            "Non-OS2",
+            "OS2"
+          ]
+        },
+        {
+          "name": "HDD S.M.A.R.T. Capability",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Full Screen LOGO Show",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Advanced Chipset Features",
+      "items": [
+        {
+          "name": "DRAM Timing Selectable",
+          "type": "item",
+          "current": "By SPD",
+          "values": [
+            "By SPD",
+            "Manual"
+          ]
+        },
+        {
+          "name": "CAS Latency Time",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "2",
+            "2.5",
+            "3"
+          ]
+        },
+        {
+          "name": "Active to Precharge Delay",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "5",
+            "6",
+            "7"
+          ]
+        },
+        {
+          "name": "DRAM RAS# to CAS# Delay",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "2",
+            "3",
+            "4"
+          ]
+        },
+        {
+          "name": "DRAM RAS# Precharge",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "2",
+            "3",
+            "4"
+          ]
+        },
+        {
+          "name": "System Memory Frequency",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "100MHz",
+            "133MHz"
+          ]
+        },
+        {
+          "name": "AGP Aperture Size (MB)",
+          "type": "item",
+          "current": "64",
+          "values": [
+            "4",
+            "8",
+            "16",
+            "32",
+            "64",
+            "128",
+            "256"
+          ]
+        },
+        {
+          "name": "On-Chip Frame Buffer Size",
+          "type": "item",
+          "current": "1MB",
+          "values": [
+            "1MB",
+            "8MB"
+          ]
+        },
+        {
+          "name": "On-Chip Video Window Size",
+          "type": "item",
+          "current": "64MB",
+          "values": [
+            "32MB",
+            "64MB",
+            "128MB"
+          ]
+        },
+        {
+          "name": "Init Display First",
+          "type": "item",
+          "current": "PCI Slot",
+          "values": [
+            "PCI Slot",
+            "Onboard/AGP"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Integrated Peripherals",
+      "items": [
+        {
+          "name": "OnChip IDE Device",
+          "type": "submenu",
+          "sub": {
+            "name": "OnChip IDE Device",
+            "items": [
+              {
+                "name": "On-Chip Primary PCI IDE",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "On-Chip Secondary PCI IDE",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "IDE Primary Master PIO",
+                "type": "item",
+                "current": "Auto",
+                "values": [
+                  "Auto",
+                  "Mode 0",
+                  "Mode 1",
+                  "Mode 2",
+                  "Mode 3",
+                  "Mode 4"
+                ]
+              },
+              {
+                "name": "IDE Primary Master UDMA",
+                "type": "item",
+                "current": "Auto",
+                "values": [
+                  "Auto",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "IDE Primary Slave UDMA",
+                "type": "item",
+                "current": "Auto",
+                "values": [
+                  "Auto",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "IDE Secondary Master UDMA",
+                "type": "item",
+                "current": "Auto",
+                "values": [
+                  "Auto",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "IDE Secondary Slave UDMA",
+                "type": "item",
+                "current": "Auto",
+                "values": [
+                  "Auto",
+                  "Disabled"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "Onboard Device",
+          "type": "submenu",
+          "sub": {
+            "name": "Onboard Device",
+            "items": [
+              {
+                "name": "USB Controller",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "USB Keyboard Support",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "AC97 Audio",
+                "type": "item",
+                "current": "Auto",
+                "values": [
+                  "Auto",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Onboard LAN",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "SuperIO Device",
+          "type": "submenu",
+          "sub": {
+            "name": "SuperIO Device",
+            "items": [
+              {
+                "name": "Onboard FDC Controller",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Onboard Serial Port 1",
+                "type": "item",
+                "current": "3F8/IRQ4",
+                "values": [
+                  "3F8/IRQ4",
+                  "2F8/IRQ3",
+                  "3E8/IRQ4",
+                  "2E8/IRQ3",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Onboard Serial Port 2",
+                "type": "item",
+                "current": "2F8/IRQ3",
+                "values": [
+                  "3F8/IRQ4",
+                  "2F8/IRQ3",
+                  "3E8/IRQ4",
+                  "2E8/IRQ3",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Onboard Parallel Port",
+                "type": "item",
+                "current": "378/IRQ7",
+                "values": [
+                  "378/IRQ7",
+                  "278/IRQ5",
+                  "3BC/IRQ7",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Parallel Port Mode",
+                "type": "item",
+                "current": "SPP",
+                "values": [
+                  "SPP",
+                  "EPP",
+                  "ECP",
+                  "ECP+EPP"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Power Management Setup",
+      "items": [
+        {
+          "name": "ACPI Function",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "ACPI Suspend Type",
+          "type": "item",
+          "current": "S1(POS)",
+          "values": [
+            "S1(POS)",
+            "S3(STR)"
+          ]
+        },
+        {
+          "name": "Power Management",
+          "type": "item",
+          "current": "User Define",
+          "values": [
+            "User Define",
+            "Min Saving",
+            "Max Saving"
+          ]
+        },
+        {
+          "name": "Video Off Method",
+          "type": "item",
+          "current": "DPMS",
+          "values": [
+            "DPMS",
+            "Blank Screen",
+            "V/H SYNC+Blank"
+          ]
+        },
+        {
+          "name": "MODEM Use IRQ",
+          "type": "item",
+          "current": "3",
+          "values": [
+            "3",
+            "4",
+            "5",
+            "7",
+            "9",
+            "10",
+            "11",
+            "NA"
+          ]
+        },
+        {
+          "name": "Soft-Off by PWRBTN",
+          "type": "item",
+          "current": "Instant-Off",
+          "values": [
+            "Instant-Off",
+            "Delay 4 Sec"
+          ]
+        },
+        {
+          "name": "Wake-Up by PCI Card",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Power On by Ring",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Resume by Alarm",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "PnP/PCI Configurations",
+      "items": [
+        {
+          "name": "Reset Configuration Data",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Resources Controlled By",
+          "type": "item",
+          "current": "Auto(ESCD)",
+          "values": [
+            "Auto(ESCD)",
+            "Manual"
+          ]
+        },
+        {
+          "name": "IRQ Resources",
+          "type": "submenu",
+          "sub": {
+            "name": "IRQ Resources",
+            "items": []
+          },
+          "tip": "Resources 设为 Manual 时, 为各 IRQ 指定 PCI Device / Reserved。"
+        },
+        {
+          "name": "PCI/VGA Palette Snoop",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "PC Health Status",
+      "items": [
+        {
+          "name": "System Temperature",
+          "type": "info",
+          "current": "34°C/93°F",
+          "disabled": true
+        },
+        {
+          "name": "CPU Temperature",
+          "type": "info",
+          "current": "45°C/113°F",
+          "disabled": true
+        },
+        {
+          "name": "CPU Fan Speed",
+          "type": "info",
+          "current": "3200 RPM",
+          "disabled": true
+        },
+        {
+          "name": "Vcore",
+          "type": "info",
+          "current": "1.72 V",
+          "disabled": true
+        },
+        {
+          "name": "Vcc3",
+          "type": "info",
+          "current": "3.34 V",
+          "disabled": true
+        },
+        {
+          "name": "Vcc5",
+          "type": "info",
+          "current": "5.02 V",
+          "disabled": true
+        },
+        {
+          "name": "+12V",
+          "type": "info",
+          "current": "12.16 V",
+          "disabled": true
+        },
+        {
+          "name": "Shutdown Temperature",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "60°C/140°F",
+            "65°C/149°F",
+            "70°C/158°F"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Frequency/Voltage Control",
+      "items": [
+        {
+          "name": "CPU Clock Ratio",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "8 X",
+            "9 X",
+            "10 X",
+            "11 X",
+            "12 X"
+          ]
+        },
+        {
+          "name": "Auto Detect PCI Clk",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Spread Spectrum",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Main Menu",
+      "items": [
+        {
+          "name": "Select Language",
+          "type": "item",
+          "current": "English",
+          "values": [
+            "English",
+            "中文"
+          ]
+        },
+        {
+          "name": "Load Fail-Safe Defaults",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "载入最安全的(稳定)默认值。"
+        },
+        {
+          "name": "Load Optimized Defaults",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "载入出厂优化默认值(性能最佳)。"
+        },
+        {
+          "name": "Set Supervisor Password",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "设置/更改/取消管理员密码，限制对 Setup 的访问。"
+        },
+        {
+          "name": "Set User Password",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "设置/更改/取消用户密码；已设 Supervisor 时用户只能查看不能修改。"
+        },
+        {
+          "name": "Save & Exit Setup",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "保存 CMOS 设置并退出 (F10)。"
+        },
+        {
+          "name": "Exit Without Saving",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "放弃所有更改并退出。"
+        }
+      ]
+    }
+  ]
+}

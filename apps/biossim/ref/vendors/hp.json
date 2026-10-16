@@ -1,0 +1,525 @@
+{
+  "model": "HP EliteBook 840 G5 (Computer Setup / F10)",
+  "source_url": "https://h10032.www1.hp.com/ctg/Manual/c06511071.pdf",
+  "retrieved": "2026-10-02",
+  "data_source_file": "HP 官方 interactive BIOS simulator - HP EliteBook 800 G5 Notebook PC Series (c06511071.pdf), 菜单栏+各页签逐项",
+  "menus": [
+    {
+      "name": "Main",
+      "items": [
+        {
+          "name": "System Information",
+          "type": "submenu",
+          "sub": {
+            "name": "System Information",
+            "items": [
+              {
+                "name": "Show Advanced System Information",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Disabled",
+                  "Enabled"
+                ]
+              },
+              {
+                "name": "Product Name",
+                "type": "info",
+                "current": "HP EliteBook 830/840/840 HC/850 G5 Notebook PCs",
+                "disabled": true
+              },
+              {
+                "name": "Processor 1",
+                "type": "info",
+                "current": "Intel(R) Core(TM) i5-8250U CPU @ 1.60GHz",
+                "disabled": true
+              },
+              {
+                "name": "Memory Size",
+                "type": "info",
+                "current": "16384 MB",
+                "disabled": true
+              },
+              {
+                "name": "System BIOS",
+                "type": "info",
+                "current": "Q78 Ver.80.31.00 10/16/2017",
+                "disabled": true
+              },
+              {
+                "name": "SERVICE ---------------------------------------------------------------",
+                "type": "separator"
+              },
+              {
+                "name": "Born On Date",
+                "type": "info",
+                "current": "00/00/0000",
+                "disabled": true
+              },
+              {
+                "name": "Serial Number",
+                "type": "info",
+                "current": "00074400PK",
+                "disabled": true
+              },
+              {
+                "name": "SKU Number",
+                "type": "info",
+                "current": "123456#ABA",
+                "disabled": true
+              },
+              {
+                "name": "Universally Unique Identifier (UUID)",
+                "type": "info",
+                "current": "6757586A-357D-8BB9-BC26-E08933445044",
+                "disabled": true
+              },
+              {
+                "name": "Asset Tracking Number",
+                "type": "info",
+                "current": "",
+                "disabled": true
+              }
+            ]
+          }
+        },
+        {
+          "name": "System Diagnostics",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "进入 HP PC Hardware Diagnostics UEFI (BIOS 外部诊断程序)。"
+        },
+        {
+          "name": "Update System BIOS",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "更新系统 BIOS。"
+        },
+        {
+          "name": "Change Date And Time",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Set Machine Unique Data",
+          "type": "submenu",
+          "sub": {
+            "name": "Set Machine Unique Data",
+            "items": []
+          }
+        },
+        {
+          "name": "System IDs",
+          "type": "submenu",
+          "sub": {
+            "name": "System IDs",
+            "items": []
+          }
+        },
+        {
+          "name": "Replicated Setup",
+          "type": "submenu",
+          "sub": {
+            "name": "Replicated Setup",
+            "items": []
+          }
+        },
+        {
+          "name": "Save Custom Defaults",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Apply Custom Defaults and Exit",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Apply Factory Defaults and Exit",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Ignore Changes and Exit",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Save Changes and Exit",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        },
+        {
+          "name": "Suppress POST Errors",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Security",
+      "items": [
+        {
+          "name": "Administrator Tools",
+          "type": "submenu",
+          "sub": {
+            "name": "Administrator Tools",
+            "items": [
+              {
+                "name": "Create BIOS Administrator Password",
+                "type": "action",
+                "current": "[Enter]",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ]
+                }
+              },
+              {
+                "name": "Create POST Power-On Password",
+                "type": "action",
+                "current": "[Enter]",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ]
+                }
+              },
+              {
+                "name": "Password Policy",
+                "type": "submenu",
+                "sub": {
+                  "name": "Password Policy",
+                  "items": []
+                }
+              },
+              {
+                "name": "Fingerprint Reset on Reboot",
+                "type": "action",
+                "current": "[Enter]",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "Security Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Security Configuration",
+            "items": [
+              {
+                "name": "TPM Embedded Security",
+                "type": "submenu",
+                "sub": {
+                  "name": "TPM Embedded Security",
+                  "items": []
+                }
+              },
+              {
+                "name": "BIOS SureStart",
+                "type": "submenu",
+                "sub": {
+                  "name": "BIOS SureStart",
+                  "items": []
+                }
+              },
+              {
+                "name": "HP Secure Platform Management (SPM)",
+                "type": "submenu",
+                "sub": {
+                  "name": "HP Secure Platform Management (SPM)",
+                  "items": []
+                }
+              },
+              {
+                "name": "Physical Presence Interface",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Disabled",
+                  "Enabled"
+                ]
+              },
+              {
+                "name": "Intel Software Guard Extensions (SGX)",
+                "type": "item",
+                "current": "Software control",
+                "values": [
+                  "Software control",
+                  "Disabled"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "Utilities",
+          "type": "submenu",
+          "sub": {
+            "name": "Utilities",
+            "items": [
+              {
+                "name": "Hard Drive Utilities",
+                "type": "submenu",
+                "sub": {
+                  "name": "Hard Drive Utilities",
+                  "items": []
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "Absolute(R) Persistence Module Current State",
+          "type": "info",
+          "current": "Activation Status: Inactive",
+          "disabled": true
+        },
+        {
+          "name": "Absolute(R) Persistence Module Permanent Disable",
+          "type": "item",
+          "current": "No",
+          "values": [
+            "No",
+            "Yes"
+          ]
+        },
+        {
+          "name": "System Management Command",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Restore Security Settings to Factory Defaults",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Advanced",
+      "items": [
+        {
+          "name": "Display Language",
+          "type": "item",
+          "current": "English",
+          "values": [
+            "English",
+            "简体中文",
+            "Français",
+            "Deutsch",
+            "Español"
+          ]
+        },
+        {
+          "name": "Scheduled Power-On",
+          "type": "submenu",
+          "sub": {
+            "name": "Scheduled Power-On",
+            "items": []
+          }
+        },
+        {
+          "name": "Boot Options",
+          "type": "submenu",
+          "sub": {
+            "name": "Boot Options",
+            "items": []
+          }
+        },
+        {
+          "name": "OS Recovery",
+          "type": "submenu",
+          "sub": {
+            "name": "OS Recovery",
+            "items": []
+          }
+        },
+        {
+          "name": "Secure Boot Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Secure Boot Configuration",
+            "items": []
+          }
+        },
+        {
+          "name": "System Options",
+          "type": "submenu",
+          "sub": {
+            "name": "System Options",
+            "items": []
+          }
+        },
+        {
+          "name": "Built-In Device Options",
+          "type": "submenu",
+          "sub": {
+            "name": "Built-In Device Options",
+            "items": []
+          }
+        },
+        {
+          "name": "Port Options",
+          "type": "submenu",
+          "sub": {
+            "name": "Port Options",
+            "items": []
+          }
+        },
+        {
+          "name": "Option ROM Launch Policy",
+          "type": "submenu",
+          "sub": {
+            "name": "Option ROM Launch Policy",
+            "items": []
+          }
+        },
+        {
+          "name": "Power Management Options",
+          "type": "submenu",
+          "sub": {
+            "name": "Power Management Options",
+            "items": []
+          }
+        },
+        {
+          "name": "Electronic Labels",
+          "type": "submenu",
+          "sub": {
+            "name": "Electronic Labels",
+            "items": []
+          }
+        },
+        {
+          "name": "MAC Address Pass Through",
+          "type": "submenu",
+          "sub": {
+            "name": "MAC Address Pass Through",
+            "items": []
+          }
+        },
+        {
+          "name": "Remote HP PC Hardware Diagnostics",
+          "type": "submenu",
+          "sub": {
+            "name": "Remote HP PC Hardware Diagnostics",
+            "items": []
+          }
+        },
+        {
+          "name": "Execute Remote HP PC Hardware Diagnostics",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "UEFI Drivers",
+      "items": [
+        {
+          "name": "3rd Party Option ROM Management",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "重启系统进入第三方 Option ROM 管理程序；也可在启动时按 F3 直接进入。"
+        }
+      ]
+    }
+  ]
+}

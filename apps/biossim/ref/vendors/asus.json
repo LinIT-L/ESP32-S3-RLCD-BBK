@@ -1,0 +1,947 @@
+{
+  "model": "ASUS UEFI BIOS (Advanced Mode)",
+  "source_url": "https://dlcdnets.asus.com/pub/ASUS/mb/LGA1151/H170I-PRO/E11627_H170I-PRO_UM_web_only.pdf",
+  "retrieved": "2026-10-02",
+  "data_source_file": "华硕官方手册(B85M-D E9357 / H170I-PRO E11627 菜单栏; ROG Z690 BIOS Manual E19569 项目细节) + 仓库真机 IFR dump ref/asus_aptio_v_real_dump.json",
+  "menus": [
+    {
+      "name": "My Favorites",
+      "items": []
+    },
+    {
+      "name": "Main",
+      "items": [
+        {
+          "name": "System Language",
+          "type": "item",
+          "current": "English",
+          "values": [
+            "English",
+            "简体中文"
+          ]
+        },
+        {
+          "name": "System Date",
+          "type": "item",
+          "current": "01/13/2022",
+          "values": [
+            "MM/DD/YYYY"
+          ]
+        },
+        {
+          "name": "System Time",
+          "type": "item",
+          "current": "17:57:00",
+          "values": [
+            "HH:MM:SS"
+          ]
+        },
+        {
+          "name": "Access Level",
+          "type": "info",
+          "current": "Administrator",
+          "disabled": true
+        },
+        {
+          "name": "Security",
+          "type": "submenu",
+          "sub": {
+            "name": "Security",
+            "items": [
+              {
+                "name": "Administrator Password",
+                "type": "action",
+                "current": "[Enter]",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ]
+                },
+                "tip": "默认 [Not Installed]，设置后显示 [Installed]。"
+              },
+              {
+                "name": "User Password",
+                "type": "action",
+                "current": "[Enter]",
+                "dialog": {
+                  "title": "Setup Confirmation",
+                  "buttons": [
+                    "Yes",
+                    "No"
+                  ]
+                }
+              }
+            ]
+          },
+          "tip": "Main 菜单内的安全设置(密码)。"
+        }
+      ]
+    },
+    {
+      "name": "Ai Tweaker",
+      "items": [
+        {
+          "name": "Ai Overclock Tuner",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "Manual",
+            "XMP I",
+            "XMP II",
+            "D.O.C.P."
+          ]
+        },
+        {
+          "name": "ASUS MultiCore Enhancement",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto - Keep booting with ASUS optimized settings",
+            "Disabled - Enforce All limits",
+            "Enabled - Remove All limits"
+          ]
+        },
+        {
+          "name": "BCLK Frequency : DRAM Frequency Ratio",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "100:133",
+            "100:100"
+          ]
+        },
+        {
+          "name": "DRAM Frequency",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "DDR4-2133MHz",
+            "DDR4-2666MHz",
+            "DDR4-3200MHz"
+          ]
+        },
+        {
+          "name": "Performance Core Ratio",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "Sync All Cores",
+            "By Core Usage"
+          ]
+        },
+        {
+          "name": "CPU SVID Support",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "DRAM Timing Control",
+          "type": "submenu",
+          "sub": {
+            "name": "DRAM Timing Control",
+            "items": []
+          },
+          "tip": "内存时序(CL/tRCD/tRP/tRAS 等)高级设置。"
+        },
+        {
+          "name": "DIGI+ VRM",
+          "type": "submenu",
+          "sub": {
+            "name": "DIGI+ VRM",
+            "items": []
+          },
+          "tip": "供电(VRM)负载线/相位/电流能力等设置。"
+        },
+        {
+          "name": "Internal CPU Power Management",
+          "type": "submenu",
+          "sub": {
+            "name": "Internal CPU Power Management",
+            "items": []
+          },
+          "tip": "CPU 内部功耗管理 (Turbo/功耗墙)。"
+        },
+        {
+          "name": "CPU Core/Cache Voltage",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "Manual Mode",
+            "Offset Mode",
+            "Adaptive Mode"
+          ]
+        },
+        {
+          "name": "DRAM Voltage",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto"
+          ]
+        },
+        {
+          "name": "TDP Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "TDP Configuration",
+            "items": []
+          }
+        },
+        {
+          "name": "Precision Boost Overdrive",
+          "type": "submenu",
+          "sub": {
+            "name": "Precision Boost Overdrive",
+            "items": []
+          }
+        },
+        {
+          "name": "GPU Boost",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "Disabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Advanced",
+      "items": [
+        {
+          "name": "Platform Misc Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Platform Misc Configuration",
+            "items": []
+          }
+        },
+        {
+          "name": "CPU Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "CPU Configuration",
+            "items": [
+              {
+                "name": "Brand String",
+                "type": "info",
+                "current": "Intel(R) Core(TM) Processor",
+                "disabled": true
+              },
+              {
+                "name": "Intel (VMX) Virtualization Technology",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Disabled",
+                  "Enabled"
+                ],
+                "tip": "启用后 VMM 可使用 Vanderpool 虚拟化技术提供的硬件能力。"
+              },
+              {
+                "name": "Hyper-Threading",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "Active Processor Cores",
+                "type": "item",
+                "current": "All",
+                "values": [
+                  "All",
+                  "1",
+                  "2",
+                  "4"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "System Agent (SA) Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "System Agent (SA) Configuration",
+            "items": [
+              {
+                "name": "Graphics Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "Graphics Configuration",
+                  "items": [
+                    {
+                      "name": "Primary Display",
+                      "type": "item",
+                      "current": "Auto",
+                      "values": [
+                        "Auto",
+                        "IGFX",
+                        "PEG",
+                        "PCIE"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "name": "Memory Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "Memory Configuration",
+                  "items": []
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "PCH Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "PCH Configuration",
+            "items": []
+          }
+        },
+        {
+          "name": "PCH Storage Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "PCH Storage Configuration",
+            "items": [
+              {
+                "name": "SATA Mode Selection",
+                "type": "item",
+                "current": "AHCI",
+                "values": [
+                  "AHCI",
+                  "RAID"
+                ],
+                "tip": "SATA 工作模式。AHCI=标准；RAID=Intel RST(需在 Tool 里建阵列)。"
+              },
+              {
+                "name": "SATA Configuration",
+                "type": "submenu",
+                "sub": {
+                  "name": "SATA Configuration",
+                  "items": []
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "PCH-FW Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "PCH-FW Configuration",
+            "items": []
+          }
+        },
+        {
+          "name": "Thunderbolt(TM) Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Thunderbolt(TM) Configuration",
+            "items": [
+              {
+                "name": "Discrete Thunderbolt(TM) Support",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Disabled",
+                  "Enabled"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "PCI Subsystem Settings",
+          "type": "submenu",
+          "sub": {
+            "name": "PCI Subsystem Settings",
+            "items": []
+          }
+        },
+        {
+          "name": "USB Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "USB Configuration",
+            "items": [
+              {
+                "name": "Legacy USB Support",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled",
+                  "Auto"
+                ]
+              },
+              {
+                "name": "XHCI Hand-off",
+                "type": "item",
+                "current": "Enabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ]
+              },
+              {
+                "name": "USB Single Port Control",
+                "type": "submenu",
+                "sub": {
+                  "name": "USB Single Port Control",
+                  "items": []
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "Network Stack Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Network Stack Configuration",
+            "items": [
+              {
+                "name": "Network Stack",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Disabled",
+                  "Enabled"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "NVMe Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "NVMe Configuration",
+            "items": []
+          }
+        },
+        {
+          "name": "HDD/SSD SMART Information",
+          "type": "submenu",
+          "sub": {
+            "name": "HDD/SSD SMART Information",
+            "items": []
+          }
+        },
+        {
+          "name": "APM Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "APM Configuration",
+            "items": [
+              {
+                "name": "ErP Ready",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Disabled",
+                  "Enabled(S4+S5)",
+                  "Enabled(S5)"
+                ]
+              },
+              {
+                "name": "Power On By PCI-E",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Disabled",
+                  "Enabled"
+                ]
+              },
+              {
+                "name": "Restore AC Power Loss",
+                "type": "item",
+                "current": "Power Off",
+                "values": [
+                  "Power Off",
+                  "Power On",
+                  "Last State"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "Onboard Devices Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Onboard Devices Configuration",
+            "items": []
+          }
+        },
+        {
+          "name": "Intel(R) Rapid Storage Technology",
+          "type": "submenu",
+          "sub": {
+            "name": "Intel(R) Rapid Storage Technology",
+            "items": []
+          },
+          "tip": "Intel RST，用于创建/管理 RAID 卷(需 SATA Mode=RAID)。"
+        }
+      ]
+    },
+    {
+      "name": "Monitor",
+      "items": [
+        {
+          "name": "CPU Temperature",
+          "type": "info",
+          "current": "36°C",
+          "disabled": true
+        },
+        {
+          "name": "Motherboard Temperature",
+          "type": "info",
+          "current": "32°C",
+          "disabled": true
+        },
+        {
+          "name": "CPU Fan Speed",
+          "type": "info",
+          "current": "1200 RPM",
+          "disabled": true
+        },
+        {
+          "name": "Chassis Fan Speed",
+          "type": "info",
+          "current": "N/A",
+          "disabled": true
+        },
+        {
+          "name": "CPU Core Voltage",
+          "type": "info",
+          "current": "1.163 V",
+          "disabled": true
+        },
+        {
+          "name": "3.3V Voltage",
+          "type": "info",
+          "current": "3.312 V",
+          "disabled": true
+        },
+        {
+          "name": "5V Voltage",
+          "type": "info",
+          "current": "5.040 V",
+          "disabled": true
+        },
+        {
+          "name": "12V Voltage",
+          "type": "info",
+          "current": "12.192 V",
+          "disabled": true
+        },
+        {
+          "name": "Q-Fan Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Q-Fan Configuration",
+            "items": []
+          }
+        },
+        {
+          "name": "Chassis Fan(s) Configuration",
+          "type": "submenu",
+          "sub": {
+            "name": "Chassis Fan(s) Configuration",
+            "items": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "Boot",
+      "items": [
+        {
+          "name": "Fast Boot",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Next Boot after AC Power Loss",
+          "type": "item",
+          "current": "Normal Boot",
+          "values": [
+            "Normal Boot",
+            "Fast Boot"
+          ]
+        },
+        {
+          "name": "Boot Logo Display",
+          "type": "item",
+          "current": "Auto",
+          "values": [
+            "Auto",
+            "Full Screen",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Post Delay Time",
+          "type": "item",
+          "current": "0 sec",
+          "values": [
+            "0 sec",
+            "3 sec",
+            "5 sec",
+            "10 sec"
+          ]
+        },
+        {
+          "name": "Post Report",
+          "type": "item",
+          "current": "5 sec",
+          "values": [
+            "1 sec",
+            "5 sec",
+            "10 sec",
+            "Until Press ESC"
+          ]
+        },
+        {
+          "name": "Boot up NumLock State",
+          "type": "item",
+          "current": "On",
+          "values": [
+            "On",
+            "Off"
+          ]
+        },
+        {
+          "name": "Wait For 'F1' If Error",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Option ROM Messages",
+          "type": "item",
+          "current": "Force BIOS",
+          "values": [
+            "Force BIOS",
+            "Keep Current"
+          ]
+        },
+        {
+          "name": "Interrupt 19 Capture",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "AMI Native NVMe Driver Support",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Setup Mode",
+          "type": "item",
+          "current": "Advanced Mode",
+          "values": [
+            "Advanced Mode",
+            "EZ Mode"
+          ]
+        },
+        {
+          "name": "CSM (Compatibility Support Module)",
+          "type": "submenu",
+          "sub": {
+            "name": "CSM (Compatibility Support Module)",
+            "items": [
+              {
+                "name": "Launch CSM",
+                "type": "item",
+                "current": "Disabled",
+                "values": [
+                  "Enabled",
+                  "Disabled"
+                ],
+                "tip": "兼容性支持模块。装 Win7/老系统需 Enabled；纯 UEFI(Win11)设 Disabled。"
+              }
+            ]
+          }
+        },
+        {
+          "name": "Secure Boot",
+          "type": "submenu",
+          "sub": {
+            "name": "Secure Boot",
+            "items": [
+              {
+                "name": "OS Type",
+                "type": "item",
+                "current": "Windows UEFI mode",
+                "values": [
+                  "Windows UEFI mode",
+                  "Other OS"
+                ]
+              },
+              {
+                "name": "Secure Boot Mode",
+                "type": "item",
+                "current": "Standard",
+                "values": [
+                  "Standard",
+                  "Custom"
+                ]
+              },
+              {
+                "name": "Key Management",
+                "type": "submenu",
+                "sub": {
+                  "name": "Key Management",
+                  "items": [
+                    {
+                      "name": "Install Default Secure Boot keys",
+                      "type": "item",
+                      "current": "No",
+                      "values": [
+                        "Yes",
+                        "No"
+                      ]
+                    },
+                    {
+                      "name": "Clear Secure Boot keys",
+                      "type": "item",
+                      "current": "No",
+                      "values": [
+                        "Yes",
+                        "No"
+                      ]
+                    },
+                    {
+                      "name": "Save all Secure Boot variables",
+                      "type": "item",
+                      "current": "No",
+                      "values": [
+                        "Yes",
+                        "No"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "Boot Option Priorities",
+          "type": "submenu",
+          "sub": {
+            "name": "Boot Option Priorities",
+            "items": []
+          },
+          "tip": "设置各启动设备优先级 (Boot Option #1/#2…)。"
+        },
+        {
+          "name": "Boot Override",
+          "type": "info",
+          "current": "（列出可用设备，回车即从所选设备启动）",
+          "disabled": true
+        }
+      ]
+    },
+    {
+      "name": "Tool",
+      "items": [
+        {
+          "name": "ASUS EZ Flash 3 Utility",
+          "type": "submenu",
+          "sub": {
+            "name": "ASUS EZ Flash 3 Utility",
+            "items": []
+          },
+          "tip": "在 BIOS 内刷新 BIOS(从 U 盘/网络)。"
+        },
+        {
+          "name": "ASUS Secure Erase",
+          "type": "submenu",
+          "sub": {
+            "name": "ASUS Secure Erase",
+            "items": []
+          },
+          "tip": "安全擦除 SSD，恢复出厂性能。"
+        },
+        {
+          "name": "ASUS User Profile",
+          "type": "submenu",
+          "sub": {
+            "name": "ASUS User Profile",
+            "items": []
+          },
+          "tip": "保存/加载多份 BIOS 配置档案。"
+        },
+        {
+          "name": "ASUS SPD Information",
+          "type": "submenu",
+          "sub": {
+            "name": "ASUS SPD Information",
+            "items": []
+          },
+          "tip": "查看内存 SPD 信息。"
+        },
+        {
+          "name": "MemTest86",
+          "type": "submenu",
+          "sub": {
+            "name": "MemTest86",
+            "items": []
+          },
+          "tip": "运行 MemTest86 内存检测。"
+        },
+        {
+          "name": "ASUS Armoury Crate",
+          "type": "submenu",
+          "sub": {
+            "name": "ASUS Armoury Crate",
+            "items": []
+          }
+        },
+        {
+          "name": "MyASUS",
+          "type": "submenu",
+          "sub": {
+            "name": "MyASUS",
+            "items": []
+          }
+        },
+        {
+          "name": "BIOS Image Rollback Support",
+          "type": "item",
+          "current": "Enabled",
+          "values": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        {
+          "name": "Publish HII Resources",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        },
+        {
+          "name": "Flexkey",
+          "type": "item",
+          "current": "Reset",
+          "values": [
+            "Reset",
+            "Aura On/Off",
+            "DirectKey",
+            "Safe Boot"
+          ]
+        },
+        {
+          "name": "Setup Animator",
+          "type": "item",
+          "current": "Disabled",
+          "values": [
+            "Disabled",
+            "Enabled"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Exit",
+      "items": [
+        {
+          "name": "Load Optimized Defaults",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "载入优化默认值 (F5)。"
+        },
+        {
+          "name": "Save Changes & Reset",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "保存并重启 (F10)。"
+        },
+        {
+          "name": "Discard Changes & Exit",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "放弃更改并退出 (Esc)。"
+        },
+        {
+          "name": "Launch EFI Shell from USB drives",
+          "type": "action",
+          "current": "[Enter]",
+          "dialog": {
+            "title": "Setup Confirmation",
+            "buttons": [
+              "Yes",
+              "No"
+            ]
+          },
+          "tip": "从文件系统设备启动 EFI Shell (shellx64.efi)。"
+        }
+      ]
+    }
+  ]
+}

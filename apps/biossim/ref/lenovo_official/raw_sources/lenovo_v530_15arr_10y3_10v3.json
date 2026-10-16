@@ -1,0 +1,4153 @@
+{
+  "data": [
+    {
+      "name": "Main",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "System Summary",
+          "value": [
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "CPU Type",
+              "value": "CPU Brand String",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "CPU Speed",
+              "value": "xx0GHz",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "CPU Core Count",
+              "value": "x",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Installed Memory",
+              "value": "xxxx MB",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Memory Bus Speed",
+              "value": "XX MHz",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Active Video",
+              "value": "IGD/PEG/PCI",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Onboard Audio",
+              "value": "Enabled",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Onboard Ethernet",
+              "value": "Enabled",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "CPU Fan",
+              "value": "Operating",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "System Fan",
+              "value": "Operating",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Aux Fan",
+              "value": "Operating",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "M.2 Drive 1",
+              "value": "None",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "SATA Drive 1",
+              "value": "None",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "SATA Drive 2",
+              "value": "None",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            }
+          ],
+          "prompt": {
+            "name": "",
+            "value": ""
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "System Time && Date",
+          "value": [
+            {
+              "name": "System Time(HH:MM:SS)",
+              "value": "$Time",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Set the Time.\nUse Tab key to switch between Time fields."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "time",
+              "selected": "1:28:32 AM"
+            },
+            {
+              "name": "System Date(YYYY:MM:DD)",
+              "value": "$Date",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Set the Date.\nUse Tab key to switch between Date fields."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "date",
+              "selected": "4/22/2026"
+            }
+          ],
+          "prompt": {
+            "name": "",
+            "value": ""
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Machine Type and Model",
+          "value": "10Y3",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "System Brand ID",
+          "value": "Lenovo V530-15ARR",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "System Serial Number",
+          "value": "INVALID",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Asset tag",
+          "value": " ",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "System UUID",
+          "value": "666DE75C-1234-1234-1234-1234567890AB",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Ethernet MAC Address",
+          "value": "XX-XX-XX-XX-XX-XX",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Embedded Controller Version",
+          "value": "O4DCT",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "BIOS Revision Level",
+          "value": "O4DKT",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Boot Block Revision Level",
+          "value": "x.xx",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "BIOS Date (MM/DD/YYYY)",
+          "value": "xx/xx/xxxx",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Preinstalled OS License",
+          "value": "Not Defined",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "OA3 License Key ID",
+          "value": "NO DPK",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "OA2.1 Marker",
+          "value": "N",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Language",
+          "value": "[English,Francais,中文]",
+          "prompt": {
+            "name": "",
+            "value": ""
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "English",
+            "Francais",
+            "中文"
+          ],
+          "selected": "English",
+          "origin": "English"
+        }
+      ]
+    },
+    {
+      "name": "Devices",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "Serial Port Setup",
+          "value": [
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Serial Port1 Address",
+              "value": "[3F8/IRQ4,2F8/IRQ3,Disabled,3E8/IRQ4,2E8/IRQ3]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select settings for the Serial Port 1. If set to \"Disabled\", the Serial Port will not be seen by the OS."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "3F8/IRQ4",
+                "2F8/IRQ3",
+                "Disabled",
+                "3E8/IRQ4",
+                "2E8/IRQ3"
+              ],
+              "selected": "3F8/IRQ4",
+              "origin": "3F8/IRQ4"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this option to configure your system's serial port."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Parallel Port Setup",
+          "value": [
+            {
+              "name": "Parallel Port Address",
+              "value": "[378,278,3BC,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select settings for the Parallel Port. If set to \"Disabled\", the Parallel Port will not be seen by the OS."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "378",
+                "278",
+                "3BC",
+                "Disabled"
+              ],
+              "selected": "378",
+              "origin": "378",
+              "effects": [
+                {
+                  "path": [
+                    "Devices",
+                    "Parallel Port Setup",
+                    "Parallel Port Mode"
+                  ],
+                  "targetIndex": [
+                    1,
+                    1,
+                    1
+                  ],
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "path": [
+                    "Devices",
+                    "Parallel Port Setup",
+                    "EPP Version"
+                  ],
+                  "targetIndex": [
+                    1,
+                    1,
+                    2
+                  ],
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "path": [
+                    "Devices",
+                    "Parallel Port Setup",
+                    "ECP Mode DMA Channel"
+                  ],
+                  "targetIndex": [
+                    1,
+                    1,
+                    3
+                  ],
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "path": [
+                    "Devices",
+                    "Parallel Port Setup",
+                    "Parallel Port IRQ"
+                  ],
+                  "targetIndex": [
+                    1,
+                    1,
+                    4
+                  ],
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                }
+              ]
+            },
+            {
+              "name": "Parallel Port Mode",
+              "value": "[ECP+EPP,ECP,EPP]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Change the Parallel Port Mode. \nEPP (Enhanced Parallel Port) and ECP (Extended Capabilities Port) are two modes to transmit data by Parallel Port. EPP is more commonly used than ECP."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "ECP+EPP",
+                "ECP",
+                "EPP"
+              ],
+              "selected": "ECP+EPP",
+              "origin": "ECP+EPP",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "EPP Version",
+              "value": "[1.9,1.7]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "There are differences between the two standards (1.9 and 1.7 version) which may affect the operation of devices."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "1.9",
+                "1.7"
+              ],
+              "selected": "1.9",
+              "origin": "1.9",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "ECP Mode DMA Channel",
+              "value": "[DMA3,DMA1]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "DMA (Direct Memory Access), a technique for transferring data from main memory to the parallel port devices without passing it through the CPU. Computers that have DMA channels can transfer data to and from devices while the CPU works on other tasks. \nSelect DMA3 or DMA1 channel."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "DMA3",
+                "DMA1"
+              ],
+              "selected": "DMA3",
+              "origin": "DMA3",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Parallel Port IRQ",
+              "value": "[IRQ7,IRQ5]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "An IRQ (interrupt request) value is an assigned location where the computer can expect the parallel port controller to interrupt it when the device sends the computer signals about its operation."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "IRQ7",
+                "IRQ5"
+              ],
+              "selected": "IRQ7",
+              "origin": "IRQ7",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    1,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this option to configure your system's Parallel port."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "USB Setup",
+          "value": [
+            {
+              "name": "USB Support",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable USB (Universal Seral Bus) functions.\nIf the functions are disabled, no USB device can be used."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "effects": [
+                {
+                  "path": [
+                    "Devices",
+                    "USB Setup",
+                    "USB Legacy Support"
+                  ],
+                  "targetIndex": [
+                    1,
+                    2,
+                    1
+                  ],
+                  "index": [
+                    1,
+                    2,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "path": [
+                    "Devices",
+                    "USB Setup",
+                    "USB Enumeration Delay"
+                  ],
+                  "targetIndex": [
+                    1,
+                    2,
+                    2
+                  ],
+                  "index": [
+                    1,
+                    2,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "path": [
+                    "Devices",
+                    "USB Setup",
+                    "Front USB Ports"
+                  ],
+                  "targetIndex": [
+                    1,
+                    2,
+                    3
+                  ],
+                  "index": [
+                    1,
+                    2,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "path": [
+                    "Devices",
+                    "USB Setup",
+                    "Rear USB Ports"
+                  ],
+                  "targetIndex": [
+                    1,
+                    2,
+                    4
+                  ],
+                  "index": [
+                    1,
+                    2,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                }
+              ]
+            },
+            {
+              "name": "USB Legacy Support",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "If it is disabled, the USB keyboard and/or USB mouse may be not able to be used without device driver support."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    2,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "USB Enumeration Delay",
+              "value": "[Disabled,Enabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "If it is enabled, extra delay will be added when host performs USB enumeration. This may improve the compatibility of USB device detection but increase POST time."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Disabled",
+                "Enabled"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    2,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Front USB Ports",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable the side USB ports."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    2,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Rear USB Ports",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable the rear USB ports."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    2,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this option to configure your system's USB port."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "ATA Drive Setup",
+          "value": [
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "SATA Controller",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable SATA controller."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "effects": [
+                {
+                  "path": [
+                    "Devices",
+                    "ATA Drive Setup",
+                    "SATA Drive 1"
+                  ],
+                  "targetIndex": [
+                    1,
+                    3,
+                    2
+                  ],
+                  "index": [
+                    1,
+                    3,
+                    1
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "path": [
+                    "Devices",
+                    "ATA Drive Setup",
+                    "SATA Drive 2"
+                  ],
+                  "targetIndex": [
+                    1,
+                    3,
+                    3
+                  ],
+                  "index": [
+                    1,
+                    3,
+                    1
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                },
+                {
+                  "path": [
+                    "Devices",
+                    "ATA Drive Setup",
+                    "Configure SATA as"
+                  ],
+                  "targetIndex": [
+                    1,
+                    3,
+                    5
+                  ],
+                  "index": [
+                    1,
+                    3,
+                    1
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                }
+              ]
+            },
+            {
+              "name": "SATA Drive 1",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable SATA Drive 1."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    3,
+                    1
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "SATA Drive 2",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable SATA Drive 2."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    3,
+                    1
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Configure SATA as",
+              "value": "[AHCI]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select AHCI Mode.\nNOTE:\nDevice driver support is required  for AHCI.\nDepending on how the hard disk image was installed, changing this setting may prevent the system from booting."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "AHCI"
+              ],
+              "selected": "AHCI",
+              "origin": "AHCI",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    3,
+                    1
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Hard Disk Pre-delay",
+              "value": "[Disabled,3 Seconds,6 Seconds,9 Seconds,12 Seconds,15 Seconds,21 Seconds,30 Seconds]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Adds a delay before the first access of a hard disk by the system software. Some hard disks hang if accessed before they have initialized themselves. This delay ensures the hard disk has initialized after power up, prior to being accessed."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Disabled",
+                "3 Seconds",
+                "6 Seconds",
+                "9 Seconds",
+                "12 Seconds",
+                "15 Seconds",
+                "21 Seconds",
+                "30 Seconds"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": ""
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Video Setup",
+          "value": [
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "UMA Frame Buffer Size",
+              "value": "[Auto,256M,512M,1024M]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Configure the memory size for internal graphic."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Auto",
+                "256M",
+                "512M",
+                "1024M"
+              ],
+              "selected": "Auto",
+              "origin": "Auto"
+            },
+            {
+              "name": "Primary Video Controller",
+              "value": "[Auto,IGD,PEG]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select which graphic controller to be used as the primary display device."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Auto",
+                "IGD",
+                "PEG"
+              ],
+              "selected": "Auto",
+              "origin": "Auto"
+            },
+            {
+              "name": "Surround View",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "If PCIE is primary display,allow IGFX(Internal Graphic) to be secondary display."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this option to configure your system's video."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Audio Setup",
+          "value": [
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Onboard Audio Controller",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable Onboard Audio Controller"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this option to configure your system's audio."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Network Setup",
+          "value": [
+            {
+              "name": "Onboard Ethernet Controller",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable Onboard Ethernet Controller.\nNOTE: If this option is changed to \"Disabled\", the Intel(R) AMT related functions will be disabled."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "effects": [
+                {
+                  "path": [
+                    "Devices",
+                    "Network Setup",
+                    "PXE Option ROM"
+                  ],
+                  "targetIndex": [
+                    1,
+                    6,
+                    1
+                  ],
+                  "index": [
+                    1,
+                    6,
+                    0
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": false
+                }
+              ]
+            },
+            {
+              "name": "PXE Option ROM",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to disable, load onboard PXE (Preboot Execution Environment).  This feature will allow the computer to boot from a server image."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "depends": [
+                {
+                  "index": [
+                    1,
+                    6,
+                    0
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                },
+                {
+                  "index": [
+                    5,
+                    5
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "PXE IPV4 network stack",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable PXE IPV4 network stack"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            },
+            {
+              "name": "PXE IPV6 network stack",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable PXE IPV6 network stack"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            },
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Wireless LAN",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable Wireless LAN.\n<Enabled> Enables use of Wireless LAN.\n<Disabled> Disables use of Wireless LAN. Wireless LAN will not be available is OS."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this option to configure your system's network."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "PCI Express Configuration",
+          "value": [
+            {
+              "name": "ASPM Support",
+              "value": "[Auto,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "<Auto> Configure ASPM automatically according to what the attached device supports in each PCI Express port.\n<Disabled> Disable ASPM support of all PCI Express ports."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Auto",
+                "Disabled"
+              ],
+              "selected": "Auto",
+              "origin": "Auto"
+            },
+            {
+              "name": "PCIe 16x Slot Speed",
+              "value": "[Auto,Gen 1,Gen 2,Gen 3]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select PCI Express port speed."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Auto",
+                "Gen 1",
+                "Gen 2",
+                "Gen 3"
+              ],
+              "selected": "Auto",
+              "origin": "Auto"
+            },
+            {
+              "name": "PCIe 1x Slot 1 Speed",
+              "value": "[Auto,Gen 1,Gen 2,Gen 3]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select PCI Express port speed."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Auto",
+                "Gen 1",
+                "Gen 2",
+                "Gen 3"
+              ],
+              "selected": "Auto",
+              "origin": "Auto"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": ""
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Card Reader",
+          "value": "[Enabled,Disabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select whether to enable or disable Card Reader.\n<Enabled> Enables use of Card Reader.\n<Disabled> Disables use of Card Reader.\nCard reader will not be available in OS."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled"
+        },
+        {
+          "name": "Bluetooth",
+          "value": "[Enabled,Disabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select whether to enable or disable Bluetooth.\n<Enabled> Enables use of Bluetooth.\n<Disabled> Disables use of Bluetooth.\nBluetooth will not be available in OS."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled"
+        }
+      ]
+    },
+    {
+      "name": "Advanced",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "CPU Setup",
+          "value": [
+            {
+              "name": "AMD Secure Virtual Machine",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "AMD Virtualization technology is a set of unique on-chip features that enables AMD PRO-based clients to run multiple operating systems and applications on a single machine.\nSelect whether to enable or disable AMD Virtualization technology."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            },
+            {
+              "name": "CPB Mode",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Core Performance Boost allows the processor to dynamically control and adjust its operating frequency to increase performance when needed and maintain lower power and thermal characteristics during normal operation."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            },
+            {
+              "name": "C6 Support",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable or disable the C6 power management state to minimize idle power consumption of the processor."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            },
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "CPU ID",
+              "value": "xxxxx",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Microcode Revision",
+              "value": "000000xx",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Chipset",
+              "value": "xxx",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this option to configure CPU features."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Dust Shield Alert",
+          "value": "[Disabled,Enabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "<Enabled> The user is reminded to clean the Dust Shield. \n<Disabled> The user is not reminded to clean the Dust Shield. \nNote that if the Dust Shield is not cleaned then it will lose its effectiveness and the machine may overheat."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Disabled",
+            "Enabled"
+          ],
+          "selected": "Disabled",
+          "origin": "Disabled"
+        }
+      ]
+    },
+    {
+      "name": "Power",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "After Power Loss",
+          "value": "[Power Off,Last State,Power On]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "This field controls whether the system will stay on after AC power is removed and then restored.\nSelect \"Power On\" if you use a power strip to turn the system on.\nSelect \"Power Off\" if you want the system to remain off after power restored.\nSelect \"Last State\" to have the system return to the previous state."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Power Off",
+            "Last State",
+            "Power On"
+          ],
+          "selected": "Power Off",
+          "origin": "Power Off"
+        },
+        {
+          "name": "Enhanced Power Saving Mode",
+          "value": "[Disabled,Enabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select whether to enable Enhanced Power Saving Mode.\n<Enabled> The system will enter to Enhanced Power Saving Mode during power off. The total power consumption will be lower during power off.\n<Disabled> Disables function of Enhanced Power Save Mode.\nNote: When enabled Enhanced Power Saving Mode, only the Wake Up on Alarm function is supported. Other wake up functions are not supported. System will not enter to Enhanced Power Saving Mode if Intel ME is required to be active in Sx states and host is in AC mode."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Disabled",
+            "Enabled"
+          ],
+          "selected": "Disabled",
+          "origin": "Disabled",
+          "effects": [
+            {
+              "path": [
+                "Power",
+                "Automatic Power On",
+                "Wake on LAN"
+              ],
+              "targetIndex": [
+                3,
+                4,
+                0
+              ],
+              "index": [
+                3,
+                1
+              ],
+              "selected": [
+                "Enabled"
+              ],
+              "targetDisabled": false
+            },
+            {
+              "path": [
+                "Power",
+                "Automatic Power On",
+                "Wake on LAN "
+              ],
+              "targetIndex": [
+                3,
+                4,
+                1
+              ],
+              "index": [
+                3,
+                1
+              ],
+              "selected": [
+                "Disabled"
+              ],
+              "targetDisabled": false
+            },
+            {
+              "path": [
+                "Power",
+                "Automatic Power On",
+                "Wake from Serial Port Ring"
+              ],
+              "targetIndex": [
+                3,
+                4,
+                2
+              ],
+              "index": [
+                3,
+                1
+              ],
+              "selected": [
+                "Enabled"
+              ],
+              "targetDisabled": false
+            },
+            {
+              "path": [
+                "Power",
+                "Automatic Power On",
+                "Wake from Serial Port Ring "
+              ],
+              "targetIndex": [
+                3,
+                4,
+                3
+              ],
+              "index": [
+                3,
+                1
+              ],
+              "selected": [
+                "Disabled"
+              ],
+              "targetDisabled": false
+            }
+          ]
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Intelligent Cooling Engine(ICE)",
+          "value": [
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "ICE Performance Mode",
+              "value": "[Better Acoustic Performance,Better Thermal Performance,Full Speed]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "<Better Acoustic Performance> The system will run with less noise at a normal thermal level.\n<Better Thermal Performance> The system will run at a better thermal level with normal acoustic performance.\n<Full Speed> All fans in the system will run at full speed."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Better Acoustic Performance",
+                "Better Thermal Performance",
+                "Full Speed"
+              ],
+              "selected": "Better Acoustic Performance",
+              "origin": "Better Acoustic Performance"
+            },
+            {
+              "name": "ICE Thermal Alert",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Thermal monitoring & alert features to protect system under critical thermal situations."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Lenovo unique system thermal management solution."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Automatic Power On",
+          "value": [
+            {
+              "name": "Wake on LAN",
+              "value": "[Automatic,Primary,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable Wake on LAN, and/or which Startup Sequence to use after a Wake on LAN event.\nNOTE: This item controls the wake up event from onboard LAN and PCI LAN."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Automatic",
+                "Primary",
+                "Disabled"
+              ],
+              "selected": "Automatic",
+              "origin": "Automatic",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    1
+                  ],
+                  "value": [
+                    "Enabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Wake on LAN ",
+              "value": "Disabled",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable Wake on LAN, and/or which Startup Sequence to use after a Wake on LAN event.\nNOTE: This item controls the wake up event from onboard LAN and PCI LAN."
+              },
+              "hidden": true,
+              "disabled": false,
+              "skip": true,
+              "type": "promptText",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    1
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Wake from Serial Port Ring",
+              "value": "[Primary,Automatic,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable Wake from Serial Port Ring, and/or which Startup Sequence to use after a serial port wake event."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Primary",
+                "Automatic",
+                "Disabled"
+              ],
+              "selected": "Primary",
+              "origin": "Primary",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    1
+                  ],
+                  "value": [
+                    "Enabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Wake from Serial Port Ring ",
+              "value": "Disabled",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable Wake from Serial Port Ring, and/or which Startup Sequence to use after a serial port wake event."
+              },
+              "hidden": true,
+              "disabled": false,
+              "skip": true,
+              "type": "promptText",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    1
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Wake Up on Alarm",
+              "value": "[Disabled,Single Event,Daily Event,Weekly Event,User Defined]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to enable Wake Up on Alarm, totun on your system on a special day of the month, special day of the week or daily.\nNOTE: Values in these fields may be overwritten by the operating system."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Disabled",
+                "Single Event",
+                "Daily Event",
+                "Weekly Event",
+                "User Defined"
+              ],
+              "selected": "Disabled",
+              "origin": "Disabled",
+              "effects": [
+                {
+                  "path": [
+                    "Power",
+                    "Automatic Power On",
+                    "Startup Sequence"
+                  ],
+                  "targetIndex": [
+                    3,
+                    4,
+                    5
+                  ],
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": true
+                },
+                {
+                  "path": [
+                    "Power",
+                    "Automatic Power On",
+                    "Alarm Time (HH:MM:SS)"
+                  ],
+                  "targetIndex": [
+                    3,
+                    4,
+                    6
+                  ],
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "selected": [
+                    "Disabled",
+                    "User Defined"
+                  ],
+                  "targetDisabled": true
+                },
+                {
+                  "path": [
+                    "Power",
+                    "Automatic Power On",
+                    "Alarm Date (MM/DD/YYYY)"
+                  ],
+                  "targetIndex": [
+                    3,
+                    4,
+                    7
+                  ],
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "selected": [
+                    "Disabled",
+                    "Daily Event",
+                    "Weekly Event",
+                    "User Defined"
+                  ],
+                  "targetDisabled": true
+                },
+                {
+                  "path": [
+                    "Power",
+                    "Automatic Power On",
+                    "Alarm Day of Week"
+                  ],
+                  "targetIndex": [
+                    3,
+                    4,
+                    8
+                  ],
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "selected": [
+                    "Disabled",
+                    "Single Event",
+                    "Daily Event",
+                    "User Defined"
+                  ],
+                  "targetDisabled": true
+                },
+                {
+                  "path": [
+                    "Power",
+                    "Automatic Power On",
+                    "User Defined Alarm"
+                  ],
+                  "targetIndex": [
+                    3,
+                    4,
+                    9
+                  ],
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "selected": [
+                    "Disabled",
+                    "Single Event",
+                    "Daily Event",
+                    "Weekly Event"
+                  ],
+                  "targetDisabled": true
+                }
+              ]
+            },
+            {
+              "name": "Startup Sequence",
+              "value": "[Primary,Automatic]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select the Startup Sequence to use after a Wake Up on Alarm event."
+              },
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Primary",
+                "Automatic"
+              ],
+              "selected": "Primary",
+              "origin": "Primary",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Alarm Time (HH:MM:SS)",
+              "value": "00:00:00",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Specify the time when the system is to wake up."
+              },
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "promptText",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "value": [
+                    "Disabled",
+                    "User Defined"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Alarm Date (MM/DD/YYYY)",
+              "value": "01/01/1999",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Specify the date when the system is to wake up."
+              },
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "promptText",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "value": [
+                    "Disabled",
+                    "Daily Event",
+                    "Weekly Event",
+                    "User Defined"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "Alarm Day of Week",
+              "value": "[Sunday,Monday,Tuesday,Wednesday,Thursday,Friday,Saturday]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select the day of the week when the system is to wake up."
+              },
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Sunday",
+                "Monday",
+                "Tuesday",
+                "Wednesday",
+                "Thursday",
+                "Friday",
+                "Saturday"
+              ],
+              "selected": "Sunday",
+              "origin": "Sunday",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "value": [
+                    "Disabled",
+                    "Single Event",
+                    "Daily Event",
+                    "User Defined"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "User Defined Alarm",
+              "value": [
+                {
+                  "name": "Sunday",
+                  "value": "[Disabled,Enabled]",
+                  "prompt": {
+                    "name": "Help Message",
+                    "value": "Select the day of the week when the system is to wake up."
+                  },
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "optionalList",
+                  "options": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "selected": "Disabled",
+                  "origin": "Disabled"
+                },
+                {
+                  "name": "Monday",
+                  "value": "[Disabled,Enabled]",
+                  "prompt": {
+                    "name": "Help Message",
+                    "value": "Select the day of the week when the system is to wake up."
+                  },
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "optionalList",
+                  "options": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "selected": "Disabled",
+                  "origin": "Disabled"
+                },
+                {
+                  "name": "Tuesday",
+                  "value": "[Disabled,Enabled]",
+                  "prompt": {
+                    "name": "Help Message",
+                    "value": "Select the day of the week when the system is to wake up."
+                  },
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "optionalList",
+                  "options": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "selected": "Disabled",
+                  "origin": "Disabled"
+                },
+                {
+                  "name": "Wednesday",
+                  "value": "[Disabled,Enabled]",
+                  "prompt": {
+                    "name": "Help Message",
+                    "value": "Select the day of the week when the system is to wake up."
+                  },
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "optionalList",
+                  "options": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "selected": "Disabled",
+                  "origin": "Disabled"
+                },
+                {
+                  "name": "Thursday",
+                  "value": "[Disabled,Enabled]",
+                  "prompt": {
+                    "name": "Help Message",
+                    "value": "Select the day of the week when the system is to wake up."
+                  },
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "optionalList",
+                  "options": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "selected": "Disabled",
+                  "origin": "Disabled"
+                },
+                {
+                  "name": "Friday",
+                  "value": "[Disabled,Enabled]",
+                  "prompt": {
+                    "name": "Help Message",
+                    "value": "Select the day of the week when the system is to wake up."
+                  },
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "optionalList",
+                  "options": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "selected": "Disabled",
+                  "origin": "Disabled"
+                },
+                {
+                  "name": "Saturday",
+                  "value": "[Disabled,Enabled]",
+                  "prompt": {
+                    "name": "Help Message",
+                    "value": "Select the day of the week when the system is to wake up."
+                  },
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "optionalList",
+                  "options": [
+                    "Disabled",
+                    "Enabled"
+                  ],
+                  "selected": "Disabled",
+                  "origin": "Disabled"
+                },
+                {
+                  "name": "User Defined Alarm Time (HH:MM:SS)",
+                  "value": "00:00:00",
+                  "prompt": {
+                    "name": "Help Message",
+                    "value": "Specify the time when the system is to wake up."
+                  },
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "promptText"
+                }
+              ],
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select the day of the week when the system is to wake up."
+              },
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "nestedList",
+              "depends": [
+                {
+                  "index": [
+                    3,
+                    4,
+                    4
+                  ],
+                  "value": [
+                    "Disabled",
+                    "Single Event",
+                    "Daily Event",
+                    "Weekly Event"
+                  ]
+                }
+              ]
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Contains automatic power on features."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        }
+      ]
+    },
+    {
+      "name": "Security",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "Administrator Password",
+          "value": "[Not Installed,Installed]",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Not Installed",
+            "Installed"
+          ],
+          "selected": "Not Installed",
+          "origin": "Not Installed"
+        },
+        {
+          "name": "Power-On Password",
+          "value": "[Not Installed,Installed]",
+          "hidden": false,
+          "disabled": true,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Not Installed",
+            "Installed"
+          ],
+          "selected": "Not Installed",
+          "origin": "Not Installed"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Set Administrator Password",
+          "value": "(Enter)",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this line to set, change, or delete the Administrator Password. \nNOTE:\nTo delete Administrator Password, enter blank fields for each new password line item."
+          },
+          "command": {
+            "name": "Set Administrator Password",
+            "value": "Enter New Password______\nConfirm New Password______\nEmulator No Support..."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "popupDialog",
+          "tips": "[Enter]"
+        },
+        {
+          "name": "Set Power-On Password",
+          "value": "(Enter)",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select this line to set, change, or delete the Power-On Password.\nNOTE: \nTo delete Power-On Password, enter blank fields for each new password line item."
+          },
+          "command": {
+            "name": "Set Power-On Password",
+            "value": "Enter New Password______\nConfirm New Password______\nEmulator No Support..."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "popupDialog",
+          "tips": "[Enter]"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Allow Flashing BIOS to a Previous Version",
+          "value": "[Yes,No]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "<Yes> - Flash BIOS to a previous  or current version is allowed. This is the default setting.\n<No> - Flash BIOS to a previous  or current version is not allowed."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Yes",
+            "No"
+          ],
+          "selected": "Yes",
+          "origin": "Yes"
+        },
+        {
+          "name": "Require Admin. Pass. when Flashing",
+          "value": "[No,Yes]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "If \"No\" is selected, the Adiministrator password will not be required when updating the system software."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "No",
+            "Yes"
+          ],
+          "selected": "No",
+          "origin": "No"
+        },
+        {
+          "name": "Windows UEFI Firmware Update",
+          "value": "[Enabled,Disabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "This option enables or disables windows UEFI firmware update feature.\n<Enabled> Allow windows UEFI firmware update.\n<Disabled> BIOS will skip windows UEFI firmware update."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled"
+        },
+        {
+          "name": "Require POP on System Boot",
+          "value": "[Yes,No]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "<Yes> The system prompts for passwords when the system starts from the full off or hibernate state.\n<No> Passwords are not prompted and continue to boot the OS. To prevent unauthorized access to the system, recommend to set user authentication on the OS."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Yes",
+            "No"
+          ],
+          "selected": "Yes",
+          "origin": "Yes"
+        },
+        {
+          "name": "Require POP on Restart",
+          "value": "[No,Yes]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "If \"No\" is selected, the Power-On Password will only be required when the system is started with a cold boot."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "No",
+            "Yes"
+          ],
+          "selected": "No",
+          "origin": "No"
+        },
+        {
+          "name": "POP Changeable by User",
+          "value": "[Yes,No]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "If \"No\" is selected, the Power-On Password can only be changed by the Supervisor password."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Yes",
+            "No"
+          ],
+          "selected": "Yes",
+          "origin": "Yes"
+        },
+        {
+          "name": "Require Admin. Pass. For F12 Boot",
+          "value": "[No,Yes]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "If Yes and an Administrator Password is aet, the user will be prompted for a password when F12 is pressed during POST."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "No",
+            "Yes"
+          ],
+          "selected": "No",
+          "origin": "No"
+        },
+        {
+          "name": "Smart USB Protection",
+          "value": "[Disabled,Read Only,No Access]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Smart USB Protection could block copying data from the computer to the USB storage device in windows.\nRead Only mode: the user can copy data from USB storage device to the Computer but cannot copy data from the computer to USB storage device.\nNo Access mode: the user cannot use USB storage device in windows"
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Disabled",
+            "Read Only",
+            "No Access"
+          ],
+          "selected": "Disabled",
+          "origin": "Disabled"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Hard Disk Password",
+          "value": [
+            {
+              "name": "M.2 Drive 1 Password",
+              "value": "(Disabled)",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Hard Disk Password prevents unauthorized users from accessing the data on the Hard Disk. In addition to the User Password,an optional Master Password can be used to recover the disk if the User Password is lost.\nNOTE: If several disks are present, suggest to set all Hard Disk Passwords to the same."
+              },
+              "command": {
+                "name": "Setup Confirmation",
+                "value": "Select \"User\" only or \"User+Master\",<yes:User> or <no:User+Master>"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            },
+            {
+              "name": "SATA Drive 1 Password",
+              "value": "(Disabled)",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Hard Disk Password prevents unauthorized users from accessing the data on the Hard Disk. In addition to the User Password,an optional Master Password can be used to recover the disk if the User Password is lost.\nNOTE: If several disks are present, suggest to set all Hard Disk Passwords to the same."
+              },
+              "command": {
+                "name": "Setup Confirmation",
+                "value": "Select \"User\" only or \"User+Master\",<yes:User> or <no:User+Master>"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            },
+            {
+              "name": "SATA Drive 2 Password",
+              "value": "(Disabled)",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Hard Disk Password prevents unauthorized users from accessing the data on the Hard Disk. In addition to the User Password,an optional Master Password can be used to recover the disk if the User Password is lost.\nNOTE: If several disks are present, suggest to set all Hard Disk Passwords to the same."
+              },
+              "command": {
+                "name": "Setup Confirmation",
+                "value": "Select \"User\" only or \"User+Master\",<yes:User> or <no:User+Master>"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            },
+            {
+              "name": "Require HDP on System Boot",
+              "value": "[Auto,No]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "<Auto> - Hard Disk Password (HDP) will be required if the Hard Disk is in lock status when the system starts from the full off, hibernate or restart state.\n<No> - HDP will not be required. However, HDP will be required when the hard disk is attached to a different system."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Auto",
+                "No"
+              ],
+              "selected": "Auto",
+              "origin": "Auto"
+            },
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Security Erase HDD Data",
+              "value": [
+                {
+                  "name": "",
+                  "value": "",
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "plainText"
+                },
+                {
+                  "name": "Erase M.2 Drive 1 Data",
+                  "value": "Enter",
+                  "hidden": false,
+                  "disabled": true,
+                  "skip": false,
+                  "type": "plainText"
+                },
+                {
+                  "name": "Erase SATA Drive 1 Data",
+                  "value": "Enter",
+                  "hidden": false,
+                  "disabled": true,
+                  "skip": false,
+                  "type": "plainText"
+                },
+                {
+                  "name": "Erase SATA Drive 2 Data",
+                  "value": "Enter",
+                  "hidden": false,
+                  "disabled": true,
+                  "skip": false,
+                  "type": "plainText"
+                }
+              ],
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select this option to security erase HDD data. The items are only available when corresponding hard disk password is present."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "nestedList"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Configure hard disk password."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "TCG Feature Setup",
+          "value": [
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "TCG Security Device",
+              "value": "Firmware TPM",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Contains TCG security features."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "promptText"
+            },
+            {
+              "name": "  Security Chip 2.0",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "<Enabled> When item enabled that TCG security feature is full function.\n<Disabled> When item disabled, TCG security feature is no functional.\nNOTE:\nIf set to  \"Disabled\", the TxT will be set to \"Disabled\" automatically."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled",
+              "effects": [
+                {
+                  "path": [
+                    "Security",
+                    "TCG Feature Setup",
+                    "  Clear TCG Security Feature"
+                  ],
+                  "targetIndex": [
+                    4,
+                    16,
+                    3
+                  ],
+                  "index": [
+                    4,
+                    16,
+                    2
+                  ],
+                  "selected": [
+                    "Disabled"
+                  ],
+                  "targetDisabled": true
+                }
+              ]
+            },
+            {
+              "name": "  Clear TCG Security Feature",
+              "value": "[NO,YES]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Select whether to clear TCG Security Feature.\nWarning: Any data in TPM will be cleared."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "NO",
+                "YES"
+              ],
+              "selected": "NO",
+              "origin": "NO",
+              "depends": [
+                {
+                  "index": [
+                    4,
+                    16,
+                    2
+                  ],
+                  "value": [
+                    "Disabled"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "  Physical Presence for Clear",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This option enables or disables confirmation of a user's physical presence when Clearing the security chip. \n<Enabled> Display user confirmation screen when Clearing. \n<Disabled> No user configuration screen when Clearing."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Configure TCG feature setup."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "System Event Log",
+          "value": [
+            {
+              "name": "View System Event Log",
+              "value": [
+                {
+                  "name": "",
+                  "value": "",
+                  "hidden": false,
+                  "disabled": false,
+                  "skip": false,
+                  "type": "plainText"
+                },
+                {
+                  "name": "DATE       TIME       Events",
+                  "value": " ",
+                  "hidden": false,
+                  "disabled": true,
+                  "skip": false,
+                  "type": "plainText"
+                },
+                {
+                  "name": "09/14/13   08:47:27   System Event Log Cleared",
+                  "value": " ",
+                  "hidden": false,
+                  "disabled": true,
+                  "skip": false,
+                  "type": "plainText"
+                },
+                {
+                  "name": "09/14/13   08:48:38   BIOS updated",
+                  "value": " ",
+                  "hidden": false,
+                  "disabled": true,
+                  "skip": false,
+                  "type": "plainText"
+                },
+                {
+                  "name": "09/14/13   09:40:16   BIOS updated",
+                  "value": " ",
+                  "hidden": false,
+                  "disabled": true,
+                  "skip": false,
+                  "type": "plainText"
+                }
+              ],
+              "prompt": {
+                "name": "Help Message",
+                "value": "View the system event log."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "nestedList"
+            },
+            {
+              "name": "Clear System Event Log",
+              "value": "( )",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Clear the system event log."
+              },
+              "command": {
+                "name": "Setup Warning",
+                "value": "All system event logs will be cleared immediately!"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "View or clear the system event log."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Secure Boot",
+          "value": [
+            {
+              "name": "System Mode",
+              "value": "User Mode",
+              "hidden": false,
+              "disabled": true,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Secure Boot",
+              "value": "[Enabled,Disabled]",
+              "prompt": {
+                "name": "Help Message",
+                "value": "<Enabled> Enables Secure Boot,BIOS will prevent un-authorised OS be loaded.\n<Disabled> Disables Secure Boot. \nWhen Secure boot set to Enabled, CSM would be automatically disabled."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "optionalList",
+              "options": [
+                "Enabled",
+                "Disabled"
+              ],
+              "selected": "Enabled",
+              "origin": "Enabled"
+            },
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Restore Factory Keys",
+              "value": "(Enter)",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Restore Factory Keys will put secure boot into factory defaults."
+              },
+              "command": {
+                "name": "Restore Factory Keys",
+                "value": "Do you really wish to Install Factory Default Secure Boot Keys?"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            },
+            {
+              "name": "Reset Platform to Setup Mode",
+              "value": "(Enter)",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Reset to setup mode will move secure boot to setup mode."
+              },
+              "command": {
+                "name": "Reset Platform to Setup Mode",
+                "value": "Do you really wish to reset Platform to Setup Mode?"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            },
+            {
+              "name": "Enter Audit Mode",
+              "value": "(Enter)",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Enter Audit Mode.\nTransitions from User to Audit Mode will result in erasing of PK variable"
+              },
+              "command": {
+                "name": "Enter Audit Mode",
+                "value": "WARNING: Removing 'PK' will reset the System to Setup/Audit Mode"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            },
+            {
+              "name": "Enter Deployed Mode",
+              "value": "(Enter)",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Transition between Deployment and User Modes"
+              },
+              "command": {
+                "name": "Enter Deployed Mode",
+                "value": "Success"
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            },
+            {
+              "name": "",
+              "value": "",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "plainText"
+            },
+            {
+              "name": "Key Management",
+              "value": "(Enter)",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Enables users to modify Secure Boot Policy variables."
+              },
+              "command": {
+                "name": "Key Management",
+                "value": "Simulator not Support..."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "type": "popupDialog",
+              "tips": "[Enter]"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "Secure Boot flow control. Secure Boot is possible only if System runs in User Mode"
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Device Guard",
+          "value": "[Disabled,Enabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Device Guard enables PCs to be protected against malware by introducing a collective set of restrictions on a device across several technologies.\n<Enabled> CPU Virtualization Technology be enabled, IOMMU, Such as Intel VT-d, AMD-Vi be enabled, Secure boot be enabled, TPM be enabled Ethernet, USB, CD, and other boot methods be disabled,only SATA device is allowed.\n<Disabled>Ethernet, USB, CD, and other boot methods be enabled."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Disabled",
+            "Enabled"
+          ],
+          "selected": "Disabled",
+          "origin": "Disabled",
+          "redbox": [
+            {
+              "name": "WARNNING",
+              "value": "1 Ethernet USB CD and other boot methods will be disabled, only internal storages such as local SATA/ PCIE / M.2 (The external SATA or PCIE storage is not included) is bootable.\n2 Administrator password must be installed.\n3 TPM will be enabled if one exists.\nDo you really want to continue?",
+              "showValue": "Enabled"
+            }
+          ]
+        },
+        {
+          "name": "Chassis Intrusion Detection",
+          "value": "[Disabled,Enabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Chassis Intrusion Detection is a utility that can tell whether someone has opened the case (intruded into the chassis).\nNOTE:\nIf chassis tamper occurs, you can only enter setup to clear this error."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Disabled",
+            "Enabled"
+          ],
+          "selected": "Disabled",
+          "origin": "Disabled"
+        },
+        {
+          "name": "Configuration Change Detection",
+          "value": "[Disabled,Enabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select whether to enable Configuration Change Detection. If enabled, when a device is installed or remove, the system will notify the user during POST. This notice can only be cleared by entering BIOS setup, saving and then exiting."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Disabled",
+            "Enabled"
+          ],
+          "selected": "Disabled",
+          "origin": "Disabled"
+        },
+        {
+          "name": "Password Count Exceeded Error",
+          "value": "[Enabled,Disabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select Enabled to show the POST 0199 error and prompt for password. \nSelect Disabled to hide the POST 0199 error and proceed without any user action required."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled"
+        }
+      ]
+    },
+    {
+      "name": "Startup",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "Primary Boot Sequence",
+          "value": [
+            {
+              "name": "",
+              "value": "USB FDD:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB KEY:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "M.2:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 1:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 2:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 3:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "Network 1:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB HDD:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB CDROM:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "Other Device:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "Excluded from boot order",
+              "hidden": false,
+              "disabled": false,
+              "skip": true,
+              "indent": {
+                "marginLeft": "0rem"
+              },
+              "type": "plainText"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "This sequence is used when the system is powered up normally.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Automatic Boot Sequence",
+          "value": [
+            {
+              "name": "",
+              "value": "Network 1:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when a communication device wakes the system up.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "M.2:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when a communication device wakes the system up.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 1:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when a communication device wakes the system up.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 2:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when a communication device wakes the system up.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 3",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when a communication device wakes the system up.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "Other Device",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when a communication device wakes the system up.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "Excluded from boot order",
+              "hidden": false,
+              "disabled": false,
+              "skip": true,
+              "indent": {
+                "marginLeft": "0rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "USB FDD:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Excluded from boot order:\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB HDD:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Excluded from boot order:\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB CDROM:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Excluded from boot order:\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB KEY:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Excluded from boot order:\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "promptText"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "This sequence is used when a communication device wakes the system up.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Error Boot Sequence",
+          "value": [
+            {
+              "name": "",
+              "value": "Network 1:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when BIOS determines that an error has occured.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "M.2:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when BIOS determines that an error has occured.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 1:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when BIOS determines that an error has occured.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 2:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when BIOS determines that an error has occured.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "SATA 3",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when BIOS determines that an error has occured.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "Other Device",
+              "prompt": {
+                "name": "Help Message",
+                "value": "This sequence is used when BIOS determines that an error has occured.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "Excluded from boot order",
+              "hidden": false,
+              "disabled": false,
+              "skip": true,
+              "indent": {
+                "marginLeft": "0rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "USB FDD:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Excluded from boot order:\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB HDD:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Excluded from boot order:\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB CDROM:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Excluded from boot order:\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "promptText"
+            },
+            {
+              "name": "",
+              "value": "USB KEY:",
+              "prompt": {
+                "name": "Help Message",
+                "value": "Excluded from boot order:\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+              },
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "promptText"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "This sequence is used when BIOS determines that an error has occured.\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "Manufacturing Boot Sequence",
+          "value": [
+            {
+              "name": "",
+              "value": "Network 1:",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "M.2:",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "SATA 1:",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "SATA 2:",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "SATA 3",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "Other Device",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.25rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "Excluded from boot order",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "USB FDD:",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "USB HDD:",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "USB CDROM:",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "plainText"
+            },
+            {
+              "name": "",
+              "value": "USB KEY:",
+              "hidden": false,
+              "disabled": false,
+              "skip": false,
+              "indent": {
+                "marginLeft": "0.2rem"
+              },
+              "type": "plainText"
+            }
+          ],
+          "prompt": {
+            "name": "Help Message",
+            "value": "\nUse Up and Down arrows to select a device.\n<+> and <-> move the device up or down.\n<x> excludes / includes the device to boot."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "nestedList"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "CSM",
+          "value": "[Enabled,Disabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Compatibility support Module. Permit the loading of a traditional operation system.\nEnable: to support Non-UEFI operation system.\nDisable: to support Win8 64-bit and later UEFI aware operation system."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled",
+          "effects": [
+            {
+              "path": [
+                "Devices",
+                "Network Setup",
+                "PXE Option ROM"
+              ],
+              "targetIndex": [
+                1,
+                6,
+                1
+              ],
+              "index": [
+                5,
+                5
+              ],
+              "selected": [
+                "Disabled"
+              ],
+              "targetDisabled": false
+            },
+            {
+              "path": [
+                "Startup",
+                "Boot Mode"
+              ],
+              "targetIndex": [
+                5,
+                6
+              ],
+              "index": [
+                5,
+                5
+              ],
+              "selected": [
+                "Disabled"
+              ],
+              "targetDisabled": false
+            },
+            {
+              "path": [
+                "Startup",
+                "Boot Priority"
+              ],
+              "targetIndex": [
+                5,
+                7
+              ],
+              "index": [
+                5,
+                5
+              ],
+              "selected": [
+                "Disabled"
+              ],
+              "targetDisabled": false
+            }
+          ]
+        },
+        {
+          "name": "Boot Mode",
+          "value": "[Auto,UEFI Only,Legacy Only]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select <Auto>, system will try to boot to UEFI or legacy operating system.\nSelect <UEFI Only>, system will only boot to UEFI aware operating system.\nSelect <Legacy Only>, system will only boot to legacy operating system."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Auto",
+            "UEFI Only",
+            "Legacy Only"
+          ],
+          "selected": "Auto",
+          "origin": "Auto",
+          "depends": [
+            {
+              "index": [
+                5,
+                5
+              ],
+              "value": [
+                "Disabled"
+              ]
+            }
+          ],
+          "effects": [
+            {
+              "path": [
+                "Startup",
+                "Boot Priority"
+              ],
+              "targetIndex": [
+                5,
+                7
+              ],
+              "index": [
+                5,
+                6
+              ],
+              "selected": [
+                "UEFI Only",
+                "Legacy Only"
+              ],
+              "targetDisabled": false
+            }
+          ]
+        },
+        {
+          "name": "Boot Priority",
+          "value": "[UEFI First,Legacy First]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Select <UEFI First>, system will try to boot to UEFI OS first and then legacy OS.\nSelect <Legacy First>, system will try to boot to legacy OS first and then UEFI OS."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "UEFI First",
+            "Legacy First"
+          ],
+          "selected": "UEFI First",
+          "origin": "UEFI First",
+          "depends": [
+            {
+              "index": [
+                5,
+                6
+              ],
+              "value": [
+                "UEFI Only",
+                "Legacy Only"
+              ]
+            },
+            {
+              "index": [
+                5,
+                5
+              ],
+              "value": [
+                "Disabled"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Boot Up Num-Lock Status",
+          "value": "[On,Off]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "This field indicates the state of the NumLock feature of the keyboard after Startup. If NumLock is \"On\", the keys on the keypad will act as numeric keys. If NumLock is \"Off\", the keys on the keypad will act as cursor keys."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "On",
+            "Off"
+          ],
+          "selected": "On",
+          "origin": "On"
+        },
+        {
+          "name": "Option Keys Display",
+          "value": "[Disabled,Enabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Controls the system software option key prompts (such as F1 key) when the system is turned on. Select \"Enabled\" to display the prompts.\nNOTE: Disabling the prompts will not affect the function of a specific key."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Disabled",
+            "Enabled"
+          ],
+          "selected": "Disabled",
+          "origin": "Disabled"
+        },
+        {
+          "name": "Option Keys Display Style",
+          "value": "[Normal,Legacy]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Controls the style of prompts displayed on the POST logo screen when the system is turned on. Choosing \"Normal\" will prompt for the Enter key and display a menu. Choosing \"Legacy\" will prompt fo F1 and F12."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Normal",
+            "Legacy"
+          ],
+          "selected": "Normal",
+          "origin": "Normal"
+        }
+      ]
+    },
+    {
+      "name": "Exit",
+      "type": "nestedList",
+      "value": [
+        {
+          "name": "Save Changes and Exit",
+          "value": "",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Exit system setup after saving the changes."
+          },
+          "command": {
+            "name": "Save and Exit",
+            "value": "Save configuration and exit"
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "popupDialog",
+          "tips": "[Enter]"
+        },
+        {
+          "name": "Discard Changes and Exit",
+          "value": "",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Exit system setup without saving any changes."
+          },
+          "command": {
+            "name": "Reset Without Saving",
+            "value": "Reset without saving?"
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "popupDialog",
+          "tips": "[Enter]"
+        },
+        {
+          "name": "",
+          "value": "",
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "plainText"
+        },
+        {
+          "name": "Load Optimal Defaults",
+          "value": "",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Restore/Load Defaults values for all the setup uptions."
+          },
+          "command": {
+            "name": "Load Optimized Defaults",
+            "value": "Load Optimized Defaults?"
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "popupDialog",
+          "tips": "[Enter]"
+        },
+        {
+          "name": "OS Optimized Defaults",
+          "value": "[Enabled,Disabled]",
+          "prompt": {
+            "name": "Help Message",
+            "value": "Some settings below are changed accordingly. Select \"Enabled\" to meet Microsoft(R) Windows 10 (R) Certification Requirement.\nAffected settings are CSM Support, Boot mode, Boot Priority, Secure Boot."
+          },
+          "hidden": false,
+          "disabled": false,
+          "skip": false,
+          "type": "optionalList",
+          "options": [
+            "Enabled",
+            "Disabled"
+          ],
+          "selected": "Enabled",
+          "origin": "Enabled",
+          "redbox": [
+            {
+              "name": "Attention!",
+              "value": "If OS Optimized Defaults is changed to Disabled, some settings including Secure Boot, CSM  will be changed.\nDo you really want to continue?\nSelect Yes to continue to disable the OS Optimized Defaults.\nSelect No  to discontinue the operation.\n",
+              "showValue": "Disabled"
+            },
+            {
+              "name": "Attention!",
+              "value": "If OS Optimized Defaults is changed to Enable, some settings including Secure Boot, CSM, IPV4 and IPV6  will be changed.\nDo you really want to continue?\nSelect Yes to continue to Enable the OS Optimized Defaults.\nSelect No  to discontinue the operation.",
+              "showValue": "Enabled"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "tags": {
+    "name": "tags",
+    "value": [
+      {
+        "name": "Main",
+        "type": "nestedList"
+      },
+      {
+        "name": "Devices",
+        "type": "nestedList"
+      },
+      {
+        "name": "Advanced",
+        "type": "nestedList"
+      },
+      {
+        "name": "Power",
+        "type": "nestedList"
+      },
+      {
+        "name": "Security",
+        "type": "nestedList"
+      },
+      {
+        "name": "Startup",
+        "type": "nestedList"
+      },
+      {
+        "name": "Exit",
+        "type": "nestedList"
+      }
+    ]
+  },
+  "CFG BLT SYS TITLE": "Lenovo BIOS Setup Utility",
+  "CFG BLT SYS DEFAULT": {
+    "name": "isLoadDefaultMode",
+    "value": "True"
+  },
+  "CFG BLT SYS LOGO": "Lenovo PCSD Service Enablement - DFS Team",
+  "CFG BLT SYS AUTHOR": "Contributed by Zongquan, V6.1, 2021/05/06",
+  "exportFeature": true
+}

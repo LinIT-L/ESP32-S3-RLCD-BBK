@@ -1,0 +1,6 @@
+build/
+dist/
+managed_components/
+*.bin
+*.elf
+*.map

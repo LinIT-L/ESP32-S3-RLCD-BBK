@@ -1,0 +1,1380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>BIOS模拟器 · 装机与固件选项学习台（LinTOS 外置应用）</title>
+<style>
+  html,body{margin:0;padding:0;background:#fff;overflow:hidden}
+  /* ⚠ --font 必须有默认值: #scr 初始 class 不是 theme-*, 那时 var(--font) 解析失败 →
+     measureGrid 的探针会量到回退字体, 列数算错, 整行溢出被裁(值列跑到屏幕外) */
+  :root{--font:'Courier New',Courier,monospace}
+  /* ⚠ 只做纯黑白（掌机 1bpp）: 不要电脑彩色版。
+   * 字体族必须有默认值: #scr 初始 class 不是主题类时 var(--font) 会解析失败 →
+   * measureAdvance 量到回退字体 → 列数算错 → 整行溢出被裁。 */
+  :root{
+    --font:'Courier New',Courier,monospace;
+    /* 与掌机一致: 反射式 1bpp 屏是**白纸黑字**（app.clear() 默认白底），
+     * 所以这里也是白底黑字；选中行/标题栏 = 黑底白字。 */
+    --bg:#fff;--fg:#000;--selbg:#000;--selfg:#fff;--val:#000;--line:#000;
+    --bar:#000;--barfg:#fff;--frame:2px solid #000;
+  }
+  #scr{position:absolute;left:0;top:0;width:100vw;height:100vh;margin:0;box-sizing:border-box;padding:6px 8px;
+       white-space:pre;overflow:hidden;font-size:13px;line-height:1.15;font-variant-ligatures:none;
+       background:var(--bg);color:var(--fg);font-family:var(--font)}
+  #scr .inv{background:var(--selbg);color:var(--selfg)}
+  #scr .inv .val{color:inherit}
+  #scr .val{color:var(--val)}
+  #scr .bar{background:var(--bar);color:var(--barfg)}
+  #dlg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);margin:0;box-sizing:border-box;
+       padding:8px 10px;white-space:pre;overflow:hidden;font-size:13px;line-height:1.15;
+       font-variant-ligatures:none;border:var(--frame);z-index:9;
+       background:var(--bg);color:var(--fg);font-family:var(--font)}
+  #dlg.hide{display:none}
+  #selftest-out{position:absolute;left:-99999px;top:0;white-space:pre}
+</style>
+</head>
+<body>
+<pre id="scr" class="scr-dark"></pre>
+<pre id="dlg" class="hide"></pre>
+<pre id="selftest-out"></pre>
+
+<script>
+/* ============================================================================
+ * BIOS 模拟器引擎（纯数据 + 纯函数，便于自测）
+ * ==========================================================================*/
+
+/* ---- 可配置项词典：key → {名称, 取值表, 默认, 只读?, 说明} ----
+ * 说明里的 "→" 后面就是「这一项到底影响什么」，对应 F1 帮助。 */
+/* eslint-disable */
+/* @DATA-BEGIN —— 这一整段是**纯数据**（只有字面量与注释，没有任何函数/副作用）。
+ * 掌机版 Lua 的数据表由 `tools/biossim_gen_lua.py` 从这对标记之间直接抽取后用 Node 求值导出 JSON，
+ * 再转成 Lua 表 —— 所以：
+ *   ① 不要在这里写函数、调用、赋值给外部变量；
+ *   ② 不要删除这两个标记。
+ * 好处: HTML 与掌机版**同一份数据源**，不会一边改了另一边忘记。 */
+const ITEMS = {
+  sataMode:      { name:'SATA Mode', vals:['IDE Mode','AHCI Mode','RAID Mode'], def:0,
+    help:'硬盘控制器工作模式。AHCI=标准 SATA 原生指令（装机首选）；IDE=老兼容模式（XP/老 Win7 免驱）；RAID (Intel RST)=Intel 快速存储，多用于 RAID/VMD，装 Win11 与 Linux 常需先改回 AHCI 或加载驱动。' },
+  sataPort0:     { name:'SATA Port 0', vals:['Not Present','WDC WD10EZEX-08WN4A0','Samsung SSD 860 EVO 500G','Kingston A400 240G'], def:1,
+    help:'SATA 口识别到的盘。切 SATA Mode 后这里显示会变（RAID/VMD 下标准 AHCI 驱动看不到这块盘）。' },
+  sataPort1:     { name:'SATA Port 1', vals:['Not Present','HL-DT-ST DVDRAM GH24NSD1'], def:1, help:'第二个 SATA 口。' },
+  nvme0:         { name:'NVMe SSD 0', vals:['Not Present','Samsung SSD 970 EVO Plus 1TB'], def:1,
+    help:'NVMe 盘。开了 VMD/RST 时 Windows 安装器需要加载对应驱动才能看到它。' },
+  csm:           { name:'CSM Support', vals:['Enabled','Disabled'], def:1,
+    help:'兼容支持模块。Enabled=兼容老系统的 Legacy 引导；装 Win7、老 PE、多引导常要开；装 Win10/11 纯 UEFI 一般关。' },
+  bootFilter:    { name:'Boot option filter', vals:['UEFI and Legacy','UEFI only','Legacy only'], def:0,
+    help:'从哪类设备引导。装 Win7 传统方式选 Legacy only；纯 UEFI 装 Win10/11 选 UEFI only。' },
+  storageOprom:  { name:'Storage OpROM policy', vals:['Legacy only','UEFI only','Do not launch'], def:0,
+    help:'存储扩展 ROM 用哪种方式加载。选了 Legacy only + CSM 关闭，会出现"看不到硬盘/装不上"。' },
+  videoOprom:    { name:'Video OpROM policy', vals:['Legacy only','UEFI only'], def:0, help:'显卡 ROM 加载方式。' },
+  secureBoot:    { name:'Secure Boot', vals:['Disabled','Enabled'], def:0,
+    help:'安全启动。Win11 强制要求 Enabled；装 Win7（无签名驱动）必须 Disabled；Ubuntu 关掉最省事。' },
+  secureBootMode:{ name:'Secure Boot Mode', vals:['Standard','Custom'], def:0,
+    help:'Standard=用厂商内置密钥；Custom=可自行管理 PK/KEK/db（给自签名驱动用）。' },
+  keyMgmt:       { name:'Key Management', vals:['Read Only','Editable'], def:0, help:'自定义密钥开关。' },
+  tpm:           { name:'Security Device Support', vals:['Disabled','Enabled'], def:1,
+    help:'TPM 总开关。Win11 要求 TPM 2.0 可用；Windows 的 BitLocker 与 TPM 绑定。' },
+  tpmDevice:     { name:'TPM Device Selection', vals:['dTPM 2.0','PTT (fTPM)'], def:1,
+    help:'用独立 TPM 芯片（dTPM）还是 Intel 平台信任技术（PTT/fTPM）。新主板多为 PTT。' },
+  tpmState:      { name:'TPM State', vals:['Disabled','Enabled'], def:1,
+    help:'本机 TPM 状态；改这里等于清/启用 TPM（可能让 BitLocker 进恢复模式）。' },
+  amt:           { name:'Intel(R) AMT', vals:['Disabled','Enabled'], def:0,
+    help:'Intel 主动管理（商用机带外管理）。开后可远程开关机/装系统（需配 MEBx），家用机没有这项。' },
+  amtSol:        { name:'AMT SOL / IDE-R', vals:['Disabled','Enabled'], def:0,
+    help:'AMT 的串口重定向（SOL）与远程挂载光驱（IDE-R），配合 AMT 用。' },
+  amtPwd:        { name:'Mebx Password', vals:['Not Set','Set'], def:0, help:'进入 MEBx（Ctrl+P）要用的密码。' },
+  vtd:           { name:'VT-d', vals:['Disabled','Enabled'], def:0, help:'直接 I/O 虚拟化，虚拟机直通设备用。' },
+  vtx:           { name:'Virtualization (VT-x / SVM Mode)', vals:['Disabled','Enabled'], def:0,
+    help:'VT-x。装 VMware/WSL2/Hyper-V、安卓模拟器都要开，否则 64 位虚拟机起不来。' },
+  hyperThreading:{ name:'Hyper-Threading Technology', vals:['Disabled','Enabled'], def:1, help:'超线程。' },
+  fastBoot:      { name:'Fast Boot', vals:['Disabled','Enabled'], def:1,
+    help:'快速启动（跳过自检）。装系统/进 PE/U 盘启动失败时先把它关掉。' },
+  quietBoot:     { name:'Quiet Boot', vals:['Disabled','Enabled'], def:1, help:'隐藏开机自检画面，只显示 Logo。' },
+  netStack:      { name:'Network Stack', vals:['Disabled','Enabled'], def:0, help:'UEFI 网络栈（网卡 PXE/HTTP 引导的前提）。' },
+  pxe:           { name:'PXE Boot', vals:['Disabled','Enabled'], def:0, help:'网卡引导（无盘工作站/网络装机用它）。' },
+  legacyUsb:     { name:'Legacy USB Support', vals:['Auto','Enabled','Disabled'], def:0,
+    help:'DOS/PE 下能不能用 USB 键鼠。Disabled 时老 U 盘启动会出现"键盘失灵"。' },
+  xhciHandoff:   { name:'XHCI Hand-off', vals:['Enabled','Disabled'], def:0, help:'把 USB3 控制权交给系统。装 Win7 必须 Enabled。' },
+  wakeUsb:       { name:'Wake on USB', vals:['Disabled','Enabled'], def:0, help:'USB 唤醒。' },
+  numLock:       { name:'NumLock at boot', vals:['On','Off'], def:1, help:'开机小键盘状态。' },
+  chassisIntrusion:{name:'Chassis Intrusion', vals:['Disabled','Enabled'], def:0, help:'机箱开盖检测（商用机）。' },
+  bootMode:      { name:'Boot Mode', vals:['UEFI','Legacy (CSM)'], def:0, help:'整机引导模式，决定分区表（GPT/MBR）与引导文件位置。' },
+  /* 只读信息项（真机里也是灰的） */
+  biosVer:  { name:'BIOS Version',   vals:['2.19.1268 (08/12/2021)'], def:0, ro:true },
+  ecVer:    { name:'EC Firmware Ver', vals:['1.14'], def:0, ro:true },
+  cpuType:  { name:'CPU Type',       vals:['Intel(R) Core(TM) i5-10400 CPU @ 2.90GHz'], def:0, ro:true },
+  cpuSpeed: { name:'CPU Speed',      vals:['2900 MHz'], def:0, ro:true },
+  memory:   { name:'Total Memory',   vals:['16384 MB (DDR4-2666)'], def:0, ro:true },
+  sysDate:  { name:'System Date',    vals:['Fri 10/02/2026'], def:0 },
+  sysTime:  { name:'System Time',    vals:['11:35:00'], def:0 },
+};
+
+/* 开机引导顺序（真实 BIOS 里是一串可上下移动的设备名） */
+const BOOT_DEVICES = [
+  'Windows Boot Manager (Samsung SSD 860 EVO)',
+  'UEFI: Kingston DataTraveler 3.0 (U盘)',
+  'SATA0: Samsung SSD 860 EVO 500G',
+  'SATA1: HL-DT-ST DVDRAM GH24NSD1',
+  'Network: UEFI PXE IPv4',
+];
+
+
+/* ---- 厂商专用真机选项（名字照真机 HDD/BIOS 手册与 IFR dump） ---- */
+Object.assign(ITEMS, {
+  prodName:   {name:'Product Name',   cn:'产品名称',   vals:['HP EliteBook 840 G8','HUAWEI MateBook D15'], def:0, ro:true},
+  prodNumber: {name:'Product Number', cn:'产品编号',   vals:['5F1A2PC#AB2'], def:0, ro:true},
+  sysBoardId: {name:'System Board ID',cn:'主板识别码', vals:['8823'], def:0, ro:true},
+  serialNo:   {name:'Serial Number',  cn:'序列号',     vals:['5CG1234ABC'], def:0, ro:true},
+  uuid:       {name:'UUID Number',    cn:'UUID 编号',  vals:['4C4C4544-0037-5110-8050-B5C04F4E4332'], def:0, ro:true},
+  factoryOS:  {name:'Factory Installed OS', cn:'出厂预装系统', vals:['Windows 11 Home'], def:0, ro:true},
+  batterySN:  {name:'Primary Battery SN', cn:'主电池序列号', vals:['01234 2024/06/11'], def:0, ro:true},
+  sysLog:     {name:'System Log',     cn:'系统记录',   vals:['[Enter] 查看'], def:0, act:'noop'},
+  language:   {name:'Language Support', cn:'语言',     vals:['English','简体中文','日本語'], def:0},
+  adminPwd:   {name:'Administrator Password', cn:'管理员密码', vals:['Not Set','Set'], def:0, help:'设了之后进 BIOS 要密码；忘记只能清 CMOS。'},
+  powerOnPwd: {name:'Power-On Password', cn:'开机密码', vals:['Not Set','Set'], def:0},
+  clearTpm:   {name:'Clear TPM',      cn:'清除 TPM',  vals:['[Enter] 清除'], def:0, act:'noop',
+    help:'清 TPM 会让 BitLocker 进入恢复模式；换主板/卖机器前才用。'},
+  restoreSecDefaults:{name:'Restore Security Settings to Factory Defaults', cn:'安全设置恢复出厂', vals:['[Enter] 恢复'], def:0, act:'noop'},
+  drivelock:  {name:'DriveLock / Automatic DriveLock', cn:'硬盘锁', vals:['Disabled','Enabled'], def:0},
+  sgx:        {name:'Intel Software Guard Extensions (SGX)', cn:'Intel SGX', vals:['Disabled','Enabled'], def:0},
+  sureStart:  {name:'BIOS Sure Start', cn:'BIOS 自校验', vals:['Enabled','Disabled'], def:0,
+    help:'BIOS 被篡改时自动回滚到可信版本（HP 商用机）。'},
+  sureRecover:{name:'HP Sure Recover', cn:'网络恢复', vals:['Disabled','Enabled'], def:0},
+  thunderbolt:{name:'Thunderbolt Options', cn:'雷电选项', vals:['[Enter]'], def:0, act:'noop'},
+  wlanRadio:  {name:'Embedded WLAN Device Radio', cn:'内置无线网卡', vals:['Enabled','Disabled'], def:0},
+  btRadio:    {name:'Embedded Bluetooth Device',  cn:'内置蓝牙',     vals:['Enabled','Disabled'], def:0},
+  fnLock:     {name:'Fn Lock',        cn:'Fn 键锁定', vals:['Enabled','Disabled'], def:0},
+  usbCharging:{name:'USB Charging Port', cn:'USB 充电口', vals:['Enabled','Disabled'], def:0},
+  batteryCare:{name:'Battery Care Function', cn:'电池养护', vals:['50%','80%','100%'], def:2},
+  f10F12Delay:{name:'F10 and f12 Delay (sec)', cn:'F10/f12 延时', vals:['0','5','10','15','20'], def:0},
+  cdromBoot:  {name:'CD-ROM boot',    cn:'光驱引导',   vals:['Enabled','Disabled'], def:0},
+  floppyBoot: {name:'Floppy boot',    cn:'软驱引导',   vals:['Enabled','Disabled'], def:1},
+  netAdapterBoot:{name:'Internal Network Adapter boot', cn:'网卡引导', vals:['Enabled','Disabled'], def:1},
+  uefiDriversNote:{name:'UEFI Drivers', cn:'UEFI 驱动', vals:['[Enter] 管理'], def:0, act:'noop'},
+  aiOverclock:{name:'Ai Overclock Tuner', cn:'超频调优', vals:['Auto','Manual','XMP I','XMP II'], def:0},
+  memFreq:    {name:'Memory Frequency', cn:'内存频率', vals:['Auto','DDR4-2666MHz','DDR4-3200MHz'], def:0},
+  cpuRatio:   {name:'CPU Core Ratio', cn:'CPU 倍频',  vals:['Auto','Per Core','Sync All Cores'], def:0},
+  cpuTemp:    {name:'CPU Temperature',cn:'CPU 温度',  vals:['45°C / 113°F'], def:0, ro:true},
+  mbTemp:     {name:'Motherboard Temperature', cn:'主板温度', vals:['36°C / 97°F'], def:0, ro:true},
+  fanSpeed:   {name:'CPU Fan Speed',  cn:'CPU 风扇转速', vals:['1245 RPM'], def:0, ro:true},
+  asusProfile:{name:'ASUS User Profile', cn:'用户配置档', vals:['[Enter] 载入/保存'], def:0, act:'noop'},
+  spdInfo:    {name:'ASUS SPD Information', cn:'SPD 信息', vals:['[Enter] 查看'], def:0, act:'noop'},
+  sataModeRaid:{name:'SATA Mode',     cn:'SATA 模式', vals:['AHCI','RAID'], def:0},
+  nvmeRaidMode:{name:'NVMe RAID mode',cn:'NVMe RAID 模式', vals:['Disabled','Enabled'], def:0},
+  raidType:   { name:'RAID Type',      cn:'RAID 类型', vals:['RAID','RAID5'], def:0},
+  /* ↓ 组阵列要用的项(放在 SATA Configuration / RAID Configuration 子菜单里) */
+  raidLevel:  { name:'RAID Level', cn:'阵列级别', vals:['RAID0','RAID1','RAID5','RAID10'], def:0,
+    help:'阵列级别。RAID0=条带: 速度翻倍、容量全用、零冗余(坏一块全丢); RAID1=镜像: 两块互为副本, 容错一块, 容量减半; RAID5=分布式校验: 至少 3 块, 容错一块, 可用容量 n-1; RAID10=先镜像再条带, 至少 4 块, 兼顾速度与容错。' },
+  raidStripe: { name:'Stripe Size', cn:'条带大小', vals:['16K','64K','128K'], def:1,
+    help:'条带大小 = 每块盘上连续写多少数据后换下一块。大文件顺序读写(视频剪辑/备份)用 128K; 数据库、虚拟化这类随机小 IO 用 16K~64K。' },
+  raidDisks:  { name:'Select Disks', cn:'选择硬盘', vals:['未选择','已选 2 块','已选 3 块'], def:0,
+    help:'把要组阵列的盘勾上。RAID0/RAID1 选 2 块, RAID5 选 3 块; 容量不一致时按**最小**那块算。' },
+  raidCreate: { name:'Create Volume', cn:'创建阵列', vals:['未创建','已创建'], def:0,
+    help:'确认创建阵列。!! 创建会**清空**所选硬盘上的全部数据, 先备份 !!' },
+  raidBootable:{ name:'Mark Bootable', cn:'设为可引导', vals:['否','是'], def:0,
+    help:'把阵列标记为可引导设备, 否则装系统时在启动项里找不到它。' },
+  raidCache:  { name:'Write-back Cache', cn:'写回缓存', vals:['Disabled','Enabled'], def:1,
+    help:'阵列写缓存。开了性能好但掉电可能丢最后一小段数据; 有 UPS 或只做临时盘可以开。' },
+  storageHierarchy:{name:'Storage Hierarchy', cn:'存储层次', vals:['Disabled','Enabled'], def:0},
+  tpmSpec:    {name:'TPM 2.0 UEFI Spec Version', cn:'TPM 2.0 规范版本', vals:['TCG_1_2','TCG_2'], def:1,
+    help:'Win11 要求 TCG_2（即 TPM 2.0）。设成 TCG_1_2 会被 Win11 判为不满足。'},
+  tpmIface:   {name:'TPM 2.0 InterfaceType', cn:'TPM 接口类型', vals:['CRB','TIS'], def:0},
+  ftpmSwitch: {name:'AMD fTPM switch', cn:'AMD fTPM 开关', vals:['Enabled','Disabled'], def:0},
+  vtxLabel:   {name:'SVM Mode (AMD) / VT-x (Intel)', cn:'虚拟化 (SVM/VT-x)', vals:['Disabled','Enabled'], def:0},
+  netStackCfg:{name:'Network Stack',  cn:'网络栈',    vals:['Disabled','Enabled'], def:0},
+});
+
+Object.assign(ITEMS, {
+  noteFav: {name:'(F3 可把常用项加到这里)', cn:'(F3 添加常用项)', vals:[''], def:0, ro:true},
+  noteOc:  {name:'(超频有风险: 改完先跑稳定性测试)', cn:'(超频有风险)', vals:[''], def:0, ro:true},
+});
+
+/* ---- 厂商皮肤：两种版式（顶排菜单 / 左竖菜单）+ 四套配色与文案 ---- */
+const BRANDS = {
+  award: { label:'Award / Phoenix（90 年代台式机·蓝底红选）', theme:'mono', layout:'leftmenu',
+    short:'Award',
+    home:'Standard CMOS Features',
+    ov:{ prodName:'Generic ATX i815EP System', serialNo:'AWARD0001234' },
+    title:'CMOS SETUP UTILITY - AWARD SOFTWARE, INC.',
+    thint:'ESC:Quit  F10:Save',
+    footer:'ESC:Quit   \u2191\u2193\u2192\u2190:Select Item   F10:Save & Exit   F9:Load Defaults   F1:Help',
+    menus:['Standard CMOS Features','Advanced BIOS Features','Advanced Chipset Features',
+           'Integrated Peripherals','Power Management Setup','PnP/PCI Configurations',
+           'PC Health Status','Load Fail-Safe Defaults','Save & Exit Setup'] },
+
+  ami: { label:'AMI Aptio V（通用台机主板·灰底深蓝）', theme:'mono', layout:'topmenu',
+    short:'AMI',
+    home:'Main',
+    ov:{ biosVer:'2.21.1203 (03/15/2024)', prodName:'AMI Aptio V Reference Board', serialNo:'AMIA0001234' },
+    title:'Aptio Setup Utility - Copyright (C) 2024 American Megatrends',
+    thint:'F10:Save & Exit',
+    footer:'F1 Help   \u2191\u2193 Select   \u2190\u2192 Screen   +/- Change   Enter Select   F9 Defaults   F10 Save & Exit   ESC Exit',
+    menus:['Main','Advanced','Security','Boot','Save & Exit'] },
+
+  asus: { label:'华硕 ASUS（Aptio V · Ai Tweaker）', theme:'mono', layout:'leftmenu',
+    short:'华硕',
+    home:'Main',
+    ov:{ biosVer:'3004 (07/12/2024)', prodName:'ASUS PRIME Z590-A', serialNo:'M3M0AS012345' },
+    title:'ASUS UEFI BIOS Utility - Advanced Mode',
+    thint:'(C) ASUSTeK COMPUTER INC.',
+    footer:'F1 Setup   F5 Reset   F7 EZ Mode   F10 Save & Exit   \u2191\u2193 Select   Enter Select',
+    menus:['My Favorites','Main','Ai Tweaker','Advanced','Monitor','Boot','Tool','Exit'] },
+
+  dell: { label:'戴尔 Dell（OptiPlex / Latitude）', theme:'mono', layout:'leftmenu',
+    short:'戴尔',
+    home:'General',
+    ov:{ biosVer:'1.28.0 (06/11/2024)', prodName:'OptiPlex 7090', serialNo:'J4K2L83', ecVer:'1.09' },
+    ovn:{ sataMode:'SATA Operation', secureBoot:'Secure Boot Enable', vtx:'Virtualization',
+          loadDefaults:'Restore Settings', prodName:'System Model', serialNo:'Service Tag' },
+    title:'Dell BIOS Setup   |   Settings   System Information',
+    thint:'F10:Save',
+    footer:'\u2191\u2193 Select   Enter Select   +/- Change   Esc Exit   F9 Defaults   F10 Save & Exit',
+    menus:['General','System Configuration','Video','Security','Secure Boot','Performance',
+           'Power Management','POST Behavior','Virtualization Support','Maintenance','System Logs','Exit'] },
+
+  hp: { label:'惠普 HP（F10 Setup Utility）', theme:'mono', layout:'topmenu',
+    short:'惠普',
+    home:'Main',
+    ov:{ biosVer:'2.19.1268 (08/12/2021)', prodName:'HP EliteBook 840 G8', serialNo:'5CG1234ABC',
+         prodNumber:'5F1A2PC#AB2', uuid:'4C4C4544-0037-5110-8050', factoryOS:'Windows 11 Home',
+         sysBoardId:'8823', batterySN:'01234 2024/06/11' },
+    ovn:{ sataMode:'SATA Emulation', tpm:'Embedded Security Device', loadDefaults:'Apply Factory Defaults' },
+    title:'HP BIOS Setup Utility',
+    thint:'(C) Copyright 1985-2024 HP Development Company, L.P.',
+    footer:'F1 Help   Esc Exit   \u2191\u2193 Select   Enter Select   F9 Defaults   F10 Save & Exit',
+    menus:['Main','Security','Advanced','UEFI Drivers','Exit'] },
+
+  ibm: { label:'联想 ThinkPad（IBM 风格·黑底蓝条）', theme:'mono', layout:'leftmenu',
+    short:'联想',
+    home:'Config',
+    ov:{ biosVer:'N2HET57W (1.44)', prodName:'ThinkPad X1 Carbon Gen 9', serialNo:'PF2ABCDE', ecVer:'1.14' },
+    ovn:{ sataMode:'SATA Mode', loadDefaults:'Setup Defaults', secureBoot:'Secure Boot',
+          bootMode:'Boot Mode', cpuType:'CPU Type' },
+    title:'ThinkPad Setup',
+    thint:'(C) Copyright 1985-2024 Lenovo',
+    footer:'\u2191\u2193 Select   Enter Select   +/- Change   Esc Exit   F9 Defaults   F10 Save & Exit',
+    menus:['Config','Date/Time','Security','Startup','Restart','Network','Display'] },
+
+  huawei: { label:'华为 HUAWEI（MateBook · 中文界面）', theme:'mono', layout:'topmenu', cn:true,
+    short:'华为',
+    home:'信息概览',
+    ov:{ biosVer:'1.32 (06/20/2024)', prodName:'HUAWEI MateBook X Pro', serialNo:'H3XPMB0123456',
+         ecVer:'1.21', cpuType:'Intel(R) Core(TM) i7-1165G7 @ 2.80GHz', cpuSpeed:'2800 MHz',
+         memory:'16384 MB (LPDDR4X-4266)' },
+    title:'HUAWEI MateBook UEFI Setup Utility',
+    thint:'F10 保存并退出',
+    footer:'F1 帮助   Esc 退出   \u2191\u2193 选择   Enter 确认   F9 默认   F10 保存并退出',
+    menus:['信息概览','安全设置','启动配置','性能调节','退出'] },
+};
+
+const PAGES = {
+  award: {
+    'Standard CMOS Features':   ['sysDate','sysTime','sataPort0','sataPort1','nvme0','memory'],
+    'Advanced BIOS Features':   ['bootMode','bootFilter','fastBoot','quietBoot','legacyUsb','xhciHandoff','numLock'],
+    'Advanced Chipset Features':['vtx','vtd','hyperThreading','@Serial ATA Controller 0 Settings'],
+    'Integrated Peripherals':   ['sataMode','legacyUsb','xhciHandoff','wakeUsb','@RAID Configuration'],
+    'Power Management Setup':   ['wakeUsb','chassisIntrusion'],
+    'PnP/PCI Configurations':   ['vtd','storageOprom','videoOprom'],
+    'PC Health Status':         ['cpuType','memory'],
+    'Load Fail-Safe Defaults':  ['loadDefaults'],
+    'Save & Exit Setup':        ['*bootOrder','*saveExit','*discardExit'],
+  },
+  ami: {
+    Main:      ['biosVer','ecVer','cpuType','cpuSpeed','memory','sysDate','sysTime'],
+    Advanced:  ['@SATA Configuration','@USB Configuration','@CSM Configuration',
+                '@Intel(R) AMT Configuration','@Trusted Computing','@CPU Configuration'],
+    Security:  ['supervisorPwd','userPwd','secureBoot','secureBootMode','keyMgmt','tpm','tpmDevice','tpmState','chassisIntrusion'],
+    Boot:      ['bootMode','bootFilter','fastBoot','quietBoot','*bootOrder','netStack','pxe'],
+    'Save & Exit': ['*saveExit','*discardExit','loadDefaults'],
+  },
+  asus: {
+    'My Favorites': ['biosVer','cpuType','memory','noteFav'],
+    Main:      ['biosVer','sysDate','sysTime','language','cpuType','cpuSpeed','memory','sataPort0','nvme0'],
+    'Ai Tweaker': ['aiOverclock','memFreq','cpuRatio','noteOc'],
+    Advanced:  ['@Serial ATA Controller 0 Settings','@SATA Configuration','@USB Configuration',
+                '@CSM (Compatibility Support Module)','@Trusted Computing','@AMD fTPM configuration',
+                '@CPU Configuration','@Network Stack Configuration'],
+    Monitor:   ['cpuTemp','mbTemp','fanSpeed'],
+    Boot:      ['bootMode','fastBoot','@RAID Configuration','*bootOrder','storageOprom'],
+    Tool:      ['asusProfile','spdInfo'],
+    Exit:      ['*saveExit','*discardExit','loadDefaults'],
+  },
+  dell: {
+    General:                 ['biosVer','ecVer','sysDate','sysTime','memory','prodName','serialNo'],
+    'System Configuration':  ['sataMode','@RAID Configuration','sataPort0','sataPort1','nvme0','legacyUsb','fastBoot'],
+    Video:                   ['videoOprom'],
+    Security:                ['adminPwd','powerOnPwd','tpm','tpmState','clearTpm','chassisIntrusion','amt'],
+    'Secure Boot':           ['secureBoot','secureBootMode','keyMgmt'],
+    Performance:             ['vtx','vtd','hyperThreading'],
+    'Power Management':      ['wakeUsb','batteryCare'],
+    'POST Behavior':         ['quietBoot','numLock','fastBoot'],
+    'Virtualization Support':['vtx','vtd'],
+    Maintenance:             ['loadDefaults','sysLog'],
+    'System Logs':           ['sysLog'],
+    Exit:                    ['*saveExit','*discardExit'],
+  },
+  hp: {
+    Main:      ['sysTime','sysDate','prodName','prodNumber','sysBoardId','cpuType','memory',
+                'biosVer','serialNo','uuid','factoryOS','batterySN','sysLog'],
+    Security:  ['adminPwd','powerOnPwd','sgx','tpm','tpmState','clearTpm','restoreSecDefaults',
+                'secureBoot','secureBootMode','drivelock'],
+    Advanced:  ['language','@Boot Options','@System Options','@Built-in Device Options',
+                '@Port Options','@Power Management Options','@Remote Management Options',
+                '@RAID Configuration','sureStart','sureRecover','thunderbolt'],
+    'UEFI Drivers': ['uefiDriversNote'],
+    Exit:      ['*saveExit','*discardExit','loadDefaults'],
+  },
+  ibm: {
+    Config:    ['@Network','@Display','@RAID Configuration','nvme0','sataMode','legacyUsb','xhciHandoff','fastBoot','fnLock','usbCharging'],
+    'Date/Time':['sysDate','sysTime'],
+    Security:  ['supervisorPwd','userPwd','secureBoot','secureBootMode','tpm','tpmDevice','tpmState',
+                'clearTpm','drivelock','amt','amtSol','amtPwd','vtx','vtd'],
+    Startup:   ['bootMode','bootFilter','*bootOrder','pxe','fastBoot'],
+    Restart:   ['loadDefaults','*saveExit','*discardExit'],
+    Network:   ['wlanRadio','btRadio','wakeUsb','netStack'],
+    Display:   ['videoOprom','quietBoot'],
+  },
+  huawei: {
+    '信息概览': ['prodName','biosVer','cpuType','cpuSpeed','memory','nvme0','serialNo','sysDate','sysTime'],
+    '安全设置': ['secureBoot','secureBootMode','tpm','tpmDevice','tpmState','clearTpm',
+                'supervisorPwd','drivelock','chassisIntrusion'],
+    '启动配置': ['bootMode','bootFilter','fastBoot','@RAID Configuration','*bootOrder','netStack','pxe'],
+    '性能调节': ['vtx','hyperThreading','quietBoot'],
+    '退出':     ['*saveExit','*discardExit','loadDefaults'],
+  },
+};
+
+/* ---- 真·子菜单（Enter 进、Esc 回）— 名字照真机 ---- */
+const SUBPAGES = {
+  'Serial ATA Controller 0 Settings': ['sataMode','sataPort0','sataPort1','@SATA Configuration'],
+  'SATA Configuration':      ['sataModeRaid','nvmeRaidMode','raidType','@RAID Configuration','sataPort0','sataPort1','nvme0'],
+  /* 组阵列的完整流程放这里: 选盘 → 选级别 → 选条带 → 创建 */
+  'RAID Configuration':      ['sataModeRaid','raidLevel','raidDisks','raidStripe','raidCache','raidCreate','raidBootable','vmd'],
+  'USB Configuration':       ['legacyUsb','xhciHandoff','wakeUsb'],
+  'CSM Configuration':       ['csm','bootFilter','storageOprom','videoOprom'],
+  'CSM (Compatibility Support Module)': ['csm','bootFilter','storageOprom','videoOprom'],
+  'Intel(R) AMT Configuration': ['amt','amtSol','amtPwd','netStack'],
+  'Trusted Computing':       ['tpm','tpmDevice','tpmState','tpmSpec','tpmIface','storageHierarchy','clearTpm'],
+  'AMD fTPM configuration':  ['ftpmSwitch','tpmState','clearTpm'],
+  'CPU Configuration':       ['cpuType','cpuSpeed','vtx','vtd','hyperThreading'],
+  'Network Stack Configuration': ['netStackCfg','pxe','netAdapterBoot'],
+  'Boot Options':            ['f10F12Delay','cdromBoot','floppyBoot','netAdapterBoot','*bootOrder'],
+  'System Options':          ['vtx','vtd','hyperThreading','fastBoot','chassisIntrusion'],
+  'Built-in Device Options': ['wlanRadio','btRadio','wakeUsb','fnLock'],
+  'Port Options':            ['legacyUsb','xhciHandoff','usbCharging'],
+  'Power Management Options':['wakeUsb','batteryCare'],
+  'Remote Management Options':['amt','amtSol','amtPwd'],
+  'Network':                 ['wlanRadio','btRadio','wakeUsb','netStack'],
+  'Display':                 ['videoOprom','quietBoot'],
+};
+/* ---- 学习任务：关键项 + 期望值 + 为什么 ---- */
+const TASKS = {
+  'win7-legacy': { mode:'os',
+    label:'给老机器装 Windows 7（传统 Legacy 方式，免驱最省心）',
+    brief:'目标：让安装 U 盘以 Legacy 方式引导，且 SATA 用安装光盘自带驱动的模式；Win7 没有 Secure Boot 签名。',
+    rules:[
+      ['bootMode', 1, 'Boot Mode 要 Legacy（Win7 传统装法用 MBR 分区表）'],
+      ['bootFilter', 2, 'Boot option filter 选 Legacy only，才认 U 盘的传统引导'],
+      ['secureBoot', 0, 'Secure Boot 必须关（Win7 的驱动无签名）'],
+      ['sataMode', 0, 'SATA 用 IDE：Win7 原版不带 AHCI 驱动，不加载驱动会 0x0000007B 蓝屏'],
+      ['legacyUsb', 1, 'Legacy USB Support 开：PE 里 USB 键鼠才动得了'],
+      ['xhciHandoff', 0, 'XHCI Hand-off 开：否则 Win7 装完 USB 口全废'],
+    ],
+    extra:['装完想升 AHCI：先在系统里改注册表 msahci/iaStorV 的 Start=0，重启后再把 BIOS 改 AHCI（见任务"IDE→AHCI 不蓝屏"）。'],
+  },
+  'win7-uefi': { mode:'os',
+    label:'给新主板装 Windows 7（UEFI + CSM 方式，GPT 分区）',
+    brief:'目标：UEFI 引导但兼容 Legacy 设备；Secure Boot 关；SATA 用 AHCI 但需注入驱动或先用 IDE。',
+    rules:[
+      ['bootMode', 0, 'Boot Mode 保持 UEFI（GPT 分区表）'],
+      ['csm', 0, 'CSM Support 开：Win7 需要 Legacy 视频/存储 ROM 兼容层'],
+      ['storageOprom', 0, 'Storage OpROM policy 要 Legacy only（配 CSM 用）'],
+      ['secureBoot', 0, 'Secure Boot 关'],
+      ['sataMode', 1, 'SATA 用 AHCI（要先给镜像注入 AHCI 驱动，否则 7B 蓝屏）'],
+      ['vtx', 1, 'VT-x 开：装完跑虚拟机/沙盘用得上'],
+    ],
+    extra:['UEFI 装 Win7 还要在硬盘上留一个 FAT32 的 ESP 分区，并把 U 盘做成 UEFI:NTFS 或先用 WinPE 分区。'],
+  },
+  win10: { mode:'os',
+    label:'装 Windows 10（纯 UEFI，推荐路线）',
+    brief:'目标：纯 UEFI + GPT；Secure Boot 可开可关；SATA 必须 AHCI。',
+    rules:[
+      ['bootMode', 0, 'Boot Mode = UEFI'],
+      ['csm', 1, 'CSM Support 关（纯 UEFI，避免装到 MBR 盘上）'],
+      ['bootFilter', 1, 'Boot option filter = UEFI only'],
+      ['sataMode', 1, 'SATA = AHCI（Win10 原生支持）'],
+      ['secureBoot', 1, 'Secure Boot 建议开（Win10 支持良好）'],
+      ['tpm', 1, 'TPM 开：BitLocker 与后续升 Win11 都要'],
+    ],
+    extra:['Win10 也能用 Legacy+MBR 装，但升级 Win11 时会被 GPT/UEFI 卡住，新机直接纯 UEFI。'],
+  },
+  win11: { mode:'os',
+    label:'装 Windows 11（硬性要求最多）',
+    brief:'目标：UEFI + Secure Boot 开 + TPM 2.0 开 + SATA 必须是 AHCI（RST/VMD 会被"找不到磁盘"卡住）。',
+    rules:[
+      ['bootMode', 0, 'Boot Mode 必须 UEFI（Win11 不支持 Legacy）'],
+      ['csm', 1, 'CSM 关（纯 UEFI）'],
+      ['secureBoot', 1, 'Secure Boot 必须 Enabled（Win11 硬性要求）'],
+      ['tpm', 1, 'Security Device Support = Enabled'],
+      ['tpmDevice', 1, '选 PTT/fTPM 或 dTPM 2.0 —— Win11 要 TPM 2.0'],
+      ['tpmState', 1, 'TPM State 要 Enabled'],
+      ['sataMode', 1, 'SATA 必须 AHCI：RAID/RST/VMD 会让安装器看不到盘'],
+      ['fastBoot', 1, '装完可开 Fast Boot（装的时候建议先关）'],
+    ],
+    extra:['本机是 RAID/VMD 又不想改：安装时用"加载驱动程序"喂 Intel RST/VMD 驱动，或在 BIOS 里把 VMD 关掉、改用 SATA AHCI。'],
+  },
+  ubuntu: { mode:'os',
+    label:'装 Linux（Ubuntu / Debian 等）',
+    brief:'目标：AHCI + 关 RST/VMD（否则安装器看不到硬盘）；Secure Boot 可关最省事。',
+    rules:[
+      ['sataMode', 1, 'SATA 必须 AHCI：开了 RST/VMD，Linux 安装器会"没有可用磁盘"'],
+      ['vmd', 0, '有 VMD 选项时关掉（Intel 11 代以后常见）'],
+      ['secureBoot', 0, 'Secure Boot 建议关：装第三方驱动（NVIDIA/WiFi）少一次签名折腾'],
+      ['bootMode', 0, 'UEFI 安装（Ubuntu 的 UEFI 引导更稳）'],
+      ['csm', 1, 'CSM 关'],
+      ['vtx', 1, 'VT-x 开：Docker/虚拟机要用'],
+    ],
+    extra:['要在 Win 旁边双系统：先在 Windows 里关"快速启动"与"休眠"，否则 Linux 只能只读挂载 NTFS。'],
+  },
+  'rst-to-ahci': { mode:'os',
+    label:'已装好系统：把 RST/RAID 改成 AHCI（不重装）',
+    brief:'目标：机器用了 Intel RST/VMD，想换成标准 AHCI。直接改 BIOS 会 INACCESSIBLE_BOOT_DEVICE 蓝屏。',
+    rules:[
+      ['sataMode', 1, '最终目标：SATA = AHCI'],
+      ['safeBoot', 1, '先在 Windows 里以"安全模式"启动一次（让系统加载标准 AHCI 驱动）'],
+      ['regFix', 1, '或先在注册表把 iaStorV/iaStorAC 的 Start 改为 0，再重启进 BIOS 改 AHCI'],
+      ['vmd', 0, '如有 VMD 项，一并 Disabled'],
+    ],
+    extra:['顺序很重要：先让 Windows 认识 AHCI 驱动 → 再改 BIOS。反过来就是蓝屏开不了机。'],
+  },
+  'ide-to-ahci': { mode:'os',
+    label:'已装好 Win7/XP：IDE 改 AHCI（不蓝屏的做法）',
+    brief:'目标：老系统从 IDE 升到 AHCI，拿到 NCQ 与热插拔；关键是先让系统里 AHCI 驱动处于启用状态。',
+    rules:[
+      ['sataMode', 1, '最终目标：SATA = AHCI'],
+      ['msahci', 1, '注册表 HKLM\\SYSTEM\\...\\Services\\msahci 的 Start 改为 0'],
+      ['iastor', 1, 'Intel 平台同时把 iaStorV 的 Start 改为 0（更保险）'],
+      ['rebootFirst', 1, '改完注册表先正常重启一次，再进 BIOS 改 AHCI'],
+    ],
+    extra:['XP 没有 msahci，要用"合并驱动"的方式先在设备管理器里装 Intel AHCI 驱动，再改 BIOS。'],
+  },
+
+  /* ============ 模式二: 阵列配置（给方案要求, 你去把 RAID 配出来） ============ */
+  'raid0-speed': {
+    label:'阵列-双盘 RAID0 提速', mode:'raid',
+    brief:'方案要求: 两块同容量 SSD 组 RAID0 当剪辑临时盘 —— 要最快的顺序读写; 不要冗余(素材另有备份)。',
+    rules:[
+      ['sataModeRaid', 1, 'SATA Mode 必须 = RAID (留在 AHCI 就根本看不到阵列菜单)'],
+      ['raidLevel', 0, 'RAID Level 选 RAID0: 条带, 速度翻倍, 容量不损失'],
+      ['raidDisks', 1, '选中 2 块盘'],
+      ['raidStripe', 2, '大文件顺序读写 → Stripe Size 用 128K'],
+      ['raidCache', 1, '临时盘可以开 Write-back Cache 换性能'],
+      ['raidCreate', 1, '最后必须 Create Volume 才真正生效'],
+      ['raidBootable', 1, '这个阵列要装系统 → 标记为可引导'],
+    ],
+    extra:['RAID0 零冗余: 任意一块盘坏 = 整个阵列数据全丢。当临时盘可以, 别放唯一副本。'],
+  },
+  'raid1-mirror': {
+    label:'阵列-双盘 RAID1 镜像', mode:'raid',
+    brief:'方案要求: 两块盘互为镜像, 坏一块还能开机进系统; 不要求容量大。',
+    rules:[
+      ['sataModeRaid', 1, 'SATA Mode = RAID'],
+      ['raidLevel', 1, 'RAID Level 选 RAID1: 镜像, 容错一块'],
+      ['raidDisks', 1, '选中 2 块盘'],
+      ['raidCreate', 1, 'Create Volume'],
+      ['raidBootable', 1, '要装系统 → 标记为可引导'],
+    ],
+    extra:['RAID1 可用容量 = 单盘容量(两块 1T 只有 1T), 换来"坏一块不丢数据、能直接开机"。'],
+  },
+  'raid5-3disk': {
+    label:'阵列-三盘 RAID5 容错', mode:'raid',
+    brief:'方案要求: 三块盘, 既要容量利用率高, 又要能容错一块。',
+    rules:[
+      ['sataModeRaid', 1, 'SATA Mode = RAID'],
+      ['raidLevel', 2, 'RAID Level 选 RAID5: 分布式校验, 至少 3 块'],
+      ['raidDisks', 2, '选中 3 块盘'],
+      ['raidStripe', 1, '混合用途 → Stripe Size 64K 比较稳'],
+      ['raidCreate', 1, 'Create Volume'],
+      ['raidBootable', 1, '要装系统 → 标记为可引导'],
+    ],
+    extra:['RAID5 可用容量 = (n-1) x 单盘容量; 只容错**一块** —— 重建期间再坏一块就全丢。'],
+  },
+
+  /* ============ 模式三: 自由模式（不判定, 随便改） ============ */
+  free: {
+    label:'自由模式 - 随便改', mode:'free',
+    brief:'自由模式: 不判定任何规则。随便翻每一页、随便改每一项, 用来熟悉"这一项在哪、改完会变成什么样"。',
+    rules:[],
+    extra:['想验证某个装机场景时, 按 BACK 回上一级换成"系统安装"或"阵列配置"模式。'],
+  },
+};
+
+/* 任务的隐藏前置项（不出现在菜单里，仅用于判定/流程） */
+const HIDDEN_ITEMS = {
+  supervisorPwd:{name:'Supervisor Password',vals:['Not Installed','Installed'],def:0,help:'管理员密码。设了之后进 BIOS 要输密码。'},
+  userPwd:{name:'User Password',vals:['Not Installed','Installed'],def:0,help:'普通用户密码。'},
+  vmd:{name:'VMD Controller',vals:['Disabled','Enabled'],def:0,help:'Volume Management Device（Intel 11 代以后）。开了 Linux/旧 Win 看不到盘。'},
+  loadDefaults:{name:'Load Optimal Defaults',vals:['[Enter] 载入出厂默认'],def:0,act:'defaults',help:'把整页设置恢复出厂。装系统卡住时先恢复默认再重设。'},
+  safeBoot:{name:'（流程项）先以安全模式启动一次',vals:['未做','已做'],def:0,hidden:true},
+  regFix:{name:'（流程项）先改注册表 iaStorV/iaStorAC Start=0',vals:['未做','已做'],def:0,hidden:true},
+  msahci:{name:'（流程项）先改注册表 msahci Start=0',vals:['未做','已做'],def:0,hidden:true},
+  iastor:{name:'（流程项）先改注册表 iaStorV Start=0',vals:['未做','已做'],def:0,hidden:true},
+  rebootFirst:{name:'（流程项）先正常重启一次',vals:['未做','已做'],def:0,hidden:true},
+};
+Object.assign(ITEMS, HIDDEN_ITEMS);
+
+/* 动作表（同属上面的 @DATA 段） */
+const ACTIONS = {
+  '*saveExit':   { name:'Save Changes and Exit', act:'saveexit', help:'保存并重启（真机是 F10）。' },
+  '*discardExit':{ name:'Discard Changes and Exit', act:'discardexit', help:'不保存退出（真机是 Esc）。' },
+  '*bootOrder':  { name:'Boot Priority Order', act:'bootorder', help:'进编辑后用 ↑↓ 选设备，← → 把它上移/下移。' },
+  /* ↓ 这三行是"掌机按键优化"：真机上它们分别是 F8 / F1 / F9，掌机没有这些键，
+   *   所以做成**每个页面末尾的普通行**，只用方向键 + OK 就能触发。 */
+  '*check':      { name:'检查结果 / 装机结论', act:'check',    help:'按当前设置逐条判定：符合几项、差哪几项、每一项为什么重要。' },
+  '*help':       { name:'说明（当前选项 / 本页）', act:'help', help:'看当前光标所在选项到底影响什么。真机是 F1。' },
+  '*defaults':   { name:'载入默认值 Load Defaults', act:'defaults', help:'恢复出厂默认设置。真机是 F9 / Load Setup Defaults。' },
+};
+/* @DATA-END */
+
+/* ---------- 状态 ---------- */
+function freshCfg(){
+  const c = {};
+  for (const k in ITEMS) c[k] = ITEMS[k].def;
+  return { cfg:c, order: BOOT_DEVICES.slice(), saved:false };
+}
+let S = freshCfg();
+let brand = 'ami', page = BRANDS.ami.home, cur = 0, helpOpen = false, dirty = false, msg = '';
+let nav = [];              /* 子菜单栈: ['SATA Configuration'] 表示正停在该子菜单里 */
+let boEdit = false, boSel = 0;   /* 引导顺序页: 是否进入编辑态 + 光标在第几项 */
+let mode = 'boot';         /* 'boot'=打开程序时的选择屏; 'bios'=全屏 BIOS 界面 */
+let bootStep = 0, bootCur = 0;   /* 选择屏: 0=选厂商, 1=选场景 */
+let dlgKind = null;        /* 弹窗: null / 'help' / 'check' */
+const monoMode = true;     /* 只有纯黑白(掌机 1bpp); 不再提供彩色"电脑版" */
+let task = 'win11';
+
+const cfgGet  = k => (ITEMS[k].ro ? 0 : S.cfg[k]);
+/* 品牌专属"身份值"优先 —— 避免在戴尔上显示 HP EliteBook 这种穿帮 */
+const cfgName = k => {
+  const ov = BRANDS[brand] && BRANDS[brand].ov;
+  if (ov && ov[k] != null) return ov[k];
+  return ITEMS[k].vals[Math.min(S.cfg[k], ITEMS[k].vals.length-1)];
+};
+
+function setCfg(k, v){
+  const it = ITEMS[k];
+  if (!it || it.ro || it.act) return false;
+  S.cfg[k] = (v + it.vals.length) % it.vals.length;
+  dirty = true;
+  return true;
+}
+
+/* 掌机按键优化: 掌机只有 ↑↓←→ + OK + BACK 六个键, 没有 F1/F8/F9/F10/±/Tab。
+ * 所以把"检查结果/说明/载入默认值"做成**每个页面末尾的普通行**(tail), 跟着方向键走。 */
+const PAGE_TAIL = ['*check', '*help', '*defaults'];
+
+/* 当前页的条目列表（把 PAGES 里的 @子菜单/*动作/普通 key 统一成行对象） */
+function rowsFrom(def){
+  const out = [];
+  for (const e of def || []){
+    if (e[0] === '@'){ out.push({kind:'sub', label:e.slice(1), key:null, sub:e.slice(1)}); }
+    else if (e[0] === '*'){ const a = ACTIONS[e]; out.push({kind:'act', label:a.name, key:e, help:a.help, act:a.act}); }
+    else if (ITEMS[e]){ out.push({kind:'item', label:ITEMS[e].name, key:e, help:ITEMS[e].help, ro:!!ITEMS[e].ro}); }
+  }
+  for (const k of PAGE_TAIL){
+    const a = ACTIONS[k];
+    if (a) out.push({kind:'act', label:a.name, key:k, help:a.help, act:a.act, tail:true});
+  }
+  return out;
+}
+/* 当前该显示哪些行：子菜单里就显示子菜单的行 */
+function rows(){
+  if (nav.length) return rowsFrom(SUBPAGES[nav[nav.length-1]]);
+  return rowsFrom(PAGES[brand][page]);
+}
+/* 右侧标题（子菜单里显示面包屑，跟真机一样） */
+function pageTitle(){
+  if (nav.length) return page + '  >  ' + nav.join(' > ');
+  return page;
+}
+/* 切品牌必须同时把 page 落到该品牌**真实存在**的菜单上 ——
+ * 否则 page 还是上一个品牌的页名 → PAGES[brand][page] === undefined → 整屏只剩标题(IBM/戴尔/华为踩过) */
+function setBrand(b){
+  if (!BRANDS[b] || !PAGES[b]) return false;
+  brand = b;
+  const pg = PAGES[b];
+  page = (BRANDS[b].home && pg[BRANDS[b].home]) ? BRANDS[b].home : Object.keys(pg)[0];
+  nav = []; cur = 0; boEdit = false; boSel = 0;
+  return true;
+}
+let hintRow = null;   /* 光标最后停过的"真实条目"(非尾部动作行) —— "说明"弹窗默认讲它 */
+function realIdx(rs, from){
+  for (let i = Math.min(from, rs.length - 1); i >= 0; i--) if (!rs[i].tail) return i;
+  for (let i = 0; i < rs.length; i++) if (!rs[i].tail) return i;
+  return -1;
+}
+function inSub(){ return nav.length > 0; }
+function popSub(){ if (nav.length){ nav.pop(); cur = 0; return true; } return false; }
+
+/* ============================================================================
+ * 按键处理（真实 BIOS 手感）
+ * ==========================================================================*/
+function keyToAction(e){
+  const k = e.key;
+  if (k === 'ArrowUp') return 'up';
+  if (k === 'ArrowDown') return 'down';
+  if (k === 'ArrowLeft') return 'left';
+  if (k === 'ArrowRight') return 'right';
+  if (k === 'Enter') return 'enter';
+  if (k === 'Escape') return 'esc';
+  if (k === 'Tab') return 'tab';
+  if (k === 'F1') return 'f1';
+  if (k === 'F2') return 'f2';
+  if (k === 'F8') return 'f8';
+  if (k === 'F9') return 'f9';
+  if (k === 'F10') return 'f10';
+  if (k === '+' || k === '=' || k === 'PageUp') return 'inc';
+  if (k === '-' || k === '_' || k === 'PageDown') return 'dec';
+  if (k === ' ') return 'inc';
+  return null;
+}
+
+function doAction(a){
+  /* 记录"光标最后停过的真实条目"，给"说明"行用（尾部动作行不算） */
+  if (a === 'up' || a === 'down' || a === 'enter' || a === 'check' || a === 'help'){
+    const rs = rows();
+    const i = realIdx(rs, (a === 'up') ? cur - 1 : cur);
+    if (i >= 0) hintRow = rs[i];
+  }
+  /* ---- 打开程序时的选择屏: 两步选择 ---- */
+  if (mode === 'boot'){
+    if (a === 'up')   { bootCur = Math.max(0, bootCur - 1); }
+    else if (a === 'down'){ bootCur = Math.min((bootStep === 0 ? Object.keys(BRANDS).length : Object.keys(TASKS).length) - 1, bootCur + 1); }
+    else if (a === 'esc'){
+      if (bootStep === 1){ bootStep = 0; bootCur = Object.keys(BRANDS).indexOf(brand); }
+    }
+    else if (a === 'enter' || a === 'right'){
+      if (bootStep === 0){
+        setBrand(Object.keys(BRANDS)[bootCur]);
+        bootStep = 1; bootCur = 0;
+      } else {
+        task = Object.keys(TASKS)[bootCur];
+        mode = 'bios'; msg = '按 Enter 改值; F1 看说明; F8 检查; F10 保存并退出';
+      }
+    }
+    render(); return;
+  }
+  /* ---- BIOS 界面 ---- */
+  if (dlgKind && a === 'esc'){ dlgKind = null; render(); return; }   /* 先关弹窗 */
+  if (helpOpen && a !== 'f1' && a !== 'esc') helpOpen = false;
+  const rowsArr = rows();
+  const R = rowsArr[cur];
+  const menus = BRANDS[brand].menus;
+  const mi = menus.indexOf(page);
+
+  /* ---- 引导顺序编辑态：↑↓ 选设备，← → 上下移，OK/BACK 退出（掌机没有 ± 键） ---- */
+  if (boEdit && (!R || R.act !== 'bootorder')) boEdit = false;   /* 光标不在引导顺序行 → 退出编辑态, 防误操作 */
+  if (boEdit){
+    switch (a){
+      case 'up':   if (boSel > 0) boSel--; break;
+      case 'down': if (boSel < S.order.length - 1) boSel++; break;
+      /* ← / +  = 上移一位;  → / -  = 下移一位 (真机是 Shift+= / -) */
+      case 'left': case 'inc': case 'right': case 'dec': {
+        const to = (a === 'left' || a === 'inc') ? boSel - 1 : boSel + 1;
+        if (to >= 0 && to < S.order.length){
+          const t = S.order[boSel]; S.order[boSel] = S.order[to]; S.order[to] = t;
+          boSel = to; dirty = true;
+          msg = `引导顺序已改：第 ${to+1} 位 = ${S.order[to]}`;
+        }
+        break;
+      }
+      case 'enter': case 'esc': boEdit = false; msg = '已退出引导顺序编辑'; break;
+    }
+    render(); return;
+  }
+
+  switch (a){
+    case 'up':   if (cur > 0) cur--; break;
+    case 'down': if (cur < rowsArr.length - 1) cur++; break;
+    /* 掌机没有 ± 键 → ← → 也能改值（在引导顺序里 = 上移/下移） */
+    case 'left': case 'right': case 'inc': case 'dec':
+      if (R && R.kind === 'item' && !R.ro){ break; }   /* 交给下面的 left/right 统一处理 */
+      break;
+    case 'left':
+      if (inSub()) popSub();                       /* 子菜单里 ← = 退回上级（真机同） */
+      else { page = menus[(mi - 1 + menus.length) % menus.length]; cur = 0; }
+      break;
+    case 'right':
+      if (inSub()) popSub();
+      else { page = menus[(mi + 1) % menus.length]; cur = 0; }
+      break;
+    case 'tab':  if (inSub()) popSub(); page = menus[(mi + 1) % menus.length]; cur = 0; break;
+    case 'inc':  if (R && R.kind === 'item' && !R.ro) setCfg(R.key, S.cfg[R.key] + 1); break;
+    case 'dec':  if (R && R.kind === 'item' && !R.ro) setCfg(R.key, S.cfg[R.key] - 1); break;
+    case 'enter':
+      if (!R) break;
+      if (R.kind === 'sub'){
+        if (SUBPAGES[R.sub]){ nav.push(R.sub); cur = 0; msg = '进入子菜单：' + R.sub; }
+        else msg = '（本模拟器未收录该子菜单）';
+      }
+      else if (R.act === 'bootorder'){ boEdit = true; boSel = 0; msg = '↑↓ 选设备，← → 上下移，OK 退出'; }
+      else if (R.act === 'check'){ dlgKind = 'check'; }
+      else if (R.act === 'help'){ dlgKind = 'help'; }
+      else if (R.act === 'defaults'){ S = freshCfg(); dirty = true; nav = []; msg = '已载入默认值（Load Setup Defaults）'; }
+      else if (R.act === 'saveexit'){ S.saved = true; dirty = false; msg = 'Changes saved. 正在重启…（模拟）'; }
+      else if (R.act === 'discardexit'){ S = freshCfg(); dirty = false; nav = []; msg = '未保存退出，已恢复上次状态（模拟）'; }
+      else if (R.key === 'loadDefaults'){ S = freshCfg(); dirty = true; msg = '已载入出厂默认（Optimal Defaults）'; }
+      else if (R.kind === 'item'){ if (!R.ro) setCfg(R.key, S.cfg[R.key] + 1); }
+      break;
+    case 'esc':
+      if (popSub()) msg = '退回上一级菜单';
+      else { mode = 'boot'; bootStep = 0; bootCur = Object.keys(BRANDS).indexOf(brand); msg = ''; }  /* 最外层 Esc = 回开机选择 */
+      break;
+    case 'f1':   dlgKind = (dlgKind === 'help') ? null : 'help'; break;
+    case 'f8':   dlgKind = (dlgKind === 'check') ? null : 'check'; break;
+    case 'f9':   S = freshCfg(); dirty = true; nav = []; msg = '已载入默认值'; break;
+    case 'f10':  S.saved = true; dirty = false; nav = [];
+                 mode = 'boot'; bootStep = 0; bootCur = Object.keys(BRANDS).indexOf(brand);   /* 保存退出 = 重启回开机选择 */
+                 break;
+  }
+  render();
+}
+
+/* ============================================================================
+ * 判定引擎（纯函数：给定 cfg 与任务，返回逐条结果 + 总结论）
+ * ========================================================================== */
+function evaluate(cf, taskId){
+  const t = TASKS[taskId];
+  const lines = [];
+  let ok = 0;
+  for (const [k, want, why] of t.rules){
+    const it = ITEMS[k];
+    if (!it) { lines.push({ok:true, text:why, now:'（本机无此项，跳过）'}); ok++; continue; }
+    const good = cf[k] === want;
+    if (good) ok++;
+    lines.push({ ok:good, text:why, now: it.name + ' = ' + it.vals[cf[k]] });
+  }
+  /* 交叉规则：连选项都不满足时给出更直接的"会卡在哪" */
+  let extra = '';
+  const sata = cf.sataMode, vmd = cf.vmd;
+  if ((taskId==='win11' || taskId.startsWith('ubuntu')) && (sata===2 || sata===3 || vmd===1))
+    extra = '⚠ 现在这个 SATA 模式，安装器会"看不到硬盘"。这是装机最常卡的一步。';
+  if (taskId==='win11' && cf.secureBoot===0)
+    extra += (extra?'\n':'') + '⚠ Secure Boot 关着，Win11 安装器会直接拒绝：需要 UEFI + Secure Boot + TPM 2.0。';
+  if (taskId.startsWith('win7') && cf.secureBoot===1)
+    extra += (extra?'\n':'') + '⚠ Secure Boot 开着装 Win7：会出现"Windows 无法验证数字签名"。';
+  const pass = ok === t.rules.length;
+  return { lines, ok, total:t.rules.length, pass, extra };
+}
+
+/* ============================================================================
+ * 渲染
+ * ==========================================================================*/
+/* ============================================================================
+ * 渲染层：掌机风格 —— 纯黑白、全屏字符网格（模拟 ST7305 1bpp 屏）
+ * ==========================================================================*/
+const scr = document.getElementById('scr');
+const dlg = document.getElementById('dlg');
+let COLS = 84, ROWS = 30;      /* 由窗口尺寸实时算出, 见 measureGrid() */
+
+/* 中文占 2 格 —— 必须按**显示宽度**排版, 否则汉字后面的对齐全是错的 */
+function dw(s){
+  let w = 0;
+  for (const ch of String(s)){
+    const c = ch.codePointAt(0);
+    const wide = (c >= 0x1100 && (c <= 0x115f || c === 0x2329 || c === 0x232a ||
+                 (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
+                 (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe6f) ||
+                 (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6) ||
+                 (c >= 0x20000 && c <= 0x3fffd)));
+    w += wide ? 2 : 1;
+  }
+  return w;
+}
+function cutW(s, n){                    /* 按显示宽度截断 */
+  let r = '', w = 0;
+  for (const ch of String(s)){ const c = dw(ch); if (w + c > n) break; r += ch; w += c; }
+  return r;
+}
+function padW(s, n){ s = cutW(s, n); while (dw(s) < n) s += ' '; return s; }
+function wrapW(text, w){                 /* 按显示宽度折行 */
+  const out = [];
+  for (const para of String(text).split('\n')){
+    let line = '';
+    for (const ch of para){
+      if (dw(line) + dw(ch) > w){ out.push(line); line = ''; }
+      line += ch;
+    }
+    out.push(line);
+  }
+  return out;
+}
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function L(text, inv){ return inv ? `<span class="inv">${esc(text)}</span>` : esc(text); }
+function mid(text, w){ const n = Math.max(0, Math.floor((COLS - dw(text)) / 2) - Math.floor((w - dw(text)) / 2)); return ' '.repeat(n) + text; }
+
+/* 真实字宽: 探针必须**挂在 #scr 里面**, 才能继承到同一套字体。
+ * 挂 body 上量到的是另一套(回退)字体, 误差 10%+ → 列数算错 → 整行溢出、值列被裁。 */
+function measureAdvance(){
+  const p = document.createElement('span');
+  p.style.cssText = 'position:absolute;left:-99999px;top:0;white-space:pre;visibility:hidden';
+  p.textContent = 'M'.repeat(200);
+  scr.appendChild(p);
+  const w = p.getBoundingClientRect().width / 200;
+  scr.removeChild(p);
+  return w || 0;
+}
+/* 网格 = 真机 BIOS 文本模式。按 80 列 / 30 行反推字号, 再用**真实字宽**定列数 */
+const GCOLS = 80, GROWS = 30;
+function measureGrid(){
+  applyTheme();          /* 必须先把主题类挂上, 量到的才是真正要渲染的那套字体 */
+  const availW = Math.max(160, window.innerWidth  - 16);
+  const availH = Math.max(120, window.innerHeight - 12);
+  const fs = Math.max(6, Math.min(availW / GCOLS / 0.6003, availH / GROWS / 1.15, 26));
+  const lh = Math.round(fs * 1.15 * 100) / 100;
+  scr.style.fontSize = fs + 'px'; scr.style.lineHeight = lh + 'px';
+  dlg.style.fontSize = fs + 'px'; dlg.style.lineHeight = lh + 'px';
+  const cw = measureAdvance() || fs * 0.6;
+  COLS = Math.min(100, Math.max(40, Math.floor(availW / cw)));
+  ROWS = Math.min(40,  Math.max(12, Math.floor(availH / lh)));
+}
+/* 超宽时按词边界截断, 不要把词切成两半 */
+function fitText(s, w){
+  s = String(s);
+  if (dw(s) <= w) return s;
+  let out = '';
+  for (const p of s.split(' ')){
+    const t = out ? out + ' ' + p : p;
+    if (dw(t) > w) break;
+    out = t;
+  }
+  return out || cutW(s, w);
+}
+/* footer 是一串"段"。窄屏只能丢掉放不下的**整段**, 不能从词中间切("Enter 确"这种) */
+function fitSegs(s, w){
+  const segs = String(s).split(/\s{3,}/).filter(x => x);
+  let out = '';
+  for (const seg of segs){
+    const t = out ? out + '   ' + seg : seg;
+    if (dw(t) > w) break;
+    out = t;
+  }
+  return out || segs[0] || '';
+}
+/* 单元格: 名称列 + 值列。**宽度必须由列宽反推** —— 写死 26 会在 80 列下把值列挤没 */
+function cellParts(nm, val, w, on){
+  /* 名称至少要占 dw(nm)+2, 值和名称之间还要留 2 格间隔, 否则会挤成 "NVMe SSD 0Samsung…" */
+  const want = Math.min(dw(nm) + 4, Math.max(10, w - 6));
+  let valW  = Math.min(dw(val), Math.max(4, w - want));
+  let nameW = w - valW;                                  /* nameW + valW === w, 恒等宽 */
+  if (nameW < 6){ nameW = 6; valW = Math.max(0, w - nameW); }
+  const v    = padW(cutW(val, valW), valW);
+  const head = padW((on ? '▶' : ' ') + ' ' + cutW(nm, Math.max(1, nameW - 2)), nameW);
+  return { head: head, v: v };
+}
+function cellW(nm, val, w, on){
+  const p = cellParts(nm, val, w, on);
+  /* 选中: 整格反色(值同色, 真机就是整行高亮); 未选中: 值列走真机配色 */
+  return on ? L(p.head + p.v, true) : esc(p.head) + '<span class="val">' + esc(p.v) + '</span>';
+}
+/* 标题栏: 左标题 + 右厂商提示, 整条反色(=真机 header) */
+function hdrText(B){
+  const L0 = B.title, R0 = B.thint || '';
+  if (!R0) return fitText(L0, COLS - 1);
+  const room = COLS - 2 - dw(R0);
+  if (room < 12) return fitText(L0, COLS - 1);
+  const left = fitText(L0, room);
+  return left + ' '.repeat(Math.max(1, COLS - 1 - dw(left) - dw(R0))) + R0;
+}
+function hdr(B){ return L(padW(' ' + hdrText(B), COLS), true); }
+function cls(){ return 'mono'; }   /* 只有纯黑白一种观感 */
+function applyTheme(){ scr.className = cls(); dlg.className = cls() + (dlgKind ? '' : ' hide'); }
+/* 标签按品牌取中/英（华为皮肤用中文名） */
+function itemName(key){
+  const it = ITEMS[key], B = BRANDS[brand];
+  if (B.ovn && B.ovn[key]) return B.ovn[key];   /* 品牌专属叫法(戴尔叫 SATA Operation…) */
+  return (B.cn && it.cn) ? it.cn : it.name;
+}
+
+/* ---- 开机选择屏：打开程序时先选（厂商 → 场景） ---- */
+function renderBoot(){
+  const out = [];
+  out.push('');
+  out.push(mid('BIOS 模拟器  装机学习台', 22));
+  out.push(mid('400x300  1bpp', 13));
+  out.push('');
+  /* 品牌只显示短名(与掌机图标网格同一套说法), 不显示括号里的介绍 */
+  const MODE_TAG = { os: '[系统安装]', raid: '[阵列配置]', free: '[自由模式]' };
+  if (bootStep === 0){
+    out.push(padW(`  第 1 步 / 2   选择品牌 ( ${Object.keys(BRANDS).length} 个 )`, COLS));
+    out.push('');
+    Object.keys(BRANDS).forEach((k, i) => {
+      out.push(L(padW(`   ${i === bootCur ? '▶' : ' '} ${BRANDS[k].short || k}`, COLS), i === bootCur));
+    });
+  } else {
+    out.push(padW(`  第 2 步 / 2   品牌: ${BRANDS[brand].short || brand}`, COLS));
+    out.push(padW('  选择模式与方案', COLS));
+    out.push('');
+    Object.keys(TASKS).forEach((k, i) => {
+      const t = TASKS[k];
+      out.push(L(padW(`   ${i === bootCur ? '▶' : ' '} ${MODE_TAG[t.mode] || ''} ${t.label}`, COLS), i === bootCur));
+    });
+    const tb = TASKS[Object.keys(TASKS)[bootCur]];
+    if (tb) out.push('', padW('  ' + tb.brief, COLS));
+  }
+  while (out.length < ROWS - 1) out.push('');
+  /* 不显示按键提示条(掌机观感: 只有内容, 没有提示) */
+  applyTheme();
+  scr.innerHTML = out.slice(0, ROWS).join('\n');
+}
+
+/* ---- 全屏 BIOS 界面（无边框、无按键提示条） ---- */
+function renderBios(){
+  applyTheme();
+  const B = BRANDS[brand];
+  const rowsArr = rows();
+  if (cur >= rowsArr.length) cur = Math.max(0, rowsArr.length - 1);
+  const out = [];
+
+  out.push(hdr(B));   /* 标题栏: 整条反色 (=真机的 header), 右端厂商提示 */
+  out.push('─'.repeat(COLS));
+
+  const cellOf = (r, i, w) => {
+    const nm  = r.kind === 'item' ? itemName(r.key) : r.label;
+    const val = r.kind === 'item' ? cfgName(r.key) : '[Enter]';
+    return cellW(nm, val, w, i === cur);
+  };
+  if (B.layout === 'topmenu'){
+    let bar = '';
+    for (const m of B.menus) bar += (m === page) ? `<@INV>${esc(padW(' ' + m + ' ', dw(m) + 2))}</@INV>` : esc(padW(' ' + m + ' ', dw(m) + 2));
+    out.push(bar);
+    out.push('─'.repeat(COLS));
+    out.push(padW('  ' + pageTitle() + (inSub() ? '   (Esc 返回上级)' : ''), COLS));
+    out.push('');
+    const half = Math.ceil(rowsArr.length / 2);
+    const W = Math.floor((COLS - 2) / 2);        /* 两列各占 W + 中间 2 格沟 = 2W+2 <= COLS */
+    for (let i = 0; i < half; i++){
+      out.push(cellOf(rowsArr[i], i, W) + '  ' +
+               (i + half < rowsArr.length ? cellOf(rowsArr[i + half], i + half, W) : ' '.repeat(W)));
+    }
+  } else {
+    const LW = Math.min(Math.max.apply(null, B.menus.map(m => dw(m))) + 2, Math.floor(COLS * 0.45));
+    const RW = COLS - LW - 2;
+    const left = B.menus.slice(0, Math.max(4, ROWS - 12)).map(m => L(padW(' ' + m, LW), m === page));
+    const right = [L(padW(' ' + pageTitle() + (inSub() ? '  (Esc 返回)' : ''), RW), true)];
+    rowsArr.forEach((r, i) => right.push(cellOf(r, i, RW)));
+    for (let i = 0; i < Math.max(left.length, right.length); i++)
+      out.push((left[i] || ' '.repeat(LW)) + '  ' + (right[i] || ''));
+  }
+
+  /* 引导顺序页: 把真实设备串列出来, 编辑态带光标 */
+  const curRow = rowsArr[cur];
+  if (curRow && curRow.act === 'bootorder'){
+    out.push('');
+    out.push(L(padW(boEdit ? '  Boot Priority Order  ↑↓选  +/-上下移  Enter退出'
+                           : '  Boot Priority Order', COLS), true));
+    S.order.forEach((d, i) => {
+      const t = padW(`  ${boEdit && i === boSel ? '▶' : ' '} ${i + 1}. ${d}`, COLS);
+      out.push((boEdit && i === boSel) ? L(t, true) : esc(t));
+    });
+  }
+  if (msg) out.push(L(padW(' ' + msg, COLS), true));
+
+  /* 底部只有一行: "任务 + 进度"(学习台信息)。**不显示按键提示条** */
+  const r = evaluate(S.cfg, task);
+  const right = `符合 ${r.ok}/${r.total}` + (r.pass ? '  可装机' : '');
+  const need = ROWS - 1;
+  while (out.length < need) out.push('');
+  out.push(L(padW(padW(' 任务: ' + TASKS[task].label, COLS - dw(right) - 1) + ' ' + right, COLS), true));
+
+  scr.innerHTML = out.slice(0, ROWS).join('\n').replace(/<\/@INV>/g, '</span>').replace(/<@INV>/g, '<span class="inv">');
+}
+
+/* ---- 黑白弹窗（帮助 / 检查结果）: 双线框, 居中 ---- */
+function renderDlg(){
+  if (!dlgKind){ dlg.className = 'hide'; return; }
+  applyTheme();
+  const W = Math.min(COLS - 4, 62);
+  const rowsArr = rows();
+  const R = rowsArr[cur];
+  let title = '', body = [];
+  if (dlgKind === 'help'){
+    /* 光标停在尾部动作行("说明"自己)时, 讲光标最后停过的那个真实选项 */
+    const HR = (R && !R.tail) ? R : (hintRow || (rowsArr.length ? rowsArr[0] : null));
+    title = HR ? (HR.kind === 'item' ? itemName(HR.key) : HR.label) : '帮助';
+    body = HR ? wrapW(HR.help || '（此项无额外说明）', W - 4) : [];
+    body.push('');
+    body.push('');
+    body = body.concat(wrapW('操作（掌机 6 键）: ↑↓ 选择   ←→ 切菜单   OK 改值/进入   BACK 返回', W - 4));
+  } else {
+    const r = evaluate(S.cfg, task);
+    title = '检查结果';
+    body = wrapW(TASKS[task].brief, W - 4);
+    body.push('');
+    for (const l of r.lines){
+      const mark = l.ok ? '[OK]' : '[X] ';   /* 固件字库没有 ✔/✘, 掌机版会整字空白 */
+      const t = body.length;
+      body = body.concat(wrapW(`${mark} ${l.text}`, W - 4).map((x, k) => k ? '   ' + x : x));
+      body.push('   当前: ' + l.now);
+    }
+    if (r.extra) { body.push(''); body = body.concat(wrapW(r.extra, W - 4)); }
+    body.push('');
+    body = body.concat(wrapW(r.pass ? '这台机器的设置可以装这个系统了。' : `还差 ${r.total - r.ok} 项, 标 ✘ 的就是要改的。`, W - 4));
+  }
+  const inner = W - 2;
+  const o = [];
+  o.push('┌' + '─'.repeat(inner) + '┐');
+  o.push('│ ' + padW(cutW(title, inner - 2), inner - 2) + ' │');
+  o.push('├' + '─'.repeat(inner) + '┤');
+  for (const b of body.slice(0, Math.min(body.length, ROWS - 8))) o.push('│ ' + padW(cutW(b, inner - 2), inner - 2) + ' │');
+  o.push('└' + '─'.repeat(inner) + '┘');
+  dlg.innerHTML = o.join('\n');
+  dlg.className = cls();
+}
+
+/* ---- 渲染 ---- */
+/* paint() = 真正画一帧; render() = 画完再自校正一次网格。
+ * ⚠ 不要指望"探针量字宽"能算准列数 —— 不同机器上 Courier New/Lucida Console 的可用性不同,
+ *   探针量到的字宽和真渲染的字宽会差 10%+, 差一点就会让整行溢出、被 overflow:hidden 把值列裁掉。
+ *   所以以 **真实渲染出来的 scrollWidth** 为准, 多退少补地收敛列数。 */
+function paint(){
+  if (mode === 'boot') renderBoot(); else renderBios();
+  renderDlg();
+}
+function fitGrid(){
+  for (let i = 0; i < 5; i++){
+    const cw   = measureAdvance() || 1;
+    const boxW = Math.max(120, scr.clientWidth - 16);      /* 减掉左右 padding */
+    const boxH = Math.max(80,  scr.clientHeight - 12);
+    const need = Math.ceil(COLS * cw);
+    const overH = Math.ceil(ROWS * (parseFloat(scr.style.lineHeight) || 12)) - boxH;
+    if (need <= boxW && overH <= 0) break;
+    if (need > boxW){
+      const n = COLS - Math.ceil((need - boxW) / cw);
+      if (n >= 40) COLS = n; else break;
+    }
+    if (overH > 0){
+      const n = ROWS - Math.ceil(overH / (parseFloat(scr.style.lineHeight) || 12));
+      if (n >= 12) ROWS = n; else break;
+    }
+    paint();
+  }
+}
+function render(){ paint(); fitGrid(); }
+
+/* ============================================================================
+ * 自测：不依赖浏览器交互，直接断言引擎
+ * ==========================================================================*/
+function runSelftest(){
+  const L = [];
+  const oMode = mode; mode = 'bios';   /* 自测断言的是 BIOS 里的按键行为 */
+  const P = (n, ok, extra) => L.push(`${ok ? 'PASS' : 'FAIL'}  ${n}${extra ? '  — ' + extra : ''}`);
+  const clone = () => JSON.parse(JSON.stringify(S.cfg));
+
+  /* 1) 默认值下：Win11 不该通过（正是真机出厂状态的坑） */
+  let c = clone();
+  let r = evaluate(c, 'win11');
+  P('默认设置下 Win11 判定为不通过', r.pass === false, `ok=${r.ok}/${r.total}`);
+
+  /* 2) 按 Win11 规则全部设对 → 必须通过 */
+  c = clone();
+  for (const [k, v] of TASKS['win11'].rules) c[k] = v;
+  r = evaluate(c, 'win11');
+  P('Win11 规则全部满足时判定通过', r.pass === true, `ok=${r.ok}/${r.total}`);
+
+  /* 3) 唯一一项错（Secure Boot 关）→ 必须不通过，且提示里点名 Secure Boot */
+  c = clone();
+  for (const [k, v] of TASKS['win11'].rules) c[k] = v;
+  c.secureBoot = 0;
+  r = evaluate(c, 'win11');
+  P('Win11 只把 Secure Boot 关掉 → 不通过', r.pass === false);
+  P('Win11 关 Secure Boot 会给出明确提示', /Secure Boot/.test(r.extra || ''));
+
+  /* 4) SATA=RAID/VMD 时 Linux 必须报"看不到盘" */
+  c = clone();
+  for (const [k, v] of TASKS['ubuntu'].rules) c[k] = v;
+  c.sataMode = 2;
+  r = evaluate(c, 'ubuntu');
+  P('Linux 在 RAID 模式下判定不通过', r.pass === false);
+  P('Linux + RAID 会提示看不到硬盘', /看不到硬盘/.test(r.extra || ''));
+  c.sataMode = 3; c.vmd = 1;
+  r = evaluate(c, 'ubuntu');
+  P('Linux 在 VMD 打开时判定不通过', r.pass === false);
+
+  /* 5) Win7 传统：Secure Boot 开 → 必须报数字签名问题 */
+  c = clone();
+  for (const [k, v] of TASKS['win7-legacy'].rules) c[k] = v;
+  c.secureBoot = 1;
+  r = evaluate(c, 'win7-legacy');
+  P('Win7 传统 + Secure Boot 开 → 不通过', r.pass === false);
+  P('Win7 + Secure Boot 提示数字签名', /数字签名/.test(r.extra || ''));
+
+  /* 6) 每套皮肤 × 每个页面都能渲染出行（不崩、不空） */
+  let pageCount = 0, emptyPages = [];
+  for (const b in PAGES){
+    for (const p in PAGES[b]){
+      const oldB = brand, oldP = page;
+      brand = b; page = p;
+      const rs = rows();
+      pageCount++;
+      if (rs.length === 0) emptyPages.push(b + '/' + p);
+      brand = oldB; page = oldP;
+    }
+  }
+  P(`全部皮肤页面都能列出条目（${pageCount} 页）`, emptyPages.length === 0, emptyPages.join(','));
+
+  /* 7) 页面里引用的 key 必须都在 ITEMS / ACTIONS 里（防手写错字） */
+  const badKeys = [];
+  for (const b in PAGES) for (const p in PAGES[b]) for (const e of PAGES[b][p]){
+    if (e[0] === '@') continue;
+    if (e[0] === '*'){ if (!ACTIONS[e]) badKeys.push(b+'/'+p+':'+e); }
+    else if (!ITEMS[e]) badKeys.push(b+'/'+p+':'+e);
+  }
+  P('PAGES 里引用的 key 全部存在', badKeys.length === 0, badKeys.join(','));
+  /* 每个 @子菜单 必须有对应 SUBPAGES, 否则设备上点了只会提示"未收录" */
+  const badSub = [];
+  for (const b in PAGES) for (const p in PAGES[b]) for (const e of PAGES[b][p])
+    if (e[0] === '@' && !SUBPAGES[e.slice(1)]) badSub.push(b+'/'+p+':'+e.slice(1));
+  P('PAGES 里引用的子菜单全部有内容', badSub.length === 0, badSub.join(','));
+  /* 每个品牌的每个页面都要能渲染（7 品牌） */
+  P('品牌数 ≥ 7 且都有 theme', Object.keys(BRANDS).length >= 7 &&
+    Object.keys(BRANDS).every(k => !!BRANDS[k].theme), Object.keys(BRANDS).join(','));
+  /* 只做纯黑白: 渲染类必须恒为 mono, 且调色板必须是黑白(不能有彩色主题残留)
+   * ⚠ 不要用 outerHTML.indexOf('theme-award') 自查 —— <script> 里就有这串字, 永远命中自己 */
+  P('只做纯黑白(无电脑彩色版)', cls() === 'mono' &&
+    getComputedStyle(scr).getPropertyValue('--selbg').trim().toLowerCase() === '#000' &&
+    getComputedStyle(scr).getPropertyValue('--bg').trim().toLowerCase() === '#fff',
+    'cls=' + cls() + ' selbg=' + getComputedStyle(scr).getPropertyValue('--selbg').trim());
+
+  /* 7b) 每个品牌切过去, 首页必须真有条目 —— 抓"page 停在别的品牌页名 → 整屏空白" */
+  const emptyHome = [];
+  {
+    const ob = brand, op = page, onav = nav.slice(), oc = cur;
+    for (const b in BRANDS){
+      if (!setBrand(b)){ emptyHome.push(b + ':setBrand失败'); continue; }
+      if (rows().length === 0) emptyHome.push(b + '/' + page);
+    }
+    brand = ob; page = op; nav = onav; cur = oc;
+  }
+  P('每个品牌切过去首页都有条目', emptyHome.length === 0, emptyHome.join(','));
+
+  /* 7c) 页名必须在该品牌的菜单栏里, 否则菜单栏不发光(看不出在哪一页) */
+  const badPage = [];
+  for (const b in PAGES) for (const p in PAGES[b]) if (BRANDS[b].menus.indexOf(p) < 0) badPage.push(b + '/' + p);
+  P('每个页名都在该品牌菜单栏里', badPage.length === 0, badPage.join(','));
+
+  /* 7d) 单元格恒等宽 + 标题栏不超宽 —— 抓"值列被挤掉/标题被切一半" */
+  const badCell = [];
+  {
+    const ob = brand, op = page, onav = nav.slice();
+    for (const b in BRANDS){
+      setBrand(b);
+      if (dw(hdrText(BRANDS[b])) + 1 > COLS) badCell.push(b + ':标题超宽');
+      const pg = PAGES[b];
+      for (const p in pg){
+        page = p; nav = [];
+        for (const r of rows()){
+          const nm  = r.kind === 'item' ? itemName(r.key) : r.label;
+          const val = r.kind === 'item' ? cfgName(r.key) : '[Enter]';
+          for (const w of [Math.floor((COLS - 2) / 2), COLS - 26 - 2]){
+            const q = cellParts(nm, val, w, false);
+            if (dw(q.head) + dw(q.v) !== w) badCell.push(b + '/' + p + '/' + nm);
+            if (dw(q.head) + dw(q.v) !== w) break;
+          }
+        }
+      }
+    }
+    brand = ob; page = op; nav = onav;
+  }
+  P('单元格宽度恒等于列宽(值列不被挤掉)', badCell.length === 0, badCell.slice(0, 3).join(','));
+
+  /* 7f) 品牌身份项不得串味(在戴尔上出现 HP EliteBook 这种) */
+  const bleed = [];
+  {
+    const ob = brand;
+    const OTHERS = { award:['HUAWEI','HP ','Dell','ASUS','Lenovo'], ami:['HUAWEI','EliteBook','OptiPlex','ThinkPad'],
+                     asus:['HUAWEI','EliteBook','OptiPlex','ThinkPad'], dell:['HUAWEI','EliteBook','ThinkPad','ASUS'],
+                     hp:['HUAWEI','OptiPlex','ThinkPad','ASUS'], ibm:['HUAWEI','EliteBook','OptiPlex','ASUS'],
+                     huawei:['EliteBook','OptiPlex','ThinkPad','ASUS'] };
+    for (const b in BRANDS){
+      brand = b;
+      for (const k of ['biosVer','prodName','serialNo']){
+        if (!ITEMS[k]) continue;
+        const v = cfgName(k);
+        for (const bad of (OTHERS[b] || []))
+          if (v.indexOf(bad) >= 0) bleed.push(b + '/' + k + '=' + v);
+      }
+    }
+    brand = ob;
+  }
+  P('品牌身份项不串味(戴尔不显示 HP 机型)', bleed.length === 0, bleed.slice(0, 3).join(','));
+
+  /* 7g) 名称与值之间必须留出间隔 */
+  {
+    const q = cellParts('NVMe SSD 0', 'Samsung SSD 970 EVO Plus 1TB', 39, false);
+    P('名称与值之间留间隔(不挤成一坨)', /  $/.test(q.head) || q.head.length >= 12 &&
+      dw(q.head) + dw(q.v) === 39, 'head=' + JSON.stringify(q.head));
+  }
+  /* 7e) 排出来的行必须放得进窗口 —— 否则 overflow:hidden 会把右边裁掉(值列跑屏幕外) */
+  {
+    const cw = measureAdvance() || 1;
+    const boxW = Math.max(120, scr.clientWidth - 16);
+    const need = Math.ceil(COLS * cw);
+    P('排出的行宽不超过窗口(不被裁)', need <= boxW,
+      'COLS=' + COLS + ' cw=' + cw.toFixed(2) + ' 需要=' + need + 'px 可用=' + boxW + 'px');
+  }
+
+  /* 7h) 掌机按键优化: 每页末尾必须有 检查/说明/默认 三行, 且只用 6 键能走到并触发 */
+  {
+    const bad = [];
+    for (const b in PAGES) for (const p in PAGES[b]){
+      const ob = brand, op = page, on = nav.slice();
+      brand = b; page = p; nav = [];
+      const rs = rows();
+      for (const k of ['*check', '*help', '*defaults'])
+        if (!rs.some(r => r.key === k)) bad.push(b + '/' + p + ':' + k);
+      brand = ob; page = op; nav = on;
+    }
+    P('每页末尾都有 检查/说明/默认 三行(掌机无 F 键)', bad.length === 0, bad.slice(0, 3).join(','));
+  }
+  {
+    /* 只用 ↑↓←→ + OK + BACK: 从首页走到"检查结果"并成功打开结论弹窗 */
+    const obm = mode, ob = brand, op = page, oc = cur, od = dlgKind;
+    mode = 'bios'; setBrand('ami'); dlgKind = null;
+    let r2 = rows(), tail = r2.findIndex(r => r.key === '*check');
+    cur = tail; doAction('enter');
+    const opened = (dlgKind === 'check');
+    dlgKind = null; mode = obm; brand = ob; page = op; cur = oc; dlgKind = od;
+    P('只用 ↑↓←→+OK+BACK 能打开"检查结果"', opened && tail >= 0, 'tail=' + tail);
+  }
+
+  /* 7i) 三种模式都要有任务; 每个品牌都要能走到 RAID（否则选了这个品牌练不了阵列配置） */
+  {
+    const modes = {};
+    for (const t in TASKS) modes[TASKS[t].mode || '(空)'] = (modes[TASKS[t].mode || '(空)'] || 0) + 1;
+    const need = ['os', 'raid', 'free'];
+    const miss = need.filter(m => !modes[m]);
+    P('三种模式都有任务(系统安装/阵列配置/自由)', miss.length === 0,
+      '各模式任务数: ' + JSON.stringify(modes));
+    /* 可达性搜索: RAID 多半是"页 → 子菜单 → 子菜单"两级进(AMI 就是 Advanced→SATA Configuration→RAID),
+     * 只查 PAGES 里的直接引用会漏。这里按 @子菜单 做 BFS。 */
+    const noRaid = [];
+    for (const b in PAGES){
+      const seen = new Set(); const queue = [];
+      for (const p in PAGES[b]) queue.push(PAGES[b][p]);
+      let hit = false;
+      while (queue.length && !hit){
+        const def = queue.shift();
+        for (const e of def){
+          if (e[0] !== '@') continue;
+          const nm = e.slice(1);
+          if (nm === 'RAID Configuration'){ hit = true; break; }
+          if (SUBPAGES[nm] && !seen.has(nm)){ seen.add(nm); queue.push(SUBPAGES[nm]); }
+        }
+      }
+      if (!hit) noRaid.push(b);
+    }
+    P('每个品牌都能走到 RAID 子菜单(BFS 可达)', noRaid.length === 0, noRaid.join(','));
+  }
+
+  /* 8) 任务里的规则 key 必须都在 ITEMS 里 */
+  const badTaskKeys = [];
+  for (const t in TASKS) for (const [k] of TASKS[t].rules) if (!ITEMS[k]) badTaskKeys.push(t+':'+k);
+  P('TASKS 里的规则 key 全部存在', badTaskKeys.length === 0, badTaskKeys.join(','));
+
+  /* 9) 只读项不可改 */
+  const before = S.cfg.biosVer;
+  setCfg('biosVer', 5);
+  P('只读项（BIOS Version）改不动', S.cfg.biosVer === before);
+
+  /* 10) 枚举项来回 +/- 应回到原值（回绕正确） */
+  const v0 = S.cfg.sataMode;
+  setCfg('sataMode', v0 + 1); setCfg('sataMode', v0);
+  P('枚举项 +/- 回绕后回到原值', S.cfg.sataMode === v0);
+
+  /* 11) F10 保存后 dirty 归零, 且回到"开机选择屏"(保存并退出 = 重启) */
+  dirty = true; doAction('f10');
+  P('F10 保存后不再有未保存改动', dirty === false && S.saved === true);
+  P('F10 保存退出后回到开机选择屏', mode === 'boot' && bootStep === 0);
+
+  /* 12) 每个任务都能算出一个明确结论（不返回 undefined） */
+  let ok12 = true;
+  for (const t in TASKS){
+    if (!TASKS[t].rules || !TASKS[t].rules.length) continue;   /* 自由模式: 本就没有规则 */
+    const rr = evaluate(S.cfg, t);
+    if (typeof rr.pass !== 'boolean' || !rr.lines.length) ok12 = false;
+  }
+  P('所有任务都能给出逐条结论', ok12);
+
+  /* 13) 子菜单：Enter 进得去、Esc 回得来、不崩 */
+  mode = 'bios';   /* ⚠ 上面 F10 用例会把 mode 切回 'boot'(保存退出=重启回开机选择), 这里拨回来 */
+  const ob = brand, op = page, oc = cur;
+  brand = 'ami'; page = 'Advanced'; nav = []; cur = 0;
+  cur = rows().findIndex(r => r.kind === 'sub');   /* ⚠ rows() 每次返回新对象, 不能用 indexOf(旧对象) */
+  const subName = rows()[cur] ? rows()[cur].sub : null;
+  doAction('enter');
+  P('Enter 能进入子菜单', nav.length === 1 && nav[0] === subName, nav.join(',') || '(nav 为空)');
+  const inRows = rows().length;
+  P('子菜单里能列出该子菜单的项', inRows > 0);
+  doAction('esc');
+  P('Esc 能退出子菜单', nav.length === 0);
+  P('退出后回到原页面且行数恢复', page === 'Advanced' && rows().length >= 6, 'rows=' + rows().length);
+  brand = ob; page = op; cur = oc; nav = [];
+
+  /* 14) 引导顺序：进入编辑 → 下移一位 → 顺序确实变了 */
+  const before0 = S.order[0], before1 = S.order[1];
+  brand = 'ami'; page = 'Boot';
+  cur = rows().findIndex(r => r.act === 'bootorder');
+  if (cur < 0) cur = 0;
+  doAction('enter');                 /* 进编辑态 */
+  doAction('inc');                   /* 把 0 号上移 = 与上一位交换, 0 号已是最上 → 不移 */
+  doAction('down'); doAction('inc'); /* 选 1 号并上移 → 与 0 号交换 */
+  P('引导顺序可上下移动', S.order[0] === before1 && S.order[1] === before0,
+    S.order.slice(0,2).join(' | '));
+  doAction('enter');                 /* 退出编辑态 */
+  brand = ob; page = op; cur = oc;
+
+  mode = oMode;
+  const fails = L.filter(x => x.startsWith('FAIL')).length;
+  const head = `自测 ${L.length} 项：通过 ${L.length - fails}，失败 ${fails}`;
+  return head + '\n' + L.join('\n');
+}
+
+/* ============================================================================
+ * 启动
+ * ==========================================================================*/
+(function init(){
+  /* 选择已移到"打开程序时的选择屏"里, 这里只做: URL 深链 → 量网格 → 挂按键 → 渲染 */
+  const q = new URLSearchParams(location.search);
+  if (q.get('brand')) setBrand(q.get('brand'));
+  if (q.get('task')  && TASKS[q.get('task')]){ task = q.get('task'); mode = 'bios'; }  /* 给了任务就直接进 BIOS */
+  if (q.get('bios') === '1') mode = 'bios';
+  if (q.get('mono') === '1') monoMode = true;                    /* 掌机 1bpp 预览 */
+  if (q.get('page') && PAGES[brand][q.get('page')]) page = q.get('page');
+  if (q.get('sub')  && SUBPAGES[q.get('sub')]){ nav = [q.get('sub')]; cur = 0; }
+  if (q.get('boedit') === '1'){ boEdit = true; boSel = 0; }
+
+  measureGrid();
+  window.addEventListener('resize', () => { measureGrid(); render(); });
+  document.addEventListener('keydown', e => {
+    const a = keyToAction(e);
+    if (!a) return;
+    e.preventDefault();
+    doAction(a);
+  });
+  scr.addEventListener('click', () => scr.focus());
+
+  if (boEdit){   /* 深链进了编辑态: 光标定位到引导顺序那一行 */
+    const bi = rows().findIndex(r => r.act === 'bootorder');
+    if (bi >= 0) cur = bi; else boEdit = false;
+  }
+  render();
+  /* ?selftest=1 → 自动跑并写进 DOM（供无头浏览器抓取） */
+  if (location.search.indexOf('selftest=1') >= 0){
+    const out = runSelftest();
+    document.getElementById('selftest-out').textContent = out;
+    console.log(out);
+  }
+})();
+</script>
+</body>
+</html>

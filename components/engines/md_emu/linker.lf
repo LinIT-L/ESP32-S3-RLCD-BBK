@@ -1,0 +1,17 @@
+# V2.x 内存精简: 整库 BSS/common 段搬到 PSRAM。
+# 用 IDF 内置 extram_bss 方案 (定义于 components/esp_wifi/linker.lf),
+# 目标输出段 .ext_ram.bss 由 esp_psram 的 sections.ld 收进 PSRAM。
+# 前置: CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y (本项目已开)。
+# 注意: 本文件必须在 CMakeLists 的 idf_component_register(LDFRAGMENTS ...) 中声明才生效,
+# 否则 IDF 根本不读它。
+#
+# [历史] 原文件里有一条 "genesis 代码搬 IRAM" 的 mapping。经核查它从未生效
+# (组件未声明 LDFRAGMENTS, ELF 中也没有 .noflash.text 段), 且若现在启用会反向把
+# gwenesis 大量代码塞进 IRAM, 吃掉内部 RAM 收益。热路径函数已由源码里的 IRAM_ATTR
+# 覆盖 (gwenesis_vdp_render_line / run_genesis_rom 实测在 0x4037xxxx, 即 IRAM),
+# 故该 mapping 已移除。
+[mapping:md_emu_extram_bss]
+archive: libmd_emu.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
