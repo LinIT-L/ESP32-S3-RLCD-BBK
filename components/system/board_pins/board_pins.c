@@ -25,7 +25,7 @@
 static const board_pins_t BP_XIAOZHI = {
     .id = BOARD_ID_XIAOZHI, .name = "小智模块+新载板",
     .lcd_dc = 7, .lcd_cs = 11, .lcd_sck = 9, .lcd_mosi = 10, .lcd_rst = -1,
-    .lcd_freq_mhz = 30,
+    .lcd_freq_mhz = 60,   /* ★2026-10-16 与微雪统一为 60MHz(同一块 ST7305 面板) */,
     .tp_sda = 5, .tp_scl = 13, .tp_int = 12, .tp_rst = 6,
     .btn_pwr = 1, .btn_right = 0, .btn_left = 4,
     .bat_adc_chan = 2,                     /* ADC1_CH2 = GPIO3 (模块内部电池分压) */
