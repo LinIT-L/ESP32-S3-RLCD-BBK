@@ -43,10 +43,38 @@ esp_err_t app_board_init(app_board_t *board)
      * 若不释放, st7305_init 的硬复位脚翻转不生效 + SPI 总线被 hold 霸住无法初始化.
      * ★ 2026-10-04: CS 从 GPIO40 挪到 **GPIO42** (小智核心模块占用 IO40)。这两处必须同步改,
      *   否则 CS 被 hold 住 → SPI 片选永远拉不动 → 屏全黑。 */
-    gpio_hold_dis(GPIO_NUM_41);   /* RST */
-    gpio_hold_dis(GPIO_NUM_42);   /* CS  (原 40) */
-    gpio_hold_dis(GPIO_NUM_11);   /* SCK */
-    gpio_hold_dis(GPIO_NUM_12);   /* MOSI */
+    /* ★★★ 2026-10-16 关键修复: 解深睡锁的引脚必须是**本板(小智)实际用的**。
+     *   之前这里是 41/42/11/12 = 微雪(原40)/新载板的值 ⇒ 小智屏的 DC7/SCK9/MOSI10
+     *   **从没被解锁** ⇒ 冻在深睡电平 ⇒ **开机全黑但串口正常**(文档明写过的坑)。
+     *   小智真值(与 LinTOS0.71 一致): DC7 CS11 SCK9 MOSI10(RST不接) + 震动8 */
+    gpio_hold_dis(GPIO_NUM_7);    /* LCD DC/RS */
+    gpio_hold_dis(GPIO_NUM_11);   /* LCD CS  */
+    gpio_hold_dis(GPIO_NUM_9);    /* LCD SCK */
+    gpio_hold_dis(GPIO_NUM_10);   /* LCD MOSI */
+    /* ★★★ 2026-10-16 修复"一直震动": 必须在**全工程最早的位置**把震动脚确定拉低。
+     *   0.8 这一版缺了这 4 行 ⇒ GPIO8 开机后**浮空** ⇒ TM6604 是**边沿触发**驱动芯片,
+     *   浮空/噪声被反复误触发 ⇒ 一直震 (0.71 里这 4 行是"开机只抖一下"的关键修复)。 */
+    /* ★★★ 2026-10-16 关键: **不要用 gpio_reset_pin()** —— 它会把该脚配成
+     *   "输入 + 内部上拉", 对 TM6604(边沿触发) 来说**上拉=一个上升沿** ⇒ 又触发一次震动;
+     *   而且烧录时 ROM 下载模式该脚浮空, 同样会被噪声误触发(马达会锁住一直转)。
+     *   这里直接配"输出、无上拉无下拉、低电平" —— 不给它任何边沿。 */
+    gpio_hold_dis(GPIO_NUM_8);
+    {
+        gpio_config_t vib0 = {
+            .pin_bit_mask = (1ULL << 8),
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_ENABLE,   /* 上电即被拉低, 杜绝浮空误触发 */
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&vib0);
+        gpio_set_level(GPIO_NUM_8, 0);
+    }
+    gpio_hold_dis(GPIO_NUM_12);   /* 触摸 INT */
+    gpio_hold_dis(GPIO_NUM_6);    /* 触摸 RST */
+    gpio_hold_dis(GPIO_NUM_5);    /* 触摸 SDA */
+    gpio_hold_dis(GPIO_NUM_13);   /* 触摸 SCL */
+    gpio_hold_dis(GPIO_NUM_1); gpio_hold_dis(GPIO_NUM_0); gpio_hold_dis(GPIO_NUM_4);  /* 按键 */
 
     /* 1. 初始化 LCD (必须最先, 显示开机 Logo) */
     st7305_config_t lcd_cfg = st7305_default_config();

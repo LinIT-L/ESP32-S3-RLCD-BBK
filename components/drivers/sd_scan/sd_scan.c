@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"        /* esp_restart (卡死看门狗强制重启) */
+#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 static const char *TAG = "SDSCAN";
 
@@ -71,9 +72,9 @@ static int  sd_full_remount(uint8_t format_if_needed);
  *     `CLK=13 CMD=10 D0=14` 一次认到卡, 25MHz 挂载成功, 容量 3.75GiB。
  *     (中途曾按反馈把 CMD/D0 对调成 14/10, 反而认不到; 是排列自检把它们试回来的。)
  */
-#define SD_CLK  GPIO_NUM_13
-#define SD_CMD  GPIO_NUM_10
-#define SD_D0   GPIO_NUM_14
+#define SD_CLK  ((gpio_num_t)CFG_SD_CLK)
+#define SD_CMD  ((gpio_num_t)CFG_SD_CMD)
+#define SD_D0   ((gpio_num_t)CFG_SD_D0)
 /* CD (卡检测) 不用: 走软件探测 (见 sd_quick_probe) */
 
 static bool s_mounted = false;

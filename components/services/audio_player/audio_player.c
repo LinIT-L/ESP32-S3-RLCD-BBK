@@ -35,15 +35,16 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 static const char *TAG = "AUDIO";
 
 /* 硬件引脚 */
-#define I2S_BCLK    GPIO_NUM_9
-#define I2S_WS      GPIO_NUM_45
-#define I2S_DOUT    GPIO_NUM_8
-#define I2S_DIN     GPIO_NUM_10   /* 双麦克风阵列 (ES7210 ADC) */
-#define I2S_MCLK    GPIO_NUM_16
+#define I2S_BCLK    ((gpio_num_t)CFG_I2S_BCLK)
+#define I2S_WS      ((gpio_num_t)CFG_I2S_WS)
+#define I2S_DOUT    ((gpio_num_t)CFG_I2S_DOUT)
+#define I2S_DIN     ((gpio_num_t)CFG_I2S_DIN)   /* 双麦克风阵列 (ES7210 ADC) */
+#define I2S_MCLK    ((gpio_num_t)CFG_I2S_MCLK)
 /* 功放使能脚 (旧板 ES8311 功放, 高=开) */
 #define PA_PIN      GPIO_NUM_46
 
@@ -56,8 +57,8 @@ static const char *TAG = "AUDIO";
  *   而且这两个脚**没有引出到焊盘**(模块内部走线) —— 固件直接用即可。
  *   ⛔ **必须改**: 13/14 现在是 **TF 卡的数据线**(TF CLK=13 / D0=14)，
  *     音频 I2C 再去驱动这两个脚 = **和 TF 卡抢线**，会把卡读挂/读错。 */
-#define I2C_SDA     38
-#define I2C_SCL     47
+#define I2C_SDA     CFG_CODEC_SDA
+#define I2C_SCL     CFG_CODEC_SCL
 
 /* 解码缓冲区 (PSRAM) */
 #define MP3_FRAME_BUF_SIZE  4096        /* MP3 帧数据读取缓冲 */

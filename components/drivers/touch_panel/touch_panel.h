@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "driver/gpio.h"
+#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,10 +26,10 @@ extern "C" {
  */
 
 /* ==== 触摸面板引脚定义 (可在此修改) ==== */
-#define TP_SDA_PIN   GPIO_NUM_15
-#define TP_SCL_PIN   GPIO_NUM_7
-#define TP_INT_PIN   GPIO_NUM_17
-#define TP_RST_PIN   GPIO_NUM_2
+#define TP_SDA_PIN   ((gpio_num_t)CFG_TP_SDA)
+#define TP_SCL_PIN   ((gpio_num_t)CFG_TP_SCL)
+#define TP_INT_PIN   ((gpio_num_t)CFG_TP_INT)
+#define TP_RST_PIN   ((gpio_num_t)CFG_TP_RST)
 
 /* ==== 面板分辨率默认值 (原始坐标最大值) ====
  * GT911 会从配置寄存器 0x8048/0x804A 精确读出, 覆盖此默认值;

@@ -5,11 +5,11 @@
 #define LCD_WIDTH      400    /* 横屏 (U8G2_R1 旋转后) */
 #define LCD_HEIGHT     300
 
-#define RLCD_DC_PIN    GPIO_NUM_5
-#define RLCD_CS_PIN    GPIO_NUM_42   /* 2026-10-04: 小智核心模块占用 IO40 → CS 40→42 */
-#define RLCD_SCK_PIN   GPIO_NUM_11
-#define RLCD_MOSI_PIN  GPIO_NUM_12
-#define RLCD_RST_PIN   GPIO_NUM_41
+#define RLCD_DC_PIN    GPIO_NUM_7
+#define RLCD_CS_PIN    GPIO_NUM_11   /* 2026-10-04: 小智核心模块占用 IO40 → CS 40→42 */
+#define RLCD_SCK_PIN   GPIO_NUM_9
+#define RLCD_MOSI_PIN  GPIO_NUM_10
+#define RLCD_RST_PIN   GPIO_NUM_NC
 
 /* I2C (SHTC3/PCF85063, 模拟器暂不使用) */
 #define ESP32_I2C_SDA_PIN   GPIO_NUM_13

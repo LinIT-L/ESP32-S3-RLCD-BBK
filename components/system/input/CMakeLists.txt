@@ -3,7 +3,7 @@ idf_component_register(
          "gesture_back.c"
     INCLUDE_DIRS "."
     REQUIRES
-        driver
+        board_cfg driver
         st7305
         touch_panel
         web_gamepad

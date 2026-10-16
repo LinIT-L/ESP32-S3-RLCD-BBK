@@ -28,6 +28,7 @@
 #include "esp_log.h"
 #include <stdlib.h>
 #include <string.h>
+#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 #define TAG "VIB"
 
@@ -53,10 +54,14 @@ typedef enum { VIB_NONE = 0, VIB_TM6604 = 1 } vib_mode_t;
  *   ⛔ 不要用 GPIO4: 它在旧固件里是**电池 ADC (ADC1_CH3)**(`board_battery.c`),
  *      拿 LEDC 去驱动会把电量采样搅成垃圾。
  * ⚠ 原 GPIO42 让给了 LCD 片选(42 同样在 24 个可用脚里 ✓)。 */
-#define VIB_PWM_PIN   GPIO_NUM_6
+#define VIB_PWM_PIN   ((gpio_num_t)CFG_VIB_PWM)   /* ★ 唯一真相源: board_cfg.h */
 #define VIB_TIMER     LEDC_TIMER_1
 #define VIB_CHANNEL   LEDC_CHANNEL_1
 #define VIB_RES       LEDC_TIMER_8_BIT
+/* ★★ 2026-10-13 关键: 原来用 LEDC_LOW_SPEED_MODE。项目开了 esp_pm(电源管理),
+ *   开机一段时间后进入省电(DFS/自动 light sleep) 时**低速 LEDC 的时钟源会被关**,
+ *   ⇒ 表现为"ledc_set_duty 一直返回成功, 但引脚不再输出波形" ⇒ 震动"开机正常, 一会儿后失效"。
+ *   高速模式(LEDC_LOW_SPEED_MODE)走 APB 时钟, 不受 DFS 影响 ⇒ 全程都有波形。 */
 #define VIB_RES_MAX   255
 /* PWM 频率 = LRA 谐振频率: 常见 150~250Hz, 不同马达按实际谐振点调整. */
 #define VIB_RES_FREQ  190
@@ -80,7 +85,21 @@ static volatile bool s_music_on;
  *   新板震动电源默认常开 + GPIO42 归了屏 CS ⇒ EN 与 PWM 合并到 GPIO48 一根线,
  *   drv_enable()/VIB_EN_PIN 整条删掉 (停止震动 = duty 归 0)。 */
 static bool ledc_init(void) {
-    gpio_reset_pin(VIB_PWM_PIN);
+    /* ★★★ 2026-10-16 关键修复: **删掉 gpio_reset_pin(VIB_PWM_PIN)** ——
+     *   它把该脚重配成"输入+内部上拉", 对 TM6604(**边沿触发**) 就是**一个上升沿** ⇒
+     *   马达被触发 ⇒ 表现为"logo 画完(紧接着 vibrator_init)就开始一直震"。
+     *   改为"输出 + 禁上拉 + 使能下拉 + 低电平", 全程不给它任何边沿。 */
+    {
+        gpio_config_t vib0 = {
+            .pin_bit_mask = (1ULL << VIB_PWM_PIN),
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_ENABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&vib0);
+        gpio_set_level(VIB_PWM_PIN, 0);
+    }
     ledc_timer_config_t tc = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = VIB_TIMER,
         .duty_resolution = VIB_RES, .freq_hz = VIB_RES_FREQ, .clk_cfg = LEDC_AUTO_CLK,
@@ -97,11 +116,24 @@ static bool ledc_init(void) {
 
 /* ================= 实际输出 ================= */
 static void out_set(uint8_t strength01) {   /* strength 0..100 */
-    if (s_mode == VIB_NONE) return;
     uint32_t duty = ((uint32_t)strength01 * VIB_RES_MAX) / 100;
     if (duty > VIB_RES_MAX) duty = VIB_RES_MAX;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, duty);
+    /* ★★ 2026-10-13 关键修复: 驱动芯片是 **TM6604 + 线性马达**, 它是**边沿触发**型 ——
+     *   振动由输入信号的"上升沿"触发。原实现直接 out_set(255) 后 duty 一直是 255(恒高),
+     *   第二次 tap 时电平**没有变化 ⇒ 没有新边沿 ⇒ 不触发** ⇒ 表现为"开机震一下, 之后再也不震"
+     *   (串口实测: 每次 tap 都 out_set duty=255/255, LEDC 写入成功, 但马达不动)。
+     *   ⇒ 现在每次输出前**先把 duty 清 0 产生下降沿, 短暂保持, 再拉起来产生新上升沿**。 */
+    /* ★★★ 2026-10-13 关键防御: 一旦 `gpio_deep_sleep_hold_en()` 被调用过
+     *   (audio_pa_force_off 里会调, 时间点正是"开机几秒后"), 处于 hold 状态的引脚
+     *   会被**冻结在当前电平** ⇒ LEDC 写 duty 一切正常但**引脚不再变化** ——
+     *   与实测现象完全一致("开机前几秒能震, 之后彻底没反馈")。
+     *   ⇒ 每次输出前**显式解冻** GPIO8, 确保 LEDC 能真正驱动它。 */
+    gpio_hold_dis(VIB_PWM_PIN);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
+    esp_rom_delay_us(300);                       /* 保证下降沿被芯片看到 */
+    esp_err_t r1 = ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, duty);
+    esp_err_t r2 = ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
 }
 static void out_off(void) {
     if (s_mode == VIB_NONE) return;
@@ -124,6 +156,13 @@ void vibrator_init(void) {
     s_pat_timer = xTimerCreate("vib_pat", pdMS_TO_TICKS(50), pdFALSE, NULL, pat_timer_cb);
     ESP_LOGI(TAG, "震动驱动就绪: PWM=GPIO%d (%dHz), 电源默认常开 (无 EN 脚)",
              (int)VIB_PWM_PIN, VIB_RES_FREQ);
+
+    /* ★ 2026-10-13 (linit 要求「开机震动可以保留」):
+     *   以前开机那一下是 **GPIO8 浮空被误触发**(时长/强度都不可控);
+     *   现在 app_board 已在开机第一刻把 GPIO8 拉低压住误触发, 这里**有意补一次短震**
+     *   作为开机反馈 —— 可控(70ms)、且不会变成"一直震"。
+     *   ω 尊重「震动反馈」总开关: 用户关了就静默。 */
+    vibrator_tap_ui(70, 100);
 }
 
 bool vibrator_ready(void) { return s_mode != VIB_NONE; }

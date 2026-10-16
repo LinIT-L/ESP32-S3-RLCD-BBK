@@ -4,10 +4,10 @@
  */
 #include "input.h"
 /* 按键引脚 (Waveshare ESP32-S3-RLCD-4.2): BOOT=GPIO0(右), KEY=GPIO18(左/确认) */
-#define BTN_GPIO_LEFT   GPIO_NUM_18
-#define BTN_GPIO_RIGHT  GPIO_NUM_0
+#define BTN_GPIO_LEFT   ((gpio_num_t)CFG_BTN_LEFT)
+#define BTN_GPIO_RIGHT  ((gpio_num_t)CFG_BTN_RIGHT)
 /* V1.0.68: 软关机键 GPIO1: 短按=确认, 长按0.5s=返回主菜单, 长按2s=软关机 */
-#define BTN_GPIO_PWR    GPIO_NUM_1
+#define BTN_GPIO_PWR    ((gpio_num_t)CFG_BTN_PWR)
 extern void wp_power_pin_init(void);   /* [电源收拢] 电源模块(sleep.c): 开机键唤醒引脚初始化(唯一唤醒源) */
 #define POWER_HOLD_MS   2000
 #define PWR_SHORT_MS    500    /* V1.5.x: 开关键短按判定阈值 — 按住<0.5s 松手=锁屏(短按);
@@ -24,6 +24,7 @@ extern void wp_power_pin_init(void);   /* [电源收拢] 电源模块(sleep.c): 
 #include "vibrator.h"   /* V1.2.x: 游戏震动 (joypad 边沿 / 退出键) */
 #include "tone_player.h" /* 引擎按键点击音 (引擎优化"按键声音"开关) */
 #include "gesture_back.h" /* 系统导航手势识别器: 底部上滑=返回 / 状态栏长按=回桌面 */
+#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 #define TAG "INPUT"
 #define DEBOUNCE_MS 30

@@ -9,6 +9,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "board_cfg.h"   /* ★ 引脚唯一真相源 */
 
 static const char *TAG = "board_battery";
 
@@ -30,7 +31,7 @@ static const char *TAG = "board_battery";
  *     VBAT，和固件打印的 mv 对比一下：若固件读数 ≈ 真实值×(3/k)，就把下面的 NUM/DEN 改成 k。
  */
 #define BOARD_BATTERY_ADC_UNIT        ADC_UNIT_1
-#define BOARD_BATTERY_ADC_CHANNEL     ADC_CHANNEL_2   /* GPIO3 (模块内部电池分压) */
+#define BOARD_BATTERY_ADC_CHANNEL     CFG_BAT_ADC_CHAN
 #define BOARD_BATTERY_ADC_CH          2               /* 同上, 纯为日志打印 */
 #define BOARD_BATTERY_ADC_GPIO_NAME   "GPIO3"         /* 同上, 纯为日志打印 */
 #define BOARD_BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12

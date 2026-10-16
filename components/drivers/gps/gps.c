@@ -54,7 +54,10 @@ static const gps_config_t k_default_cfg = {
     .uart_num    = UART_NUM_1,   /* console 是 USB-Serial-JTAG, UART0/1 都空; 用 1 避开 ROM 默认口 */
     .pin_tx      = 43,           /* 模块脚 37 (TXD0) */
     .pin_rx      = 44,           /* 模块脚 36 (RXD0) */
-    .pin_extint  = 8,            /* 原 47 在模块上不可用 ⇒ 挪到 8 */
+    /* ★★★ 2026-10-16 **必须 -1(不接)**: 之前写成 8 ⇒ **和震动脚 GPIO8 撞脚**!
+     *   GPS 待机/唤醒时会在 EXTINT 上输出脉冲(上升沿) ⇒ TM6604 被触发 ⇒ **震动一直震**。
+     *   本板 EXTINT 没接(模块上 47 未引出), GPS 主用 UART RX 唤醒, 不需要 EXTINT。 */
+    .pin_extint  = -1,
     .baud        = 921600,
     .drive_extint = false,       /* 默认不驱动 EXTINT: 极性未确认, 悬空/误电平会自己叫醒模块 */
 };

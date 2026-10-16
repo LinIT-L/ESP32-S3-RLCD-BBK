@@ -38,7 +38,7 @@
 
 /* 物理键: PWR(GPIO1) / KEY 左(GPIO18) / BOOT 右(GPIO0), 低电平按下。 */
 #define PWR_KEY     GPIO_NUM_1
-#define KEY_LEFT    GPIO_NUM_18
+#define KEY_LEFT   GPIO_NUM_4
 #define KEY_RIGHT   GPIO_NUM_0
 
 #define PWR_MASK       (1ULL << PWR_KEY)

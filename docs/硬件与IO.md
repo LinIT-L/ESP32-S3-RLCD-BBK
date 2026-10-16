@@ -253,3 +253,39 @@
 - **ESP-IDF v5.5.5**（`~/esp/esp-idf-v55`），工具链 esp-14.2.0
 - Python：`idf5.5_py3.13_env`（`idf.py` 需在其 venv 内调用）
 - 详见 [开发指南](开发指南.md)
+
+---
+
+## ★★★ 载板引脚唯一真相源 = `components/drivers/board_cfg/include/board_cfg.h`
+
+**2026-10-16 起：全工程引脚集中在这一个文件**（改一处、全局生效）。
+引用它的模块：`st7305`(屏) · `audio_player`(音频) · `touch_panel`(触摸) · `board_battery`(电池) ·
+`sd_scan`(SD) · `vibrator`(震动) · `input`(按键)；各组件 CMake 均 `REQUIRES board_cfg`。
+⛔ **任何 .c/.h 里都不许再出现写死的 GPIO 号**（含 `GPIO_NUM_x` 与纯数字）。
+
+### 当前值（小智 ESP32-S3-AI-2E 模块 + 新载板）
+| 功能 | 引脚 | 功能 | 引脚 |
+|---|---|---|---|
+| LCD DC/RS | **7** | LCD CS | **11** |
+| LCD SCK | **9** | LCD MOSI | **10** |
+| LCD RST | **不接**(仅 10k 上拉) | LCD SPI 时钟 | **30MHz** |
+| 触摸 SDA/SCL | **5 / 13** | 触摸 INT / RST | **12 / 6** |
+| 按键 PWR/RIGHT/LEFT | **1 / 0 / 4**（LEFT 兼"确认"） | 电池 ADC | **ADC1_CH2 = GPIO3** |
+| I2S MCLK / BCLK | **40 / 39** | I2S WS / DOUT / DIN | **45 / 48 / 21** |
+| codec I2C SDA/SCL | **38 / 47** | 功放使能 | **46** |
+| **震动 PWM** | **8**（TM6604，边沿触发） | SD CLK/CMD/D0 | **16 / 15 / 17** |
+| GPS TX/RX | **43 / 44** | **GPS EXTINT** | **不接(-1)** ← 绝不能是 8 |
+
+### ⛔ 铁律（2026-10-16 血泪总结）
+1. **改任何引脚前，先全工程搜"这个新号有没有被别的功能占用"**。
+   实例：`e3605f5` 把 **GPS EXTINT 挪到 GPIO8**，而 GPIO8 是**震动 PWM** ⇒
+   GPS 待机/唤醒时在 EXTINT 上输出脉冲 ⇒ **TM6604 被边沿触发 ⇒ 震动一直震**（软件完全查不出，
+   日志里只有一行 `GPS: ... EXTINT=监听8`）。**现象与"嫌疑功能"常常毫无关系。**
+2. **屏的 RST 不接** ⇒ `(1ULL << rst_gpio)` 必须加 `>= 0` 保护，否则非法掩码 ⇒
+   `gpio_config` 失败 ⇒ `ESP_ERROR_CHECK` abort ⇒ **开不了机、反复重启**。
+3. **TM6604 是边沿触发**：禁止对该脚做 `gpio_reset_pin()`（它会上拉 ⇒ 等于送一个上升沿）、
+   不要让它浮空；`ledc_init` 里也不能 reset 该脚。
+4. **触摸/音频/按键等模块的默认宏必须与真相源一致**：曾出现 `input.c` 里
+   `BTN_GPIO_LEFT` 写死 `GPIO_NUM_18`（微雪值）⇒ **确认键失效**。
+5. **烧录必须整片/三块齐烧**：只烧 `0x60000` 的 app 而引导/分区表不一致 ⇒
+   `Factory app partition is not bootable` ⇒ **整机不跑（表现为全黑）**。
