@@ -3,7 +3,7 @@ idf_component_register(
          "gesture_back.c"
     INCLUDE_DIRS "."
     REQUIRES
-    board_pins
+    hw_cfg board_pins
         driver
         st7305
         touch_panel

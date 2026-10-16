@@ -16,12 +16,12 @@ static uint8_t s_det   = 0;
 static uint8_t s_en    = 0;
 
 /* ---------- NVS ---------- */
-static uint8_t nvs_get_u8(const char *k, uint8_t def) {
+static uint8_t cfg_get_u8(const char *k, uint8_t def) {
     nvs_handle_t h; uint8_t v = def;
     if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) { nvs_get_u8(h, k, &v); nvs_close(h); }
     return v;
 }
-static void nvs_set_u8(const char *k, uint8_t v) {
+static void cfg_set_u8(const char *k, uint8_t v) {
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, k, v); nvs_commit(h); nvs_close(h); }
 }
@@ -76,26 +76,26 @@ bool hw_cfg_enabled(hw_id_t id)  { return (s_en  >> id) & 1u; }
 
 void hw_cfg_set_enabled(hw_id_t id, bool on) {
     if (on) s_en |=  (1u << id); else s_en &= ~(1u << id);
-    nvs_set_u8("en_mask", s_en);
+    cfg_set_u8("en_mask", s_en);
 }
 
 void hw_cfg_rescan(void) {
     int b = detect_board();
-    if (b >= 0) { s_board = b; nvs_set_u8("board_id", (uint8_t)b); }
+    if (b >= 0) { s_board = b; cfg_set_u8("board_id", (uint8_t)b); }
     s_det = scan_peripherals(s_board);
-    uint8_t en = nvs_get_u8("en_mask", 0xFF);
+    uint8_t en = cfg_get_u8("en_mask", 0xFF);
     s_en = (en == 0xFF) ? s_det : (uint8_t)(en & s_det);   /* 手动关过的继续关, 但探测不到的一律不开 */
-    nvs_set_u8("en_mask", s_en);
+    cfg_set_u8("en_mask", s_en);
     ESP_LOGW(TAG, "HW: board=%s det=0x%02X en=0x%02X", hw_cfg_board_name(), s_det, s_en);
 }
 
 int hw_cfg_init(void) {
     int b = detect_board();
-    if (b >= 0) { s_board = b; nvs_set_u8("board_id", (uint8_t)b); }
-    else        { s_board = nvs_get_u8("board_id", HW_BOARD_XIAOZHI); }
+    if (b >= 0) { s_board = b; cfg_set_u8("board_id", (uint8_t)b); }
+    else        { s_board = cfg_get_u8("board_id", HW_BOARD_XIAOZHI); }
     hw_cfg_board_apply();          /* ★把板型交给 board_pins (引脚随之确定) */
     s_det = scan_peripherals(s_board);
-    uint8_t en = nvs_get_u8("en_mask", 0xFF);
+    uint8_t en = cfg_get_u8("en_mask", 0xFF);
     s_en = (en == 0xFF) ? s_det : (uint8_t)(en & s_det);
     ESP_LOGW(TAG, "HW: board=%s det=0x%02X en=0x%02X", hw_cfg_board_name(), s_det, s_en);
     return s_board;

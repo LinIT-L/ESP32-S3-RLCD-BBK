@@ -2,7 +2,8 @@
 #include "gps.h"          /* GPS (MAX-M10S) 驱动 API: gps_init/gps_sleep */
 
 #include "esp_log.h"
-#include "board_pins.h"   /* 板型表: 引脚下发 */
+#include "board_pins.h"
+#include "hw_cfg.h"   /* 板型表: 引脚下发 */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -105,25 +106,16 @@ esp_err_t app_board_init(app_board_t *board)
      * 丢到小任务里做, 启动立即继续, board->sd_ok 稍后由任务置位。
      * (sd_watcher_start 本来就有补挂逻辑, 这里只是不让首次挂载等它 15s 的补挂周期。) */
     board->sd_ok = false;
-#if LINTOS_USE_SD && !LINTOS_LCD_ONLY
-    /* 启用 SD */
-#else
-    ESP_LOGW(TAG, "★诊断: SD 未启用");
-#endif
-#if 0
+if (hw_cfg_enabled(HW_SD)) {
     if (xTaskCreate(sd_mount_task, "sd_mnt", 4096, board, 3, NULL) != pdPASS) {
         ESP_LOGW(TAG, "SD 挂载任务创建失败, 回退为同步挂载");
         esp_err_t sd_ret = sd_mount();
         board->sd_ok = (sd_ret == ESP_OK);
     }
-#endif
+}
 
     /* 3. 初始化按键 */
-#if LINTOS_USE_INPUT && !LINTOS_LCD_ONLY
-    input_init();
-#else
-    ESP_LOGW("APP_BOARD", "★诊断: input 未启用");
-#endif
+if (hw_cfg_enabled(HW_TOUCH) || hw_cfg_enabled(HW_SD)) { input_init(); }   /* 按键总在; 触摸由 input 内部按指纹判 */
 
     /* 4. 初始化 NVS (蓝牙/WiFi 需要存储校准数据和配置) */
     ret = svc_nvs_flash_init();
@@ -139,9 +131,7 @@ esp_err_t app_board_init(app_board_t *board)
     ESP_LOGI(TAG, "事件循环创建成功");
 
     /* 6. 启动 SD 卡监控任务 */
-#if LINTOS_USE_SD && !LINTOS_LCD_ONLY
-    sd_watcher_start();
-#endif
+if (hw_cfg_enabled(HW_SD)) sd_watcher_start();
     return ESP_OK;
 }
 

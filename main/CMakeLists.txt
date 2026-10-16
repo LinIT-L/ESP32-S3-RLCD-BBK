@@ -5,7 +5,7 @@ idf_component_register(
     SRCS "main.c" "remcon.c" "lua_launch.c"
     INCLUDE_DIRS "."
     REQUIRES
-    board_pins
+    hw_cfg board_pins
         self_test
         input
         app_board

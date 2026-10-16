@@ -4,6 +4,7 @@
  */
 #include "input.h"
 #include "board_pins.h"
+#include "hw_cfg.h"
 /* 按键引脚 ★2026-10-13 新载板: SW1=GPIO1(PWR) SW2=GPIO0(右) SW3=GPIO4(左/确认) */
 #define BTN_GPIO_LEFT   (board_pins_get()->btn_left)   /* ★ 按板型表 */
 #define BTN_GPIO_RIGHT  (board_pins_get()->btn_right)
@@ -252,12 +253,8 @@ void input_init(void) {
         tp_pins_t tp = { BOARD_TP_SDA, BOARD_TP_SCL, BOARD_TP_INT, BOARD_TP_RST };
         touch_panel_set_pins(&tp);
     }
-#if LINTOS_USE_TOUCH
-    touch_panel_init();
-#else
-    ESP_LOGW("INPUT", "★诊断: 触摸未启用(微雪无触摸) —— 只跑物理按键");
-    s_has_touch = false;
-#endif
+if (hw_cfg_enabled(HW_TOUCH)) { touch_panel_init(); }
+    else { ESP_LOGW("INPUT", "触摸未启用(未检测到/被关闭)"); s_has_touch = false; }
     /* V1.0.69: 运行时分清两套机型, 物理键语义按有没有触摸屏分支. */
     s_has_touch = touch_panel_is_present();   /* 开机检测一次 */
     input_cfg_keys();                          /* 按结果配置物理键语义 */

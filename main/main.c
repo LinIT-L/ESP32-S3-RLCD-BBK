@@ -24,6 +24,7 @@
 
 #include "st7305.h"
 #include "board_pins.h"
+#include "hw_cfg.h"
 #include "bbk_boot.h"
 #include "input.h"
 #include "gam4980_emu.h"
@@ -312,24 +313,24 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     /* 延后初始化 (避免抢占内部 DMA RAM): 音频 -> 电池.
      * V1.5.x 省电: 蓝牙按需开启 — 开机不再初始化蓝牙 (进蓝牙/手柄设置页时由 os_hw 触发). */
-#if LINTOS_USE_AUDIO && !LINTOS_LCD_ONLY
-    app_board_init_audio(board);
-#else
-    ESP_LOGW("MAIN", "★诊断: LINTOS_USE_AUDIO 未启用");
-#endif
-#if LINTOS_USE_BATTERY && !LINTOS_LCD_ONLY
-    app_board_init_battery(board);
-#else
-    ESP_LOGW("MAIN", "★诊断: LINTOS_USE_BATTERY 未启用");
-#endif
+if (hw_cfg_enabled(HW_AUDIO)) {
+        app_board_init_audio(board);
+    } else {
+        ESP_LOGW("MAIN", "跳过 app_board_init_audio (硬件未检测到/被关闭)");
+    }
+if (hw_cfg_enabled(HW_BATTERY)) {
+        app_board_init_battery(board);
+    } else {
+        ESP_LOGW("MAIN", "跳过 app_board_init_battery (硬件未检测到/被关闭)");
+    }
     /* MAX-M10S GPS (2026-09-29 新增硬件): VCC 常通电, 固件当前不用定位 →
      * 初始化后立刻送"软件待机"(UBX-RXM-PMREQ), 把常驻 25~30mA 降到 µA 级.
      * 模块化: 驱动在 components/drivers/gps (gps.h API), 板级封装在 app_board. */
-#if LINTOS_USE_GPS && !LINTOS_LCD_ONLY
-    app_board_init_gps(board);
-#else
-    ESP_LOGW("MAIN", "★诊断: LINTOS_USE_GPS 未启用");
-#endif
+if (hw_cfg_enabled(HW_GPS)) {
+        app_board_init_gps(board);
+    } else {
+        ESP_LOGW("MAIN", "跳过 app_board_init_gps (硬件未检测到/被关闭)");
+    }
     /* ★★ 2026-10-15 linit "联网归网络模块管": 开机由**网络模块**自动联网 ——
      *   有保存凭据就拉起射频并连接, 之后断线重连全归它的自愈任务。
      *   应用/商店只管查 wifi_manager_is_connected(), 不再各自弹门禁去连网
@@ -397,6 +398,9 @@ void app_main(void)
 
     /* === 硬件初始化 (app_board 模块化封装, 顺序敏感见 components/app_board) === */
     app_board_t board;
+    /* ★★★ 2026-10-16 自适应: 开机先探测芯片指纹定板型, 再让 app_board 按板型下发引脚 */
+    hw_cfg_init();
+
     esp_err_t ret = app_board_init(&board);
 
     if (ret != ESP_OK) {
