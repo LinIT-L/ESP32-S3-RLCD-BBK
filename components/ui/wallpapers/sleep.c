@@ -19,6 +19,7 @@
  * 关机来源用 RTC 内存保存(RTC_NOINIT_ATTR, 掉电才清; 官方示例同样用 RTC 内存跨睡眠存数据)。
  * ==========================================================================*/
 #include <stdbool.h>
+#include "board_pins.h"   /* ★按键引脚唯一真相源 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -28,8 +29,11 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "audio_player.h"   /* audio_pa_force_off(): 进深睡前关功放并 hold 低电平 */
+#include "gps.h"            /* gps_sleep(): 进深睡前把 GPS 送进 backup 待机 (2026-10-09) */
 
 #include "sleep.h"
+#include "power_stat.h"     /* power_stat_on_deep_sleep(): 睡前结账 (电池信息页) */
 #include "st7305.h"
 #include "bt_manager.h"
 #include "wifi_manager.h"
@@ -37,9 +41,9 @@
 #define TAG "PWR"
 
 /* 物理键: PWR(GPIO1) / KEY 左(GPIO18) / BOOT 右(GPIO0), 低电平按下。 */
-#define PWR_KEY     GPIO_NUM_1
-#define KEY_LEFT   GPIO_NUM_4
-#define KEY_RIGHT   GPIO_NUM_0
+#define PWR_KEY     (board_pins_get()->btn_pwr)   /* ★ 按板型表 */
+#define KEY_LEFT    (board_pins_get()->btn_left)
+#define KEY_RIGHT   (board_pins_get()->btn_right)
 
 #define PWR_MASK       (1ULL << PWR_KEY)
 /* 唤醒掩码 = PWR(GPIO1) + KEY 左(GPIO18)。**故意不含 GPIO0(BOOT 键)**:
@@ -87,12 +91,31 @@ static void wake_src_set(uint64_t mask)
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     esp_err_t err = esp_sleep_enable_ext1_wakeup_io(mask, WAKE_LEVEL);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "EXT1 唤醒源设置失败: %s", esp_err_to_name(err));
+        ESP_LOGD(TAG, "EXT1 唤醒源设置失败: %s", esp_err_to_name(err));
     }
     /* EXT1 不在 IDF 的"自动保 RTC_PERIPH 供电"名单里(RTC_EXT0/RTC_GPIO 才自动开,
      * 见 sleep_modes.c), 不显式打开则该域掉电 → RTC 上拉失效 → 引脚浮空被误唤醒。
      * 代价是深睡电流略高, 对按键唤醒设备是必要开销。 */
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+}
+
+/* ---- ★ 深睡期间"锁住唤醒键的当前配置" (2026-10-14 修"睡眠秒自醒") ----
+ * 症状: 自动关机(掩码 GPIO1|GPIO4)一睡就醒; 手动关机(仅 GPIO1)能睡住。
+ * 根因: `gpio_config()` 配的上拉属于**数字域**, 深睡时数字域掉电 → 上拉失效 → 引脚浮空;
+ *       EXT1 是电平触发(ANY_LOW), 浮空脚被当成"按下" → 立刻自醒。
+ *       GPIO1 浮空恰好落在高电平所以没事, GPIO4 浮空落在低电平 → 秒醒。
+ *       (老板 LEFT=GPIO18 只是"运气好浮在高", 这坑一直在, 换到 GPIO4 才暴露。)
+ * 官方手段 (IDF `driver/gpio.h`): `gpio_hold_en(pin)` 把该 pad 的**当前有效配置**(含上拉)锁存,
+ *       再 `gpio_deep_sleep_hold_en()` 让锁存在**深睡期间**生效 ——
+ *       原文: "the state of each pad holds is its active configuration (not pad's sleep configuration!)"。
+ * ⛔ 不要用 `rtc_gpio_init()` 那条路: 它把 pad 切到 RTC 功能, 数字读键会失灵(0.7 踩过)。
+ * 释放: 醒来后由 `app_board` 的 `gpio_hold_dis()` 统一解。 */
+static void wake_pins_hold(uint64_t mask)
+{
+    if (mask & PWR_MASK)             gpio_hold_en(PWR_KEY);
+    if (mask & (1ULL << KEY_LEFT))   gpio_hold_en(KEY_LEFT);
+    if (mask & (1ULL << KEY_RIGHT))  gpio_hold_en(KEY_RIGHT);
+    gpio_deep_sleep_hold_en();   /* 幂等; audio_pa_force_off() 也会调 */
 }
 
 /* 掩码内是否有键正被按住 */
@@ -136,6 +159,33 @@ void wp_power_off(int origin)
     if (bt_manager_is_enabled())   bt_manager_disable();
     if (wifi_manager_is_enabled()) wifi_manager_disable();
 
+    /* ★ 功放使能必须显式关断并 hold 住低电平。
+     *   深睡时 GPIO 默认变高阻, 若模块侧功放 SD 脚有外部上拉, 功放会在**整个睡眠
+     *   期间保持工作**(几十 mA 级) —— "关机了还在耗电"的典型来源。
+     *   必须在进深睡**之前**做 (esp_deep_sleep_start 之后没有代码会执行)。 */
+    /* ★ 2026-10-09: GPS (MAX-M10S) 也必须显式送进"软件待机", 并把 ESP 侧 TX 钉住。
+     *   为什么必须在这里做:
+     *   ① 深睡期间**没有任何代码会执行** ⇒ 若此刻 GPS 还在连续跟踪, 它会整夜保持
+     *      ~10mA(峰值 25mA); 而待机只要 46µA —— 差 200 倍。这是"关机还在掉电"的
+     *      另一大来源 (此前只治了功放 GPIO46 那一路)。
+     *   ② GPS 的唤醒源是 **UART RX**。深睡时 GPIO 变高阻, TX 浮空/拾噪会被 GPS 当成
+     *      起始位把它唤醒 —— 醒后再没人让它睡回去。`gpio_hold_en` 把 TX 冻在 UART
+     *      的空闲高电平上, 从根上不给它边沿。
+     *   ⚠ 顺序: 先 gps_sleep() (要发 UBX, 需要 UART 还能工作) 再 hold。 */
+    gps_sleep();
+    {
+        const gps_config_t *gc = gps_default_config();
+        if (gc && gc->pin_tx >= 0) {
+            gpio_hold_en((gpio_num_t)gc->pin_tx);   /* 冻住当前电平 (UART 空闲 = 高) */
+            ESP_LOGI(TAG, "GPS 已送待机, TX(GPIO%d) 已 hold 在高电平", gc->pin_tx);
+        }
+    }
+
+    /* ⚠ 必须放在 GPS 之后调用: 这行内部会 gpio_deep_sleep_hold_en() + hold 功放脚,
+     *   把 pad 冻住。放在前面会把 UART TX 也冻上, 上面那条 UBX 就发不出去
+     *   —— "GPS 送待机" 会静默失败, 深睡期间 GPS 继续 ~10mA。(2026-10-09 修顺序) */
+    audio_player_sleep_for_off();
+
     if (s_lcd) {
         st7305_clear(s_lcd, ST7305_COLOR_WHITE);
         st7305_flush_override(s_lcd);
@@ -145,16 +195,20 @@ void wp_power_off(int origin)
     s_off_origin = ORIGIN_MAGIC | (uint32_t)((unsigned)origin & 0xFFu);
 
     /* 诊断: 关机前的三键电平(1=松开 0=按下)。某键恒 0 = 浮空/被外部拉低 → 会被 EXT1 误唤醒。 */
-    ESP_LOGW(TAG, "关机前键电平: PWR=%d KEY18=%d BOOT0=%d",
-             gpio_get_level(PWR_KEY), gpio_get_level(KEY_LEFT), gpio_get_level(KEY_RIGHT));
+    ESP_LOGI(TAG, "关机前键电平: PWR(%d)=%d LEFT(%d)=%d RIGHT(%d)=%d",
+             (int)PWR_KEY, gpio_get_level(PWR_KEY),
+             (int)KEY_LEFT, gpio_get_level(KEY_LEFT),
+             (int)KEY_RIGHT, gpio_get_level(KEY_RIGHT));
 
     wait_keys_released(mask);
     wake_src_set(mask);
+    wake_pins_hold(mask);   /* ★ 锁住唤醒键的上拉配置, 否则深睡数字域掉电→浮空→秒醒 */
 
     ESP_LOGI(TAG, "关机: 进入深睡 (来源=%s, 唤醒=%s, 掩码=0x%llX)",
              (origin == WP_OFF_AUTO) ? "休眠到点" : "手动",
              (origin == WP_OFF_AUTO) ? "任意键" : "PWR 键按住 0.5s",
              (unsigned long long)mask);
+    power_stat_on_deep_sleep();   /* 结账"醒着段", 记下入睡时刻 (电池信息页用) */
     esp_deep_sleep_start();
     /* 不返回 */
 }
@@ -176,6 +230,33 @@ void wp_power_wake_gate(void)
             wait_keys_released(PWR_MASK);
             s_off_origin = ORIGIN_MAGIC | (uint32_t)WP_OFF_MANUAL;
             wake_src_set(PWR_MASK);
+            /* 进深睡前的统一不变量: 功放必须关断并 hold 低电平
+             * (这条路径在 app_board_init 之前, 但同样不能漏 —— 睡眠期间功放耗电是
+             *  "关机了还在掉电" 的典型来源)。 */
+            /* ★ 2026-10-09: GPS (MAX-M10S) 也必须显式送进"软件待机", 并把 ESP 侧 TX 钉住。
+     *   为什么必须在这里做:
+     *   ① 深睡期间**没有任何代码会执行** ⇒ 若此刻 GPS 还在连续跟踪, 它会整夜保持
+     *      ~10mA(峰值 25mA); 而待机只要 46µA —— 差 200 倍。这是"关机还在掉电"的
+     *      另一大来源 (此前只治了功放 GPIO46 那一路)。
+     *   ② GPS 的唤醒源是 **UART RX**。深睡时 GPIO 变高阻, TX 浮空/拾噪会被 GPS 当成
+     *      起始位把它唤醒 —— 醒后再没人让它睡回去。`gpio_hold_en` 把 TX 冻在 UART
+     *      的空闲高电平上, 从根上不给它边沿。
+     *   ⚠ 顺序: 先 gps_sleep() (要发 UBX, 需要 UART 还能工作) 再 hold。 */
+    gps_sleep();
+    {
+        const gps_config_t *gc = gps_default_config();
+        if (gc && gc->pin_tx >= 0) {
+            gpio_hold_en((gpio_num_t)gc->pin_tx);   /* 冻住当前电平 (UART 空闲 = 高) */
+            ESP_LOGI(TAG, "GPS 已送待机, TX(GPIO%d) 已 hold 在高电平", gc->pin_tx);
+        }
+    }
+
+    /* ⚠ 必须放在 GPS 之后调用: 这行内部会 gpio_deep_sleep_hold_en() + hold 功放脚,
+     *   把 pad 冻住。放在前面会把 UART TX 也冻上, 上面那条 UBX 就发不出去
+     *   —— "GPS 送待机" 会静默失败, 深睡期间 GPS 继续 ~10mA。(2026-10-09 修顺序) */
+    audio_player_sleep_for_off();
+            wake_pins_hold(PWR_MASK);   /* 同样要锁住 PWR 上拉, 否则浮空秒醒 */
+            power_stat_on_deep_sleep();   /* 误触回睡也要结账 (醒着段不能白算) */
             esp_deep_sleep_start();   /* 不返回 */
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -203,11 +284,12 @@ void wp_sleep_boot_diag(void)
     int o = wp_power_wake_origin();
     /* ext1_status: 触发本次唤醒的键掩码(按 GPIO 号; 0 = 非 EXT1 唤醒)。 */
     uint64_t ws = (w == ESP_SLEEP_WAKEUP_EXT1) ? esp_sleep_get_ext1_wakeup_status() : 0;
-    ESP_LOGI(TAG, "开机: reset_reason=%d wakeup_cause=%d 关机来源=%s ext1_status=0x%llX (PWR1=%d KEY18=%d BOOT0=%d)",
+    ESP_LOGI(TAG, "开机: reset_reason=%d wakeup_cause=%d 关机来源=%s ext1_status=0x%llX "
+                  "(PWR%d=%d LEFT%d=%d RIGHT%d=%d)",
              (int)r, (int)w,
              (o == WP_OFF_MANUAL) ? "手动" : (o == WP_OFF_AUTO) ? "休眠到点" : "非关机唤醒",
              (unsigned long long)ws,
-             (ws & PWR_MASK) ? 1 : 0,
-             (ws & (1ULL << KEY_LEFT)) ? 1 : 0,
-             (ws & (1ULL << KEY_RIGHT)) ? 1 : 0);
+             (int)PWR_KEY,     (ws & PWR_MASK) ? 1 : 0,
+             (int)KEY_LEFT,    (ws & (1ULL << KEY_LEFT)) ? 1 : 0,
+             (int)KEY_RIGHT,   (ws & (1ULL << KEY_RIGHT)) ? 1 : 0);
 }

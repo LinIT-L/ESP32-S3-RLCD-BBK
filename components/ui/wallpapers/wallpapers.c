@@ -216,6 +216,7 @@ static st7305_handle_t *s_ss_lcd = NULL;
 
 #include "sleep.h"   /* 电源模块: wp_power_init(绑定 LCD + 注册深睡唤醒源) */
 #include "usb_hid.h" /* usb_hid_host_mounted(): USB 插着就不自动休眠 (2026-10-02) */
+#include "power_stat.h" /* power_stat_tick(): USB 插入边沿 → 电源统计清零 (电池信息页) */
 
 /* USB(主机已枚举) 期间不自动休眠: 插在电脑上时正在传文件/调试/充电, 不希望它息屏甚至自动关机。 */
 static bool s_usb_suppress_prev = false;
@@ -224,9 +225,10 @@ static void ss_supervisor_task(void *arg) {
     (void)arg;
     /* [诊断] 开机复位原因: 6=esp_restart软复位 / 7=CPU看门狗(panic) / 其它=上电/深睡 等.
      *   用于区分浅睡唤醒后的"重启回桌面"是软复位还是异常panic. */
-    ESP_LOGW(WP_TAG, "开机: reset_reason=%d", (int)esp_reset_reason());
+    ESP_LOGD(WP_TAG, "开机: reset_reason=%d", (int)esp_reset_reason());
     while (1) {
         uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        power_stat_tick();   /* USB 插入边沿 → 电源统计清零 (电池信息页; 本任务已在轮询 USB) */
         if (os_screensaver_active()) {
             /* ★★★ 2026-10-02 修复「按一次键画面定住、要按第二次才返回」:
              *   原来本分支是"**先画星空+刷屏, 再判输入唤醒**"。按键唤醒时:
@@ -264,12 +266,16 @@ static void ss_supervisor_task(void *arg) {
             bool usb = usb_hid_host_mounted();
             if (usb != s_usb_suppress_prev) {
                 s_usb_suppress_prev = usb;
-                ESP_LOGW(WP_TAG, "USB 主机%s → %s", usb ? "已连接" : "已断开",
+                ESP_LOGD(WP_TAG, "USB 主机%s → %s", usb ? "已连接" : "已断开",
                          usb ? "暂停自动休眠/自动关机" : "恢复自动休眠");
             }
             uint32_t last_in = input_last_any_ms();
-            if (!usb && last_in != 0 && now - last_in >= wp_ss_delay_ms()) {
-                ESP_LOGW(WP_TAG, "独立监视: 空闲超时, 强制进入壁纸");
+            /* ★ 2026-10-09: "正在玩(按住游戏键)不自动进屏保" —— 按住不再刷新 last_in,
+             *   所以这里必须显式避开, 否则按住键玩 10 分钟会被判空闲而进屏保。
+             *   (松开的一瞬间 input_mark_game_held() 会重置时钟, 于是"放下手柄才开始计时") */
+            if (!usb && last_in != 0 && !input_game_key_held() &&
+                now - last_in >= wp_ss_delay_ms()) {
+                ESP_LOGD(WP_TAG, "独立监视: 空闲超时, 强制进入壁纸");
                 os_screensaver_force_enter();
             }
             vTaskDelay(pdMS_TO_TICKS(250));

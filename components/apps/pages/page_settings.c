@@ -14,6 +14,7 @@
 #include "st7305.h"       /* st7305_set_inversion: 暗黑模式(面板反色) */
 #include "ui_common.h"
 #include "wallpapers.h" /* wp_screensaver_set_delay_ms: 设置休眠时间后更新息屏延时 */
+#include "power_stat.h"  /* 电池信息页: 运行/睡眠/上次充电至今 三个时长 */
 #include "input.h"       /* input_consume_tap / input_get_touch_pos (时间滚轮), esp_util.h */
 #include "esp_attr.h"
 #include "font_zh.h"
@@ -96,13 +97,9 @@ static void settings_load(void) {
     nvs_handle_t h;
     if (svc_nvs_open(SET_NS, NVS_READONLY, &h) != ESP_OK) return;
     uint8_t v;
-    if (svc_nvs_get_u8(h, "vol", &v) == ESP_OK) {
-        /* 兼容: 旧固件存 0-100 百分比, 新固件存档位 0-9 */
-        int pct = (v > (uint8_t)(AUDIO_VOL_STEPS - 1)) ? (int)v
-                  : audio_player_vol_to_percent((int)v);
-        audio_player_set_volume(pct);
-    }
-    if (svc_nvs_get_u8(h, "snd_on", &v) == ESP_OK)     audio_player_set_muted(!v);
+    /* ⚠ 音量 "vol" 与声音开关 "snd_on" 已改由 **audio_player_init() 自己开机恢复**
+     *   (2026-10-14: 原来只在这里恢复 ⇒ 不进设置页就永远停在默认 100%, 用户以为没生效)。
+     *   这里不再重复处理, 保证单一归属。 */
     /* V1.2.x: 震动拆为 UI/游戏 两个独立开关 (NVS vib_ui / vib_game).
      * 旧固件的单键 "vib" 仅作首次迁移: 任一缺省时取旧值. */
     if (svc_nvs_get_u8(h, "vib_ui", &v) == ESP_OK)        s_vib_ui = v;
@@ -621,7 +618,8 @@ static void open_dark_dlg(ui_ctx_t *ctx) {
     os_dialog_wheel(ctx, ptrs, 3, s_dark, on_dark_wheel);
 }
 
-/* ---- 休眠相关子菜单 (V1.5.x): 壁纸时间 / 休眠时间 / 关机时间 / 触摸唤醒 ---- */
+/* 休眠相关子菜单 (V1.5.x): 壁纸时间 / 休眠时间 / 关机时间 / 电池信息 / 触摸唤醒
+ * (linit 2026-10-14: 触摸唤醒常驻**最下面**, 开关类放末尾) */
 static void open_disp_dlg(ui_ctx_t *ctx, int sel);
 static void open_sleepgrp_dlg(ui_ctx_t *ctx, int sel);
 /* 休眠时间 (与壁纸页共用 NVS "os_wp"/"wp_run"; 档位数组见上方 s_wpgrp_mins) */
@@ -646,18 +644,153 @@ static void open_shutgrp_min_dlg(ui_ctx_t *ctx) {
     dlg.on_touch  = wheel_touch;
     os_dialog_push(ctx, &dlg);
 }
-/* 休眠相关 触摸唤醒 toggle (关后原地刷新) */
+/* ============ 电池信息 (休眠与电源 → 电池信息) ============
+ * 自绘整层弹窗 (on_render 全接管): 上方当前电压, 主体是**横向电压波形图**。
+ *   数据 = board_battery_history() 的真实采样点 (60s 一条, 环形 ≤64 条 ≈ 近 1 小时),
+ *   纵轴固定 3.3V(空) ~ 4.2V(满), 与电量换算同口径。
+ * ★ 尺寸/底栏必须与 os_dialog 标准列表弹窗**完全一致** (linit 要求):
+ *   350×250 (屏 400×300 − DLG_MARGIN 25×2) · 边框 2px ·
+ *   底栏 = 40px 行高, 顶 = y + h − 4 − 40, 分隔线在其上一行且左右各内缩 6px, 文字居中。 */
+#define BI_W       350                 /* = DLG_W: ui_screen_w() - 25*2 */
+#define BI_H       250                 /* = DLG_H: ui_screen_h() - 25*2 */
+#define BI_PAD     4                   /* = os_dialog 的 inner_pad */
+#define BI_LINE_H  40                  /* = DLG_LINE_H (底栏行高) */
+#define BI_V_MIN   3300u               /* 纵轴下限 mV */
+#define BI_V_MAX   4200u               /* 纵轴上限 mV */
+#define BI_FOOT_Y  (BI_H - BI_PAD - BI_LINE_H)   /* 底栏行顶 (相对弹窗): 206 */
+
+static uint32_t s_bi_last_s;
+
+/* 电压 → 图内 y (纵轴 3.3~4.2V 线性映射, 夹在画框内) */
+static int bi_v_to_y(uint32_t mv, int gy0, int gy1) {
+    if (mv < BI_V_MIN) mv = BI_V_MIN;
+    if (mv > BI_V_MAX) mv = BI_V_MAX;
+    int ih = gy1 - gy0 - 1;
+    int y = gy1 - 1 - (int)((mv - BI_V_MIN) * (uint32_t)ih / (BI_V_MAX - BI_V_MIN));
+    if (y < gy0 + 1) y = gy0 + 1;
+    if (y > gy1 - 1) y = gy1 - 1;
+    return y;
+}
+
+static bool batinfo_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)d; (void)ud;
+    st7305_handle_t *lcd = ctx->lcd;
+    if (!lcd) return true;
+
+    const int bx = (UI_SCREEN_W - BI_W) / 2, by = (UI_SCREEN_H - BI_H) / 2;
+    const int fty = by + BI_FOOT_Y;                 /* 底栏行顶 (绝对) */
+
+    /* 白底 + 2px 边框. ⛔ 上方不要标题「电池信息」和横杠;
+     *    波形**直接画在这个弹窗边框里**, 不再自画图框 (linit 2026-10-14)。 */
+    fill_rect(lcd, bx, by, bx + BI_W - 1, by + BI_H - 1, ST7305_COLOR_WHITE);
+    for (int k = 0; k < 2; k++) {
+        draw_hline(lcd, bx + k, bx + BI_W - 1 - k, by + k, ST7305_COLOR_BLACK);
+        draw_hline(lcd, bx + k, bx + BI_W - 1 - k, by + BI_H - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, bx + k, by + k, by + BI_H - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, bx + BI_W - 1 - k, by + k, by + BI_H - 1 - k, ST7305_COLOR_BLACK);
+    }
+
+    /* ---- 历史样本: 1 字节/分钟, 保留 7 天 (PSRAM + 按天 NVS), 绘制时按窗口抽稀 ---- */
+    static EXT_RAM_BSS_ATTR bat_sample_t smp[BOARD_BATTERY_WAVE_MAX];
+    /* 窗口 = 实际已有数据跨度, 上限 7 天 ⇒ 有几条就撑满整宽 (linit: "实时填满") */
+    uint32_t win = board_battery_hist_span_s();
+    if (win > BOARD_BATTERY_SPAN_MAX) win = BOARD_BATTERY_SPAN_MAX;
+    if (win < 600u) win = 600u;
+    int n = board_battery_wave(smp, BOARD_BATTERY_WAVE_MAX, win);
+    uint32_t now = board_battery_clock_s();
+    uint32_t t0  = (now > win) ? (now - win) : 0;
+
+    /* ---- 顶行: 电压靠左 / 百分比靠右 (linit: 贴两侧; 中间不显示时间) ---- */
+    board_battery_status_t bat;
+    uint32_t mv = 0, pct = 0;
+    if (board_battery_read_cached(&bat) == ESP_OK) { mv = bat.voltage_mv; pct = bat.percent; }
+    char vtxt[24];
+    if (mv) snprintf(vtxt, sizeof(vtxt), "%u.%02uV", (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
+    else    snprintf(vtxt, sizeof(vtxt), "无电池数据");
+    const int ty = by + 8;
+    draw_text(lcd, bx + 10, ty, vtxt, false);                       /* 左 */
+    if (mv) {
+        char ptxt[12];
+        snprintf(ptxt, sizeof(ptxt), "%u%%", (unsigned)pct);
+        draw_text(lcd, bx + BI_W - 10 - text_width(ptxt), ty, ptxt, false);   /* 右 */
+    }
+
+    /* ---- 电压波形: 直接铺在弹窗内框里 (横轴=时间) ---- */
+    const int gx0 = bx + 6, gx1 = bx + BI_W - 7;
+    const int gy0 = by + 36, gy1 = fty - 6;
+    const int iw = gx1 - gx0 - 1;
+    if (n >= 1 && win) {
+        /* 相邻样本**直接连线** —— 曲线按真实时间铺在窗口里, 所以**深睡那段也被连起来**
+         * (linit: "休眠的时候唤醒波形图, 中间也连接起来 这样就方便判断") */
+        int px = -1, py = 0;
+        for (int i = 0; i < n; i++) {
+            if (smp[i].t < t0) continue;                       /* 窗口外的样本不画 */
+            int x = gx0 + (int)((uint64_t)(smp[i].t - t0) * (uint32_t)iw / win);
+            if (x > gx1) x = gx1;
+            if (x < gx0) x = gx0;
+            int y = bi_v_to_y(smp[i].mv, gy0, gy1);
+            if (px < 0) { ui_draw_pixel(lcd, x, y, ST7305_COLOR_BLACK); px = x; py = y; continue; }
+            int lasty = -1;
+            for (int X = px; X <= x; X++) {
+                int yy = (x == px) ? y : (py + (int)((int32_t)(y - py) * (X - px) / (x - px)));
+                if (lasty < 0) ui_draw_pixel(lcd, X, yy, ST7305_COLOR_BLACK);
+                else draw_vline(lcd, X, (lasty < yy) ? lasty : yy,
+                                         (lasty < yy) ? yy : lasty, ST7305_COLOR_BLACK);
+                lasty = yy;
+            }
+            px = x; py = y;
+        }
+    } else if (n == 0) {
+        const char *ph = "采样中...";
+        draw_text(lcd, gx0 + (gx1 - gx0 - text_width(ph)) / 2, gy0 + (gy1 - gy0) / 2 - 12, ph, false);
+    }
+
+    /* ---- 底栏 (与标准列表弹窗同几何: 分隔线在行上一行, 左右内缩 6px; 文字 40px 行内居中) ---- */
+    draw_hline(lcd, bx + 6, bx + BI_W - 7, fty - 1, ST7305_COLOR_BLACK);
+    const char *ok = "退出";
+    draw_text(lcd, bx + BI_W / 2 - text_width(ok) / 2, fty + (BI_LINE_H - 24) / 2, ok, false);
+    return true;
+}
+
+static bool batinfo_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
+    (void)d; (void)ud;
+    const int bx = (UI_SCREEN_W - BI_W) / 2, by = (UI_SCREEN_H - BI_H) / 2;
+    const int fty = by + BI_FOOT_Y;
+    if (x < bx || x > bx + BI_W - 1 || y < by || y > by + BI_H - 1) return false;
+    if (y >= fty) os_dialog_pop(ctx);   /* 底部"退出"行 → 关掉本弹窗 */
+    return true;                        /* 窗内点击一律消费, 不穿透到下层 */
+}
+
+static void batinfo_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)d; (void)ud;
+    /* 每秒刷一帧: 三个时长是秒级更新的; 电压本身 60s 才来一个新采样点 */
+    uint32_t s = (uint32_t)(esp_timer_get_time() / 1000000);
+    if (s != s_bi_last_s) { s_bi_last_s = s; ctx->needs_redraw = true; }
+}
+
+static void open_batinfo_dlg(ui_ctx_t *ctx) {
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    dlg.no_footer = true;              /* 整层自绘 (含底部"退出") */
+    dlg.on_render = batinfo_render;
+    dlg.on_poll   = batinfo_poll;
+    dlg.on_touch  = batinfo_touch;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* 休眠相关子菜单 → 选中项 */
 static void on_sleepgrp_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     switch (result) {
     case 0: open_sleep_dlg(ctx); break;          /* 壁纸时间 (os_wp/min: 无操作多久进壁纸) */
     case 1: open_wp_dlg(ctx); break;             /* 休眠时间 (os_wp/wp_run: 壁纸播多久进休眠) */
     case 2: open_shutgrp_min_dlg(ctx); break;    /* 关机时间 */
-    case 3: {  /* 触摸唤醒壁纸开关 (V1.5.x) */
+    case 3: open_batinfo_dlg(ctx); break;        /* 电池信息 (电压波形图) */
+    case 4: {  /* 触摸唤醒壁纸开关 (V1.5.x, 常驻最下面) */
         bool en = !wp_screensaver_touch_wake_enabled();
         wp_screensaver_set_touch_wake(en);
         os_dialog_pop(ctx);
-        open_sleepgrp_dlg(ctx, 3);
+        open_sleepgrp_dlg(ctx, 4);
         os_dialog_toast(ctx, en ?
             "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x8f\xaf\xe5\x94\xa4\xe9\x86\x92\xe5\xa3\x81\xe7\xba\xb8" :   /* 触摸可唤醒壁纸 */
             "\xe8\xa7\xa6\xe6\x91\xb8\xe4\xb8\x8d\xe5\x94\xa4\xe9\x86\x92\xe5\xa3\x81\xe7\xba\xb8");  /* 触摸不唤醒壁纸 */
@@ -667,16 +800,17 @@ static void on_sleepgrp_select(ui_ctx_t *ctx, int result, void *ud) {
     }
 }
 static void open_sleepgrp_dlg(ui_ctx_t *ctx, int sel) {
-    char items[4][24];
-    const char *ptrs[4];
+    char items[5][24];
+    const char *ptrs[5];
     snprintf(items[0], sizeof(items[0]), "\xe5\xa3\x81\xe7\xba\xb8\xe6\x97\xb6\xe9\x97\xb4");  /* 壁纸时间(os_wp/min=无操作多久进壁纸) */
     snprintf(items[1], sizeof(items[1]), "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4");  /* 休眠时间(os_wp/wp_run=壁纸播多久进休眠) */
     snprintf(items[2], sizeof(items[2]), "\xe5\x85\xb3\xe6\x9c\xba\xe6\x97\xb6\xe9\x97\xb4");  /* 关机时间 */
-    snprintf(items[3], sizeof(items[3]), "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x94\xa4\xe9\x86\x92:%s",  /* 触摸唤醒:开/关 */
+    snprintf(items[3], sizeof(items[3]), "\xe7\x94\xb5\xe6\xb1\xa0\xe4\xbf\xa1\xe6\x81\xaf");  /* 电池信息 */
+    snprintf(items[4], sizeof(items[4]), "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x94\xa4\xe9\x86\x92:%s",  /* 触摸唤醒:开/关 */
              wp_screensaver_touch_wake_enabled() ? "\xe5\xbc\x80" : "\xe5\x85\xb3");
-    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3];
-    sel = (sel < 0) ? 0 : (sel > 3 ? 3 : sel);
-    os_dialog_list(ctx, "\xe4\xbc\x91\xe7\x9c\xa0\xe7\x9b\xb8\xe5\x85\xb3", ptrs, 4, sel, on_sleepgrp_select, NULL);
+    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3]; ptrs[4] = items[4];
+    sel = (sel < 0) ? 0 : (sel > 4 ? 4 : sel);
+    os_dialog_list(ctx, "\xe4\xbc\x91\xe7\x9c\xa0\xe7\x9b\xb8\xe5\x85\xb3", ptrs, 5, sel, on_sleepgrp_select, NULL);
 }
 
 /* ---- 显示与时间弹窗: 平铺 4 项 (日期/时间/字体/暗黑; 休眠独立为主菜单项) ---- */
@@ -730,8 +864,9 @@ static void open_snd_dlg(ui_ctx_t *ctx, int sel);
 static void on_vol_wheel(ui_ctx_t *ctx, int sel, void *ud) {
     (void)ud;
     if (sel >= 0 && sel < AUDIO_VOL_STEPS) {
+        /* ★ 音量统一入口: 只调它, 持久化由 audio_player 自己负责 (存百分比)。
+         *   ⛔ 不要再在这里 settings_save_u8("vol", sel) —— 两处存档会不一致。 */
         audio_player_set_volume(audio_player_vol_to_percent(sel));
-        settings_save_u8("vol", (uint8_t)sel);   /* 存档位 0-9 */
     }
     os_dialog_mark_handled(ctx);   /* 阻止自动弹栈, 由下面自行替换刷新 */
     os_dialog_pop(ctx);            /* 滚轮 */

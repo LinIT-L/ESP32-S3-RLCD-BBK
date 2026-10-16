@@ -181,6 +181,7 @@ static char *rc_next(char **rest){
 /* ===== 立即执行 (在字符串读任务上下文, 不外发到 UI) =====
  * 注意: 必须在内部复制一份再用 —— 调用方 rc_exec 里的 buf 已被 rc_next 在
  * 命令名后写过 '\0', 直接传进去会丢掉后面所有参数(如 "shutdown auto" 变成 "shutdown")。 */
+static void rc_cmd_mt(void);   /* 内部 RAM 运行时归属审计 (定义见文件后部) */
 static void rc_cmd_immediate(const char *line){
     char args[RC_LINE_MAX];
     snprintf(args, sizeof(args), "%s", line);
@@ -259,6 +260,9 @@ static void rc_cmd_immediate(const char *line){
     } else if (strcmp(cmd, "blk") == 0) {
         /* 内部堆块级 dump: 定位具体模块/静态缓冲占用 */
         heap_caps_dump(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    } else if (strcmp(cmd, "mt") == 0) {
+        /* 内部 RAM **运行时归属**审计 (2026-10-16): 谁在用内部堆 */
+        rc_cmd_mt();
     } else if (strcmp(cmd, "stack") == 0) {
         printf("STACK mine=%u\r\n",
                (unsigned)uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()));
@@ -394,12 +398,143 @@ static void rc_cmd_immediate(const char *line){
             fflush(stdout);
         }
     } else if (strcmp(cmd, "help") == 0) {
-        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait help\r\n");
+        printf("CMDS: hello echo reboot shutdown loglevel mem blk mt audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait help\r\n");
     }
     fflush(stdout);
 }
 
-/* ===== 注入队列 ===== */
+/* ================== mt: 内部 RAM 运行时归属审计 ==================
+ * 回答"**到底是什么程序在用内部 RAM**"的设备侧命令 (2026-10-16)。
+ * 静态占用(编译期 .bss/.data/IRAM) → 主机命令 `python tools/mem_audit.py`
+ * 运行时占用(堆) → 本命令:
+ *   ① 内部堆的每个 region (起止地址), 看堆到底覆盖了哪些 SRAM
+ *   ② 每个任务: 栈基址 / 栈总大小(从堆块反查) / 剩余水位 / 空隙浪费率
+ *   ③ 内部堆每个已分配块 → 归属到「某任务栈」或「非栈」, 两者分别求和
+ *   ④ 非栈块中 ≥1KB 的逐条列出 (拿去和源码里的缓冲尺寸对号)
+ * 说明: 非栈块没有归属信息, 要看"哪个函数分配的"需开 CONFIG_HEAP_TRACING;
+ *       本命令的定位是**先量出谁占大头**, 不做逐次分配追踪。 */
+#define MT_MAX_TASK   24
+#define MT_MAX_REGION  8
+#define MT_MAX_BIG    40
+typedef struct { const char *name; uint32_t base; uint32_t size; uint32_t hwm; } mt_task_t;
+typedef struct { uint32_t start, end; } mt_region_t;
+static mt_task_t  s_mt_task[MT_MAX_TASK];
+static int        s_mt_n;
+static mt_region_t s_mt_reg[MT_MAX_REGION];
+static int        s_mt_reg_n;
+static uint32_t   s_mt_stack_bytes, s_mt_other_bytes, s_mt_other_blocks;
+static uint32_t   s_mt_big[MT_MAX_BIG];
+static int        s_mt_big_n;
+
+static bool mt_region_cb(walker_heap_into_t hi, walker_block_info_t bi, void *ud)
+{
+    (void)bi; (void)ud;
+    for (int i = 0; i < s_mt_reg_n; i++)
+        if (s_mt_reg[i].start == (uint32_t)hi.start) return true;
+    if (s_mt_reg_n < MT_MAX_REGION) {
+        s_mt_reg[s_mt_reg_n].start = (uint32_t)hi.start;
+        s_mt_reg[s_mt_reg_n].end   = (uint32_t)hi.end;
+        s_mt_reg_n++;
+    }
+    return true;
+}
+
+static bool mt_attr_cb(walker_heap_into_t hi, walker_block_info_t bi, void *ud)
+{
+    (void)hi; (void)ud;
+    if (!bi.used) return true;
+    uint32_t a = (uint32_t)bi.ptr;
+    for (int i = 0; i < s_mt_n; i++) {
+        if (!s_mt_task[i].size) continue;
+        if (a >= s_mt_task[i].base && a < s_mt_task[i].base + s_mt_task[i].size) {
+            s_mt_stack_bytes += bi.size;
+            return true;
+        }
+    }
+    s_mt_other_bytes += bi.size;
+    s_mt_other_blocks++;
+    if (bi.size >= 1024 && s_mt_big_n < MT_MAX_BIG) s_mt_big[s_mt_big_n++] = (uint32_t)bi.size;
+    return true;
+}
+
+static int mt_cmp_desc(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x < y) ? 1 : (x > y ? -1 : 0);
+}
+
+static void rc_cmd_mt(void)
+{
+    /* ---- ① 堆 region (先走一遍, 拿到堆的范围; 后面反查栈块大小要靠它做保护) ---- */
+    s_mt_reg_n = 0;
+    heap_caps_walk(MALLOC_CAP_INTERNAL, mt_region_cb, NULL);
+    printf("MT regions=%d\r\n", s_mt_reg_n);
+    for (int i = 0; i < s_mt_reg_n; i++) {
+        uint32_t sz = s_mt_reg[i].end - s_mt_reg[i].start;
+        printf("MT  region 0x%08x..0x%08x %7u B (%u KB)\r\n",
+               (unsigned)s_mt_reg[i].start, (unsigned)s_mt_reg[i].end,
+               (unsigned)sz, (unsigned)(sz / 1024));
+    }
+
+    /* ---- ② 任务表: 栈基址 / 栈大小 / 水位 ---- */
+    TaskStatus_t *st = (TaskStatus_t *)heap_caps_malloc(MT_MAX_TASK * sizeof(TaskStatus_t),
+                                                       MALLOC_CAP_SPIRAM);
+    if (!st) { printf("MT_ERR oom\r\n"); return; }
+    UBaseType_t n = uxTaskGetSystemState(st, MT_MAX_TASK, NULL);
+    s_mt_n = 0;
+    for (UBaseType_t i = 0; i < n && s_mt_n < MT_MAX_TASK; i++) {
+        if (!st[i].pxStackBase) continue;
+        uint32_t base = (uint32_t)st[i].pxStackBase;
+        uint32_t sz = 0;
+        /* ★只有地址落在**内部堆 region** 里才能反查块大小, 否则
+         *  heap_caps_get_containing_block_size 会断言崩 → 静态栈(PSRAM/.bss)一律记 0 */
+        for (int r = 0; r < s_mt_reg_n; r++)
+            if (base >= s_mt_reg[r].start && base < s_mt_reg[r].end) {
+                sz = (uint32_t)heap_caps_get_containing_block_size((void *)base);
+                break;
+            }
+        s_mt_task[s_mt_n].name = st[i].pcTaskName;
+        s_mt_task[s_mt_n].base = base;
+        s_mt_task[s_mt_n].size = sz;
+        s_mt_task[s_mt_n].hwm  = (uint32_t)st[i].usStackHighWaterMark;
+        s_mt_n++;
+    }
+    free(st);
+
+    /* ---- ③ 归属统计 ---- */
+    s_mt_stack_bytes = s_mt_other_bytes = 0; s_mt_other_blocks = 0; s_mt_big_n = 0;
+    heap_caps_walk(MALLOC_CAP_INTERNAL, mt_attr_cb, NULL);
+
+    uint32_t total_used = heap_caps_get_total_size(MALLOC_CAP_INTERNAL)
+                        - heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    printf("MT internal_used=%u  任务栈=%u (%.1f%%)  非栈=%u (%.1f%%)  [块开销/差 %d]\r\n",
+           (unsigned)total_used, (unsigned)s_mt_stack_bytes,
+           total_used ? (double)s_mt_stack_bytes * 100.0 / total_used : 0.0,
+           (unsigned)s_mt_other_bytes,
+           total_used ? (double)s_mt_other_bytes * 100.0 / total_used : 0.0,
+           (int)total_used - (int)(s_mt_stack_bytes + s_mt_other_bytes));
+
+    printf("MT tasks (name base size free_water waste):\r\n");
+    uint32_t tsum = 0;
+    for (int i = 0; i < s_mt_n; i++) {
+        const mt_task_t *t = &s_mt_task[i];
+        int waste = t->size ? (int)((uint64_t)t->hwm * 100 / t->size) : -1;
+        tsum += t->size;
+        printf("MT  %-12s 0x%08x %7u %7u %4d%%\r\n",
+               t->name ? t->name : "?", (unsigned)t->base,
+               (unsigned)t->size, (unsigned)t->hwm, waste);
+    }
+    printf("MT task_stacks_total=%u\r\n", (unsigned)tsum);
+
+    /* ---- ④ 非栈大块 (去重后按大小降序) ---- */
+    qsort(s_mt_big, s_mt_big_n, sizeof(uint32_t), mt_cmp_desc);
+    printf("MT nonstack_blocks=%u  >=1KB 共 %d 块:\r\n",
+           (unsigned)s_mt_other_blocks, s_mt_big_n);
+    for (int i = 0; i < s_mt_big_n; i++) printf("MT  big %u\r\n", (unsigned)s_mt_big[i]);
+    printf("MT_DONE\r\n");
+}
+
+
 static void rc_enqueue(const rc_cmd_t *c){
     if (s_q) xQueueSend(s_q, c, pdMS_TO_TICKS(100));
 }
@@ -445,6 +580,7 @@ static void rc_exec(const char *line){
         strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0 ||
         strcmp(cmd, "loglevel") == 0 || strcmp(cmd, "heap") == 0 ||
         strcmp(cmd, "mem") == 0 || strcmp(cmd, "blk") == 0 ||
+        strcmp(cmd, "mt") == 0 ||
         strcmp(cmd, "audit") == 0 || strcmp(cmd, "stack") == 0 ||
         strcmp(cmd, "uptime") == 0 || strcmp(cmd, "tasks") == 0 ||
         strcmp(cmd, "ls") == 0 || strcmp(cmd, "wifi") == 0 ||
