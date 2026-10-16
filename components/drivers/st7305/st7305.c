@@ -160,13 +160,17 @@ esp_err_t st7305_init(st7305_handle_t *out, const st7305_config_t *config) {
              (void*)out->fb, FB_BYTES,
              esp_ptr_internal(out->fb) ? "SRAM" : "PSRAM");
 
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << out->dc_gpio) | (1ULL << out->rst_gpio),
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io));
+    /* ★★★ 2026-10-16 修复重启循环: rst_gpio = -1(本板 RESET 只 10k 上拉、不接 MCU) 时
+     *   无条件 `1ULL << rst_gpio` 生成**非法掩码** ⇒ gpio_config 失败 ⇒ abort ⇒ 反复重启。 */
+    uint64_t io_mask = 0;
+    if (out->dc_gpio  >= 0) io_mask |= (1ULL << out->dc_gpio);
+    if (out->rst_gpio >= 0) io_mask |= (1ULL << out->rst_gpio);
+    if (io_mask) {
+        gpio_config_t io = { .pin_bit_mask = io_mask, .mode = GPIO_MODE_OUTPUT };
+        ESP_ERROR_CHECK(gpio_config(&io));
+    }
 
-    st7305_hw_reset(out);
+    if (out->rst_gpio >= 0) st7305_hw_reset(out);
 
     spi_bus_config_t bus = {
         .mosi_io_num = out->spi_mosi,

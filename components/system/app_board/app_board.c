@@ -44,10 +44,16 @@ esp_err_t app_board_init(app_board_t *board)
      * 若不释放, st7305_init 的硬复位脚翻转不生效 + SPI 总线被 hold 霸住无法初始化.
      * ★ 2026-10-04: CS 从 GPIO40 挪到 **GPIO42** (小智核心模块占用 IO40)。这两处必须同步改,
      *   否则 CS 被 hold 住 → SPI 片选永远拉不动 → 屏全黑。 */
-    gpio_hold_dis(GPIO_NUM_41);   /* RST */
-    gpio_hold_dis(GPIO_NUM_42);   /* CS  (原 40) */
-    gpio_hold_dis(GPIO_NUM_11);   /* SCK */
-    gpio_hold_dis(GPIO_NUM_12);   /* MOSI */
+    /* ★★★ 2026-10-16: 解锁列表必须是**本板实际用的引脚**(漏改=屏全黑但串口正常)。
+     *   小智: LCD DC7/CS11/SCK9/MOSI10 · 震动8 · 触摸5/13/12/6 · 按键1/0/4 */
+    gpio_hold_dis(GPIO_NUM_7);    /* LCD DC/RS */
+    gpio_hold_dis(GPIO_NUM_11);   /* LCD CS */
+    gpio_hold_dis(GPIO_NUM_9);    /* LCD SCK */
+    gpio_hold_dis(GPIO_NUM_10);   /* LCD MOSI */
+    gpio_hold_dis(GPIO_NUM_8);    /* 震动 PWM */
+    gpio_hold_dis(GPIO_NUM_12); gpio_hold_dis(GPIO_NUM_6);
+    gpio_hold_dis(GPIO_NUM_5);    gpio_hold_dis(GPIO_NUM_13);   /* 触摸 */
+    gpio_hold_dis(GPIO_NUM_1); gpio_hold_dis(GPIO_NUM_0); gpio_hold_dis(GPIO_NUM_4);  /* 按键 */
 
     /* 1. 初始化 LCD (必须最先, 显示开机 Logo) */
     /* ★★★ 2026-10-16 关键修复: 从板型表把引脚**下发**给驱动。
