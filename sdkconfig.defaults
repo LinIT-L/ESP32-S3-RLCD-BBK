@@ -361,3 +361,10 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 #   (hw_cfg 板型探测用新驱动 driver/i2c_master.h, 工程别处还有旧驱动;
 #    不开这个开关 IDF 会在开机 check_i2c_driver_conflict 里 abort 重启)
 CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# ★★★ 2026-10-16 官方省内部 RAM 开关(实测 .iram0.text 119K→103K, 内部堆 +17.8KB)
+#   S3 上 IRAM(代码) 与 DRAM 共用 512KB SRAM ⇒ 把这些非关键函数放进 flash 即等于还内存
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
