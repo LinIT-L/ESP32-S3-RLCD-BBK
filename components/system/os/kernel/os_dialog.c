@@ -190,13 +190,19 @@ static const char *dlg_ret_text(const os_dlg_stack_t *d) {
 static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
                          int abs_y, const char *text, bool selected) {
     /* ★★★ 2026-10-16 裁剪(linit): 内容区之外的行一律不画。
-     *   修复"滑动时内容越过弹窗边框、框外留残影" —— 之前 layout 算了 clip 边界但没应用。 */
+     *   修复"滑动时内容越过弹窗边框、框外留残影"。
+     *   ⚠ 底部固定行(返回/取消/退出)在内容区裁剪边界之下 ⇒ 必须豁免, 否则会被裁掉。 */
+    bool is_footer_row = (L->footer_y >= 0 && abs_y >= L->footer_y);
     int y0c = abs_y, y1c = abs_y + DLG_LINE_H - 2;      /* 本行绘制范围 */
-    if (y1c < L->clip_top) return;                       /* 整行在上边界之上 */
-    if (y0c > L->clip_bottom) return;                    /* 整行在下边界之下 */
-    bool full = (y0c >= L->clip_top && y1c <= L->clip_bottom);   /* 完全可见才写字 */
-    int y0v = (y0c < L->clip_top) ? L->clip_top : y0c;
-    int y1v = (y1c > L->clip_bottom) ? L->clip_bottom : y1c;
+    bool full = true;
+    int y0v = y0c, y1v = y1c;
+    if (!is_footer_row) {                                /* 仅内容行参与裁剪 */
+        if (y1c < L->clip_top) return;                   /* 整行在上边界之上 */
+        if (y0c > L->clip_bottom) return;                /* 整行在下边界之下 */
+        full = (y0c >= L->clip_top && y1c <= L->clip_bottom);   /* 完全可见才写字 */
+        y0v = (y0c < L->clip_top) ? L->clip_top : y0c;
+        y1v = (y1c > L->clip_bottom) ? L->clip_bottom : y1c;
+    }
 
     int x0 = L->x + 6, x1 = L->x + L->w - 6;
     const char *t = text;
