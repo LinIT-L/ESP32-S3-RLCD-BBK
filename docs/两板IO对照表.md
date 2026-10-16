@@ -1,59 +1,54 @@
-# 两块载板 IO 对照表（小智 / 微雪）
+# 两板硬件 IO 对照表
 
-> **数据源（唯一真相）**：`components/system/board_pins/board_pins.c` 里的 `BP_XIAOZHI` / `BP_WEIXUE` 两张表
-> —— 开机由 `app_board` 通过 `board_pins_get()` 统一下发给各驱动（LCD/音频/触摸/电池/SD/震动/按键）。
-> **换板只改 `components/system/board_pins/include/board_pins.h` 里的 `BOARD_IS_WEIXUE` 一行**
-> （`0`=小智，`1`=微雪），重新编译即可。
-> 数值来源：小智 = `LinTOS0.71` 实测 + 项目记录；微雪 = 硬件官方表 + v1.3 实测。
+> 唯一数据源：`components/system/board_pins/board_pins.c`（`BP_XIAOZHI` / `BP_WEIXUE`）
+> 换板：改 `board_pins.h` 里 `BOARD_IS_WEIXUE`（`0`=小智 / `1`=微雪）→ 编译 → 整片 16MB 烧录。
 
-## 一、逐项对照
+## 一、引脚对照
 
-| 功能 / 信号 | **小智 ESP32-S3-AI-2E + 新载板** | **微雪 ESP32-S3-RLCD-4.2** | 说明 |
-|---|---|---|---|
-| LCD DC/RS | **7** | **5** | 数据/命令选择 |
-| LCD CS | **11** | **40** | ⛔ 微雪的 40 与小智模块的 I2S MCLK 同脚 |
-| LCD SCK | **9** | **11** | SPI 时钟 |
-| LCD MOSI | **10** | **12** | SPI 数据 |
-| LCD RST | **不接**（仅 10k 上拉） | **41** | ⛔ 不接时驱动须跳过复位 + `(1ULL<<rst)` 要保护 |
-| LCD SPI 时钟 | **30 MHz** | **60 MHz** | 新载板跑 30M |
-| 触摸 SDA | **5** | 无触摸 | 微雪此脚 = LCD RS(5)，故触摸默认宏必须为 -1 |
-| 触摸 SCL | **13** | 无触摸 | |
-| 触摸 INT | **12** | 无触摸 | 微雪此脚 = LCD MOSI(12) |
-| 触摸 RST | **6** | 无触摸 | |
-| 按键 PWR（SW1） | **1** | **18** | 锁屏/长按返回/2s 软关机 |
-| 按键 RIGHT（SW2） | **0** | **0** | BOOT 共用 |
-| 按键 LEFT（SW3，兼**确认**） | **4** | **18** | ⛔ 确认键：小智=4，微雪=18 |
-| 电池 ADC | **ADC1_CH2 = GPIO3** | **ADC1_CH3 = GPIO4** | 模块内部电池分压 |
-| 音频 I2S MCLK | **40** | **16** | ⛔ 小智 40 = 微雪 LCD CS |
-| 音频 I2S BCLK | **39** | **9** | ⛔ 小智 39 与 LCD SCK(9) 不同；微雪 9 |
-| 音频 I2S WS/LRCK | **45** | **45** | 两板巧合相同 |
-| 音频 I2S DOUT（ESP→codec） | **48** | **8** | ⛔ 微雪 8 与震动脚同 |
-| 音频 I2S DIN（codec→ESP） | **21** | **10** | 微雪 10 = LCD MOSI |
-| codec I2C SDA | **38** | **13** | |
-| codec I2C SCL | **47** | **14** | |
-| 功放使能 PA/SD | **46** | **46** | LPA2103A，两板同 |
-| **震动 PWM** | **8** | **8** | TM6604 + 线性马达，**边沿触发** |
-| SD CLK | **16** | **38** | SDMMC 1-bit |
-| SD CMD | **15** | **21** | |
-| SD D0 | **17** | **39** | |
-| GPS TX | **43** | **43** | MAX-M10S |
-| GPS RX | **44** | **44** | |
-| **GPS EXTINT（唤醒）** | **18** | **18** | linit 2026-10-13 指定；`drive_extint=false`（输入+上拉，只监听不驱动） |
-| GPS 波特率 | 9600 | 921600 | 见 `gps.c` 默认配置 |
+| 信号 | 小智（AI-2E 模块 + 新载板） | 微雪（ESP32-S3-RLCD-4.2） |
+|---|---|---|
+| LCD DC | 7 | 5 |
+| LCD CS | 11 | 40 |
+| LCD SCK | 9 | 11 |
+| LCD MOSI | 10 | 12 |
+| LCD RST | 不接 | 41 |
+| LCD SPI 时钟 | 60 MHz | 60 MHz |
+| 触摸 SDA | 5 | — |
+| 触摸 SCL | 13 | — |
+| 触摸 INT | 12 | — |
+| 触摸 RST | 6 | — |
+| 按键 PWR | 1 | 18 |
+| 按键 RIGHT | 0 | 0 |
+| 按键 LEFT（确认） | 4 | 18 |
+| 电池 ADC | CH2 = GPIO3 | CH3 = GPIO4 |
+| I2S MCLK | 40 | 16 |
+| I2S BCLK | 39 | 9 |
+| I2S WS | 45 | 45 |
+| I2S DOUT | 48 | 8 |
+| I2S DIN | 21 | 10 |
+| codec I2C SDA | 38 | 13 |
+| codec I2C SCL | 47 | 14 |
+| 功放使能 | 46 | 46 |
+| 震动 PWM | 8 | 48 |
+| SD CLK | 16 | 38 |
+| SD CMD | 15 | 21 |
+| SD D0 | 17 | 39 |
+| GPS TX | 43 | 43 |
+| GPS RX | 44 | 44 |
+| GPS EXTINT | 18 | 47 |
 
-## 二、⛔ 必须记住的坑（血泪）
+## 二、不能错的三条
 
-1. **两个 40 号脚**：微雪 **LCD CS=40**；小智模块 **I2S MCLK=40**。把音频按小智配（MCLK=40）却用在微雪板上 ⇒ **音频抢走屏的片选 ⇒ 全黑且初始化"成功"**。
-2. **两个 8 号脚**：微雪 **I2S DOUT=8**；**震动 PWM 两板都是 8**。选错音频引脚 ⇒ 震动被 I2S 数据流误触发。
-3. **确认键**：小智 **GPIO4** / 微雪 **GPIO18**。板型开关设错 ⇒ **按键全部失灵**（这是"能开机但按啥都没反应"的典型）。
-4. **LCD RST 不接**（小智）⇒ 驱动里 `(1ULL << rst_gpio)` **必须加 `>= 0` 保护**，否则非法掩码 ⇒ `gpio_config` 失败 ⇒ **反复重启**。
-5. **解深睡锁列表（`app_board` 里 `gpio_hold_dis`）必须跟着板型走**：漏改 = 屏全黑但串口一切正常。
-6. **换板流程**：改 `BOARD_IS_WEIXUE` → `PYTHONPATH= ./build.sh` → **整片 16MB 烧 `dist/merged_16mb.bin`**（或三块齐烧 `0x0`+`0x8000`+`0x60000`，**只烧 app 会 boot loop**）。
+1. **确认键**：小智 **4** / 微雪 **18** —— 错则**按键全失灵**。
+2. **8 与 48 两板对调**：小智 震动=**8**、音频 DOUT=**48**；微雪 震动=**48**、音频 DOUT=**8** —— 错则**震动乱震 / 没声音**。
+3. **LCD RST**：小智**不接** ⇒ 驱动里 `(1ULL << rst_gpio)` 必须有 `>= 0` 保护，否则**反复重启**。
+4. **解深睡锁列表**（`app_board.c` 的 `gpio_hold_dis`）必须跟板型一致，漏改 = **屏全黑但串口正常**。
 
-## 三、换板检查清单（照做不会错）
+## 三、烧录
 
-- [ ] `board_pins.h` 的 `BOARD_IS_WEIXUE` 改对了（0=小智 / 1=微雪）
-- [ ] 离线编译通过（**注意 `build.sh` 末尾即便 CMake 失败也会打印 "Build completed!"，必须看 `build/LinTOS.bin` 时间戳有没有更新**）
-- [ ] 整片 16MB 烧录（或三块齐烧）
-- [ ] 串口确认：`Loaded app` **1 次**（多次=重启循环）、屏 `ST7305 initialized`、触摸 `CST816`（小智）、按键 `INPUT`、音频 `ES8311/ES7210`
-- [ ] 实机确认：屏显示 · 触摸滑动 · **确认键** · 震动 · 声音
+```
+PYTHONPATH= ./build.sh          # 看 build/LinTOS.bin 时间戳是否更新(别信 "Build completed!")
+0x0    build/bootloader/bootloader.bin
+0x8000 build/partition_table/partition-table.bin
+0x60000 build/LinTOS.bin        # 只烧这段会 boot loop
+```
