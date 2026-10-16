@@ -1,7 +1,7 @@
 {
   "ver": 1,
   "site": "https://bbk.linit.cn/bbk",
-  "updated": "2026-10-17 00:39:14",
+  "updated": "2026-10-17 01:20:41",
   "mirrors": [
     "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store",
     "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store"
@@ -13,61 +13,61 @@
       "cat": "app",
       "ver": 1,
       "size": 18125,
-      "crc32": "5ea41d4a",
+      "crc32": 1587813706,
       "path": "pkgs/bikecomp.lua"
     },
     {
       "name": "earthsurvival",
       "label": "地球生存",
-      "cat": "game",
+      "cat": "app",
       "ver": 1,
       "size": 32297,
-      "crc32": "5bec895f",
+      "crc32": 1542228319,
       "path": "pkgs/earthsurvival.lua"
     },
     {
       "name": "map",
       "label": "矢量地图",
-      "cat": "ops",
+      "cat": "app",
       "ver": 1,
       "size": 100467,
-      "crc32": "5131f966",
+      "crc32": 1362229606,
       "path": "pkgs/map.lua"
     },
     {
       "name": "minidayz",
       "label": "迷你DayZ",
-      "cat": "game",
+      "cat": "app",
       "ver": 1,
       "size": 55680,
-      "crc32": "11979efe",
+      "crc32": 295149310,
       "path": "pkgs/minidayz.lua"
     },
     {
       "name": "qqtang",
       "label": "QQ堂冒险",
-      "cat": "game",
+      "cat": "app",
       "ver": 1,
       "size": 81773,
-      "crc32": "e413aa54",
+      "crc32": 3826494036,
       "path": "pkgs/qqtang.lua"
     },
     {
       "name": "wuxia",
       "label": "英雄坛说",
-      "cat": "game",
+      "cat": "app",
       "ver": 1,
       "size": 63947,
-      "crc32": "21991991",
+      "crc32": 563681681,
       "path": "pkgs/wuxia.lua"
     },
     {
       "name": "biossim",
       "label": "BIOS模拟器",
-      "cat": "game",
+      "cat": "ops",
       "ver": 1,
       "size": 211533,
-      "crc32": "128a641b",
+      "crc32": 311059483,
       "path": "pkgs/biossim.lua"
     },
     {
@@ -76,7 +76,7 @@
       "cat": "ops",
       "ver": 1,
       "size": 51199,
-      "crc32": "30fb5afa",
+      "crc32": 821779194,
       "path": "pkgs/planeradar.lua"
     }
   ]
