@@ -260,7 +260,15 @@ void input_init(void) {
      *   按住 <0.5s 松手 → POWER_LOCK(锁屏进壁纸); 持续按住 ≥0.5s 不投(避免长按关机途中误锁屏),
      *   到 2s 由 input_power_should_sleep 独立轮询弹"是否关机"确认框.
      *   long_action 保持 NONE (长按关机不由本键 tick 投递). */
-    s_btns[2] = (btn_ctx_t){ BTN_GPIO_PWR, ST_IDLE, 0, POWER_HOLD_MS, MENU_ACTION_POWER_LOCK, MENU_ACTION_NONE, true, "PWR" };
+    /* ★★★ 2026-10-16: 板型可能把"电源键"和"确认键"放在同一个脚(微雪=GPIO18) ⇒
+     *   若两条目读同一 GPIO, 状态机互相打架 ⇒ **按键全部点不动**。
+     *   这里统一处理: 同脚时**只保留 KEY(确认)条目**, 电源键条目禁用(pin=-1)。 */
+    if (BTN_GPIO_PWR == BTN_GPIO_LEFT) {
+        s_btns[2] = (btn_ctx_t){ (gpio_num_t)(-1), ST_IDLE, 0, POWER_HOLD_MS,
+                                 MENU_ACTION_NONE, MENU_ACTION_NONE, false, "PWR(同脚,禁用)" };
+    } else {
+        s_btns[2] = (btn_ctx_t){ BTN_GPIO_PWR, ST_IDLE, 0, POWER_HOLD_MS, MENU_ACTION_POWER_LOCK, MENU_ACTION_NONE, true, "PWR" };
+    }
 
     /* [电源收拢] 唤醒/睡眠引脚(RTC域上拉 + EXT1唤醒掩码)统一由电源模块 sleep.c 负责
      * (wp_power_pin_init: 仅开机键 PWR(GPIO1) 为唯一唤醒源). input.c 在此只负责
@@ -783,6 +791,9 @@ menu_action_t input_get_action(void) {
      * "底部上滑(BACK)"与"物理 BACK 键" (上滑再划一次=确认, 物理 BACK=取消) */
     s_last_action_touch = false;
     for (int i = 0; i < 3; i++) {
+        /* ★ 2026-10-16: pin<0 = 该板不存在/已禁用(如微雪 电源键与确认键同脚) ⇒ 必须跳过,
+         *   否则 gpio_get_level(-1) 恒返回 0 ⇒ 被当成"一直按下"的幽灵键。 */
+        if ((int)s_btns[i].gpio < 0) continue;
         menu_action_t a = tick(&s_btns[i]);
         if (a != MENU_ACTION_NONE) { s_tap_x = s_tap_y = -1; s_last_any_ms = now_ms(); fb_game_exit_vib(a); return a; }
     }

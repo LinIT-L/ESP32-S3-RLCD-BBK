@@ -51,12 +51,14 @@ static inline void rst_set(st7305_handle_t *dev, int level) {
     gpio_set_level(dev->rst_gpio, level);
 }
 
+static uint32_t s_spi_bytes = 0;   /* ★诊断: 实际写出的单字节数 */
 static void spi_write_byte(st7305_handle_t *dev, uint8_t byte) {
     spi_transaction_t t = {
         .length = 8,
         .tx_buffer = &byte,
     };
     spi_device_polling_transmit(dev->spi, &t);
+    s_spi_bytes++;
 }
 
 static void send_cmd(st7305_handle_t *dev, uint8_t cmd) {
@@ -595,7 +597,9 @@ static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb) 
     };
     spi_device_polling_transmit(dev->spi, &t);
 
-    uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t0);
+            static uint32_t s_frames = 0;
+        ESP_LOGW(TAG, "★送屏 #%lu: 本帧 15000B, 累计单字节 %lu", (unsigned long)(++s_frames), (unsigned long)s_spi_bytes);
+uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t0);
     if (elapsed > 15000) {  /* >15ms 时打日志, 正常应该是 12-15ms */
         ESP_LOGW(TAG, "flush slow: %lu us", (unsigned long)elapsed);
     }

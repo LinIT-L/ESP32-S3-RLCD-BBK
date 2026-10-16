@@ -75,6 +75,9 @@ esp_err_t app_board_init(app_board_t *board)
     lcd_cfg.spi_cs   = bp->lcd_cs;
     lcd_cfg.spi_sclk = bp->lcd_sck;
     lcd_cfg.spi_mosi = bp->lcd_mosi;
+    ESP_LOGW("APP_BOARD", "★下发配置: DC=%d CS=%d SCK=%d MOSI=%d RST=%d @%dMHz (板=%s)",
+             lcd_cfg.dc_gpio, lcd_cfg.spi_cs, lcd_cfg.spi_sclk, lcd_cfg.spi_mosi,
+             lcd_cfg.rst_gpio, lcd_cfg.spi_freq, bp->name);
     lcd_cfg.rst_gpio = bp->lcd_rst;
     if (bp->lcd_freq_mhz > 0) lcd_cfg.spi_freq = bp->lcd_freq_mhz;
     audio_player_apply_pins(bp->i2s_mclk, bp->i2s_bclk, bp->i2s_ws, bp->i2s_dout,
