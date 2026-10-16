@@ -123,18 +123,19 @@ static void build_sysinfo(void) {
      * ★ 2026-10-02 版本管理整合: 版本号/构建信息一律取自 lintos_version.h 的接口,
      *   **不再硬编码**（旧代码这里写死 "1.3", 而代码已到 V1.7.x → 显示的版本是错的）。
      *   中文 3 字节/字符, 故用 %.*s 显式限长, 避免 -Wformat-truncation。 */
+    /* ★ 2026-10-16: 行号紧凑排列(0..4) —— 删掉"内部版本"后必须连续编号, 否则中间空行 */
     snprintf(s_info_lines[0], sizeof(s_info_lines[0]),
-             "\xe5\xaf\xb9\xe5\xa4\x96\xe7\x89\x88\xe6\x9c\xac\x3a%.18s", os_version_public());   /* 对外版本:1.3   (只在推送时改) */
-    snprintf(s_info_lines[3], sizeof(s_info_lines[3]),
+             "\xe7\x89\x88\xe6\x9c\xac\xe5\x8f\xb7:%.18s", os_version_public());   /* 版本号:1.4 */
+    snprintf(s_info_lines[1], sizeof(s_info_lines[1]),
              "\xe5\x89\xa9\xe4\xbd\x99PSRAM:%uKB", /* 剩余PSRAM:XXKB */
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
-    snprintf(s_info_lines[4], sizeof(s_info_lines[4]),
+    snprintf(s_info_lines[2], sizeof(s_info_lines[2]),
              "\xe4\xbd\x9c\xe8\x80\x85\xe4\xbf\xa1\xe6\x81\xaf:LinIT"); /* 作者信息:LinIT */
-    snprintf(s_info_lines[5], sizeof(s_info_lines[5]),
+    snprintf(s_info_lines[3], sizeof(s_info_lines[3]),
              "\xe6\x9e\x84\xe5\xbb\xba:%.24s", os_build_stamp());       /* 构建:2026-10-02 11:00 */
-    snprintf(s_info_lines[6], sizeof(s_info_lines[6]),
-             "\xe6\x8f\x90\xe4\xba\xa4:%.24s", os_git_desc());          /* 提交:v1.3.1-12-g88140ce */
-    s_info_n = 7;
+    snprintf(s_info_lines[4], sizeof(s_info_lines[4]),
+             "\xe6\x8f\x90\xe4\xba\xa4:%.24s", os_git_desc());          /* 提交:v1.4.0-xx-gxxxxxxx */
+    s_info_n = 5;
 }
 
 /* ---- 时间设置: 3.3 风格滚轮弹窗.
