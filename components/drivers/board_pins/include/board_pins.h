@@ -68,6 +68,9 @@ uint64_t board_wake_mask(void);
 /* ★★★ 2026-10-16 linit: **删除板型识别**, 回到最简单方式 —— 编译期选一块板。
  *   换板 = 改这一行 + 重编 (与 v1.3 一样直观, 不扫描 I2C、不写 NVS)。 */
 /* 选板: 0=小智  1=微雪  2=自制(仿微雪, 暂同微雪) */
+/* ★ 只启用屏幕 IO 的诊断开关: 1=不启动 SD/按键/触摸, 系统照跑(排查屏用) */
+#define LINTOS_LCD_ONLY      1
+
 #define BOARD_IS_WEIXUE      1   /* ← 当前: 微雪 */
 #define BOARD_DEFAULT_ID     (BOARD_IS_WEIXUE ? BOARD_ID_WEIXUE : BOARD_ID_XIAOZHI)
 #define BOARD_BTN_PWR        GPIO_NUM_1

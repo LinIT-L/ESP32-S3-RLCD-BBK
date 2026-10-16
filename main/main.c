@@ -385,6 +385,7 @@ void app_main(void)
     /* === 硬件初始化 (app_board 模块化封装, 顺序敏感见 components/app_board) === */
     app_board_t board;
     esp_err_t ret = app_board_init(&board);
+
     if (ret != ESP_OK) {
         ESP_LOGD(TAG, "硬件初始化失败: %s", esp_err_to_name(ret));
         return;

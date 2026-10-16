@@ -9,6 +9,7 @@
 #include "driver/gpio.h"
 
 #include "sd_scan.h"
+#include "board_pins.h"
 #include "input.h"
 #include "svc_nvs.h"
 #include "esp_event.h"
@@ -104,14 +105,22 @@ esp_err_t app_board_init(app_board_t *board)
      * 丢到小任务里做, 启动立即继续, board->sd_ok 稍后由任务置位。
      * (sd_watcher_start 本来就有补挂逻辑, 这里只是不让首次挂载等它 15s 的补挂周期。) */
     board->sd_ok = false;
+#if LINTOS_LCD_ONLY
+    ESP_LOGW(TAG, "★只点屏模式: 跳过 SD 挂载");
+#else
     if (xTaskCreate(sd_mount_task, "sd_mnt", 4096, board, 3, NULL) != pdPASS) {
         ESP_LOGW(TAG, "SD 挂载任务创建失败, 回退为同步挂载");
         esp_err_t sd_ret = sd_mount();
         board->sd_ok = (sd_ret == ESP_OK);
     }
+#endif
 
     /* 3. 初始化按键 */
+#if LINTOS_LCD_ONLY
+    ESP_LOGW("APP_BOARD", "★只点屏模式: 跳过 input_init(按键/触摸)");
+#else
     input_init();
+#endif
 
     /* 4. 初始化 NVS (蓝牙/WiFi 需要存储校准数据和配置) */
     ret = svc_nvs_flash_init();
@@ -127,7 +136,9 @@ esp_err_t app_board_init(app_board_t *board)
     ESP_LOGI(TAG, "事件循环创建成功");
 
     /* 6. 启动 SD 卡监控任务 */
+#if !LINTOS_LCD_ONLY
     sd_watcher_start();
+#endif
     return ESP_OK;
 }
 
