@@ -6,6 +6,7 @@
 #include "driver/i2c_master.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "driver/uart.h"
 #include <string.h>
 
 #define TAG "HW_CFG"
@@ -59,7 +60,8 @@ static uint8_t scan_peripherals(int board) {
     if (board == HW_BOARD_HOMEMADE) { if (probe_addr(15, 7, 0x15)) m |= (1u << HW_TOUCH); }
     /* SD / 电池 / 震动: 三块板都有(真正的"有无"由挂载/读值运行时判) */
     m |= (1u << HW_SD) | (1u << HW_BATTERY) | (1u << HW_VIB);
-    /* GPS: 小智可能不焊 ⇒ 用串口是否收到字节判(粗略: 先按板型给, 运行时 standby 失败即关) */
+    /* GPS: ⛔ 2026-10-16 实测: 开机动 UART0 探测会导致整屏花屏 ⇒ 暂时禁用
+     *   (改由 gps_init 运行时自行判定; 未焊 GPS 的板子在设置里手动关) */
     if (board == HW_BOARD_XIAOZHI) m |= (1u << HW_GPS);
     return m;
 }
@@ -75,6 +77,7 @@ bool hw_cfg_detected(hw_id_t id) { return (s_det >> id) & 1u; }
 bool hw_cfg_enabled(hw_id_t id)  { return (s_en  >> id) & 1u; }
 
 void hw_cfg_set_enabled(hw_id_t id, bool on) {
+    if (id == HW_TOUCH && !on) return;          /* ★核心项不允许关闭 */
     if (on) s_en |=  (1u << id); else s_en &= ~(1u << id);
     cfg_set_u8("en_mask", s_en);
 }
@@ -83,21 +86,39 @@ void hw_cfg_rescan(void) {
     int b = detect_board();
     if (b >= 0) { s_board = b; cfg_set_u8("board_id", (uint8_t)b); }
     s_det = scan_peripherals(s_board);
-    uint8_t en = cfg_get_u8("en_mask", 0xFF);
+    /* ★★ 2026-10-16 一次性重置: 早期版本把 touch 误关存进了 NVS ⇒ 按键触摸失效。
+     *   用 cfg_ver 作废旧存档, 之后用户再改会重新存(带新版本号)。 */
+    uint8_t ver = cfg_get_u8("cfg_ver", 0);
+    uint8_t en;
+    if (ver < 2) { en = 0xFF; cfg_set_u8("cfg_ver", 2); }
+    else         { en = cfg_get_u8("en_mask", 0xFF); }
     s_en = (en == 0xFF) ? s_det : (uint8_t)(en & s_det);   /* 手动关过的继续关, 但探测不到的一律不开 */
     cfg_set_u8("en_mask", s_en);
     ESP_LOGW(TAG, "HW: board=%s det=0x%02X en=0x%02X", hw_cfg_board_name(), s_det, s_en);
 }
 
 int hw_cfg_init(void) {
-    int b = detect_board();
-    if (b >= 0) { s_board = b; cfg_set_u8("board_id", (uint8_t)b); }
-    else        { s_board = cfg_get_u8("board_id", HW_BOARD_XIAOZHI); }
+    /* ★★★ 版型锁定(linit 2026-10-16): NVS 已有有效板型 ⇒ 沿用, 不再重探。
+     *   刷固件/重启都不会改变已锁定的方案; 仅首次或设置里"重新自检"才探测。 */
+    uint8_t locked = cfg_get_u8("board_lock", 0xFF);
+    int b;
+    if (locked <= HW_BOARD_HOMEMADE) {
+        b = (int)locked;
+        ESP_LOGW(TAG, "版型已锁定(沿用 NVS): %s", hw_cfg_board_name());
+    } else {
+        b = detect_board();
+        if (b >= 0) { cfg_set_u8("board_lock", (uint8_t)b); ESP_LOGW(TAG, "首次探测 ⇒ 锁定版型"); }
+        else        { b = cfg_get_u8("board_id", HW_BOARD_XIAOZHI); }
+    }
+    s_board = b;
+    cfg_set_u8("board_id", (uint8_t)b);
     hw_cfg_board_apply();          /* ★把板型交给 board_pins (引脚随之确定) */
     s_det = scan_peripherals(s_board);
     uint8_t en = cfg_get_u8("en_mask", 0xFF);
     s_en = (en == 0xFF) ? s_det : (uint8_t)(en & s_det);
-    ESP_LOGW(TAG, "HW: board=%s det=0x%02X en=0x%02X", hw_cfg_board_name(), s_det, s_en);
+    /* ★★ 核心保护: 触摸是核心输入通道 ⇒ 探测到就必开, NVS/用户都关不掉 */
+    if (s_det & (1u << HW_TOUCH)) s_en |= (1u << HW_TOUCH);
+    ESP_LOGW(TAG, "HW: board=%s det=0x%02X en=0x%02X (触摸核心已保护)", hw_cfg_board_name(), s_det, s_en);
     return s_board;
 }
 

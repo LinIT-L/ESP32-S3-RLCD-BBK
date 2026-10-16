@@ -951,9 +951,7 @@ void settings_wifi_connect_open(ui_ctx_t *ctx) {
 static void on_wifi_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     /* ★ 2026-10-16: 硬件自检 / 硬件配置 (位置动态, 用记录的下标判断) */
-    if (result >= 0 && result == s_wifi_idx_hwcfg)     { open_hw_cfg_dlg(ctx);     return; }
     if (result >= 0 && result == s_wifi_idx_selfcheck) { open_hw_selfcheck_dlg(ctx); return; }
-    if (result >= 0 && result == s_wifi_idx_hwcfg)     { open_hw_cfg_dlg(ctx);     return; }
     if (result == 0) {   /* 蓝牙开关 (懒加载 os_hw) */
         if (bt_is_on()) { os_hw_release(OS_HW_BT); bt_manager_disable(); }  /* 计数错位时兜底直关 */
         else            os_hw_request(OS_HW_BT);
@@ -1354,14 +1352,8 @@ static void open_wifi_dlg(ui_ctx_t *ctx, int sel) {
     }
     snprintf(items[n], sizeof(items[n]), "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xbf\xa1\xe6\x81\xaf");  /* 系统信息 */
     ptrs[n] = items[n]; n++;
-    s_wifi_idx_hwcfg = n;
-    snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe9\x85\x8d\xe7\xbd\xae");  /* 硬件配置 */
-    ptrs[n] = items[n]; n++;
     s_wifi_idx_selfcheck = n;
     snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe8\x87\xaa\xe6\xa3\x80");  /* 硬件自检 */
-    ptrs[n] = items[n]; n++;
-    s_wifi_idx_hwcfg = n;
-    snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe9\x85\x8d\xe7\xbd\xae");  /* 硬件配置 */
     ptrs[n] = items[n]; n++;
     sel = (sel < 0) ? 0 : (sel >= n ? n - 1 : sel);
     os_dialog_list(ctx, "", ptrs, n, sel, on_wifi_select, NULL);
