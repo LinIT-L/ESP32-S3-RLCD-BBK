@@ -350,24 +350,63 @@ static inline void mp3_dither_px(st7305_handle_t *lcd, int x, int y)
 {
     if (((x + y) & 1) == 0) st7305_draw_pixel(lcd, x, y, ST7305_COLOR_BLACK);
 }
+/* 画圆头胶囊描边(黑): 两端各加一个实心圆 ⇒ 两头是圆的 */
+static void mp3_capsule_outline(st7305_handle_t *lcd, int cx, int yt, int yb, int hw)
+{
+    draw_vline(lcd, cx - hw, yt, yb, ST7305_COLOR_BLACK);
+    draw_vline(lcd, cx + hw, yt, yb, ST7305_COLOR_BLACK);
+    for (int a = 0; a < 360; a += 3) {
+        float rad = (float)a * 3.14159f / 180.0f;
+        int ox = (int)((float)hw * cosf(rad) + 0.5f);
+        int oy = (int)((float)hw * sinf(rad) + 0.5f);
+        st7305_draw_pixel(lcd, cx + ox, yt + oy, ST7305_COLOR_BLACK);
+        st7305_draw_pixel(lcd, cx + ox, yb + oy, ST7305_COLOR_BLACK);
+    }
+}
+/* 绘制音量竖向滑条 (linit 2026-10-16 V4):
+ *  ① 轨道 = 白芯 + 黑描边 + 圆头(胶囊), 外圈棋盘点圈(发白) ⇒ 黑环境下也能看清
+ *  ② 圆球 = 黑芯 + 白圈 + 外圈棋盘点圈(发白) */
 static void mp3_draw_vol_slider(st7305_handle_t *lcd)
 {
     const int cx = MP3_VOL_CX;
+    const int hw = MP3_VOL_HW;
     int dy = mp3_vol_slider_dot_y();
-    fill_rect(lcd, cx - MP3_VOL_HW, MP3_VOL_YT, cx + MP3_VOL_HW, MP3_VOL_YB, ST7305_COLOR_WHITE);
+
+    /* 轨道外圈"发白"点圈 (先铺, 半径 hw+3) */
+    for (int oy = -(hw + 3); oy <= (MP3_VOL_YB - MP3_VOL_YT) + hw + 3; oy++) {
+        for (int ox = -hw - 3; ox <= hw + 3; ox++) {
+            int px = cx + ox, py = MP3_VOL_YT + oy;
+            /* 在胶囊外、外扩 3px 之内 ⇒ 打棋盘点 */
+            int yy = py;
+            if (yy < MP3_VOL_YT) yy = MP3_VOL_YT;
+            if (yy > MP3_VOL_YB) yy = MP3_VOL_YB;
+            int ddy = py - yy;
+            int d2 = ox * ox + ddy * ddy;
+            if (d2 <= hw * hw) continue;              /* 胶囊内不画 */
+            if (d2 > (hw + 3) * (hw + 3)) continue;   /* 只到外扩 3px */
+            mp3_dither_px(lcd, px, py);
+        }
+    }
+    /* 白芯胶囊: 两端用实心圆做圆头 */
+    mp3_fill_circle(lcd, cx, MP3_VOL_YT, hw, ST7305_COLOR_WHITE);
+    mp3_fill_circle(lcd, cx, MP3_VOL_YB, hw, ST7305_COLOR_WHITE);
+    fill_rect(lcd, cx - hw, MP3_VOL_YT, cx + hw, MP3_VOL_YB, ST7305_COLOR_WHITE);
+    /* 已选段(球下方)填黑 = 当前音量高度 */
     if (dy < MP3_VOL_YB)
-        fill_rect(lcd, cx - MP3_VOL_HW + 1, dy, cx + MP3_VOL_HW - 1, MP3_VOL_YB, ST7305_COLOR_BLACK);
-    draw_vline(lcd, cx - MP3_VOL_HW, MP3_VOL_YT, MP3_VOL_YB, ST7305_COLOR_BLACK);
-    draw_vline(lcd, cx + MP3_VOL_HW, MP3_VOL_YT, MP3_VOL_YB, ST7305_COLOR_BLACK);
-    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R + 2, ST7305_COLOR_WHITE);
-    for (int oy = -MP3_VOL_DOT_R - MP3_VOL_HALO; oy <= MP3_VOL_DOT_R + MP3_VOL_HALO; oy++)
-        for (int ox = -MP3_VOL_DOT_R - MP3_VOL_HALO; ox <= MP3_VOL_DOT_R + MP3_VOL_HALO; ox++) {
-            int d2 = ox*ox + oy*oy;
-            if (d2 <= MP3_VOL_DOT_R*MP3_VOL_DOT_R) continue;
-            if (d2 > (MP3_VOL_DOT_R+MP3_VOL_HALO)*(MP3_VOL_DOT_R+MP3_VOL_HALO)) continue;
+        fill_rect(lcd, cx - hw + 1, dy, cx + hw - 1, MP3_VOL_YB, ST7305_COLOR_BLACK);
+    /* 黑描边(圆头胶囊) */
+    mp3_capsule_outline(lcd, cx, MP3_VOL_YT, MP3_VOL_YB, hw);
+
+    /* 圆球: 外圈棋盘点(发白) → 白圈 → 黑芯 */
+    for (int oy = -MP3_VOL_DOT_R - 3 - MP3_VOL_HALO; oy <= MP3_VOL_DOT_R + 3 + MP3_VOL_HALO; oy++)
+        for (int ox = -MP3_VOL_DOT_R - 3 - MP3_VOL_HALO; ox <= MP3_VOL_DOT_R + 3 + MP3_VOL_HALO; ox++) {
+            int d2 = ox * ox + oy * oy;
+            if (d2 <= (MP3_VOL_DOT_R + 3) * (MP3_VOL_DOT_R + 3)) continue;
+            if (d2 > (MP3_VOL_DOT_R + 3 + MP3_VOL_HALO) * (MP3_VOL_DOT_R + 3 + MP3_VOL_HALO)) continue;
             mp3_dither_px(lcd, cx + ox, dy + oy);
         }
-    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R, ST7305_COLOR_BLACK);
+    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R + 3, ST7305_COLOR_WHITE);   /* 白圈(黑底上看得见) */
+    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R, ST7305_COLOR_BLACK);       /* 黑芯 */
 }
 
 /* ============ V1.4.x: 随音乐震动 (保留能力, 由 NVS 控制; 图标按钮已从 UI 移除) ============ */
@@ -525,6 +564,15 @@ static void p_mp3_render(ui_ctx_t *ctx)
     fill_rect(lcd, bar_x0, bar_y + bar_h - 1, bar_x1, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
     fill_rect(lcd, bar_x0, bar_y, bar_x0, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
     fill_rect(lcd, bar_x1, bar_y, bar_x1, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
+    /* ★ 进度小圆球(linit 2026-10-16): 白圈+黑芯, 标在当前播放位置(比音量球小) */
+    {
+        int kx = bar_x0 + played_w;
+        int ky = bar_y + bar_h / 2;
+        if (kx < bar_x0) kx = bar_x0;
+        if (kx > bar_x1) kx = bar_x1;
+        mp3_fill_circle(lcd, kx, ky, 7, ST7305_COLOR_WHITE);
+        mp3_fill_circle(lcd, kx, ky, 5, ST7305_COLOR_BLACK);
+    }
     /* 音量滑条 (若已弹出) 优先绘制在图标之前避免被覆盖 */
     if (s_vol_slider) mp3_draw_vol_slider(lcd);
     mp3_draw_control_icons(lcd);   /* 音量 / 上曲 / 播放暂停 / 下曲 / 循环 */

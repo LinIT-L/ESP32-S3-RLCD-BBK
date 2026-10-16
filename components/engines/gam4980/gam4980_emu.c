@@ -633,7 +633,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
         memset(g_lcd->fb, 0xFF, FB_BYTES);
         uint8_t *fb = g_lcd->fb;
 
-        if (g_pic_opt >= 1) {
+        if (g_pic_opt >= 1 && g_display_mode != 2) {   /* ★ 拉伸(2) 不走AA路径: 它按240行预算, 拉伸要铺满300行 */
             /* === V1.0.58: 全屏覆盖率抗锯齿 (保粗AA / EPX 档都走这个, 因为非 2x 整数倍) ===
              * 每个源像素映射到输出块 (2/3 列 x 2/3 行), 按邻域分类决定块内黑点:
              * 直线实心, 拐角/端点去外角 → 保持笔画不变粗, 拐角圆滑. */
@@ -663,10 +663,16 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
             }
         } else {
             /* 纯最近邻放大 (关抗锯齿): 原逻辑 */
-            for (int dy = 0; dy < FS_SCALED_H; dy++) {
-                int sy = g_fs_row_map[dy];
+            /* ★★★ 2026-10-16 linit: 拉伸(2) 真拉伸到全屏 400x300 (不等比铺满);
+             *      全屏(1) 保持 400x240 等比居中. 之前两者共用同一分支 ⇒ 看起来一样. */
+            const bool stretch = (g_display_mode == 2);
+            const int out_h  = stretch ? ST7305_HEIGHT : FS_SCALED_H;
+            const int y_base = stretch ? 0 : FS_GAME_Y;
+            for (int dy = 0; dy < out_h; dy++) {
+                int sy = stretch ? ((dy * CORE_H) / ST7305_HEIGHT) : g_fs_row_map[dy];
+                if (sy >= CORE_H) sy = CORE_H - 1;
                 const uint16_t *row = src + sy * (pitch / 2);
-                int y = FS_GAME_Y + dy;
+                int y = y_base + dy;
                 int inv_y = ST7305_HEIGHT - 1 - y;
                 int y_group = inv_y >> 2;
                 int y_sub = inv_y & 3;
@@ -691,7 +697,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
 
         /* V1.0.68+: 虚拟按键启用时不画底部装饰栏与游戏名称
          * (会与底部 Select/Start 按键区域重叠碍眼) */
-        if (!virtual_keys_is_enabled()) {
+        if (!virtual_keys_is_enabled() && g_display_mode != 2) {   /* ★ 拉伸铺满时不压装饰栏 */
             int bottom_y = FS_GAME_Y + FS_SCALED_H;
             /* 左侧装饰三角形 - 直接写 fb 跳过 st7305_draw_pixel */
             {
