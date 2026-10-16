@@ -862,100 +862,22 @@ static void open_disp_dlg(ui_ctx_t *ctx, int sel) {
 /* ---- 声音调整弹窗: 声音开关/音量/震动 (动态显示状态) ---- */
 static void open_snd_dlg(ui_ctx_t *ctx, int sel);
 /* 音量滚轮: 0-9 档; 完成后刷新声音弹窗音量显示 */
-/* ============ 音量竖向滑条 (linit 2026-10-16: 参照 iOS 竖向音量) ============
- * 竖线轨道 + 中间大圆球, 上下拖动; 球外一圈"棋盘点圈(发白)"避免纯黑圆盘糊住显示。
- * 数值实时生效(只走 audio_player_set_volume 唯一入口, 存档由它负责)。 */
-#define VOL_BOX_W 350
-#define VOL_BOX_H 250
-#define VOL_TRACK_TOP    30
-#define VOL_TRACK_BOT    30
-#define VOL_KNOB_R       13
-#define VOL_HALO         7
-
-static int s_vol_val = 0;
-
-static void vol_ui_geom(int *x0, int *y0) {
-    *x0 = (ui_screen_w() - VOL_BOX_W) / 2;
-    *y0 = (ui_screen_h() - VOL_BOX_H) / 2;
-}
-/* 50% 棋盘点: 1bpp 上做"发白"的半透明感, 不挡底层 */
-static inline void vol_dither(st7305_handle_t *lcd, int x, int y) {
-    if (((x + y) & 1) == 0) st7305_draw_pixel(lcd, x, y, ST7305_COLOR_BLACK);
-}
-static bool vol_ui_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
-    (void)d; (void)ud;
-    st7305_handle_t *lcd = ctx->lcd;
-    int x0, y0; vol_ui_geom(&x0, &y0);
-    int x1 = x0 + VOL_BOX_W - 1, y1 = y0 + VOL_BOX_H - 1;
-    fill_rect(lcd, x0, y0, x1, y1, ST7305_COLOR_WHITE);
-    for (int k = 0; k < 2; k++) {
-        draw_hline(lcd, x0 + k, x1 - k, y0 + k, ST7305_COLOR_BLACK);
-        draw_hline(lcd, x0 + k, x1 - k, y1 - k, ST7305_COLOR_BLACK);
-        draw_vline(lcd, x0 + k, y0 + k, y1 - k, ST7305_COLOR_BLACK);
-        draw_vline(lcd, x1 - k, y0 + k, y1 - k, ST7305_COLOR_BLACK);
+static void on_vol_wheel(ui_ctx_t *ctx, int sel, void *ud) {
+    (void)ud;
+    if (sel >= 0 && sel < AUDIO_VOL_STEPS) {
+        /* ★ 音量统一入口: 只调它, 持久化由 audio_player 自己负责 (存百分比)。
+         *   ⛔ 不要再在这里 settings_save_u8("vol", sel) —— 两处存档会不一致。 */
+        audio_player_set_volume(audio_player_vol_to_percent(sel));
     }
-    const int cx = x0 + VOL_BOX_W / 2;
-    const int ty = y0 + VOL_TRACK_TOP, by = y1 - VOL_TRACK_BOT;
-    const int n  = AUDIO_VOL_STEPS - 1;
-    int ky = by - (s_vol_val * (by - ty)) / (n > 0 ? n : 1);
-    for (int y = ty; y <= by; y++) {
-        if (y >= ky) draw_hline(lcd, cx - 2, cx + 2, y, ST7305_COLOR_BLACK);
-        else { vol_dither(lcd, cx, y); vol_dither(lcd, cx + 1, y); }
-    }
-    for (int dy = -VOL_KNOB_R; dy <= VOL_KNOB_R; dy++)
-        for (int dx = -VOL_KNOB_R; dx <= VOL_KNOB_R; dx++)
-            if (dx*dx + dy*dy <= VOL_KNOB_R*VOL_KNOB_R)
-                st7305_draw_pixel(lcd, cx + dx, ky + dy, ST7305_COLOR_BLACK);
-    for (int dy = -VOL_KNOB_R - VOL_HALO; dy <= VOL_KNOB_R + VOL_HALO; dy++)
-        for (int dx = -VOL_KNOB_R - VOL_HALO; dx <= VOL_KNOB_R + VOL_HALO; dx++) {
-            int d2 = dx*dx + dy*dy;
-            if (d2 <= VOL_KNOB_R*VOL_KNOB_R) continue;
-            if (d2 > (VOL_KNOB_R + VOL_HALO)*(VOL_KNOB_R + VOL_HALO)) continue;
-            vol_dither(lcd, cx + dx, ky + dy);
-        }
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d", s_vol_val);
-    draw_text(lcd, cx + VOL_KNOB_R + VOL_HALO + 14, ky - 12, buf, false);
-    ctx->needs_redraw = true;
-    return true;
-}
-static void vol_set_from_y(int y) {
-    int x0, y0; vol_ui_geom(&x0, &y0);
-    int ty = y0 + VOL_TRACK_TOP, by = y0 + VOL_BOX_H - 1 - VOL_TRACK_BOT;
-    int n = AUDIO_VOL_STEPS - 1;
-    if (y < ty) y = ty;
-    if (y > by) y = by;
-    int v = ((by - y) * n + (by - ty) / 2) / (by - ty);
-    if (v < 0) v = 0;
-    if (v > n) v = n;
-    if (v != s_vol_val) {
-        s_vol_val = v;
-        audio_player_set_volume(audio_player_vol_to_percent(v));
-    }
-}
-static void vol_ui_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
-    (void)d; (void)ud;
-    int tx, ty;
-    if (input_get_touch_pos(&tx, &ty)) { vol_set_from_y(ty); ctx->needs_redraw = true; }
-}
-static bool vol_ui_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
-    (void)d; (void)ud;
-    int x0, y0; vol_ui_geom(&x0, &y0);
-    if (y >= y0 + VOL_BOX_H - 26) { os_dialog_pop(ctx); return true; }
-    vol_set_from_y(y);
-    os_dialog_mark_handled(ctx);
-    ctx->needs_redraw = true;
-    return true;
+    os_dialog_mark_handled(ctx);   /* 阻止自动弹栈, 由下面自行替换刷新 */
+    os_dialog_pop(ctx);            /* 滚轮 */
+    os_dialog_pop(ctx);            /* 声音弹窗 */
+    open_snd_dlg(ctx, 1);
 }
 static void open_vol_dlg(ui_ctx_t *ctx) {
-    s_vol_val = audio_player_vol_to_step(audio_player_get_volume());
-    os_dlg_stack_t dlg; memset(&dlg, 0, sizeof(dlg));
-    dlg.no_footer = true;
-    dlg.count = 0;
-    dlg.on_render = vol_ui_render;
-    dlg.on_poll   = vol_ui_poll;
-    dlg.on_touch  = vol_ui_touch;
-    os_dialog_push(ctx, &dlg);
+    static const char *ptrs[10] = { "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+    int cur = audio_player_vol_to_step(audio_player_get_volume());
+    os_dialog_wheel(ctx, ptrs, AUDIO_VOL_STEPS, cur, on_vol_wheel);
 }
 static void on_snd_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
