@@ -125,11 +125,6 @@ static void build_sysinfo(void) {
      *   中文 3 字节/字符, 故用 %.*s 显式限长, 避免 -Wformat-truncation。 */
     snprintf(s_info_lines[0], sizeof(s_info_lines[0]),
              "\xe5\xaf\xb9\xe5\xa4\x96\xe7\x89\x88\xe6\x9c\xac\x3a%.18s", os_version_public());   /* 对外版本:1.3   (只在推送时改) */
-    snprintf(s_info_lines[1], sizeof(s_info_lines[1]),
-             "\xe5\x86\x85\xe9\x83\xa8\xe7\x89\x88\xe6\x9c\xac\x3a%.18s", os_version_full());   /* 内部版本:1.3.1+12 (自测用, 细) */
-    snprintf(s_info_lines[2], sizeof(s_info_lines[2]),
-             "\xe5\x89\xa9\xe4\xbd\x99\xe5\x86\x85\xe5\xad\x98:%uKB", /* 剩余内存:XXKB */
-             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     snprintf(s_info_lines[3], sizeof(s_info_lines[3]),
              "\xe5\x89\xa9\xe4\xbd\x99PSRAM:%uKB", /* 剩余PSRAM:XXKB */
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));

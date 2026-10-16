@@ -25,12 +25,12 @@
 #pragma once
 
 /* ===== 对外版本 (只往 外面 推送时改) ===== */
-#define LINTOS_VERSION_PUBLIC  "1.3"
+#define LINTOS_VERSION_PUBLIC  "1.4"
 
 /* ===== 内部版本 (自测用, 小步走) ===== */
 #define LINTOS_VERSION_MAJOR   1
-#define LINTOS_VERSION_MINOR   3
-#define LINTOS_VERSION_PATCH   1
+#define LINTOS_VERSION_MINOR   4
+#define LINTOS_VERSION_PATCH   0
 #define LINTOS_VERSION_STR     "1.3.1"    /* 内部三段: 主.次.修订 */
 #define LINTOS_VERSION_DATE    "2026-10-02"
 #define LINTOS_VERSION_NAME    "\xe5\x8f\x8c\xe6\x89\x8b\xe6\x9f\x84\xe6\xa1\xa3\xe6\xa1\x88\xe8\xa1\xa8"  /* 本次迭代主题: 双手柄档案表 */
