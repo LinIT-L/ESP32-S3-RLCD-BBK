@@ -61,6 +61,8 @@ void st7305_deinit(st7305_handle_t *dev);
 void st7305_clear(st7305_handle_t *dev, st7305_color_t color);
 
 void st7305_draw_pixel(st7305_handle_t *dev, int x, int y, st7305_color_t color);
+void st7305_set_clip_y(st7305_handle_t *dev, int y0, int y1);   /* ★y裁剪带(弹窗滚动用) */
+void st7305_reset_clip_y(st7305_handle_t *dev);
 
 /* 竖屏绘制目标开关: pfb=300×400 逻辑缓冲 (调用方分配), rot=2(左)/3(右).
  * 启用后所有绘制写入 pfb, st7305_flush 自动旋转回物理帧缓冲再送屏; pfb=NULL 关闭. */

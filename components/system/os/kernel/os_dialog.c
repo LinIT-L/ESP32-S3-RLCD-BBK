@@ -189,43 +189,37 @@ static const char *dlg_ret_text(const os_dlg_stack_t *d) {
 /* 画一行 (3.3 样式): 选中=黑底白字居中; 未选=白底黑字居中 (强制白底防残留) */
 static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
                          int abs_y, const char *text, bool selected, bool is_footer) {
-    /* ★★★ 2026-10-16 裁剪(linit): 内容区之外的行一律不画。
-     *   修复"滑动时内容越过弹窗边框、框外留残影"。
-     *   ⚠ 底部固定行(返回/取消/退出)在内容区裁剪边界之下 ⇒ 必须豁免, 否则会被裁掉。 */
     int y0c = abs_y, y1c = abs_y + DLG_LINE_H - 2;      /* 本行绘制范围 */
-    bool full = true;
     int y0v = y0c, y1v = y1c;
-    if (!is_footer) {        /* ★ 仅内容行裁剪; 底部固定行由调用方显式标记, 不靠 y 猜 */
-        if (y1c < L->clip_top) return;                   /* 整行在上边界之上 */
-        if (y0c > L->clip_bottom) return;                /* 整行在下边界之下 */
-        full = (y0c >= L->clip_top && y1c <= L->clip_bottom);   /* 完全可见才写字 */
+    if (!is_footer) {                       /* 内容行: 先按内容区裁剪 */
+        if (y1c < L->clip_top) return;      /* 整行在上边界之上 */
+        if (y0c > L->clip_bottom) return;   /* 整行在下边界之下 */
         y0v = (y0c < L->clip_top) ? L->clip_top : y0c;
         y1v = (y1c > L->clip_bottom) ? L->clip_bottom : y1c;
     }
-    /* ★★★ 绝对钳制(linit 2026-10-16): 不论布局怎么算, 行绘制范围绝不越出弹窗框。
-     *   上边 = 框顶+2 (边框粗 2px), 下边 = 框底-2 ⇒ 拖动时内容永远不会画到框外。 */
-    {
-        int box_top = L->y + 2, box_bot = L->y + L->h - 2;
-        if (y1v < box_top || y0v > box_bot) return;     /* 行完全在框外 */
-        if (y0v < box_top) { y0v = box_top; full = false; }
-        if (y1v > box_bot) { y1v = box_bot; full = false; }
-        if (y0c < box_top || y1c > box_bot) full = false;
-    }
+    /* 绝对钳制: 绝不越出弹窗框 (边框 2px) */
+    int box_top = L->y + 2, box_bot = L->y + L->h - 2;
+    if (y1v < box_top || y0v > box_bot) return;
+    if (y0v < box_top) y0v = box_top;
+    if (y1v > box_bot) y1v = box_bot;
+
+    /* ★★★ 2026-10-16: 设 y 裁剪带 —— 超出可见段的笔画被"切掉", 可见部分照常显示
+     *   (替代之前"整行才显示文字"的做法 ⇒ 滚动时不再整行文字突然消失) */
+    if (is_footer) st7305_reset_clip_y(lcd);
+    else           st7305_set_clip_y(lcd, y0v, y1v);
 
     int x0 = L->x + 6, x1 = L->x + L->w - 6;
     const char *t = text;
-    if (text_width(text) > x1 - x0) t = text_clip(text, x1 - x0);   /* 超长只显示前20英文/10中文 */
-    int top = abs_y + (DLG_LINE_H - 24) / 2;   /* 单行 24px 字垂直居中 */
+    if (text_width(text) > x1 - x0) t = text_clip(text, x1 - x0);
+    int top = abs_y + (DLG_LINE_H - 24) / 2;
     if (selected) {
         fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_BLACK);
-        if (full) draw_text_centered(lcd, top, t, true);
+        draw_text_centered(lcd, top, t, true);
     } else {
-        /* ★★★ 2026-10-16 根治(linit): 未选中行原来用**未裁剪的 abs_y** 画白底、且**无条件**画文字
-         *   ⇒ 行只要部分出界，白底+文字就画到框外、压过顶边框(拖动时满屏文字压线)。
-         *   现在与选中行一致: 白底用裁剪后的 y0v/y1v，文字仅"整行可见"才画。 */
         fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_WHITE);
-        if (full) draw_text_centered(lcd, top, t, false);
+        draw_text_centered(lcd, top, t, false);
     }
+    st7305_reset_clip_y(lcd);
 }
 
 /* 居中 toast 提示框 (与确认框同族观感: 2px 黑边框 + 12px 左右内边距, 高 40, 只显示消息、不显示标题)

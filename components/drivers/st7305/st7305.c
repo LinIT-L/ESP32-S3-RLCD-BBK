@@ -286,8 +286,19 @@ void st7305_clear(st7305_handle_t *dev, st7305_color_t color) {
     memset(dev->fb, (color == ST7305_COLOR_WHITE) ? 0xFF : 0x00, FB_BYTES);
 }
 
+/* ★★★ 2026-10-16 y 裁剪带(linit): 弹窗滚动时"字被切一半也要正常显示"。
+ *   所有像素最终都过 st7305_draw_pixel ⇒ 在这一层裁剪即可覆盖 ASCII/汉字/图形。 */
+static int s_clip_y0 = 0, s_clip_y1 = 1 << 30;
+void st7305_set_clip_y(st7305_handle_t *dev, int y0, int y1) {
+    (void)dev; s_clip_y0 = (y0 < 0) ? 0 : y0; s_clip_y1 = y1;
+}
+void st7305_reset_clip_y(st7305_handle_t *dev) {
+    (void)dev; s_clip_y0 = 0; s_clip_y1 = 1 << 30;
+}
+
 void st7305_draw_pixel(st7305_handle_t *dev, int x, int y, st7305_color_t color) {
     if (!dev || !dev->fb) return;
+    if (y < s_clip_y0 || y > s_clip_y1) return;      /* ★ y 裁剪带 */
     if (dev->pt_pfb) {
         pt_px(dev->pt_pfb, x, y, (color == ST7305_COLOR_BLACK) ? 1 : 0);
         return;
