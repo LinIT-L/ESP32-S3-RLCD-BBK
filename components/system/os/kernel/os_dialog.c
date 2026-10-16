@@ -220,8 +220,11 @@ static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
         fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_BLACK);
         if (full) draw_text_centered(lcd, top, t, true);
     } else {
-        fill_rect(lcd, x0, abs_y, x1 - 1, abs_y + DLG_LINE_H - 2, ST7305_COLOR_WHITE);
-        draw_text_centered(lcd, top, t, false);
+        /* ★★★ 2026-10-16 根治(linit): 未选中行原来用**未裁剪的 abs_y** 画白底、且**无条件**画文字
+         *   ⇒ 行只要部分出界，白底+文字就画到框外、压过顶边框(拖动时满屏文字压线)。
+         *   现在与选中行一致: 白底用裁剪后的 y0v/y1v，文字仅"整行可见"才画。 */
+        fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_WHITE);
+        if (full) draw_text_centered(lcd, top, t, false);
     }
 }
 
@@ -385,7 +388,7 @@ static void dlg_render(ui_ctx_t *ctx) {
         if (row_y + DLG_LINE_H <= L.clip_top || row_y >= L.clip_bottom) continue;
         dlg_draw_row(lcd, &L, row_y, d->items[idx], (!touch_scheme && idx == d->sel), false);
         /* 行最右侧删除"×" (row_x): 与行反相 */
-        if (d->row_x) {
+        if (d->row_x && row_y >= L.clip_top && row_y + DLG_LINE_H - 2 <= L.clip_bottom) {
             bool sel = (!touch_scheme && idx == d->sel);
             int ox = L.x + L.w - 6 - 16;
             int oy = row_y + (DLG_LINE_H - 24) / 2;
