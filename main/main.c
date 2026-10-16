@@ -25,6 +25,7 @@
 #include "st7305.h"
 #include "board_pins.h"
 #include "hw_cfg.h"
+#include "esp_bt.h"   /* ★经典蓝牙内存释放 */
 #include "nvs_flash.h"
 #include "bbk_boot.h"
 #include "input.h"
@@ -401,6 +402,11 @@ void app_main(void)
     app_board_t board;
     /* ★★★ 2026-10-16 自适应: 开机先探测芯片指纹定板型, 再让 app_board 按板型下发引脚
      * ⚠ hw_cfg 要用 NVS 存板型/en_mask ⇒ **必须先把 NVS 起来**(否则 IDF 断言重启) */
+    /* ★★★ 2026-10-16 内存优化(官方): S3 没有经典蓝牙, 但默认仍占着它的内存池
+     *   在 BT 初始化之前释放掉 ⇒ 立即回收(官方 API, 反复释放安全) */
+    { esp_err_t brel = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+      ESP_LOGW("MAIN", "★释放经典蓝牙内存池 ret=%d (S3 无经典蓝牙, 纯回收)", brel); }
+
     { esp_err_t nret = nvs_flash_init();
       if (nret == ESP_ERR_NVS_NO_FREE_PAGES || nret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
           nvs_flash_erase(); nvs_flash_init();
