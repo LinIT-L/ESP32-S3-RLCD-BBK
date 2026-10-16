@@ -87,6 +87,11 @@ static int  s_am_leave_child     = 0;      /* >0 = 本次离开管家是进了�
 /* 商店联网门禁 (2026-10-15 linit "联网归网络模块"): 商店**不自己连网** ——
  * 已配过就等网络模块连上 (toast 提示一下), 没配过就引导去设置。
  * 连上后云端索引由 am_rstore 自己拉 (它也只看 is_connected)。 */
+/* ★ 商店门禁确认回调: 0=确定(左) 1=取消(右) */
+static void am_wifi_gate_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result == 0) settings_wifi_connect_open(ctx);   /* ★ 确定 ⇒ 直接拉起系统联网弹窗(扫描+密码键盘) */
+}
 static void am_store_wifi_gate(ui_ctx_t *ctx) {
     if (s_store_wifi_asked) return;
     s_store_wifi_asked = true;
@@ -95,8 +100,10 @@ static void am_store_wifi_gate(ui_ctx_t *ctx) {
         ESP_LOGI(TAG, "商店门禁: 等网络模块连上");
         os_dialog_toast_ms(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c...", 1500); /* 正在连接网络... */
     } else {
-        ESP_LOGI(TAG, "商店门禁: 未配置网络 → 引导设置");
-        os_dialog_toast_ms(ctx, "\xe6\x9c\xaa\xe9\x85\x8d\xe7\xbd\xae\xe7\xbd\x91\xe7\xbb\x9c: \xe5\x88\xb0\xe8\xae\xbe\xe7\xbd\xae\xe9\x87\x8c\xe8\xbf\x9e Wi-Fi", 2500); /* 未配置网络: 到设置里连 Wi-Fi */
+        /* ★★★ 2026-10-16 linit: 未配置网络 ⇒ 弹"是否添加网络?"确认框;
+         *   点"确定"直接拉起系统联网弹窗(扫描+密码键盘), 不再是只给一句 toast。 */
+        ESP_LOGI(TAG, "商店门禁: 未配置网络 → 弹确认框引导连网");
+        os_dialog_confirm_ex(ctx, "\xe6\x98\xaf\xe5\x90\xa6\xe6\xb7\xbb\xe5\x8a\xa0\xe7\xbd\x91\xe7\xbb\x9c\x3f", 0, -1, am_wifi_gate_cb, NULL); /* 是否添加网络? */
     }
 }
 
