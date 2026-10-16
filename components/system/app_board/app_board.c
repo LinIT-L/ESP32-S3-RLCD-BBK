@@ -46,14 +46,23 @@ esp_err_t app_board_init(app_board_t *board)
      *   否则 CS 被 hold 住 → SPI 片选永远拉不动 → 屏全黑。 */
     /* ★★★ 2026-10-16: 解锁列表必须是**本板实际用的引脚**(漏改=屏全黑但串口正常)。
      *   小智: LCD DC7/CS11/SCK9/MOSI10 · 震动8 · 触摸5/13/12/6 · 按键1/0/4 */
-    gpio_hold_dis(GPIO_NUM_7);    /* LCD DC/RS */
-    gpio_hold_dis(GPIO_NUM_11);   /* LCD CS */
-    gpio_hold_dis(GPIO_NUM_9);    /* LCD SCK */
-    gpio_hold_dis(GPIO_NUM_10);   /* LCD MOSI */
-    gpio_hold_dis(GPIO_NUM_8);    /* 震动 PWM */
-    gpio_hold_dis(GPIO_NUM_12); gpio_hold_dis(GPIO_NUM_6);
-    gpio_hold_dis(GPIO_NUM_5);    gpio_hold_dis(GPIO_NUM_13);   /* 触摸 */
-    gpio_hold_dis(GPIO_NUM_1); gpio_hold_dis(GPIO_NUM_0); gpio_hold_dis(GPIO_NUM_4);  /* 按键 */
+    /* ★ 2026-10-16: 解锁列表**按板型表**给出(小智/微雪/自制各自不同), 不再写死。 */
+    {
+        const board_pins_t *bp0 = board_pins_get();
+        gpio_hold_dis((gpio_num_t)bp0->lcd_dc);
+        gpio_hold_dis((gpio_num_t)bp0->lcd_cs);
+        gpio_hold_dis((gpio_num_t)bp0->lcd_sck);
+        gpio_hold_dis((gpio_num_t)bp0->lcd_mosi);
+        if (bp0->lcd_rst >= 0) gpio_hold_dis((gpio_num_t)bp0->lcd_rst);
+        gpio_hold_dis((gpio_num_t)bp0->btn_pwr);
+        gpio_hold_dis((gpio_num_t)bp0->btn_right);
+        gpio_hold_dis((gpio_num_t)bp0->btn_left);
+        if (bp0->tp_sda >= 0) {
+            gpio_hold_dis((gpio_num_t)bp0->tp_sda); gpio_hold_dis((gpio_num_t)bp0->tp_scl);
+            gpio_hold_dis((gpio_num_t)bp0->tp_int); gpio_hold_dis((gpio_num_t)bp0->tp_rst);
+        }
+        gpio_hold_dis((gpio_num_t)(BOARD_IS_WEIXUE ? 48 : 8));   /* 震动 */
+    }
 
     /* 1. 初始化 LCD (必须最先, 显示开机 Logo) */
     /* ★★★ 2026-10-16 关键修复: 从板型表把引脚**下发**给驱动。

@@ -2,7 +2,7 @@ idf_component_register(
     SRCS "app_board.c"
     INCLUDE_DIRS "." "include"
     REQUIRES
-        st7305
+        board_pins st7305
         sd_scan
         input
         nvs_flash svc_nvs

@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
+#include "board_pins.h"
 
 static const char *TAG = "GPS";
 
@@ -54,7 +55,7 @@ static const gps_config_t k_default_cfg = {
     .uart_num    = UART_NUM_1,   /* console 是 USB-Serial-JTAG, UART0/1 都空; 用 1 避开 ROM 默认口 */
     .pin_tx      = 43,           /* 模块脚 37 (TXD0) */
     .pin_rx      = 44,           /* 模块脚 36 (RXD0) */
-    .pin_extint  = 18,           /* ★2026-10-13 linit 指定 GPIO18(⚠U3 音频座 5 脚也是 18) */            /* 原 47 在模块上不可用 ⇒ 挪到 8 */
+        .pin_extint  = BOARD_IS_WEIXUE ? 47 : 18,   /* ★按板型: 微雪=47, 小智=18(linit 指定) */
     /* ★ 2026-10-09: 921600 → **9600**。
      * 原因: 开机时 app_board 就把模块送进 `UBX-RXM-PMREQ(backup)`, 而 backup 模式
      * **不保留接收机配置** —— 唤醒后模块回到 u-blox 出厂默认 **9600 波特率**。

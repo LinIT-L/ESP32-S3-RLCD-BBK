@@ -53,7 +53,8 @@ typedef enum { VIB_NONE = 0, VIB_TM6604 = 1 } vib_mode_t;
  *   ⛔ 不要用 GPIO4: 它在旧固件里是**电池 ADC (ADC1_CH3)**(`board_battery.c`),
  *      拿 LEDC 去驱动会把电量采样搅成垃圾。
  * ⚠ 原 GPIO42 让给了 LCD 片选(42 同样在 24 个可用脚里 ✓)。 */
-#define VIB_PWM_PIN   GPIO_NUM_8   /* ★2026-10-13 新载板: 震动改 GPIO8 */
+#include "board_pins.h"
+#define VIB_PWM_PIN   ((gpio_num_t)(BOARD_IS_WEIXUE ? 48 : 8))   /* ★按板型: 微雪=48, 小智=8 */
 #define VIB_TIMER     LEDC_TIMER_1
 #define VIB_CHANNEL   LEDC_CHANNEL_1
 #define VIB_RES       LEDC_TIMER_8_BIT

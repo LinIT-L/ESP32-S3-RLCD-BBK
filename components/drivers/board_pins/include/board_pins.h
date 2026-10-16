@@ -67,8 +67,8 @@ uint64_t board_wake_mask(void);
  * ⚠ 运行时一律用 board_pins_get()->xxx; 这些宏仅在没有表上下文的地方兜底。 */
 /* ★★★ 2026-10-16 linit: **删除板型识别**, 回到最简单方式 —— 编译期选一块板。
  *   换板 = 改这一行 + 重编 (与 v1.3 一样直观, 不扫描 I2C、不写 NVS)。 */
-#define BOARD_IS_WEIXUE      0   /* 0=小智(当前板) 1=微雪 */   /* 1 = 微雪 REST41/触摸15-7-17-2/音频16-9-45-8-10 等
-                                  * 0 = 小智模块+载板(DC7/CS11/SCK9/MOSI10) */
+/* 选板: 0=小智  1=微雪  2=自制(仿微雪, 暂同微雪) */
+#define BOARD_IS_WEIXUE      1   /* ← 当前: 微雪 */
 #define BOARD_DEFAULT_ID     (BOARD_IS_WEIXUE ? BOARD_ID_WEIXUE : BOARD_ID_XIAOZHI)
 #define BOARD_BTN_PWR        GPIO_NUM_1
 #define BOARD_BTN_RIGHT      GPIO_NUM_0
