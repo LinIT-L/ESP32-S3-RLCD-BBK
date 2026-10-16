@@ -25,6 +25,7 @@
 #include "st7305.h"
 #include "board_pins.h"
 #include "hw_cfg.h"
+#include "nvs_flash.h"
 #include "bbk_boot.h"
 #include "input.h"
 #include "gam4980_emu.h"
@@ -398,7 +399,12 @@ void app_main(void)
 
     /* === 硬件初始化 (app_board 模块化封装, 顺序敏感见 components/app_board) === */
     app_board_t board;
-    /* ★★★ 2026-10-16 自适应: 开机先探测芯片指纹定板型, 再让 app_board 按板型下发引脚 */
+    /* ★★★ 2026-10-16 自适应: 开机先探测芯片指纹定板型, 再让 app_board 按板型下发引脚
+     * ⚠ hw_cfg 要用 NVS 存板型/en_mask ⇒ **必须先把 NVS 起来**(否则 IDF 断言重启) */
+    { esp_err_t nret = nvs_flash_init();
+      if (nret == ESP_ERR_NVS_NO_FREE_PAGES || nret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+          nvs_flash_erase(); nvs_flash_init();
+      } }
     hw_cfg_init();
 
     esp_err_t ret = app_board_init(&board);
