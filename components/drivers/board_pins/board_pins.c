@@ -61,6 +61,11 @@ static const board_pins_t BP_WEIXUE = {
 
 static const board_pins_t *s_cur = BOARD_IS_WEIXUE ? &BP_WEIXUE : &BP_XIAOZHI;
 
+/* ★ 2026-10-16 运行时选板: hw_cfg 探测出板型后调它覆盖编译期默认值 */
+void board_pins_set_id(board_id_t id) {
+    s_cur = (id == BOARD_ID_WEIXUE) ? &BP_WEIXUE : &BP_XIAOZHI;
+}
+
 const board_pins_t *board_pins_of(board_id_t id) {
     return (id == BOARD_ID_WEIXUE) ? &BP_WEIXUE : &BP_XIAOZHI;
 }

@@ -44,7 +44,8 @@ typedef struct {
 } board_pins_t;
 
 /* ---------------- 接口 ---------------- */
-const board_pins_t *board_pins_get(void);              /* 当前生效的表 (未识别 = 默认板型) */
+const board_pins_t *board_pins_get(void);
+void board_pins_set_id(board_id_t id);   /* ★运行时选板(hw_cfg 探测后调) */              /* 当前生效的表 (未识别 = 默认板型) */
 const board_pins_t *board_pins_of(board_id_t id);      /* 指定板型的表 (只读; 未知返回默认) */
 bool board_pins_select(board_id_t id);                 /* 设当前板型, 返回是否发生变化 */
 
