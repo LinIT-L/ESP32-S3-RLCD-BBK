@@ -15,8 +15,10 @@
 #include "os_sources.h"
 
 static const char *const S[] = {
-    /* ★ 主源 (2026-10-16 linit 定): Gitee raw —— 国内直连、免费、零运维(git push 即发布) */
-    "https://gitee.com/LinIT-L/ESP32-S3-RLCD-BBK/raw/master/store",
+    /* ★★ 主源 (2026-10-17 实测修正): Gitee 仓库不存在(404) ⇒ 改 GitHub raw。
+     *   GitHub raw 国内偏慢但可用; 优先走 jsDelivr CDN (国内有节点, 较快)。 */
+    "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store",
+    "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store",
     /* ⛔ 自有站已移除: 服务器不稳时会白等一次超时, 拖慢整个回退过程。
      *   要恢复请把它放在 Gitee **之后**(备源), 并先确认真的能下到。 */
     /* "https://bbk.linit.cn/bbk", */

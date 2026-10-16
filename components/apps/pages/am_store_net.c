@@ -40,6 +40,7 @@
 #include "esp_crt_bundle.h"
 #include "am_internal.h"
 #include "os_sources.h"
+#include "store_index_builtin.h"   /* ★ 固件内置商店索引(离线可用) */
 #include "am_store_json.h"
 #include "sd_scan.h"
 #include "wifi_manager.h"
@@ -112,6 +113,21 @@ static void am_idx_task(void *arg) {
         snprintf(tries[ntry++], AM_MIRROR_LEN, "%s", s_mir[i]);
 
     int rc = -99;
+    bool have_builtin = false;
+    /* ★★★ 2026-10-17 linit: 先用【固件内置索引】铺底 —— 离线/网络不通也能看到应用列表 */
+    {
+        char mir[AM_MIRROR_MAX][AM_MIRROR_LEN];
+        int  mn = 0, pn = 0;
+        if (am_store_json_parse(STORE_INDEX_BUILTIN, s_rpkg, AM_RPKG_MAX, &pn,
+                                mir, AM_MIRROR_MAX, &mn) == 0) {
+            memcpy(s_mir, mir, sizeof(s_mir));
+            s_mir_n = mn; s_rpkg_n = pn;
+            have_builtin = true;
+            ESP_LOGI(TAG, "★ 内置索引已加载: %d 个包(离线可用)", pn);
+        } else {
+            ESP_LOGW(TAG, "内置索引解析失败(编译进固件的那份有问题)");
+        }
+    }
     for (int i = 0; i < ntry; i++) {
         char url[AM_MIRROR_LEN + 32];
         url3(url, sizeof(url), tries[i], "/index.json", NULL);
@@ -151,7 +167,8 @@ static void am_idx_task(void *arg) {
             ESP_LOGD(TAG, "索引解析失败 rc=%d (跳过 %d 条)", pr, am_store_json_skipped());
         }
     }
-    if (rc == 0) {
+    if (rc == 0 || have_builtin) {     /* ★ 有内置索引 ⇒ 即使网络全挂也进 READY(离线商店) */
+        if (rc != 0) ESP_LOGW(TAG, "云端索引失败, 使用内置索引(离线模式)");
         __sync_synchronize();          /* 先写完数据, 再放状态 */
         s_state = ARS_READY;
     } else {
@@ -235,11 +252,14 @@ static void am_dl_task(void *arg) {
     snprintf(dst, sizeof(dst), "%s/%s.lua", dir, pk->name);
     ESP_LOGI(TAG, "下载 %s -> %s (%u B)", pk->name, dst, (unsigned)pk->size);
 
-    int rc = 0;   /* 0=OK 1=HTTP 2=连接 3=写盘 4=校验 */
+    /* ★★★ 2026-10-17 修: 初值必须非 0 —— 否则下面的"重试循环"一次都不进(死了一个源就整体失败) */
+    int rc = 9;   /* 9=未尝试 / 0=OK 1=HTTP 2=连接 3=写盘 4=校验 */
     uint32_t crc = 0;
     int total = 0, status = 0;
 
-    for (int i = 0; i < s_mir_n && rc == 0; i++) {
+    /* ★★★ 2026-10-17 修: 原为 `rc == 0`(只要成功就继续) ⇒ 逻辑反了:
+     *   第一个镜像失败后循环立刻退出, 永不重试后续镜像。改为 `rc != 0`(失败才继续试下一个)。 */
+    for (int i = 0; i < s_mir_n && rc != 0; i++) {
         char url[AM_MIRROR_LEN + 128];
         url3(url, sizeof(url), s_mir[i], "/", pk->path);
         if (i > 0) ESP_LOGD(TAG, "换源重试: %s", url);
