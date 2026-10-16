@@ -16,7 +16,7 @@
 #define CFG_LCD_CS        40
 #define CFG_LCD_SCK       11
 #define CFG_LCD_MOSI      12
-#define CFG_LCD_RST       41
+#define CFG_LCD_RST       (-1)   /* ★2026-10-16 微雪实物: DC 与 RESET 同为 GPIO5 ⇒ 固件不驱动 */
 #define CFG_LCD_FREQ_MHZ  60
 #define CFG_TP_SDA        (-1)   /* 本板无触摸 */
 #define CFG_TP_SCL        (-1)

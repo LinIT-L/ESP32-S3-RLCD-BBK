@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "st7305.h"
+#include "board_pins.h"
 
 #define TAG "ST7305"
 
@@ -791,14 +792,18 @@ esp_err_t st7305_flush_rotated(st7305_handle_t *dev, uint8_t rot, uint8_t *work_
 }
 
 st7305_config_t st7305_default_config(void) {
+    /* ★★★ 2026-10-16 单一真相源: 直接取当前板型表的引脚, 不再有第二份宏定义。
+     *   微雪: DC5/CS40/SCK11/MOSI12/RST41@60M(RST 必须驱动并拉高 3.3V)
+     *   小智: DC7/CS11/SCK9/MOSI10/RST不接@60M */
+    const board_pins_t *bp = board_pins_get();
     return (st7305_config_t){
-        .dc_gpio = 5,
-        .rst_gpio = 41,
+        .dc_gpio  = (gpio_num_t)bp->lcd_dc,
+        .rst_gpio = (gpio_num_t)bp->lcd_rst,
         .spi_host = SPI2_HOST,
-        .spi_mosi = 12,
-        .spi_sclk = 11,
-        .spi_cs = 42,     /* 2026-10-04: 小智核心模块占用 IO40 → CS 40→42 (与 user_config.h 同步) */
-        .spi_freq = 60,   /* ST7305 最大支持 60MHz, 提高刷新率 */
+        .spi_mosi = (gpio_num_t)bp->lcd_mosi,
+        .spi_sclk = (gpio_num_t)bp->lcd_sck,
+        .spi_cs   = (gpio_num_t)bp->lcd_cs,
+        .spi_freq = bp->lcd_freq_mhz,
     };
 }
 

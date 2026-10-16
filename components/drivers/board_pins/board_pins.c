@@ -41,7 +41,7 @@ static const board_pins_t BP_WEIXUE = {
      *   (仓库 LinIT-L/ESP32-S3-RLCD-BBK 的 v1.3 标签, 从驱动默认值/头文件里逐行抓出来的),
      *   一处不漏、不与 LCD 撞脚。 */
     /* 微雪 LCD: 照 v1.3(能亮那版)的值; **实际接法待 linit 逐根确认, 不猜** */
-    .lcd_dc = 5, .lcd_cs = 40, .lcd_sck = 11, .lcd_mosi = 12, .lcd_rst = -1,
+    .lcd_dc = 5, .lcd_cs = 40, .lcd_sck = 11, .lcd_mosi = 12, .lcd_rst = 41,   /* ★linit 实物: RST=41, 固件必须驱动并拉高 3.3V */
     .lcd_freq_mhz = 60,
     /* 触摸: 15/7/17/2 (与 LCD 的 5/40/11/12 不冲突) */
     .tp_sda = 15, .tp_scl = 7, .tp_int = 17, .tp_rst = 2,
