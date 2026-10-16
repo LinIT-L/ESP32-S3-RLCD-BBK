@@ -155,8 +155,19 @@ static void am_idx_task(void *arg) {
             int pr = am_store_json_parse(s_idx, s_rpkg, AM_RPKG_MAX, &pn,
                                          mir, AM_MIRROR_MAX, &mn);
             if (pr == 0) {
-                memcpy(s_mir, mir, sizeof(s_mir));
-                s_mir_n = mn;
+                /* ★★★ 2026-10-17 修: 云端索引的 mirrors 可能来自 CDN 旧缓存(含已下线源) ⇒
+                 *   不能直接覆盖! 云端源打头, 再把**固件内置源**追加进来去重 ⇒
+                 *   旧缓存再也不会把设备带向死服务器。 */
+                int k = 0;
+                for (int a = 0; a < mn && k < AM_MIRROR_MAX; a++)
+                    snprintf(s_mir[k++], AM_MIRROR_LEN, "%s", mir[a]);
+                for (int a = 0; a < os_sources_count() && k < AM_MIRROR_MAX; a++) {
+                    const char *u = os_sources_get(a);
+                    bool dup = false;
+                    for (int b = 0; b < k; b++) if (strcmp(s_mir[b], u) == 0) { dup = true; break; }
+                    if (!dup) snprintf(s_mir[k++], AM_MIRROR_LEN, "%s", u);
+                }
+                s_mir_n = k;
                 s_rpkg_n = pn;
                 ESP_LOGI(TAG, "索引 OK: %d 个包, %d 个镜像源, 跳过 %d 条",
                          s_rpkg_n, s_mir_n, am_store_json_skipped());
