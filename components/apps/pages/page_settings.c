@@ -951,7 +951,6 @@ void settings_wifi_connect_open(ui_ctx_t *ctx) {
 static void on_wifi_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     /* ★ 2026-10-16: 硬件自检 / 硬件配置 (位置动态, 用记录的下标判断) */
-    if (result >= 0 && result == s_wifi_idx_selfcheck) { open_hw_selfcheck_dlg(ctx); return; }
     if (result >= 0 && result == s_wifi_idx_hwcfg)     { open_hw_cfg_dlg(ctx);     return; }
     if (result >= 0 && result == s_wifi_idx_selfcheck) { open_hw_selfcheck_dlg(ctx); return; }
     if (result >= 0 && result == s_wifi_idx_hwcfg)     { open_hw_cfg_dlg(ctx);     return; }
@@ -1355,9 +1354,6 @@ static void open_wifi_dlg(ui_ctx_t *ctx, int sel) {
     }
     snprintf(items[n], sizeof(items[n]), "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xbf\xa1\xe6\x81\xaf");  /* 系统信息 */
     ptrs[n] = items[n]; n++;
-    s_wifi_idx_selfcheck = n;
-    snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe8\x87\xaa\xe6\xa3\x80");  /* 硬件自检 */
-    ptrs[n] = items[n]; n++;
     s_wifi_idx_hwcfg = n;
     snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe9\x85\x8d\xe7\xbd\xae");  /* 硬件配置 */
     ptrs[n] = items[n]; n++;
@@ -1431,22 +1427,32 @@ static void open_hw_selfcheck_dlg(ui_ctx_t *ctx) {
     os_dialog_push(ctx, &dlg);
 }
 
-/* 配置页: 6 项开关, 点一下切换并存 NVS */
+/* 配置页(2026-10-16 linit 定): 只列"已检测到"的硬件; 没检测到的不显示;
+ * 已识别的无论当前开/关都列出, 点一下即切换并立即存 NVS */
+static int s_hwcfg_list[HW_COUNT];       /* 行号 → hw_id 映射(只含检测到的) */
 static void hwcfg_pass1(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
-    if (result < 0 || result >= HW_COUNT) return;
-    if (!hw_cfg_detected((hw_id_t)result)) { os_dialog_toast(ctx, "该硬件未检测到"); return; }
-    hw_cfg_set_enabled((hw_id_t)result, !hw_cfg_enabled((hw_id_t)result));
+    if (result < 0) return;
+    int n = 0;
+    for (int i = 0; i < HW_COUNT; i++) if (hw_cfg_detected((hw_id_t)i)) n++;
+    if (result >= n) return;
+    hw_id_t id = (hw_id_t)s_hwcfg_list[result];
+    hw_cfg_set_enabled(id, !hw_cfg_enabled(id));
     os_dialog_pop(ctx);
-    open_hw_cfg_dlg(ctx);                  /* 重开以刷新显示 */
+    open_hw_cfg_dlg(ctx);                 /* 重开以刷新开关状态 */
 }
 static void open_hw_cfg_dlg(ui_ctx_t *ctx) {
     os_dlg_stack_t dlg; memset(&dlg, 0, sizeof(dlg));
-    for (int i = 0; i < HW_COUNT; i++)
-        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s:%s%s", HWCFG_NAMES[i],
-                 hw_cfg_enabled((hw_id_t)i) ? "开" : "关",
-                 hw_cfg_detected((hw_id_t)i) ? "" : "(未检测到)");
-    dlg.count = HW_COUNT; dlg.sel = 0; dlg.cb = hwcfg_pass1;
+    int n = 0;
+    for (int i = 0; i < HW_COUNT; i++) {
+        if (!hw_cfg_detected((hw_id_t)i)) continue;      /* ★没检测到的不显示 */
+        s_hwcfg_list[n] = i;
+        snprintf(dlg.items[n], sizeof(dlg.items[n]), "%s:%s", HWCFG_NAMES[i],
+                 hw_cfg_enabled((hw_id_t)i) ? "开" : "关");
+        n++;
+    }
+    if (n == 0) { os_dialog_toast(ctx, "没有检测到可配置的硬件"); return; }
+    dlg.count = n; dlg.sel = 0; dlg.cb = hwcfg_pass1;
     os_dialog_push(ctx, &dlg);
 }
 
