@@ -93,14 +93,15 @@ static const char *s_loop_toast[MP3_LOOP_N] = {
 #define MP3_BTN_X3   338          /* 下一首 */
 #define MP3_BTN_X4   380          /* 循环模式 */
 #define MP3_BTN_GAP  8            /* 相邻图标中心间隔 */
-/* 音量横向苹果药丸 (V2.x): 图标上方横向胶囊 + 中央圆点拖动调音量.
- * 读数左边小(音量0%)→右边大(音量100%), 圆点随音量左右移动. */
-#define MP3_VOL_X0        205           /* 胶囊左端 x (留出左栏列表) */
-#define MP3_VOL_X1        300           /* 胶囊右端 x */
-#define MP3_VOL_CY        (MP3_BTN_CY - 58)   /* 188: 音量图标上方 */
-#define MP3_VOL_H         22            /* 胶囊厚度 (药丸高度) */
-#define MP3_VOL_DOT_R     10            /* 中央圆点半径 */
-#define MP3_VOL_TOUCH     32            /* 触摸热区左右宽度 */
+/* 音量竖向滑条 (V3, linit 2026-10-16): 音量图标正上方细竖线 + 大圆球上下拖动.
+ * 球外一圈棋盘点圈(发白) ⇒ 压在光盘上也不糊住底图. */
+#define MP3_VOL_CX        MP3_BTN_X0
+#define MP3_VOL_YT        96
+#define MP3_VOL_YB        (MP3_BTN_CY - 44)
+#define MP3_VOL_HW        5
+#define MP3_VOL_DOT_R     12
+#define MP3_VOL_HALO      6
+#define MP3_VOL_TOUCH     22
 /* 播放列表: 底部止于进度条上方 (留 4px) */
 #define MP3_LIST_BOTTOM  (MP3_BAR_Y - 4)
 
@@ -322,62 +323,51 @@ static void mp3_draw_control_icons(st7305_handle_t *lcd)
       mp3_draw_icon(lcd, MP3_BTN_X4, MP3_BTN_CY, w, h, ic, false); }
 }
 
-/* ==== 音量横向苹果药丸 ==== */
-/* 当前音量 → 圆点 x 坐标 (0..100 → X0..X1) */
-static int mp3_vol_slider_dot_x(void)
+/* ==== 音量竖向滑条: 细竖线 + 大圆球(上下拖动) + 球外棋盘点圈(发白) ==== */
+static int mp3_vol_slider_dot_y(void)
 {
     int vol = audio_player_get_volume();
-    int range = MP3_VOL_X1 - MP3_VOL_X0;
-    return MP3_VOL_X0 + (range * vol / 100);
+    int range = MP3_VOL_YB - MP3_VOL_YT;
+    return MP3_VOL_YB - (range * vol / 100);
 }
-/* x 坐标 → 音量 (0..100) */
-static int mp3_slider_x_to_vol(int x)
+static int mp3_slider_y_to_vol(int y)
 {
-    int range = MP3_VOL_X1 - MP3_VOL_X0;
-    int t = x - MP3_VOL_X0;
+    int range = MP3_VOL_YB - MP3_VOL_YT;
+    int t = MP3_VOL_YB - y;
     int v = (range <= 0) ? 100 : (t * 100 / range);
     if (v < 0) v = 0;
     if (v > 100) v = 100;
     return v;
 }
-/* 命中药丸 (圆点附近左右 TOUCH, 上下 ±H, 便于按住拖动) */
 static bool mp3_in_vol_slider(int x, int y)
 {
-    int dx = x - mp3_vol_slider_dot_x();
-    int dy = y - MP3_VOL_CY;
-    if (dx < -MP3_VOL_TOUCH || dx > MP3_VOL_TOUCH) return false;
-    if (dy < -MP3_VOL_H || dy > MP3_VOL_H) return false;
+    if (x < MP3_VOL_CX - MP3_VOL_TOUCH || x > MP3_VOL_CX + MP3_VOL_TOUCH) return false;
+    if (y < MP3_VOL_YT - MP3_VOL_TOUCH || y > MP3_VOL_YB + MP3_VOL_TOUCH) return false;
     return true;
 }
-/* 绘制音量横向苹果药丸: 白底圆角胶囊 + 中央圆点.
- * 垫白底遮住底下旋转光盘; 胶囊 = 圆角矩形 (两端半圆 + 中段矩形); 圆点随音量移动. */
+/* 50% 棋盘点: 1bpp 上当"半透明发白"用, 压在光盘上不糊底图 */
+static inline void mp3_dither_px(st7305_handle_t *lcd, int x, int y)
+{
+    if (((x + y) & 1) == 0) st7305_draw_pixel(lcd, x, y, ST7305_COLOR_BLACK);
+}
 static void mp3_draw_vol_slider(st7305_handle_t *lcd)
 {
-    /* 先垫一块白底 (胶囊区外扩), 盖住底下旋转光盘, 保证胶囊/圆点纯净 */
-    fill_rect(lcd, MP3_VOL_X0 - MP3_VOL_DOT_R - 4, MP3_VOL_CY - MP3_VOL_H - 4,
-              MP3_VOL_X1 + MP3_VOL_DOT_R + 4, MP3_VOL_CY + MP3_VOL_H + 4, ST7305_COLOR_WHITE);
-    /* 胶囊描边 (黑) */
-    int rr = MP3_VOL_H / 2;   /* 圆角半径 */
-    draw_rect_outline(lcd, MP3_VOL_X0, MP3_VOL_CY - rr, MP3_VOL_X1, MP3_VOL_CY + rr, ST7305_COLOR_BLACK);
-    /* 两端半圆 */
-    for (int a = 0; a < 360; a++) {
-        float rad = (float)a * 3.14159f / 180.0f;
-        int px = MP3_VOL_X0 + (int)(rr * cosf(rad));
-        int py = MP3_VOL_CY + (int)(rr * sinf(rad));
-        if (px >= 0 && px < UI_SCREEN_W && py >= 0 && py < UI_SCREEN_H)
-            st7305_draw_pixel(lcd, px, py, ST7305_COLOR_BLACK);
-    }
-    for (int a = 0; a < 360; a++) {
-        float rad = (float)a * 3.14159f / 180.0f;
-        int px = MP3_VOL_X1 + (int)(rr * cosf(rad));
-        int py = MP3_VOL_CY + (int)(rr * sinf(rad));
-        if (px >= 0 && px < UI_SCREEN_W && py >= 0 && py < UI_SCREEN_H)
-            st7305_draw_pixel(lcd, px, py, ST7305_COLOR_BLACK);
-    }
-    /* 中央圆点 (白边 + 黑芯), 位置=当前音量 */
-    int dx = mp3_vol_slider_dot_x();
-    mp3_fill_circle(lcd, dx, MP3_VOL_CY, MP3_VOL_DOT_R + 2, ST7305_COLOR_WHITE);
-    mp3_fill_circle(lcd, dx, MP3_VOL_CY, MP3_VOL_DOT_R, ST7305_COLOR_BLACK);
+    const int cx = MP3_VOL_CX;
+    int dy = mp3_vol_slider_dot_y();
+    fill_rect(lcd, cx - MP3_VOL_HW, MP3_VOL_YT, cx + MP3_VOL_HW, MP3_VOL_YB, ST7305_COLOR_WHITE);
+    if (dy < MP3_VOL_YB)
+        fill_rect(lcd, cx - MP3_VOL_HW + 1, dy, cx + MP3_VOL_HW - 1, MP3_VOL_YB, ST7305_COLOR_BLACK);
+    draw_vline(lcd, cx - MP3_VOL_HW, MP3_VOL_YT, MP3_VOL_YB, ST7305_COLOR_BLACK);
+    draw_vline(lcd, cx + MP3_VOL_HW, MP3_VOL_YT, MP3_VOL_YB, ST7305_COLOR_BLACK);
+    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R + 2, ST7305_COLOR_WHITE);
+    for (int oy = -MP3_VOL_DOT_R - MP3_VOL_HALO; oy <= MP3_VOL_DOT_R + MP3_VOL_HALO; oy++)
+        for (int ox = -MP3_VOL_DOT_R - MP3_VOL_HALO; ox <= MP3_VOL_DOT_R + MP3_VOL_HALO; ox++) {
+            int d2 = ox*ox + oy*oy;
+            if (d2 <= MP3_VOL_DOT_R*MP3_VOL_DOT_R) continue;
+            if (d2 > (MP3_VOL_DOT_R+MP3_VOL_HALO)*(MP3_VOL_DOT_R+MP3_VOL_HALO)) continue;
+            mp3_dither_px(lcd, cx + ox, dy + oy);
+        }
+    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R, ST7305_COLOR_BLACK);
 }
 
 /* ============ V1.4.x: 随音乐震动 (保留能力, 由 NVS 控制; 图标按钮已从 UI 移除) ============ */
@@ -670,13 +660,13 @@ static void p_mp3_poll(ui_ctx_t *ctx)
             if (!pts[i].pressed) continue;
             int px = pts[i].x, py = pts[i].y;
             if (mp3_in_vol_slider(px, py)) {
-                int ddx = px - s_vol_drag_y;
+int ddy = py - s_vol_drag_y;
                 if (!s_vol_drag) {
-                    s_vol_drag = true;      /* 记录拖动起始基准, 本帧不改音量 */
-                    s_vol_drag_y = px;
-                } else if (ddx > 4 || ddx < -4) {  /* 真正拖动才实时调音量 */
-                    audio_player_set_volume(mp3_slider_x_to_vol(px));
-                    s_vol_drag_y = px;
+                    s_vol_drag = true;      /* 记录起始基准, 本帧不改音量 */
+                    s_vol_drag_y = py;
+                } else if (ddy > 4 || ddy < -4) {  /* 真拖动才实时调音量 */
+                    audio_player_set_volume(mp3_slider_y_to_vol(py));
+                    s_vol_drag_y = py;
                     ctx->needs_redraw = true;
                 }
                 break;
