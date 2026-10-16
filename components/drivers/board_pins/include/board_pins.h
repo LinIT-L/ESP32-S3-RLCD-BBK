@@ -73,13 +73,13 @@ uint64_t board_wake_mask(void);
  *   ⛔ 排查完**全部改回 1**(即恢复正常全功能)。 */
 #define LINTOS_USE_SD     1    /* ← 本轮测试项: SD 卡 */
 #define LINTOS_USE_INPUT     1    /* ← 本轮: 只加按键 */    /* ← 待测: 按键 */
-#define LINTOS_USE_TOUCH     0    /* ← 微雪无触摸: 保持关闭 */    /* 触摸(微雪无触摸, 先关) */
+#define LINTOS_USE_TOUCH     1    /* ← 微雪无触摸: 保持关闭 */    /* 触摸(微雪无触摸, 先关) */
 #define LINTOS_USE_AUDIO     1    /* ← 本轮: 加音频 */    /* ← 待测: 音频 */
 #define LINTOS_USE_BATTERY     1    /* ← 本轮: 加电池 */
-#define LINTOS_USE_GPS       0    /* 微雪无 GPS */
+#define LINTOS_USE_GPS     1    /* 微雪无 GPS */
 #define LINTOS_LCD_ONLY      0    /* 兼容旧开关: 1=全部跳过 */
 
-#define BOARD_IS_WEIXUE      1   /* ← 当前: 微雪 */
+#define BOARD_IS_WEIXUE      0   /* 0=小智(当前) 1=微雪 */
 #define BOARD_DEFAULT_ID     (BOARD_IS_WEIXUE ? BOARD_ID_WEIXUE : BOARD_ID_XIAOZHI)
 #define BOARD_BTN_PWR        GPIO_NUM_1
 #define BOARD_BTN_RIGHT      GPIO_NUM_0
