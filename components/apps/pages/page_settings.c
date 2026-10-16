@@ -30,6 +30,7 @@
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "board_battery.h"
+#include "hw_cfg.h"
 #include "svc_nvs.h"
 #include "svc_cfg.h"
 #include <string.h>
@@ -925,6 +926,9 @@ static void open_snd_dlg(ui_ctx_t *ctx, int sel) {
 static void open_wifi_dlg(ui_ctx_t *ctx, int sel);
 static void open_wifi_scan(ui_ctx_t *ctx);
 static void open_info_dlg(ui_ctx_t *ctx);
+static void open_hw_selfcheck_dlg(ui_ctx_t *ctx);   /* ★硬件自检 */
+static void open_hw_cfg_dlg(ui_ctx_t *ctx);         /* ★硬件配置 */
+static int  s_wifi_idx_selfcheck = -1, s_wifi_idx_hwcfg = -1;
 
 /* USB 网卡菜单"连接WiFi"入口: 复用以设置页同样的扫描→输密码 流程.
  * 需在设置页同编译单元内, 故放这里并导出让 page_usb_net 调用. */
@@ -946,6 +950,8 @@ void settings_wifi_connect_open(ui_ctx_t *ctx) {
 }
 static void on_wifi_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
+    if (result >= 0 && result == s_wifi_idx_selfcheck) { open_hw_selfcheck_dlg(ctx); return; }
+    if (result >= 0 && result == s_wifi_idx_hwcfg)     { open_hw_cfg_dlg(ctx);     return; }
     if (result == 0) {   /* 蓝牙开关 (懒加载 os_hw) */
         if (bt_is_on()) { os_hw_release(OS_HW_BT); bt_manager_disable(); }  /* 计数错位时兜底直关 */
         else            os_hw_request(OS_HW_BT);
@@ -1328,8 +1334,8 @@ static void open_wifi_scan(ui_ctx_t *ctx) {
 }
 
 static void open_wifi_dlg(ui_ctx_t *ctx, int sel) {
-    char items[4][30];
-    const char *ptrs[4];
+    char items[6][30];
+    const char *ptrs[6];
     int n = 0;
     snprintf(items[n], sizeof(items[n]), "\xe8\x93\x9d\xe7\x89\x99:%s", bt_is_on() ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 蓝牙:开/关 */
     ptrs[n] = items[n]; n++;
@@ -1345,6 +1351,12 @@ static void open_wifi_dlg(ui_ctx_t *ctx, int sel) {
         ptrs[n] = items[n]; n++;
     }
     snprintf(items[n], sizeof(items[n]), "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xbf\xa1\xe6\x81\xaf");  /* 系统信息 */
+    ptrs[n] = items[n]; n++;
+    s_wifi_idx_selfcheck = n;
+    snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe8\x87\xaa\xe6\xa3\x80");  /* 硬件自检 */
+    ptrs[n] = items[n]; n++;
+    s_wifi_idx_hwcfg = n;
+    snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe9\x85\x8d\xe7\xbd\xae");  /* 硬件配置 */
     ptrs[n] = items[n]; n++;
     sel = (sel < 0) ? 0 : (sel >= n ? n - 1 : sel);
     os_dialog_list(ctx, "", ptrs, n, sel, on_wifi_select, NULL);
@@ -1367,6 +1379,68 @@ static void info_refresh_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     d->count = s_info_n;
     ctx->needs_redraw = true;
 }
+
+/* ============ ★ 硬件自检 / 硬件配置 (2026-10-16 linit 要求) ============ */
+static const char *HWCFG_NAMES[6] = { "触摸", "SD卡", "音频", "电池", "GPS", "震动" };
+
+/* 自检页: 板型 + 6 项"检测到/未检测到(开/关)" + 最后一行"重新自检" */
+static int hwsc_build(char lines[][28]) {
+    int k = 0;
+    snprintf(lines[k++], 28, "板型:%s", hw_cfg_board_name());
+    for (int i = 0; i < HW_COUNT; i++)
+        snprintf(lines[k++], 28, "%s:%s%s", HWCFG_NAMES[i],
+                 hw_cfg_detected((hw_id_t)i) ? "检测到" : "未检测到",
+                 hw_cfg_enabled((hw_id_t)i) ? "(开)" : "(关)");
+    snprintf(lines[k++], 28, "重新自检");
+    return k;
+}
+static void hwsc_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)ud;
+    static uint32_t last = 0;
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (now - last < 1000) return;
+    last = now;
+    char L[8][28]; int n = hwsc_build(L);
+    for (int i = 0; i < n; i++) snprintf(d->items[i], sizeof(d->items[i]), "%s", L[i]);
+    d->count = n; ctx->needs_redraw = true;
+}
+static void hwsc_select(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    char L[8][28]; int n = hwsc_build(L);
+    if (result == n - 1) {                 /* 最后一行 = 重新自检 */
+        hw_cfg_rescan();
+        os_dialog_pop(ctx);
+        open_hw_selfcheck_dlg(ctx);
+        os_dialog_toast(ctx, "已重新自检");
+    }
+}
+static void open_hw_selfcheck_dlg(ui_ctx_t *ctx) {
+    os_dlg_stack_t dlg; memset(&dlg, 0, sizeof(dlg));
+    char L[8][28]; int n = hwsc_build(L);
+    for (int i = 0; i < n; i++) snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", L[i]);
+    dlg.count = n; dlg.sel = -1; dlg.on_poll = hwsc_poll; dlg.cb = hwsc_select;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* 配置页: 6 项开关, 点一下切换并存 NVS */
+static void hwcfg_pass1(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result < 0 || result >= HW_COUNT) return;
+    if (!hw_cfg_detected((hw_id_t)result)) { os_dialog_toast(ctx, "该硬件未检测到"); return; }
+    hw_cfg_set_enabled((hw_id_t)result, !hw_cfg_enabled((hw_id_t)result));
+    os_dialog_pop(ctx);
+    open_hw_cfg_dlg(ctx);                  /* 重开以刷新显示 */
+}
+static void open_hw_cfg_dlg(ui_ctx_t *ctx) {
+    os_dlg_stack_t dlg; memset(&dlg, 0, sizeof(dlg));
+    for (int i = 0; i < HW_COUNT; i++)
+        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s:%s%s", HWCFG_NAMES[i],
+                 hw_cfg_enabled((hw_id_t)i) ? "开" : "关",
+                 hw_cfg_detected((hw_id_t)i) ? "" : "(未检测到)");
+    dlg.count = HW_COUNT; dlg.sel = 0; dlg.cb = hwcfg_pass1;
+    os_dialog_push(ctx, &dlg);
+}
+
 static void open_info_dlg(ui_ctx_t *ctx) {
     build_sysinfo();
     os_dlg_stack_t dlg;
