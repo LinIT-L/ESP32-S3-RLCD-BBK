@@ -19,7 +19,7 @@
     {
       "name": "earthsurvival",
       "label": "地球生存",
-      "cat": "app",
+      "cat": "game",
       "ver": 1,
       "size": 32297,
       "crc32": "5bec895f",
@@ -28,7 +28,7 @@
     {
       "name": "map",
       "label": "矢量地图",
-      "cat": "app",
+      "cat": "ops",
       "ver": 1,
       "size": 100467,
       "crc32": "5131f966",
@@ -37,7 +37,7 @@
     {
       "name": "minidayz",
       "label": "迷你DayZ",
-      "cat": "app",
+      "cat": "game",
       "ver": 1,
       "size": 55680,
       "crc32": "11979efe",
@@ -46,7 +46,7 @@
     {
       "name": "qqtang",
       "label": "QQ堂冒险",
-      "cat": "app",
+      "cat": "game",
       "ver": 1,
       "size": 81773,
       "crc32": "e413aa54",
@@ -55,7 +55,7 @@
     {
       "name": "wuxia",
       "label": "英雄坛说",
-      "cat": "app",
+      "cat": "game",
       "ver": 1,
       "size": 63947,
       "crc32": "21991991",
@@ -64,7 +64,7 @@
     {
       "name": "biossim",
       "label": "BIOS模拟器",
-      "cat": "ops",
+      "cat": "game",
       "ver": 1,
       "size": 211533,
       "crc32": "128a641b",
