@@ -1353,7 +1353,7 @@ static void open_wifi_dlg(ui_ctx_t *ctx, int sel) {
     snprintf(items[n], sizeof(items[n]), "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xbf\xa1\xe6\x81\xaf");  /* 系统信息 */
     ptrs[n] = items[n]; n++;
     s_wifi_idx_selfcheck = n;
-    snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe8\x87\xaa\xe6\xa3\x80");  /* 硬件自检 */
+    snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe7\xae\xa1\xe7\x90\x86");  /* 硬件管理 */
     ptrs[n] = items[n]; n++;
     sel = (sel < 0) ? 0 : (sel >= n ? n - 1 : sel);
     os_dialog_list(ctx, "", ptrs, n, sel, on_wifi_select, NULL);
@@ -1401,6 +1401,21 @@ static void hwsc_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     for (int i = 0; i < n; i++) snprintf(d->items[i], sizeof(d->items[i]), "%s", L[i]);
     d->count = n; ctx->needs_redraw = true;
 }
+/* ★ 只有 音频/GPS/震动 可点击开关; 触摸/SD卡/电池 只显示不可点(linit 2026-10-16) */
+static bool hwmg_clickable(int id) {
+    return (id == HW_AUDIO || id == HW_GPS || id == HW_VIB);
+}
+static int s_hwmg_id = -1;
+static void hwmg_confirm_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result == 0 && s_hwmg_id >= 0) {          /* 0=确定 1=取消 */
+        hw_id_t id = (hw_id_t)s_hwmg_id;
+        hw_cfg_set_enabled(id, !hw_cfg_enabled(id));
+    }
+    s_hwmg_id = -1;
+    os_dialog_pop(ctx);
+    open_hw_selfcheck_dlg(ctx);                   /* 重开刷新状态 */
+}
 static void hwsc_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     char L[8][28]; int n = hwsc_build(L);
@@ -1409,6 +1424,18 @@ static void hwsc_select(ui_ctx_t *ctx, int result, void *ud) {
         os_dialog_pop(ctx);
         open_hw_selfcheck_dlg(ctx);
         os_dialog_toast(ctx, "已重新自检");
+        return;
+    }
+    /* 第 1..HW_COUNT 行 = 硬件项(第 0 行是板型标题, 不可点) */
+    if (result >= 1 && result <= HW_COUNT) {
+        int id = result - 1;
+        if (!hwmg_clickable(id)) return;                 /* 触摸/SD/电池: 点击无反应 */
+        if (!hw_cfg_detected((hw_id_t)id)) return;       /* 未检测到: 无反应 */
+        s_hwmg_id = id;
+        char msg[48];
+        snprintf(msg, sizeof(msg), "%s%s?", hw_cfg_enabled((hw_id_t)id) ? "禁用" : "启用",
+                 HWCFG_NAMES[id]);
+        os_dialog_confirm_ex(ctx, msg, 0, -1, hwmg_confirm_cb, NULL);   /* 左确定/右取消 */
     }
 }
 static void open_hw_selfcheck_dlg(ui_ctx_t *ctx) {
