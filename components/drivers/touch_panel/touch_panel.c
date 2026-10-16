@@ -235,7 +235,9 @@ tp_chip_t touch_panel_init(void) {
     }
     /* 启动后台触摸看门狗 (V1.0.68) */
     if (!s_wd_task) {
-        xTaskCreate(touch_watchdog_task, "touch_wd", 4096, NULL, 2, &s_wd_task);
+        /* ★2026-10-16 内存优化: 栈放 PSRAM(不涉 DMA/cache 关断路径) */
+        xTaskCreateWithCaps(touch_watchdog_task, "touch_wd", 4096, NULL, 2, &s_wd_task,
+                            MALLOC_CAP_SPIRAM);
         ESP_LOGI(TAG, "触摸看门狗已启动");
     }
     return s_chip;

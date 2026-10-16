@@ -423,7 +423,7 @@ static int i2s_init_locked(int sample_rate) {
      * V1.0.67: DMA 降到 6×576 (13.5KB), 给 WiFi 腾 DMA 内存 (蓝牙+音频已占 113KB).
      * 6×576=3456 帧 ≈ 72ms@24kHz, 足够吸收模拟器帧抖动不欠载. */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 6;
+    chan_cfg.dma_desc_num = 4;   /* ★2026-10-16 内存优化: 6→4, 每方向省 2×2304B=4.6KB, 两方向共 ~9.2KB */
     chan_cfg.dma_frame_num = 576;
     chan_cfg.auto_clear = true;
     esp_err_t ret = i2s_new_channel(&chan_cfg, &s_tx_chan, &s_rx_chan);
