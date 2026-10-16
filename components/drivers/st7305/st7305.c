@@ -138,6 +138,18 @@ esp_err_t st7305_init(st7305_handle_t *out, const st7305_config_t *config) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* ★引脚实测(回答"RST 到底有没有 3.3V") */
+    if (config->rst_gpio >= 0) {
+        gpio_set_direction((gpio_num_t)config->rst_gpio, GPIO_MODE_INPUT_OUTPUT);
+        ESP_LOGW(TAG, "★引脚实测: RST(GPIO%d) 电平=%d", config->rst_gpio,
+                 gpio_get_level((gpio_num_t)config->rst_gpio));
+    }
+    if (config->dc_gpio >= 0) {
+        gpio_set_direction((gpio_num_t)config->dc_gpio, GPIO_MODE_INPUT_OUTPUT);
+        ESP_LOGW(TAG, "★引脚实测: DC(GPIO%d) 电平=%d", config->dc_gpio,
+                 gpio_get_level((gpio_num_t)config->dc_gpio));
+    }
+
     *out = (st7305_handle_t){
         .dc_gpio = config->dc_gpio,
         .rst_gpio = config->rst_gpio,
