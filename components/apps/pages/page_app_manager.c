@@ -1116,9 +1116,11 @@ static void p_am_render(ui_ctx_t *ctx) {
         /* 该分类暂无应用 */
     }
 
-    /* 下载中: 盖上进度框 (画在列表之上, 但不遮挡整屏) */
+    /* ⛔ 2026-10-18 linit: **下载浮层面板已彻底移除** —— 进度改在列表行内进度条。
+     *   (原来只让函数体 return, 面板背景照样画 ⇒ 出现"空白弹窗" ✗)
     if (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING)
         am_draw_dl_overlay(lcd, grid_x0, content_top);
+    */
 
     /* 视图切换图标已移除: 改为 长按硬件确认键 3s 切换 (见 p_am_poll/OS_ACTION_BT_SEARCH). */
 

@@ -532,8 +532,11 @@ void am_store_activate(ui_ctx_t *ctx, const os_app_t *a) {
     int k = am_pkg_find(a);
     if (k < 0) return;
     if (am_pkg_installed(k)) {
-        const char *run = am_file_exist(s_pkg[k].dst) ? s_pkg[k].dst : s_pkg[k].dst_sd; /* 优先内置, 否则TF卡 */
-        am_lua_open_path(ctx, run);     /* 统一入口: 带 `need=wifi` 门禁 (未联网先弹窗连网) */
+        /* ★★★ 2026-10-18 linit 反复报"点卸载就退出应用中心"的真因:
+         *   商店里点**已安装的行**原来会 `am_lua_open_path()` **直接启动应用** ✗
+         *   ⇒ 用户以为"退出应用中心" ✓ (实际是被拉去跑那个应用了)
+         *   商店里**永远不启动应用**(只负责装/卸) ⇒ 已安装的点一下就弹"卸载?" ✓ */
+        am_store_uninstall_ask(ctx, a);
         return;
     }
     char title[64];
@@ -542,33 +545,47 @@ void am_store_activate(ui_ctx_t *ctx, const os_app_t *a) {
 }
 
 /* ========== 商店 卸载 (删除已装包 + 移出主菜单 + 重新扫描) ========== */
+/* ★★★ 2026-10-18 linit: **卸载放后台任务** —— 原来在 UI 线程删 4 个文件 + 写两次 NVS,
+ *   会卡住界面。现在 UI 立刻弹 toast, 文件删除/记录清理在后台做完再刷新列表。 */
+typedef struct {
+    char paths[4][192];
+    char lid[64];
+    int  npaths;
+} am_uninst_job_t;
+
+static void am_uninst_task(void *arg) {
+    am_uninst_job_t *j = (am_uninst_job_t *)arg;
+    for (int i = 0; i < j->npaths; i++)
+        if (j->paths[i][0]) remove(j->paths[i]);
+    os_app_set_mainmenu(j->lid, false);
+    os_app_set_hidden(j->lid, true);
+    am_store_invalidate();     /* 重扫 → 下次进商店/重建时列表已更新 */
+    am_lua_invalidate();
+    ESP_LOGI("AMSTORE", "后台卸载完成: %s (删了 %d 个文件)", j->lid, j->npaths);
+    free(j);
+    vTaskDelete(NULL);
+}
+
 static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
     if (k < 0 || k >= s_pkg_n) return;
     if (!am_pkg_installed(k)) { os_dialog_toast(ctx, "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85"); return; } /* 未安装 */
-    remove(s_pkg[k].dst);                                  /* 删掉 /store/apps/{cat}/{file} */
-    char sd[192];
-    snprintf(sd, sizeof(sd), "/sdcard/apps/%s/%s", s_pkg[k].cat, s_pkg[k].fname); /* 联动删 SD 卡同名副本 */
-    if (am_file_exist(sd)) remove(sd);
-    /* ★★★ 2026-10-18 linit: 卸载后必须**连下载副本一起删** ——
-     *   否则商店里还会显示"安装"(因为 /sdcard/store_pkg 里还有包) ⇒ 他要重新变成"下载" ✓ */
-    remove(s_pkg[k].src);                                  /* 源(下载目录里的那份) */
-    char dp[192];
-    snprintf(dp, sizeof(dp), "/sdcard/store_pkg/%s", s_pkg[k].fname);
-    if (am_file_exist(dp)) remove(dp);
-    snprintf(dp, sizeof(dp), "/store/%s", s_pkg[k].fname);
-    if (am_file_exist(dp)) remove(dp);
-    ESP_LOGI("AMSTORE", "卸载已清理: 安装副本 + 下载副本 %s", s_pkg[k].fname);
-    am_store_invalidate();   /* 重扫 → 列表刷新(不退出商店) */
-    char lid[64];
-    snprintf(lid, sizeof(lid), "lua:%s", s_pkg[k].fname);  /* 同步清掉对应 Lua 项的主菜单记录 */
-    os_app_set_mainmenu(lid, false);
-    os_app_set_hidden(lid, true);
-    am_lua_invalidate();   /* Lua 列表下次重扫 */
+    am_uninst_job_t *j = calloc(1, sizeof(*j));
+    if (!j) return;
+    /* 先把要删的路径拷进任务(任务跑的时候 s_pkg 可能已被重扫 ✗) */
+    snprintf(j->paths[j->npaths++], 192, "%s", s_pkg[k].dst);
+    snprintf(j->paths[j->npaths++], 192, "/sdcard/apps/%s/%s", s_pkg[k].cat, s_pkg[k].fname);
+    snprintf(j->paths[j->npaths++], 192, "/sdcard/store_pkg/%s", s_pkg[k].fname);
+    snprintf(j->paths[j->npaths++], 192, "/store/%s", s_pkg[k].fname);
+    snprintf(j->lid, sizeof(j->lid), "lua:%s", s_pkg[k].fname);
+    s_pkg_inst[k] = false;   /* UI 立刻认为未安装(按钮变"下载") */
     os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8d\xb8\xe8\xbd\xbd");   /* 已卸载 */
-    am_reload_pkg_inst(k);                       /* 卸载后只刷新该包缓存一次 */
-    am_rebuild_keep();
     ctx->needs_redraw = true;
+    if (xTaskCreate(am_uninst_task, "am_uninst", 4096, j, 3, NULL) != pdPASS) {
+        /* 任务建不起来: 退化为同步删(至少保证功能正确) */
+        am_uninst_task(j);
+    }
 }
+
 static void am_store_uninstall_cb(ui_ctx_t *ctx, int result, void *ud) {
     if (result == 0) am_store_uninstall_do(ctx, (int)(long)ud);
     if (os_dialog_depth() > 0) os_dialog_pop(ctx);   /* ★ 有弹窗才关, 不会弹走商店页 */
