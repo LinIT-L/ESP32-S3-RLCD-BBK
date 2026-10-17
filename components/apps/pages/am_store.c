@@ -172,8 +172,10 @@ static void am_pkg_scan(void) {
                         if (rp && strcmp(rp->name, bn) == 0 && rp->cat[0]) { icat = rp->cat; break; }
                     }
                 }
-                const char *pcat   = (strcmp(icat, "game") == 0) ? "engine"
-                                   : (strcmp(icat, "ops")  == 0) ? "ops" : "app";
+                /* 中文分类 → 安装目录: 游戏→engine / 运维·工具→ops / 其它→app */
+                const char *pcat = "app";
+                if (strcmp(icat, "游戏") == 0) pcat = "engine";
+                else if (strcmp(icat, "运维") == 0 || strcmp(icat, "工具") == 0) pcat = "ops";
                 snprintf(s_pkg[k].cat, sizeof(s_pkg[k].cat), "%s", pcat);
                 snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/%s/%s", AM_STORE_DST, pcat, nm);
                 snprintf(s_pkg[k].dst_sd, sizeof(s_pkg[k].dst_sd), "/sdcard/apps/%s/%s", pcat, nm);
@@ -184,8 +186,7 @@ static void am_pkg_scan(void) {
                 s_pkg[k].app.page      = OS_PAGE_LUA;
                 s_pkg[k].app.hidden    = true;
                 s_pkg[k].app.touch_only= false;
-                s_pkg[k].app.cat       = (strcmp(pcat, "engine") == 0) ? "游戏"
-                                       : (strcmp(pcat, "ops") == 0) ? "运维" : "程序";
+                s_pkg[k].app.cat       = (strcmp(icat, "工具") == 0) ? "运维" : icat;   /* ★ 直接用应用自带分类 */
                 s_pkg[k].app.reveal    = false;
             }
             snprintf(s_pkg[k].src, sizeof(s_pkg[k].src), "%s/%s", bases[b], nm);
@@ -293,9 +294,9 @@ static void am_store_sync_remote(void) {
         /* ★★★ 2026-10-17 linit: 按索引里的 cat 归类(不再一律塞"软件")。
          *   索引 cat: game/ops/app ; 本地合法目录: engine/ops/app(无 game) ⇒ game→engine(独立游戏)。
          *   安装目录随分类变化, 下载前后同源(本地扫描按目录判分类 ⇒ 一致)。 */
-        const char *icat = (rp->cat[0]) ? rp->cat : "app";
-        const char *cat  = (strcmp(icat, "game") == 0) ? "engine"
-                         : (strcmp(icat, "ops")  == 0) ? "ops" : "app";
+        const char *icat = (rp->cat[0]) ? rp->cat : "程序";   /* 索引里的中文分类 */
+        const char *cat  = (strcmp(icat, "游戏") == 0) ? "engine"
+                         : (strcmp(icat, "运维") == 0 || strcmp(icat, "工具") == 0) ? "ops" : "app";
         snprintf(e->cat,   sizeof(e->cat),   "%s", cat);
         snprintf(e->id,    sizeof(e->id),    "pkg:%s", fn);
         snprintf(e->src,   sizeof(e->src),   "%s/%s", AM_STORE_SRC2, fn);
@@ -310,9 +311,7 @@ static void am_store_sync_remote(void) {
         /* ★★★ 2026-10-17: 商店顶部子分类用的是**中文分类名**(与内置应用 .cat 同一套:
          *   游戏/软件(程序)/系统/运维/学习) —— 之前直接塞英文 "engine/ops/app" ⇒ 全部对不上
          *   ⇒ 所有云包都掉进"其他"。这里做一次映射: 安装目录仍用英文(e->cat), 显示用中文。 */
-        e->app.cat = (strcmp(cat, "engine") == 0) ? "游戏"
-                   : (strcmp(cat, "ops")    == 0) ? "运维"
-                   : "程序";
+        e->app.cat = (strcmp(icat, "工具") == 0) ? "运维" : icat;   /* ★ 用应用自带分类 */
         e->app.reveal = false;
         s_rview_n++;
     }

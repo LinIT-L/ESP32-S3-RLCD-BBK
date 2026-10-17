@@ -42,14 +42,20 @@ LABEL_FIX = {
     "bikecomp": "自行车码表",
 }
 
-# 分类覆盖: 所有 Lua 源都在 apps/lua/apps/ 下, 自动推算一律得到 "app" ⇒ 必须逐个指定
-# game=游戏(装载到 engine 目录) / ops=运维 / app=软件
-CAT_FIX = {
-    "minidayz": "game", "qqtang": "game", "wuxia": "game",
-    "earthsurvival": "game", "biossim": "ops",
-    "planeradar": "ops", "map": "ops",
-    "bikecomp": "app",
+# 分类以**应用自己的 LAPP 头**为准 (`--@app cat=...`), 再归一到商店的 5 个分类:
+#   游戏 / 软件 / 标准 / 运维 / 学习
+CAT_5 = ("游戏", "软件", "标准", "运维", "学习")
+CAT_NORMALIZE = {
+    "程序": "软件", "工具": "软件", "应用": "软件",
+    "系统": "标准", "设置": "标准",
+    "网络": "运维", "运维": "运维",
 }
+
+def norm_cat(c):
+    if not c:
+        return "软件"
+    c = CAT_NORMALIZE.get(c, c)
+    return c if c in CAT_5 else "软件"
 
 def lapp_meta(path):
     """从 LAPP 头里取 name/desc/cat（tools/pack_app.py 打进去的）。"""
@@ -98,7 +104,7 @@ def main():
             pkgs.append({
                 "name": name,
                 "label": LABEL_FIX.get(name) or meta.get("label") or meta.get("name") or name,
-                "cat": CAT_FIX.get(name, cat),
+                "cat": norm_cat(meta.get("cat")),
                 "ver": int(meta.get("ver") or 1),
                 "size": len(data),
                 "crc32": "%08x" % (binascii.crc32(data) & 0xFFFFFFFF),   # ★ 必须是【十六进制字符串】: 设备端 am_store_json.c 用 j_str+strtoul(hex) 解析, 数字会导致整条被丢弃
