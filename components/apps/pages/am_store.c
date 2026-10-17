@@ -44,6 +44,7 @@ typedef struct {
     int      pref;       /* 推荐安装目标: 0=内置固件 1=TF卡 */
     char     fname[48];  /* 文件名 xxx.lua */
     char     desc[96];   /* LAPP 简介 (无打包则空) */
+    char     cat_zh[16]; /* ★ 中文分类(游戏/运维/软件...) —— app.cat 指向这里, 不能用局部数组(悬空) */
     uint8_t  kind;       /* 0=本地已有包(可安装)  1=云端包(需先下载) —— 2026-10-04 */
     int16_t  ridx;       /* kind=1 时: 对应 am_rstore_get() 的下标 */
 } am_pkg_entry_t;
@@ -80,10 +81,18 @@ static int am_pkg_prefer(const char *fname) { (void)fname; return 0; }
 /* ★★★ 2026-10-17 linit: 按【分类】给默认图标 —— 之前没有专属图标的包一律回退
  *   ICON_MINI_GAMES(迷你游戏) ⇒ 商店里所有云包都长一个游戏图标, 看着毫无分类。
  *   engine(游戏/引擎)=迷你游戏 · ops(运维)=终端 · app(软件)=应用中心。 */
+/* ★★★ 2026-10-17 linit: **每个分类一个默认图标** —— 应用自己没带图标时用它。
+ *   五类全用现成图标(实测都合适):
+ *     游戏 → 迷你游戏 · 软件 → 应用中心 · 标准 → 设置 · 运维 → 终端 · 学习 → 阅读器 */
 static int am_store_cat_icon(const char *cat) {
-    if (cat && strcmp(cat, "engine") == 0) return ICON_MINI_GAMES;
-    if (cat && strcmp(cat, "ops")    == 0) return ICON_TERMINAL;
-    return ICON_APP_MGR;
+    if (!cat || !cat[0])            return ICON_APP_MGR;
+    if (strcmp(cat, "游戏") == 0)   return ICON_MINI_GAMES;
+    if (strcmp(cat, "运维") == 0)   return ICON_TERMINAL;
+    if (strcmp(cat, "标准") == 0)   return ICON_SETTINGS;
+    if (strcmp(cat, "学习") == 0)   return ICON_BOOK;
+    if (strcmp(cat, "engine") == 0) return ICON_MINI_GAMES;   /* 兼容旧目录名 */
+    if (strcmp(cat, "ops") == 0)    return ICON_TERMINAL;
+    return ICON_APP_MGR;                                      /* 软件/其它 */
 }
 static int am_store_icon_of(const char *fname, const char *cat) {
     static const struct { const char *f; int ic; } T[] = {
@@ -187,9 +196,12 @@ static void am_pkg_scan(void) {
                  *   索引里查不到同名包才回退 app。 */
                 /* ★★★ 分类**优先读应用自带的 LAPP 头**(--@app cat=), 这是唯一真相源;
                  *   包头里没有分类时, 才用云端索引里同名包的 cat 兜底, 再不行归"软件"。 */
+                /* ★★★ 2026-10-17 修: **分类优先取云端索引**(索引里的 cat 由 store_build 从各应用
+                 *   LAPP 头生成, 已验证正确 ✓); `meta.cat` 作兜底 —— 实测 apppack_parse 没填 cat,
+                 *   导致所有包都掉到默认"软件"。 */
                 char icat[16];
-                snprintf(icat, sizeof(icat), "%s", meta.cat[0] ? meta.cat : "");
-                if (!icat[0]) {
+                snprintf(icat, sizeof(icat), "%s", "");
+                {
                     char bn[48];
                     snprintf(bn, sizeof(bn), "%.*s", (int)(len - 4), nm);
                     int rn = am_rstore_count();
@@ -198,6 +210,7 @@ static void am_pkg_scan(void) {
                         if (rp && strcmp(rp->name, bn) == 0 && rp->cat[0]) { snprintf(icat, sizeof(icat), "%s", rp->cat); break; }
                     }
                 }
+                if (!icat[0] && meta.cat[0]) snprintf(icat, sizeof(icat), "%s", meta.cat);
                 if (!icat[0]) snprintf(icat, sizeof(icat), "软件");
                 /* 中文分类 → 安装目录: 游戏→engine / 运维·工具→ops / 其它→app */
                 const char *pcat = "app";
@@ -211,11 +224,17 @@ static void am_pkg_scan(void) {
                 (void)am_pkg_prefer;
                 s_pkg[k].app.id        = s_pkg[k].id;
                 s_pkg[k].app.label     = s_pkg[k].label;
-                s_pkg[k].app.icon_idx  = am_store_icon_of(nm, s_pkg[k].cat);
+                s_pkg[k].app.icon_idx  = am_store_icon_of(nm, s_pkg[k].cat_zh);
                 s_pkg[k].app.page      = OS_PAGE_LUA;
                 s_pkg[k].app.hidden    = true;
                 s_pkg[k].app.touch_only= false;
-                s_pkg[k].app.cat       = (strcmp(icat, "工具") == 0) ? "运维" : icat;   /* ★ 直接用应用自带分类 */
+                /* ★★★ 2026-10-17 修: 必须拷进结构体自己的字段再指过去 ——
+                 *   原来直接指局部数组 icat ⇒ 悬空指针 ⇒ 分类过滤读垃圾 ⇒ 全部掉默认"软件"。 */
+                snprintf(s_pkg[k].cat_zh, sizeof(s_pkg[k].cat_zh), "%s",
+                         (strcmp(icat, "工具") == 0) ? "运维" : icat);
+                s_pkg[k].app.cat       = s_pkg[k].cat_zh;
+                ESP_LOGI("AMSTORE", "扫描包: %-16s cat='%s' app.cat='%s' dir=%s",
+                         nm, s_pkg[k].cat, s_pkg[k].app.cat, bases[b]);
                 s_pkg[k].app.reveal    = false;
             }
             snprintf(s_pkg[k].src, sizeof(s_pkg[k].src), "%s/%s", bases[b], nm);
@@ -341,14 +360,17 @@ static void am_store_sync_remote(void) {
         snprintf(e->dst_sd,sizeof(e->dst_sd),"/sdcard/apps/%s/%s", cat, fn);
         e->app.id   = e->id;
         e->app.label = e->label;
-        e->app.icon_idx = am_store_icon_of(fn, e->cat);
+        e->app.icon_idx = am_store_icon_of(fn, e->cat_zh);
         e->app.page   = OS_PAGE_LUA;
         e->app.hidden = true;
         e->app.touch_only = false;
         /* ★★★ 2026-10-17: 商店顶部子分类用的是**中文分类名**(与内置应用 .cat 同一套:
          *   游戏/软件(程序)/系统/运维/学习) —— 之前直接塞英文 "engine/ops/app" ⇒ 全部对不上
          *   ⇒ 所有云包都掉进"其他"。这里做一次映射: 安装目录仍用英文(e->cat), 显示用中文。 */
-        e->app.cat = (strcmp(icat, "工具") == 0) ? "运维" : icat;   /* ★ 用应用自带分类 */
+        /* ★ 同上: 拷进结构体字段, 避免指向局部数组 */
+        snprintf(e->cat_zh, sizeof(e->cat_zh), "%s",
+                 (strcmp(icat, "工具") == 0) ? "运维" : icat);
+        e->app.cat = e->cat_zh;
         e->app.reveal = false;
         s_rview_n++;
     }
@@ -397,9 +419,10 @@ static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
         os_dialog_toast(ctx, "\xe5\xae\x89\xe8\xa3\x85\xe5\xa4\xb1\xe8\xb4\xa5");   /* 安装失败 */
     }
     am_rebuild_keep();
-    /* ★ 2026-10-02: 原来安装完**不关**确认框, 要用户手动按返回才消失
-     *   (卸载路径一直有 os_dialog_pop, 安装路径漏了)。这里补上, 与卸载对称。 */
-    os_dialog_pop(ctx);
+    /* ★★★ 2026-10-17 linit: 原来这里 os_dialog_pop —— 但 toast 已经把确认框关掉了,
+     *   再 pop 一次就把**商店页本身**弹出去了("安装完就退出商店"的根因)。
+     *   改用 mark_handled: 只关闭当前弹窗, 不额外弹栈。 */
+    os_dialog_mark_handled(ctx);
     ctx->needs_redraw = true;
 }
 /* ========== 商店 云端包: 先下载到商店源目录, 再走普通安装 (2026-10-04) ==========
@@ -412,7 +435,7 @@ static void am_store_dl_cb(ui_ctx_t *ctx, int result, void *ud) {
     if (rpos < 0 || !am_rstore_dl_start(rpos))
         os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe5\xbc\x80\xe5\xa7\x8b\xe4\xb8\x8b\xe8\xbd\xbd"); /* 无法开始下载 */
     am_rebuild_keep();
-    os_dialog_pop(ctx);
+    os_dialog_mark_handled(ctx);   /* ★ 同上: 不再多 pop 一层 */
     ctx->needs_redraw = true;
 }
 /* 云端条目被点 → 弹"下载 XX (123KB)?" */
@@ -478,7 +501,7 @@ static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
 }
 static void am_store_uninstall_cb(ui_ctx_t *ctx, int result, void *ud) {
     if (result == 0) am_store_uninstall_do(ctx, (int)(long)ud);
-    os_dialog_pop(ctx);                                    /* 关掉确认框 (toast 会置 handled, 这里补关) */
+    os_dialog_mark_handled(ctx);   /* ★ 2026-10-17: 不再多 pop 一层(否则把商店页弹走) */
     ctx->needs_redraw = true;
 }
 /* 选中的商店项若已安装 → 弹"卸载 XX?" 确认 */
