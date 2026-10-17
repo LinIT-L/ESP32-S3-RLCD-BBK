@@ -1,10 +1,11 @@
 {
   "ver": 1,
   "site": "https://bbk.linit.cn/bbk",
-  "updated": "2026-10-17 21:55:57",
+  "updated": "2026-10-18 02:22:05",
   "mirrors": [
-    "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store",
-    "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store"
+    "https://bbk.linit.cn/bbk",
+    "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store",
+    "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store"
   ],
   "pkgs": [
     {
