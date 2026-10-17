@@ -21,6 +21,7 @@ typedef struct {
     char     name[32];    /* 包名 bikecomp (文件名主干) */
     char     label[48];   /* 中文名 (LAPP label=) */
     char     cat[16];     /* app / ops */
+    char     desc[96];    /* 商店列表第二行: 应用说明 */
     uint32_t size;        /* 字节数 */
     uint32_t crc;         /* crc32 (zlib/以太网, 由 hex 文本转来) */
     char     path[96];    /* 相对路径 pkgs/xxx.lua */

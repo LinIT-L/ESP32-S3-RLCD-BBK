@@ -105,6 +105,7 @@ def main():
                 "name": name,
                 "label": name,   # ★ 显示名 = 文件名(去 .lua); 由 linit 2026-10-17 定
                 "cat": norm_cat(meta.get("cat")),
+                "desc": meta.get("desc") or "",
                 "ver": int(meta.get("ver") or 1),
                 "size": len(data),
                 "crc32": "%08x" % (binascii.crc32(data) & 0xFFFFFFFF),   # ★ 必须是【十六进制字符串】: 设备端 am_store_json.c 用 j_str+strtoul(hex) 解析, 数字会导致整条被丢弃

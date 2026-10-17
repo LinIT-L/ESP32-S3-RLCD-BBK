@@ -181,6 +181,8 @@ int am_store_json_parse(const char *txt,
         if (!v || !j_str(v, rk.name, sizeof(rk.name)) || !rk.name[0]) ok = false;
         v = j_key(ob, "label");
         if (ok && (!v || !j_str(v, rk.label, sizeof(rk.label)))) ok = false;
+        v = j_key(ob, "desc");
+        if (ok && v) j_str(v, rk.desc, sizeof(rk.desc));    /* 可选: 列表第二行文案 */
         v = j_key(ob, "cat");
         if (ok && (!v || !j_str(v, rk.cat, sizeof(rk.cat)) || !rk.cat[0])) ok = false;
         v = j_key(ob, "path");

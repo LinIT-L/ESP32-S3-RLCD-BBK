@@ -488,10 +488,8 @@ const char *am_store_sub_of(const os_app_t *a) {
     if (r < 0) return NULL;
     const am_rpkg_t *rp = am_rstore_get(s_rview[r].ridx);
     if (!rp) return NULL;
-    static char s_sub[40];   /* 渲染路径每帧调, 不能 malloc */
-    snprintf(s_sub, sizeof(s_sub), "\xe6\x9c\xaa\xe4\xb8\x8b\xe8\xbd\xbd \xc2\xb7 %uKB",  /* 未下载 · NKB */
-             (unsigned)((rp->size + 1023u) / 1024u));
-    return s_sub;
+    /* ★ 2026-10-17 linit: 第二行统一显示**应用说明**(不再显示"未下载 · NKB") */
+    return rp->desc[0] ? rp->desc : NULL;
 }
 /* 右侧按钮文案: 下载 / 卸载 / 安装 (同一行只会是其中一种) */
 const char *am_store_btn_of(const os_app_t *a) {
