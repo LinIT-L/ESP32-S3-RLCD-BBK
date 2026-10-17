@@ -323,10 +323,13 @@ static void am_rebuild_ex(bool keep_cam) {
         /* 商店: 本地应用包 (后台扫描 /store 根 与 /sdcard/store_pkg, 不联网).
          * 首次未扫完 → 空列表显示"正在扫描…", 扫描完成后由 poll 重建列表. */
         am_store_prefetch();
+        /* ★★★★ 2026-10-17 修 (linit 反复反馈"商店全在软件里"的真凶):
+         *   原来只在「全部」和「软件」两个页签填列表 ⇒ 其它页签永远空, 而「软件」装了全部 8 个。
+         *   改为与其它分类一致: **逐个条目走 app_match_sub() 按分类过滤** ✓ */
         if (am_store_ready())
             for (int k = 0; k < am_store_count() && s_list_n < 64; k++) {
-                if (s_sub == AM_SUB_ALL || s_sub == AM_SUB_PROG)
-                    { const os_app_t *sa = am_store_app(k); if (sa) s_list[s_list_n++] = sa; }
+                const os_app_t *sa = am_store_app(k);
+                if (sa && app_match_sub(sa)) s_list[s_list_n++] = sa;
             }
     } else if (s_cat == AM_CAT_ENGINE) {
         /* 引擎: 按用户指定顺序插入 (从注册表取对应应用) */
