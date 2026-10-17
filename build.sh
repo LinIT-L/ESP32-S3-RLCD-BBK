@@ -26,6 +26,19 @@ export PATH="${TOOLCHAIN_BIN_DIR}:${IDF_PYTHON_ENV_PATH}/bin:${PATH}"
 export IDF_PATH
 export IDF_PYTHON_ENV_PATH
 
+# ★ 2026-10-17: 构建前自动把商店索引(store/index.json)编译进固件 ——
+#   "离线商店"依赖它; 索引来自各应用 LAPP 头, 不含 Lua 本体(应用仍按需从商店下载)。
+#   重建商店索引(若 store/pkgs 有增删)后无需手工操作, 这里自动同步。
+if [ -f store/index.json ]; then
+    python3 - <<'PYEOF' 2>/dev/null || true
+src = open("store/index.json", encoding="utf-8").read()
+esc = src.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+open("components/apps/pages/store_index_builtin.h", "w", encoding="utf-8").write(
+    '/* store_index_builtin.h — 固件内置商店索引(离线可用), 自动生成 */\n'
+    '#pragma once\nstatic const char STORE_INDEX_BUILTIN[] =\n"%s";\n' % esc)
+PYEOF
+fi
+
 if [ ! -f "${IDF_PATH}/tools/idf.py" ]; then
     echo "[错误] 未找到 ESP-IDF: ${IDF_PATH}"
     echo "       请安装 ESP-IDF v5.5+ 并设置 IDF_PATH 环境变量"

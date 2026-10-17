@@ -219,6 +219,14 @@ static void am_pkg_scan(void) {
                 s_pkg[k].app.reveal    = false;
             }
             snprintf(s_pkg[k].src, sizeof(s_pkg[k].src), "%s/%s", bases[b], nm);
+            /* ★★★ 2026-10-17 linit: 在**已安装目录**里扫到的条目, dst 必须是"它实际所在的那个文件" ——
+             *   否则卸载会删另一条路径 ⇒ 文件残留、商店里一直在(linit 报"卸载了还在"的根因)。
+             *   b>=2 = /store/apps/{app,engine,ops} 已安装目录。 */
+            if (b >= 2) {
+                snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/%s", bases[b], nm);
+                s_pkg[k].dst_sd[0] = 0;
+                ESP_LOGI("AMSTORE", "已安装条目: %s (cat=%s)", s_pkg[k].src, s_pkg[k].cat);
+            }
             /* 缓存安装状态: 仅扫描时算一次, 渲染不再逐帧 fopen */
             s_pkg_inst[k] = am_file_exist(s_pkg[k].dst) || am_file_exist(s_pkg[k].dst_sd);
         }
