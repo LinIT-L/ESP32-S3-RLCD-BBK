@@ -5,6 +5,8 @@
 #include "bt_manager.h"   /* bt_manager_is_enabled(): BT 开着时扫描时序不能覆盖 */
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -20,7 +22,8 @@
 #define KEY_SSID "ssid"
 #define KEY_PASS "pass"
 
-static bool s_inited = false;    /* esp_wifi_init 已调用 */
+static bool s_inited = false;
+static bool s_diag_done = false;   /* 一次性域名/TCP 诊断 */    /* esp_wifi_init 已调用 */
 static bool s_enabled = false;   /* esp_wifi_start 已成功 */
 static bool s_connecting = false;
 static bool s_connected = false;
@@ -136,6 +139,34 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
                 d.ip.u_addr.ip4.addr = esp_ip4addr_aton("114.114.114.114");
                 esp_netif_set_dns_info(nif, ESP_NETIF_DNS_BACKUP, &d);
                 ESP_LOGI("WIFI_MANAGER", "DNS 已强制设为 223.5.5.5 / 114.114.114.114");
+                /* ★ 2026-10-18 诊断: 解析商店主源域名 + 试连 443 —— 定位"设备连不上而电脑能连"
+                 *   是 DNS 还是路由/防火墙问题。 */
+                if (!s_diag_done) {
+                    s_diag_done = true;
+                    struct addrinfo hints = { 0 }, *res = NULL;
+                    hints.ai_family = AF_INET;
+                    hints.ai_socktype = SOCK_STREAM;
+                    int g = getaddrinfo("bbk.linit.cn", "443", &hints, &res);
+                    if (g == 0 && res) {
+                        char ip[32] = "?";
+                        struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+                        snprintf(ip, sizeof(ip), "%d.%d.%d.%d",
+                                 (int)((ntohl(sa->sin_addr.s_addr) >> 24) & 0xFF),
+                                 (int)((ntohl(sa->sin_addr.s_addr) >> 16) & 0xFF),
+                                 (int)((ntohl(sa->sin_addr.s_addr) >> 8) & 0xFF),
+                                 (int)(ntohl(sa->sin_addr.s_addr) & 0xFF));
+                        ESP_LOGI("WIFI_MANAGER", "诊断: bbk.linit.cn 解析到 %s", ip);
+                        int sk = socket(AF_INET, SOCK_STREAM, 0);
+                        if (sk >= 0) {
+                            int rc = connect(sk, res->ai_addr, res->ai_addrlen);
+                            ESP_LOGI("WIFI_MANAGER", "诊断: TCP 443 %s (rc=%d)", rc == 0 ? "可连 ✓" : "连不上 ✗", rc);
+                            close(sk);
+                        }
+                        freeaddrinfo(res);
+                    } else {
+                        ESP_LOGW("WIFI_MANAGER", "诊断: 解析 bbk.linit.cn 失败 g=%d", g);
+                    }
+                }
             }
         }
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
