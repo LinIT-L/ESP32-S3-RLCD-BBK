@@ -897,10 +897,20 @@ static void am_col_render_list(void) {
             /* 第二行 = 文案 (本地包 → LAPP 简介 desc=; 云端包 → "未下载 · NKB"),
              * 不再显示文件路径/文件名 ——
              * 用户原话: "模拟器下方不要显示路径名称, 直接显示对应说明"。 */
-            const char *ds = am_store_sub_of(a);
-            if (ds && ds[0])
-                am_col_text_l(AM_ROW_TX, y + 27,
-                              am_col_ellipsis(ds, AM_ROW_BTN_X0 - 4 - AM_ROW_TX), sel);
+            /* ★ 2026-10-18 linit: **下载中 → 第二行画进度条**(顶掉应用说明), 跑完自动恢复说明 */
+            int dpm = am_store_dl_permille_of(a);
+            if (dpm >= 0) {
+                int bx0 = AM_ROW_TX, bx1 = AM_ROW_BTN_X0 - 10;
+                int by0 = y + 29, by1 = by0 + 7;
+                am_col_rect_outline(bx0, by0, bx1, by1, !sel);
+                int fw = ((bx1 - bx0 - 2) * dpm) / 1000;
+                if (fw > 0) am_col_fill(bx0 + 1, by0 + 1, bx0 + fw, by1 - 1, !sel);
+            } else {
+                const char *ds = am_store_sub_of(a);
+                if (ds && ds[0])
+                    am_col_text_l(AM_ROW_TX, y + 27,
+                                  am_col_ellipsis(ds, AM_ROW_BTN_X0 - 4 - AM_ROW_TX), sel);
+            }
             /* 按钮文案由商店给 (安装 / 卸载 / 下载) */
             const char *act = am_store_btn_of(a);
             const int bt = y + (AM_ROW_H - 16) / 2;    /* 按钮垂直居中 */
@@ -955,6 +965,7 @@ static void am_draw_dl_overlay(st7305_handle_t *lcd, int grid_x0, int content_to
     for (int k = 0; k < 2; k++)              /* 2px 边框, 与弹窗同族 */
         draw_rect_outline(lcd, x0 + k, y0 + k, x1 - k, y1 - k, ST7305_COLOR_BLACK);
 
+    return;   /* ★ 2026-10-18 linit: 不再画浮层进度面板 —— 进度直接显示在列表第二行 */
     int pm = am_rstore_dl_permille();
     char pct[12];
     if (pm < 0) snprintf(pct, sizeof(pct), "--");

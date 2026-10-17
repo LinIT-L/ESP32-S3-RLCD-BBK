@@ -606,6 +606,24 @@ const char *am_store_fname_of(const os_app_t *a) {
 }
 /* 商店行第二行文案: 本地包 → LAPP 简介 (可能 NULL → 不画);
  *                    云端包 → "未下载 · NKB" (让用户知道点了要下多少) */
+/* ★ 2026-10-18 linit: 该条目正在下载时返回进度(0..1000), 否则 -1。
+ *   行渲染据此把第二行画成进度条(顶掉应用说明)。 */
+int am_store_dl_permille_of(const os_app_t *a) {
+    const char *nm = NULL;
+    int kk = am_pkg_find(a);
+    if (kk >= 0) nm = s_pkg[kk].fname;
+    else { int rr = am_rview_find(a); if (rr >= 0) nm = s_rview[rr].fname; }
+    const char *dl = am_rstore_dl_name();
+    if (!nm || !dl || !dl[0]) return -1;
+    char stem[48];
+    snprintf(stem, sizeof(stem), "%s", nm);
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = 0;
+    if (strcmp(stem, dl) != 0) return -1;
+    int pm = am_rstore_dl_permille();
+    return (pm < 0) ? 0 : pm;
+}
+
 const char *am_store_sub_of(const os_app_t *a) {
     /* ★★★ 2026-10-18 linit: **正在下载的那一条, 第二行临时显示进度**(顶掉应用说明) ——
      *   不再靠弹窗。返回静态缓冲(渲染路径每帧调, 不能 malloc)。 */
