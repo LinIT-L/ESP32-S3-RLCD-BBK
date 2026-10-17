@@ -432,6 +432,25 @@ static void am_store_dl_cb(ui_ctx_t *ctx, int result, void *ud) {
     int rk = (int)(long)ud;
     if (result != 0) { am_rebuild_keep(); return; }   /* 取消: 弹窗由框架自动关 */
     int rpos = (rk >= 0 && rk < s_rview_n) ? s_rview[rk].ridx : -1;
+    /* ★★★ 2026-10-18 彻底修 (linit 反复报"无法开始下载"):
+     *   原来直接用**缓存的 ridx** —— 索引刷新后(尤其失败回退内置索引)包顺序会变,
+     *   ridx 就指向错的包或越界 ⇒ `am_rstore_dl_start()` 立刻拒绝 ✗
+     *   改为**按文件名重新查找当前索引里真正的下标** ✓ */
+    if (rpos < 0 || rpos >= am_rstore_count()) {
+        const char *fn = (rk >= 0 && rk < s_rview_n) ? s_rview[rk].fname : NULL;
+        rpos = -1;
+        if (fn && fn[0]) {
+            char stem[48];
+            snprintf(stem, sizeof(stem), "%s", fn);
+            char *dot = strrchr(stem, '.');
+            if (dot) *dot = 0;
+            for (int i = 0; i < am_rstore_count(); i++) {
+                const am_rpkg_t *rp = am_rstore_get(i);
+                if (rp && strcmp(rp->name, stem) == 0) { rpos = i; break; }
+            }
+            ESP_LOGI("AMSTORE", "按文件名重定位: %s -> idx %d (共 %d 个包)", stem, rpos, am_rstore_count());
+        }
+    }
     if (rpos < 0 || !am_rstore_dl_start(rpos))
         os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe5\xbc\x80\xe5\xa7\x8b\xe4\xb8\x8b\xe8\xbd\xbd"); /* 无法开始下载 */
     am_rebuild_keep();
