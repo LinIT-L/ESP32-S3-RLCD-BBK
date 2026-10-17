@@ -1,7 +1,7 @@
 {
   "ver": 1,
   "site": "https://bbk.linit.cn/bbk",
-  "updated": "2026-10-17 01:20:41",
+  "updated": "2026-10-17 21:17:14",
   "mirrors": [
     "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store",
     "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store"
@@ -13,7 +13,7 @@
       "cat": "app",
       "ver": 1,
       "size": 18125,
-      "crc32": 1587813706,
+      "crc32": "5ea41d4a",
       "path": "pkgs/bikecomp.lua"
     },
     {
@@ -22,7 +22,7 @@
       "cat": "app",
       "ver": 1,
       "size": 32297,
-      "crc32": 1542228319,
+      "crc32": "5bec895f",
       "path": "pkgs/earthsurvival.lua"
     },
     {
@@ -31,7 +31,7 @@
       "cat": "app",
       "ver": 1,
       "size": 100467,
-      "crc32": 1362229606,
+      "crc32": "5131f966",
       "path": "pkgs/map.lua"
     },
     {
@@ -40,7 +40,7 @@
       "cat": "app",
       "ver": 1,
       "size": 55680,
-      "crc32": 295149310,
+      "crc32": "11979efe",
       "path": "pkgs/minidayz.lua"
     },
     {
@@ -49,7 +49,7 @@
       "cat": "app",
       "ver": 1,
       "size": 81773,
-      "crc32": 3826494036,
+      "crc32": "e413aa54",
       "path": "pkgs/qqtang.lua"
     },
     {
@@ -58,7 +58,7 @@
       "cat": "app",
       "ver": 1,
       "size": 63947,
-      "crc32": 563681681,
+      "crc32": "21991991",
       "path": "pkgs/wuxia.lua"
     },
     {
@@ -67,7 +67,7 @@
       "cat": "ops",
       "ver": 1,
       "size": 211533,
-      "crc32": 311059483,
+      "crc32": "128a641b",
       "path": "pkgs/biossim.lua"
     },
     {
@@ -76,7 +76,7 @@
       "cat": "ops",
       "ver": 1,
       "size": 51199,
-      "crc32": 821779194,
+      "crc32": "30fb5afa",
       "path": "pkgs/planeradar.lua"
     }
   ]
