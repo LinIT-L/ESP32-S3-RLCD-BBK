@@ -89,6 +89,7 @@
 #include "gps.h"           /* gps: 查 GPS 电源状态 (待机 46µA / 跟踪 ~10mA) */
 #include "esp_pm.h"        /* pm: 打印 PM 配置 + 锁表 (看 DFS/浅睡是否被驱动锁住) */
 #include "board_battery.h" /* bat: 电池 raw/脚上mV/分压系数/VBAT 现场核对 (2026-10-14) */
+#include "am_store_json.h"   /* ★ am_rpkg_t (storedl 命令用) */
 
 #define RC_TAG      "remcon"
 #define RC_LINE_MAX 256
@@ -296,6 +297,61 @@ static void rc_cmd_immediate(const char *line){
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
+    } else if (strcmp(cmd, "storedl") == 0) {
+        /* ★ 2026-10-18: 串口触发商店下载(绕过 UI, 用于自动化测试)。
+         *   用法: storedl [包名]   不带参数则列出索引里的包 */
+        extern int  am_rstore_count(void);
+        extern const am_rpkg_t *am_rstore_get(int i);
+        extern bool am_rstore_dl_start(int i);
+        extern const char *am_rstore_dl_name(void);
+        extern int  am_rstore_dl_permille(void);
+        extern void am_rstore_prefetch(void);
+        extern bool am_rstore_tick(void);
+        int n = am_rstore_count();
+        if (n == 0) {
+            /* 索引还没加载(平时只在进商店时加载) ⇒ 主动拉一次内置索引 */
+            am_rstore_prefetch();
+            for (int w = 0; w < 20 && am_rstore_count() == 0; w++) vTaskDelay(pdMS_TO_TICKS(100));
+            am_rstore_tick();
+            n = am_rstore_count();
+            printf("STORE_LOADED %d\r\n", n);
+        }
+        if (!rest || !*rest) {
+            printf("STORE_PKGS %d\r\n", n);
+            for (int i = 0; i < n; i++) {
+                const am_rpkg_t *rp = am_rstore_get(i);
+                if (rp) printf("PKG %d %s\r\n", i, rp->name);
+            }
+            return;
+        }
+        const char *want = rest;
+        while (*want == ' ') want++;
+        int idx = -1;
+        for (int i = 0; i < n; i++) {
+            const am_rpkg_t *rp = am_rstore_get(i);
+            if (rp && strcmp(rp->name, want) == 0) { idx = i; break; }
+        }
+        if (idx < 0) { printf("STORE_ERR 找不到包 '%s' (共 %d 个)\r\n", want, n); return; }
+        bool ok = am_rstore_dl_start(idx);
+        printf("STORE_DL %s idx=%d -> %s\r\n", want, idx, ok ? "已启动" : "启动失败");
+        if (ok) {
+            for (int t = 0; t < 60; t++) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                int pm = am_rstore_dl_permille();
+                const char *dn = am_rstore_dl_name();
+                printf("STORE_PROGRESS %d %d%%\r\n", t, pm < 0 ? -1 : pm / 10);
+                if (!dn || !dn[0]) {
+                    /* ★ 下载完成 → 自动安装(与 UI 路径同一个函数) */
+                    extern bool am_store_auto_install(const char *fname);
+                    char fn[56];
+                    snprintf(fn, sizeof(fn), "%s.lua", want);
+                    bool inst = am_store_auto_install(fn);
+                    printf("STORE_INSTALL %s\r\n", inst ? "OK" : "FAIL");
+                    printf("STORE_DONE\r\n");
+                    break;
+                }
+            }
+        }
     } else if (strcmp(cmd, "loglevel") == 0) {
         char *lvl = rc_next(&rest); int v = lvl ? atoi(lvl) : -1;
         if (v >= 0 && v <= 5) { esp_log_level_set("*", (esp_log_level_t)v); printf("LOGLEVEL %d\r\n", v); }
@@ -659,6 +715,7 @@ static void rc_exec(const char *line){
     }
     if (strcmp(cmd, "hello") == 0 || strcmp(cmd, "echo") == 0 ||
         strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0 ||
+        strcmp(cmd, "storedl") == 0 ||   /* ★ 商店下载测试 (2026-10-18) */
         strcmp(cmd, "loglevel") == 0 || strcmp(cmd, "heap") == 0 ||
         strcmp(cmd, "mem") == 0 || strcmp(cmd, "blk") == 0 ||
         strcmp(cmd, "audit") == 0 || strcmp(cmd, "stack") == 0 ||

@@ -357,6 +357,17 @@ static void am_dl_task(void *arg) {
     } else {
         s_permille = 1000;
         ESP_LOGI(TAG, "下载完成: %s (%d B)", dst, total);
+        /* ★★★ 2026-10-18: **下载完成后在后台任务里自动安装** ——
+         *   ⚠ 绝不能放到 UI 的 tick 里做(文件复制 + 全局失效 ⇒ 开店死机) ✗ */
+        {
+            extern bool am_store_auto_install(const char *fname);
+            char fn[56];
+            snprintf(fn, sizeof(fn), "%s.lua", s_dl_name);
+            if (s_dl_name[0]) {
+                if (am_store_auto_install(fn)) ESP_LOGI(TAG, "已自动安装: %s", fn);
+                else                           ESP_LOGW(TAG, "自动安装失败: %s", fn);
+            }
+        }
         __sync_synchronize();
         s_state = ARS_OK;
     }

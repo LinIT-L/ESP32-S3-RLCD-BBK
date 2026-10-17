@@ -1506,7 +1506,9 @@ static void p_am_poll(ui_ctx_t *ctx) {
         if (am_rstore_tick()) {
             int rs = am_rstore_state();
             if (rs == ARS_OK) {
-                os_dialog_toast(ctx, "\xe4\xb8\x8b\xe8\xbd\xbd\xe5\xae\x8c\xe6\x88\x90");   /* 下载完成 */
+                /* ★ 2026-10-18: 自动安装已移到**下载任务**(后台线程) ——
+                 *   UI 线程只负责提示, 不做文件 I/O(否则开店死机)。 */
+                os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85");   /* 已安装 */
                 am_rstore_ack();
                 am_store_invalidate();      /* 重扫: 刚下好的包要从"云端"变成"可安装" */
                 am_store_prefetch();

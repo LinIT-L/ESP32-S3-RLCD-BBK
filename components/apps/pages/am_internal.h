@@ -73,7 +73,8 @@ void  am_rstore_ack(void);               /* UI 处理完 OK/DLFAIL 后回落到 
 int   am_rstore_state(void);             /* ARS_* */
 int   am_rstore_count(void);
 const am_rpkg_t *am_rstore_get(int i);
-void am_rstore_clear_cache(void);   /* ★ 清商店缓存(长按分类图标 3s) */
+void am_rstore_clear_cache(void);
+bool am_store_auto_install(const char *fname);   /* ★ 下载完自动安装 */   /* ★ 清商店缓存(长按分类图标 3s) */
 bool  am_rstore_dl_start(int i);         /* 后台下载第 i 个包 → 商店源目录 */
 int   am_rstore_dl_permille(void);       /* 0..1000; -1 = 总长未知 */
 const char *am_rstore_dl_name(void);     /* 正在下载的包名 */

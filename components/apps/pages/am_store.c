@@ -393,6 +393,46 @@ static void am_reload_pkg_inst(int k) {
     if (k < 0 || k >= s_pkg_n) return;
     s_pkg_inst[k] = am_file_exist(s_pkg[k].dst) || am_file_exist(s_pkg[k].dst_sd);
 }
+/* ★★★ 2026-10-18 linit: **下载完成后自动安装**(一步到位, 不用再点"安装")。
+ *   按文件名在本地包里找 → 复制到 /store/apps/{cat}/, 与手动"安装"完全等价。 */
+bool am_store_auto_install(const char *fname) {
+    if (!fname || !fname[0]) return false;
+    /* 去掉 .lua 得到包名 */
+    char stem[48];
+    snprintf(stem, sizeof(stem), "%s", fname);
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = 0;
+
+    /* ★ 2026-10-18: **不依赖 s_pkg**(扫描可能还没跑完) —— 直接按索引决定分类目录,
+     *   从下载目录复制到 /store/apps/{cat}/ ✓ */
+    const char *sub = "app";
+    int n = am_rstore_count();
+    for (int i = 0; i < n; i++) {
+        const am_rpkg_t *rp = am_rstore_get(i);
+        if (rp && strcmp(rp->name, stem) == 0) {
+            if (strcmp(rp->cat, "游戏") == 0) sub = "engine";
+            else if (strcmp(rp->cat, "运维") == 0 || strcmp(rp->cat, "工具") == 0) sub = "ops";
+            break;
+        }
+    }
+    char src[192], dst[192], catdir[96];
+    snprintf(src, sizeof(src), "/sdcard/store_pkg/%s", fname);
+    if (!am_file_exist(src)) snprintf(src, sizeof(src), "%s/%s", AM_STORE_SRC1, fname);
+    snprintf(catdir, sizeof(catdir), "%s/%s", AM_STORE_DST, sub);
+    snprintf(dst, sizeof(dst), "%s/%s", catdir, fname);
+    mkdir(AM_STORE_DST, 0755);
+    mkdir(catdir, 0755);
+    if (am_file_exist(dst)) { ESP_LOGI("AMSTORE", "自动安装: 已存在 %s", dst); return true; }
+    if (am_copy_file(src, dst)) {
+        ESP_LOGI("AMSTORE", "自动安装完成: %s -> %s", src, dst);
+        am_lua_invalidate();
+        am_store_invalidate();
+        return true;
+    }
+    ESP_LOGW("AMSTORE", "自动安装失败: %s -> %s", src, dst);
+    return false;
+}
+
 /* 安装目标选择回调: result 0=内置固件 1=TF卡 */
 /* 确认安装回调 (V1.6.x): 安装目标不再让用户选择, 由应用自身默认 s_pkg[k].pref 决定
  * (结果 0=确认安装; 1=取消). 现有应用默认装内置; 以后大的游戏在对应应用设默认装 TF. */
@@ -422,7 +462,9 @@ static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
     /* ★★★ 2026-10-17 linit: 原来这里 os_dialog_pop —— 但 toast 已经把确认框关掉了,
      *   再 pop 一次就把**商店页本身**弹出去了("安装完就退出商店"的根因)。
      *   改用 mark_handled: 只关闭当前弹窗, 不额外弹栈。 */
-    os_dialog_mark_handled(ctx);
+    /* ★★★ 2026-10-18 修: mark_handled **不关弹窗** ✗ ⇒ 确认框一直挂着, 再点就重复下载
+     *   ⇒ "状态忙" ⇒ 弹"无法开始下载"。改用**带深度检查的 pop**: 有弹窗才关, 不会误弹页面。 */
+    if (os_dialog_depth() > 0) os_dialog_pop(ctx);
     ctx->needs_redraw = true;
 }
 /* ========== 商店 云端包: 先下载到商店源目录, 再走普通安装 (2026-10-04) ==========
@@ -454,7 +496,7 @@ static void am_store_dl_cb(ui_ctx_t *ctx, int result, void *ud) {
     if (rpos < 0 || !am_rstore_dl_start(rpos))
         os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe5\xbc\x80\xe5\xa7\x8b\xe4\xb8\x8b\xe8\xbd\xbd"); /* 无法开始下载 */
     am_rebuild_keep();
-    os_dialog_mark_handled(ctx);   /* ★ 同上: 不再多 pop 一层 */
+    if (os_dialog_depth() > 0) os_dialog_pop(ctx);   /* ★ 有弹窗才关 */
     ctx->needs_redraw = true;
 }
 /* 云端条目被点 → 弹"下载 XX (123KB)?" */
@@ -507,6 +549,16 @@ static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
     char sd[192];
     snprintf(sd, sizeof(sd), "/sdcard/apps/%s/%s", s_pkg[k].cat, s_pkg[k].fname); /* 联动删 SD 卡同名副本 */
     if (am_file_exist(sd)) remove(sd);
+    /* ★★★ 2026-10-18 linit: 卸载后必须**连下载副本一起删** ——
+     *   否则商店里还会显示"安装"(因为 /sdcard/store_pkg 里还有包) ⇒ 他要重新变成"下载" ✓ */
+    remove(s_pkg[k].src);                                  /* 源(下载目录里的那份) */
+    char dp[192];
+    snprintf(dp, sizeof(dp), "/sdcard/store_pkg/%s", s_pkg[k].fname);
+    if (am_file_exist(dp)) remove(dp);
+    snprintf(dp, sizeof(dp), "/store/%s", s_pkg[k].fname);
+    if (am_file_exist(dp)) remove(dp);
+    ESP_LOGI("AMSTORE", "卸载已清理: 安装副本 + 下载副本 %s", s_pkg[k].fname);
+    am_store_invalidate();   /* 重扫 → 列表刷新(不退出商店) */
     char lid[64];
     snprintf(lid, sizeof(lid), "lua:%s", s_pkg[k].fname);  /* 同步清掉对应 Lua 项的主菜单记录 */
     os_app_set_mainmenu(lid, false);
@@ -519,7 +571,7 @@ static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
 }
 static void am_store_uninstall_cb(ui_ctx_t *ctx, int result, void *ud) {
     if (result == 0) am_store_uninstall_do(ctx, (int)(long)ud);
-    os_dialog_mark_handled(ctx);   /* ★ 2026-10-17: 不再多 pop 一层(否则把商店页弹走) */
+    if (os_dialog_depth() > 0) os_dialog_pop(ctx);   /* ★ 有弹窗才关, 不会弹走商店页 */
     ctx->needs_redraw = true;
 }
 /* 选中的商店项若已安装 → 弹"卸载 XX?" 确认 */
@@ -563,7 +615,12 @@ const char *am_store_sub_of(const os_app_t *a) {
         if (kk >= 0) nm = s_pkg[kk].fname;
         else { int rr = am_rview_find(a); if (rr >= 0) nm = s_rview[rr].fname; }
         const char *dl = am_rstore_dl_name();
-        if (nm && dl && dl[0] && strcmp(nm, dl) == 0) {
+        /* ★ 2026-10-18 修: 条目 fname 带 ".lua", dl_name 不带 ⇒ 去掉后缀再比, 否则进度永远不显示 */
+        char stem[48];
+        snprintf(stem, sizeof(stem), "%s", nm ? nm : "");
+        char *dot = strrchr(stem, '.');
+        if (dot) *dot = 0;
+        if (nm && dl && dl[0] && strcmp(stem, dl) == 0) {
             static char s_pg[28];
             int pm = am_rstore_dl_permille();
             if (pm < 0) snprintf(s_pg, sizeof(s_pg), "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad ...");   /* 下载中 ... */
