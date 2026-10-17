@@ -162,16 +162,20 @@ static void am_pkg_scan(void) {
                 /* ★★★ 2026-10-17: 本地包也按【云端索引里的 cat】分类 —— 之前写死 "app" +
                  *   app.cat=NULL ⇒ 所有包都显示在"软件", 且在游戏/运维子分类里看不到。
                  *   索引里查不到同名包才回退 app。 */
-                const char *icat = "app";
-                {
+                /* ★★★ 分类**优先读应用自带的 LAPP 头**(--@app cat=), 这是唯一真相源;
+                 *   包头里没有分类时, 才用云端索引里同名包的 cat 兜底, 再不行归"软件"。 */
+                char icat[16];
+                snprintf(icat, sizeof(icat), "%s", meta.cat[0] ? meta.cat : "");
+                if (!icat[0]) {
                     char bn[48];
                     snprintf(bn, sizeof(bn), "%.*s", (int)(len - 4), nm);
                     int rn = am_rstore_count();
                     for (int r = 0; r < rn; r++) {
                         const am_rpkg_t *rp = am_rstore_get(r);
-                        if (rp && strcmp(rp->name, bn) == 0 && rp->cat[0]) { icat = rp->cat; break; }
+                        if (rp && strcmp(rp->name, bn) == 0 && rp->cat[0]) { snprintf(icat, sizeof(icat), "%s", rp->cat); break; }
                     }
                 }
+                if (!icat[0]) snprintf(icat, sizeof(icat), "软件");
                 /* 中文分类 → 安装目录: 游戏→engine / 运维·工具→ops / 其它→app */
                 const char *pcat = "app";
                 if (strcmp(icat, "游戏") == 0) pcat = "engine";
