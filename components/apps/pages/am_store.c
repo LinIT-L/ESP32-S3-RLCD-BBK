@@ -291,7 +291,12 @@ static void am_store_sync_remote(void) {
         e->app.page   = OS_PAGE_LUA;
         e->app.hidden = true;
         e->app.touch_only = false;
-        e->app.cat    = e->cat;      /* ★ 交给商店按分类分组显示 */
+        /* ★★★ 2026-10-17: 商店顶部子分类用的是**中文分类名**(与内置应用 .cat 同一套:
+         *   游戏/软件(程序)/系统/运维/学习) —— 之前直接塞英文 "engine/ops/app" ⇒ 全部对不上
+         *   ⇒ 所有云包都掉进"其他"。这里做一次映射: 安装目录仍用英文(e->cat), 显示用中文。 */
+        e->app.cat = (strcmp(cat, "engine") == 0) ? "游戏"
+                   : (strcmp(cat, "ops")    == 0) ? "运维"
+                   : "程序";
         e->app.reveal = false;
         s_rview_n++;
     }

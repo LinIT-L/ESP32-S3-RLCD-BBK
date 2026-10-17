@@ -161,6 +161,22 @@ MCU:**ESP32-S3**(240MHz, 8MB PSRAM, 16MB Flash)。
 
 ---
 
+## 打板与采购
+
+- **PCB 工程文件（嘉立创 EDA）**：`hardware/LinTOS_2026-10-17.epro` —— 用嘉立创 EDA 专业版打开，可直接导出 Gerber 下单打样
+- **两个版本 3D 渲染图**：`hardware/images/pcb-xiaozhi.png`（小智集成板）· `hardware/images/pcb-standard.png`（标准扩展板）
+- **各版本需要采购的配件清单**：→ [hardware/README.md](hardware/README.md)
+
+> 懒得打板？直接下 `LinTOS-v1.4-16MB.bin` 刷到微雪原板（ESP32-S3-RLCD-4.2）即可，无需任何硬件改动。
+
+## 讨论 / 交流
+
+有问题、想讨论改进，欢迎加 **QQ 群**：
+
+**1128448441**
+
+![QQ群二维码](hardware/images/qq-group.png)
+
 ## 目录结构
 
 ```

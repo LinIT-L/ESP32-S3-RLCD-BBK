@@ -169,6 +169,19 @@ static void am_idx_task(void *arg) {
                 }
                 s_mir_n = k;
                 s_rpkg_n = pn;
+                /* ★★★ 2026-10-17: 云端索引解析出 0 个包 ⇒ 说明索引损坏/是旧格式(如 crc32 被写成数字),
+                 *   此时**回退到固件内置索引** —— 坏索引再也不会把商店清空。 */
+                if (pn == 0) {
+                    char mir2[AM_MIRROR_MAX][AM_MIRROR_LEN];
+                    int mn2 = 0, pn2 = 0;
+                    if (am_store_json_parse(STORE_INDEX_BUILTIN, s_rpkg, AM_RPKG_MAX, &pn2,
+                                            mir2, AM_MIRROR_MAX, &mn2) == 0 && pn2 > 0) {
+                        s_rpkg_n = pn2;
+                        memcpy(s_mir, mir2, sizeof(s_mir));
+                        s_mir_n = mn2;
+                        ESP_LOGW(TAG, "云端索引 0 个包(格式异常) ⇒ 已回退内置索引: %d 个包", pn2);
+                    }
+                }
                 ESP_LOGI(TAG, "索引 OK: %d 个包, %d 个镜像源, 跳过 %d 条",
                          s_rpkg_n, s_mir_n, am_store_json_skipped());
                 rc = 0;

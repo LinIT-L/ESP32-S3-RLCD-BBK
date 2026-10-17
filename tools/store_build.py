@@ -87,7 +87,7 @@ def main():
                 "cat": cat,
                 "ver": int(meta.get("ver") or 1),
                 "size": len(data),
-                "crc32": binascii.crc32(data) & 0xFFFFFFFF,   # 必须是数字: 设备端按数字解析(原来写成字符串 ⇒ 校验恒失败)
+                "crc32": "%08x" % (binascii.crc32(data) & 0xFFFFFFFF),   # ★ 必须是【十六进制字符串】: 设备端 am_store_json.c 用 j_str+strtoul(hex) 解析, 数字会导致整条被丢弃
                 "path": "pkgs/%s" % fn,
             })
             print("  + %-14s %-10s %6d B  crc=%s" % (name, pkgs[-1]["label"],
