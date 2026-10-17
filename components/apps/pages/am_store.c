@@ -119,8 +119,12 @@ static void am_pkg_scan(void) {
      * ("一直正在扫描"根因). */
     if (s_pkg_scanned == 0) return;
     s_pkg_n = 0;
-    const char *bases[2] = { AM_STORE_SRC1, AM_STORE_SRC2 };
-    for (int b = 0; b < 2; b++) {
+    /* ★★★ 2026-10-17 linit: 除了"待下载"目录, **也扫已安装目录** ——
+     *   这样本地已装的应用(哪怕云端索引里没有)也会出现在商店里, 方便直接卸载。
+     *   b<2 = 待下载源(store 根 / SD store_pkg); b>=2 = 已安装目录(/store/apps/{cat})。 */
+    const char *bases[5] = { AM_STORE_SRC1, AM_STORE_SRC2,
+                             AM_STORE_DST "/app", AM_STORE_DST "/engine", AM_STORE_DST "/ops" };
+    for (int b = 0; b < 5; b++) {
         DIR *d = opendir(bases[b]);
         if (!d) continue;
         struct dirent *e;
@@ -149,9 +153,27 @@ static void am_pkg_scan(void) {
                  * -Werror=restrict (编译器无法排除 nm 与 s_pkg 重叠)。 */
                 char nb[64];
                 snprintf(nb, sizeof(nb), "%.*s", (int)len - 4, nm);
+                /* ★★★ 2026-10-17 linit: `/sdcard/store_pkg` 是**商店自己的下载目录**,
+                 *   只显示云端索引里存在的包 —— 旧的英文名残留文件(改名前的下载)自动隐藏,
+                 *   商店里不会再出现"英文名 + 中文名"两份。/store(SPIFFS 根)放宽, 允许用户自己放。 */
                 /* LAPP 打包则用包内 name/desc (可中文), 否则文件名 */
                 char spath[192];
                 snprintf(spath, sizeof(spath), "%s/%s", bases[b], nm);
+                /* ★ 2026-10-17 linit: 商店自己的下载目录里, 索引中没有的残留包**直接删除**
+                 *   (改名/过期留下的旧文件), 不再隐藏。手动往 /store 放的不受影响。 */
+                if (b == 1) {
+                    bool known = false;
+                    int rn = am_rstore_count();
+                    for (int r = 0; r < rn; r++) {
+                        const am_rpkg_t *rp = am_rstore_get(r);
+                        if (rp && strcmp(rp->name, nb) == 0) { known = true; break; }
+                    }
+                    if (!known) {
+                        ESP_LOGW("AMSTORE", "删除残留包: %s", spath);
+                        remove(spath);
+                        continue;
+                    }
+                }
                 apppack_meta_t meta;
                 /* ★★★ 2026-10-17 linit 定: **显示名以文件名(去 .lua)为准** —— 游戏/模拟器习惯用文件名,
                  *   LAPP 里的 name 仅作兜底(文件名为空时)。分类/图标仍读 LAPP 头。 */
@@ -184,7 +206,9 @@ static void am_pkg_scan(void) {
                 snprintf(s_pkg[k].cat, sizeof(s_pkg[k].cat), "%s", pcat);
                 snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/%s/%s", AM_STORE_DST, pcat, nm);
                 snprintf(s_pkg[k].dst_sd, sizeof(s_pkg[k].dst_sd), "/sdcard/apps/%s/%s", pcat, nm);
-                s_pkg[k].pref = am_pkg_prefer(nm);
+                /* ★ 2026-10-17 linit: **一律装到内置** (/store/apps), 不再默认装 TF 卡 */
+                s_pkg[k].pref = 0;
+                (void)am_pkg_prefer;
                 s_pkg[k].app.id        = s_pkg[k].id;
                 s_pkg[k].app.label     = s_pkg[k].label;
                 s_pkg[k].app.icon_idx  = am_store_icon_of(nm, s_pkg[k].cat);
