@@ -32,7 +32,8 @@ extern const uint8_t (*FONT8X12)[16];
 
 /* ===== mini-UI 基础控件 (类 LVGL 简化, 供全项目统一) =====
  * 统一字体: 中文 font_zh16(16×16) + 英文 8×16; 文案风格一致. */
-int  ui_text16w(const char *s);                              /* 整行像素宽(中16/英8) */
+int  ui_text16w(const char *s);
+bool ui_text16_ready(void);   /* ★ 16px 字库可用才返回 true */                              /* 整行像素宽(中16/英8) */
 void ui_text16(st7305_handle_t *lcd, int x, int y, const char *s, bool inverted); /* 左对齐 */
 void ui_text16c(st7305_handle_t *lcd, int cx, int y, const char *s, bool inverted);/* 居中 */
 

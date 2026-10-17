@@ -328,7 +328,10 @@ static void dlg_render(ui_ctx_t *ctx) {
             draw_vline(lcd, L.x + L.w - 1 - k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
         }
         /* 消息居中在上 (距上边框内沿 5px) */
-        draw_text_centered(lcd, L.y + 7, d->title, false);   /* 恢复 24px(16px 会崩) */
+        /* ★ 2026-10-18 linit: 弹窗标题用 16px(确认/取消按钮保持原尺寸不变);
+         *   字库没就绪则降级 24px —— 避免之前的崩溃。 */
+        if (ui_text16_ready()) ui_text16c(lcd, L.x + L.w / 2, L.y + 11, d->title, false);
+        else                    draw_text_centered(lcd, L.y + 7, d->title, false);
         /* 按钮区: 横杠/竖线连接到弹窗边框 (横杠连左右, 竖线连横杠与底边框),
          * 确定/取消 对称居中于左右两半 */
         int bx0 = L.x + 2, bx1 = L.x + L.w - 1 - 2;   /* 按钮白底区: 不覆盖左右边框 */

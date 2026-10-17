@@ -100,3 +100,10 @@ const uint8_t *font_zh16_get_bitmap_by_index(int idx) {
     if (!s_zh16_bound || (uint32_t)idx >= s_zh16_count) return NULL;
     return s_zh16_glyphs + (size_t)idx * 32;
 }
+
+/* ★ 2026-10-18: 就绪检测 —— 字库分区映射失败时指针为 NULL, 直接调用 ui_text16 会崩。
+ *   调用方(如弹窗标题)先用它判断, 不就绪就降级到 24px。 */
+bool font_zh16_ready(void) {
+    if (!s_zh16_bound) font_zh16_bind();
+    return s_zh16_bound && s_zh16_glyphs && s_zh16_chars && s_zh16_count > 0;
+}

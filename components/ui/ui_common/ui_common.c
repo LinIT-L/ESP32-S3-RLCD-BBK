@@ -275,6 +275,8 @@ int ui_text16w(const char *s) {
     }
     return w;
 }
+bool ui_text16_ready(void) { return font_zh16_ready(); }   /* ★ 16px 字库是否可用 */
+
 void ui_text16(st7305_handle_t *lcd, int x, int y, const char *s, bool inverted) {
     st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
     int aofs = (ZH16_FONT_H - 16) / 2;
