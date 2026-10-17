@@ -77,15 +77,22 @@ static int am_pkg_prefer(const char *fname) { (void)fname; return 0; }
 /* 商店列表要的是 main_icons 索引, 而 LAPP 头里带的是 64x64 位图(应用管家用) ——
  * 两者没有反查关系。原实现把所有包硬写成 ICON_MINI_GAMES(迷你游戏), 看着像 bug。
  * 这里给已知包名一个小映射, 未知包沿用默认。 */
-static int am_store_icon_of(const char *fname) {
+/* ★★★ 2026-10-17 linit: 按【分类】给默认图标 —— 之前没有专属图标的包一律回退
+ *   ICON_MINI_GAMES(迷你游戏) ⇒ 商店里所有云包都长一个游戏图标, 看着毫无分类。
+ *   engine(游戏/引擎)=迷你游戏 · ops(运维)=终端 · app(软件)=应用中心。 */
+static int am_store_cat_icon(const char *cat) {
+    if (cat && strcmp(cat, "engine") == 0) return ICON_MINI_GAMES;
+    if (cat && strcmp(cat, "ops")    == 0) return ICON_TERMINAL;
+    return ICON_APP_MGR;
+}
+static int am_store_icon_of(const char *fname, const char *cat) {
     static const struct { const char *f; int ic; } T[] = {
-        { "biossim.lua", ICON_BIOSSIM },          /* BIOS 装机模拟器 (原借 ICON_DIAG) */
-        { "planeradar.lua", ICON_PLANERADAR },    /* 航班雷达 (2026-10-15 补: 漏了这条 →
-                                                   *   商店里一直显示"迷你游戏"默认图标) */
+        { "biossim.lua", ICON_BIOSSIM },          /* BIOS 装机模拟器 */
+        { "planeradar.lua", ICON_PLANERADAR },    /* 航班雷达 */
     };
     for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++)
         if (strcmp(T[i].f, fname) == 0) return T[i].ic;
-    return ICON_MINI_GAMES;
+    return am_store_cat_icon(cat);                /* ★ 无专属图标 ⇒ 用分类默认图标 */
 }
 static bool am_copy_file(const char *src, const char *dst) {
     FILE *in = fopen(src, "rb");
@@ -158,7 +165,7 @@ static void am_pkg_scan(void) {
                 s_pkg[k].pref = am_pkg_prefer(nm);
                 s_pkg[k].app.id        = s_pkg[k].id;
                 s_pkg[k].app.label     = s_pkg[k].label;
-                s_pkg[k].app.icon_idx  = am_store_icon_of(nm);
+                s_pkg[k].app.icon_idx  = am_store_icon_of(nm, s_pkg[k].cat);
                 s_pkg[k].app.page      = OS_PAGE_LUA;
                 s_pkg[k].app.hidden    = true;
                 s_pkg[k].app.touch_only= false;
@@ -267,20 +274,24 @@ static void am_store_sync_remote(void) {
         e->pref  = 0;
         snprintf(e->fname, sizeof(e->fname), "%s", fn);
         snprintf(e->label, sizeof(e->label), "%s", rp->label);
-        /* ⚠ cat 一律取 "app": 下载完成后本地扫描 (am_pkg_scan) 也是按 "app" 建的条目,
-         *   两边必须同源, 否则"下载前/下载后"的安装目录会不一致。索引里的 cat 暂只作参考。 */
-        snprintf(e->cat,   sizeof(e->cat),   "app");
+        /* ★★★ 2026-10-17 linit: 按索引里的 cat 归类(不再一律塞"软件")。
+         *   索引 cat: game/ops/app ; 本地合法目录: engine/ops/app(无 game) ⇒ game→engine(独立游戏)。
+         *   安装目录随分类变化, 下载前后同源(本地扫描按目录判分类 ⇒ 一致)。 */
+        const char *icat = (rp->cat[0]) ? rp->cat : "app";
+        const char *cat  = (strcmp(icat, "game") == 0) ? "engine"
+                         : (strcmp(icat, "ops")  == 0) ? "ops" : "app";
+        snprintf(e->cat,   sizeof(e->cat),   "%s", cat);
         snprintf(e->id,    sizeof(e->id),    "pkg:%s", fn);
         snprintf(e->src,   sizeof(e->src),   "%s/%s", AM_STORE_SRC2, fn);
-        snprintf(e->dst,   sizeof(e->dst),   "%s/app/%s", AM_STORE_DST, fn);
-        snprintf(e->dst_sd,sizeof(e->dst_sd),"/sdcard/apps/app/%s", fn);
+        snprintf(e->dst,   sizeof(e->dst),   "%s/%s/%s", AM_STORE_DST, cat, fn);
+        snprintf(e->dst_sd,sizeof(e->dst_sd),"/sdcard/apps/%s/%s", cat, fn);
         e->app.id   = e->id;
         e->app.label = e->label;
-        e->app.icon_idx = am_store_icon_of(fn);
+        e->app.icon_idx = am_store_icon_of(fn, e->cat);
         e->app.page   = OS_PAGE_LUA;
         e->app.hidden = true;
         e->app.touch_only = false;
-        e->app.cat    = NULL;
+        e->app.cat    = e->cat;      /* ★ 交给商店按分类分组显示 */
         e->app.reveal = false;
         s_rview_n++;
     }
