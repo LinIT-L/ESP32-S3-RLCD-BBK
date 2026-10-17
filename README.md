@@ -169,6 +169,14 @@ MCU:**ESP32-S3**(240MHz, 8MB PSRAM, 16MB Flash)。
 
 > 懒得打板？直接下 `LinTOS-v1.4-16MB.bin` 刷到微雪原板（ESP32-S3-RLCD-4.2）即可，无需任何硬件改动。
 
+## 讨论 / 交流
+
+有问题、想讨论改进，欢迎加 **QQ 群**：
+
+**1128448441**
+
+![QQ群二维码](hardware/images/qq-group.png)
+
 ## 目录结构
 
 ```
