@@ -37,6 +37,20 @@ DEFAULT_MIRRORS = [
 HDR = re.compile(rb"--@app\s+([a-z_]+)=([^\r\n]*)")
 
 
+# 展示名覆盖: 应用 LAPP 头里的标签太简略时, 商店里显示更清楚的名称
+LABEL_FIX = {
+    "bikecomp": "自行车码表",
+}
+
+# 分类覆盖: 所有 Lua 源都在 apps/lua/apps/ 下, 自动推算一律得到 "app" ⇒ 必须逐个指定
+# game=游戏(装载到 engine 目录) / ops=运维 / app=软件
+CAT_FIX = {
+    "minidayz": "game", "qqtang": "game", "wuxia": "game",
+    "earthsurvival": "game", "biossim": "game",
+    "planeradar": "ops", "map": "ops",
+    "bikecomp": "app",
+}
+
 def lapp_meta(path):
     """从 LAPP 头里取 name/desc/cat（tools/pack_app.py 打进去的）。"""
     head = open(path, "rb").read(2048)
@@ -83,8 +97,8 @@ def main():
             meta = lapp_meta(src)
             pkgs.append({
                 "name": name,
-                "label": meta.get("label") or meta.get("name") or name,
-                "cat": cat,
+                "label": LABEL_FIX.get(name) or meta.get("label") or meta.get("name") or name,
+                "cat": CAT_FIX.get(name, cat),
                 "ver": int(meta.get("ver") or 1),
                 "size": len(data),
                 "crc32": "%08x" % (binascii.crc32(data) & 0xFFFFFFFF),   # ★ 必须是【十六进制字符串】: 设备端 am_store_json.c 用 j_str+strtoul(hex) 解析, 数字会导致整条被丢弃
