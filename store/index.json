@@ -1,83 +1,83 @@
 {
   "ver": 1,
   "site": "https://bbk.linit.cn/bbk",
-  "updated": "2026-10-17 21:44:52",
+  "updated": "2026-10-17 21:53:05",
   "mirrors": [
     "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store",
     "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store"
   ],
   "pkgs": [
     {
-      "name": "bikecomp",
-      "label": "自行车码表",
-      "cat": "软件",
-      "ver": 1,
-      "size": 18125,
-      "crc32": "5ea41d4a",
-      "path": "pkgs/bikecomp.lua"
-    },
-    {
-      "name": "earthsurvival",
-      "label": "地球生存",
-      "cat": "游戏",
-      "ver": 1,
-      "size": 32297,
-      "crc32": "5bec895f",
-      "path": "pkgs/earthsurvival.lua"
-    },
-    {
-      "name": "map",
-      "label": "矢量地图",
-      "cat": "软件",
-      "ver": 1,
-      "size": 100467,
-      "crc32": "5131f966",
-      "path": "pkgs/map.lua"
-    },
-    {
-      "name": "minidayz",
-      "label": "迷你DayZ",
-      "cat": "游戏",
-      "ver": 1,
-      "size": 55680,
-      "crc32": "11979efe",
-      "path": "pkgs/minidayz.lua"
-    },
-    {
-      "name": "qqtang",
+      "name": "QQ堂冒险",
       "label": "QQ堂冒险",
       "cat": "游戏",
       "ver": 1,
       "size": 81773,
       "crc32": "e413aa54",
-      "path": "pkgs/qqtang.lua"
+      "path": "pkgs/QQ堂冒险.lua"
     },
     {
-      "name": "wuxia",
+      "name": "地球生存",
+      "label": "地球生存",
+      "cat": "游戏",
+      "ver": 1,
+      "size": 32297,
+      "crc32": "5bec895f",
+      "path": "pkgs/地球生存.lua"
+    },
+    {
+      "name": "矢量地图",
+      "label": "矢量地图",
+      "cat": "软件",
+      "ver": 1,
+      "size": 100467,
+      "crc32": "5131f966",
+      "path": "pkgs/矢量地图.lua"
+    },
+    {
+      "name": "自行车码表",
+      "label": "自行车码表",
+      "cat": "软件",
+      "ver": 1,
+      "size": 18125,
+      "crc32": "5ea41d4a",
+      "path": "pkgs/自行车码表.lua"
+    },
+    {
+      "name": "英雄坛说",
       "label": "英雄坛说",
       "cat": "游戏",
       "ver": 1,
       "size": 63947,
       "crc32": "21991991",
-      "path": "pkgs/wuxia.lua"
+      "path": "pkgs/英雄坛说.lua"
     },
     {
-      "name": "biossim",
+      "name": "迷你DayZ",
+      "label": "迷你DayZ",
+      "cat": "游戏",
+      "ver": 1,
+      "size": 55680,
+      "crc32": "11979efe",
+      "path": "pkgs/迷你DayZ.lua"
+    },
+    {
+      "name": "BIOS模拟器",
       "label": "BIOS模拟器",
       "cat": "运维",
       "ver": 1,
       "size": 211533,
       "crc32": "128a641b",
-      "path": "pkgs/biossim.lua"
+      "path": "pkgs/BIOS模拟器.lua"
     },
     {
-      "name": "planeradar",
+      "name": "航班雷达",
       "label": "航班雷达",
       "cat": "运维",
       "ver": 1,
       "size": 51199,
       "crc32": "30fb5afa",
-      "path": "pkgs/planeradar.lua"
+      "path": "pkgs/航班雷达.lua"
     }
   ]
 }

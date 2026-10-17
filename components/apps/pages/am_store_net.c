@@ -269,6 +269,24 @@ void am_rstore_ack(void) {
 /* crc32 已移到 net_client (netc_crc32): 下载时 want_crc=true, 收完直接比 —— 
  * 全工程共用同一份实现, 保证与 tools/store_build.py 的 binascii.crc32 一致。 */
 
+/* ★★★ 2026-10-17: 包文件名可能是中文(linit 定: 用文件名做应用显示名) ⇒
+ *   拼 URL 前必须百分号编码 —— esp_http_client 不做编码, 直接把 UTF-8 塞进 URL 会 400/404。 */
+static void am_url_encode(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < cap; p++) {
+        unsigned char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = "0123456789ABCDEF"[c >> 4];
+            out[o++] = "0123456789ABCDEF"[c & 0x0F];
+        }
+    }
+    out[o] = 0;
+}
+
 /* ==================== 后台: 下载一个包 ==================== */
 static void am_dl_task(void *arg) {
     int idx = (int)(intptr_t)arg;
@@ -295,8 +313,10 @@ static void am_dl_task(void *arg) {
     /* ★★★ 2026-10-17 修: 原为 `rc == 0`(只要成功就继续) ⇒ 逻辑反了:
      *   第一个镜像失败后循环立刻退出, 永不重试后续镜像。改为 `rc != 0`(失败才继续试下一个)。 */
     for (int i = 0; i < s_mir_n && rc != 0; i++) {
-        char url[AM_MIRROR_LEN + 128];
-        url3(url, sizeof(url), s_mir[i], "/", pk->path);
+        char url[AM_MIRROR_LEN + 256];
+        char enc[224];
+        am_url_encode(pk->path, enc, sizeof(enc));   /* ★ 中文文件名 ⇒ %XX */
+        url3(url, sizeof(url), s_mir[i], "/", enc);
         if (i > 0) ESP_LOGD(TAG, "换源重试: %s", url);
 
         /* ★ 2026-10-15 联网收口: 流式落盘 + crc32 全交给 net_client;

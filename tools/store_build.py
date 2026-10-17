@@ -103,7 +103,7 @@ def main():
             meta = lapp_meta(src)
             pkgs.append({
                 "name": name,
-                "label": LABEL_FIX.get(name) or meta.get("label") or meta.get("name") or name,
+                "label": name,   # ★ 显示名 = 文件名(去 .lua); 由 linit 2026-10-17 定
                 "cat": norm_cat(meta.get("cat")),
                 "ver": int(meta.get("ver") or 1),
                 "size": len(data),

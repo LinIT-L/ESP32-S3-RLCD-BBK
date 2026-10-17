@@ -153,12 +153,13 @@ static void am_pkg_scan(void) {
                 char spath[192];
                 snprintf(spath, sizeof(spath), "%s/%s", bases[b], nm);
                 apppack_meta_t meta;
-                if (apppack_parse(spath, &meta) == ESP_OK && meta.name[0]) {
+                /* ★★★ 2026-10-17 linit 定: **显示名以文件名(去 .lua)为准** —— 游戏/模拟器习惯用文件名,
+                 *   LAPP 里的 name 仅作兜底(文件名为空时)。分类/图标仍读 LAPP 头。 */
+                apppack_parse(spath, &meta);
+                snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%.*s", (int)len - 4, nm);
+                if (!s_pkg[k].label[0] && meta.name[0])
                     snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%s", meta.name);
-                    snprintf(s_pkg[k].desc, sizeof(s_pkg[k].desc), "%s", meta.desc);
-                } else {
-        snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%.*s", (int)sizeof(s_pkg[k].label) - 1, nb);
-                }
+                snprintf(s_pkg[k].desc, sizeof(s_pkg[k].desc), "%s", meta.desc);
                 /* ★★★ 2026-10-17: 本地包也按【云端索引里的 cat】分类 —— 之前写死 "app" +
                  *   app.cat=NULL ⇒ 所有包都显示在"软件", 且在游戏/运维子分类里看不到。
                  *   索引里查不到同名包才回退 app。 */
