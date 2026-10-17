@@ -337,7 +337,12 @@ if (hw_cfg_enabled(HW_GPS)) {
      *   有保存凭据就拉起射频并连接, 之后断线重连全归它的自愈任务。
      *   应用/商店只管查 wifi_manager_is_connected(), 不再各自弹门禁去连网
      *   (原来没人主动开射频 ⇒ 不手动进设置页就一直"未联网")。 */
-    wifi_manager_autostart();
+    /* ★★★ 2026-10-18 linit: 原来是**同步**调用, 界面要等 WiFi 初始化完(~4.9s)才出来。
+     *   改成延后 2.5s 由独立任务启动 —— 首帧优先, 射频晚一点拉不影响使用。 */
+    {
+        extern void wifi_boot_deferred_task(void *arg);
+        xTaskCreatePinnedToCore(wifi_boot_deferred_task, "wifi_boot", 4096, NULL, 3, NULL, 0);
+    }
     if (usb_bt_is_active()) {
         /* USB-BT 激活 (开机早期进 BTH 模式): 蓝牙控制器供 USB 蓝牙适配器独占,
          * 不启动手柄蓝牙, 直接初始化 BTH. 这是官方 usb_dongle 方式(开机早期进),
@@ -364,6 +369,15 @@ if (hw_cfg_enabled(HW_GPS)) {
     os_shell_loop(&ctx);
 }
 #endif /* CONFIG_OS */
+
+/* ★ 2026-10-18: 延后启动 WiFi(独立任务, 栈必须在内部 RAM —— 初始化要读写 NVS/flash) */
+static void wifi_boot_task(void *arg) {
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(2500));
+    wifi_manager_autostart();
+    vTaskDelete(NULL);
+}
+void wifi_boot_deferred_task(void *arg) { wifi_boot_task(arg); }
 
 void app_main(void)
 {

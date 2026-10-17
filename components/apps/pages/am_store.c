@@ -536,6 +536,22 @@ const char *am_store_fname_of(const os_app_t *a) {
 /* 商店行第二行文案: 本地包 → LAPP 简介 (可能 NULL → 不画);
  *                    云端包 → "未下载 · NKB" (让用户知道点了要下多少) */
 const char *am_store_sub_of(const os_app_t *a) {
+    /* ★★★ 2026-10-18 linit: **正在下载的那一条, 第二行临时显示进度**(顶掉应用说明) ——
+     *   不再靠弹窗。返回静态缓冲(渲染路径每帧调, 不能 malloc)。 */
+    {
+        const char *nm = NULL;
+        int kk = am_pkg_find(a);
+        if (kk >= 0) nm = s_pkg[kk].fname;
+        else { int rr = am_rview_find(a); if (rr >= 0) nm = s_rview[rr].fname; }
+        const char *dl = am_rstore_dl_name();
+        if (nm && dl && dl[0] && strcmp(nm, dl) == 0) {
+            static char s_pg[28];
+            int pm = am_rstore_dl_permille();
+            if (pm < 0) snprintf(s_pg, sizeof(s_pg), "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad ...");   /* 下载中 ... */
+            else        snprintf(s_pg, sizeof(s_pg), "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad %d%%", pm / 10); /* 下载中 42% */
+            return s_pg;
+        }
+    }
     int k = am_pkg_find(a);
     if (k >= 0) return s_pkg[k].desc[0] ? s_pkg[k].desc : NULL;
     int r = am_rview_find(a);
