@@ -1521,6 +1521,27 @@ static void p_am_poll(ui_ctx_t *ctx) {
             ctx->needs_redraw = true;
         }
     }
+    /* ★★★ 2026-10-17 linit: **长按左栏分类图标 3 秒 = 清掉商店缓存并重新拉取**
+     *   (放在 s_list_n 早退之前 —— 商店列表为空时也要能长按重置) */
+    {
+        static uint32_t s_cat_lp_ms = 0;
+        static bool     s_cat_lp_fired = false;
+        int lx = 0, ly = 0;
+        bool ldown = input_get_touch_pos(&lx, &ly);
+        if (ldown && lx < AM_CATBAR_W && ly >= AM_CAT_Y0) {
+            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+            if (s_cat_lp_ms == 0) s_cat_lp_ms = now;
+            else if (!s_cat_lp_fired && now - s_cat_lp_ms >= 3000) {
+                s_cat_lp_fired = true;
+                am_rstore_clear_cache();
+                os_dialog_toast_ms(ctx, "\xe5\x95\x86\xe5\xba\x97\xe7\xbc\x93\xe5\xad\x98\xe5\xb7\xb2\xe6\xb8\x85\xe7\xa9\xba", 1200); /* 商店缓存已清空 */
+                ctx->needs_redraw = true;
+            }
+        } else {
+            s_cat_lp_ms = 0;
+            s_cat_lp_fired = false;
+        }
+    }
     if (s_list_n <= 0) return;
 
     int tx, ty;

@@ -46,7 +46,7 @@ LABEL_FIX = {
 # game=游戏(装载到 engine 目录) / ops=运维 / app=软件
 CAT_FIX = {
     "minidayz": "game", "qqtang": "game", "wuxia": "game",
-    "earthsurvival": "game", "biossim": "game",
+    "earthsurvival": "game", "biossim": "ops",
     "planeradar": "ops", "map": "ops",
     "bikecomp": "app",
 }

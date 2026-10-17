@@ -229,6 +229,17 @@ void am_rstore_prefetch(void) {
     }
 }
 
+/* ★ 2026-10-17 linit: 清掉商店缓存(索引/镜像/包列表), 下次进商店会重新拉取。
+ *   入口: 应用商店左栏"商店"图标长按 3 秒。 */
+void am_rstore_clear_cache(void) {
+    s_fetched    = false;
+    s_retry_wait = false;
+    s_state      = ARS_IDLE;
+    s_rpkg_n     = 0;
+    s_mir_n      = 0;
+    ESP_LOGI(TAG, "商店缓存已清空(用户长按), 下次请求将重新拉取索引");
+}
+
 int am_rstore_state(void) { return s_state; }
 int am_rstore_count(void) { return s_rpkg_n; }
 const am_rpkg_t *am_rstore_get(int i) {

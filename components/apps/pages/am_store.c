@@ -159,9 +159,24 @@ static void am_pkg_scan(void) {
                 } else {
         snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%.*s", (int)sizeof(s_pkg[k].label) - 1, nb);
                 }
-                snprintf(s_pkg[k].cat, sizeof(s_pkg[k].cat), "app");
-                snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/app/%s", AM_STORE_DST, nm);
-                snprintf(s_pkg[k].dst_sd, sizeof(s_pkg[k].dst_sd), "/sdcard/apps/app/%s", nm);
+                /* ★★★ 2026-10-17: 本地包也按【云端索引里的 cat】分类 —— 之前写死 "app" +
+                 *   app.cat=NULL ⇒ 所有包都显示在"软件", 且在游戏/运维子分类里看不到。
+                 *   索引里查不到同名包才回退 app。 */
+                const char *icat = "app";
+                {
+                    char bn[48];
+                    snprintf(bn, sizeof(bn), "%.*s", (int)(len - 4), nm);
+                    int rn = am_rstore_count();
+                    for (int r = 0; r < rn; r++) {
+                        const am_rpkg_t *rp = am_rstore_get(r);
+                        if (rp && strcmp(rp->name, bn) == 0 && rp->cat[0]) { icat = rp->cat; break; }
+                    }
+                }
+                const char *pcat   = (strcmp(icat, "game") == 0) ? "engine"
+                                   : (strcmp(icat, "ops")  == 0) ? "ops" : "app";
+                snprintf(s_pkg[k].cat, sizeof(s_pkg[k].cat), "%s", pcat);
+                snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/%s/%s", AM_STORE_DST, pcat, nm);
+                snprintf(s_pkg[k].dst_sd, sizeof(s_pkg[k].dst_sd), "/sdcard/apps/%s/%s", pcat, nm);
                 s_pkg[k].pref = am_pkg_prefer(nm);
                 s_pkg[k].app.id        = s_pkg[k].id;
                 s_pkg[k].app.label     = s_pkg[k].label;
@@ -169,7 +184,8 @@ static void am_pkg_scan(void) {
                 s_pkg[k].app.page      = OS_PAGE_LUA;
                 s_pkg[k].app.hidden    = true;
                 s_pkg[k].app.touch_only= false;
-                s_pkg[k].app.cat       = NULL;
+                s_pkg[k].app.cat       = (strcmp(pcat, "engine") == 0) ? "游戏"
+                                       : (strcmp(pcat, "ops") == 0) ? "运维" : "程序";
                 s_pkg[k].app.reveal    = false;
             }
             snprintf(s_pkg[k].src, sizeof(s_pkg[k].src), "%s/%s", bases[b], nm);
@@ -333,7 +349,10 @@ static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
     mkdir(base, 0755);
     mkdir(catdir, 0755);
     const char *dest = to_tf ? s_pkg[k].dst_sd : s_pkg[k].dst;
+    /* ★ 2026-10-17 诊断: 安装到底从哪复制到哪、cat 是什么 —— "报成功但应用里看不到" 时看这行 */
+    ESP_LOGI("AMSTORE", "安装: k=%d cat='%s' src=%s dst=%s", k, s_pkg[k].cat, s_pkg[k].src, dest);
     if (am_copy_file(s_pkg[k].src, dest)) {
+        ESP_LOGI("AMSTORE", "安装完成: %s", dest);
         os_dialog_toast(ctx, to_tf ? "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85\xe5\x88\xb0TF\xe5\x8d\xa1"   /* 已安装到TF卡 */
                                    : "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85\xe5\x88\xb0\xe5\x86\x85\xe7\xbd\xae"); /* 已安装到内置 */
         am_lua_invalidate();   /* Lua 列表下次重扫 */
