@@ -212,6 +212,7 @@ static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
     const char *t = text;
     if (text_width(text) > x1 - x0) t = text_clip(text, x1 - x0);
     int top = abs_y + (DLG_LINE_H - 24) / 2;
+    /* ⚠ 16px 方案已回滚(2026-10-17): font_zh16 未加载时 ui_text16() 会崩 —— 先保持 24px */
     if (selected) {
         fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_BLACK);
         draw_text_centered(lcd, top, t, true);
@@ -327,7 +328,7 @@ static void dlg_render(ui_ctx_t *ctx) {
             draw_vline(lcd, L.x + L.w - 1 - k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
         }
         /* 消息居中在上 (距上边框内沿 5px) */
-        draw_text_centered(lcd, L.y + 7, d->title, false);
+        draw_text_centered(lcd, L.y + 7, d->title, false);   /* 恢复 24px(16px 会崩) */
         /* 按钮区: 横杠/竖线连接到弹窗边框 (横杠连左右, 竖线连横杠与底边框),
          * 确定/取消 对称居中于左右两半 */
         int bx0 = L.x + 2, bx1 = L.x + L.w - 1 - 2;   /* 按钮白底区: 不覆盖左右边框 */

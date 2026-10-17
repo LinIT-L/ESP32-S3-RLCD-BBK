@@ -123,6 +123,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             }
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        /* ★★★ 2026-10-17 linit: 拿到 IP 后**强制覆盖 DNS** —— 实测 routers 下发的 DNS
+         *   在设备侧解析不了(商店下载瞬间 ESP_ERR_HTTP_CONNECT)。用国内公共 DNS:
+         *   阿里 223.5.5.5 / 114DNS 114.114.114.114。注意: 仍不能解决"域名被墙", 只解决 DNS。 */
+        {
+            esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            if (nif) {
+                esp_netif_dns_info_t d = { 0 };
+                d.ip.type = ESP_IPADDR_TYPE_V4;
+                d.ip.u_addr.ip4.addr = esp_ip4addr_aton("223.5.5.5");
+                esp_netif_set_dns_info(nif, ESP_NETIF_DNS_MAIN, &d);
+                d.ip.u_addr.ip4.addr = esp_ip4addr_aton("114.114.114.114");
+                esp_netif_set_dns_info(nif, ESP_NETIF_DNS_BACKUP, &d);
+                ESP_LOGI("WIFI_MANAGER", "DNS 已强制设为 223.5.5.5 / 114.114.114.114");
+            }
+        }
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         s_connected = true;
         s_connecting = false;

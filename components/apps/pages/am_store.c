@@ -444,8 +444,7 @@ static void am_store_download_ask(ui_ctx_t *ctx, int rk) {
     const am_rpkg_t *rp = am_rstore_get(s_rview[rk].ridx);
     char title[72];
     if (rp)
-        snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s (%uKB)?",   /* 下载 XX (NKB)? */
-                 rp->label, (unsigned)((rp->size + 1023u) / 1024u));
+        snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s?", rp->label);   /* 下载 XX? (不再带大小) */
     else
         snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s?", s_rview[rk].label);
     os_dialog_confirm_ex(ctx, title, 0, 0, am_store_dl_cb, (void *)(long)rk);

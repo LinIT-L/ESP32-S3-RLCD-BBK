@@ -943,8 +943,11 @@ static void am_col_present(st7305_handle_t *lcd, int grid_x0, int content_top, i
  * ⛔ 不做全屏白底遮罩 —— 全屏刷白 = 12 万次 PSRAM 随机写 ≈ 几十毫秒 (见 1bpp 性能法则)。
  *    只画一个 ~290x84 的框 (≈2.4 万像素), 列表在框外照旧可见, 反而更清楚"正在下哪个包"。 */
 static void am_draw_dl_overlay(st7305_handle_t *lcd, int grid_x0, int content_top) {
-    const int x1 = UI_SCREEN_W - 16;
-    const int x0 = grid_x0 + 16;
+    /* ★ 2026-10-17 linit: 原按"内容区"居中(从 grid_x0+16 起) ⇒ 视觉偏右 ✗; 而且太宽(293px)。
+     *   改为**屏幕居中 + 收窄到 260**。 */
+    const int w  = 260;
+    const int x0 = (UI_SCREEN_W - w) / 2;
+    const int x1 = x0 + w;
     const int h  = 84;
     const int y0 = content_top + (UI_SCREEN_H - content_top - h) / 2;
     const int y1 = y0 + h;

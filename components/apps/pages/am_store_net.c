@@ -364,9 +364,18 @@ static void am_dl_task(void *arg) {
 }
 
 bool am_rstore_dl_start(int i) {
-    if (i < 0 || i >= s_rpkg_n) return false;
-    if (s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) return false;
-    if (!wifi_manager_is_connected()) return false;
+    if (i < 0 || i >= s_rpkg_n) {
+        ESP_LOGW(TAG, "dl_start 拒绝: 索引越界 i=%d rpkg_n=%d", i, s_rpkg_n);
+        return false;
+    }
+    if (s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) {
+        ESP_LOGW(TAG, "dl_start 拒绝: 状态忙 state=%d (1=正在刷索引 4=正在下载)", s_state);
+        return false;
+    }
+    if (!wifi_manager_is_connected()) {
+        ESP_LOGW(TAG, "dl_start 拒绝: WiFi 未连接");
+        return false;
+    }
     s_permille = -1;
     s_state = ARS_DOWNLOADING;
     if (xTaskCreatePinnedToCore(am_dl_task, "am_dl", 8192, (void *)(intptr_t)i, 4, NULL, 0) != pdPASS) {
