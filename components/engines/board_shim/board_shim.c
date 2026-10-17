@@ -596,9 +596,15 @@ static inline uint8_t board_rlcd_rgb565_be_to_gbc_shade(uint16_t rgb565_be)
     uint8_t b5 = (uint8_t)(rgb & 0x1FU);
     uint16_t gray = (uint16_t)(r5 * 38U + g6 * 75U + b5 * 15U);
 
-    if (gray >= 4800U) return 0;
-    if (gray >= 3200U) return 1;
-    if (gray >= 1600U) return 2;
+    /* ★★★ 2026-10-17 修正 (依据社区反馈 andjiang0083 的分析, 同一个原理):
+     *   4 档的实际等效亮度(2x2 抖动, 白点数 4/3/2/1) = 6368 / 4776 / 3184 / 1592;
+     *   要让"离哪一档最近就归哪一档", 分界必须取相邻两档的中点:
+     *     (6368+4776)/2=5572 · (4776+3184)/2=3980 · (3184+1592)/2=2388
+     *   原来用等分 4800/3200/1600 ⇒ 暗端门限被抬高(1600 vs 2388),
+     *   暗色元素(如暗绿文字/图标)被判成全黑而消失。 */
+    if (gray >= 5572U) return 0;
+    if (gray >= 3980U) return 1;
+    if (gray >= 2388U) return 2;
     return 3;
 }
 

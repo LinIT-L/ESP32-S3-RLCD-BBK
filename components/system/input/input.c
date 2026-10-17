@@ -122,7 +122,9 @@ static void input_cfg_keys(void) {
         s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, 2000, MENU_ACTION_CONFIRM, MENU_ACTION_BT_SEARCH, false, "KEY" };
     } else {
         /* 无触摸机型: BOOT 短按=右向, 长按=返回; KEY=确认 */
-        s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, 0, MENU_ACTION_RIGHT, MENU_ACTION_BACK, false, "BOOT" };
+        /* ★ 2026-10-17 (社区反馈): long_ms 原为 0 ⇒ 走全局 500ms ⇒ 极易误触"返回";
+         *   无触摸机型只有几个键, 长按必须明显区别于短按 ⇒ 改 2000ms。 */
+        s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, 2000, MENU_ACTION_RIGHT, MENU_ACTION_BACK, false, "BOOT" };
         s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, 2000, MENU_ACTION_CONFIRM, MENU_ACTION_BT_SEARCH, false, "KEY" };
     }
 }

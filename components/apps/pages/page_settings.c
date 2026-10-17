@@ -1495,10 +1495,13 @@ static bool settings_main_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, v
     (void)ud;
     switch (a) {
     case OS_ACTION_UP:
-        if (d->sel > 0) { d->sel--; ctx->needs_redraw = true; }
+        d->sel = (d->sel > 0) ? (d->sel - 1) : 4;   /* ★ 2026-10-17: 首尾循环(原来夹紧在 0) */
+        ctx->needs_redraw = true;
+        if (0) { }
         return true;
     case OS_ACTION_DOWN:
-        if (d->sel < 4) { d->sel++; ctx->needs_redraw = true; }   /* 5 项 (含喝杯水) */
+        d->sel = (d->sel < 4) ? (d->sel + 1) : 0;   /* 5 项 (含喝杯水), 首尾循环 */
+        ctx->needs_redraw = true;
         return true;
     case OS_ACTION_CONFIRM:
         if (d->sel >= d->count) return false;   /* 底部"返回"行 → 默认处理 (关闭) */

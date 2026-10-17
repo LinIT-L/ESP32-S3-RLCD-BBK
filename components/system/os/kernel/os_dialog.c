@@ -467,13 +467,16 @@ static void dlg_action(ui_ctx_t *ctx, os_action_t a) {
     int content_count = dlg_content_count(d);   /* 不含底部返回行 */
     int max_sel = d->no_footer ? (d->count - 1) : content_count;   /* list 含底部返回行 */
     switch (a) {
+    /* ★★★ 2026-10-17 (社区反馈: 无触摸机型只有几个物理键):
+     *   ① 首尾循环 —— 到底再按就回第一条, 不用反向按到底
+     *   ② LEFT/RIGHT 等同 UP/DOWN —— 只有上下键的机器也能用, 四个方向都能翻 */
     case OS_ACTION_UP:
-        if (d->sel > 0) d->sel--;
+        d->sel = (d->sel > 0) ? (d->sel - 1) : max_sel;
         d->scroll_px = 0;   /* 按键导航吸附回正 */
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_DOWN:
-        if (d->sel < max_sel) d->sel++;
+        d->sel = (d->sel < max_sel) ? (d->sel + 1) : 0;
         d->scroll_px = 0;   /* 按键导航吸附回正 */
         ctx->needs_redraw = true;
         break;
@@ -495,6 +498,15 @@ static void dlg_action(ui_ctx_t *ctx, os_action_t a) {
             int n = (d->count == 2) ? 2 : 3;
             if (a == OS_ACTION_LEFT) d->sel = (d->sel + n - 1) % n;
             else d->sel = (d->sel + 1) % n;
+            ctx->needs_redraw = true;
+        } else if (!d->no_footer && max_sel >= 0) {
+            /* ★ 2026-10-17 (社区反馈): 列表弹窗原来"左右键忽略" ⇒ 无触摸机型只有方向键时
+             *   少一半按键可用。改为左右键也能翻, 且首尾循环。 */
+            int n = max_sel + 1;
+            if (a == OS_ACTION_LEFT) d->sel = (d->sel > 0) ? (d->sel - 1) : max_sel;
+            else                     d->sel = (d->sel < max_sel) ? (d->sel + 1) : 0;
+            (void)n;
+            d->scroll_px = 0;
             ctx->needs_redraw = true;
         }
         break;

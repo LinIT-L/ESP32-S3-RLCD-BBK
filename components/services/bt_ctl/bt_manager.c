@@ -138,7 +138,7 @@ static bool s_rc_target_valid = false;
 /* 自动回连退避参数 (定义在此供断连回调等前置函数使用):
  * 直连上次地址, 不空转扫描; 退避 60s→120s→240s→封顶300s. */
 #define BT_RECONNECT_POLL_MS   60000
-#define BT_RECONNECT_MAX_MS    300000
+#define BT_RECONNECT_MAX_MS    60000    /* ★ 2026-10-17: 5min→1min, 回连等待感太明显(社区反馈) */
 #define BT_BOOT_RECONNECT_POLL_MS 3000   /* V1.5.x: 开机回连窗口内直连间隔 (低占空比) */
 #define BT_BOOT_RECONNECT_WINDOW_MS 30000 /* V1.5.x: 开机回连窗口默认时长 */
 static uint32_t s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;
