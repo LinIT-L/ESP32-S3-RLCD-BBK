@@ -58,6 +58,10 @@ const FW_URLS = [
   'https://github.com/' + REPO + '/releases/latest/download/' + FW_ASSET,
   'https://raw.githubusercontent.com/' + REPO + '/main/flash/' + FW_REPO_MIRROR
 ];
+/* ★ 2026-10-18: GitHub Release 的下载重定向到 release-assets.githubusercontent.com,
+ *   那个域**没有 CORS 头** ⇒ 浏览器 fetch 直接失败（页面报"最新版固件下载失败"）。
+ *   所以优先走**本站镜像** (bbk.linit.cn 已加 Access-Control-Allow-Origin: *)。 */
+const FW_SITE_BASE = 'https://bbk.linit.cn/fw/';
 const FLASH_ADDR = 0x0;
 const BAUD = 115200;   /* 固定 (USB-JTAG 设备波特率不影响速度, 与硬件无关) */
 const $ = (id) => document.getElementById(id);
@@ -179,6 +183,15 @@ async function releaseBinUrl(tag) {
   return legacy;
 }
 
+
+/* 取 latest 对应的真实 tag（本站镜像按 tag 命名文件） */
+async function latestTag() {
+  try {
+    const res = await fetch('https://api.github.com/repos/' + REPO + '/releases/latest');
+    if (res.ok) { const j = await res.json(); if (j && j.tag_name) return j.tag_name; }
+  } catch (e) { /* 忽略 */ }
+  return 'v1.4.1';
+}
 /* ========== 阶段1: 下载固件 (结果为 Uint8Array) ========== */
 async function downloadFirmware() {
   const status = $('status');
@@ -188,8 +201,9 @@ async function downloadFirmware() {
     const verLabel = (ver === 'latest') ? '最新版' : ver;
     let r = null;
     status.textContent = '正在解析 ' + verLabel + ' 固件地址…';
+    const tag = (ver === 'latest') ? await latestTag() : ver;
+    const urls = [ FW_SITE_BASE + 'LinTOS-' + String(tag).replace(/^v/, 'v') + '-16MB.bin' ];
     const assetUrl = await releaseBinUrl(ver);
-    const urls = [];
     if (assetUrl) urls.push(assetUrl);
     if (ver === 'latest') { for (const u of FW_URLS) urls.push(u); }
     for (const u of urls) {
