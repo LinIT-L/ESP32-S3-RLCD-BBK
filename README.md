@@ -121,8 +121,12 @@ python -m esptool --chip esp32s3 -b 460800 write_flash \
 
 固件下载：https://bbk.linit.cn/fw/　分区表：[partitions.csv](partitions.csv)　版本记录：[CHANGELOG.md](CHANGELOG.md)
 
-## 版权
+## 版权与参考
 
-- BBK 4988 内核：[gam4980](https://github.com/ThisBoringWorld/gam4980)
-- GB/GBC、NES：[esp-box-emu](https://github.com/espressif/esp-box-emu)
-- ArduBoy 适配：[UVE5](https://github.com/losehu/UVE5)
+感谢以下开源项目,以及感谢 AI 与 **DeepSeek**:
+
+- **BBK 4988 内核**: [gam4980](https://github.com/ThisBoringWorld/gam4980)
+- **GB/GBC、NES**: [esp-box-emu](https://github.com/espressif/esp-box-emu)(gnuboy、noFrendo)
+- **Ab 模拟器适配**: 精简自 [UVE5](https://github.com/losehu/UVE5)
+- 部分界面/模拟器思路参考 **esp32-s3-rlcd-gb-emulator**
+- 开发交接文档见 `docs/HANDOVER.md`
