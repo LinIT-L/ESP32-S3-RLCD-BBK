@@ -20,12 +20,6 @@
 
 ## 演示
 
-<sub>手持实机演示（12 fps）</sub>
-
-<img src="images/demo/handheld.webp" width="360" alt="手持演示">
-
-原片：[MP4](images/demo/handheld.mp4)（600 宽 · 2 MB）
-
 <sub>真机操作：主菜单 → 应用中心 → 商店</sub>
 
 <img src="images/demo/ui-tour.gif" width="360" alt="操作演示">
@@ -37,6 +31,8 @@
 <sub>BBK 词典运行游戏</sub>
 
 <img src="images/demo/bbk-game.png" width="360" alt="三国坛说">
+
+<img src="images/demo/handheld.webp" width="360" alt="手持演示">
 
 ## 操作
 
