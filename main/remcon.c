@@ -713,6 +713,14 @@ static void rc_exec(const char *line){
         if (m > 0 && m < 120000) vTaskDelay(pdMS_TO_TICKS(m));
         return;
     }
+    if (strcmp(cmd, "amcat") == 0) {
+        /* amcat <0引擎|1应用|2运维|3商店> —— 调试: 切应用管家分类(验证渲染不死机) */
+        extern void am_debug_set_cat(int c);
+        int c = rest ? atoi(rest) : 3;
+        am_debug_set_cat(c);
+        printf("AMCAT %d\r\n", c);
+        return;
+    }
     if (strcmp(cmd, "hello") == 0 || strcmp(cmd, "echo") == 0 ||
         strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0 ||
         strcmp(cmd, "storedl") == 0 ||   /* ★ 商店下载测试 (2026-10-18) */

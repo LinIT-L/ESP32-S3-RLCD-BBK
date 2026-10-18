@@ -351,7 +351,10 @@ static void am_dl_task(void *arg) {
         remove(dst);      /* 不许留半个包在商店源目录里 (会被当成"待安装") */
         s_dl_err = rc;
         s_permille = -1;
-        ESP_LOGD(TAG, "下载失败 rc=%d (%s)", rc, dst);
+        ESP_LOGW(TAG, "下载失败 rc=%d (%s)", rc, dst);
+        /* ★★★ 2026-10-18 修: 失败也必须**清掉"正在下载"的名字** ——
+         *   否则列表那行永远停在"下载中" ✗ (linit 报"一直显示下载中无法下载") */
+        s_dl_name[0] = 0;
         __sync_synchronize();
         s_state = ARS_DLFAIL;
     } else {

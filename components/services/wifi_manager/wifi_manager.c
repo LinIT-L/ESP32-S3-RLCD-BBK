@@ -23,7 +23,8 @@
 #define KEY_PASS "pass"
 
 static bool s_inited = false;
-static bool s_diag_done = false;   /* 一次性域名/TCP 诊断 */    /* esp_wifi_init 已调用 */
+static bool s_diag_done = false;   /* 一次性域名/TCP 诊断 */
+static int8_t s_stable_power = 0;   /* ★ 连上时记下的发射功率(重连直接复用) */    /* esp_wifi_init 已调用 */
 static bool s_enabled = false;   /* esp_wifi_start 已成功 */
 static bool s_connecting = false;
 static bool s_connected = false;
@@ -105,16 +106,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             s_retry++;
             /* ★ 2026-10-09: 重连时**逐步放开发射功率**。
              *   首次连接故意用 8.5dBm(34) 压住"一开 WiFi 就把 3V3 拉黑屏"的冲击;
-             *   但连不上多半是信噪比不够 (本机实测 RSSI ≈ -71dBm, 8.5dBm 太勉强),
-             *   于是逐次放开: 1 次 8.5dBm → 2~3 次 15.5dBm(62) → 4~5 次 19.5dBm(78)。
-             *   连上后保持当期功率; 下次 enable() 会复位回 8.5dBm。 */
-            int8_t want = (s_retry >= 4) ? 78 : ((s_retry >= 2) ? 62 : 34);
+             *   但连不上多半是信噪比不够, 于是逐次放开。
+             * ★★ 2026-10-18 优化 (linit "WiFi 卡/连得慢"):
+             *   ① **删掉 vTaskDelay(1000)** —— 原来在 WiFi 事件任务里阻塞 1 秒,
+             *      把扫描/GOT_IP/断开事件全拖住 ⇒ "打开 WiFi 页卡" ✗
+             *      改为**立即 esp_wifi_connect()**, IDF 自己会做退避;
+             *   ② 第 1 次重试就直接上 19.5dBm(78) —— 本机实测 RSSI ≈ -87dBm,
+             *      还从 8.5dBm 慢慢爬纯属浪费两轮;
+             *   ③ 连上后把功率记为"已稳定", 后续断线不再回到 8.5dBm。 */
+            int8_t want = (s_stable_power > 0) ? s_stable_power : 78;
             esp_wifi_set_max_tx_power(want);
             s_connecting = true;
             snprintf(s_status, sizeof(s_status), "连接中...");
-            ESP_LOGD(TAG, "Wi-Fi 连接失败, 1s后重试 (%d/5, TX=%d/4dBm)", s_retry, (int)want);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            esp_wifi_connect();
+            ESP_LOGI(TAG, "Wi-Fi 重连 (%d/5, TX=%d*0.25dBm)", s_retry, (int)want);
+            esp_wifi_connect();          /* ★ 立即重连, 不再阻塞事件任务 */
         } else {
             s_retry = 0;
             if (s_connecting) {
@@ -126,6 +131,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             }
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        /* ★ 连上后记住当前发射功率, 之后断线重连直接用它(不再从 8.5dBm 爬) */
+        {
+            int8_t pw = 0;
+            if (esp_wifi_get_max_tx_power(&pw) == ESP_OK && pw > s_stable_power) s_stable_power = pw;
+        }
         /* ★★★ 2026-10-17 linit: 拿到 IP 后**强制覆盖 DNS** —— 实测 routers 下发的 DNS
          *   在设备侧解析不了(商店下载瞬间 ESP_ERR_HTTP_CONNECT)。用国内公共 DNS:
          *   阿里 223.5.5.5 / 114DNS 114.114.114.114。注意: 仍不能解决"域名被墙", 只解决 DNS。 */

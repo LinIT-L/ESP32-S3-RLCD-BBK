@@ -214,7 +214,8 @@ static void am_pkg_scan(void) {
                 if (!icat[0]) snprintf(icat, sizeof(icat), "软件");
                 /* 中文分类 → 安装目录: 游戏→engine / 运维·工具→ops / 其它→app */
                 const char *pcat = "app";
-                if (strcmp(icat, "游戏") == 0) pcat = "engine";
+                /* ★ 2026-10-18 linit: **游戏改装到 app/(应用→游戏)**, 引擎只留模拟器 */
+                if (strcmp(icat, "游戏") == 0) pcat = "app";
                 else if (strcmp(icat, "运维") == 0 || strcmp(icat, "工具") == 0) pcat = "ops";
                 snprintf(s_pkg[k].cat, sizeof(s_pkg[k].cat), "%s", pcat);
                 snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/%s/%s", AM_STORE_DST, pcat, nm);
@@ -351,8 +352,8 @@ static void am_store_sync_remote(void) {
          *   索引 cat: game/ops/app ; 本地合法目录: engine/ops/app(无 game) ⇒ game→engine(独立游戏)。
          *   安装目录随分类变化, 下载前后同源(本地扫描按目录判分类 ⇒ 一致)。 */
         const char *icat = (rp->cat[0]) ? rp->cat : "程序";   /* 索引里的中文分类 */
-        const char *cat  = (strcmp(icat, "游戏") == 0) ? "engine"
-                         : (strcmp(icat, "运维") == 0 || strcmp(icat, "工具") == 0) ? "ops" : "app";
+        /* ★ 2026-10-18 linit: 游戏 → app(应用→游戏); 引擎分类只留模拟器 */
+        const char *cat  = (strcmp(icat, "运维") == 0 || strcmp(icat, "工具") == 0) ? "ops" : "app";
         snprintf(e->cat,   sizeof(e->cat),   "%s", cat);
         snprintf(e->id,    sizeof(e->id),    "pkg:%s", fn);
         snprintf(e->src,   sizeof(e->src),   "%s/%s", AM_STORE_SRC2, fn);
@@ -410,7 +411,7 @@ bool am_store_auto_install(const char *fname) {
     for (int i = 0; i < n; i++) {
         const am_rpkg_t *rp = am_rstore_get(i);
         if (rp && strcmp(rp->name, stem) == 0) {
-            if (strcmp(rp->cat, "游戏") == 0) sub = "engine";
+            if (strcmp(rp->cat, "游戏") == 0) sub = "app";   /* 游戏 → 应用→游戏 */
             else if (strcmp(rp->cat, "运维") == 0 || strcmp(rp->cat, "工具") == 0) sub = "ops";
             break;
         }
@@ -562,6 +563,7 @@ static void am_uninst_task(void *arg) {
     am_store_invalidate();     /* 重扫 → 下次进商店/重建时列表已更新 */
     am_lua_invalidate();
     ESP_LOGI("AMSTORE", "后台卸载完成: %s (删了 %d 个文件)", j->lid, j->npaths);
+
     free(j);
     vTaskDelete(NULL);
 }
@@ -569,8 +571,12 @@ static void am_uninst_task(void *arg) {
 static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
     if (k < 0 || k >= s_pkg_n) return;
     if (!am_pkg_installed(k)) { os_dialog_toast(ctx, "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85"); return; } /* 未安装 */
+    /* ★★★ 2026-10-18: **不再用"忙标志"挡** —— 之前任务异常退出会把标志永久置 true
+     *   ⇒ "点卸载没反应" ✗。卸载是幂等的(删不存在的文件只返回错误),
+     *   连点/重复完全无害 ⇒ 直接放行, 由后台任务各删各的 ✓ */
     am_uninst_job_t *j = calloc(1, sizeof(*j));
     if (!j) return;
+
     /* 先把要删的路径拷进任务(任务跑的时候 s_pkg 可能已被重扫 ✗) */
     snprintf(j->paths[j->npaths++], 192, "%s", s_pkg[k].dst);
     snprintf(j->paths[j->npaths++], 192, "/sdcard/apps/%s/%s", s_pkg[k].cat, s_pkg[k].fname);
@@ -578,15 +584,19 @@ static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
     snprintf(j->paths[j->npaths++], 192, "/store/%s", s_pkg[k].fname);
     snprintf(j->lid, sizeof(j->lid), "lua:%s", s_pkg[k].fname);
     s_pkg_inst[k] = false;   /* UI 立刻认为未安装(按钮变"下载") */
-    os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8d\xb8\xe8\xbd\xbd");   /* 已卸载 */
+    os_dialog_toast(ctx, "\xe5\x8d\xb8\xe8\xbd\xbd\xe4\xb8\xad...");   /* 卸载中... (后台删完会刷新列表) */
     ctx->needs_redraw = true;
-    if (xTaskCreate(am_uninst_task, "am_uninst", 4096, j, 3, NULL) != pdPASS) {
+    if (xTaskCreate(am_uninst_task, "am_uninst", 6144, j, 3, NULL) != pdPASS) {
         /* 任务建不起来: 退化为同步删(至少保证功能正确) */
         am_uninst_task(j);
     }
 }
 
 static void am_store_uninstall_cb(ui_ctx_t *ctx, int result, void *ud) {
+    /* ★★★ 2026-10-18 修(弹窗不关): **先关确认框再执行** ——
+     *   因为 os_dialog_toast() 会把 s_cb_handled 置 true, 框架的 dlg_finish_top
+     *   就**不再自动关**了 ⇒ 弹窗一直挂着 ✗ */
+    if (os_dialog_depth() > 0) os_dialog_pop(ctx);
     if (result == 0) am_store_uninstall_do(ctx, (int)(long)ud);
     /* 同上: 交给框架自己关, 不要手动 pop */
     ctx->needs_redraw = true;

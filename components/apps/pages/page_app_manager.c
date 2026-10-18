@@ -386,6 +386,14 @@ static void am_rebuild_ex(bool keep_cam) {
     s_col_dirty = true;   /* 列表内容变了, 整列需重渲染 */
 }
 static void am_rebuild(void)      { am_rebuild_ex(false); }
+/* ★ 2026-10-18: 串口调试用 —— 切分类并重建(验证商店渲染不死机) */
+void am_debug_set_cat(int c) {
+    if (c < 0 || c >= AM_CAT_COUNT) return;
+    s_cat = c;
+    s_sub = AM_SUB_ALL;
+    am_rebuild_ex(true);
+    ESP_LOGI("APPM", "debug: 分类切到 %d, 条目 %d", c, s_list_n);
+}
 void am_rebuild_keep(void) { am_rebuild_ex(true);  }   /* 对外: am_store.c 安装/卸载后重建 */
 static int am_max_scroll(void) {
     if (!s_view_grid) {
@@ -897,13 +905,31 @@ static void am_col_render_list(void) {
             /* 第二行 = 文案 (本地包 → LAPP 简介 desc=; 云端包 → "未下载 · NKB"),
              * 不再显示文件路径/文件名 ——
              * 用户原话: "模拟器下方不要显示路径名称, 直接显示对应说明"。 */
-            /* ⚠ 2026-10-18: 行内"画进度条"版本会导致写列缓冲越界 ⇒ 开店死机 ✗
-             *   ⇒ 暂时退回**文字进度**(下载中 42%), 稳定优先; 之后用安全方式重做进度条。 */
+            /* ★★★ 2026-10-18 linit: **下载/安装中 → 第二行画进度条**(顶掉介绍), 完成自动恢复。
+             *   ⚠ 安全约束(上次就是这里崩的): 所有坐标必须夹在【本行】与【列缓冲】内,
+             *     只用 am_col_hline / am_col_fill(已带边界夹取), 不自己算指针。 */
             int dpm = am_store_dl_permille_of(a);
             if (dpm >= 0) {
-                char pg[24];
-                snprintf(pg, sizeof(pg), "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad %d%%", dpm / 10); /* 下载中 42% */
-                am_col_text_l(AM_ROW_TX, y + 27, pg, sel);
+                int bx0 = AM_ROW_TX;
+                int bx1 = AM_ROW_BTN_X0 - 42;   /* ★ 留出右侧 42px 给百分比, 避免重叠 */
+                int by0 = y + 29;
+                int by1 = by0 + 6;
+                /* 夹进本行可见范围 (AM_ROW_H 内) 与列缓冲高度 */
+                if (by1 > y + AM_ROW_H - 3) by1 = y + AM_ROW_H - 3;
+                if (by1 >= s_col_h)          by1 = s_col_h - 1;
+                if (bx1 >= AM_COL_W)         bx1 = AM_COL_W - 1;
+                if (by1 > by0 && bx1 > bx0) {
+                    am_col_rect_outline(bx0, by0, bx1, by1, !sel);      /* 外框 */
+                    int fw = ((bx1 - bx0 - 2) * dpm) / 1000;            /* 内部填充 */
+                    if (fw > 0)
+                        am_col_fill(bx0 + 1, by0 + 1,
+                                    (bx0 + fw < bx1) ? bx0 + fw : bx1 - 1,
+                                    by1 - 1, !sel);
+                    /* 百分比画在**条右侧的空白区**(条已留出 42px) */
+                    char pg[8];
+                    snprintf(pg, sizeof(pg), "%d%%", dpm / 10);
+                    am_col_text_l(bx1 + 6, by0 - 1, pg, sel);
+                }
             } else {
                 const char *ds = am_store_sub_of(a);
                 if (ds && ds[0])
@@ -1504,10 +1530,41 @@ static void p_am_poll(ui_ctx_t *ctx) {
         ctx->needs_redraw = true;
     }
 
-    /* ★★★ 2026-10-18 linit: **下载中每帧重绘** —— 否则进度条一直停在 0%(空白),
-     *   一下载完就跳 100% (因为没人请求重绘, 界面停在旧帧) ✗ */
-    if (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING)
+    /* ★★★ 2026-10-18 linit: **下载中每帧重绘 + 标脏列缓冲** ——
+     *   行是渲染到离屏列缓冲 s_col 的, 只有 s_col_dirty 才重新渲染 ✗
+     *   ⇒ 只设 needs_redraw 等于把【旧缓冲】重新贴一遍, 进度条永远不动 ✓
+     *   (linit 报"下载没进度, 一下子完成"就是这个) */
+    if (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING) {
         ctx->needs_redraw = true;
+        s_col_dirty = true;
+    }
+
+    /* ★★★ 2026-10-18 linit: **下载刚开始时, 把正在下载的那条冒泡到第一位 + 列表回顶部** ——
+     *   否则它还在原来的位置, 用户要自己找进度 ✗ (他明确要求"排第一个 + 回最上面")
+     *   ⚠ 只调整 s_list 顺序 + 滚动位置, **不重建列表**(重建会崩, 见上面的注释) ✓ */
+    {
+        static bool s_dl_was = false;
+        bool dl_now = (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING);
+        if (dl_now && !s_dl_was) {
+            for (int i = 0; i < s_list_n; i++) {
+                if (am_store_dl_permille_of(s_list[i]) >= 0) {
+                    if (i > 0) {
+                        const os_app_t *t = s_list[i];
+                        for (int j = i; j > 0; j--) s_list[j] = s_list[j - 1];
+                        s_list[0] = t;
+                    }
+                    break;
+                }
+            }
+            s_focus  = 0;
+            s_scroll = 0;
+            s_gcam   = 0.0f;
+            ctx->needs_redraw = true;
+            s_col_dirty = true;
+            ESP_LOGI("APPM", "下载开始 → 该条目排到第一位, 列表回顶部");
+        }
+        s_dl_was = dl_now;
+    }
 
     /* 分类 Lua 后台扫描完成: 影子缓冲搬到 s_lua, 标记数据就绪, 重建列表 (UI 线程取货).
      * 迁移须在 UI 线程一次性完成 (后台只写 s_lua_bg, 避免与渲染读 s_lua 竞态). */
@@ -1539,6 +1596,17 @@ static void p_am_poll(ui_ctx_t *ctx) {
         }
         /* 下载中: 进度框要每帧重画 */
         if (am_rstore_state() == ARS_DOWNLOADING) ctx->needs_redraw = true;
+
+        /* ⚠ 2026-10-18: 这里直接 am_rebuild_keep() 会崩(LoadProhibited) ✗
+         *   ⇒ 改为**只标脏**, 由下一帧正常渲染路径重建(不在这里重建) */
+        static bool s_was_ready = false;
+        bool now_ready = am_store_ready();
+        if (now_ready && !s_was_ready) {
+            ctx->needs_redraw = true;
+            s_col_dirty = true;
+            ESP_LOGI("APPM", "商店重扫完成 → 请求刷新");
+        }
+        s_was_ready = now_ready;
     }
     if (store_dirty) {
         if (s_cat == AM_CAT_STORE) {
