@@ -2,6 +2,8 @@
 
 本项目是一款提供几个复古游戏引擎与运维工具的 ESP32-S3 固件，硬件上支持 DIY 的 ESP32 拼音学习机与微雪 ESP32-S3-RLCD-4.2 开发板。
 
+**在线刷机**：https://linit-l.github.io/ESP32-S3-RLCD-BBK/flash/ （Chrome / Edge 打开，USB 直刷 16 MB）
+
 ## 隐藏功能
 
 - 显示 GB / GBC / NES / ArduBoy 图标：设置 →「请作者喝杯水」→ 赞助图连按确认 5 次
