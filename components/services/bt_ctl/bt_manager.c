@@ -74,6 +74,7 @@ static bool s_connected = false;
 static bool s_scanning = false;
 static bool s_suspended = false;
 static bool s_connecting = false;
+static int64_t s_scan_start_ms = 0;   /* ★ 2026-10-18: 本轮扫描起点 (看门狗用, 0=未在扫) */
 /* 蓝牙"电源开关": disable() 置真(彻底关栈), enable() 清假.
  * 用于锁屏/屏保省电 —— 关电后自动回连任务必须停手, 不能偷偷把栈再拉起来. */
 static bool s_power_off = false;
@@ -146,6 +147,59 @@ static TaskHandle_t s_reconnect_task = NULL;   /* 断连/开机可即时唤醒�
 
 /* 前置声明: 扫描回调(前文)与 connect_device(后文) 都要用; esp_hidh_dev_open 会阻塞, 必须异步调用 */
 static bool bt_connect_async(const esp_hid_scan_result_t *r);
+
+/* ============================================================================
+ * 连接收敛 (2026-10-18) —— 修"失败一次之后后面全失败"
+ * ----------------------------------------------------------------------------
+ * 现象 (linit): 手柄第二/第三次连接经常失败，且**失败一次后所有后续尝试都失败**。
+ * 根因（读 IDF 源码确认，非猜测）：
+ *   ① `esp_hidh_dev_open()` 内部的 `WAIT_CB()` 是 `xSemaphoreTake(sem, portMAX_DELAY)`
+ *      —— **无限等** GATTC 事件。连接没成（GATT 0x85 / 设备不在）时它可能一直不返回
+ *      ⇒ `s_connecting` 永远为 true ⇒ 回连任务与 UI 全被"正在连接"挡住
+ *      ⇒ 之后每一次尝试都失败（看起来像"坏了"）。
+ *   ② 失败后没人主动断开 ⇒ Bluedroid 侧还挂着 pending create-conn / 半开链路，
+ *      下次 `esp_hidh_dev_open()` 直接撞 `Already Connected` / `INVALID_STATE`，
+ *      直到重启才恢复。
+ * 处理：每次尝试记下 bda + 截止时间；失败或超时统一走 bt_conn_failed()
+ *   → 清"连接中" → 主动断掉那条链路 → 记连败次数 → 连败 N 次由回连任务重建蓝牙栈。
+ * ==========================================================================*/
+#define BT_CONNECT_TIMEOUT_MS   12000   /* open 可能无限阻塞 ⇒ 外部兜底 */
+#define BT_CONN_FAILS_TO_RESET  2       /* 连败几次就整栈重建 */
+static int64_t  s_conn_deadline_ms = 0;      /* 0 = 无进行中的尝试 */
+static uint8_t  s_conn_try_bda[6];
+static bool     s_conn_try_valid = false;
+static int      s_conn_fail_streak = 0;
+static int      s_conn_task_alive = 0;       /* 还在 open 里阻塞的任务数 (>0 时不许拆栈) */
+static volatile bool s_need_stack_reset = false;
+
+static void bt_conn_begin(const uint8_t bda[6])
+{
+    if (bda) { memcpy(s_conn_try_bda, bda, 6); s_conn_try_valid = true; }
+    s_conn_deadline_ms = esp_timer_get_time() / 1000 + BT_CONNECT_TIMEOUT_MS;
+}
+static void bt_conn_end(void) { s_conn_deadline_ms = 0; }
+
+/* allow_reset: 只有"本次 open 已经返回失败"时才允许整栈重建 ——
+ * 若 open 还卡在 WAIT_CB 里就 deinit，那个任务会拿着已释放的信号量/dev 指针继续跑（UAF）。 */
+static void bt_conn_failed(const char *why, bool allow_reset)
+{
+    s_connecting = false;
+    bt_conn_end();
+    if (s_conn_try_valid) {
+        bt_core_cancel_pending(s_conn_try_bda);   /* ★ 断掉 pending/半开链路 */
+        s_conn_try_valid = false;
+    } else {
+        bt_core_disconnect();
+    }
+    if (s_conn_fail_streak < 99) s_conn_fail_streak++;
+    ESP_LOGW(TAG, "连接失败(%s), 连败 %d 次%s", why, s_conn_fail_streak,
+             allow_reset ? "" : " [open 仍在阻塞, 暂不拆栈]");
+    if (allow_reset && s_conn_task_alive <= 0 &&
+        s_conn_fail_streak >= BT_CONN_FAILS_TO_RESET) {
+        s_need_stack_reset = true;
+    }
+    if (s_reconnect_task) xTaskNotifyGive(s_reconnect_task);
+}
 
 /* 上次连接设备名 (持久化): 用于判断"新手柄"——设备名与上次不同则清空旧映射 */
 static char  s_last_conn_name[32] = {0};
@@ -814,6 +868,9 @@ static void on_connected_cb(bool connected, esp_hidh_dev_t *dev)
         s_connected = true;
         s_connecting = false;
         s_auto_reconnect_pending = false;
+        bt_conn_end();            /* ★ 收敛: 清截止时间 */
+        s_conn_fail_streak = 0;   /* ★ 连上了: 连败计数归零 */
+        s_conn_try_valid = false;
 
         /* 记录当前连接地址 */
         const uint8_t *bda = esp_hidh_dev_bda_get(dev);
@@ -887,7 +944,9 @@ static void on_connected_cb(bool connected, esp_hidh_dev_t *dev)
 
         if (s_connect_cb) s_connect_cb(true);
     } else {
-        s_connecting = false;
+        /* ★ 2026-10-18: OPEN 失败事件 = 权威失败信号 → 统一收尾(断链路+记连败)，
+         *   否则下一次 open 会撞 Already Connected / 半开链路，表现"失败一次后再也连不上"。 */
+        bt_conn_failed("OPEN 失败事件", true);
         if (s_connect_cb) s_connect_cb(false);
     }
 }
@@ -900,6 +959,7 @@ static void on_disconnected_cb(bool connected, esp_hidh_dev_t *dev)
     s_connecting = false;
     s_conn_addr_valid = false;
     s_conn_info.available = false;
+    bt_conn_end();            /* ★ 断连不是"失败", 只清截止时间, 不清连败计数 */
     /* 断连即快速重连: 复位退避到基础间隔 + 唤醒重连任务立即尝试, 不必等退避睡满.
      * 否则断开前若曾重连失败退避到 300s(5分钟), 断开后要干等 5 分钟才重试 →
      * 表现为"不会自动重连已连接的手柄". 掉线后 ~60s 内 (立即复位后任务被唤醒即试) 重连. */
@@ -1199,6 +1259,7 @@ void bt_manager_start_scan(bt_scan_callback_t callback)
     s_scan_cb = callback;
     s_cont_cb = NULL;
     s_scanning = true;
+    s_scan_start_ms = esp_timer_get_time() / 1000;   /* ★ 看门狗起点 */
     bt_core_scan(5);
 }
 
@@ -1207,11 +1268,25 @@ void bt_manager_start_scan_continuous(bt_device_found_cb_t callback)
     s_cont_cb = callback;
     s_scan_cb = NULL;
     s_scanning = true;
+    s_scan_start_ms = esp_timer_get_time() / 1000;   /* ★ 看门狗起点 */
     bt_core_scan(5);
 }
 
 bool bt_manager_is_scanning(void)
 {
+    /* ★★ 2026-10-18: "一直显示正在扫描"的自愈。
+     *   bt_core_scan() 在 core 侧 s_scanning 仍为 true 时是**直接 return**（不起任务），
+     *   于是一次被卡住的扫描之后，管理器这边 s_scanning=true 却永远不会收到 on_scan_done
+     *   ⇒ UI 永远显示"正在扫描..."，只能重启。
+     *   这里给硬上限：超过 15s（正常 5s 扫完 + 余量）就强制复位两边标志，
+     *   UI 自然翻成"未发现设备"，用户可以重扫。 */
+    if (s_scanning && s_scan_start_ms &&
+        (int64_t)(esp_timer_get_time() / 1000) - s_scan_start_ms > 15000) {
+        ESP_LOGW(TAG, "扫描 15s 未收敛 ⇒ 复位扫描状态 (core=%d)", (int)bt_core_is_scanning());
+        s_scanning = false;
+        bt_core_stop_scan();
+        s_scan_start_ms = 0;
+    }
     return s_scanning || bt_core_is_scanning();
 }
 
@@ -1219,6 +1294,7 @@ void bt_manager_stop_scan(void)
 {
     bt_core_stop_scan();
     s_scanning = false;
+    s_scan_start_ms = 0;
     s_auto_reconnect_pending = false;
 }
 
@@ -1340,13 +1416,15 @@ typedef struct { esp_hid_scan_result_t r; } bt_conn_arg_t;
 static void bt_connect_task(void *arg)
 {
     bt_conn_arg_t *a = (bt_conn_arg_t *)arg;
+    s_conn_task_alive++;
     if (a) {
         if (!bt_core_connect(&a->r)) {
             ESP_LOGD(TAG, "异步连接失败(超时/不在范围)");
-            s_connecting = false;   /* 复位"连接中", 允许后续重试 */
+            bt_conn_failed("异步 open 失败", true);   /* 复位状态 + 断链路 + 记连败 */
         }
         free(a);
     }
+    s_conn_task_alive--;
     vTaskDelete(NULL);
 }
 
@@ -1358,8 +1436,11 @@ static bool bt_connect_async(const esp_hid_scan_result_t *r)
     if (!a) return false;
     memset(a, 0, sizeof(*a));
     a->r = *r;   /* 浅拷贝: bt_core_connect 只用 bda/transport/ble.addr_type, 不用 name */
+    bt_conn_begin(r->bda);   /* ★ 记下本次目标 + 截止时间 (超时/失败靠它收尾) */
     if (xTaskCreate(bt_connect_task, "bt_conn", 4096, a, 2, NULL) != pdPASS) {
         free(a);
+        s_connecting = false;
+        bt_conn_end();
         return false;
     }
     return true;
@@ -1450,7 +1531,14 @@ void bt_manager_cancel_connect(void)
 {
     s_connecting = false;
     s_auto_reconnect_pending = false;
-    bt_core_disconnect();
+    bt_conn_end();            /* 用户主动取消: 不算失败, 不清连败计数 */
+    /* ★ 取消也要断掉那条悬着的链路，否则用户"取消后重新点连接"会撞 Already Connected */
+    if (s_conn_try_valid) {
+        bt_core_cancel_pending(s_conn_try_bda);
+        s_conn_try_valid = false;
+    } else {
+        bt_core_disconnect();
+    }
 }
 
 static bool s_bt_on = false;   /* V1.6.x: 蓝牙是否已启用 (供键盘↔手柄模式切换记录原状态) */
@@ -1501,6 +1589,7 @@ void bt_manager_disable(void)
     s_connected = false;
     s_connecting = false;
     s_scanning = false;
+    s_scan_start_ms = 0;
     s_suspended = false;
     s_conn_addr_valid = false;
     s_conn_info.available = false;
@@ -1528,8 +1617,9 @@ static bool bt_try_reconnect_now(void)
     fake.transport = ESP_HID_TRANSPORT_BLE;
     fake.ble.addr_type = d->addr_type;
     s_connecting = true;
+    bt_conn_begin(d->bd_addr);
     if (!bt_core_connect(&fake)) {
-        s_connecting = false;   /* 立即失败(设备不在): 复位连接中状态 */
+        bt_conn_failed("直连失败(设备不在/链路残留)", true);
         return false;
     }
     return true;   /* 成功: 状态由 on_connected 回调收敛 */
@@ -1539,8 +1629,34 @@ static void bt_reconnect_task(void *arg)
 {
     (void)arg;
     for (;;) {
+        /* ★ 连接看门狗 (2026-10-18): esp_hidh_dev_open 内部是 portMAX_DELAY 无限等 GATTC 事件,
+         *   连接没成时它可能一直不返回 ⇒ s_connecting 永远 true ⇒ 回连任务/UI 全被挡住
+         *   = 用户说的"失败一次之后后面全失败"。超时就按失败收尾(断链路), 允许下一次尝试。 */
+        if (s_connecting && s_conn_deadline_ms &&
+            (int64_t)(esp_timer_get_time() / 1000) > s_conn_deadline_ms) {
+            bt_conn_failed("超时未收敛(open 卡住)", false);
+        }
+        /* 连败达阈值 ⇒ 整栈重建。必须有任务还卡在 open 里就不做(会 UAF) */
+        if (s_need_stack_reset) {
+            if (s_conn_task_alive > 0) {
+                ESP_LOGW(TAG, "需重建蓝牙栈, 但仍有连接任务未退出 ⇒ 稍后重试");
+            } else if (s_scanning || bt_core_is_scanning() || s_scan_cb || s_cont_cb) {
+                /* ★★ 不能在有扫描任务时拆栈：scan_task 正卡在 esp_hid_scan 里，
+                 *   拆栈会让它拿着已释放的栈/dev 继续跑 —— 表现为"一直显示正在扫描"。 */
+                ESP_LOGW(TAG, "需重建蓝牙栈, 但正在扫描 ⇒ 稍后重试");
+            } else {
+                s_need_stack_reset = false;
+                ESP_LOGW(TAG, "连败 %d 次 ⇒ 重建蓝牙栈", s_conn_fail_streak);
+                s_conn_fail_streak = 0;
+                bt_manager_disable();
+                bt_manager_enable();
+                s_reconnect_delay_ms = BT_RECONNECT_POLL_MS;
+            }
+        }
+        /* 连接进行中/待重建时缩短等待, 让看门狗及时生效 */
+        uint32_t wait_ms = (s_connecting || s_need_stack_reset) ? 1500 : s_reconnect_delay_ms;
         /* 可唤醒睡眠: 断连/开机时发通知立即醒来重连, 不必干等当前退避 (最长300s) 睡满 */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(s_reconnect_delay_ms));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms));
         /* 条件: 已连接/正在连/在扫/被挂起/关电/无历史 → 都不自动回连 */
         if (s_connected || s_connecting || s_suspended || s_power_off ||
             bt_manager_is_scanning() || s_history_count <= 0) {

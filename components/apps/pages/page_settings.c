@@ -126,15 +126,20 @@ static void build_sysinfo(void) {
     /* ★ 2026-10-16: 行号紧凑排列(0..4) —— 删掉"内部版本"后必须连续编号, 否则中间空行 */
     snprintf(s_info_lines[0], sizeof(s_info_lines[0]),
              "\xe7\x89\x88\xe6\x9c\xac\xe5\x8f\xb7:%.18s", os_version_public());   /* 版本号:1.4 */
+    /* ★★★ 2026-10-18 linit: 核心内存用**英文标签 + KB 单位**显示, 只显示空闲量。
+     *   RAM = 内核内部 RAM(最紧张的资源), PSRAM = 外部 8MB。 */
     snprintf(s_info_lines[1], sizeof(s_info_lines[1]),
-             "\xe5\x89\xa9\xe4\xbd\x99PSRAM:%uKB", /* 剩余PSRAM:XXKB */
-             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+             "RAM:%uKB",                  /* 核心内部 RAM 空闲 KB */
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     snprintf(s_info_lines[2], sizeof(s_info_lines[2]),
-             "\xe4\xbd\x9c\xe8\x80\x85\xe4\xbf\xa1\xe6\x81\xaf:LinIT"); /* 作者信息:LinIT */
+             "PSRAM:%uKB",                /* 外部 PSRAM 空闲 KB */
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     snprintf(s_info_lines[3], sizeof(s_info_lines[3]),
-             "\xe6\x9e\x84\xe5\xbb\xba:%.24s", os_build_stamp());       /* 构建:2026-10-02 11:00 */
+             "\xe4\xbd\x9c\xe8\x80\x85\xe4\xbf\xa1\xe6\x81\xaf:LinIT"); /* 作者信息:LinIT */
     snprintf(s_info_lines[4], sizeof(s_info_lines[4]),
-             "\xe6\x8f\x90\xe4\xba\xa4:%.24s", os_git_desc());          /* 提交:v1.4.0-xx-gxxxxxxx */
+             "\xe6\x9e\x84\xe5\xbb\xba:%.24s", os_build_stamp());       /* 构建:2026-10-02 11:00 */
+    /* ★ 2026-10-18 linit: 删掉"提交:xxx" 那一行 —— 内容是 git 描述(v1.4.0-3-g88140ce)，
+     *   英文+哈希对用户没意义，需要看版本时看"版本号/构建"两行就够。 */
     s_info_n = 5;
 }
 
@@ -953,8 +958,10 @@ static void on_wifi_select(ui_ctx_t *ctx, int result, void *ud) {
         else            os_hw_request(OS_HW_BT);
         os_dialog_pop(ctx); open_wifi_dlg(ctx, result);   /* 原地替换, 层级不加深 */
     } else if (result == 1) {   /* WiFi 开关 */
-        if (wifi_is_on()) { os_hw_release(OS_HW_WIFI); wifi_manager_disable(); }
-        else              os_hw_request(OS_HW_WIFI);
+        /* ★ 2026-10-18: 记住用户显式开关意图 (NVS), 重启后按它决定 WiFi 是否开机拉起。
+         *   手动关过 → 重启也不开 (省 ~69KB); 手动开过 → 重启仍是开。 */
+        if (wifi_is_on()) { os_hw_release(OS_HW_WIFI); wifi_manager_disable(); wifi_manager_set_want_on(false); }
+        else            { os_hw_request(OS_HW_WIFI);                          wifi_manager_set_want_on(true);  }
         os_dialog_pop(ctx); open_wifi_dlg(ctx, result);   /* 原地替换, 层级不加深 */
     } else if (result == 2) {
         /* WiFi 开时 = "连接WiFi"; WiFi 关时该项为"系统信息" (固定末项映射) */
@@ -1419,7 +1426,8 @@ static void hwsc_select(ui_ctx_t *ctx, int result, void *ud) {
         hw_cfg_rescan();
         os_dialog_pop(ctx);
         open_hw_selfcheck_dlg(ctx);
-        os_dialog_toast(ctx, "已重新自检");
+        /* 重新自检会换引脚表，但外设已按旧表初始化 ⇒ 必须重启才真正生效 */
+        os_dialog_toast(ctx, "已重新自检，重启后生效");
         return;
     }
     /* 第 1..HW_COUNT 行 = 硬件项(第 0 行是板型标题, 不可点) */

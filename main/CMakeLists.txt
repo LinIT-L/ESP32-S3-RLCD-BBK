@@ -29,6 +29,7 @@ idf_component_register(
         sd_scan
         usb_bt
         usb_net
+        espsdr         # espsdr_reclaim_boot: 频谱仪禁用则回收 64KB 采集区
         nes_emu
         spiffs
         lua

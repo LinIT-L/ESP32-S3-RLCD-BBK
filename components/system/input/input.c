@@ -244,15 +244,15 @@ void input_init(void) {
     };
     esp_err_t _ret = gpio_config(&io_conf);
     ESP_LOGI(TAG, "GPIO ret=%d K%d B%d P%d", _ret,
-             gpio_get_level(GPIO_NUM_4), gpio_get_level(GPIO_NUM_0),
-             gpio_get_level(GPIO_NUM_1));
+             gpio_get_level(BTN_GPIO_LEFT), gpio_get_level(BTN_GPIO_RIGHT),
+             gpio_get_level(BTN_GPIO_PWR));
 
     /* 触摸面板 (V1.0.65): 未检测到芯片时 read 恒返回 false, 零开销
-     * ★ 2026-10-16: 引脚由本层从 board_pins.h 下发 (换板只改那一个文件) ——
-     *   以前触摸引脚写死在 touch_panel.h, 微雪板上与 LCD_DC 撞成同一个 GPIO5,
-     *   I2C 把该脚设成开漏+上拉 → LCD DC 恒 3.3V、"设置不刷新"。 */
+     * ★ 2026-10-18: 引脚按**板型表运行时**下发（原来是编译期 BOARD_TP_* 宏 = 小智的 5/13/12/6，
+     *   在标准扩展版上既打不开触摸、还会把该板的 LCD DC(5) 配成开漏上拉 ⇒ 屏不刷新）。 */
     {
-        tp_pins_t tp = { BOARD_TP_SDA, BOARD_TP_SCL, BOARD_TP_INT, BOARD_TP_RST };
+        const board_pins_t *bp = board_pins_get();
+        tp_pins_t tp = { bp->tp_sda, bp->tp_scl, bp->tp_int, bp->tp_rst };
         touch_panel_set_pins(&tp);
     }
 if (hw_cfg_enabled(HW_TOUCH)) { touch_panel_init(); }
@@ -466,6 +466,12 @@ static bool s_power_armed = false;
 static bool s_power_press_valid = false;   /* 本次按住是否为新按下 (防开机误触) */
 
 bool input_power_should_sleep(void) {
+    /* ★★★ 2026-10-18 linit 实测修复: 电源键与 LEFT/RIGHT 撞脚时(微雪 PWR==KEY==GPIO18),
+     *   input_init 已把"电源键条目"禁用(见上), 但本函数原先**仍在轮询该 GPIO** ⇒
+     *   在"连接蓝牙"等界面按住这个键(=长按搜索/确认键)到 2s, 会**顺带弹出"是否关机?"**
+     *   (用户实测: 某些界面按该键弹出关机确认)。撞脚时此脚是 UI 键, 不是电源键 → 停轮询。 */
+    if (BTN_GPIO_PWR < 0 || BTN_GPIO_PWR == BTN_GPIO_LEFT || BTN_GPIO_PWR == BTN_GPIO_RIGHT)
+        return false;
     bool pressed = (gpio_get_level(BTN_GPIO_PWR) == 0);
     uint32_t now = now_ms();
 

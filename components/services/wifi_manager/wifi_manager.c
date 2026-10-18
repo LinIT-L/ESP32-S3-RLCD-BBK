@@ -21,6 +21,7 @@
 #define NVS_NS   "wifi_cfg"
 #define KEY_SSID "ssid"
 #define KEY_PASS "pass"
+#define KEY_STATE "state"   /* 用户显式开关意图: 1=开 0=关; 缺省=auto(有凭据才开) */
 
 static bool s_inited = false;
 static bool s_diag_done = false;   /* 一次性域名/TCP 诊断 */
@@ -82,6 +83,26 @@ static void load_cfg(void) {
 void wifi_manager_get_saved(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz) {
     snprintf(ssid, ssid_sz, "%s", s_ssid);
     snprintf(pass, pass_sz, "%s", s_pass);
+}
+
+/* ---- 用户显式开关意图 (持久化, 重启后按它决定 WiFi 状态) ----
+ * -1 = 从未手动设置 (默认: 有凭据才开机自动开);
+ *  0 = 用户手动关了 ⇒ 开机不 init (省 ~69KB 内部 RAM);
+ *  1 = 用户手动开了 ⇒ 开机 init+start (有凭据则顺带连接)。 */
+int wifi_manager_get_want_on(void) {
+    nvs_handle_t h;
+    if (svc_nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return -1;
+    uint8_t v = 0;
+    esp_err_t e = svc_nvs_get_u8(h, KEY_STATE, &v);
+    svc_nvs_close(h);
+    return (e == ESP_OK) ? (int)v : -1;
+}
+void wifi_manager_set_want_on(bool on) {
+    nvs_handle_t h;
+    if (svc_nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    svc_nvs_set_u8(h, KEY_STATE, on ? 1 : 0);
+    svc_nvs_commit(h);
+    svc_nvs_close(h);
 }
 
 /* ---------- 事件处理 ---------- */
@@ -441,11 +462,25 @@ static void wifi_supervisor_task(void *arg) {
  * 上层(应用/商店)只管查 is_connected, **不再各自联网**。
  * 没配过网络则完全不动 (不开射频, 保持省电)。 */
 void wifi_manager_autostart(void) {
+    /* ★★★ 2026-10-18 linit 内存优化 + 状态持久化:
+     *   ① 先读凭据(load_cfg 只读 NVS, 不 init/不分配) —— 没了"先 init 再发现没网"的白花 ~69KB;
+     *   ② 尊重"用户手动开关"意图: 手动关过 ⇒ 开机不 init; 手动开过 ⇒ 开机就开;
+     *      从未手动设置(默认) ⇒ 有凭据才自动开 (即"没手动关过又配过网 = 开机仍开")。 */
+    load_cfg();
+    int want = wifi_manager_get_want_on();
+    if (want == 0) {
+        ESP_LOGI(TAG, "开机: 用户已关闭 WiFi, 不启用 (省 ~69KB 内部 RAM)");
+        return;
+    }
+    if (want < 0 && s_ssid[0] == '\0') {
+        ESP_LOGI(TAG, "开机: 未配置网络, 不初始化 WiFi (省 ~69KB 内部 RAM)");
+        return;
+    }
     if (!s_inited) wifi_manager_init();
     if (!s_inited) return;
-    if (s_ssid[0] == '\0') { ESP_LOGI(TAG, "开机自动联网: 未配置网络, 保持射频关闭"); return; }
     if (!wifi_manager_enable()) { ESP_LOGW(TAG, "开机自动联网: 射频启动失败"); return; }
-    ESP_LOGI(TAG, "开机自动联网: 已发起连接 %s", s_ssid);
+    if (s_ssid[0]) ESP_LOGI(TAG, "开机自动联网: 已发起连接 %s", s_ssid);
+    else          ESP_LOGI(TAG, "开机: 已开启 WiFi (无保存凭据, 仅射频就绪)");
 }
 
 

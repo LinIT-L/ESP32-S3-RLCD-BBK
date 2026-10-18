@@ -34,6 +34,11 @@ bool wifi_manager_has_saved(void);
  * 之后连接/断线重连全由本模块的自愈任务负责, 上层只管查 is_connected。 */
 void wifi_manager_autostart(void);
 
+/* ★ 2026-10-18: 用户显式开关意图 (持久化) —— 设置页 WLAN 开关调用, 重启后按它决定状态。
+ * get_want_on: -1=从未手动设置(auto: 有凭据才开机开), 0=手动关, 1=手动开。 */
+int  wifi_manager_get_want_on(void);
+void wifi_manager_set_want_on(bool on);
+
 /* V1.0.46: 消费"刚刚连接成功"事件 (供菜单弹 0.5s 提示), 返回 true=本次刚连上 */
 bool wifi_manager_consume_connected_event(void);
 

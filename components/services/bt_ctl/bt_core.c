@@ -225,6 +225,11 @@ bool bt_core_is_ready(void)
 
 void bt_core_deinit(void)
 {
+    /* ★ 2026-10-18: 扫描标志必须复位 —— 若拆栈时正好有个扫描任务卡在 esp_hid_scan 里，
+     *   s_scanning 会一直保持 true ⇒ 之后 bt_core_scan() 直接 return，永不再扫，
+     *   表现为 UI "一直显示正在扫描..."。 */
+    s_scanning = false;
+    s_scan_task = NULL;
     if (s_scan_results) {
         esp_hid_scan_results_free(s_scan_results);
         s_scan_results = NULL;
@@ -371,6 +376,26 @@ void bt_core_disconnect(void)
     if (s_conn_dev) {
         esp_hidh_dev_close(s_conn_dev);
     }
+}
+
+/* ★ 2026-10-18: 失败/超时后的收尾。
+ *   只 close s_conn_dev 不够 —— 失败路径上 s_conn_dev 是 NULL（open 没成功过），
+ *   而 Bluedroid 侧可能还挂着一次 pending create-conn 或半开链路：
+ *   下次 esp_hidh_dev_open() 就会撞 "Already Connected" / INVALID_STATE，
+ *   表现为"失败一次之后永远连不上，只能重启"。
+ *   ⇒ 这里对 bda 主动发一次 GAP disconnect，把链路彻底撤掉。 */
+void bt_core_cancel_pending(const uint8_t bd_addr[6])
+{
+    if (s_conn_dev) {
+        esp_hidh_dev_close(s_conn_dev);
+        s_conn_dev = NULL;
+        s_connected = false;
+    }
+    if (!bd_addr) return;
+    esp_err_t err = esp_ble_gap_disconnect((uint8_t *)bd_addr);
+    ESP_LOGD(TAG, "cancel_pending %02x:%02x:%02x:%02x:%02x:%02x -> %s",
+             bd_addr[0], bd_addr[1], bd_addr[2], bd_addr[3], bd_addr[4], bd_addr[5],
+             esp_err_to_name(err));
 }
 
 /* 删除指定对端地址的 BLE 绑定(配对密钥)。

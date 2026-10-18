@@ -28,6 +28,10 @@ typedef enum {
 } sd_mnt_state_t;
 
 const char *sd_get_cid_name(void);        /* 卡的 CID 卡名 (出厂固化), 无卡返回 "-" */
+/* ★ 2026-10-18: CID 的 name 是**出厂型号名**(很多 4G 卡就写 "SD16G"), 不是容量 —— UI 别拿它当容量。
+ *   要显示"品牌 + 真实容量"用下面两个。 */
+const char *sd_get_vendor_str(void);      /* 按 CID MID 推断品牌 (SanDisk/Samsung/...), 未知返回 "通用卡" */
+uint64_t    sd_get_size_bytes(void);      /* 卡原始容量 (字节), 无卡返回 0 */
 sd_mnt_state_t sd_get_mnt_state(void);
 const char *sd_get_mnt_state_str(void);   /* 中文短句 (已挂载/卡无响应/exFAT 不支持/无文件系统) */
 

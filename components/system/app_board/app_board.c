@@ -31,8 +31,12 @@ static void sd_mount_task(void *arg)
     if (b) b->sd_ok = (r == ESP_OK);
     if (r == ESP_OK) {
         ESP_LOGI(TAG, "TF 卡挂载成功 (后台异步)");
+    } else if (r == ESP_FAIL) {
+        /* sd_mount 用 ESP_FAIL 表示"quick_probe 没探到卡"(不是文件系统坏) —— 别提示格式化 */
+        ESP_LOGI(TAG, "未检测到 TF 卡 (未插卡或卡座接触不良)");
     } else {
-        ESP_LOGW(TAG, "TF 卡挂载失败: %s (进入菜单后可手动格式化)", esp_err_to_name(r));
+        /* ★ 2026-10-18: 卡被识别但挂不上(文件系统不认/需要格式化)走这里, 原因见 SDSCAN 日志 */
+        ESP_LOGW(TAG, "TF 卡已识别但挂载失败: %s (见 SDSCAN 的判定行)", esp_err_to_name(r));
     }
     vTaskDelete(NULL);
 }
@@ -70,7 +74,7 @@ esp_err_t app_board_init(app_board_t *board)
             gpio_hold_dis((gpio_num_t)bp0->tp_sda); gpio_hold_dis((gpio_num_t)bp0->tp_scl);
             gpio_hold_dis((gpio_num_t)bp0->tp_int); gpio_hold_dis((gpio_num_t)bp0->tp_rst);
         }
-        gpio_hold_dis((gpio_num_t)(BOARD_IS_WEIXUE ? 48 : 8));   /* 震动 */
+        if (bp0->vib >= 0) gpio_hold_dis((gpio_num_t)bp0->vib);   /* 震动 (按板型表, 8/48) */
     }
 
     /* 1. 初始化 LCD (必须最先, 显示开机 Logo) */

@@ -52,11 +52,19 @@ ESP32-S3 复古掌机固件。屏幕为 ST7305 反射式 1bit LCD(400×300),低�
 
 ### 物理按键
 
+| 板型 | 确认（KEY） | 右 / 返回（BOOT） | 电源（PWR） |
+|---|---|---|---|
+| ① 小智一体版 | GPIO4 | GPIO0 | GPIO1 |
+| ② 微雪原版 | GPIO18 | GPIO0 | 无 GPIO（硬件电源锁存，长按直接断电） |
+| ③ 标准扩展版 | GPIO18 | GPIO0 | GPIO1 |
+
 | 按键 | 短按 | 长按 |
 |---|---|---|
-| **KEY** (GPIO18) | 确认 | 多功能键(收藏等) |
-| **BOOT** (GPIO0) | 右 | 返回 (BACK) |
-| **PWR** (GPIO1) | 锁屏 | 0.5s=返回主菜单; **2s=关机** |
+| **KEY** | 确认 | 多功能键（收藏等） |
+| **BOOT** | 右 | 返回（BACK） |
+| **PWR** | 锁屏 | 0.5s = 返回主菜单；**2s = 关机** |
+
+> 同一份固件开机自动识别板型，按键随之切换；详见 [docs/板型IO表.md](docs/板型IO表.md)。
 
 ### 触摸手势
 
@@ -127,7 +135,11 @@ MCU:**ESP32-S3**(240MHz, 8MB PSRAM, 16MB Flash)。
 
 ![微雪正面](images/微雪ESP32-S3-RLCD-4.2正面图片.jpeg)
 
-### ① 小智集成板 — 拼多多「拼音学练机」改造(本项目实际硬件)
+### ① 小智一体板 — 拼多多「拼音学练机」改造(本项目实际硬件)
+
+> ⚠ 本节是**早期拼音机改造的接线记录**（相当于"标准扩展版"那套走线）。
+> **现行 ① 小智一体版（小智 ESP32-S3-AI-2E 模块）的引脚以上方三块板对照表和
+> [docs/板型IO表.md](docs/板型IO表.md) 为准** —— 固件读的是 `board_pins` 里的表，不是本节。
 
 拆机换 ESP32-S3,接线如下:
 
@@ -180,35 +192,24 @@ MCU:**ESP32-S3**(240MHz, 8MB PSRAM, 16MB Flash)。
 ## 目录结构
 
 ```
-├── main/                    # 主循环: 渲染 / 输入 / 屏保 / 软关机
-├── components/
-│   ├── menu/                # 菜单、应用管理、设置、壁纸、收藏、蓝牙、诊断、配置
-│   ├── engine_manager/      # 引擎统一管理(用时载入、退出释放)
-│   ├── gam4980/             # BBK 电子词典引擎
-│   ├── gb_emu/ gbc_emu/     # GB / GBC 引擎
-│   ├── nes_emu/             # NES 引擎
-│   ├── arduboy/ arduboy_avr/# Arduboy 引擎 + 内置迷你游戏
-│   ├── lavax/               # 文曲星 LavaX 引擎
-│   ├── vpet/                # 暴龙机(虚拟宠物)引擎
-│   ├── book_reader/         # 电子书阅读器
-│   ├── usb_hid/             # USB 仿真键鼠
-│   ├── usbh_msc/            # TF 卡挂载
-│   ├── self_test/           # 硬件自检 / 显示测试
-│   ├── audio_player/ tone_player/  # 音频(解码 / 方波)
-│   ├── st7305/ board_shim/  # LCD 驱动 / 画面缩放灰度
-│   ├── touch_panel/ input/  # 触摸驱动 / 手势
-│   ├── virtual_keys/        # 屏幕虚拟按键
-│   └── web_gamepad/ dns_server/  # 网页手柄 / 热点
-├── flash/                   # 在线刷写页面 + 16MB 固件镜像
+├── main/                    # 外壳: 启动流程 / 主循环 / 串口远程控制台(remcon) / Lua 拉起
+├── components/              # 五层分层（构建内置依赖守卫 check_deps.py，反向依赖直接构建失败）
+│   ├── apps/                # L4 应用层: pages/ 每页一个 .c + apps_registry.c 装配 + lua_bridge/
+│   ├── engines/             # L3 引擎层: gb / gbc / nes / sms / md / arduboy / lavax / vpet / gam4980(步步高)
+│   ├── system/              # L2 系统层: os 内核(kernel+services) / input / engine_manager / app_board / bbk_boot
+│   ├── services/            # L1 服务层: svc_* · wifi · bt_ctl · usb_hid/bt/net/msc · audio/tone · net_client · hw_cfg
+│   ├── ui/                  # L1 UI 层: ui_common · fonts · kbd_lib · virtual_keys · wallpapers
+│   ├── drivers/             # L0 驱动层: st7305(LCD) · touch_panel · sd_scan · board_pins · board_battery · gps · espsdr
+│   ├── libs/                # L0 库: calc · lua
+│   └── tools/               # 自检 self_test
+├── docs/                    # 架构/约定/板型 IO/地图/频谱仪 等文档
+├── apps/ store/             # Lua 应用源 + 商店索引（index.json / pkgs）
 ├── system_image/            # BBK 词典系统 ROM
-├── tools/                   # 图标 / 字库生成脚本、日志工具
-├── docs/                    # 交接 / 架构文档
-├── CHANGELOG.md             # 版本更新日志
-├── sdkconfig.defaults       # 构建配置
-├── partitions.csv           # 分区表
-├── build.sh                 # 一键构建
-├── merge_flash.sh           # 合并 16MB 镜像
-└── pack_firmware.sh         # 固件打包
+├── tools/                   # 图标 / 字库 / 商店索引 / 抓屏 等脚本
+├── dist/                    # 产物: LinTOS_16mb.bin（唯一固件）/ merged_16mb.bin
+├── partitions.csv           # 分区表（唯一真相源）
+├── build.sh                 # 一键构建（生成内置商店索引 → fullclean → build → 合并 16MB）
+└── merge_flash.sh           # 合并 16MB 镜像（含 apps SPIFFS 区）
 ```
 
 ---

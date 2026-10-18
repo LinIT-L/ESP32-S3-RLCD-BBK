@@ -51,9 +51,11 @@ static uint32_t crc32_upd(uint32_t crc, const uint8_t *p, size_t n) {
     return ~crc;
 }
 
-/* ★ 搬运缓冲必须**内部 RAM**: 写 SPIFFS 时 flash 驱动会关 Flash+PSRAM cache,
- *   那个窗口里读 PSRAM 源缓冲会取到垃圾 (商店那套踩过, 见 am_store_net.c 文件头③)。 */
-static char s_chunk[8192];
+/* ★ 落盘搬运缓冲: 必须**内部 RAM** (写 SPIFFS 时 flash 驱动会关 Flash+PSRAM cache,
+ *   那个窗口里读 PSRAM 源缓冲会取到垃圾 —— 商店那套踩过, 见 am_store_net.c 文件头③)。
+ *   改为**按需分配**: 只在"下载落盘"时 malloc、任务结束即 free ⇒ 平时不占这 8KB。
+ *   (原来 static char s_chunk[8192] 是常驻内部 BSS, 不用也占。) */
+#define NETC_CHUNK  8192
 
 static const char *DEFAULT_UA = "LinTOS/1.0 (ESP32-S3)";
 
@@ -75,8 +77,14 @@ static void netc_task(void *arg) {
     };
     int total = 0, status = 0, clen = -1;
     esp_err_t e = ESP_OK;
-    FILE *fp = NULL;
+    /* 落盘才需要 8KB 搬运缓冲 —— 按需分配内部 RAM, 用完即释放 (不下载就不占) */
+    char *chunk = NULL;
     if (s_path[0]) {
+        chunk = heap_caps_malloc(NETC_CHUNK, MALLOC_CAP_INTERNAL);
+        if (!chunk) { ESP_LOGW(TAG, "内部RAM不足, 无法分配 %dKB 落盘缓冲", NETC_CHUNK / 1024); e = ESP_FAIL; }
+    }
+    FILE *fp = NULL;
+    if (e == ESP_OK && s_path[0]) {
         fp = fopen(s_path, "wb");
         if (!fp) { ESP_LOGW(TAG, "打不开落盘文件 %s", s_path); e = ESP_FAIL; }
     }
@@ -93,14 +101,14 @@ static void netc_task(void *arg) {
             for (;;) {
                 if (s_cancel) { e = ESP_ERR_INVALID_STATE; break; }
                 if (fp) {
-                    int n = esp_http_client_read(cl, s_chunk, sizeof(s_chunk));
+                    int n = esp_http_client_read(cl, chunk, NETC_CHUNK);
                     if (n <= 0) break;
-                    if (fwrite(s_chunk, 1, (size_t)n, fp) != (size_t)n) {
+                    if (fwrite(chunk, 1, (size_t)n, fp) != (size_t)n) {
                         ESP_LOGW(TAG, "写文件失败 %s (卡满?)", s_path);
                         e = ESP_FAIL;
                         break;
                     }
-                    if (s_want_crc) s_crc = crc32_upd(s_crc, (const uint8_t *)s_chunk, (size_t)n);
+                    if (s_want_crc) s_crc = crc32_upd(s_crc, (const uint8_t *)chunk, (size_t)n);
                     total += n;
                     s_got = total;
                 } else {
@@ -140,6 +148,7 @@ static void netc_task(void *arg) {
     s_len = total; s_http = status; s_err = (int)e;
     __sync_synchronize();                     /* 先写完数据再放状态 */
     s_state = (e == ESP_OK) ? NETC_DONE : NETC_ERR;
+    if (chunk) free(chunk);                   /* 释放落盘缓冲 (下不再常驻内部 RAM) */
     vTaskDelete(NULL);
 }
 

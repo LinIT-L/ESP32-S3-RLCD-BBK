@@ -118,6 +118,40 @@ static sd_mnt_state_t s_mnt_state = SD_MNT_UNKNOWN;
 static char           s_cid_name[12] = "";
 
 const char *sd_get_cid_name(void) { return s_cid_name[0] ? s_cid_name : "-"; }
+
+/* ★ 2026-10-18: 品牌 + 真实容量 (替代"把 CID 型号名当容量显示")。
+ *   CID 的 `name[8]` 是**出厂型号名**，不是容量 —— 实测 3834MB 的卡上印的是 "SD16G"，
+ *   用户看到就以为容量显示错了。品牌取 CID 的 MID (SD-3C 厂商号)。
+ *   MID 表按多家实测统计 (SD-3C 不公开官方表)：Linux `mmc` 打印 / cameramemoryspeed /
+ *   bahjeez 微 SD 普查 三处交叉一致。⛔ 常见误传: 0x28 不是 Kingston 而是 **Lexar(旧)**，
+ *   Kingston 是 0x41；0x27 是 **Phison 代工**（Lexar/PNY/Verbatim/Delkin 等贴牌）。 */
+const char *sd_get_vendor_str(void)
+{
+    if (!s_card) return "-";
+    switch (s_card->cid.mfg_id) {
+        case 0x01: return "Panasonic";
+        case 0x02: return "Toshiba";     /* 现 Kioxia */
+        case 0x03: return "SanDisk";
+        case 0x09: return "ATP";
+        case 0x1B: return "Samsung";
+        case 0x1D: return "ADATA";
+        case 0x27: return "Phison";      /* 代工厂: Lexar/PNY/Verbatim/Delkin… */
+        case 0x28: return "Lexar";
+        case 0x31: return "SiliconPower";
+        case 0x41: return "Kingston";
+        case 0x6F: return "Netac";       /* 也供 HP/Kodak/Hiksemi 等 */
+        case 0x74: return "Transcend";
+        case 0xAD: return "Longsys";     /* 新 Lexar / Amazon Basics / RPi */
+        case 0xFE: return "杂牌";        /* 白牌/贴牌常见 */
+        default:   return "未知";
+    }
+}
+
+uint64_t sd_get_size_bytes(void)
+{
+    if (!s_card) return 0;
+    return (uint64_t)s_card->csd.capacity * 512ULL;   /* capacity 单位 = 512B 扇区 */
+}
 sd_mnt_state_t sd_get_mnt_state(void) { return s_mnt_state; }
 const char *sd_get_mnt_state_str(void)
 {
@@ -167,6 +201,13 @@ static void sd_probe_permutations(void)
         }
         ESP_LOGD(TAG, "   SD 排列自检 [%d/6] ✗ CLK=%d CMD=%d D0=%d", n, pins[i], pins[j], pins[k]);
     }
+    /* ★★★ 2026-10-18 真机 bug: 6 种排列全失败时主机**停在已初始化状态** ⇒ 紧接着的
+     *   sd_probe_pins() 里 sdmmc_host_init() 变成空操作("already initialized"),
+     *   init_slot 沿用上一组脚的时钟配置 → set_card_clk 返回 0x107 → 1 秒超时后判"没有卡"。
+     *   ⇒ 而 sd_quick_probe 的兜底排列又**跳过了固件里那组正确顺序**(以为"上面已试过")
+     *   ⇒ 结果: **正确接法从来没被真正测过一次**，卡插着也报"未检测到 TF 卡"。
+     *   修法: 无论成败, 退出前一律 deinit, 保证后面拿到的是干净主机。 */
+    sdmmc_host_deinit();
     ESP_LOGD(TAG, "★★ SD 排列自检: 6 种排列全部失败 ⇒ 卡未插/接触不良/焊接");
 }
 
@@ -276,6 +317,9 @@ static esp_err_t sd_probe_pins(int clk, int cmd, int d0) {
     slot.cd = -1; slot.wp = -1; slot.flags = 0;
 
     esp_err_t r = ESP_FAIL;
+    /* ★ 2026-10-18: 进函数先 deinit。sdmmc_host_init() 在"已初始化"时是**空操作**,
+     *   会拿上一组脚的 slot 配置继续用（排列自检失败后就是这种状态）⇒ 必然 0x107。 */
+    sdmmc_host_deinit();
     if (sdmmc_host_init() != ESP_OK) return ESP_FAIL;
     if (sdmmc_host_init_slot(SDMMC_HOST_SLOT_1, &slot) == ESP_OK) {
         sdmmc_card_t *card = heap_caps_malloc(sizeof(sdmmc_card_t), MALLOC_CAP_INTERNAL);
@@ -510,15 +554,15 @@ esp_err_t sd_mount(void) {
     }
 
     /* 走到这里说明**卡是被识别到的**, 只是挂载失败 —— 这才是真该报的错误。
-     * (没插卡的情况已经在 sd_quick_probe() 那一步安静返回了。) */
-    ESP_LOGD(TAG, "=== sd_mount 全部 %d 次尝试都失败 ===", retry_count);
-    ESP_LOGD(TAG, "  卡已被识别但挂载失败 ⇒ 不是没插卡, 可能是:");
-    ESP_LOGD(TAG, "    - 文件系统不识别 (要 FAT32; 固件不支持 exFAT)");
-    ESP_LOGD(TAG, "    - 卡损坏 / 需要重新格式化");
-    ESP_LOGD(TAG, "  建议: 进菜单 → TF卡 → 格式化TF卡");
+     * (没插卡的情况已经在 sd_quick_probe() 那一步安静返回了。)
+     * ★ 2026-10-18: 这几行原来是 LOGD(默认看不见) ⇒ 用户只看到"未检测到 TF 卡",
+     *   分不清"没卡"和"卡在但文件系统不认"。改 LOGW, 并返回**独立错误码**。 */
+    ESP_LOGW(TAG, "=== sd_mount 全部 %d 次尝试都失败 (卡已被识别, 不是没插卡) ===", retry_count);
     /* 2026-09-29: 探测失败原因 (无卡 / exFAT / 无文件系统) 供 UI 显示 */
     sd_probe_fail_reason();
-    return ESP_FAIL;
+    ESP_LOGW(TAG, "  判定: %s", sd_get_mnt_state_str());
+    ESP_LOGW(TAG, "  处理: 菜单 → 存储 → 格式化TF卡 (固件只支持 FAT32, 不支持 exFAT)");
+    return ESP_ERR_INVALID_STATE;   /* ≠ ESP_FAIL: 让上层区分"卡在但挂不上" */
 }
 
 /* 卸载 SD 卡 (SDMMC 模式)

@@ -51,11 +51,11 @@ static gps_power_state_t  s_state = GPS_POWER_UNKNOWN;
  *    **留给以后上 32.768kHz 晶振做 RTC 低功耗时钟**，所以不用它；
  *    8 是纯普通 IO(TOUCH8 / ADC1_CH7 / SUBSPICS1，没有第二身份)，拿来当输入最省事。
  *    (备选 GPIO9; 若以后要撤, 把下面改回 -1 即可。) */
-static const gps_config_t k_default_cfg = {
+static gps_config_t s_default_cfg = {
     .uart_num    = UART_NUM_1,   /* console 是 USB-Serial-JTAG, UART0/1 都空; 用 1 避开 ROM 默认口 */
     .pin_tx      = 43,           /* 模块脚 37 (TXD0) */
     .pin_rx      = 44,           /* 模块脚 36 (RXD0) */
-        .pin_extint  = BOARD_IS_WEIXUE ? 47 : 18,   /* ★按板型: 微雪=47, 小智=18(linit 指定) */
+    .pin_extint  = 18,           /* 由板型表覆盖, 见 default_cfg_bound() */
     /* ★ 2026-10-09: 921600 → **9600**。
      * 原因: 开机时 app_board 就把模块送进 `UBX-RXM-PMREQ(backup)`, 而 backup 模式
      * **不保留接收机配置** —— 唤醒后模块回到 u-blox 出厂默认 **9600 波特率**。
@@ -67,7 +67,22 @@ static const gps_config_t k_default_cfg = {
     .drive_extint = false,       /* 默认不驱动 EXTINT: 极性未确认, 悬空/误电平会自己叫醒模块 */
 };
 
-const gps_config_t *gps_default_config(void) { return &k_default_cfg; }
+static bool s_default_bound = false;
+
+/* ★ 2026-10-18: 引脚一律按**板型表运行时**下发（小智 43/44/18 · 微雪/标准扩展 43/44/47）。
+ *   原来是 `BOARD_IS_WEIXUE ? 47 : 18` 的编译期常量 ⇒ 一个固件换板后 GPS 引脚不会变，
+ *   在微雪板上等于把 EXTINT 接到小智的 18 号脚。 */
+static const gps_config_t *default_cfg_bound(void) {
+    if (!s_default_bound) {
+        const board_pins_t *bp = board_pins_get();
+        s_default_cfg.pin_tx     = bp->gps_tx;
+        s_default_cfg.pin_rx     = bp->gps_rx;
+        s_default_cfg.pin_extint = bp->gps_extint;
+        s_default_bound = true;
+    }
+    return &s_default_cfg;
+}
+const gps_config_t *gps_default_config(void) { return default_cfg_bound(); }
 bool gps_is_ready(void) { return s_ready; }
 gps_power_state_t gps_power_state(void) { return s_state; }
 
@@ -134,7 +149,7 @@ static uint32_t gps_autobaud(void)
 
 esp_err_t gps_init(const gps_config_t *cfg)
 {
-    s_cfg = cfg ? *cfg : k_default_cfg;
+    s_cfg = cfg ? *cfg : *default_cfg_bound();
 
     esp_err_t e = uart_driver_install(s_cfg.uart_num, GPS_RX_BUF, GPS_TX_BUF, 0, NULL, 0);
     if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {

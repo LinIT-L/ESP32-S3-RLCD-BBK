@@ -54,7 +54,10 @@ typedef enum { VIB_NONE = 0, VIB_TM6604 = 1 } vib_mode_t;
  *      拿 LEDC 去驱动会把电量采样搅成垃圾。
  * ⚠ 原 GPIO42 让给了 LCD 片选(42 同样在 24 个可用脚里 ✓)。 */
 #include "board_pins.h"
-#define VIB_PWM_PIN   ((gpio_num_t)(BOARD_IS_WEIXUE ? 48 : 8))   /* ★按板型: 微雪=48, 小智=8 */
+/* ★★ 2026-10-18: 震动脚改成**运行时**从板型表取（小智=8 / 微雪=48 / 标准扩展=48）。
+ *   原来是 `BOARD_IS_WEIXUE ? 48 : 8` —— 编译期常量，一个固件通吃三块板时
+ *   换板不会变 ⇒ 微雪板上拿 GPIO8（= 微雪的 I2S DOUT）去斩 PWM，音频直接废。 */
+static gpio_num_t s_vib_pin = GPIO_NUM_NC;
 #define VIB_TIMER     LEDC_TIMER_1
 #define VIB_CHANNEL   LEDC_CHANNEL_1
 #define VIB_RES       LEDC_TIMER_8_BIT
@@ -85,14 +88,14 @@ static volatile bool s_music_on;
  *   新板震动电源默认常开 + GPIO42 归了屏 CS ⇒ EN 与 PWM 合并到 GPIO48 一根线,
  *   drv_enable()/VIB_EN_PIN 整条删掉 (停止震动 = duty 归 0)。 */
 static bool ledc_init(void) {
-    gpio_reset_pin(VIB_PWM_PIN);
+    gpio_reset_pin(s_vib_pin);
     ledc_timer_config_t tc = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = VIB_TIMER,
         .duty_resolution = VIB_RES, .freq_hz = VIB_RES_FREQ, .clk_cfg = LEDC_AUTO_CLK,
     };
     if (ledc_timer_config(&tc) != ESP_OK) return false;
     ledc_channel_config_t ch = {
-        .gpio_num = VIB_PWM_PIN, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = VIB_CHANNEL,
+        .gpio_num = s_vib_pin, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = VIB_CHANNEL,
         .timer_sel = VIB_TIMER, .duty = 0, .hpoint = 0,
     };
     if (ledc_channel_config(&ch) != ESP_OK) return false;
@@ -114,12 +117,12 @@ static void out_set(uint8_t strength01) {   /* strength 0..100 */
      *   会被**冻结在当前电平** ⇒ LEDC 写 duty 一切正常但**引脚不再变化** ——
      *   与实测现象完全一致("开机前几秒能震, 之后彻底没反馈")。
      *   ⇒ 每次输出前**显式解冻** GPIO8, 确保 LEDC 能真正驱动它。 */
-    gpio_hold_dis(VIB_PWM_PIN);
+    gpio_hold_dis(s_vib_pin);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
     esp_rom_delay_us(300);                       /* 保证下降沿被芯片看到 */
-    esp_err_t r1 = ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, duty);
-    esp_err_t r2 = ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
 }
 static void out_off(void) {
     if (s_mode == VIB_NONE) return;
@@ -133,15 +136,21 @@ static void tap_timer_cb(TimerHandle_t t) { (void)t; out_off(); }
 /* ================= 对外接口 ================= */
 void vibrator_init(void) {
     if (s_mode != VIB_NONE) return;
+    /* ★ 每次 init 都按当前板型表取脚（换板后 hw_cfg 已把表切好） */
+    s_vib_pin = (gpio_num_t)board_pins_get()->vib;
+    if ((int)s_vib_pin < 0) {
+        ESP_LOGW(TAG, "本板无震动脚 (板型表 vib=-1), 震动不可用");
+        return;
+    }
     if (!ledc_init()) {
-        ESP_LOGD(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)VIB_PWM_PIN);
+        ESP_LOGD(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)s_vib_pin);
         return;
     }
     s_mode = VIB_TM6604;
     s_tap_timer = xTimerCreate("vib_tap", pdMS_TO_TICKS(50), pdFALSE, NULL, tap_timer_cb);
     s_pat_timer = xTimerCreate("vib_pat", pdMS_TO_TICKS(50), pdFALSE, NULL, pat_timer_cb);
     ESP_LOGI(TAG, "震动驱动就绪: PWM=GPIO%d (%dHz), 电源默认常开 (无 EN 脚)",
-             (int)VIB_PWM_PIN, VIB_RES_FREQ);
+             (int)s_vib_pin, VIB_RES_FREQ);
 
     /* ★ 2026-10-13 (linit 要求「开机震动可以保留」):
      *   以前开机那一下是 **GPIO8 浮空被误触发**(时长/强度都不可控);

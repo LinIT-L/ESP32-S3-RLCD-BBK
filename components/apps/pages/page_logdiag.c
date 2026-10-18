@@ -235,7 +235,7 @@ static const ld_card_t s_cards[6] = {
       "\xe7\xa8\x8b\xe5\xba\x8f\xe5\xb4\xa9\xe6\xba\x83\xe8\xae\xb0\xe5\xbd\x95",           /* 程序崩溃记录 */
       s_c_log, LOG_N, s_d_log, 0 },
     { "\xe7\xbd\x91\xe7\xbb\x9c\xe9\x85\x8d\xe7\xbd\xae",           /* 网络配置 */
-      "IP\xc2\xb7DNS\xc2\xb7\xe8\xb7\xaf\xe7\x94\xb1",                                                        /* IP·DNS·路由 */
+      "IP\xc2\xb7" "DNS\xc2\xb7\xe8\xb7\xaf\xe7\x94\xb1",                                                        /* IP·DNS·路由 */
       "\xe7\xab\xaf\xe5\x8f\xa3\xc2\xb7\xe4\xbb\xa3\xe7\x90\x86",                                            /* 端口·代理 */
       "\xe9\x98\xb2\xe7\x81\xab\xe5\xa2\x99\xc2\xb7\xe5\x85\xb1\xe4\xba\xab",                                /* 防火墙·共享 */
       s_c_net, NET_N, s_d_net, 0 },

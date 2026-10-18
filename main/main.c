@@ -44,6 +44,7 @@ void settings_apply_dark(st7305_handle_t *lcd);
 #include "board_rlcd.h"   /* board_shim_set_lcd: 绑定主屏, 供 NES/GBC/文曲星/ArduBoy 引擎使用 */
 #include "usb_bt.h"        /* usb_bt_is_active / usb_bt_start */
 #include "usb_net.h"       /* usb_net_is_active / usb_net_start */
+#include "espsdr.h"        /* espsdr_reclaim_boot: 频谱仪禁用则回收 64KB 采集区 */
 #include "remcon.h"        /* 串口远程控制台 (远程自动化测试/排障) */
 #include "tone_player.h"   /* V1.0.68: 方波直驱音调播放器 (开机音/按键音) */
 #include "engine_manager.h" /* V1.0.98: 主菜单定时复核引擎残留 (unload_all 幂等) */
@@ -296,7 +297,10 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
     /* 补等 Logo 显示时长 (仅硬上电; 软开机直接进桌面, 不等) */
     if (!s_soft_boot) {
         while ((uint32_t)(esp_timer_get_time() / 1000 - t_logo_ms) < LOGO_HOLD_MS) {
-            if (gpio_get_level(BTN_GPIO_A) == 0) break;
+            /* ★ 2026-10-18: 按当前板型表的确认键判断（原 BTN_GPIO_A 是编译期 GPIO4，
+             *   微雪板上该脚是电池 ADC、确认键在 18 ⇒ 换板后"按键跳过 Logo"失效）。 */
+            int a_pin = board_pins_get()->btn_left;
+            if (a_pin >= 0 && gpio_get_level((gpio_num_t)a_pin) == 0) break;
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -426,6 +430,11 @@ void app_main(void)
           nvs_flash_erase(); nvs_flash_init();
       } }
     hw_cfg_init();
+
+    /* ★ 频谱仪 64KB 采集区回收: 必须在堆分配铺开之前一次性决定 (无 remove_region,
+     *   只能开机按 NVS 决定)。禁用/无触摸 ⇒ heap_caps_add_region 加回内部堆 (+64KB)。
+     *   touch_ok: 微雪原版无触摸屏 → 频谱仪全触屏操作没法用 → 强制回收。 */
+    espsdr_reclaim_boot(hw_cfg_detected(HW_TOUCH));
 
     esp_err_t ret = app_board_init(&board);
 

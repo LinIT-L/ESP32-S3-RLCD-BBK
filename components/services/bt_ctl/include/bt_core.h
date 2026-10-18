@@ -56,6 +56,11 @@ bool bt_core_connect(const esp_hid_scan_result_t *r);
  * 用于 BLE 地址会漂移的手柄(历史里的旧地址直连必失败)。调用前须确保无其他扫描在跑。 */
 bool bt_core_connect_by_name(const char *name);
 void bt_core_disconnect(void);
+
+/* ★ 2026-10-18: 主动取消一个"悬着的"连接（失败/超时后必须调，否则下次 open 必失败）。
+ *   - 若已有 dev 句柄 → close 掉；
+ *   - 再对 bda 发一次 GAP disconnect，撤掉 Bluedroid 侧 pending create-conn / 半开链路。 */
+void bt_core_cancel_pending(const uint8_t bd_addr[6]);
 /* 删除指定对端地址的 BLE 绑定: 手柄地址漂移(同名不同址)时清掉残留旧绑定, 让双方干净重配对 */
 bool bt_core_remove_bond(const uint8_t bd_addr[6]);
 

@@ -48,8 +48,20 @@ static void open_sd_info(ui_ctx_t *ctx) {
     static const char *ptrs[6];
     int n = 0;
     uint64_t total = 0, free = 0;
-    /* 卡名 (CID, 出厂固化): 换卡/认不到卡时一眼看清是哪张卡 (2026-09-29) */
-    snprintf(items[n++], sizeof(items[0]), "\xe5\x8d\xa1: %s", sd_get_cid_name());   /* 卡: xxx */
+    /* ★ 2026-10-18: 第一行原来是 CID 型号名(\"SD16G\"), 用户会当成容量 —— 那是出厂型号, 不是容量。
+     *   现在显示 **品牌 + 标称容量**(按字节换十进制 GB 四舍五入: 3834MB→4G / 14.8GiB→16G),
+     *   型号另起一行明确标注, 换卡时仍能一眼分辨是哪张。 */
+    uint64_t cap_bytes = sd_get_size_bytes();
+    if (cap_bytes > 0) {
+        uint32_t nominal_g = (uint32_t)((cap_bytes + 500000000ULL) / 1000000000ULL);
+        if (nominal_g == 0) nominal_g = 1;
+        snprintf(items[n++], sizeof(items[0]), "\xe5\x8d\xa1: %s %uG",      /* 卡: 品牌 XG */
+                 sd_get_vendor_str(), (unsigned)nominal_g);
+        snprintf(items[n++], sizeof(items[0]), "\xe5\x87\xba\xe5\x8e\x82\xe5\x90\x8d: %s", /* 出厂名: xxx */
+                 sd_get_cid_name());
+    } else {
+        snprintf(items[n++], sizeof(items[0]), "\xe5\x8d\xa1: %s", sd_get_cid_name());   /* 卡: xxx */
+    }
     if (sd_get_info(&total, &free) == 0) {
         uint32_t total_mb = (uint32_t)(total / (1024ULL * 1024ULL));
         uint32_t free_mb  = (uint32_t)(free  / (1024ULL * 1024ULL));

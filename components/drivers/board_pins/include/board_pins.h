@@ -17,10 +17,11 @@
 #include "soc/gpio_num.h"
 #include "driver/gpio.h"
 
-/* ---------------- 板型 ---------------- */
+/* ---------------- 板型（三档，官方命名） ---------------- */
 typedef enum {
-    BOARD_ID_XIAOZHI = 0,   /* 小智 ESP32-S3-AI-2E 模块 + 新载板 */
-    BOARD_ID_WEIXUE  = 1,   /* 微雪官方 ESP32-S3-RLCD-4.2 原板 (无触摸) */
+    BOARD_ID_XIAOZHI = 0,   /* ① 小智一体版: ESP32-S3-AI-2E 模块（自带充电/降压/功放/解码/麦克风） */
+    BOARD_ID_WEIXUE  = 1,   /* ② 微雪原版: ESP32-S3-RLCD-4.2（无触摸） */
+    BOARD_ID_STD     = 2,   /* ③ 标准扩展版: 官方标准模块 + 按需扩展（触摸/充电/功放自行加） */
     BOARD_ID_UNKNOWN = -1,
 } board_id_t;
 
@@ -36,6 +37,8 @@ typedef struct {
     int bat_adc_chan;                                    /* 电池 ADC 通道号 (ADC1) */
     int i2s_mclk, i2s_bclk, i2s_ws, i2s_dout, i2s_din;   /* 音频 I2S */
     int codec_sda, codec_scl, pa_pin;                    /* 编解码器 I2C + 功放使能 */
+    int vib;                                             /* 震动马达 PWM (-1 = 无) */
+    int gps_tx, gps_rx, gps_extint;                       /* GPS (可选; -1 = 未接) */
     /* SD/TF: 0 = SDMMC(1-bit, 小智) · 1 = SPI(微雪)。上层挂载后都是 /sdcard (FAT),
      * 应用代码不受影响, 只有驱动初始化这条路不同。 */
     int sd_bus;                                          /* 0=SDMMC 1=SPI */
@@ -49,26 +52,16 @@ void board_pins_set_id(board_id_t id);   /* ★运行时选板(hw_cfg 探测后�
 const board_pins_t *board_pins_of(board_id_t id);      /* 指定板型的表 (只读; 未知返回默认) */
 bool board_pins_select(board_id_t id);                 /* 设当前板型, 返回是否发生变化 */
 
-/* 开机识别板型 (I2C 器件指纹):
- *   ① 先做 NVS 缓存的**轻量校验** (缓存那块板的指纹还在不在) → 在就直接用
- *   ② 否则探"默认板型自己的 I2C" → 有自家器件即定板 (常规场景不碰另一组脚)
- *   ③ 都没有 → 探另一组 → 命中即定板
- *   ④ 全无应答 → NVS 上次值 → 再不行默认板型
- * ★ 必须在**任何外设初始化之前**调用; 只在 I2C 上扫描, 探完立即释放总线。 */
-/* 板型识别已删除 (linit 2026-10-16): 不再扫描 I2C、不写 NVS, 用 BOARD_IS_WEIXUE 选板。
- * 下面两个声明保留为空壳以便老调用点编译。 */
-board_id_t board_identify(void);
-
-void board_pins_save(void);   /* 空实现(保留兼容) */
+/* 板型识别**不在本组件**：由 `services/hw_cfg` 开机探 I2C 指纹后调 `board_pins_set_id()`。
+ * 本组件只负责「三张引脚表 + 运行时当前表」，不含任何探测/NVS 逻辑（避免两处各存一份板型）。 */
 
 /* 深睡唤醒掩码: PWR + LEFT (⛔ 故意不含 RIGHT/GPIO0 —— strapping 脚电平保不住会误唤醒) */
 uint64_t board_wake_mask(void);
 
 /* ---------------- 兼容宏: 只作"默认板型的编译期缺省" ----------------
- * ⚠ 运行时一律用 board_pins_get()->xxx; 这些宏仅在没有表上下文的地方兜底。 */
-/* ★★★ 2026-10-16 linit: **删除板型识别**, 回到最简单方式 —— 编译期选一块板。
- *   换板 = 改这一行 + 重编 (与 v1.3 一样直观, 不扫描 I2C、不写 NVS)。 */
-/* 选板: 0=小智  1=微雪  2=自制(仿微雪, 暂同微雪) */
+ * ⚠ 运行时一律用 board_pins_get()->xxx; 这些宏仅在没有表上下文的地方兜底。
+ * ⛔ 任何"按板型分支"的逻辑都不许写成 `BOARD_IS_WEIXUE ? A : B` —— 那是编译期常量,
+ *   运行时换板不会变（震动/触摸/GPS 都踩过）。要在运行期判，就取 `board_pins_get()`。 */
 /* ★★★ 逐项外设开关(排查屏冲突用): 1=启用, 0=不启动。
  *   用法: 一次只把一个改回 1, 烧录后看屏还亮不亮 ⇒ 亮=它不冲突, 黑=它就是冲突源。
  *   ⛔ 排查完**全部改回 1**(即恢复正常全功能)。 */
