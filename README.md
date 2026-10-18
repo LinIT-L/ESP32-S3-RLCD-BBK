@@ -1,11 +1,11 @@
 # ESP32-S3-RLCD-BBK
 
-本项目是一款提供几个复古游戏引擎与运维工具的 ESP32-S3 固件，硬件上支持 DIY 的 ESP32 拼音学习机与微雪 ESP32-S3-RLCD-4.2 开发板。
+本项目是一款提供一部分不同复古游戏引擎与运维工具的 ESP32-S3 固件，硬件上支持 DIY 的 ESP32 拼音学习机与微雪 ESP32-S3-RLCD-4.2 开发板。
 
 ## 隐藏功能
 
-- 显示 GB / GBC / NES / ArduBoy 图标：设置 →「请作者喝杯水」→ 赞助图连按确认 5 次
-- 音频方案 / 禁用触摸：设置 → 系统信息 →「BY: LinIT」连点 5 次
+- 在设置里面 →「请作者喝杯水」→ 赞助图连按确认 5 次 即启用 GB / GBC / NES / ArduBoy /应用中心，等应用。
+
 
 [![在线刷机](https://bbk.linit.cn/fw/card.svg)](https://bbk.linit.cn/fw/flash.html)
 
