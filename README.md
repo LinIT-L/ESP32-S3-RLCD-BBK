@@ -59,19 +59,19 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 
 <sub>微雪 ESP32-S3-RLCD-4.2 正面</sub>
 
-<img src="images/微雪ESP32-S3-RLCD-4.2正面图片.jpeg" width="660" alt="微雪正面">
+<img src="images/微雪ESP32-S3-RLCD-4.2正面图片.jpeg" width="500" alt="微雪正面">
 
 <sub>DIY 拼音学习机 正面</sub>
 
-<img src="images/拼音学习机正面图.jpeg" width="660" alt="拼音学习机正面">
+<img src="images/拼音学习机正面图.jpeg" width="500" alt="拼音学习机正面">
 
 <sub>内部布局</sub>
 
-<img src="images/内部布局图.jpeg" width="660" alt="内部布局">
+<img src="images/内部布局图.jpeg" width="500" alt="内部布局">
 
 <sub>主板测试点定义</sub>
 
-<img src="images/测试点定义图.jpg" width="660" alt="测试点定义">
+<img src="images/测试点定义图.jpg" width="500" alt="测试点定义">
 
 ## 打板与采购
 
