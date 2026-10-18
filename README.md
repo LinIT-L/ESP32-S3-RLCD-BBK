@@ -100,14 +100,6 @@ system_image/ BBK 词典 ROM
 tools/        图标、字库、商店索引、抓屏脚本
 ```
 
-## 构建
-
-ESP-IDF v5.5.x：
-
-```bash
-./build.sh
-```
-
 ## 烧录
 
 ```bash
