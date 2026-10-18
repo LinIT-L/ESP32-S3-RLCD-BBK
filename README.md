@@ -20,6 +20,12 @@
 
 ## 演示
 
+<sub>手持实机演示（12 fps）</sub>
+
+<img src="images/demo/handheld.webp" width="360" alt="手持演示">
+
+原片：[MP4](images/demo/handheld.mp4)（600 宽 · 2 MB）
+
 <sub>真机操作：主菜单 → 应用中心 → 商店</sub>
 
 <img src="images/demo/ui-tour.gif" width="360" alt="操作演示">
@@ -31,8 +37,6 @@
 <sub>BBK 词典运行游戏</sub>
 
 <img src="images/demo/bbk-game.png" width="360" alt="三国坛说">
-
-手持演示视频：[MP4](images/demo/handheld.mp4)（600 宽，2 MB）· [GIF](images/demo/handheld.gif)（5.6 MB）
 
 ## 操作
 
@@ -80,10 +84,6 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 <sub>DIY 拼音学习机 正面</sub>
 
 <img src="images/拼音学习机正面图.jpeg" width="500" alt="拼音学习机正面">
-
-<sub>内部布局</sub>
-
-<img src="images/内部布局图.jpeg" width="500" alt="内部布局">
 
 <sub>主板测试点定义</sub>
 
