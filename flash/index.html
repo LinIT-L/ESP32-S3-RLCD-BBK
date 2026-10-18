@@ -33,7 +33,8 @@
 <div class="wrap">
   <div class="card">
     <div class="title">LinTOS 固件刷写 <span class="ver">v1.4.1</span></div>
-    <label><input type="radio" name="src" value="github" checked> GitHub 固件（推荐）</label>
+    <label><input type="radio" name="src" value="site" checked> BBK.LinIT.cn（推荐）</label>
+    <label><input type="radio" name="src" value="github"> GitHub 固件</label>
     <select id="verSel"><option value="latest">最新版（加载中…）</option></select>
     <label><input type="radio" name="src" value="local"> 本地文件</label>
     <input type="file" id="fileInput" accept=".bin" hidden>
@@ -196,22 +197,29 @@ async function latestTag() {
 async function downloadFirmware() {
   const status = $('status');
   const src = document.querySelector('input[name="src"]:checked').value;
-  if (src === 'github') {
+  if (src === 'site' || src === 'github') {
     const ver = $('verSel').value || 'latest';
     const verLabel = (ver === 'latest') ? '最新版' : ver;
     let r = null;
     status.textContent = '正在解析 ' + verLabel + ' 固件地址…';
     const tag = (ver === 'latest') ? await latestTag() : ver;
-    const urls = [ FW_SITE_BASE + 'LinTOS-' + String(tag).replace(/^v/, 'v') + '-16MB.bin' ];
-    const assetUrl = await releaseBinUrl(ver);
-    if (assetUrl) urls.push(assetUrl);
-    if (ver === 'latest') { for (const u of FW_URLS) urls.push(u); }
+    /* ★★ 2026-10-18: **两个源都必须能用**
+     *   · 本站: bbk.linit.cn/fw/ 已加 CORS, 按 tag 命名文件, 支持任选版本;
+     *   · GitHub: Release 附件域 **没有 CORS 头**, 浏览器 fetch 必然失败 ⇒
+     *     改走**仓库内的 flash/merged_16mb.bin**(raw 与 jsDelivr 都带 CORS), 固定最新版。 */
+    let urls = [];
+    if (src === 'site') {
+      urls = [ FW_SITE_BASE + 'LinTOS-' + String(tag).replace(/^v/, 'v') + '-16MB.bin' ];
+    } else {
+      urls = [ 'https://raw.githubusercontent.com/' + REPO + '/main/flash/merged_16mb.bin',
+               'https://cdn.jsdelivr.net/gh/' + REPO + '@main/flash/merged_16mb.bin' ];
+    }
     for (const u of urls) {
       status.textContent = '正在下载 ' + verLabel + ' 固件…';
       try { r = await fetch(u); if (r && r.ok) break; } catch (e) { r = null; }
     }
     if (!r || !r.ok) throw new Error(verLabel + ' 固件下载失败, 请检查网络后重试');
-    $('fwInfo').textContent = 'GitHub 固件 · ' + verLabel + ' · 16MB';
+    $('fwInfo').textContent = (src === 'site' ? 'BBK.LinIT.cn' : 'GitHub') + ' · ' + verLabel + ' · 16MB';
     const total = Number(r.headers.get('Content-Length')) || 0;
     const reader = r.body.getReader();
     const chunks = [];
