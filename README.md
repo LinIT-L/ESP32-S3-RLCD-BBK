@@ -93,17 +93,6 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 
 <img src="https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/qq-group.png?raw=true" width="120" height="120" alt="QQ 群">
 
-## 烧录
-
-```bash
-python -m esptool --chip esp32s3 -b 460800 write_flash \
-  --flash_mode dio --flash_size 16MB --flash_freq 80m \
-  0x0 dist/merged_16mb.bin
-```
-
-- `dist/merged_16mb.bin`（完整镜像）→ `0x0`
-- `build/LinTOS.bin`（固件）→ `0x60000`
-- `build/apps_l.bin`（应用区）→ `0xC00000`
 
 ## 目录结构
 
