@@ -23,7 +23,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "driver/rtc_io.h"   /* rtc_gpio_pullup_en: RTC 域上拉(深睡期间数字域掉电, 数字上拉会失效) */
+#include "driver/rtc_io.h"
+/* ★ 深睡: 卸掉 TF 卡(待机可到 mA 级)。sd_scan 的头文件没在本组件 include 路径里 ⇒ 前置声明 */
+void sd_unmount(void);
+   /* rtc_gpio_pullup_en: RTC 域上拉(深睡期间数字域掉电, 数字上拉会失效) */
 #include "esp_attr.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
@@ -230,6 +233,12 @@ void wp_power_off(int origin)
 
     ESP_LOGI(TAG, "深睡电源域: RTC_PERIPH=ON(唤醒用), XTAL/VDDSDIO=OFF");
 
+    /* ★★★ 2026-10-18 linit: **TF 卡必须卸载** —— 否则卡在深睡期间仍保持"传输态",
+     *   待机电流可达**几 mA**(来源: "SD 卡的待机电流可能很大(几十毫安!), 进入深睡前
+     *   一定要正确卸载并切断电源")。卸载后卡进入 idle, 耗电降到 µA 级 ✓
+     *   (深睡唤醒=完整重启 ⇒ 会重新 mount ✓) */
+    sd_unmount();
+
     /* ★★★ 2026-10-18 linit: **隔离所有不用的引脚** —— 官方文档明确推荐:
      *   "Some ESP32-S3 IOs have internal pullups/pulldowns, which are enabled by default.
      *    如果外部电路驱动这些脚, 电流会经过上下拉电阻 ⇒ 增加深睡电流。
@@ -243,12 +252,21 @@ void wp_power_off(int origin)
         int papin = board_pins_get()->pa_pin;
         int niso = 0;
         for (int g = 0; g <= 48; g++) {
-            if (g == keep[0] || g == keep[1] || g == keep[2]) continue;  /* 唤醒键 */
-            if (g == gpstx || g == papin) continue;                      /* 已 hold */
-            rtc_gpio_isolate((gpio_num_t)g);
+            if (g == keep[0] || g == keep[1] || g == keep[2]) continue;  /* 唤醒键: 必须留上拉 */
+            if (g == gpstx || g == papin) continue;                      /* 已 hold 固定电平 */
+            /* ★★★ 关键(来源: "10 Things Draining Your ESP32 Battery"):
+             *   "Each enabled internal pull-up/pull-down sources current through a ~45kΩ
+             *    resistor — that's 10..50 µA PER PIN, and they stay enabled through deep
+             *    sleep unless explicitly disabled."
+             *   ⇒ **先关内部上下拉**(全部引脚, 包括非 RTC 脚) ✗ 之前只做 isolate
+             *     (rtc_gpio_isolate 只对 RTC 引脚 0~21 生效, 22~48 是空操作) ✓
+             *   ⇒ RTC 引脚再额外 isolate(切断数字域到 pad 的通路) */
+            gpio_pullup_dis((gpio_num_t)g);
+            gpio_pulldown_dis((gpio_num_t)g);
+            if (g <= 21) rtc_gpio_isolate((gpio_num_t)g);
             niso++;
         }
-        ESP_LOGI(TAG, "已隔离 %d 个引脚(唤醒键/GPS_TX/PA 除外)", niso);
+        ESP_LOGI(TAG, "已关上下拉+隔离 %d 个引脚(唤醒键/GPS_TX/PA 除外)", niso);
     }
 
     esp_deep_sleep_start();
