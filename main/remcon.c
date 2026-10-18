@@ -529,6 +529,13 @@ static void rc_cmd_immediate(const char *line){
     } else if (strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0) {
         /* 电池分压/满量程校准用: raw / 脚上 mV / 系数 / VBAT / 百分比 (日志行前缀 BATDIAG) */
         board_battery_diag();
+        /* ★ 2026-10-18 linit: 同时报**醒着/睡眠累计时长** —— 判断"到底睡没睡"的直接证据
+         *   (linit: 500mAh 12 小时耗光 ⇒ 需要看真实睡眠占比) */
+        {
+            extern void power_stat_get(void *out);
+            extern void power_stat_diag(void);
+            power_stat_diag();      /* 有则打印, 无则忽略 */
+        }
     } else if (strcmp(cmd, "tasks") == 0) {
         char *buf = (char *)malloc(4096 * 2);
         if (!buf) printf("RC_ERR tasks oom\r\n");

@@ -249,11 +249,30 @@ void wp_power_off(int origin)
         const int keep[3] = { PWR_KEY, KEY_LEFT, KEY_RIGHT };
         const gps_config_t *gc2 = gps_default_config();
         int gpstx = (gc2 && gc2->pin_tx >= 0) ? gc2->pin_tx : -1;
-        int papin = board_pins_get()->pa_pin;
+        const board_pins_t *bp = board_pins_get();
+        int papin = bp ? bp->pa_pin : -1;
+
+        /* ★★★★ 2026-10-18 linit **严重回归修复**: 之前对**所有**引脚去上下拉+隔离,
+         *   把 I2C(触摸/编解码)、屏、SD、触摸 INT/RST 这些**功能脚**也动了 ✗
+         *   ⇒ 深睡唤醒后 I2C 探测失败 ⇒ 板型识别回落到默认(小智) ⇒ 触摸失灵 + 按键错位 ✓✓
+         *   ⇒ 现在**只处理真正未使用的脚**: board_pins 里定义过的功能脚全部跳过 ✓ */
+        int fn[40]; int fn_n = 0;
+        #define KEEP_PIN(x) do { int _v=(int)(x); if (_v >= 0) fn[fn_n++ < 40 ? fn_n : 39] = _v; } while (0)
+        if (bp) {
+            KEEP_PIN(bp->lcd_dc);  KEEP_PIN(bp->lcd_cs);  KEEP_PIN(bp->lcd_sck); KEEP_PIN(bp->lcd_mosi);
+            KEEP_PIN(bp->lcd_rst);
+            KEEP_PIN(bp->tp_sda);  KEEP_PIN(bp->tp_scl);  KEEP_PIN(bp->tp_int);  KEEP_PIN(bp->tp_rst);
+            KEEP_PIN(bp->codec_sda); KEEP_PIN(bp->codec_scl);
+            KEEP_PIN(bp->sd_clk);  KEEP_PIN(bp->sd_cmd);  KEEP_PIN(bp->sd_d0);
+            KEEP_PIN(bp->sd_cs);   KEEP_PIN(bp->sd_sck);  KEEP_PIN(bp->sd_mosi); KEEP_PIN(bp->sd_miso);
+        }
         int niso = 0;
         for (int g = 0; g <= 48; g++) {
             if (g == keep[0] || g == keep[1] || g == keep[2]) continue;  /* 唤醒键: 必须留上拉 */
             if (g == gpstx || g == papin) continue;                      /* 已 hold 固定电平 */
+            int skip = 0;
+            for (int j = 0; j < fn_n && j < 40; j++) if (fn[j] == g) { skip = 1; break; }
+            if (skip) continue;                                          /* ★ 功能脚一律不动 */
             /* ★★★ 关键(来源: "10 Things Draining Your ESP32 Battery"):
              *   "Each enabled internal pull-up/pull-down sources current through a ~45kΩ
              *    resistor — that's 10..50 µA PER PIN, and they stay enabled through deep

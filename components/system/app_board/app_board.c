@@ -50,6 +50,13 @@ esp_err_t app_board_init(app_board_t *board)
      *   小智: LCD DC7/CS11/SCK9/MOSI10 · 震动8 · 触摸5/13/12/6 · 按键1/0/4 */
     /* ★ 2026-10-16: 解锁列表**按板型表**给出(小智/微雪/自制各自不同), 不再写死。 */
     {
+        /* ★★★★ 2026-10-18 linit **严重 bug 修复**: `gpio_deep_sleep_hold_en()` 是**全局锁存开关**,
+         *   只逐个 `gpio_hold_dis(pin)` 是解不掉的 ✗
+         *   ⇒ 必须**先** `gpio_deep_sleep_hold_dis()` 关掉全局锁存, 再逐脚释放 ✓
+         *   症状(只在"睡过一觉后"出现): **按键读错电平 + 触摸失灵** ✓✓
+         *   (深睡时 sleep.c 调了 gpio_deep_sleep_hold_en(), 醒来这里从没关过 ✗) */
+        gpio_deep_sleep_hold_dis();
+
         const board_pins_t *bp0 = board_pins_get();
         gpio_hold_dis((gpio_num_t)bp0->lcd_dc);
         gpio_hold_dis((gpio_num_t)bp0->lcd_cs);

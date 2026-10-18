@@ -92,3 +92,15 @@ void power_stat_get(power_stat_t *out)
     out->since_usb_s = out->awake_s + out->sleep_s;
     out->usb_now = usb_hid_host_mounted();
 }
+
+/* ★ 2026-10-18 linit: 串口诊断 —— 打印"上次充电以来"的醒着/睡眠累计时长。
+ *   linit 报"500mAh 12 小时耗光", 需要直接证据判断设备到底睡了多久。 */
+void power_stat_diag(void)
+{
+    power_stat_t st;
+    power_stat_get(&st);
+    ESP_LOGW("PWRSTAT", "PWRSTAT awake=%us (%.1fh)  sleep=%us (%.1fh)  睡眠占比=%.1f%%",
+             (unsigned)st.awake_s, st.awake_s / 3600.0f,
+             (unsigned)st.sleep_s, st.sleep_s / 3600.0f,
+             (st.awake_s + st.sleep_s) ? (100.0f * st.sleep_s / (st.awake_s + st.sleep_s)) : 0.0f);
+}
