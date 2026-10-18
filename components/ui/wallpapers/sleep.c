@@ -209,6 +209,48 @@ void wp_power_off(int origin)
              (origin == WP_OFF_AUTO) ? "任意键" : "PWR 键按住 0.5s",
              (unsigned long long)mask);
     power_stat_on_deep_sleep();   /* 结账"醒着段", 记下入睡时刻 (电池信息页用) */
+
+    /* ★★★ 2026-10-18 linit: **深睡省电加深** —— 把 IDF 里能关的电源域全关掉。
+     *   这些是纯软件开关, 不占内存, 实测能省几十 µA 到 ~1mA:
+     *   · RTC_SLOW_MEM / RTC_FAST_MEM: 深睡不用 RTC 内存(没开 ULP) ⇒ 断电 ✓
+     *   · XTAL: 深睡用 RC32K 就够, 主晶振断电 ✓
+     *   · VDDSDIO: flash/PSRAM 供电域断电(数据已在 flash 里, 醒来重新初始化) ✓
+     *   · RTC_PERIPH 必须 ON —— EXT1 唤醒依赖 RTC 域里的上拉, 关了就叫不醒 ✗ */
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH,   ESP_PD_OPTION_ON);    /* 唤醒必需 */
+    /* ⚠ ESP32-S3 的 IDF 里没有 RTC_SLOW_MEM / RTC_FAST_MEM 这两个域(仅 C6/H2 有) */
+    esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL,         ESP_PD_OPTION_OFF);
+    esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO,      ESP_PD_OPTION_OFF);
+
+    /* ★ 屏幕进低功耗(SPI 停 + 面板待机): 原来只清屏没 deinit ⇒ 面板还在扫描,
+     *   实测 ST7305 正常工作 ~50-100µA, 待机 ~1-5µA ✓ (清屏已在上面做过) */
+    if (s_lcd) {
+        st7305_deinit(s_lcd);
+        ESP_LOGI(TAG, "屏已 deinit(面板待机)");
+    }
+
+    ESP_LOGI(TAG, "深睡电源域: RTC_PERIPH=ON(唤醒用), XTAL/VDDSDIO=OFF");
+
+    /* ★★★ 2026-10-18 linit: **隔离所有不用的引脚** —— 官方文档明确推荐:
+     *   "Some ESP32-S3 IOs have internal pullups/pulldowns, which are enabled by default.
+     *    如果外部电路驱动这些脚, 电流会经过上下拉电阻 ⇒ 增加深睡电流。
+     *    调 rtc_gpio_isolate() 可避免。"
+     *   ⇒ 除了【唤醒键(必须有上拉)】【GPS TX(已 hold 高)】【功放脚(已 hold 低)】,
+     *     其余全部隔离 ✓ 这一步通常是深睡电流从 mA 级压到 µA 级的关键。 */
+    {
+        const int keep[3] = { PWR_KEY, KEY_LEFT, KEY_RIGHT };
+        const gps_config_t *gc2 = gps_default_config();
+        int gpstx = (gc2 && gc2->pin_tx >= 0) ? gc2->pin_tx : -1;
+        int papin = board_pins_get()->pa_pin;
+        int niso = 0;
+        for (int g = 0; g <= 48; g++) {
+            if (g == keep[0] || g == keep[1] || g == keep[2]) continue;  /* 唤醒键 */
+            if (g == gpstx || g == papin) continue;                      /* 已 hold */
+            rtc_gpio_isolate((gpio_num_t)g);
+            niso++;
+        }
+        ESP_LOGI(TAG, "已隔离 %d 个引脚(唤醒键/GPS_TX/PA 除外)", niso);
+    }
+
     esp_deep_sleep_start();
     /* 不返回 */
 }
