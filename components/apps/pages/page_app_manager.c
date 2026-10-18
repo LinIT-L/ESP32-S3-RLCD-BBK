@@ -1602,6 +1602,11 @@ static void p_am_poll(ui_ctx_t *ctx) {
             }
             store_dirty = true;
         }
+        /* ★★★ 2026-10-18 linit: **扫描没完成就每帧重试** ——
+         *   原来只在"重建列表"时试一次, 任务创建失败(内存紧张)就永远空白 ✗
+         *   prefetch 内部自带 busy 超时(3s) 和 s_pkg_scanned 判断, 每帧调无副作用 ✓ */
+        if (!am_store_ready()) am_store_prefetch();
+
         /* 下载中: 进度框要每帧重画 */
         if (am_rstore_state() == ARS_DOWNLOADING) ctx->needs_redraw = true;
 

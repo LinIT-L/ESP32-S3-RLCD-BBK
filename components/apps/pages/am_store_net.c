@@ -155,6 +155,19 @@ static void am_idx_task(void *arg) {
             int pr = am_store_json_parse(s_idx, s_rpkg, AM_RPKG_MAX, &pn,
                                          mir, AM_MIRROR_MAX, &mn);
             if (pr == 0) {
+                /* ★★★ 2026-10-18 linit: **把拉到的索引缓存到 apps 安装分区**(SPIFFS /store) ✓
+                 *   ⇒ 下次开机/离线时优先读它 ⇒ 不用联网也能看到"上次联网的列表" ✓
+                 *   (以前只有编译进固件的内置索引 ⇒ 云端加了新应用, 离线就永远看不到) */
+                {
+                    FILE *fc = fopen("/store/index.json", "wb");
+                    if (fc) {
+                        size_t w = fwrite(s_idx, 1, (size_t)total, fc);
+                        fclose(fc);
+                        ESP_LOGI(TAG, "索引已缓存到 /store/index.json (%u B)", (unsigned)w);
+                    } else {
+                        ESP_LOGW(TAG, "索引缓存写入失败(SPIFFS 满? 无所谓, 用内置索引)");
+                    }
+                }
                 /* ★★★ 2026-10-17 修: 云端索引的 mirrors 可能来自 CDN 旧缓存(含已下线源) ⇒
                  *   不能直接覆盖! 云端源打头, 再把**固件内置源**追加进来去重 ⇒
                  *   旧缓存再也不会把设备带向死服务器。 */
@@ -212,6 +225,21 @@ static void am_idx_task(void *arg) {
 static volatile bool     s_retry_wait;
 static volatile uint32_t s_retry_ms;
 
+/* ★ 2026-10-18: 距上次索引刷新是否已过 60 秒(且当前没在拉) */
+bool am_rstore_refresh_due(void) {
+    if (s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) return false;
+    static int64_t last_ms = 0;
+    int64_t now = esp_timer_get_time() / 1000;
+    if (last_ms == 0 || now - last_ms > 60000) { last_ms = now; return true; }
+    return false;
+}
+/* ★ 强制重新拉一次索引(后台, 不阻塞; 失败不清旧数据) */
+void am_rstore_refresh_force(void) {
+    s_fetched = false;
+    s_retry_wait = false;
+    am_rstore_prefetch();
+}
+
 void am_rstore_prefetch(void) {
     if (s_fetched || s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) return;
     /* ★ 失败退避: 上电/服务器抖动导致第一次没拉到 → 隔 RETRY_MS 再试, 不必重启 */
@@ -223,11 +251,29 @@ void am_rstore_prefetch(void) {
     if (s_rpkg_n == 0) {
         char mir[AM_MIRROR_MAX][AM_MIRROR_LEN];
         int  mn = 0, pn = 0;
-        if (am_store_json_parse(STORE_INDEX_BUILTIN, s_rpkg, AM_RPKG_MAX, &pn,
-                                mir, AM_MIRROR_MAX, &mn) == 0) {
+        bool got = false;
+
+        /* ★★★ 2026-10-18 linit: **优先用 apps 分区里的缓存索引**(上次联网拉到的) ——
+         *   离线/没网也能看到最新应用列表 ✓ 缓存坏了/不存在再退回固件内置 ✓ */
+        FILE *fc = fopen("/store/index.json", "rb");
+        if (fc) {
+            size_t n = fread(s_idx, 1, AM_IDX_MAX - 1, fc);
+            fclose(fc);
+            s_idx[n] = 0;
+            if (n > 16 && am_store_json_parse(s_idx, s_rpkg, AM_RPKG_MAX, &pn,
+                                              mir, AM_MIRROR_MAX, &mn) == 0) {
+                memcpy(s_mir, mir, sizeof(s_mir));
+                s_mir_n = mn; s_rpkg_n = pn;
+                got = true;
+                ESP_LOGI(TAG, "★ 离线: 已用**上次联网缓存**索引 %d 个包(/store/index.json %u B)",
+                         pn, (unsigned)n);
+            }
+        }
+        if (!got && am_store_json_parse(STORE_INDEX_BUILTIN, s_rpkg, AM_RPKG_MAX, &pn,
+                                        mir, AM_MIRROR_MAX, &mn) == 0) {
             memcpy(s_mir, mir, sizeof(s_mir));
             s_mir_n = mn; s_rpkg_n = pn;
-            ESP_LOGI(TAG, "★ 离线/未联网: 已启用内置索引 %d 个包", pn);
+            ESP_LOGI(TAG, "★ 离线: 已启用内置索引 %d 个包", pn);
         }
     }
     if (!wifi_manager_is_connected()) return;   /* ★ 见文件头 ①: 没联网一律不发请求 */
@@ -235,7 +281,9 @@ void am_rstore_prefetch(void) {
     s_fetched = true;
     s_state = ARS_FETCHING;
     /* 任务栈必须内部 RAM (TLS 会短暂禁中断; 8KB 与 luat_lib_net 的 fetch 任务同规格) */
-    if (xTaskCreatePinnedToCore(am_idx_task, "am_idx", 8192, NULL, 4, NULL, 0) != pdPASS) {
+    /* ★ 2026-10-18: 栈 8192 → **6144**(TLS 握手实测够用) ——
+     *   内部 RAM 紧张时 8KB 任务会创建失败 ⇒ 索引永远拉不到 ✓ */
+    if (xTaskCreatePinnedToCore(am_idx_task, "am_idx", 6144, NULL, 4, NULL, 0) != pdPASS) {
         ESP_LOGD(TAG, "索引任务创建失败(内存不足)");
         s_state = ARS_FAIL;
         s_fetched = false;

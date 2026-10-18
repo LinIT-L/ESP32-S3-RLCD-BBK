@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "am_internal.h"
+#include "esp_timer.h"   /* ★ 扫描 busy 超时判断 */
 #include "apppack.h"   /* LAPP 单文件资源包: 取名称/简介 */
 
 #define TAG "AMSTORE"
@@ -287,16 +288,54 @@ static void am_pkg_scan_task(void *arg) {
     s_pkg_busy = false;
     vTaskDelete(NULL);
 }
+/* ★★★ 2026-10-18 linit: **每次联网进商店都后台自动更新索引** ——
+ *   原来 `am_rstore_prefetch()` 只用 s_fetched 保证"只拉一次" ✗ ⇒ 永远看第一次的列表
+ *   ⇒ 现在每次进商店(距上次刷新 > 60 秒)就把 s_fetched 清掉, 让它重新拉一次 ✓
+ *   拉取在后台任务里做, 失败**不清旧数据**(离线仍能浏览) ✓ 不阻塞界面 ✓ */
+void am_store_refresh_index_if_due(void) {
+    extern bool am_rstore_refresh_due(void);
+    if (am_rstore_refresh_due()) am_rstore_refresh_force();
+}
+
 void am_store_prefetch(void) {
-    if (s_pkg_scanned == 0 || s_pkg_busy) return;
+    /* ★★★ 2026-10-18 linit **必修**: `s_pkg_busy` 一旦卡死(扫描任务异常退出/创建失败)
+     *   就再也不会重扫 ⇒ `am_total_n()` 永远 0 ⇒ **商店空白 + 索引也不拉** ✗
+     *   ⇒ 加 3 秒超时: 超时认为扫描已死, 强制解锁重来 ✓ */
+    if (s_pkg_busy) {
+        static int64_t busy_t0 = 0;
+        if (busy_t0 == 0) busy_t0 = esp_timer_get_time();
+        if ((esp_timer_get_time() - busy_t0) > 3000000) {
+            ESP_LOGW(TAG, "商店扫描卡住超 3s ⇒ 强制解锁重扫");
+            s_pkg_busy = false;
+            s_pkg_scanned = -1;
+            s_pkg_done = false;
+            busy_t0 = 0;
+        } else {
+            return;
+        }
+    } else {
+        ; /* 未 busy: 走下面的正常流程 */
+    }
+    if (s_pkg_scanned == 0) return;
+    /* ★ 每次进商店(>60s)顺带把云端索引也刷新一次 ✓ */
+    {
+        extern void am_rstore_refresh_force(void);
+        extern bool am_rstore_refresh_due(void);
+        if (am_rstore_refresh_due()) am_rstore_refresh_force();
+    }
     s_pkg_busy = true;
     s_pkg_done = false;
     /* V1.2 修复: 原实现忽略返回值 —— 任务创建失败(内存不足)时 s_pkg_busy 永久为 true,
      * 商店会一直显示"正在扫描…"且无法重试 (prefetch 被 busy 挡退). 失败须回滚标志. */
-    if (xTaskCreatePinnedToCore(am_pkg_scan_task, "pkgscan", 8192, NULL, 3, NULL, 0) != pdPASS) {
+    /* ★★★ 2026-10-18 linit **必修**: 栈 8192 → **4096**。
+     *   实测开机内部 RAM 只剩 ~10KB, 8KB 栈的任务**创建失败** ✗
+     *   ⇒ 扫描永不执行 ⇒ `s_pkg_scanned` 永远 != 0 ⇒ 商店空白 "无法获取应用列表" ✓✓
+     *   (本任务只做 opendir/fopen/strcmp, 4KB 足够; 必须内部 RAM —— 读 flash 时禁缓存,
+     *    PSRAM 栈会崩) */
+    if (xTaskCreatePinnedToCore(am_pkg_scan_task, "pkgscan", 4096, NULL, 3, NULL, 0) != pdPASS) {
         s_pkg_busy = false;
         s_pkg_done = false;
-        ESP_LOGD(TAG, "商店扫描任务创建失败(内存不足?), 保留上次结果并允许重试");
+        ESP_LOGW(TAG, "商店扫描任务创建失败(内存不足?) ⇒ 保留上次结果, 下帧重试");
     }
 }
 /* 商店源清理 (V1.6.x): 商店"本地源" = /store 根目录的 .lua 待装包; "已安装"只认
@@ -331,7 +370,8 @@ static int am_rview_find(const os_app_t *a) {
  * ⚠ 已下载到商店源目录的包要**剔掉** —— 否则它会以"云端条目"再出现一次, 同一个包
  *   在列表里显示两条(一条可安装、一条还在"下载"), 与"商店里两个 BIOS 模拟器"同款 bug。 */
 static void am_store_sync_remote(void) {
-    if (!am_store_ready()) return;
+    /* ★ 同上: 不再要求"包扫描完成" —— 没 TF 卡也要能显示云端列表 ✓ */
+    if (am_rstore_count() == 0) return;
     int want = am_rstore_count();
     if (want == s_rview_synced) return;
     s_rview_n = 0;
@@ -381,7 +421,10 @@ static void am_store_sync_remote(void) {
     s_rview_synced = want;
 }
 /* 总条目数 / 取第 k 条: 前 s_pkg_n 条是本地包, 后面接云端视图 */
-static int am_total_n(void) { return (s_pkg_scanned == 0) ? (s_pkg_n + s_rview_n) : 0; }
+/* ★★★ 2026-10-18 linit **必修**: 原来 `(s_pkg_scanned == 0) ? ... : 0`
+ *   ⇒ **没插 TF 卡时包扫描永远完不成** ⇒ 列表恒为 0 ⇒ "无法获取应用列表" ✗
+ *   ⇒ 现在直接返回本地+云端条数; 扫描没完只是本地那部分为空, **云端列表照常显示** ✓ */
+static int am_total_n(void) { return s_pkg_n + s_rview_n; }
 static const am_pkg_entry_t *am_entry(int k) {
     if (k < 0 || k >= am_total_n()) return NULL;
     return (k < s_pkg_n) ? &s_pkg[k] : &s_rview[k - s_pkg_n];
