@@ -79,12 +79,31 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 |---|---|
 | PCB 工程（嘉立创 EDA 专业版） | [LinTOS_2026-10-17.epro](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/LinTOS_2026-10-17.epro) |
 | 原理图 | [schematic.pdf](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/schematic.pdf) |
-| 3D 渲染 | [小智一体版](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/pcb-xiaozhi.png) · [标准扩展版](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/pcb-standard.png) |
 | BOM 清单 | [hardware/README.md](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/README.md) |
+
+<sub>PCB 图片 — 小智一体版</sub>
+
+<img src="hardware/images/pcb-xiaozhi.png" width="420" alt="PCB 小智一体版">
+
+<sub>PCB 图片 — 标准扩展版</sub>
+
+<img src="hardware/images/pcb-standard.png" width="420" alt="PCB 标准扩展版">
 
 交流群 **1128448441**
 
 <img src="https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/qq-group.png?raw=true" width="120" height="120" alt="QQ 群">
+
+## 烧录
+
+```bash
+python -m esptool --chip esp32s3 -b 460800 write_flash \
+  --flash_mode dio --flash_size 16MB --flash_freq 80m \
+  0x0 dist/merged_16mb.bin
+```
+
+- `dist/merged_16mb.bin`（完整镜像）→ `0x0`
+- `build/LinTOS.bin`（固件）→ `0x60000`
+- `build/apps_l.bin`（应用区）→ `0xC00000`
 
 ## 目录结构
 
@@ -103,18 +122,6 @@ apps/ store/  Lua 应用源与商店索引
 system_image/ BBK 词典 ROM
 tools/        图标、字库、商店索引、抓屏脚本
 ```
-
-## 烧录
-
-```bash
-python -m esptool --chip esp32s3 -b 460800 write_flash \
-  --flash_mode dio --flash_size 16MB --flash_freq 80m \
-  0x0 dist/merged_16mb.bin
-```
-
-- `dist/merged_16mb.bin`（完整镜像）→ `0x0`
-- `build/LinTOS.bin`（固件）→ `0x60000`
-- `build/apps_l.bin`（应用区）→ `0xC00000`
 
 ## 版权与参考
 
