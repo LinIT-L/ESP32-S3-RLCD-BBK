@@ -53,7 +53,10 @@ static int s_pkg_n = 0;
 static volatile int s_pkg_scanned = -1;   /* 0=已扫描 (数据可用)  -1=未扫/扫描中 (后台任务写入) */
 static volatile bool s_pkg_busy  = false;   /* 后台扫描任务进行中 */
 static volatile bool s_pkg_done  = false;   /* 后台扫描已完成 (UI 线程取货) */
+static volatile bool s_uninst_done = false;   /* ★ 后台卸载刚完成 ⇒ UI 需刷新一次 */
 static bool s_pkg_inst[AM_PKG_MAX]; /* 每包安装状态缓存: 渲染用, 避免每帧 fopen(SD/SPIFFS 慢)致商店卡顿 */
+
+
 
 /* ---- 云端包视图 (2026-10-04) ----
  * 索引里的包**不直接进 s_pkg[]** —— s_pkg[] 是后台扫描任务的产物, 而索引是另一个
@@ -560,9 +563,12 @@ static void am_uninst_task(void *arg) {
         if (j->paths[i][0]) remove(j->paths[i]);
     os_app_set_mainmenu(j->lid, false);
     os_app_set_hidden(j->lid, true);
-    am_store_invalidate();     /* 重扫 → 下次进商店/重建时列表已更新 */
+    /* ★★ 2026-10-18: **卸载后不再触发全量重扫** —— 文件已删, `am_store_installed_of()`
+     *   按文件存在性判断, 自动变"下载"; 重扫只会拖慢(linit 反馈"卸载慢") ✗
+     *   只让 Lua 列表失效(应用管家里那条要消失) ✓ */
     am_lua_invalidate();
     ESP_LOGI("AMSTORE", "后台卸载完成: %s (删了 %d 个文件)", j->lid, j->npaths);
+    s_uninst_done = true;    /* ★ 通知 UI 刷新(它只重绘, 不重建列表) */
 
     free(j);
     vTaskDelete(NULL);
@@ -613,6 +619,12 @@ void am_store_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a) {
 
 /* ==================== 对外接口 (声明见 am_internal.h) ==================== */
 bool am_store_ready(void) { return s_pkg_scanned == 0; }
+/* ★ 2026-10-18: 取"卸载完成"事件(取一次即清), UI 用它触发一次重绘 ✓ */
+bool am_store_take_uninst_done(void) {
+    if (!s_uninst_done) return false;
+    s_uninst_done = false;
+    return true;
+}
 int  am_store_count(void) { return am_total_n(); }
 
 const os_app_t *am_store_app(int k) {
@@ -640,13 +652,13 @@ int am_store_dl_permille_of(const os_app_t *a) {
     int kk = am_pkg_find(a);
     if (kk >= 0) nm = s_pkg[kk].fname;
     else { int rr = am_rview_find(a); if (rr >= 0) nm = s_rview[rr].fname; }
-    const char *dl = am_rstore_dl_name();
-    if (!nm || !dl || !dl[0]) return -1;
     char stem[48];
-    snprintf(stem, sizeof(stem), "%s", nm);
+    snprintf(stem, sizeof(stem), "%s", nm ? nm : "");
     char *dot = strrchr(stem, '.');
     if (dot) *dot = 0;
-    if (strcmp(stem, dl) != 0) return -1;
+
+    const char *dl = am_rstore_dl_name();
+    if (!dl || !dl[0] || strcmp(stem, dl) != 0) return -1;
     int pm = am_rstore_dl_permille();
     return (pm < 0) ? 0 : pm;
 }

@@ -1538,6 +1538,14 @@ static void p_am_poll(ui_ctx_t *ctx) {
         ctx->needs_redraw = true;
         s_col_dirty = true;
     }
+    /* ★★★ 2026-10-18 linit: **卸载完成后自动刷新页面** ——
+     *   后台删完文件只会置标志; 这里取一次 ⇒ 强制重渲染整列(按钮变"下载")
+     *   ⚠ 只重绘不重建列表(poll 里 rebuild 会崩) ✓ */
+    if (s_cat == AM_CAT_STORE && am_store_take_uninst_done()) {
+        ctx->needs_redraw = true;
+        s_col_dirty = true;
+        ESP_LOGI("APPM", "卸载完成 → 自动刷新页面");
+    }
 
     /* ★★★ 2026-10-18 linit: **下载刚开始时, 把正在下载的那条冒泡到第一位 + 列表回顶部** ——
      *   否则它还在原来的位置, 用户要自己找进度 ✗ (他明确要求"排第一个 + 回最上面")

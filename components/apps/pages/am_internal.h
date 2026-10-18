@@ -75,7 +75,8 @@ int   am_rstore_count(void);
 const am_rpkg_t *am_rstore_get(int i);
 void am_rstore_clear_cache(void);
 int  am_store_dl_permille_of(const os_app_t *a);   /* ★ 该条目下载进度(无则 -1) */
-bool am_store_auto_install(const char *fname);   /* ★ 下载完自动安装 */   /* ★ 清商店缓存(长按分类图标 3s) */
+bool am_store_auto_install(const char *fname);
+bool am_store_take_uninst_done(void);   /* ★ 卸载刚完成(取一次即清) */   /* ★ 下载完自动安装 */   /* ★ 清商店缓存(长按分类图标 3s) */
 bool  am_rstore_dl_start(int i);         /* 后台下载第 i 个包 → 商店源目录 */
 int   am_rstore_dl_permille(void);       /* 0..1000; -1 = 总长未知 */
 const char *am_rstore_dl_name(void);     /* 正在下载的包名 */
