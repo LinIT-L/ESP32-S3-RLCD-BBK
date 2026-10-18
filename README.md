@@ -1,11 +1,11 @@
 # ESP32-S3-RLCD-BBK
 
-本项目是一款提供一部分不同复古游戏引擎与运维工具的 ESP32-S3 固件，硬件上支持 DIY 的 ESP32 拼音学习机与微雪 ESP32-S3-RLCD-4.2 开发板。
+本项目是一款提供几个复古游戏引擎与运维工具的 ESP32-S3 固件，硬件上支持 DIY 的 ESP32 拼音学习机与微雪 ESP32-S3-RLCD-4.2 开发板。
 
 ## 隐藏功能
 
-- 在设置里面 →「请作者喝杯水」→ 赞助图连按确认 5 次 即启用 GB / GBC / NES / ArduBoy /应用中心，等应用。
-
+- 显示 GB / GBC / NES / ArduBoy 图标：设置 →「请作者喝杯水」→ 赞助图连按确认 5 次
+- 音频方案 / 禁用触摸：设置 → 系统信息 →「BY: LinIT」连点 5 次
 
 [![在线刷机](https://bbk.linit.cn/fw/card.svg)](https://bbk.linit.cn/fw/flash.html)
 
@@ -54,18 +54,19 @@ Wi-Fi 网页手柄：开热点 `BBK-WIFI-handle`，手机浏览器打开 `8.8.8.
 | GPS（可选） | TX43 RX44 EXTINT18 | 无 | 可选 |
 | 板型指纹 | I2C 38/47 有 `0x18` | I2C 13/14 有 `0x18` | I2C 15/7 有 `0x15` |
 
+ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/drivers/board_pins`。
 
-<sub>微雪 ESP32-S3-RLCD-4.2 正面</sub>
 <img src="images/微雪ESP32-S3-RLCD-4.2正面图片.jpeg" width="330" alt="微雪正面"><br>
+<sub>微雪 ESP32-S3-RLCD-4.2 正面</sub>
 
-<sub>DIY 拼音学习机 正面</sub>
 <img src="images/拼音学习机正面图.jpeg" width="330" alt="拼音学习机正面"><br>
+<sub>DIY 拼音学习机 正面</sub>
 
-<sub>内部布局</sub>
 <img src="images/内部布局图.jpeg" width="330" alt="内部布局"><br>
+<sub>内部布局</sub>
 
-<sub>主板测试点定义</sub>
 <img src="images/测试点定义图.jpg" width="330" alt="测试点定义"><br>
+<sub>主板测试点定义</sub>
 
 ## 打板与采购
 
@@ -117,8 +118,6 @@ python -m esptool --chip esp32s3 -b 460800 write_flash \
 - `dist/merged_16mb.bin`（完整镜像）→ `0x0`
 - `build/LinTOS.bin`（固件）→ `0x60000`
 - `build/apps_l.bin`（应用区）→ `0xC00000`
-
-固件下载：https://bbk.linit.cn/fw/　分区表：[partitions.csv](partitions.csv)　版本记录：[CHANGELOG.md](CHANGELOG.md)
 
 ## 版权与参考
 
