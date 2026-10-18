@@ -462,9 +462,9 @@ static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
     /* ★★★ 2026-10-17 linit: 原来这里 os_dialog_pop —— 但 toast 已经把确认框关掉了,
      *   再 pop 一次就把**商店页本身**弹出去了("安装完就退出商店"的根因)。
      *   改用 mark_handled: 只关闭当前弹窗, 不额外弹栈。 */
-    /* ★★★ 2026-10-18 修: mark_handled **不关弹窗** ✗ ⇒ 确认框一直挂着, 再点就重复下载
-     *   ⇒ "状态忙" ⇒ 弹"无法开始下载"。改用**带深度检查的 pop**: 有弹窗才关, 不会误弹页面。 */
-    if (os_dialog_depth() > 0) os_dialog_pop(ctx);
+    /* ★★★ 2026-10-18 定案: **回调里什么都不做** —— 框架(os_dialog)在回调返回后
+     *   会自己关掉这个确认框(dlg_finish_top)。手动 pop 反而多退一层 ⇒
+     *   表现就是"显示已卸载 ⇒ 直接回主桌面" ✗ (os_dialog_pop 在 s_top==0 时会 os_pop 弹窗页) */
     ctx->needs_redraw = true;
 }
 /* ========== 商店 云端包: 先下载到商店源目录, 再走普通安装 (2026-10-04) ==========
@@ -496,7 +496,7 @@ static void am_store_dl_cb(ui_ctx_t *ctx, int result, void *ud) {
     if (rpos < 0 || !am_rstore_dl_start(rpos))
         os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe5\xbc\x80\xe5\xa7\x8b\xe4\xb8\x8b\xe8\xbd\xbd"); /* 无法开始下载 */
     am_rebuild_keep();
-    if (os_dialog_depth() > 0) os_dialog_pop(ctx);   /* ★ 有弹窗才关 */
+    /* 同上: 交给框架自己关, 不要手动 pop */
     ctx->needs_redraw = true;
 }
 /* 云端条目被点 → 弹"下载 XX (123KB)?" */
@@ -588,7 +588,7 @@ static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
 
 static void am_store_uninstall_cb(ui_ctx_t *ctx, int result, void *ud) {
     if (result == 0) am_store_uninstall_do(ctx, (int)(long)ud);
-    if (os_dialog_depth() > 0) os_dialog_pop(ctx);   /* ★ 有弹窗才关, 不会弹走商店页 */
+    /* 同上: 交给框架自己关, 不要手动 pop */
     ctx->needs_redraw = true;
 }
 /* 选中的商店项若已安装 → 弹"卸载 XX?" 确认 */

@@ -357,19 +357,19 @@ static void am_dl_task(void *arg) {
     } else {
         s_permille = 1000;
         ESP_LOGI(TAG, "下载完成: %s (%d B)", dst, total);
-        /* ★ 2026-10-18: 清掉下载名 ⇒ 列表第二行从"进度条"恢复成应用说明 ✓ */
-        s_dl_name[0] = 0;
-        /* ★★★ 2026-10-18: **下载完成后在后台任务里自动安装** ——
-         *   ⚠ 绝不能放到 UI 的 tick 里做(文件复制 + 全局失效 ⇒ 开店死机) ✗ */
+        /* ★★★ 2026-10-18 修顺序: **先用名字去自动安装, 再清空** ——
+         *   之前先清 s_dl_name 再用 ⇒ fn 变成 ".lua" ⇒ 永远装不上 ✗ */
         {
             extern bool am_store_auto_install(const char *fname);
-            char fn[56];
-            snprintf(fn, sizeof(fn), "%s.lua", s_dl_name);
-            if (s_dl_name[0]) {
+            char nm[48], fn[56];
+            snprintf(nm, sizeof(nm), "%s", s_dl_name);
+            if (nm[0]) {
+                snprintf(fn, sizeof(fn), "%s.lua", nm);
                 if (am_store_auto_install(fn)) ESP_LOGI(TAG, "已自动安装: %s", fn);
                 else                           ESP_LOGW(TAG, "自动安装失败: %s", fn);
             }
         }
+        s_dl_name[0] = 0;   /* 装完再清 ⇒ 列表第二行从"下载中"恢复成应用说明 ✓ */
         __sync_synchronize();
         s_state = ARS_OK;
     }

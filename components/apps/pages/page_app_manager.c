@@ -897,14 +897,13 @@ static void am_col_render_list(void) {
             /* 第二行 = 文案 (本地包 → LAPP 简介 desc=; 云端包 → "未下载 · NKB"),
              * 不再显示文件路径/文件名 ——
              * 用户原话: "模拟器下方不要显示路径名称, 直接显示对应说明"。 */
-            /* ★ 2026-10-18 linit: **下载中 → 第二行画进度条**(顶掉应用说明), 跑完自动恢复说明 */
+            /* ⚠ 2026-10-18: 行内"画进度条"版本会导致写列缓冲越界 ⇒ 开店死机 ✗
+             *   ⇒ 暂时退回**文字进度**(下载中 42%), 稳定优先; 之后用安全方式重做进度条。 */
             int dpm = am_store_dl_permille_of(a);
             if (dpm >= 0) {
-                int bx0 = AM_ROW_TX, bx1 = AM_ROW_BTN_X0 - 10;
-                int by0 = y + 29, by1 = by0 + 7;
-                am_col_rect_outline(bx0, by0, bx1, by1, !sel);
-                int fw = ((bx1 - bx0 - 2) * dpm) / 1000;
-                if (fw > 0) am_col_fill(bx0 + 1, by0 + 1, bx0 + fw, by1 - 1, !sel);
+                char pg[24];
+                snprintf(pg, sizeof(pg), "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad %d%%", dpm / 10); /* 下载中 42% */
+                am_col_text_l(AM_ROW_TX, y + 27, pg, sel);
             } else {
                 const char *ds = am_store_sub_of(a);
                 if (ds && ds[0])
@@ -1504,6 +1503,11 @@ static void p_am_poll(ui_ctx_t *ctx) {
         am_gcam_tick();
         ctx->needs_redraw = true;
     }
+
+    /* ★★★ 2026-10-18 linit: **下载中每帧重绘** —— 否则进度条一直停在 0%(空白),
+     *   一下载完就跳 100% (因为没人请求重绘, 界面停在旧帧) ✗ */
+    if (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING)
+        ctx->needs_redraw = true;
 
     /* 分类 Lua 后台扫描完成: 影子缓冲搬到 s_lua, 标记数据就绪, 重建列表 (UI 线程取货).
      * 迁移须在 UI 线程一次性完成 (后台只写 s_lua_bg, 避免与渲染读 s_lua 竞态). */
