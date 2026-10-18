@@ -513,6 +513,8 @@ static void am_store_download_ask(ui_ctx_t *ctx, int rk) {
     else
         snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s?", s_rview[rk].label);
     os_dialog_confirm_ex(ctx, title, 0, 0, am_store_dl_cb, (void *)(long)rk);
+    /* ★ 只有这个弹窗用 16px 标题(名字长也不挤), 其他弹窗保持 24px ✓ */
+    { os_dlg_stack_t *d = os_dialog_top_mut(ctx); if (d) d->title_small = true; }
 }
 
 /* ★ 商店行统一入口 (2026-10-02 linit: "商店只负责安装/卸载, 卸载不负责启动应用"):

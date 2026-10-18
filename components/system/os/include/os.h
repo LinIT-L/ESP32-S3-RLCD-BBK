@@ -303,6 +303,7 @@ struct os_dlg_stack {
     bool  no_footer;             /* true=无底部"返回"行 (如确认框: 确定/取消) */
     bool  small;                 /* true=小自适应确认弹窗 (退出等, 3.3 notice 样式); false=大窗 350×250 */
     bool  auto_h;                /* true=列表自适应高度(内容少自动收窄, 多则满高滚动); false=固定 350×250 */
+    bool  title_small;           /* ★ 标题用 16px(小字) — 仅应用中心"下载 XX?"用; 其他一律 24px */
     bool  row_x;                 /* true=每行内容最右侧显示删除"×", 点击 x 命中该行→弹删除确认 (长按即时同义) */
     const uint8_t *icon;         /* 可选: 确认弹窗文字区下方居中的 1bpp 位图 (如挂载/传输图标); NULL=无 */
     int   icon_w, icon_h;        /* icon 宽高 (bitmap 每行 ceil(w/8) 字节, 位=1 黑像素) */
