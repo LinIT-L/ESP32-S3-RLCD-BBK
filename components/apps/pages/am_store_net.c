@@ -217,6 +217,19 @@ void am_rstore_prefetch(void) {
     /* ★ 失败退避: 上电/服务器抖动导致第一次没拉到 → 隔 RETRY_MS 再试, 不必重启 */
     if (s_retry_wait &&
         (uint32_t)(esp_timer_get_time() / 1000) - s_retry_ms < RETRY_MS) return;
+    /* ★★★ 2026-10-18 linit: **没联网也要有列表!**
+     *   原来 WiFi 判断在加载内置索引之前 ⇒ 离线直接 return ⇒ 商店一片空白 ✗
+     *   现在先把**固件内置索引**装上(离线可浏览 8 个应用), 再判断要不要联网刷新 ✓ */
+    if (s_rpkg_n == 0) {
+        char mir[AM_MIRROR_MAX][AM_MIRROR_LEN];
+        int  mn = 0, pn = 0;
+        if (am_store_json_parse(STORE_INDEX_BUILTIN, s_rpkg, AM_RPKG_MAX, &pn,
+                                mir, AM_MIRROR_MAX, &mn) == 0) {
+            memcpy(s_mir, mir, sizeof(s_mir));
+            s_mir_n = mn; s_rpkg_n = pn;
+            ESP_LOGI(TAG, "★ 离线/未联网: 已启用内置索引 %d 个包", pn);
+        }
+    }
     if (!wifi_manager_is_connected()) return;   /* ★ 见文件头 ①: 没联网一律不发请求 */
     s_retry_wait = false;
     s_fetched = true;
