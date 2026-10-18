@@ -257,12 +257,10 @@ static void ss_supervisor_task(void *arg) {
                 wp_program_render(s_ss_lcd, WP_PROG_STARS, t);
                 st7305_flush_override(s_ss_lcd);   /* 屏保期间唯一允许写屏的通道 */
             }
-            /* ★★★ 2026-10-18 linit: 屏保帧率 16fps → **4fps** ——
-             *   屏保(星空)每帧都要刷整屏 15000B, 16fps 下 CPU 常驻 240MHz + SPI 持续写
-             *   ⇒ 实测整机 **30~50mA** ✗ (linit: 500mAh 电池 12 小时就空)
-             *   降 4 帧/秒: 星星照样动, 刷屏电耗降到 1/4 ✓
-             *   (vTaskDelay 仍必须保留: 让出 CPU 并喂狗, 否则饿死主循环 + task_wdt) */
-            vTaskDelay(pdMS_TO_TICKS(250));
+            /* 流畅优先: 星空 16fps (1000/62)。linit 定: **屏保保持 16fps**(星空要顺) ✓
+             * 必须有 vTaskDelay 让出 CPU **并喂狗**, 否则本任务(优先级 IDLE+2)在此分支
+             * 100% 空转, 饿死同一核上的主循环/输入, 表现为"任意键都点不醒壁纸"+ task_wdt。 */
+            vTaskDelay(pdMS_TO_TICKS(52));
         } else {
             /* 空闲检测 (低频省电) —— USB 插着就不进屏保(也就不会连锁到自动关机) */
             bool usb = usb_hid_host_mounted();
