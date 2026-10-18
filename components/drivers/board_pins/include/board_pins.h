@@ -80,7 +80,11 @@ uint64_t board_wake_mask(void);
 #define LINTOS_USE_GPS     1    /* 微雪无 GPS */
 #define LINTOS_LCD_ONLY      0    /* 兼容旧开关: 1=全部跳过 */
 
-#define BOARD_IS_WEIXUE      0   /* 0=小智(当前) 1=微雪 */
+/* ★★★ 2026-10-18 linit 定案: **一个固件通吃三块板** —— 本开关仅作"探测全失败时的兜底默认"
+ *   运行时探测链: hw_cfg_init() → I2C 指纹(38/47@0x18 小智 · 13/14@0x18 微雪 · 15/7@0x15 标准扩展)
+ *                → 失败读 NVS "board_id"(上次成功的) → 再失败才用本默认值
+ *   探测结果会 cfg_set_u8("board_id") 固化 ⇒ **换板不用重编固件** ✓          */
+#define BOARD_IS_WEIXUE      0   /* 0=小智(默认) 1=微雪 */
 #define BOARD_DEFAULT_ID     (BOARD_IS_WEIXUE ? BOARD_ID_WEIXUE : BOARD_ID_XIAOZHI)
 #define BOARD_BTN_PWR        GPIO_NUM_1
 #define BOARD_BTN_RIGHT      GPIO_NUM_0
