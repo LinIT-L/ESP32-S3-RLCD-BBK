@@ -1,270 +1,141 @@
 # ESP32-S3-RLCD-BBK
 
-ESP32-S3 复古掌机固件。屏幕为 ST7305 反射式 1bit LCD(400×300),低功耗、断电保留画面。
+ESP32-S3 复古掌机固件。ST7305 反射式 1bit LCD（400×300），断电保留画面。
 
-**内置**
-
-- 步步高 BBK 4980 系列电子词典模拟器
-- 游戏引擎:GB / GBC / NES / MD / SMS·GG / ArduBoy / 文曲星 / 暴龙机
-- 应用:电子书阅读器、音乐播放器、仿真键鼠、收藏夹、频谱仪、离线矢量地图、航班雷达
-
-**v1.4 新增**
-
-- **应用商店** —— 固件内直接浏览、下载、安装应用;多源按序回退(前一个源失败自动切下一个)
-- **自适应固件** —— 同一份固件支持三种硬件:`① 小智集成板` / `② 微雪原版` / `③ 标准扩展板`。
-  开机探测 I2C 总线上各板独有芯片判定板型,自动套用对应引脚表,并按探测结果启停模块;
-  未检测到的硬件不初始化(例:未焊 GPS 则不占用串口)。也可在设置中手动开关。
-- **Lua 应用** —— 单文件脚本即一个应用,放 TF 卡或从商店下载均可运行
-
-> **在线刷机**:https://bbk.linit.cn/flash/ (浏览器 WebSerial 直刷 16MB 固件)
-> **固件下载**:https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases
-
-
----
+**下载固件**：https://bbk.linit.cn/fw/ · **版本记录**：[Releases](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/releases)
 
 ## 功能
 
-### 模拟器 / 游戏引擎
-- **BBK 电子词典**:内置词典与游戏,支持存档
-- **GB / GBC**:经典掌机游戏
-- **NES**:红白机游戏
-- **Arduboy**:掌机小游戏(另含内置迷你游戏)
-- **文曲星**:运行 `.lav` 游戏
-- **暴龙机**:虚拟宠物养成
-
-### 应用 / 工具
-- **应用管理**:分类找应用,点开即用
-- **电子书阅读器**:支持 TXT / FB2 / EPUB,可调字体字号、旋转方向
-- **仿真键鼠**:把设备当作 USB 键盘 / 鼠标使用
-- **电脑维修思路诊断**:给出硬件故障的排查思路与解决步骤
-- **收藏系统**:快速收藏常用游戏,各引擎独立保存
-- **存储管理**:TF 卡挂载与查看
-- **壁纸屏保**:星空 + 游戏壁纸(待机时跑游戏)
-- **番茄钟 / MP3 播放 / 天气时钟 / 系统信息**
-
-### 输入 / 交互
-- 蓝牙手柄按键、Wi-Fi 网页手柄(热点直连即玩)
-- 屏幕虚拟按键 + 触摸手势 + 物理按键
-
----
+**引擎**：步步高 BBK 4980 电子词典 · GB / GBC / NES / MD / SMS·GG / ArduBoy / 文曲星 / 暴龙机
+**应用**：阅读器 · 音乐 · 仿真键鼠 · 收藏夹 · 频谱仪 · 离线矢量地图 · 航班雷达 · 应用商店 · Lua 脚本
+**输入**：蓝牙手柄 · Wi-Fi 网页手柄 · 触摸手势 · 物理按键
 
 ## 按键与触摸
 
-### 物理按键
+| 板型 | 确认（KEY） | 右 / 返回（BOOT） | 电源（PWR） |
+|---|---|---|---|
+| ① 小智一体版 | GPIO4 | GPIO0 | GPIO1 |
+| ② 微雪原版 | GPIO18 | GPIO0 | 无 GPIO（硬件电源锁存） |
+| ③ 标准扩展版 | GPIO18 | GPIO0 | GPIO1 |
 
 | 按键 | 短按 | 长按 |
 |---|---|---|
-| **KEY** (GPIO18) | 确认 | 多功能键(收藏等) |
-| **BOOT** (GPIO0) | 右 | 返回 (BACK) |
-| **PWR** (GPIO1) | 锁屏 | 0.5s=返回主菜单; **2s=关机** |
-
-### 触摸手势
+| **KEY** | 确认 | 收藏 |
+| **BOOT** | 右 | 返回 |
+| **PWR** | 锁屏 | 0.5s 回主菜单；2s 关机 |
 
 | 手势 | 效果 |
 |---|---|
-| **点击** | 确认(点哪进哪) |
-| **左右滑** | 主菜单切图标 / 游戏内左右 |
-| **上下滑** | 列表选择 |
-| **底部上滑** | 返回(1s 内再滑一次=强制回主菜单) |
-| **长按 ≥2s**(不移动) | 收藏 / 取消收藏 |
+| 点击 | 确认（点哪进哪） |
+| 左右滑 | 主菜单切图标 / 游戏内左右 |
+| 上下滑 | 列表选择 |
+| 底部上滑 | 返回（1s 内再滑一次 = 回主菜单） |
+| 长按 ≥2s | 收藏 / 取消收藏 |
 
-### 各功能操作
-- **BBK 词典**:左侧选文件夹/收藏,右侧选游戏,点击启动;游戏中点=确认、滑=方向
-- **电子书**:先到书架选书;阅读时点上半=上一页、下半=下一页、中间=设置
-- **蓝牙手柄**:仅支持 BLE(蓝牙 4.0+),不支持传统蓝牙;实测闪玩 Q36 正常
-- **WiFi 网页手柄**:开热点(AP:**BBK-WIFI-handle**)→ 手机连热点 → 浏览器打开 `http://8.8.8.8` 即可玩,映射见下图
+**Wi-Fi 网页手柄**：开热点 `BBK-WIFI-handle` → 手机连上 → 浏览器打开 `http://8.8.8.8`。
 
-  ![Wi-Fi 手柄映射](images/Wi-Fi手柄映射.jpeg)
-- **壁纸 / 番茄钟 / MP3**:在应用管理或主菜单进入,按提示操作即可
-
----
+![Wi-Fi 手柄映射](images/Wi-Fi手柄映射.jpeg)
 
 ## 隐藏功能
 
-> **隐藏游戏**(GB / GBC / NES / Arduboy):
+**隐藏游戏**（GB / GBC / NES / ArduBoy）：设置 →「请作者喝杯水」→ 在赞助图上连按确认键 5 次。
 
-1. 主菜单 → **设置** → **「请作者喝杯水」**(全屏赞助图)
-2. 赞助图上**连按确认键 5 次**
-3. 返回主菜单即可看到这些引擎图标
+**隐藏设置**（音频方案 / 禁用触摸）：设置 → 系统信息 → 在「BY: LinIT」一行连点 5 次。
 
-> **隐藏设置**(音频方案 / 禁用触摸屏):
+## 硬件
 
-1. 主菜单 → **设置** → **系统信息**
-2. 在 **「BY: LinIT」** 一行**连点 5 次**
-3. 弹出隐藏设置(音频方案、禁用触摸屏)
+三块板共用同一份固件，开机自动识别。
 
----
-
-## 硬件说明
-
-**同一份固件支持以下三种硬件版本**,开机自动识别板型,无需手动选板。
-
-| 功能 | ① 小智集成板 | ② 微雪原版 | ③ 标准扩展板 |
+| 功能 | ① 小智一体版 | ② 微雪原版 | ③ 标准扩展版 |
 |---|---|---|---|
-| **主控** | 小智 ESP32-S3-AI-2E 模块 | 板载 ESP32-S3 | 官方标准 ESP32-S3 模块 |
-| **LCD(ST7305 400×300 1bit 反射)** | DC=7 CS=11 SCK=9 MOSI=10 **RST 不接** | DC=5 CS=40 SCK=11 MOSI=12 **RST=41** | 同 ② |
-| **触摸** | CST816, SDA=5 SCL=13 INT=12 RST=6 | **无** | CST816, SDA=15 SCL=7 INT=17 RST=2 |
-| **音频解码** | **ES8311**(模块内), I2C SDA=38 SCL=47 | **ES8311**, I2C SDA=13 SCL=14 | **NS4168**(纯功放, 无 I2C) |
-| **麦克风** | **ES7210**(模块内) | 无 | 按需外接 |
-| **I2S** | MCLK=40 BCLK=39 WS=45 DOUT=48 DIN=21 | MCLK=16 BCLK=9 WS=45 DOUT=8 DIN=10 | BCLK=9 WS=45 SDATA=8 (**无 MCLK**) |
-| **功放使能(PA)** | GPIO46 | GPIO46 | GPIO46 |
-| **充电 / 降压** | **模块内集成** | 板载 | **需自行外加** |
-| **电池 ADC** | GPIO3 (ADC1_CH2) | GPIO4 (ADC1_CH3) | 同 ② |
-| **震动马达** | GPIO8 (PWM) | GPIO48 (PWM) | 同 ② |
-| **TF 卡(SDMMC 1-bit)** | CLK=16 CMD=15 D0=17 | CLK=38 CMD=21 D0=39 | 同 ② |
-| **GPS(可选)** | TX=43 RX=44 EXTINT=18 | 无 | 可选 |
-| **识别指纹** | I2C `38/47` 上有 `0x18`(ES8311) | I2C `13/14` 上有 `0x18` | I2C `15/7` 上有 `0x15`(CST816) |
+| 主控 | 小智 ESP32-S3-AI-2E 模块 | 板载 ESP32-S3 | 官方标准 ESP32-S3 模块 |
+| LCD DC/CS/SCK/MOSI/RST | 7/11/9/10/**不接** | 5/40/11/12/**41** | 同 ② |
+| 触摸 | CST816 5/13/12/6 | **无** | CST816 15/7/17/2 |
+| 音频解码 | ES8311（模块内），I2C 38/47 | ES8311，I2C 13/14 | NS4168 纯功放（无 I2C） |
+| 麦克风 | ES7210（模块内） | 无 | 按需外接 |
+| I2S MCLK/BCLK/WS/DOUT/DIN | 40/39/45/48/21 | 16/9/45/8/10 | 无/9/45/8/无 |
+| 功放使能 | GPIO46 | GPIO46 | GPIO46 |
+| 充电 / 降压 | 模块内集成 | 板载 | 自行外加 |
+| 电池 ADC | GPIO3 | GPIO4 | 同 ② |
+| 震动 | GPIO8 | GPIO48 | 同 ② |
+| TF 卡（SDMMC 1-bit） | 16/15/17 | 38/21/39 | 同 ② |
+| GPS（可选） | TX=43 RX=44 EXTINT=18 | 无 | 可选 |
+| 识别指纹 | 38/47 有 `0x18` | 13/14 有 `0x18` | 15/7 有 `0x15` |
 
-MCU:**ESP32-S3**(240MHz, 8MB PSRAM, 16MB Flash)。
+MCU：ESP32-S3，240 MHz，8 MB PSRAM，16 MB Flash。引脚以 `components/drivers/board_pins` 为准。
 
-> ⚠️ **ESP32-S3 开发模组注意**:若使用裸模组/开发板无法启动,请确认 **EN 脚已上拉到 3.3V**
-> (部分模组 EN 未做上拉,会导致完全无法启动),必要时外接 10kΩ 上拉到 3.3V。
-
-### ② 微雪原版 — Waveshare ESP32-S3-RLCD-4.2 开发板
-
-可直接烧录使用,自带屏幕。**该板无触摸屏**,需按键操作(建议配蓝牙手柄)。
-原理图:`docs/ESP32-S3-RLCD-4.2-schematic.pdf`。
+- **① 小智一体版**：模块自带充电/降压/功放/解码/麦克风，配自绘载板。
+- **② 微雪原版**（[ESP32-S3-RLCD-4.2](https://www.waveshare.com/esp32-s3-rlcd-4.2.htm)）：自带屏幕，无触摸，插卡即用。
+- **③ 标准扩展版**：官方模块 + 自行扩展外设。
 
 ![微雪正面](images/微雪ESP32-S3-RLCD-4.2正面图片.jpeg)
 
-### ① 小智集成板 — 拼多多「拼音学练机」改造(本项目实际硬件)
-
-拆机换 ESP32-S3,接线如下:
-
 ![拼音学习机正面](images/拼音学习机正面图.jpeg)
-
 ![内部布局](images/内部布局图.jpeg)
-
-| 外设 | 引脚 | 说明 |
-|---|---|---|
-| 屏幕 ST7305 | DC=5, CS=40, SCK=11, MOSI=12, RST=41 | SPI2, 400×300 1bit 反射式(**TE 不接**) |
-| 触摸屏 | SDA=15, SCL=7, INT=17, RST=2 | 自动识别 GT911 / CST816 / FT6236 |
-| TF 卡 | CMD=21, CLK=38, D0=39 | SDMMC 1bit |
-| 按键 ×3 | BOOT=GPIO0, KEY=GPIO18, PWR=GPIO1 | 右/返回, 确认/多功能, 锁屏/关机 |
-| 声音 | GPIO48 → AXS2005B 功放 → 喇叭(方波 PWM) | 也可接 ES8311 解码 |
-| USB 电源 | AMS1117(5V→3.3V) + 充放电模块 | 供电 / 电池充电 |
-
-> **接线提醒**:触摸 INT/RST 必须接(否则触摸失效);功放使能 PA=46;
-> 若不接 ES8311 解码器,到「隐藏设置」把音频方案设为**「方波直驱(PWM)」**或**「禁用」**。
-
-**主板测试点定义**(焊接参考):
-
-![测试点定义图](images/测试点定义图.jpg)
-
-### ③ 标准扩展板
-
-主控用**官方标准 ESP32-S3 模块**,**充电 / 降压 / 功放 / 解码 / 麦克风按需自行扩展**,适合自由配置。
-
-> **同一份固件自动识别板型**:开机探测各板独有芯片(I2C 上的音频解码 / 触摸芯片等)判定版本,
-> 自动套用对应引脚表,无需手动选板。识别不到的硬件不会初始化(例如没焊 GPS 就不会占用串口),
-> 也可在「设置 → 网络与系统 → 硬件管理」里手动开关。
-
----
+![测试点定义](images/测试点定义图.jpg)
 
 ## 打板与采购
 
-- **PCB 工程文件（嘉立创 EDA）**：`hardware/LinTOS_2026-10-17.epro` —— 用嘉立创 EDA 专业版打开，可直接导出 Gerber 下单打样
-- **两个版本 3D 渲染图**：`hardware/images/pcb-xiaozhi.png`（小智集成板）· `hardware/images/pcb-standard.png`（标准扩展板）
-- **各版本需要采购的配件清单**：→ [hardware/README.md](hardware/README.md)
+硬件资料在仓库 [`hardware/`](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/tree/main/hardware)：
 
-> 懒得打板？直接下 `LinTOS-v1.4-16MB.bin` 刷到微雪原板（ESP32-S3-RLCD-4.2）即可，无需任何硬件改动。
+| 资料 | 直接打开 |
+|---|---|
+| PCB 工程（嘉立创 EDA，可导出 Gerber） | [LinTOS_2026-10-17.epro](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/LinTOS_2026-10-17.epro) |
+| 原理图 | [schematic.pdf](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/schematic.pdf) |
+| 3D 渲染图 | [小智一体版](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/pcb-xiaozhi.png) · [标准扩展版](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/pcb-standard.png) |
+| 采购清单 | [hardware/README.md](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/README.md) |
 
-## 讨论 / 交流
+## 讨论
 
-有问题、想讨论改进，欢迎加 **QQ 群**：
+QQ 群 **1128448441**
 
-**1128448441**
-
-![QQ群二维码](hardware/images/qq-group.png)
+![QQ群二维码](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/qq-group.png?raw=true)
 
 ## 目录结构
 
 ```
-├── main/                    # 主循环: 渲染 / 输入 / 屏保 / 软关机
-├── components/
-│   ├── menu/                # 菜单、应用管理、设置、壁纸、收藏、蓝牙、诊断、配置
-│   ├── engine_manager/      # 引擎统一管理(用时载入、退出释放)
-│   ├── gam4980/             # BBK 电子词典引擎
-│   ├── gb_emu/ gbc_emu/     # GB / GBC 引擎
-│   ├── nes_emu/             # NES 引擎
-│   ├── arduboy/ arduboy_avr/# Arduboy 引擎 + 内置迷你游戏
-│   ├── lavax/               # 文曲星 LavaX 引擎
-│   ├── vpet/                # 暴龙机(虚拟宠物)引擎
-│   ├── book_reader/         # 电子书阅读器
-│   ├── usb_hid/             # USB 仿真键鼠
-│   ├── usbh_msc/            # TF 卡挂载
-│   ├── self_test/           # 硬件自检 / 显示测试
-│   ├── audio_player/ tone_player/  # 音频(解码 / 方波)
-│   ├── st7305/ board_shim/  # LCD 驱动 / 画面缩放灰度
-│   ├── touch_panel/ input/  # 触摸驱动 / 手势
-│   ├── virtual_keys/        # 屏幕虚拟按键
-│   └── web_gamepad/ dns_server/  # 网页手柄 / 热点
-├── flash/                   # 在线刷写页面 + 16MB 固件镜像
-├── system_image/            # BBK 词典系统 ROM
-├── tools/                   # 图标 / 字库生成脚本、日志工具
-├── docs/                    # 交接 / 架构文档
-├── CHANGELOG.md             # 版本更新日志
-├── sdkconfig.defaults       # 构建配置
-├── partitions.csv           # 分区表
-├── build.sh                 # 一键构建
-├── merge_flash.sh           # 合并 16MB 镜像
-└── pack_firmware.sh         # 固件打包
+main/            启动流程 / 主循环 / 串口控制台(remcon)
+components/
+  apps/          L4 应用页 + 应用注册表 + Lua 桥
+  engines/       L3 模拟器内核
+  system/        L2 os 内核 / input / engine_manager / app_board
+  services/      L1 蓝牙 · WiFi · USB · 音频 · 网络 · 硬件配置
+  ui/            L1 UI 绘制 / 字库 / 键盘 / 壁纸
+  drivers/       L0 LCD · 触摸 · SD · 板型表 · 电池 · GPS
+  libs/          calc · lua
+docs/            架构 / 板型 IO / 地图 / 频谱仪
+apps/ store/     Lua 应用源 + 商店索引
+system_image/    BBK 词典系统 ROM
+tools/           图标 / 字库 / 商店索引 / 抓屏脚本
+dist/            构建产物
 ```
-
----
 
 ## 构建
 
-要求 ESP-IDF **v5.5.x**:
+ESP-IDF v5.5.x：
 
 ```bash
-idf.py build        # 构建
-./build.sh          # 一键构建 (fullclean + 合并 16MB 镜像)
+./build.sh          # 一键构建 + 合并 16MB 镜像
 ```
 
 ## 烧录
 
-> ⚠️ **必须整片烧录 16MB**(`0x0 merged_16mb.bin`)。**中文字库在 `apps` 分区**(`0xC00000`)——
-> 只烧 `app`(分段烧)会出现**图标正常但文字全空**,这是最容易踩的坑。
-
-分区真相源是 **[`partitions.csv`](partitions.csv)**(16MB),常用地址:
-
-| 目标 | 烧录地址 | 说明 |
-|---|---|---|
-| `build/LinTOS.bin` | **`0x60000`** | 系统固件(factory, 5MB) |
-| `build/apps_l.bin` | **`0xC00000`** | Lua 应用区(SPIFFS, 4MB) |
-| `dist/merged_16mb.bin` | **`0x0`** | 完整镜像(新设备 / 含系统 ROM) |
-
-**方式一: 只更新固件(分区不变)**
 ```bash
 python -m esptool --chip esp32s3 -b 460800 write_flash \
   --flash_mode dio --flash_size 16MB --flash_freq 80m \
-  0x60000 build/LinTOS.bin
+  0x0 dist/merged_16mb.bin
 ```
 
-**方式二: 完整 16MB 镜像** — `./merge_flash.sh` 生成 `dist/merged_16mb.bin` 后烧 `0x0`。
+| 目标 | 地址 |
+|---|---|
+| 完整镜像 `dist/merged_16mb.bin` | `0x0` |
+| 固件 `build/LinTOS.bin` | `0x60000` |
+| 应用区 `build/apps_l.bin` | `0xC00000` |
 
-## 系统 ROM
-
-BBK 词典需要系统 ROM `8.BIN` + `E.BIN`(在 `system_image/`)。`./merge_flash.sh` 会自动把它们
-按 `appdata` 分区内的固定槽位写入(`8.BIN` @ `0x560000`、`E.BIN` @ `0x760000`):
-
-```bash
-./merge_flash.sh
-```
-
-> 注意: `idf.py flash` **不会**更新 `appdata`/`apps` 分区,系统 ROM 与字库必须走 `merge_flash.sh`。
-
-版本变更见 **[CHANGELOG.md](CHANGELOG.md)**。
-
----
+分区表见 [partitions.csv](partitions.csv)。版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 版权与参考
 
-感谢以下开源项目,以及感谢 AI 与 **DeepSeek**:
-
-- **BBK 4988 内核**: [gam4980](https://github.com/ThisBoringWorld/gam4980)
-- **GB/GBC、NES**: [esp-box-emu](https://github.com/espressif/esp-box-emu)(gnuboy、noFrendo)
-- **Ab 模拟器适配**: 精简自 [UVE5](https://github.com/losehu/UVE5)
-- 部分界面/模拟器思路参考 **esp32-s3-rlcd-gb-emulator**
-- 开发交接文档见 `docs/HANDOVER.md`
+- **BBK 4988 内核**：[gam4980](https://github.com/ThisBoringWorld/gam4980)
+- **GB/GBC、NES**：[esp-box-emu](https://github.com/espressif/esp-box-emu)
+- **ArduBoy 适配**：[UVE5](https://github.com/losehu/UVE5)
