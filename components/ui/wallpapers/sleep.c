@@ -224,6 +224,18 @@ void wp_power_off(int origin)
     esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL,         ESP_PD_OPTION_OFF);
     esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO,      ESP_PD_OPTION_OFF);
 
+    /* ★★★ 2026-10-18 linit: 微雪 LCD RST(GPIO41) 平时被强制拉高("释放"电平),
+     *   深睡前把它**拉低**并保持 —— 屏已 deinit, RST 高会让面板复位电路持续耗电 ✓
+     *   (其他板 lcd_rst 不接/不同, 不动) */
+    {
+        const board_pins_t *bpw2 = board_pins_get();
+        if (bpw2->id == BOARD_ID_WEIXUE && bpw2->lcd_rst >= 0) {
+            gpio_set_level((gpio_num_t)bpw2->lcd_rst, 0);
+            gpio_hold_en((gpio_num_t)bpw2->lcd_rst);   /* 深睡期间保持低 */
+            ESP_LOGI(TAG, "微雪: LCD RST(GPIO%d) 已拉低并 hold(省电)", bpw2->lcd_rst);
+        }
+    }
+
     /* ★ 屏幕进低功耗(SPI 停 + 面板待机): 原来只清屏没 deinit ⇒ 面板还在扫描,
      *   实测 ST7305 正常工作 ~50-100µA, 待机 ~1-5µA ✓ (清屏已在上面做过) */
     if (s_lcd) {

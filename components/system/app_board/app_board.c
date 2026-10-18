@@ -102,6 +102,20 @@ esp_err_t app_board_init(app_board_t *board)
         return ret;
     }
     ESP_LOGI(TAG, "ST7305 初始化成功");
+
+    /* ★★★ 2026-10-18 linit: **微雪版 LCD RST(GPIO41) 必须常拉高** ——
+     *   微雪 RLCD 面板的 RESET 是"高有效(释放)"脚, 初始化完成后必须由固件
+     *   强制输出高电平并保持; 否则面板可能回到未释放状态 ⇒ 花屏/全黑/触摸异常。
+     *   ⛔ **只有微雪这么做** —— 小智模块的屏 RST 不接(lcd_rst = -1), 标准扩展也不同 ✓
+     *   ⛔ 睡眠时例外: sleep.c 深睡前会把它拉低省电(屏已 deinit) ✓ */
+    {
+        const board_pins_t *bpw = board_pins_get();
+        if (bpw->id == BOARD_ID_WEIXUE && bpw->lcd_rst >= 0) {
+            gpio_set_direction((gpio_num_t)bpw->lcd_rst, GPIO_MODE_OUTPUT);
+            gpio_set_level((gpio_num_t)bpw->lcd_rst, 1);      /* 保持高 = 释放复位 */
+            ESP_LOGW(TAG, "微雪: LCD RST(GPIO%d) 已强制拉高并保持", bpw->lcd_rst);
+        }
+    }
     /* ★★★ 2026-10-16 关键修复(第2处): 屏保门禁。
      *   wallpapers.c 屏保激活时会 st7305_set_flush_blocked(true), 此后**所有普通
      *   st7305_flush 在第一行就 return ESP_OK(静默丢弃)** ⇒ 屏收不到任何数据 ⇒ 全黑且无报错。
