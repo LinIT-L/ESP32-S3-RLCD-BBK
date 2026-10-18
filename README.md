@@ -18,6 +18,22 @@
 | 输入 | BLE 手柄、Wi-Fi 网页手柄、触摸手势、三个物理按键 |
 | 显示 | 400×300 单色反射屏，无背光，断电保留画面 |
 
+## 演示
+
+<sub>真机操作：主菜单 → 应用中心 → 商店</sub>
+
+<img src="images/demo/ui-tour.gif" width="360" alt="操作演示">
+
+<sub>实机与系统界面</sub>
+
+<img src="images/demo/photo-tour.gif" width="360" alt="实机演示">
+
+<sub>BBK 词典运行游戏</sub>
+
+<img src="images/demo/bbk-game.png" width="360" alt="三国坛说">
+
+手持演示视频：[MP4](images/demo/handheld.mp4)（600 宽，2 MB）· [GIF](images/demo/handheld.gif)（5.6 MB）
+
 ## 操作
 
 | 按键 / 手势 | 短按 | 长按 |
@@ -93,6 +109,17 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 
 <img src="https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/qq-group.png?raw=true" width="120" height="120" alt="QQ 群">
 
+## 烧录
+
+```bash
+python -m esptool --chip esp32s3 -b 460800 write_flash \
+  --flash_mode dio --flash_size 16MB --flash_freq 80m \
+  0x0 dist/merged_16mb.bin
+```
+
+- `dist/merged_16mb.bin`（完整镜像）→ `0x0`
+- `build/LinTOS.bin`（固件）→ `0x60000`
+- `build/apps_l.bin`（应用区）→ `0xC00000`
 
 ## 目录结构
 
