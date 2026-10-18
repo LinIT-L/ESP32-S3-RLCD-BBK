@@ -211,8 +211,8 @@ async function downloadFirmware() {
     if (src === 'site') {
       urls = [ FW_SITE_BASE + 'LinTOS-' + String(tag).replace(/^v/, 'v') + '-16MB.bin' ];
     } else {
-      urls = [ 'https://raw.githubusercontent.com/' + REPO + '/main/flash/merged_16mb.bin',
-               'https://cdn.jsdelivr.net/gh/' + REPO + '@main/flash/merged_16mb.bin' ];
+      urls = [ 'https://cdn.jsdelivr.net/gh/' + REPO + '@main/flash/merged_16mb.bin',
+               'https://raw.githubusercontent.com/' + REPO + '/main/flash/merged_16mb.bin' ];
     }
     for (const u of urls) {
       status.textContent = '正在下载 ' + verLabel + ' 固件…';
