@@ -9,6 +9,8 @@ ESP32-S3 + ST7305 400×300 1bit 反射屏掌机固件，一份固件支持三种
 | 显示 GB / GBC / NES / ArduBoy 图标 | 设置 →「请作者喝杯水」→ 赞助图连按确认 5 次 |
 | 音频方案 / 禁用触摸 | 设置 → 系统信息 →「BY: LinIT」连点 5 次 |
 
+[![在线刷机](https://bbk.linit.cn/fw/card.svg)](https://bbk.linit.cn/fw/flash.html)
+
 ## 功能
 
 | 类别 | 内容 |
@@ -40,7 +42,7 @@ ESP32-S3 + ST7305 400×300 1bit 反射屏掌机固件，一份固件支持三种
 
 **Wi-Fi 网页手柄**：开热点 `BBK-WIFI-handle`，手机连接后浏览器打开 `http://8.8.8.8`。
 
-![Wi-Fi 手柄映射](images/Wi-Fi手柄映射.jpeg)
+![Wi-Fi 手柄映射](images/wifi-gamepad.png)
 
 ## 硬件
 
