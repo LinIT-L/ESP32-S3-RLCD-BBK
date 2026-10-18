@@ -77,14 +77,6 @@ Wi-Fi 网页手柄：开热点 `BBK-WIFI-handle`，手机浏览器打开 `8.8.8.
 
 ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/drivers/board_pins`。
 
-<sub>微雪 ESP32-S3-RLCD-4.2 正面</sub>
-
-<img src="images/微雪ESP32-S3-RLCD-4.2正面图片.jpeg" width="500" alt="微雪正面">
-
-<sub>DIY 拼音学习机 正面</sub>
-
-<img src="images/拼音学习机正面图.jpeg" width="500" alt="拼音学习机正面">
-
 <sub>主板测试点定义</sub>
 
 <img src="images/测试点定义图.jpg" width="500" alt="测试点定义">
