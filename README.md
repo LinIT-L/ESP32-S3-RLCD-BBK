@@ -7,8 +7,6 @@
 - 显示 GB / GBC / NES / ArduBoy 图标：设置 →「请作者喝杯水」→ 赞助图连按确认 5 次
 - 音频方案 / 禁用触摸：设置 → 系统信息 →「BY: LinIT」连点 5 次
 
-[![在线刷机](https://bbk.linit.cn/fw/card.svg)](https://bbk.linit.cn/fw/flash.html)
-
 ## 功能
 
 | 类别 | 内容 |
