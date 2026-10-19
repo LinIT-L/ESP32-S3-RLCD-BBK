@@ -81,7 +81,7 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 
 | 资料 | 链接 |
 |---|---|
-| PCB 工程（嘉立创 EDA 专业版） | [LinTOS_2026-10-17.epro](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/LinTOS_2026-10-17.epro) |
+| PCB 工程（嘉立创 EDA 专业版） | [LinTOS_2026-10-19.epro](https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/hardware/LinTOS_2026-10-19.epro) |
 | 原理图 | [schematic.pdf](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/schematic.pdf) |
 | BOM 清单 | [hardware/README.md](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/README.md) |
 
