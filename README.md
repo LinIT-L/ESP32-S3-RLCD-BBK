@@ -79,6 +79,8 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 
 ## 打板与采购
 
+> ⚠️ **自己打板：PCB 厚度必须选 0.8 mm**。
+
 | 资料 | 链接 |
 |---|---|
 | PCB 工程（嘉立创 EDA 专业版） | [LinTOS_2026-10-19.epro](https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/hardware/LinTOS_2026-10-19.epro) |
