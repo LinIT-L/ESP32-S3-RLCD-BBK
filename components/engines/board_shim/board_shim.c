@@ -501,7 +501,7 @@ static const uint8_t s_scatter[4][4] = {
     /* shade 2 (中灰): 2 黑 (左上+右下, 对角散点) */
     { ST7305_COLOR_BLACK, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK },
     /* shade 3 (深灰): 3 黑 (右下外全黑) */
-    { ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK },
+    { ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_WHITE },
 };
 
 /* 纯黑白: shade>=2 为黑, 否则白 */
@@ -596,9 +596,26 @@ static inline uint8_t board_rlcd_rgb565_be_to_gbc_shade(uint16_t rgb565_be)
     uint8_t b5 = (uint8_t)(rgb & 0x1FU);
     uint16_t gray = (uint16_t)(r5 * 38U + g6 * 75U + b5 * 15U);
 
-    if (gray >= 4800U) return 0;
-    if (gray >= 3200U) return 1;
-    if (gray >= 1600U) return 2;
+    /* 分界取"相邻两档实际显示亮度"的中点, 而不是把量程四等分.
+     * 每档 2x2 图案的白点占比决定其实际亮度 (量程满分 6368 = 31*38+63*75+31*15):
+     *   点聚 s_cluster_4 : shade 0/1/2/3 → 白 4/4, 3/4, 2/4, 0/4 → 6368, 4776, 3184, 0
+     *   散点 s_scatter   : shade 0/1/2/3 → 白 4/4, 3/4, 2/4, 1/4 → 6368, 4776, 3184, 1592
+     *   纯黑白 s_cluster_bw: shade 0/1 → 白, shade 2/3 → 黑 → 6368, 0
+     * 对应中点: 点聚 {5572, 3980, 1592} / 散点 {5572, 3980, 2388} / 纯黑白 {3184}.
+     * 原实现 4800/3200/1600 是量程四等分(=1600 的整数倍), 与中点差 772/788 灰阶(≈12%):
+     * [4800,5572) 的亮部被并成纯白 (高光细节丢失), [3200,3980) 的中灰被并成浅灰 (画面发灰). */
+    if (g_gb_gray == 0) {
+        return (gray >= 3184U) ? 0 : 3;   /* 两档: 白/黑中点 */
+    }
+    if (g_gb_gray == 2) {
+        if (gray >= 5572U) return 0;
+        if (gray >= 3980U) return 1;
+        if (gray >= 2388U) return 2;      /* (3184+1592)/2 */
+        return 3;
+    }
+    if (gray >= 5572U) return 0;          /* 点聚: (6368+4776)/2 */
+    if (gray >= 3980U) return 1;          /* (4776+3184)/2 */
+    if (gray >= 1592U) return 2;          /* (3184+0)/2 */
     return 3;
 }
 
