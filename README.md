@@ -73,6 +73,18 @@ Wi-Fi 网页手柄：开热点 `BBK-WIFI-handle`，手机浏览器打开 `8.8.8.
 
 ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/drivers/board_pins`。
 
+### 三个方案怎么选
+
+| | ① 小智一体版 | ② 微雪原版 | ③ 标准扩展版 |
+|---|---|---|---|
+| 优点 | 带麦克风、可加 GPS、有触摸 | 扩展性强、18650 大电池 | 可加 GPS、有触摸 |
+| 缺点 | 电池偏小 | **无触摸、无震动**、体积大、屏脆 | 电池偏小、无麦克风 |
+| 适合谁 | 想要一台完整掌机 | 不想焊、只想刷固件 | 手上有拆机件、自己配外设 |
+| 要打板吗 | 要（0.8 mm） | 不用，买成品板 | 要（0.8 mm） |
+
+> 三个方案**共用同一份固件**，开机探 I2C 指纹自动认板型，不需要分开编译。
+
+
 <sub>主板测试点定义</sub>
 
 <img src="images/测试点定义图.jpg" width="500" alt="测试点定义">
@@ -86,6 +98,30 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 | PCB 工程（嘉立创 EDA 专业版） | [LinTOS_2026-10-19.epro](https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/hardware/LinTOS_2026-10-19.epro) |
 | 原理图 | [schematic.pdf](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/schematic.pdf) |
 | BOM 清单 | [hardware/README.md](https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/README.md) |
+
+**采购清单（精简版）**：✅ = 需要买；拆旧 = 从一台「拼音学练机」拆下来复用，不用另买。
+
+| 配件 | 型号 / 规格 | 数量 | 小智版 | 标准版 |
+|---|---|---|---|---|
+| 主控模块 | 小智 ESP32-S3-AI-2E（先问卖家有没有） | 1 | ✅ | — |
+| 主控模块 | ESP32-S3-WROOM-1 N16R8 | 1 | — | ✅ |
+| 震动马达 | 1508 线性马达 | 1 | ✅ | ✅ |
+| 马达驱动 | TM6604（SOT-23-6） | 1 | ✅ | ✅ |
+| 电源芯片 | UMW TP4057（SOT-23-6） | 1 | — | ✅ |
+| 解码功放 | NS4168（ESOP8，2.5 W，I2S） | 1 | — | ✅ |
+| 降压芯片 | SY8088AAC（丝印 LD，SOT-23-5） | 1 | — | ✅ |
+| 电感 | 2.2 µH（印字 2R2） | 1 | — | ✅ |
+| 电阻 | 10 kΩ ×5、5.1 kΩ ×2、4.7 kΩ ×2 | 1 批 | ✅ | ✅ |
+| 屏幕连接器 | 0.3 mm FPC 插座 21P 翻盖下接 | 1 | 拆旧 | 拆旧 |
+| 屏幕排线座 | HC-0.8-2PWT | 3 | 拆旧 | 拆旧 |
+| 麦克风 | 4013 贴片咪头 | 2 | 拆旧 | 拆旧 |
+| TYPE-C | 母座 16P 沉板 1.6 | 1 | 拆旧 | 拆旧 |
+| 存储卡座 | microSD 自弹座 | 1 | 拆旧 | 拆旧 |
+| 轻触开关 | 3×4×2 mm | 3 | 拆旧 | 拆旧 |
+| GPS（可选） | MAX-M10S-00B-01 | 1 | 选配 | 选配 |
+
+> 显示屏为 ST7305 4.2″ 400×300 单色反射屏，同样来自拆机件，未单列。型号拿去淘宝搜即可。
+
 
 <sub>PCB 图片 — 小智一体版</sub>
 
