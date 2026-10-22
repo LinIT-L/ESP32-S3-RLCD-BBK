@@ -4,6 +4,10 @@
 
 **在线刷机**：https://linit-l.github.io/ESP32-S3-RLCD-BBK/flash/ （Chrome / Edge 打开，USB 直刷 16 MB）
 
+交流群 **1128448441**
+
+<img src="https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/qq-group.png?raw=true" width="120" height="120" alt="QQ 群">
+
 ## 隐藏功能
 
 - 显示 GB / GBC / NES / ArduBoy 图标：设置 →「请作者喝杯水」→ 赞助图连按确认 5 次
@@ -51,44 +55,6 @@ Wi-Fi 网页手柄：开热点 `BBK-WIFI-handle`，手机浏览器打开 `8.8.8.
 <a href="images/wifi-gamepad.png"><img src="images/wifi-gamepad.png" width="200" height="200" alt="Wi-Fi 手柄映射"></a><br>
 <sub>Wi-Fi 网页手柄映射</sub>
 
-## 硬件
-
-| 项 | ① 小智一体版 | ② 微雪原版 | ③ 标准扩展版 |
-|---|---|---|---|
-| 主控 | 小智 ESP32-S3-AI-2E 模块 | 板载 ESP32-S3 | 标准 ESP32-S3 模块 |
-| 供电 / 充电 | 模块内置 | 板载 18650 + 充电 | UMW TP4057 |
-| LCD DC/CS/SCK/MOSI/RST | 7/11/9/10/**不接** | 5/40/11/12/**41** | 同 ② |
-| 触摸 | CST816 5/13/12/6 | 无 | CST816 15/7/17/2 |
-| 解码 / 放大 | ES8311 (I2C 38/47) | ES8311 (I2C 13/14) | NS4168 (ESOP8) |
-| 麦克风 | ES7210（模块内） | 无 | 外接 |
-| I2S MCLK/BCLK/WS/DOUT/DIN | 40/39/45/48/21 | 16/9/45/8/10 | —/9/45/8/— |
-| 功放使能 | GPIO46 | GPIO46 | GPIO46 |
-| 电池 ADC | GPIO3 | GPIO4 | 同 ② |
-| 震动 | GPIO8 | GPIO48 | GPIO48 |
-| 震动驱动 / 马达 | TM6604 (SOT-23-6) + 1508 脉冲 X 轴线性马达 | 同 ① | 同 ① |
-| TF 卡（SDMMC 1-bit） | 16/15/17 | 38/21/39 | 同 ② |
-| 按键 KEY/BOOT/PWR | 4 / 0 / 1 | 18 / 0 / —（电源锁存 IC） | 18 / 0 / 1 |
-| GPS（可选） | MAX-M10S-00B-01（TX43 RX44 EXTINT18） | 无 | MAX-M10S-00B-01 |
-| 板型指纹 | I2C 38/47 有 `0x18` | I2C 13/14 有 `0x18` | I2C 15/7 有 `0x15` |
-
-ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/drivers/board_pins`。
-
-### 三个方案怎么选
-
-| | ① 小智一体版 | ② 微雪原版 | ③ 标准扩展版 |
-|---|---|---|---|
-| 优点 | 带麦克风、可加 GPS、有触摸 | 扩展性强、18650 大电池 | 可加 GPS、有触摸 |
-| 缺点 | 电池偏小 | **无触摸、无震动**、体积大、屏脆 | 电池偏小、无麦克风 |
-| 适合谁 | 想要一台完整掌机 | 不想焊、只想刷固件 | 手上有拆机件、自己配外设 |
-| 要打板吗 | 要（0.8 mm） | 不用，买成品板 | 要（0.8 mm） |
-
-> 三个方案**共用同一份固件**，开机探 I2C 指纹自动认板型，不需要分开编译。
-
-
-<sub>主板测试点定义</sub>
-
-<img src="images/测试点定义图.jpg" width="500" alt="测试点定义">
-
 ## 打板与采购
 
 > ⚠️ **自己打板：PCB 厚度必须选 0.8 mm**。
@@ -122,7 +88,6 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 
 > 显示屏为 ST7305 4.2″ 400×300 单色反射屏，同样来自拆机件，未单列。型号拿去淘宝搜即可。
 
-
 <sub>PCB 图片 — 小智一体版</sub>
 
 <img src="hardware/images/pcb-xiaozhi.png" width="420" alt="PCB 小智一体版">
@@ -131,9 +96,42 @@ ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/d
 
 <img src="hardware/images/pcb-standard.png" width="420" alt="PCB 标准扩展版">
 
-交流群 **1128448441**
+## 硬件
 
-<img src="https://github.com/LinIT-L/ESP32-S3-RLCD-BBK/blob/main/hardware/images/qq-group.png?raw=true" width="120" height="120" alt="QQ 群">
+| 项 | ① 小智一体版 | ② 微雪原版 | ③ 标准扩展版 |
+|---|---|---|---|
+| 主控 | 小智 ESP32-S3-AI-2E 模块 | 板载 ESP32-S3 | 标准 ESP32-S3 模块 |
+| 供电 / 充电 | 模块内置 | 板载 18650 + 充电 | UMW TP4057 |
+| LCD DC/CS/SCK/MOSI/RST | 7/11/9/10/**不接** | 5/40/11/12/**41** | 同 ② |
+| 触摸 | CST816 5/13/12/6 | 无 | CST816 15/7/17/2 |
+| 解码 / 放大 | ES8311 (I2C 38/47) | ES8311 (I2C 13/14) | NS4168 (ESOP8) |
+| 麦克风 | ES7210（模块内） | 无 | 外接 |
+| I2S MCLK/BCLK/WS/DOUT/DIN | 40/39/45/48/21 | 16/9/45/8/10 | —/9/45/8/— |
+| 功放使能 | GPIO46 | GPIO46 | GPIO46 |
+| 电池 ADC | GPIO3 | GPIO4 | 同 ② |
+| 震动 | GPIO8 | GPIO48 | GPIO48 |
+| 震动驱动 / 马达 | TM6604 (SOT-23-6) + 1508 脉冲 X 轴线性马达 | 同 ① | 同 ① |
+| TF 卡（SDMMC 1-bit） | 16/15/17 | 38/21/39 | 同 ② |
+| 按键 KEY/BOOT/PWR | 4 / 0 / 1 | 18 / 0 / —（电源锁存 IC） | 18 / 0 / 1 |
+| GPS（可选） | MAX-M10S-00B-01（TX43 RX44 EXTINT18） | 无 | MAX-M10S-00B-01 |
+| 板型指纹 | I2C 38/47 有 `0x18` | I2C 13/14 有 `0x18` | I2C 15/7 有 `0x15` |
+
+ESP32-S3 · 240 MHz · 8 MB PSRAM · 16 MB Flash。引脚定义见 `components/drivers/board_pins`。
+
+### 三个方案怎么选
+
+| | ① 小智一体版 | ② 微雪原版 | ③ 标准扩展版 |
+|---|---|---|---|
+| 优点 | 带麦克风、可加 GPS、有触摸 | 扩展性强、18650 大电池 | 可加 GPS、有触摸 |
+| 缺点 | 电池偏小 | **无触摸、无震动**、体积大、屏脆 | 电池偏小、无麦克风 |
+| 适合谁 | 想要一台完整掌机 | 不想焊、只想刷固件 | 手上有拆机件、自己配外设 |
+| 要打板吗 | 要（0.8 mm） | 不用，买成品板 | 要（0.8 mm） |
+
+> 三个方案**共用同一份固件**，开机探 I2C 指纹自动认板型，不需要分开编译。
+
+<sub>主板测试点定义</sub>
+
+<img src="images/测试点定义图.jpg" width="500" alt="测试点定义">
 
 ## 烧录
 
