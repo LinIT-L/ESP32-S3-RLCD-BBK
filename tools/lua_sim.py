@@ -93,8 +93,8 @@ FAKE_PUBJSON = '{"ip":"112.5.20.31","prov":"示例省","city":"示例市","isp":
 
 # 假 IP 定位应答 (app.net.fetch_start): 首选 api.ip.sb 给 latitude/longitude,
 # 兜底 ip-api.com 给 lat/lon —— 与 planeradar.lua 的 GEO_URLS 对应
-FAKE_GEO_IPSB   = '{"ip":"112.48.94.33","region":"Fujian","city":"Putian","latitude":25.4310,"longitude":119.0078,"isp":"China Mobile"}'
-FAKE_GEO_IPAPI  = '{"status":"success","country":"\u4e2d\u56fd","regionName":"\u798f\u5efa\u7701","city":"\u8386\u7530\u5e02","lat":25.4310,"lon":119.0078}'
+FAKE_GEO_IPSB   = '{"ip":"112.48.94.33","region":"Beijing","city":"Beijing","latitude":39.9042,"longitude":116.4074,"isp":"China Mobile"}'
+FAKE_GEO_IPAPI  = '{"status":"success","country":"\u4e2d\u56fd","regionName":"\u5317\u4eac\u5e02","city":"\u5317\u4eac\u5e02","lat":39.9042,"lon":116.4074}'
 
 # 假 ADS-B 应答 (app.net.fetch_start/fetch_poll + app.json.pick) —— 字段与 adsb.fi
 # v2 接口 (https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{nm}) 一致,
@@ -109,7 +109,7 @@ FAKE_ADSB = ('{"now":1790951848.001,"resultCount":9,"ptime":0.11,"aircraft":['
              '{"hex":"781122","flight":"CSN3301 ","r":"B-9012","t":"A321","lat":25.62,"lon":119.19,'
              '"alt_baro":36000,"alt_geom":36300,"gs":471.5,"track":95.0,"baro_rate":1280,"squawk":"4512",'
              '"dst":24.6,"dir":2.4,"rssi":-9.9,"ownOp":"China Southern","emergency":"none"},'
-             '{"hex":"781133","flight":"CXA8899 ","r":"B-2345","t":"B737","lat":25.03,"lon":119.73,'
+             '{"hex":"781133","flight":"CXA8899 ","r":"B-2345","t":"B737","lat":39.90,"lon":116.41,'
              '"alt_baro":12400,"alt_geom":12600,"gs":318.7,"track":276.3,"baro_rate":-1920,"squawk":"2244",'
              '"dst":33.1,"dir":91.2,"rssi":-14.0,"ownOp":"Xiamen Air","emergency":"none"},'
              '{"hex":"781144","flight":"CHH7721 ","r":"B-3456","t":"B789","lat":24.66,"lon":119.65,'
@@ -118,13 +118,13 @@ FAKE_ADSB = ('{"now":1790951848.001,"resultCount":9,"ptime":0.11,"aircraft":['
              '{"hex":"781155","flight":"CSZ9001 ","r":"B-4567","t":"A333","lat":25.71,"lon":118.55,'
              '"alt_baro":2900,"alt_geom":3000,"gs":212.4,"track":338.1,"baro_rate":-1024,"squawk":"7012",'
              '"dst":44.8,"dir":286.5,"rssi":-18.2,"ownOp":"Shenzhen Airlines","emergency":"none"},'
-             '{"hex":"781166","flight":"","r":"","t":"","lat":25.05,"lon":119.16,'
+             '{"hex":"781166","flight":"","r":"","t":"","lat":40.02,"lon":116.55,'
              '"alt_baro":"ground","alt_geom":0,"gs":12.0,"track":180.0,"baro_rate":0,"squawk":"1200",'
              '"dst":0.6,"dir":210.0,"rssi":-22.0,"ownOp":"","emergency":"none"},'
              '{"hex":"781177","flight":"CPA301 ","r":"B-KQZ","t":"A35K","lat":24.40,"lon":118.30,'
              '"alt_baro":41000,"alt_geom":41300,"gs":502.1,"track":55.4,"baro_rate":0,"squawk":"3411",'
              '"dst":62.7,"dir":215.8,"rssi":-20.1,"ownOp":"Cathay Pacific","emergency":"none"},'
-             '{"hex":"781188","flight":"NOK888  ","r":"B-7788","t":"B738","lat":25.44,"lon":119.86,'
+             '{"hex":"781188","flight":"NOK888  ","r":"B-7788","t":"B738","lat":40.15,"lon":116.90,'
              '"alt_baro":7600,"alt_geom":7800,"gs":268.3,"track":150.9,"baro_rate":1664,"squawk":"5501",'
              '"dst":47.9,"dir":78.3,"rssi":-17.5,"ownOp":"Thai AirAsia","emergency":"none"}'
              ']}')
@@ -1056,8 +1056,8 @@ class Sim:
         否则地图应用的指标条在模拟器里永远是 "--"。
         """
         t = self.ms / 1000.0
-        lat = 25433500 + int(2500 * math.sin(t / 40.0))       # 微度 (±0.0025° ≈ 280 m)
-        lon = 119011000 + int(2500 * math.cos(t / 40.0))
+        lat = 39904200 + int(2500 * math.sin(t / 40.0))       # 微度 (±0.0025° ≈ 280 m)
+        lon = 116407400 + int(2500 * math.cos(t / 40.0))
         kmh10 = 216 + int(58 * math.sin(t * 0.45))            # 0.1 km/h
         alt = 32 + int(18 * math.sin(t / 25.0))               # 米, 用来验证"爬升迟滞"
         hh, mm, ss = self._clock()

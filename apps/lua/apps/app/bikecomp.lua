@@ -85,6 +85,9 @@ local G = {
   tr_lat = nil, tr_lon = nil,        -- 上一个轨迹点的位置 (判打点间距)
   last_tick = 0,
   track = {}, tr_n = 0, tr_full = false,
+  spd_hist = {}, spd_n = 0,          -- 速度走势 (每 2s 一点)
+  alt_hist = {}, alt_n = 0,          -- 海拔剖面 (每 2s 一点)
+  hist_ms = 0,                       -- 上次采样时间
   hr = nil,             -- 心率 (预留: 后续接 BLE 心率带 / Garmin 手表广播)
   fix = nil,            -- 最新定位快照
   src = "初始化",        -- 数据源角标
@@ -143,7 +146,7 @@ end
 --   ② 单位: latf/lonf 是**度**, 而 dist/111320 得来的增量也是**度**。第一版把"微度增量"
 --      加到"度"变量上, 33 秒后纬度跑到 604°N。
 --   ③ 内部用浮点累加, 只在输出时取整 —— 每步都取整会丢掉不足 1 微度的位移, 距离偏小。
-local SIM = { t0 = nil, t_last = nil, latf = 25.046000, lonf = 119.119000, crs = 0 }
+local SIM = { t0 = nil, t_last = nil, latf = 39.904200, lonf = 116.407400, crs = 0 }  -- 演示轨迹起点: 通用坐标
 
 local function sim_fix()
   local ms = app.millis() or 0
@@ -230,6 +233,17 @@ local function accumulate(fix, dt_ms)
 
   local k = fix.kmh10 or 0
   if k > G.max_kmh10 then G.max_kmh10 = k end
+
+  -- 走势采样: 每 2 秒记一点 (60 点 = 2 分钟窗口), 供主界面走势条与海拔剖面用
+  G.hist_ms = G.hist_ms + dt_ms
+  if G.hist_ms >= 2000 then
+    G.hist_ms = 0
+    local HN = 60
+    G.spd_n = G.spd_n + 1
+    G.spd_hist[((G.spd_n - 1) % HN) + 1] = k
+    G.alt_n = G.alt_n + 1
+    G.alt_hist[((G.alt_n - 1) % HN) + 1] = fix.alt_m or 0
+  end
 end
 
 -- 均速 (0.1km/h, 纯整数算, 避免浮点): dist_dm*3.6/t_s
@@ -240,16 +254,19 @@ local function avg_kmh10()
 end
 
 -- ================= 绘制 =================
+-- 版式参考 Helm One：**左大数字卡 + 右长驻数据列 + 底部走势条**，
+-- 单色屏上没有颜色可用，所以层次全靠「字号 + 留白 + 图案」拉开。
+--
+-- ⚠ 两侧文字都必须走 app.mix：
+--   ① app.textsb 是**纯 ASCII** 字体 → 送汉字画成 '?'；
+--   ② app.zh 是**汉字专用**字体 → 送 ASCII 画成空白。
+--   app.mix 两头都认，用它就不用按内容挑字体。
 
--- 标签 + 数值 一行。
--- ⚠ 两侧都必须走 app.mix, 原因有两条 (都是踩出来的):
---   ① app.textsb 是**纯 ASCII** 字体 → 送汉字画成 '?';
---   ② app.zh 是**汉字专用**字体 → 送 ASCII (如 "HDOP") 画成空白, 标签直接消失。
---      app.mix 两头都认, 用它就不用再按内容挑字体。
-local function cell(x, y, label, value, inv)
+local function kv(xl, xr, y, label, value, inv)
   local on = inv and true or false
-  app.mix(x, y, label, on)
-  app.mix(x + app.mixw(label) + 4, y, value, on)
+  app.mix(xl, y, label, on)
+  local vw = app.mixw(value)
+  app.mix(xr - vw, y, value, on)
 end
 
 local function draw_header(title)
@@ -259,52 +276,110 @@ local function draw_header(title)
   app.hline(0, W - 1, SB_H + 22, BK)
 end
 
--- 大号速度: 8×16 字模 * scale6 = 每字 48×96
-local function draw_speed(fix)
-  local k = fix and fix.kmh10 or 0
-  app.bigc(W // 2, SB_H + 30, fmt_tenth(k), 6, false)
-  app.textsb(W // 2 - 16, SB_H + 130, "km/h", false)
+-- 速度走势条：最近 60 个采样画成竖条，一眼看出"刚才快还是慢"
+local function spd_bar(x0, y0, x1, y1)
+  local n = G.spd_n < 60 and G.spd_n or 60
+  if n < 1 then return end
+  local mx = 1
+  for i = 1, n do
+    local v = G.spd_hist[i] or 0
+    if v > mx then mx = v end
+  end
+  -- 固定柱宽 4px（柱宽随点数变化会让"只有一个采样"变成一整片黑）
+  local bw = 4
+  local cap = (x1 - x0 + 1) // bw
+  local first = (n > cap) and (n - cap + 1) or 1
+  for i = first, n do
+    local h = (y1 - y0) * (G.spd_hist[i] or 0) // mx
+    if h < 3 then h = 3 end                 -- 有速度就至少给 3px，否则看不出来
+    if h > (y1 - y0) then h = y1 - y0 end
+    local bx = x0 + (i - first) * bw
+    app.fill(bx, y1 - h, bx + bw - 2, y1, BK)
+  end
 end
 
+-- 海拔剖面：折线 + 上下刻度
+local function alt_profile(x0, y0, x1, y1)
+  app.rect(x0, y0, x1, y1, BK)
+  local n = G.alt_n < 60 and G.alt_n or 60
+  if n < 2 then
+    app.mixc((x0 + x1) // 2, (y0 + y1) // 2 - 8, "暂无海拔", false)
+    return
+  end
+  local mn, mx = 99999, -99999
+  for i = 1, n do
+    local v = G.alt_hist[i] or 0
+    if v < mn then mn = v end
+    if v > mx then mx = v end
+  end
+  if mx - mn < 5 then mx = mn + 5 end
+  local iw = (x1 - x0) - 10
+  local ih = (y1 - y0) - 12
+  local px, py = nil, nil
+  for i = 1, n do
+    local v = G.alt_hist[i] or 0
+    local x = x0 + 5 + (i - 1) * iw // (n - 1)
+    local y = y1 - 5 - (v - mn) * ih // (mx - mn)
+    if px then
+      local steps = math.max(math.abs(x - px), math.abs(y - py))
+      if steps > 0 then
+        for s = 1, steps do
+          app.px(px + (x - px) * s // steps, py + (y - py) * s // steps, BK)
+        end
+      else
+        app.px(x, y, BK)
+      end
+    else
+      app.px(x, y, BK)
+    end
+    px, py = x, y
+  end
+  app.mix(x1 - 46, y0 + 3, tostring(mx) .. "m", false)
+  app.mix(x1 - 46, y1 - 17, tostring(mn) .. "m", false)
+end
+
+-- ① 主界面：左大速度 + 右五行 + 底部状态
 local function page_main(fix)
-  draw_header("BIKECOMP")
-  draw_speed(fix)
+  draw_header("骑行")
 
-  local y0 = SB_H + 152
-  app.hline(0, W - 1, y0 - 6, BK)
+  local lx0, ly0, lx1, ly1 = 6, SB_H + 28, 250, 244
+  app.rect(lx0, ly0, lx1, ly1, BK)
 
-  local y1, y2 = y0, y0 + 22
-  cell(8,   y1, "里程", fmt_km(G.dist_dm) .. "km")
-  cell(208, y1, "用时", fmt_hms(G.t_ms))
-  cell(8,   y2, "均速", fmt_tenth(avg_kmh10()) .. "km/h")
-  cell(208, y2, "最高", fmt_tenth(G.max_kmh10) .. "km/h")
+  local k = fix and fix.kmh10 or 0
+  app.bigc((lx0 + lx1) // 2, ly0 + 20, fmt_tenth(k), 6, false)
+  app.mixc((lx0 + lx1) // 2, ly0 + 126, "km/h", false)
 
-  app.hline(0, W - 1, y2 + 20, BK)
+  app.hline(lx0 + 10, lx1 - 10, ly0 + 148, BK)
+  spd_bar(lx0 + 10, ly0 + 156, lx1 - 10, ly1 - 8)
 
-  -- 底部状态: 卫星 / 心率(预留) / 数据源
-  local y3 = y2 + 28
+  local rx0, rx1 = 258, 394
+  local y = SB_H + 30
+  kv(rx0, rx1, y, "里程", fmt_km(G.dist_dm) .. "km"); y = y + 26
+  kv(rx0, rx1, y, "用时", fmt_hms(G.t_ms)); y = y + 26
+  kv(rx0, rx1, y, "均速", fmt_tenth(avg_kmh10())); y = y + 26
+  kv(rx0, rx1, y, "最高", fmt_tenth(G.max_kmh10)); y = y + 26
   local sats = fix and fix.sats or 0
-  if fix and fix.valid then
-    cell(8, y3, "卫星", tostring(sats) .. " 颗")
-  else
-    cell(8, y3, "卫星", tostring(sats) .. " 等定位")
-  end
-  local hr = G.hr and (tostring(G.hr) .. " bpm") or "--"
-  cell(208, y3, "心率", hr)
+  kv(rx0, rx1, y, "卫星", tostring(sats), not (fix and fix.valid))
 
-  -- 数据源角标: 一眼看出现在是真 GPS 还是模拟
-  do
-    local sw = app.mixw(G.src)
-    app.mix(W - 6 - sw, H - 14, G.src, false)
+  -- 底部状态条
+  local by = H - 20
+  app.hline(0, W - 1, by - 8, BK)
+  if G.rec then
+    app.fill(8, by + 3, 15, by + 9, BK)
+    app.mix(21, by, "记录中", false)
+  else
+    app.rect(8, by + 3, 15, by + 9, BK)
+    app.mix(21, by, "已暂停", false)
   end
+  app.mix(110, by, G.src, false)
+  app.mixc(W - 62, by, (fix and fix.valid) and "已定位" or "等星", false)
 end
 
--- 面包屑轨迹: 把已存点缩放到方框里
+-- ② 轨迹页：上轨迹图 + 中海拔剖面 + 下三行
 local function page_track(fix)
-  draw_header("TRACK")
+  draw_header("轨迹")
 
-  -- 方框给底部 3 行文字让位: 3 行 × 16px, 从 H-60 起 → 到 H-60+16=H-44 … 末行 H-28+16=H-12
-  local bx0, by0, bx1, by1 = 8, SB_H + 26, W - 9, H - 68
+  local bx0, by0, bx1, by1 = 6, SB_H + 28, 394, 150
   app.rect(bx0, by0, bx1, by1, BK)
 
   local n = G.tr_n < TRACK_MAX and G.tr_n or TRACK_MAX
@@ -328,8 +403,7 @@ local function page_track(fix)
       local p = G.track[i]
       if p then
         local x = bx0 + 4 + ((p[2] - lo0) * iw) // dlo
-        local y = by1 - 4 - ((p[1] - la0) * ih) // dla   -- 纬度向上
-        -- 点稀疏时连成线, 更看得出路线
+        local y = by1 - 4 - ((p[1] - la0) * ih) // dla
         if px and (math.abs(x - px) > 1 or math.abs(y - py) > 1) then
           local steps = math.max(math.abs(x - px), math.abs(y - py))
           for s = 1, steps do
@@ -345,44 +419,50 @@ local function page_track(fix)
     app.mixc(W // 2, (by0 + by1) // 2 - 8, "等待轨迹", false)
   end
 
-  -- 底部三行: 坐标 / 海拔+航向 / 点数+距离  (末行必须 ≤ H-16, 否则被屏幕切掉)
-  local yy = H - 60
+  -- 中：海拔剖面
+  alt_profile(6, by1 + 8, 394, 236)
+
+  -- 下：三行
+  local yy = 244
   if fix and fix.valid then
     app.mix(8, yy, "坐标 " .. fmt_dms(fix.lat_e6, "N", "S") .. " " .. fmt_dms(fix.lon_e6, "E", "W"), false)
-    app.mix(8, yy + 16, "海拔 " .. tostring(fix.alt_m or 0) .. "m  航向 " .. fmt_tenth(fix.crs10 or 0) .. "度", false)
-    app.mix(8, yy + 32, "点数 " .. tostring(n) .. "  距离 " .. fmt_km(G.dist_dm) .. "km", false)
+    app.mix(8, yy + 18, "海拔 " .. tostring(fix.alt_m or 0) .. "m  航向 " .. fmt_tenth(fix.crs10 or 0) .. "度", false)
+    app.mix(8, yy + 36, "点数 " .. tostring(n) .. "  距离 " .. fmt_km(G.dist_dm) .. "km", false)
   else
-    app.mixc(W // 2, yy + 16, "无定位", false)
+    app.mixc(W // 2, yy + 18, "无定位", false)
   end
 end
 
--- 上机调 GPS 就看这页
+-- ③ 数据页：十项两列（版式同 Helm One 的「完整数据」）
 local function page_diag(fix)
-  draw_header("GPS INFO")
+  draw_header("数据")
 
-  local y = SB_H + 30
-  local function ln(label, val, inv)
-    cell(8, y, label, val, inv)
-    y = y + 20
+  local hd = function(v) return tostring((v or 0) // 10) .. "." .. tostring((v or 0) % 10) end
+  local rows = {
+    { "定位", (fix and fix.valid) and "有效" or "无效", not (fix and fix.valid) },
+    { "卫星", tostring(fix and fix.sats or 0) .. " 颗", false },
+    { "海拔", tostring(fix and fix.alt_m or 0) .. " m", false },
+    { "HDOP", hd(fix and fix.hdop100), false },
+    { "句子", tostring(fix and fix.sentences or 0), false },
+    { "校验错", tostring(fix and fix.badcs or 0), (fix and (fix.badcs or 0) > 0) or false },
+    { "维度", tostring(fix and fix.dim or 0) .. "D", false },
+    { "已收点", tostring(G.tr_n), false },
+    { "数据源", G.src, false },
+    { "均速", fmt_tenth(avg_kmh10()) .. " km/h", false },
+  }
+
+  local y0, dy = SB_H + 30, 30
+  for i = 1, 10 do
+    local col = (i - 1) // 5
+    local row = (i - 1) % 5
+    local xl = (col == 0) and 10 or 206
+    local xr = (col == 0) and 190 or 392
+    local r = rows[i]
+    kv(xl, xr, y0 + row * dy, r[1], r[2], r[3])
   end
 
-  if not fix then
-    cell(8, y, "状态", "无数据")
-    return
-  end
-
-  ln("定位", fix.valid and "有效" or "无效", not fix.valid)
-  ln("质量", tostring(fix.quality or 0) .. "  维度 " .. tostring(fix.dim or 0) .. "D")
-  ln("卫星", tostring(fix.sats or 0) .. " 颗")
-  ln("HDOP", tostring((fix.hdop100 or 0) // 10) .. "." .. tostring((fix.hdop100 or 0) % 10))
-  ln("海拔", tostring(fix.alt_m or 0) .. " m")
-  ln("句子", tostring(fix.sentences or 0) .. "  校验错 " .. tostring(fix.badcs or 0))
-  -- G.src 本身在模拟时已经是"模拟", 再拼一次会变成"模拟 (模拟)"
-  ln("数据源", G.src)
-  ln("已收点", tostring(G.tr_n))
-
-  -- 底下一行: 上机排查的提示
-  app.mix(8, H - 20, "无句子=线或波特率 校验错多=波特率", false)
+  app.hline(0, W - 1, H - 26, BK)
+  app.mix(8, H - 22, "无句子=线或波特率  校验错多=波特率", false)
 end
 
 -- ================= 契约函数 =================
