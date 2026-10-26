@@ -67,6 +67,24 @@ void audio_player_diag(void);
  *   必须在 esp_deep_sleep_start() **之前**调用 (之后没有代码会执行)。 */
 void audio_player_sleep_for_off(void);
 
+
+/* === 录音机：WAV 录制（2026-10-27） ===
+ * 录音在独立任务里跑（CPU1 / 优先级 8），stop 是同步的：返回时 WAV 头已回填。
+ * path 用 TF 卡绝对路径，如 "/sdcard/Rec/rec_001.wav"。返回 0 成功。 */
+int  audio_player_rec_start(const char *path, int sample_rate);
+void audio_player_rec_stop(void);
+bool audio_player_rec_active(void);
+uint32_t audio_player_rec_ms(void);       /* 已录时长 (ms) */
+uint32_t audio_player_rec_bytes(void);    /* 已写 PCM 字节数 */
+const char *audio_player_rec_path(void);  /* 当前/最后一次录音路径 */
+
+/* === WAV 播放（异步任务，只支持 16bit PCM WAV） === */
+int  audio_player_play_wav(const char *path);
+void audio_player_wav_stop(void);
+bool audio_player_wav_active(void);
+uint32_t audio_player_wav_ms(void);        /* 已播 (ms) */
+uint32_t audio_player_wav_total_ms(void);  /* 总长 (ms) */
+
 /* 获取当前播放文件名 */
 const char *audio_player_get_filename(void);
 

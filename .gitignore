@@ -235,3 +235,30 @@ components/apps/pages/store_index_builtin.h
 # ===== 地球生存（暂停维护）=====
 apps/lua/apps/app/earthsurvival.lua
 apps/lua/earthsurvival/
+
+# ===== 一次性生成器 / 商店工具 / 可选单测（本地保留）=====
+tools/book_engine_test/dbg.c
+tools/book_engine_test/test.c
+tools/bt_c8_verify.py
+tools/check_app_registry.py
+tools/check_embed_js.py
+tools/dl_chunks.sh
+tools/enet_report.py
+tools/fb_png.py
+tools/fw_kbd.py
+tools/gen_ascii_8x16.py
+tools/gen_oui_db.py
+tools/gen_pal_fontbin.py
+tools/gen_wp_1bpp.py
+tools/mdz_pack.py
+tools/pal_rix2wav.cpp
+tools/qqt_bw.py
+tools/qqt_img.py
+tools/qqt_pack.py
+tools/rc_shot.py
+tools/render_sf_symbols.swift
+tools/store_build.py
+tools/store_deploy.sh
+tools/store_parse_test.c
+tools/theme_preview.py
+tools/wuxia_pack.py

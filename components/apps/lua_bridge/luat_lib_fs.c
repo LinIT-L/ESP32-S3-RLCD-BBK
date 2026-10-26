@@ -84,6 +84,15 @@ static int l_fs_remove(lua_State *L) {
  * ⚠ 上限比 read 大 (1 MB): 单块最大 364 KB, 再留余量给将来的包。
  *   FATFS 的 fseek 是索引式的, 不像 SPIFFS 那样每次 seek 都扫目录, 可以放心用。 */
 #define LUA_FS_READ_AT_MAX (1024 * 1024)
+/* app.fs.rename(old, new) -> bool
+ * 改名/移动。录音机改文件名、整理目录都用它。 */
+static int l_fs_rename(lua_State *L) {
+    const char *from = luaL_checkstring(L, 1);
+    const char *to   = luaL_checkstring(L, 2);
+    lua_pushboolean(L, rename(from, to) == 0);
+    return 1;
+}
+
 static int l_fs_read_at(lua_State *L) {
     const char *p = luaL_checkstring(L, 1);
     lua_Integer off = luaL_checkinteger(L, 2);
@@ -158,6 +167,7 @@ void lua_mod_fs_register(lua_State *L)
     lua_pushcfunction(L, l_fs_write);            lua_setfield(L, -2, "write");
     lua_pushcfunction(L, l_fs_append);           lua_setfield(L, -2, "append");
     lua_pushcfunction(L, l_fs_remove);           lua_setfield(L, -2, "remove");
+    lua_pushcfunction(L, l_fs_rename);           lua_setfield(L, -2, "rename");
     lua_pushcfunction(L, l_fs_size);             lua_setfield(L, -2, "size");
     lua_pushcfunction(L, l_fs_mkdir);            lua_setfield(L, -2, "mkdir");
     lua_pushcfunction(L, l_fs_listdir);          lua_setfield(L, -2, "listdir");
