@@ -608,6 +608,74 @@ class Sim:
                               read_at=lambda p, o, n: self._fs_read_at(str(p), int(o), int(n)),
                               mkdir=lambda p: self._fs_mkdir(str(p)),
                               listdir=lambda d: self._listdir(d))
+        # ---- app.rec: 录音机桩（真实实现在 audio_player.c 的独立任务里，
+        #      模拟器只做"UI 能跑通"的验证：录音=按时间造数据，播放=按时间推进）----
+        self.rec_t0 = None
+        self.rec_path = None
+        self.play_t0 = None
+        self.play_total = 0
+
+        def _rec_hdr(rate=16000, ch=2):
+            h = bytearray(44)
+            h[0:4] = b'RIFF'
+            h[8:16] = b'WAVEfmt '
+            h[20:22] = (1).to_bytes(2, 'little')
+            h[22:24] = int(ch).to_bytes(2, 'little')
+            h[24:28] = int(rate).to_bytes(4, 'little')
+            h[28:32] = int(rate * ch * 2).to_bytes(4, 'little')
+            h[32:34] = int(ch * 2).to_bytes(2, 'little')
+            h[34:36] = (16).to_bytes(2, 'little')
+            h[36:40] = b'data'
+            return h
+
+        def _rec_start(path, rate=16000):
+            self.rec_t0 = self.ms
+            self.rec_path = str(path)
+            self.fs[self.rec_path] = bytes(_rec_hdr(int(rate)))
+            return 0
+
+        def _rec_ms():
+            return 0 if self.rec_t0 is None else max(0, int(self.ms - self.rec_t0))
+
+        def _rec_stop():
+            if self.rec_t0 is None:
+                return 0
+            ms = _rec_ms()
+            p2 = self.rec_path
+            if p2 and p2 in self.fs:
+                d = bytearray(self.fs[p2]) + bytes(ms * 64)
+                total = len(d) - 44
+                d[4:8] = (36 + total).to_bytes(4, 'little')
+                d[40:44] = total.to_bytes(4, 'little')
+                self.fs[p2] = bytes(d)
+            self.rec_t0 = None
+            return ms
+
+        def _rec_play(path):
+            p2 = str(path)
+            if p2 not in self.fs:
+                return -1
+            d = self.fs[p2]
+            rate = int.from_bytes(d[24:28], 'little') or 16000
+            ch = int.from_bytes(d[22:24], 'little') or 2
+            fb = max(1, ch * 2)
+            self.play_total = int(((len(d) - 44) * 1000) / (rate * fb)) if len(d) > 44 else 0
+            self.play_t0 = self.ms
+            return 0
+
+        def _play_ms():
+            if self.play_t0 is None:
+                return 0
+            return min(int(self.ms - self.play_t0), self.play_total)
+
+        def _playing():
+            return self.play_t0 is not None and _play_ms() < self.play_total
+
+        a.rec = self.lua.table(
+            start=_rec_start, stop=_rec_stop, active=lambda: self.rec_t0 is not None,
+            ms=_rec_ms, bytes=lambda: _rec_ms() * 64,
+            play=_rec_play, stop_play=lambda: setattr(self, 'play_t0', None),
+            playing=_playing, play_ms=_play_ms, play_total_ms=lambda: self.play_total)
         # ⚠ 必须与固件一致(page_lua.c): 命名空间是**固定的** "luaapp"，
         #    签名里没有 sp 参数 —— get_int(key) / set_int(key,v) / get_str(key) / set_str(key,v)
         #    且 get_* 在键不存在时返回 **0 个值**(即 nil)，不是默认值。
