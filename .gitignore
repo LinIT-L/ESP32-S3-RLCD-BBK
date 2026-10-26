@@ -226,3 +226,12 @@ tools/image_convert/gen_status_icons_12.py
 
 # ===== 真实地图数据（从服务器分发，不入库）=====
 store/maps/
+
+# ===== 商店内容（不随仓库分发，统一从网站下载）=====
+store/
+# 商店索引的固件内置副本（由 build.sh 按本地 store/index.json 生成，不入库）
+components/apps/pages/store_index_builtin.h
+
+# ===== 地球生存（暂停维护）=====
+apps/lua/apps/app/earthsurvival.lua
+apps/lua/earthsurvival/
