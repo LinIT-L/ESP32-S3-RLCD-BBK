@@ -7,6 +7,7 @@
 #include "os.h"
 #include "os_pane.h"
 #include "ui_common.h"
+#include "ui_scroll.h"   /* ★ 2026-10-24 统一跟手滚动 */
 #include "book_reader.h"
 #include "font_book.h"
 #include "sd_scan.h"
@@ -36,7 +37,18 @@ static bool is_txt(const char *name) {
            (strcasecmp(e, ".fb2") == 0);
 }
 
-static EXT_RAM_BSS_ATTR os_pane_t s_bp;   /* 双栏模板状态 (PSRAM, 省 30KB 内部 RAM) */
+/* ★ LINTOS 2026-10-25: 列表 pane(约 59KB) 原来静态常驻 PSRAM, 改为进页面才分配/退出即还 */
+static os_pane_t *s_bp__p;
+static os_pane_t *s_bp__get(void) {
+    if (!s_bp__p) {
+        s_bp__p = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_bp__p) ESP_LOGW("PANE", "列表 pane 分配失败 (%u B)", (unsigned)sizeof(os_pane_t));
+    }
+    if (!s_bp__p) s_bp__p = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_8BIT);   /* 兜底: 内部 RAM */
+    return s_bp__p;
+}
+static inline void s_bp__free(void) { if (s_bp__p) { heap_caps_free(s_bp__p); s_bp__p = NULL; } }
+#define s_bp (*s_bp__get())
 
 /* 阅读器模式 (运行时全屏) */
 static bool s_reader_open = false;
@@ -50,7 +62,7 @@ static int s_bs_margin   = 1;   /* 0=窄 1=中 2=宽 */
 static int s_bs_lineh    = 1;   /* 0=紧凑 1=标准 2=宽松 */
 static int s_bs_gap      = 1;   /* 0=紧凑 1=标准 2=宽松 */
 static int s_bs_indent   = 1;   /* 0=关 1=开 (段落首行缩进两全角空格) */
-static int s_bs_rot      = 0;   /* 0=上 1=下 2=左 3=右 (阅读优化旋转方向) */
+static int s_bs_rot      = 2;   /* 0=上 1=下 2=左 3=右 (阅读优化旋转方向) —— 默认「左」(linit 2026-10-24) */
 
 static void bs_load(void) {
     nvs_handle_t h;
@@ -67,6 +79,12 @@ static void bs_load(void) {
         if (svc_nvs_get_i32(h, "gp", &v) == ESP_OK && v >= 0 && v <= 2) s_bs_gap = (int)v;
         if (svc_nvs_get_i32(h, "in", &v) == ESP_OK && v >= 0 && v <= 1) s_bs_indent = (int)v;
         if (svc_nvs_get_i32(h, "rt", &v) == ESP_OK && v >= 0 && v <= 3) s_bs_rot = (int)v;
+        /* ★ 2026-10-24 linit: 阅读旋转方向**默认改成「左」**。
+         *   老存档里可能存着别的方向(rt)，这里做一次性迁移: 没有 rot_ver 的旧档
+         *   统一切成 2(左) 并写 rot_ver=1; 之后用户自己转的方向照常保存、不再覆盖。 */
+        if (svc_nvs_get_i32(h, "rot_ver", &v) != ESP_OK) {
+            s_bs_rot = 2;
+        }
         svc_nvs_close(h);
     }
 }
@@ -79,6 +97,7 @@ static void bs_save(void) {
     svc_cfg_set_i32(BNS, "gp", s_bs_gap);
     svc_cfg_set_i32(BNS, "in", s_bs_indent);
     svc_cfg_set_i32(BNS, "rt", s_bs_rot);
+    svc_cfg_set_i32(BNS, "rot_ver", 1);   /* 迁移标记: 默认方向已定为「左」 */
 }
 static int  bs_size_reader_idx(void);   /* 前置声明 (定义在下方): 三档字号 → 阅读器内部档位 */
 static void bs_apply(void) {
@@ -579,16 +598,27 @@ static bool book_shelf_touch(ui_ctx_t *ctx, int x, int y) {
     return true;
 }
 
-/* 每帧: 右栏触摸拖动滚动 (跟手 1:1; 坐标同样页内映射到逻辑坐标) */
+/* 每帧: 右栏触摸拖动滚动 —— ★★★ 2026-10-24 统一交给 ui_scroll
+ *   (1:1 跟手 + 惯性×0.86 + 越界回弹 + 松手吸附整行)。
+ *   原来自己维护 s_last_y/s_start_off 做 1:1，但没有惯性也没有回弹。 */
 static void book_shelf_drag(ui_ctx_t *ctx) {
-    int tx, ty;
-    static int s_last_y = -1, s_start_off = 0;
-    static bool s_started_right = false;
+    static ui_scroll_t sc;
+    static bool ready = false, started_right = false;
     const int list_y = s_bp.list_y > 0 ? s_bp.list_y : 30;
+    int tx, ty;
     bool down = input_get_touch_pos(&tx, &ty);
-    if (down) {
-        book_touch_map(&tx, &ty);   /* 物理 → 逻辑 (页内自包含映射) */
-        if (!s_bp.settings_mode && tx >= SL_LEFT_W && ty >= list_y && ty < ui_screen_h() - 4) {
+    if (down) book_touch_map(&tx, &ty);   /* 物理 → 逻辑 (页内自包含映射) */
+
+    const int vh = ui_screen_h() - list_y - 4;
+    const int content = s_bp.item_count * SL_ROW_H;
+    if (!ready) { ui_scroll_config(&sc, UI_SCROLL_LIST, 0); ready = true; }
+    if (sc.content_px != content || sc.view_px != vh)
+        ui_scroll_init(&sc, SL_ROW_H, vh, content);
+
+    if (down && !sc.pressed) {
+        started_right = (!s_bp.settings_mode && tx >= SL_LEFT_W &&
+                         ty >= list_y && ty < ui_screen_h() - 4);
+        if (started_right) {
             int hidx = (s_bp.item_off + (ty - list_y)) / SL_ROW_H;
             if (hidx >= 0 && hidx < s_bp.item_count)
                 if (s_bp.sel_item != hidx || s_bp.focus != 1) {
@@ -596,28 +626,27 @@ static void book_shelf_drag(ui_ctx_t *ctx) {
                     s_bp.focus = 1;
                     if (ctx) ctx->needs_redraw = true;
                 }
+        } else {
+            /* 右栏外按下: 只登记 pressed, 不参与滚动 */
+            ui_scroll_touch_xy(&sc, tx, ty, true);
         }
-        if (s_last_y < 0) {
-            bool in_right = (tx >= SL_LEFT_W && ty >= list_y && ty < ui_screen_h() - 4);
-            s_started_right = in_right;
-            s_last_y = ty;
-            s_start_off = s_bp.item_off;
-            return;
-        }
-        if (!s_started_right) return;
-        int max_off = book_max_off();
-        if (max_off < 0) max_off = 0;
-        int new_off = s_start_off - (ty - s_last_y);   /* 1:1 跟手 */
-        if (new_off < 0) new_off = 0;
-        if (new_off > max_off) new_off = max_off;
-        if (new_off != s_bp.item_off) {
-            s_bp.item_off = new_off;
-            if (ctx) ctx->needs_redraw = true;
-        }
-    } else {
-        s_last_y = -1;
-        s_start_off = 0;
-        s_started_right = false;
+    }
+    if (down && started_right) {
+        if (ui_scroll_touch_xy(&sc, tx, ty, true) && ctx) ctx->needs_redraw = true;
+    } else if (!down) {
+        ui_scroll_touch_xy(&sc, 0, 0, false);
+        started_right = false;
+    }
+    if (ui_scroll_poll(&sc) && ctx) ctx->needs_redraw = true;
+
+    /* 写回渲染读的偏移量（外力改过 item_off 时也在这里对齐回来）*/
+    int off = ui_scroll_offset(&sc);
+    if (off < 0) off = 0;
+    int mx = ui_scroll_max(&sc);
+    if (off > mx) off = mx;
+    if (s_bp.item_off != off) {
+        s_bp.item_off = off;
+        if (ctx) ctx->needs_redraw = true;
     }
 }
 
@@ -675,6 +704,7 @@ static void p_book_enter(ui_ctx_t *ctx) {
 }
 
 static void p_book_exit(ui_ctx_t *ctx) {
+    s_bp__free();   /* LINTOS: 页面退出归还列表 pane */
     /* 从阅读器直接 HOME/退出离开: 先收尾阅读器 (释放内存+复位), 再复位触摸旋转 */
     if (s_reader_open) {
         book_reader_close();

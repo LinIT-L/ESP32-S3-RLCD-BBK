@@ -8,11 +8,14 @@
  * I2C 使用独立的 I2C_NUM_1 (音频 ES8311/ES7210 占用 I2C_NUM_0), 互不干扰.
  */
 #include "touch_panel.h"
-#include "driver/i2c.h"
+#include "driver/i2c.h"          /* 仅保留 I2C_NUM_x 常量 */
+#include "driver/i2c_master.h"   /* ★ 新驱动: i2c_new_master_bus / i2c_master_probe */
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "nvs.h"
+#include <string.h>
 
 /* ---- 本板触摸引脚 (★ 2026-10-16: 由上层 touch_panel_set_pins() 设定) ----
  * 默认值 = 原来写死的小智模块板接线; 微雪原板由 input.c 从 board_pins.h 下发。 */
@@ -24,6 +27,12 @@ void touch_panel_set_pins(const tp_pins_t *pins) {
 
 
 #define TAG "TOUCH"
+
+/* 常驻极值统计 (只做 4 次比较, 不影响性能) —— 串口 `tpcal` 随时查看/清零。
+ * 好处: 不卡时间窗口, 用户什么时候摸都能累积下来。 */
+static int s_cal_minx = 99999, s_cal_maxx = -1;
+static int s_cal_miny = 99999, s_cal_maxy = -1;
+static int s_cal_n = 0;
 
 #define TP_I2C_PORT   I2C_NUM_1
 #define TP_I2C_FREQ   (100 * 1000)   /* 飞线 100kHz 最稳; 稳定后可选 400kHz */
@@ -73,74 +82,109 @@ static bool wd_wait_idle(void);
 #define GT911_REG_RES      0x8048   /* X/Y 分辨率 (0x8048/49=X, 0x804A/4B=Y) */
 
 static tp_chip_t s_chip = TP_CHIP_NONE;
+static bool s_cst836 = false;   /* true=CST836U(支持双点), false=CST816S(仅单点) */
 static uint8_t    s_addr = 0;
 static int        s_res_x = TP_DEFAULT_RES_X;
 static int        s_res_y = TP_DEFAULT_RES_Y;
 
+/* ★ FT6236 方向参数 (运行时, NVS 落盘): bit0 = 交换 XY, bit1 = Y 取反。
+ *   默认 3 = 鱼星 RLCD 4.2(90° 旋转安装) 需要的组合。
+ *   ⛔ 只作用于 ft6236_read_points, CST836U / GT911 各走各的读点函数, 完全不受影响。 */
+static uint8_t s_ft_axis = 3;
+static bool    s_ft_axis_loaded = false;
+
+static void ft_axis_load(void) {
+    if (s_ft_axis_loaded) return;
+    s_ft_axis_loaded = true;
+    nvs_handle_t h;
+    uint8_t v = 3;
+    if (nvs_open("os_tp", NVS_READONLY, &h) == ESP_OK) { nvs_get_u8(h, "ft_axis", &v); nvs_close(h); }
+    if (v <= 3) s_ft_axis = v;
+}
+
+uint8_t touch_panel_get_ft_axis(void) { ft_axis_load(); return s_ft_axis; }
+
+void touch_panel_set_ft_axis(uint8_t v) {
+    if (v > 3) return;
+    s_ft_axis = v;
+    s_ft_axis_loaded = true;
+    nvs_handle_t h;
+    if (nvs_open("os_tp", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "ft_axis", v);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "FT6236 方向参数 = %u (bit0 交换XY=%d, bit1 Y取反=%d)",
+             v, v & 1, (v >> 1) & 1);
+}
+
 /* ==================== I2C 底层 ==================== */
+/* ★★★ 2026-10-22 定案（linit 实测 + 日志实锤）：
+ *   旧 API (`i2c_param_config` + `i2c_driver_install` + `i2c_master_cmd_begin`)
+ *   在**标准扩展版的 15/7 上完全不通** —— 驱动返回 ESP_OK、端口 1 装好，
+ *   但 4 个候选地址 (0x5D/0x14/0x15/0x38) 一律 0 应答；
+ *   而同一时刻 `tpscan`（新 API `i2c_new_master_bus` + `i2c_master_probe`）能扫到 `ACK 0x15`。
+ *   换一块已知正常的屏也复现 ⇒ **不是硬件、不是时序，是驱动**。
+ *   ⇒ 底层整体切到新驱动，与 tpscan 完全一致；上层 `*_read_points` 逻辑一行没动。 */
+static i2c_master_bus_handle_t s_bus = NULL;
+static i2c_master_dev_handle_t s_dev = NULL;
+
+/* 按地址建从机句柄（芯片型号探测出来后才能建） */
+static void tp_dev_attach(uint8_t addr) {
+    if (s_dev) { i2c_master_bus_rm_device(s_dev); s_dev = NULL; }
+    if (!s_bus || addr == 0) return;
+    i2c_device_config_t dc = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = TP_I2C_FREQ,
+    };
+    if (i2c_master_bus_add_device(s_bus, &dc, &s_dev) != ESP_OK) s_dev = NULL;
+}
+
+/* 重建总线 (探测失败几次后总线可能残留状态: SDA 被从机拉住时
+ * i2c_master_probe 会把所有地址都误报 ACK ⇒ 误判成 GT911)。
+ * hw_cfg 的探测每次都是全新总线, 所以它能命中; 这里补齐同样的干净起点。 */
+static void tp_bus_rebuild(void) {
+    if (s_dev) { i2c_master_bus_rm_device(s_dev); s_dev = NULL; }
+    if (s_bus) { i2c_del_master_bus(s_bus);       s_bus = NULL; }
+    i2c_master_bus_config_t bc = {
+        .i2c_port    = TP_I2C_PORT,
+        .sda_io_num  = s_pins.sda,
+        .scl_io_num  = s_pins.scl,
+        .clk_source  = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    if (i2c_new_master_bus(&bc, &s_bus) != ESP_OK) s_bus = NULL;
+}
 
 /* 探测 7-bit 地址是否有 ACK */
 static bool tp_i2c_probe(uint8_t addr) {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin(TP_I2C_PORT, cmd, pdMS_TO_TICKS(50));
-    i2c_cmd_link_delete(cmd);
-    return (err == ESP_OK);
+    if (!s_bus) return false;
+    return i2c_master_probe(s_bus, addr, 50) == ESP_OK;
 }
 
 /* 8-bit 寄存器地址读 (CST816 / FT6236) */
 static esp_err_t tp_i2c_read8(uint8_t reg, uint8_t *buf, size_t len) {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (s_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (s_addr << 1) | I2C_MASTER_READ, true);
-    if (len > 1) {
-        i2c_master_read(cmd, buf, len - 1, I2C_MASTER_ACK);
-    }
-    i2c_master_read_byte(cmd, buf + len - 1, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(TP_I2C_PORT, cmd, pdMS_TO_TICKS(20));
-    i2c_cmd_link_delete(cmd);
-    return ret;
+    if (!s_dev) return ESP_FAIL;
+    return i2c_master_transmit_receive(s_dev, &reg, 1, buf, len, 50);
 }
 
 /* 16-bit 寄存器地址读 (GT911) */
 static esp_err_t tp_i2c_read16(uint16_t reg, uint8_t *buf, size_t len) {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (s_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, (reg >> 8) & 0xFF, true);
-    i2c_master_write_byte(cmd, reg & 0xFF, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (s_addr << 1) | I2C_MASTER_READ, true);
-    if (len > 1) {
-        i2c_master_read(cmd, buf, len - 1, I2C_MASTER_ACK);
-    }
-    i2c_master_read_byte(cmd, buf + len - 1, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(TP_I2C_PORT, cmd, pdMS_TO_TICKS(20));
-    i2c_cmd_link_delete(cmd);
-    return ret;
+    if (!s_dev) return ESP_FAIL;
+    uint8_t r[2] = { (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF) };
+    return i2c_master_transmit_receive(s_dev, r, 2, buf, len, 50);
 }
 
 /* 16-bit 寄存器地址写 (GT911) */
 static esp_err_t tp_i2c_write16(uint16_t reg, const uint8_t *buf, size_t len) {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (s_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, (reg >> 8) & 0xFF, true);
-    i2c_master_write_byte(cmd, reg & 0xFF, true);
-    if (len) {
-        i2c_master_write(cmd, (uint8_t *)buf, len, true);
-    }
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(TP_I2C_PORT, cmd, pdMS_TO_TICKS(20));
-    i2c_cmd_link_delete(cmd);
-    return ret;
+    if (!s_dev || len > 16) return ESP_FAIL;
+    uint8_t tmp[2 + 16];
+    tmp[0] = (uint8_t)(reg >> 8);
+    tmp[1] = (uint8_t)(reg & 0xFF);
+    if (len) memcpy(tmp + 2, buf, len);
+    return i2c_master_transmit(s_dev, tmp, 2 + len, 50);
 }
 
 /* ==================== GT911 复位时序 ==================== */
@@ -166,6 +210,7 @@ static void gt911_reset(void) {
     gpio_set_direction(s_pins.intr, GPIO_MODE_INPUT);  /* 恢复为输入(上拉) */
 }
 
+
 /* ==================== 初始化 ==================== */
 
 static tp_chip_t tp_probe_chip(void);   /* 定义在下方 (探测芯片) */
@@ -178,27 +223,27 @@ tp_chip_t touch_panel_init(void) {
         ESP_LOGI(TAG, "本板未接触摸 (SDA/SCL 未设定), 跳过触摸初始化");
         return TP_CHIP_NONE;
     }
-    /* I2C_NUM_1 独立总线 */
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = s_pins.sda,
-        .scl_io_num = s_pins.scl,
-        .sda_pullup_en = true,
-        .scl_pullup_en = true,
-        .master.clk_speed = TP_I2C_FREQ,
+    /* ★ 新驱动建总线（与 tpscan 一致）。旧 API 在标准版 15/7 上不通，见文件头说明。 */
+    if (s_bus) { i2c_del_master_bus(s_bus); s_bus = NULL; }
+    i2c_master_bus_config_t bc = {
+        .i2c_port    = TP_I2C_PORT,
+        .sda_io_num  = s_pins.sda,
+        .scl_io_num  = s_pins.scl,
+        .clk_source  = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    esp_err_t ret = i2c_param_config(TP_I2C_PORT, &conf);
+    esp_err_t ret = i2c_new_master_bus(&bc, &s_bus);
     if (ret != ESP_OK) {
-        ESP_LOGD(TAG, "I2C 配置失败: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "I2C 总线创建失败(%s) sda=%d scl=%d ⇒ 触摸不可用",
+                 esp_err_to_name(ret), s_pins.sda, s_pins.scl);
+        s_bus = NULL;
         return TP_CHIP_NONE;
     }
-    ret = i2c_driver_install(TP_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGD(TAG, "I2C 驱动安装失败: %s", esp_err_to_name(ret));
-        return TP_CHIP_NONE;
-    }
+    ESP_LOGW(TAG, "I2C 总线就绪 port=%d sda=%d scl=%d @%dkHz",
+             TP_I2C_PORT, s_pins.sda, s_pins.scl, TP_I2C_FREQ / 1000);
 
-    /* RST 输出(初始低), INT 输入+上拉 */
+    /* RST 输出(先不拉低: 芯片上电本就就绪时不需要碰它), INT 输入+上拉 */
     gpio_config_t rst_cfg = {
         .pin_bit_mask = (1ULL << s_pins.rst),
         .mode = GPIO_MODE_OUTPUT,
@@ -207,7 +252,7 @@ tp_chip_t touch_panel_init(void) {
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&rst_cfg);
-    gpio_set_level(s_pins.rst, 0);
+    gpio_set_level(s_pins.rst, 1);   /* ★ 保持 RST 高(释放复位), 让芯片能应答 */
 
     gpio_config_t int_cfg = {
         .pin_bit_mask = (1ULL << s_pins.intr),
@@ -218,16 +263,41 @@ tp_chip_t touch_panel_init(void) {
     };
     gpio_config(&int_cfg);
 
-    /* 先做 GT911 复位时序 (对 CST816/FT6236 无害, 只是把 RST 拉高) */
-    gt911_reset();
-    gpio_set_level(s_pins.rst, 1);
-    vTaskDelay(pdMS_TO_TICKS(80));   /* 等触摸芯片上电就绪 */
-
-    /* 按地址探测芯片 */
-    tp_probe_chip();
+    /* ★★★ 2026-10-22: 三级探测, 从"对芯片打扰最小"的一级开始。
+     *   ① **裸探** —— 芯片上电已就绪时不碰任何脚 (CST836U / FT6236 常见)。
+     *   ② **只拉 RST 脉冲** —— 冷启动卡在复位态时救回来 (CST/FT 通用, 不碰 INT)。
+     *   ③ 最后才走 `gt911_reset()` (把 INT 当输出强推 50ms 去选 I2C 地址) ——
+     *      这段**只对 Goodix GT911 有意义**, 对 CST/FT 是破坏性的: 它们的 INT 是
+     *      **芯片输出脚**, 被 MCU 强推会打挂采样状态。
+     *   实测(标准扩展版 15/7 + CST836U): 裸探能命中 0x15, 但原来无条件先跑
+     *   gt911_reset ⇒ tp_probe_chip 报"未检测到触摸芯片", 而同一时刻 tpscan 却扫得到 0x15。
+     *   ⇒ 顺序错了, 不是硬件问题。 */
+    if (tp_probe_chip() == TP_CHIP_NONE) {
+        ESP_LOGW(TAG, "触摸探测 ①裸探 无应答");
+        /* ② 只拉 RST 脉冲 (不碰 INT), 再等芯片真正启动 */
+        gpio_set_direction(s_pins.rst, GPIO_MODE_OUTPUT);
+        gpio_set_level(s_pins.rst, 0);
+        vTaskDelay(pdMS_TO_TICKS(12));
+        gpio_set_level(s_pins.rst, 1);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        /* ★ 关键: 重建总线。上面几次探测失败会让总线残留状态, 不重建的话
+         *   下一轮 4 个地址会**全部误报 ACK**(SDA 被拉住时 i2c_master_probe 的假阳性),
+         *   于是被误判成 GT911、读出乱码 PID —— 实测踩过。 */
+        tp_bus_rebuild();
+        if (tp_probe_chip() == TP_CHIP_NONE) {
+            ESP_LOGW(TAG, "触摸探测 ②RST脉冲 无应答 (sda=%d scl=%d rst=%d)",
+                     s_pins.sda, s_pins.scl, s_pins.rst);
+            gt911_reset();                       /* 只为 GT911 选地址, 最后才试 */
+            gpio_set_level(s_pins.rst, 1);
+            vTaskDelay(pdMS_TO_TICKS(80));
+            tp_bus_rebuild();
+            if (tp_probe_chip() == TP_CHIP_NONE)
+                ESP_LOGW(TAG, "触摸探测 ③GT911复位时序 仍无应答 ⇒ 芯片未接/供电/排线");
+        }
+    }
 
     if (s_chip == TP_CHIP_NONE) {
-        ESP_LOGD(TAG, "未检测到触摸芯片 (GT911/CST816/FT6236)");
+        ESP_LOGW(TAG, "未检测到触摸芯片 (GT911/CST816/FT6236)");
     } else {
         const char *names[] = {"?", "GT911", "CST816", "FT6236"};
         ESP_LOGI(TAG, "触摸芯片: %s (I2C addr=0x%02X, 分辨率=%dx%d)",
@@ -236,7 +306,7 @@ tp_chip_t touch_panel_init(void) {
     /* 启动后台触摸看门狗 (V1.0.68) */
     if (!s_wd_task) {
         /* ★2026-10-16 内存优化: 栈放 PSRAM(不涉 DMA/cache 关断路径) */
-        xTaskCreateWithCaps(touch_watchdog_task, "touch_wd", 4096, NULL, 2, &s_wd_task,
+        xTaskCreateWithCaps(touch_watchdog_task, "touch_wd", 1536, NULL, 2, &s_wd_task,   /* ★ 12KB→6KB: 实测仅用 2.8KB */
                             MALLOC_CAP_SPIRAM);
         ESP_LOGI(TAG, "触摸看门狗已启动");
     }
@@ -247,8 +317,19 @@ tp_chip_t touch_panel_init(void) {
 static tp_chip_t tp_probe_chip(void) {
     s_chip = TP_CHIP_NONE;
     s_addr = 0;
-
-    if (tp_i2c_probe(GT911_ADDR_A) || tp_i2c_probe(GT911_ADDR_B)) {
+    /* ★ 2026-10-22 诊断: 一次把 4 个候选地址的 ACK 全打出来, 避免"到底哪个没通"靠猜。 */
+    {
+        bool a = tp_i2c_probe(GT911_ADDR_A), b = tp_i2c_probe(GT911_ADDR_B);
+        bool c = tp_i2c_probe(CST816_ADDR), d = tp_i2c_probe(FT6236_ADDR);
+        ESP_LOGW(TAG, "probe: 0x5D=%d 0x14=%d 0x15=%d 0x38=%d", (int)a, (int)b, (int)c, (int)d);
+        if (a || b)      { s_addr = a ? GT911_ADDR_A : GT911_ADDR_B; }
+        else if (c)      { s_addr = CST816_ADDR; }
+        else if (d)      { s_addr = FT6236_ADDR; }
+        else             { return TP_CHIP_NONE; }
+        tp_dev_attach(s_addr);          /* ★ 新驱动: 先建从机句柄, 后面 read/write 才能用 */
+    }
+    /* ── 下面按 s_addr 判定芯片型号 (原逻辑) ── */
+    if (s_addr == GT911_ADDR_A || s_addr == GT911_ADDR_B) {
         /* GT911 有两种地址, 用 ACK 的那个 */
         s_addr = tp_i2c_probe(GT911_ADDR_A) ? GT911_ADDR_A : GT911_ADDR_B;
         /* 读产品 ID 验证 (0x8140..0x8143 应为 "911") */
@@ -279,6 +360,12 @@ static tp_chip_t tp_probe_chip(void) {
     } else if (tp_i2c_probe(CST816_ADDR)) {
         s_addr = CST816_ADDR;
         s_chip = TP_CHIP_CST816;
+        /* ★ 2026-10-20: 用型号寄存器区分 CST836U / 老款 CST816S ——
+         *   否则"该读 13 字节还是 11 字节"只能靠猜, 读长了直接 NACK 触摸全死。 */
+        uint8_t cid[2] = {0};
+        s_cst836 = (tp_i2c_read8(0xAA, cid, 2) == ESP_OK && cid[0] == 0x13);   /* 实测 0xAA=13 0xAB=00 */
+        ESP_LOGI(TAG, "CST 型号: 0xAA=%02X 0xAB=%02X ⇒ %s", cid[0], cid[1],
+                 s_cst836 ? "CST836U(双点)" : "CST816S(单点)");
         /* 读芯片 ID/版本 (0xA7-0xAA) 便于确认具体型号 */
         uint8_t id[4] = {0};
         if (tp_i2c_read8(0xA7, id, 4) == ESP_OK) {
@@ -322,6 +409,16 @@ static bool wd_recover_throttle(void) {
 }
 
 /* 非阻塞请求恢复 (input.c 在连续失败后调用, 由看门狗任务执行) */
+/* 深睡前关断触摸 IC：RST 拉低并 hold。
+ * 触摸芯片待机也有 1~2mA，而本机唤醒源是 EXT1 按键（不是触摸），
+ * 所以睡死它没有副作用；唤醒后是整片复位，init 会重新拉高 RST。 */
+void touch_panel_power_down(void) {
+    if (s_pins.rst < 0) return;
+    gpio_set_direction(s_pins.rst, GPIO_MODE_OUTPUT);
+    gpio_set_level(s_pins.rst, 0);
+    gpio_hold_en(s_pins.rst);
+}
+
 void touch_panel_request_recover(void) {
     s_recover_request = true;
 }
@@ -371,23 +468,20 @@ void touch_panel_recover(void) {
         gpio_set_level(s_pins.rst, 1);
         vTaskDelay(pdMS_TO_TICKS(60));
     }
-    /* 2. 重装 I2C 驱动 (SDA 被从机拉低卡死时, 重装可清掉总线状态) */
-    esp_err_t del = i2c_driver_delete(TP_I2C_PORT);
-    if (del != ESP_OK && del != ESP_ERR_INVALID_STATE) {
-        ESP_LOGD(TAG, "i2c_driver_delete 返回 %s, 继续", esp_err_to_name(del));
-    }
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = s_pins.sda,
-        .scl_io_num = s_pins.scl,
-        .sda_pullup_en = true,
-        .scl_pullup_en = true,
-        .master.clk_speed = TP_I2C_FREQ,
+    /* 2. 重建 I2C 总线 (新驱动; SDA 被从机拉低卡死时, 重建可清掉总线状态) */
+    if (s_dev) { i2c_master_bus_rm_device(s_dev); s_dev = NULL; }
+    if (s_bus) { i2c_del_master_bus(s_bus);       s_bus = NULL; }
+    i2c_master_bus_config_t bc = {
+        .i2c_port    = TP_I2C_PORT,
+        .sda_io_num  = s_pins.sda,
+        .scl_io_num  = s_pins.scl,
+        .clk_source  = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    i2c_param_config(TP_I2C_PORT, &conf);
-    esp_err_t ins = i2c_driver_install(TP_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
-    if (ins != ESP_OK && ins != ESP_ERR_INVALID_STATE) {
-        ESP_LOGD(TAG, "i2c_driver_install 失败: %s", esp_err_to_name(ins));
+    if (i2c_new_master_bus(&bc, &s_bus) != ESP_OK) {
+        ESP_LOGD(TAG, "恢复: 重建 I2C 总线失败");
+        s_bus = NULL;
         return;
     }
     /* 3. 重新探测 */
@@ -498,50 +592,192 @@ static bool gt911_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
 }
 
 static bool cst816_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
-    /* CST8xx 系列 (本设备 CST836U) 实测布局 + 官方 esp_lcd_touch_cst816s 资料:
-     * 芯片虽在点名里可报 2, 但官方确认 "始终只返回单指事件 + 手势",
-     * 第二点坐标寄存器无有效数据 => 只信任点1, 避免双指时幽灵点乱跳.
-     * 布局: 从 reg 0x00 连续读 11 字节. 0x02=点数; 点1 12 位坐标:
-     *   X = ((d[3]&0x0F)<<8)|d[4], Y = ((d[5]&0x0F)<<8)|d[6].
-     * 实测对照 (n=1, d=00 D7 00 C2): X=0xD7=215, Y=0xC2=194. */
+    /* ★ 2026-10-20: 恢复到**原来能用的读法** —— 一次读 11 字节,
+     *   点数在 d[2]、点1 坐标 d[3..6]。实测本面板 0xAA=13 / 0xAB=00,
+     *   不能按 CST816S 老布局(d[1]/d[2..5])解析, 否则永远 0 点。
+     *   第二点(仅 CST836U 的双点模式才有)用**另一次独立读**取 d[9..12]:
+     *   失败就只回单点, 绝不让"多读几个字节"把整次触摸读废掉。 */
     uint8_t d[11] = {0};
-    if (tp_i2c_read8(0x00, d, 11) != ESP_OK) {
-        return false;
-    }
+    if (tp_i2c_read8(0x00, d, sizeof(d)) != ESP_OK) return false;
+
+    for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
+
     int n = d[2] & 0x0F;
-    if (n <= 0) {
-        for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
-        *count = 0;
-        return true;
-    }
-    /* 只取点1 (单指有效), 丢弃点2 */
-    int x = (int)(((d[3] & 0x0F) << 8) | d[4]);
-    int y = (int)(((d[5] & 0x0F) << 8) | d[6]);
+    if (n <= 0) { *count = 0; return true; }
+
+    int x1 = (int)(((d[3] & 0x0F) << 8) | d[4]);
+    int y1 = (int)(((d[5] & 0x0F) << 8) | d[6]);
+    if (x1 > 4095) x1 = 0;
+    if (y1 > 4095) y1 = 0;
     pts[0].pressed = true;
-    pts[0].x = (int16_t)x;
-    pts[0].y = (int16_t)y;
-    pts[1].pressed = false;   /* 第二点无效, 恒为未按压 */
-    *count = 1;
+    pts[0].x = (int16_t)x1;
+    pts[0].y = (int16_t)y1;
+
+    int cnt = 1;
+    if (n >= 2) {
+        uint8_t e[4] = {0};
+        if (tp_i2c_read8(0x09, e, sizeof(e)) == ESP_OK) {
+            int x2 = (int)(((e[0] & 0x0F) << 8) | e[1]);
+            int y2 = (int)(((e[2] & 0x0F) << 8) | e[3]);
+            if (x2 > 0 && x2 <= 4095 && y2 > 0 && y2 <= 4095) {
+                pts[1].pressed = true;
+                pts[1].x = (int16_t)x2;
+                pts[1].y = (int16_t)y2;
+                cnt = 2;
+            }
+        }
+    }
+    *count = cnt;
     return true;
 }
 
+/* ===== 调试: 触摸量程标定 =====
+ * 用法: 串口 `tpcal 20` → 在这 20 秒内**用手指把整个屏幕划一遍**(左右到边、上下到边),
+ *       结束时打印 X/Y 的最小最大值 —— 用来推算面板真实量程和轴方向。 */
+void touch_panel_debug_cal(int seconds)
+{
+    if (seconds <= 0) {
+        /* 只打印累积值 (用户已随手摸过) */
+        ESP_LOGW(TAG, "TPCAL 累积: X=[%d..%d] Y=[%d..%d] touch=%d",
+                 s_cal_maxx < 0 ? -1 : s_cal_minx, s_cal_maxx,
+                 s_cal_maxy < 0 ? -1 : s_cal_miny, s_cal_maxy, s_cal_n);
+        return;
+    }
+    if (seconds > 300) seconds = 300;
+    s_cal_minx = s_cal_miny = 99999; s_cal_maxx = s_cal_maxy = -1; s_cal_n = 0;
+    ESP_LOGW(TAG, "TPCAL 清零, 采样 %ds", seconds);
+    for (int i = 0; i < seconds * 10; i++) {
+        uint8_t d[8] = {0};
+        if (tp_i2c_read8(0x00, d, 8) == ESP_OK && (d[2] & 0x0F)) {
+            int rx = ((d[3] & 0x0F) << 8) | d[4];
+            int ry = ((d[5] & 0x0F) << 8) | d[6];
+            if (rx < s_cal_minx) s_cal_minx = rx;
+            if (rx > s_cal_maxx) s_cal_maxx = rx;
+            if (ry < s_cal_miny) s_cal_miny = ry;
+            if (ry > s_cal_maxy) s_cal_maxy = ry;
+            s_cal_n++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGW(TAG, "TPCAL 结果: X=[%d..%d] Y=[%d..%d] touch=%d",
+             s_cal_maxx < 0 ? -1 : s_cal_minx, s_cal_maxx,
+             s_cal_maxy < 0 ? -1 : s_cal_miny, s_cal_maxy, s_cal_n);
+}
+
+/* ===== 调试: 监控触摸 (只在读到触点/数据变化时打印) =====
+ * 用法: 串口 `tpwatch 30` → 30 秒内按住屏幕, 有触点就会打印。 */
+void touch_panel_debug_watch(int seconds)
+{
+    if (seconds <= 0)  seconds = 30;
+    if (seconds > 180) seconds = 180;
+    int iters = seconds * 10, printed = 0;
+    ESP_LOGW(TAG, "TPWATCH start %ds chip=%d", seconds, (int)s_chip);
+    for (int i = 0; i < iters; i++) {
+        uint8_t d[16] = {0};
+        esp_err_t e = tp_i2c_read8(0x00, d, sizeof(d));
+        if (e != ESP_OK) {
+            if (printed < 15) { ESP_LOGW(TAG, "TPW[%03d] FAIL %s", i, esp_err_to_name(e)); printed++; }
+        } else {
+            int n2 = d[2] & 0x0F, n0 = d[0] & 0x0F;
+            if (n2 || n0 || d[3] || d[4] || d[5] || d[6]) {
+                tp_point_t pts[TP_MAX_POINTS]; int cnt = 0;
+                touch_panel_read_points(pts, &cnt);
+                int rawx = ((d[3] & 0x0F) << 8) | d[4];
+                int rawy = ((d[5] & 0x0F) << 8) | d[6];
+                ESP_LOGW(TAG, "TPW[%03d] n=%d/%d  %02X %02X %02X %02X %02X %02X %02X  RAW=(%d,%d)  EV=%d",
+                         i, n2, n0, d[0],d[1],d[2],d[3],d[4],d[5],d[6],
+                         rawx, rawy, (d[3] >> 6) & 0x03);
+                if (++printed >= 15) break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGW(TAG, "TPWATCH end (printed=%d)", printed);
+}
+
+/* ===== 调试: 连续读 0x00..0x0F 原始寄存器 =====
+ * 用途: 判断 FT6236 的点数/坐标到底落在哪几个寄存器上。
+ * 用法: 串口发 `tpreg 30`, 然后**按住屏幕**不放, 日志会刷出每次读到的 16 字节。 */
+void touch_panel_debug_regs(int times)
+{
+    if (times <= 0) times = 20;
+    if (times > 200) times = 200;
+    ESP_LOGW(TAG, "TPREG start chip=%d addr=0x%02X sda=%d scl=%d int=%d rst=%d",
+             (int)s_chip, s_addr, s_pins.sda, s_pins.scl, s_pins.intr, s_pins.rst);
+    for (int k = 0; k < times; k++) {
+        uint8_t d[16] = {0};
+        esp_err_t e = tp_i2c_read8(0x00, d, sizeof(d));
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "TPREG[%02d] read FAIL %s", k, esp_err_to_name(e));
+        } else {
+            ESP_LOGW(TAG, "TPREG[%02d] %02X %02X %02X %02X %02X %02X %02X %02X | %02X %02X %02X %02X %02X %02X %02X %02X",
+                     k, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7], d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    ESP_LOGW(TAG, "TPREG end");
+}
+
 static bool ft6236_read_points(tp_point_t pts[TP_MAX_POINTS], int *count) {
-    uint8_t d[10] = {0};
-    if (tp_i2c_read8(0x00, d, 10) != ESP_OK) {
+    uint8_t d[16] = {0};
+    if (tp_i2c_read8(0x00, d, sizeof(d)) != ESP_OK) {
         return false;
     }
-    int n = d[0] & 0x0F;   /* 0x00 = TD_STATUS 点数 */
+    ft_axis_load();          /* 首次调用时从 NVS 取方向参数 */
+
+    /* ★★★ 2026-10-22 修 "FT6236 认到了但触摸完全没反应":
+     *   FT6x36 系列(FocalTech)的标准寄存器布局是
+     *     0x00 = DEVICE_MODE (上电恒为 0x00)
+     *     0x01 = GEST_ID
+     *     0x02 = TD_STATUS  ← **点数在这里**
+     *     0x03..0x06 = P1_XH / P1_XL / P1_YH / P1_YL
+     *     0x07..0x0A = P2_...
+     *   原来代码把 d[0](DEVICE_MODE, 永远 0) 当成点数 ⇒ 永远判 0 点 ⇒ 触摸完全没反应。
+     *   实测静止时读出来的正是 00 00 00 ... (0x0F 是 0xFF 保留位), 与手册一致。
+     *   少数变种把 TD_STATUS 放在 0x00 ⇒ 保留一条兼容分支。 */
+    int n = d[2] & 0x0F;
+    int base = 3;
+    if (n == 0) {
+        int alt = d[0] & 0x0F;
+        if (alt > 0 && alt <= 5) { n = alt; base = 1; }
+    }
+
     if (n <= 0) {
         for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
         *count = 0;
         return true;
     }
-    int cnt = (n > 2) ? 2 : n;   /* FT6236 硬件最多 2 点 */
+
+    int cnt = (n > 2) ? 2 : n;   /* 硬件最多 2 点 */
     for (int i = 0; i < cnt; i++) {
-        const uint8_t *q = d + 1 + i * 4;
+        const uint8_t *q = d + base + i * 6;    /* FT: 每点 6 字节 (XH XL YH YL WHO RES) */
+        int rx = (int)(((q[0] & 0x0F) << 8) | q[1]);
+        int ry = (int)(((q[2] & 0x0F) << 8) | q[3]);
+        if (rx > 4095) rx = 0;
+        if (ry > 4095) ry = 0;
+
+        /* 常驻统计原始坐标极值 (在交换之前记录) */
+        if (rx < s_cal_minx) s_cal_minx = rx;
+        if (rx > s_cal_maxx) s_cal_maxx = rx;
+        if (ry < s_cal_miny) s_cal_miny = ry;
+        if (ry > s_cal_maxy) s_cal_maxy = ry;
+        s_cal_n++;
+
+        /* ★★★ 2026-10-22 FT6236 方向修正 (只在本分支生效):
+         *   鱼星 RLCD 4.2 那块屏是 **90° 旋转安装** ⇒ 交换 XY + Y 取反
+         *   (昨天实测: 先"上下滑变左右滑"⇒需 swap; 再"上下颠倒"⇒需 flip)。
+         *   ⛔ 用 **NVS 运行时参数**(键 `ft_axis`: bit0=交换XY, bit1=Y取反),
+         *      不用编译期宏 —— 编译期宏会让"换一种朝向的屏就要重编"。
+         *   ⚠ 这段只写在 ft6236_read_points 内部 ⇒ **对 CST836U / GT911 零影响**,
+         *      它们的读点函数各走各的, 一个字节都不共用。 */
+        int x, y;
+        if (s_ft_axis & 0x01) { x = ry; y = rx; } else { x = rx; y = ry; }
+        if (s_ft_axis & 0x02) { y = (TP_DEFAULT_RES_Y - 1) - y; }
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
         pts[i].pressed = true;
-        pts[i].x = (int16_t)(((q[0] & 0x0F) << 8) | q[1]);
-        pts[i].y = (int16_t)(((q[2] & 0x0F) << 8) | q[3]);
+        pts[i].x = (int16_t)x;
+        pts[i].y = (int16_t)y;
     }
     for (int i = cnt; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
     *count = cnt;
@@ -620,11 +856,45 @@ bool touch_panel_read(tp_point_t *pt) {
 
 /* V1.0.68: 禁用触摸屏: 卸载 I2C 驱动(释放驱动内存) + 复位芯片状态.
  * 之后 touch_panel_read 恒返回 false (零开销), 触摸不再工作. */
+/* 调试: 打印原始报文 (供串口 tpraw 使用) */
+void touch_panel_debug_dump(void)
+{
+    if (s_chip != TP_CHIP_CST816) { printf("TPRAW not CST (chip=%d)\r\n", (int)s_chip); return; }
+    uint8_t d[11] = {0}, e[4] = {0};
+    esp_err_t r1 = tp_i2c_read8(0x00, d, sizeof(d));
+    esp_err_t r2 = tp_i2c_read8(0x09, e, sizeof(e));
+    printf("TPRAW r1=%d d=", (int)r1);
+    for (int i = 0; i < 11; i++) printf("%02X ", d[i]);
+    printf("| r2=%d e=", (int)r2);
+    for (int i = 0; i < 4; i++) printf("%02X ", e[i]);
+    printf("| n=%d x1=%d y1=%d x2=%d y2=%d\r\n", d[2] & 0x0F,
+           ((d[3] & 0x0F) << 8) | d[4], ((d[5] & 0x0F) << 8) | d[6],
+           ((e[0] & 0x0F) << 8) | e[1], ((e[2] & 0x0F) << 8) | e[3]);
+}
+
+/* 深睡前: 把触摸 IC 按进复位态 (省掉它在整个睡眠期间的扫描电流)。
+ * 只动 RST 电平, 不写 I2C 寄存器 —— 深睡路径上不能碰任何依赖 cache/flash 的驱动代码。
+ * 唤醒后是完整重启, app_board 会 gpio_deep_sleep_hold_dis() 再重新 init, 不受影响。 */
+void touch_panel_sleep(void) {
+    if (s_pins.rst >= 0) {
+        gpio_set_level((gpio_num_t)s_pins.rst, 0);
+        gpio_hold_en((gpio_num_t)s_pins.rst);   /* 深睡期间钉在低电平 */
+    }
+    if (s_pins.intr >= 0) {
+        gpio_pullup_dis((gpio_num_t)s_pins.intr);
+        gpio_pulldown_dis((gpio_num_t)s_pins.intr);
+    }
+    if (s_pins.sda >= 0) gpio_pullup_dis((gpio_num_t)s_pins.sda);
+    if (s_pins.scl >= 0) gpio_pullup_dis((gpio_num_t)s_pins.scl);
+    ESP_LOGI(TAG, "触摸 IC 已按入复位态 (RST=%d hold 低)", s_pins.rst);
+}
+
 void touch_panel_deinit(void) {
     if (s_chip != TP_CHIP_NONE) {
         s_recovering = true;            /* 通知看门狗/读取任务让路 */
         wd_wait_idle();
-        i2c_driver_delete(TP_I2C_PORT);
+        if (s_dev) { i2c_master_bus_rm_device(s_dev); s_dev = NULL; }
+        if (s_bus) { i2c_del_master_bus(s_bus);       s_bus = NULL; }
         s_chip = TP_CHIP_NONE;
         s_addr = 0;
         s_res_x = TP_DEFAULT_RES_X;
@@ -632,6 +902,6 @@ void touch_panel_deinit(void) {
         s_wd_win_reads = s_wd_win_fails = 0;
         s_wd_stuck_ms = 0;
         s_recovering = false;
-        ESP_LOGI(TAG, "触摸屏已禁用, I2C 驱动已释放");
+        ESP_LOGI(TAG, "触摸屏已禁用, I2C 总线已释放");
     }
 }

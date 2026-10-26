@@ -75,15 +75,21 @@ static const os_app_t s_builtin_apps[] = {
     { .id="lavax",   .label="\xe6\x96\x87\xe6\x9b\xb2\xe6\x98\x9f", .icon_idx=ICON_WQX, .page=OS_PAGE_WQX,    .hidden=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f" }, /* 文曲星 游戏 */
 
     { .id="vpet",    .label="\xe6\x9a\xb4\xe9\xbe\x99\xe6\x9c\xba", .icon_idx=ICON_VPET, .page=OS_PAGE_VPET,   .hidden=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f" }, /* 暴龙机 游戏 (暴龙机图标) */
+    /* ★ 2026-10-24 linit 删: 诺亚舟 9288T / NPE 引擎整块移除 (引擎组件已删) */
 
     /* 修改机: 默认不进主菜单, 仅软件管家"独立游戏"分类可见 (icon_idx=ICON_MODTOOL).
      * 用户需求: 不默认显示主菜单; 不开机启动. */
     { .id="modtool", .label="\xe4\xbf\xae\xe6\x94\xb9\xe6\x9c\xba", .icon_idx=ICON_MODTOOL, .page=OS_PAGE_MODTOOL, .hidden=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f" }, /* 修改机 游戏 (ICON_MODTOOL) */
     /* 网络检测/无线探测/日志诊断/运维助手/电脑诊断/终端 已在上方"内置工具应用"区统一登记 */
     /* 商店可下载应用 (默认隐藏, 从应用管家"商店"下载后解隐加入主菜单) */
-    { .id="secure",   .label="密钥管理器", .icon_idx=ICON_SECURE, .page=OS_PAGE_PLACEHOLDER_SECURE, .hidden=true, .cat="程序" }, /* 密钥管理器 程序 */
+#if LINTOS_ENABLE_KEYMGR
+    { .id="secure",   .label="密钥管理器", .icon_idx=ICON_SECURE, .page=OS_PAGE_PLACEHOLDER_SECURE, .hidden=true, .cat="程序" }, /* 密钥管理器 (WIP) */
+#endif
     { .id="fav",   .label="收藏夹", .icon_idx=ICON_FAV, .page=OS_PAGE_FAV, .hidden=true, .cat="程序" }, /* 收藏夹 程序 (ICON_FAV) */
     { .id="sdr", .label="频谱仪", .icon_idx=ICON_SDR, .page=OS_PAGE_SDR, .hidden=true, .cat="运维" }, /* 频谱仪 运维 (2026-10-03 linit: 原 cat=系统, 改归运维) */
+    /* ★ 资源包类应用: requires 目录不存在就整条不显示 ⇒ 装了游戏数据才出现在"游戏"分类里。
+     *   数据由商店资源包解压到 /sdcard/pal (见 am_store 的 asset 类型)。 */
+    { .id="pal", .label="\xe4\xbb\x99\xe5\x89\x91\xe5\xa5\x87\xe4\xbe\xa0\xe4\xbc\xa0", .icon_idx=ICON_PAL, .page=OS_PAGE_PAL, .hidden=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f", .requires="/sdcard/apps/app/pal" },
 };
 #define BUILTIN_APP_COUNT (sizeof(s_builtin_apps) / sizeof(s_builtin_apps[0]))
 
@@ -130,10 +136,13 @@ void apps_register_all(void)
     os_page_morse_register();         /* 摩斯密码 */
     os_page_pomodoro_register();      /* 番茄钟 */
 #endif
-    os_page_keymanager_register();    /* 密钥管理器 */
+#if LINTOS_ENABLE_KEYMGR
+    os_page_keymanager_register();    /* 密钥管理器 (WIP) */
+#endif
     os_page_fav_register();           /* 收藏夹 */
     os_page_lua_register();           /* Lua 单文件程序 */
     os_page_sdr_register();                /* 频谱仪 */
+    os_page_pal_register();                /* 仙剑奇侠传 */
 
 /* 应用注册表 (主菜单/应用管理共用) */
     for (int i = 0; i < (int)BUILTIN_APP_COUNT; i++)

@@ -794,6 +794,7 @@ static const os_module_t s_mod_gamepad = {
     .on_enter   = p_gamepad_enter,
     .on_exit    = p_gamepad_exit,
     .fullscreen = false,
+    .exit_confirm = true,   /* ★ 2026-10-25 linit: 应用页按返回键先弹"退出程序?" */
 };
 
 /* 网页手柄等待 WiFi 连接: 用全局 service 而非模块 poll, 保证在任意页面

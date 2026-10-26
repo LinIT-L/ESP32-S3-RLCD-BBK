@@ -348,6 +348,7 @@ static const os_module_t s_mod_calc = {
     .touch     = calc_touch,
     .poll      = calc_poll,
     .fullscreen = false,
+    .exit_confirm = true,   /* ★ 2026-10-25 linit: 应用页按返回键先弹"退出程序?" */
 };
 
 void os_page_calculator_register(void) { os_register(&s_mod_calc); }

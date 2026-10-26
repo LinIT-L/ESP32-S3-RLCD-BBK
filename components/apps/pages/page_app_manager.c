@@ -14,6 +14,7 @@
 #include "am_internal.h"   /* 应用中心内部模块接口 (am_store / am_lua) */
 #include "os_theme.h"
 #include "ui_common.h"
+#include "ui_scroll.h"   /* ★ 2026-10-24 统一跟手滚动 */
 #include "engine_manager.h"   /* 返回应用管家统一卸载引擎 (应用管家=主菜单级边界) */
 #include "input.h"
 #include "vibrator.h"         /* V1.5.x: 点击应用震动 (ctx_block 屏蔽 input 层, 打开/选中时补) */
@@ -33,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include "str_trunc.h"   /* str_trunc(): 短字段的有意截断拷贝 */
 
 #define TAG "APPM"
 
@@ -70,7 +72,7 @@ static const char *const s_sub_names[AM_SUB_COUNT] = {
     "\xe5\x85\xa8\xe9\x83\xa8",  /* 全部 */
     "\xe6\xb8\xb8\xe6\x88\x8f",  /* 游戏 */
     "\xe8\xbd\xaf\xe4\xbb\xb6",  /* 软件 */
-    "\xe7\xb3\xbb\xe7\xbb\x9f",  /* 系统 */
+    "\xe6\xa0\x87\xe5\x87\x86",  /* 标准 */
     "\xe8\xbf\x90\xe7\xbb\xb4",  /* 运维 */
     "\xe5\xad\xa6\xe4\xb9\xa0",  /* 学习 */
 };
@@ -96,15 +98,13 @@ static void am_store_wifi_gate(ui_ctx_t *ctx) {
     if (s_store_wifi_asked) return;
     s_store_wifi_asked = true;
     if (wifi_manager_is_connected()) return;
-    if (wifi_manager_has_saved()) {
-        ESP_LOGI(TAG, "商店门禁: 等网络模块连上");
-        os_dialog_toast_ms(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c...", 1500); /* 正在连接网络... */
-    } else {
-        /* ★★★ 2026-10-16 linit: 未配置网络 ⇒ 弹"是否添加网络?"确认框;
-         *   点"确定"直接拉起系统联网弹窗(扫描+密码键盘), 不再是只给一句 toast。 */
-        ESP_LOGI(TAG, "商店门禁: 未配置网络 → 弹确认框引导连网");
-        os_dialog_confirm_ex(ctx, "\xe6\x98\xaf\xe5\x90\xa6\xe6\xb7\xbb\xe5\x8a\xa0\xe7\xbd\x91\xe7\xbb\x9c\x3f", 0, -1, am_wifi_gate_cb, NULL); /* 是否添加网络? */
-    }
+    /* ★★★ 2026-10-25 linit「切换过去不提醒是否联网，直接正在连接网络」:
+     *   原来按 wifi_manager_has_saved() 分流 —— **配过一次 WiFi 之后** 就直接
+     *   toast "正在连接网络" 并用联网模块自己连，用户完全没被征求过意见。
+     *   现在一律先弹确认框：点"确定"才走 settings_wifi_connect_open(已保存则直连、
+     *   未保存则弹扫描+密码)，点"取消"保持离线、只浏览本地已装的包。 */
+    ESP_LOGI(TAG, "商店门禁: 弹确认框询问是否联网 (已保存配置=%d)", (int)wifi_manager_has_saved());
+    os_dialog_confirm_ex(ctx, "\xe6\x98\xaf\xe5\x90\xa6\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c\xe6\x9b\xb4\xe6\x96\xb0\xe5\xba\x94\xe7\x94\xa8\xef\xbc\x9f", 0, -1, am_wifi_gate_cb, NULL); /* 是否连接网络更新应用？ */
 }
 
 /* ==== 页面状态 ==== */
@@ -123,7 +123,12 @@ static bool s_list_vis[64];           /* 每项可见性缓存: 渲染用, 避�
 
 /* ==== 网格相机 (仿主菜单: 跟手 + 平滑吸附) ====
  * s_gcam 以"行"为单位, 可小数; 拖动时跟手, 松手后平滑吸附到最近焦点行. */
-static float s_gcam = 0.0f;            /* 当前相机 (行, 可小数) */
+static float s_gcam = 0.0f;            /* 当前相机 (行, 可小数) — ★ 现在是 ui_scroll 的渲染镜像 */
+static ui_scroll_t s_am_sc;            /* ★ 2026-10-24 统一滚动控制器 */
+static bool s_am_sc_rdy = false;
+static int  s_am_sc_cap = -1, s_am_sc_vh = -1;
+static bool am_sc_poll(ui_ctx_t *ctx);   /* 定义在文件后部, 拖动段先用 */
+static void am_sc_sync(void);            /* 重建/切分类后把 ui_scroll 对齐到 s_gcam */
 static float s_gcam_anim_from = 0.0f;
 static float s_gcam_anim_to   = 0.0f;
 static uint32_t s_gcam_anim_start = 0;
@@ -148,8 +153,8 @@ static bool  s_gdrag_active = false;
 #define AM_ROW_ICON_SZ  36                          /* 行内图标边长 (缩放到行高内) */
 #define AM_ROW_ICON_X   (6 + AM_ROW_ICON_SZ / 2)    /* 图标中心 x = 24 (左缘留 6px) */
 #define AM_ROW_TX       50                          /* 名称/说明左边界 (图标右缘 + 9) */
-#define AM_ROW_BTN_TW   32                          /* 按钮两汉字宽 (16px×2) */
-#define AM_ROW_BTN_X0   (AM_COL_W - 10 - AM_ROW_BTN_TW)   /* 按钮文字左边 = 283 */
+#define AM_ROW_BTN_TW   48                          /* ★ 2026-10-25: 按钮两汉字宽 (24px×2, 原 16px) */
+#define AM_ROW_BTN_X0   (AM_COL_W - 10 - AM_ROW_BTN_TW)   /* 按钮文字左边 = 267 */
 #define AM_COL_H_MAX  (64 * AM_ROW_H)               /* 列表最多 64 行的整列缓冲高 */
 static uint8_t *s_col = NULL;                       /* PSRAM 整列缓冲 */
 static int      s_col_h = 0;                        /* 当前列高 (px) */
@@ -311,6 +316,7 @@ bool am_sub_want_cat(const char *cat) {
 }
 
 static void am_rebuild_ex(bool keep_cam) {
+    const int64_t t_rebuild0 = esp_timer_get_time();
     /* 视图固定不可切换: 商店=列表, 其他分类=图标网格 */
     s_view_grid = (s_cat != AM_CAT_STORE);
     /* 分类 Lua 后台扫描 (不再同步阻塞首帧): 本次先只组 C 应用; 若该分类数据还没就绪,
@@ -323,10 +329,13 @@ static void am_rebuild_ex(bool keep_cam) {
         /* 商店: 本地应用包 (后台扫描 /store 根 与 /sdcard/store_pkg, 不联网).
          * 首次未扫完 → 空列表显示"正在扫描…", 扫描完成后由 poll 重建列表. */
         am_store_prefetch();
+        /* ★★★★ 2026-10-17 修 (linit 反复反馈"商店全在软件里"的真凶):
+         *   原来只在「全部」和「软件」两个页签填列表 ⇒ 其它页签永远空, 而「软件」装了全部 8 个。
+         *   改为与其它分类一致: **逐个条目走 app_match_sub() 按分类过滤** ✓ */
         if (am_store_ready())
             for (int k = 0; k < am_store_count() && s_list_n < 64; k++) {
-                if (s_sub == AM_SUB_ALL || s_sub == AM_SUB_PROG)
-                    { const os_app_t *sa = am_store_app(k); if (sa) s_list[s_list_n++] = sa; }
+                const os_app_t *sa = am_store_app(k);
+                if (sa && app_match_sub(sa)) s_list[s_list_n++] = sa;
             }
     } else if (s_cat == AM_CAT_ENGINE) {
         /* 引擎: 按用户指定顺序插入 (从注册表取对应应用) */
@@ -334,7 +343,9 @@ static void am_rebuild_ex(bool keep_cam) {
             int total = os_app_count();
             for (int i = 0; i < total; i++) {
                 const os_app_t *a = os_app_get(i);
-                if (a && strcmp(a->id, s_engine_order[o]) == 0) {
+                /* ★ 2026-10-25: 必须过可见性判定 —— 资源包类应用(requires 目录不在)
+                 *   和用户隐藏的应用, 不能进列表。原来只按分类/id 匹配 ⇒ 隐藏的照样显示。 */
+                if (a && strcmp(a->id, s_engine_order[o]) == 0 && os_app_available(a)) {
                     s_list[s_list_n++] = a;
                     break;
                 }
@@ -346,7 +357,7 @@ static void am_rebuild_ex(bool keep_cam) {
         int total = os_app_count();
         for (int i = 0; i < total && s_list_n < 64; i++) {
             const os_app_t *a = os_app_get(i);
-            if (app_match_cat(a)) s_list[s_list_n++] = a;
+            if (app_match_cat(a) && os_app_available(a)) s_list[s_list_n++] = a;   /* ★ 只过滤资源未就绪的 */
         }
         if (am_lua_ready(s_cat)) am_lua_append(true);    /* 只并入运维类 Lua */
     } else {
@@ -354,15 +365,17 @@ static void am_rebuild_ex(bool keep_cam) {
         int total = os_app_count();
         for (int i = 0; i < total && s_list_n < 64; i++) {
             const os_app_t *a = os_app_get(i);
-            if (app_match_cat(a)) s_list[s_list_n++] = a;
+            if (app_match_cat(a) && os_app_available(a)) s_list[s_list_n++] = a;   /* ★ 只过滤资源未就绪的 */
         }
         if (am_lua_ready(s_cat)) am_lua_append(false);   /* 并入 Lua 应用文件 (排除运维类) */
     }
     /* 缓存可见性: 渲染循环不再逐帧调 os_app_visible(读 NVS flash 极慢, 是管家卡顿根因) */
+    const int64_t tb0 = esp_timer_get_time();
     for (int i = 0; i < s_list_n; i++) {
         const os_app_t *v = s_list[i];
         s_list_vis[i] = v ? os_app_visible(v) : false;
     }
+    const int64_t tb1 = esp_timer_get_time();
     if (s_focus >= s_list_n) s_focus = 0;
     if (s_focus < 0) s_focus = 0;
     if (keep_cam) {
@@ -380,9 +393,26 @@ static void am_rebuild_ex(bool keep_cam) {
     }
     s_gcam_anim_start = 0;
     am_clamp_scroll();
+    /* ★★★ 2026-10-25 必修: 切分类/重建后必须把 ui_scroll 对齐到新的 s_gcam。
+     *   否则 s_am_sc 还留着**上一个分类**的偏移（比如商店拖到底 2.5 行），
+     *   am_sc_poll() 每帧又拿它反写 s_gcam ⇒ 相机被拉回旧位置 ⇒
+     *   引擎/运维这种一屏装得下的分类，内容整体下移、顶部空一排，
+     *   看起来就像"应用少了一条"。 */
+    am_sc_sync();
     s_col_dirty = true;   /* 列表内容变了, 整列需重渲染 */
+    ESP_LOGI(TAG, "rebuild: %d 条, 总计=%lld us (可见性段=%lld us, 收尾=%lld us)",
+             s_list_n, (long long)(esp_timer_get_time() - t_rebuild0),
+             (long long)(tb1 - tb0), (long long)(esp_timer_get_time() - tb1));
 }
 static void am_rebuild(void)      { am_rebuild_ex(false); }
+/* ★ 2026-10-18: 串口调试用 —— 切分类并重建(验证商店渲染不死机) */
+void am_debug_set_cat(int c) {
+    if (c < 0 || c >= AM_CAT_COUNT) return;
+    s_cat = c;
+    s_sub = AM_SUB_ALL;
+    am_rebuild_ex(true);
+    ESP_LOGI("APPM", "debug: 分类切到 %d, 条目 %d", c, s_list_n);
+}
 void am_rebuild_keep(void) { am_rebuild_ex(true);  }   /* 对外: am_store.c 安装/卸载后重建 */
 static int am_max_scroll(void) {
     if (!s_view_grid) {
@@ -766,6 +796,53 @@ static void am_col_label(int cx, int y, const char *s, bool inv) {
         }
     }
 }
+/* ★ 2026-10-25 linit: 商店行右侧按钮改用系统 24px 字库 (原 16px 太小, 8 米外看不清)。
+ *   与 am_col_text_l 同套路: 只写列缓冲, 不改渲染主流程。
+ *   24px 字模布局: 每行 3 字节, 24 行 = 72 字节 (ZH_FONT_BYTES_PER_CHAR)。 */
+static void am_col_text24_l(int x, int y, const char *s, bool inv) {
+    for (const unsigned char *p = (const unsigned char *)s; *p;) {
+        if ((*p & 0xe0) == 0xe0) {
+            int idx = font_zh_find_utf8((const char *)p);
+            const uint8_t *b = (idx >= 0) ? font_zh_get_bitmap_by_index(idx) : NULL;
+            if (b)
+                for (int r = 0; r < ZH_FONT_H; r++)
+                    for (int c = 0; c < ZH_FONT_W; c++)
+                        if (b[r * 3 + (c >> 3)] & (0x80 >> (c & 7)))
+                            am_col_px(x + c, y + r, !inv);
+            x += ZH_FONT_W; p += 3;
+        } else {
+            if (*p >= 0x20 && *p <= 0x7e) {          /* ASCII 兜底: 8x12 居中 */
+                const uint8_t *b = FONT8X12[*p - 0x20];
+                for (int cy = 0; cy < 16; cy++)
+                    for (int cc = 0; cc < 8; cc++)
+                        if (b[cy] & (0x80u >> cc)) am_col_px(x + cc, y + 4 + cy, !inv);
+            }
+            x += 8; p++;
+        }
+    }
+}
+/* 圆角矩形描边 (r=3): 四角 1/4 圆弧 + 四边直线段, 全部走 am_col_px 边界夹取 */
+static void am_col_round_outline(int x0, int y0, int x1, int y1, int r, bool black) {
+    if (r < 1 || (x1 - x0) < 2 * r + 2 || (y1 - y0) < 2 * r + 2) {
+        am_col_rect_outline(x0, y0, x1, y1, black);
+        return;
+    }
+    am_col_hline(x0 + r, x1 - r, y0, black);
+    am_col_hline(x0 + r, x1 - r, y1, black);
+    am_col_vline(x0, y0 + r, y1 - r, black);
+    am_col_vline(x1, y0 + r, y1 - r, black);
+    const int r2 = r * r, r2i = (r - 1) * (r - 1);
+    for (int dy = 0; dy <= r; dy++) {
+        for (int dx = 0; dx <= r; dx++) {
+            const int d2 = dx * dx + dy * dy;
+            if (d2 > r2 || d2 <= r2i) continue;
+            am_col_px(x0 + r - dx, y0 + r - dy, black);   /* 左上 */
+            am_col_px(x1 - r + dx, y0 + r - dy, black);   /* 右上 */
+            am_col_px(x0 + r - dx, y1 - r + dy, black);   /* 左下 */
+            am_col_px(x1 - r + dx, y1 - r + dy, black);   /* 右下 */
+        }
+    }
+}
 static void am_col_text_l(int x, int y, const char *s, bool inv) {
     int aofs = (ZH16_FONT_H - 16) / 2;
     for (const unsigned char *p = (const unsigned char *)s; *p;) {
@@ -894,18 +971,58 @@ static void am_col_render_list(void) {
             /* 第二行 = 文案 (本地包 → LAPP 简介 desc=; 云端包 → "未下载 · NKB"),
              * 不再显示文件路径/文件名 ——
              * 用户原话: "模拟器下方不要显示路径名称, 直接显示对应说明"。 */
-            const char *ds = am_store_sub_of(a);
-            if (ds && ds[0])
-                am_col_text_l(AM_ROW_TX, y + 27,
-                              am_col_ellipsis(ds, AM_ROW_BTN_X0 - 4 - AM_ROW_TX), sel);
-            /* 按钮文案由商店给 (安装 / 卸载 / 下载) */
+            /* ★★★ 2026-10-18 linit: **下载/安装中 → 第二行画进度条**(顶掉介绍), 完成自动恢复。
+             *   ⚠ 安全约束(上次就是这里崩的): 所有坐标必须夹在【本行】与【列缓冲】内,
+             *     只用 am_col_hline / am_col_fill(已带边界夹取), 不自己算指针。 */
+            int dpm = am_store_dl_permille_of(a);
+            if (dpm >= 0) {
+                int bx0 = AM_ROW_TX;
+                int bx1 = AM_ROW_BTN_X0 - 42;   /* ★ 留出右侧 42px 给百分比, 避免重叠 */
+                int by0 = y + 29;
+                int by1 = by0 + 6;
+                /* 夹进本行可见范围 (AM_ROW_H 内) 与列缓冲高度 */
+                if (by1 > y + AM_ROW_H - 3) by1 = y + AM_ROW_H - 3;
+                if (by1 >= s_col_h)          by1 = s_col_h - 1;
+                if (bx1 >= AM_COL_W)         bx1 = AM_COL_W - 1;
+                if (by1 > by0 && bx1 > bx0) {
+                    am_col_rect_outline(bx0, by0, bx1, by1, !sel);      /* 外框 */
+                    int fw = ((bx1 - bx0 - 2) * dpm) / 1000;            /* 内部填充 */
+                    if (fw > 0)
+                        am_col_fill(bx0 + 1, by0 + 1,
+                                    (bx0 + fw < bx1) ? bx0 + fw : bx1 - 1,
+                                    by1 - 1, !sel);
+                    /* 百分比画在**条右侧的空白区**(条已留出 42px) */
+                    char pg[8];
+                    int pct = dpm / 10; if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+                    snprintf(pg, sizeof(pg), "%d%%", pct);   /* 0..100 ⇒ 最多 4 字节 */
+                    am_col_text_l(bx1 + 6, by0 - 1, pg, sel);
+                }
+            } else {
+                const char *ds = am_store_sub_of(a);
+                if (ds && ds[0])
+                    am_col_text_l(AM_ROW_TX, y + 27,
+                                  am_col_ellipsis(ds, AM_ROW_BTN_X0 - 4 - AM_ROW_TX), sel);
+            }
+            /* 按钮文案由商店给 (安装 / 卸载 / 下载)
+             * ★ 2026-10-25 linit:
+             *   ① 24px 字 + 按字号放大的 r3 圆角框 (原 16px 方框);
+             *   ② **下载/解压期间一律显示"下载中"** —— 原来只要 target 目录被解出
+             *      一两个文件, 按钮就跳成"卸载"(还没到 100% 就变), 现在按"是否正在
+             *      下发/解包"锁住, 完成(进度清空)后才允许显示"卸载";
+             *   ③ 框宽按字数自适应 (2 字 48px / 3 字 72px), 右边缘对齐不变。 */
             const char *act = am_store_btn_of(a);
-            const int bt = y + (AM_ROW_H - 16) / 2;    /* 按钮垂直居中 */
-            am_col_text_l(AM_ROW_BTN_X0, bt, act, sel);
-            /* 框必须**完整包住**两字: 文字实占 [bt, bt+15] → 框 [bt-2, bt+17] (上下各留 2px).
-             * (旧代码框底到 y+26 < 文字底 y+30 → 两字下半截露在框外, 就是"框没框住"。) */
-            am_col_rect_outline(AM_ROW_BTN_X0 - 3, bt - 2,
-                                AM_ROW_BTN_X0 + AM_ROW_BTN_TW + 2, bt + 17, !sel);
+            if (am_store_dl_permille_of(a) >= 0) act = "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad";  /* 下载中 */
+            int nch = 0;
+            for (const unsigned char *q = (const unsigned char *)act; *q; ) {
+                q += (*q >= 0xf0) ? 4 : (*q >= 0xe0) ? 3 : (*q >= 0xc0) ? 2 : 1;
+                nch++;
+            }
+            const int tw = nch * ZH_FONT_W;
+            const int bx = AM_COL_W - 8 - tw;                      /* 右对齐 */
+            const int bt = y + (AM_ROW_H - ZH_FONT_H) / 2;          /* 24px 字垂直居中 */
+            am_col_text24_l(bx, bt, act, sel);
+            /* 框包住整字再各留 3~4px: 文字 [bt, bt+23] → 框 [bt-3, bt+26], 高 30 */
+            am_col_round_outline(bx - 4, bt - 3, AM_COL_W - 4, bt + 26, 3, !sel);
         } else {
             am_col_text_l(AM_ROW_TX, y + 27, id, sel);
             bool mm = (i >= 0 && i < s_list_n) && s_list_vis[i];
@@ -939,9 +1056,12 @@ static void am_col_present(st7305_handle_t *lcd, int grid_x0, int content_top, i
 /* ==== 下载中: 内容区居中进度框 (2026-10-04) ====
  * ⛔ 不做全屏白底遮罩 —— 全屏刷白 = 12 万次 PSRAM 随机写 ≈ 几十毫秒 (见 1bpp 性能法则)。
  *    只画一个 ~290x84 的框 (≈2.4 万像素), 列表在框外照旧可见, 反而更清楚"正在下哪个包"。 */
-static void am_draw_dl_overlay(st7305_handle_t *lcd, int grid_x0, int content_top) {
-    const int x1 = UI_SCREEN_W - 16;
-    const int x0 = grid_x0 + 16;
+__attribute__((unused)) static void am_draw_dl_overlay(st7305_handle_t *lcd, int grid_x0, int content_top) {
+    /* ★ 2026-10-17 linit: 原按"内容区"居中(从 grid_x0+16 起) ⇒ 视觉偏右 ✗; 而且太宽(293px)。
+     *   改为**屏幕居中 + 收窄到 260**。 */
+    const int w  = 260;
+    const int x0 = (UI_SCREEN_W - w) / 2;
+    const int x1 = x0 + w;
     const int h  = 84;
     const int y0 = content_top + (UI_SCREEN_H - content_top - h) / 2;
     const int y1 = y0 + h;
@@ -949,6 +1069,7 @@ static void am_draw_dl_overlay(st7305_handle_t *lcd, int grid_x0, int content_to
     for (int k = 0; k < 2; k++)              /* 2px 边框, 与弹窗同族 */
         draw_rect_outline(lcd, x0 + k, y0 + k, x1 - k, y1 - k, ST7305_COLOR_BLACK);
 
+    return;   /* ★ 2026-10-18 linit: 不再画浮层进度面板 —— 进度直接显示在列表第二行 */
     int pm = am_rstore_dl_permille();
     char pct[12];
     if (pm < 0) snprintf(pct, sizeof(pct), "--");
@@ -1099,9 +1220,11 @@ static void p_am_render(ui_ctx_t *ctx) {
         /* 该分类暂无应用 */
     }
 
-    /* 下载中: 盖上进度框 (画在列表之上, 但不遮挡整屏) */
+    /* ⛔ 2026-10-18 linit: **下载浮层面板已彻底移除** —— 进度改在列表行内进度条。
+     *   (原来只让函数体 return, 面板背景照样画 ⇒ 出现"空白弹窗" ✗)
     if (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING)
         am_draw_dl_overlay(lcd, grid_x0, content_top);
+    */
 
     /* 视图切换图标已移除: 改为 长按硬件确认键 3s 切换 (见 p_am_poll/OS_ACTION_BT_SEARCH). */
 
@@ -1324,7 +1447,23 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
     }
 }
 
+static int s_dbg_last_x = -1, s_dbg_last_y = -1;
+/* ★ 2026-10-25 诊断: 左栏"图标位置 vs 触摸位置对不上"时, 跑 `remcon amgeo` 打印几何 +
+ *   最后一次落点, 一眼就能算出偏差几像素 (不用猜)。 */
+void am_debug_geo(void)
+{
+    printf("AMGEO bar_w=%d icon_cx=%d size=%d y0=%d gap=%d slot=%d\r\n",
+           AM_CATBAR_W, AM_ICON_X, AM_ICON_SIZE, AM_CAT_Y0, AM_ICON_GAP,
+           AM_ICON_SIZE + AM_ICON_GAP - 1);
+    for (int r = 0; r < AM_CAT_COUNT; r++)
+        printf("AMGEO  cat%d center_y=%d top=%d bottom=%d\r\n", r,
+               am_cat_cy(r), am_cat_cy(r) - AM_ICON_SIZE / 2, am_cat_cy(r) + AM_ICON_SIZE / 2);
+    printf("AMGEO last_touch=(%d,%d) sel_cat=%d\r\n", s_dbg_last_x, s_dbg_last_y, s_cat);
+    fflush(stdout);
+}
+
 static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
+    s_dbg_last_x = x; s_dbg_last_y = y;
     /* 拖动滚动中: 忽略点击 (松手后由 poll 复位 s_gdrag_active) */
     if (s_gdrag_active) return true;
     /* 长按已触发: 吞掉松手后的那次 tap (避免重复弹操作窗) */
@@ -1486,6 +1625,50 @@ static void p_am_poll(ui_ctx_t *ctx) {
         ctx->needs_redraw = true;
     }
 
+    /* ★★★ 2026-10-18 linit: **下载中每帧重绘 + 标脏列缓冲** ——
+     *   行是渲染到离屏列缓冲 s_col 的, 只有 s_col_dirty 才重新渲染 ✗
+     *   ⇒ 只设 needs_redraw 等于把【旧缓冲】重新贴一遍, 进度条永远不动 ✓
+     *   (linit 报"下载没进度, 一下子完成"就是这个) */
+    if (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING) {
+        ctx->needs_redraw = true;
+        s_col_dirty = true;
+    }
+    /* ★★★ 2026-10-18 linit: **卸载完成后自动刷新页面** ——
+     *   后台删完文件只会置标志; 这里取一次 ⇒ 强制重渲染整列(按钮变"下载")
+     *   ⚠ 只重绘不重建列表(poll 里 rebuild 会崩) ✓ */
+    if (s_cat == AM_CAT_STORE && am_store_take_uninst_done()) {
+        ctx->needs_redraw = true;
+        s_col_dirty = true;
+        ESP_LOGI("APPM", "卸载完成 → 自动刷新页面");
+    }
+
+    /* ★★★ 2026-10-18 linit: **下载刚开始时, 把正在下载的那条冒泡到第一位 + 列表回顶部** ——
+     *   否则它还在原来的位置, 用户要自己找进度 ✗ (他明确要求"排第一个 + 回最上面")
+     *   ⚠ 只调整 s_list 顺序 + 滚动位置, **不重建列表**(重建会崩, 见上面的注释) ✓ */
+    {
+        static bool s_dl_was = false;
+        bool dl_now = (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING);
+        if (dl_now && !s_dl_was) {
+            for (int i = 0; i < s_list_n; i++) {
+                if (am_store_dl_permille_of(s_list[i]) >= 0) {
+                    if (i > 0) {
+                        const os_app_t *t = s_list[i];
+                        for (int j = i; j > 0; j--) s_list[j] = s_list[j - 1];
+                        s_list[0] = t;
+                    }
+                    break;
+                }
+            }
+            s_focus  = 0;
+            s_scroll = 0;
+            s_gcam   = 0.0f;
+            ctx->needs_redraw = true;
+            s_col_dirty = true;
+            ESP_LOGI("APPM", "下载开始 → 该条目排到第一位, 列表回顶部");
+        }
+        s_dl_was = dl_now;
+    }
+
     /* 分类 Lua 后台扫描完成: 影子缓冲搬到 s_lua, 标记数据就绪, 重建列表 (UI 线程取货).
      * 迁移须在 UI 线程一次性完成 (后台只写 s_lua_bg, 避免与渲染读 s_lua 竞态). */
     if (am_lua_tick()) {
@@ -1500,7 +1683,9 @@ static void p_am_poll(ui_ctx_t *ctx) {
         if (am_rstore_tick()) {
             int rs = am_rstore_state();
             if (rs == ARS_OK) {
-                os_dialog_toast(ctx, "\xe4\xb8\x8b\xe8\xbd\xbd\xe5\xae\x8c\xe6\x88\x90");   /* 下载完成 */
+                /* ★ 2026-10-18: 自动安装已移到**下载任务**(后台线程) ——
+                 *   UI 线程只负责提示, 不做文件 I/O(否则开店死机)。 */
+                os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85");   /* 已安装 */
                 am_rstore_ack();
                 am_store_invalidate();      /* 重扫: 刚下好的包要从"云端"变成"可安装" */
                 am_store_prefetch();
@@ -1512,13 +1697,50 @@ static void p_am_poll(ui_ctx_t *ctx) {
             }
             store_dirty = true;
         }
+        /* ★★★ 2026-10-18 linit: **扫描没完成就每帧重试** ——
+         *   原来只在"重建列表"时试一次, 任务创建失败(内存紧张)就永远空白 ✗
+         *   prefetch 内部自带 busy 超时(3s) 和 s_pkg_scanned 判断, 每帧调无副作用 ✓ */
+        if (!am_store_ready()) am_store_prefetch();
+
         /* 下载中: 进度框要每帧重画 */
         if (am_rstore_state() == ARS_DOWNLOADING) ctx->needs_redraw = true;
+
+        /* ⚠ 2026-10-18: 这里直接 am_rebuild_keep() 会崩(LoadProhibited) ✗
+         *   ⇒ 改为**只标脏**, 由下一帧正常渲染路径重建(不在这里重建) */
+        static bool s_was_ready = false;
+        bool now_ready = am_store_ready();
+        if (now_ready && !s_was_ready) {
+            ctx->needs_redraw = true;
+            s_col_dirty = true;
+            ESP_LOGI("APPM", "商店重扫完成 → 请求刷新");
+        }
+        s_was_ready = now_ready;
     }
     if (store_dirty) {
         if (s_cat == AM_CAT_STORE) {
             am_rebuild_keep();
             ctx->needs_redraw = true;
+        }
+    }
+    /* ★★★ 2026-10-17 linit: **长按左栏分类图标 3 秒 = 清掉商店缓存并重新拉取**
+     *   (放在 s_list_n 早退之前 —— 商店列表为空时也要能长按重置) */
+    {
+        static uint32_t s_cat_lp_ms = 0;
+        static bool     s_cat_lp_fired = false;
+        int lx = 0, ly = 0;
+        bool ldown = input_get_touch_pos(&lx, &ly);
+        if (ldown && lx < AM_CATBAR_W && ly >= AM_CAT_Y0) {
+            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+            if (s_cat_lp_ms == 0) s_cat_lp_ms = now;
+            else if (!s_cat_lp_fired && now - s_cat_lp_ms >= 3000) {
+                s_cat_lp_fired = true;
+                am_rstore_clear_cache();
+                os_dialog_toast_ms(ctx, "\xe5\x95\x86\xe5\xba\x97\xe7\xbc\x93\xe5\xad\x98\xe5\xb7\xb2\xe6\xb8\x85\xe7\xa9\xba", 1200); /* 商店缓存已清空 */
+                ctx->needs_redraw = true;
+            }
+        } else {
+            s_cat_lp_ms = 0;
+            s_cat_lp_fired = false;
         }
     }
     if (s_list_n <= 0) return;
@@ -1540,9 +1762,17 @@ static void p_am_poll(ui_ctx_t *ctx) {
         /* 松手: 平滑吸附到最近焦点行 (无惯性甩手/弹簧回弹) */
         if (s_gdrag_active) {
             s_gdrag_active = false;
-            am_gcam_animate(lroundf(s_gcam), 260);
+            /* ★ 2026-10-24 统一滚动: 松手惯性/回弹/吸附全部交给 ui_scroll,
+             *   不再用本文件那套 260ms 缓动（两者同时动会打架）。 */
             ctx->needs_redraw = true;
         }
+        /* ★★★ 2026-10-25 必修: 松手必须显式喂 down=false, 否则 ui_scroll 的
+         *   `pressed` 一直挂着 true ⇒ 下一次按下时不会重记基准点(base_off/anchor),
+         *   而是拿**上一次**的旧基准算位移 ⇒ 第二次拖动一上手就"弹回原位"。
+         *   (现象: 第一次拖正常, 松手后再拖直接弹回去。) */
+        ui_scroll_touch_xy(&s_am_sc, 0, 0, false);
+        /* 松手后仍要每帧推进惯性/回弹/吸附 */
+        if (am_sc_poll(ctx)) ctx->needs_redraw = true;
         s_gdrag_last_y = -1;
         s_lp_idx = -1;
         s_lp_fired = false;
@@ -1584,12 +1814,77 @@ static void p_am_poll(ui_ctx_t *ctx) {
         }
     }
 
-    /* 跟手: 相机 = 基点 - 位移/行高 */
-    s_gcam = s_gdrag_base - (float)(ty - s_gdrag_anchor_y) / (float)row_h;
-    /* 边界 */
-    if (s_gcam < 0) s_gcam = 0;
-    if (s_gcam > max_row) s_gcam = (float)max_row;
+    /* ★ 2026-10-24 统一滚动: 相机完全由 ui_scroll 算（1:1 跟手 + 越界可拉 + 吸附整行）。
+     *   s_gcam 退化成"渲染镜像"（offset / 行高），渲染侧一行不用改。 */
+    {
+        int view_h  = UI_SCREEN_H - content_top;
+        int content = (max_row * row_h) + view_h;
+        if (!s_am_sc_rdy) { ui_scroll_config(&s_am_sc, UI_SCROLL_LIST, 0); s_am_sc_rdy = true; }
+        /* ⚠ 只在**没在动**时才能 init —— init 会清 pressed 和 fling,
+         *   拖动中调它 = 拖动被打断、松手惯性消失(表现: 一放手回原位)。 */
+        if (!ui_scroll_busy(&s_am_sc) &&
+            (s_am_sc_cap != content || s_am_sc_vh != view_h)) {
+            ui_scroll_init(&s_am_sc, row_h, view_h, content);
+            s_am_sc_cap = content; s_am_sc_vh = view_h;
+        }
+        if (ui_scroll_touch_xy(&s_am_sc, tx, ty, true)) ctx->needs_redraw = true;
+        if (ui_scroll_poll(&s_am_sc)) ctx->needs_redraw = true;
+        float g = (float)ui_scroll_offset(&s_am_sc) / (float)row_h;
+        if (g < 0) g = 0;
+        if (g > (float)max_row + 1.0f) g = (float)max_row + 1.0f;   /* 只为防越界, 不参与定位 */
+        s_gcam = g;
+    }
     if (s_gdrag_active) ctx->needs_redraw = true;
+}
+
+/* 把 ui_scroll 的偏移/内容尺寸对齐到当前分类的 s_gcam。
+ * 调用时机: am_rebuild_ex() 重建列表之后（切分类、安装/卸载、刷新）。 */
+static void am_sc_sync(void) {
+    if (!s_am_sc_rdy) return;
+    int content_top = am_content_top();
+    int row_h = s_view_grid ? ((UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS) : AM_ROW_H;
+    if (s_view_grid && row_h < AM_ICON_SIZE + 18) row_h = AM_ICON_SIZE + 18;
+    int view_h  = UI_SCREEN_H - content_top;
+    int max_row = s_view_grid ? am_max_scroll() : 0;
+    if (!s_view_grid) {
+        int mv = view_h / AM_ROW_H;
+        max_row = s_list_n - mv;
+        if (max_row < 0) max_row = 0;
+    }
+    int content = max_row * row_h + view_h;
+    ui_scroll_init(&s_am_sc, row_h, view_h, content);
+    s_am_sc_cap = content;
+    s_am_sc_vh  = view_h;
+    int off = (int)(s_gcam * (float)row_h);
+    if (off < 0) off = 0;
+    int mx = ui_scroll_max(&s_am_sc);
+    if (off > mx) off = mx;
+    s_am_sc.off   = off;
+    s_am_sc.sub   = 0;
+    s_am_sc.fling = 0.0f;
+}
+
+/* 松手后每帧推进会返回 true = 需要重绘 */
+static bool am_sc_poll(ui_ctx_t *ctx) {
+    (void)ctx;
+    if (!s_am_sc_rdy) return false;
+    /* 这里只推进, 绝不 init */
+    bool ch = ui_scroll_poll(&s_am_sc);
+    int content_top = am_content_top();
+    /* 位置以 ui_scroll 为准, 这里只做镜像换算, 不再二次夹紧 */
+    int row_h = s_view_grid ? ((UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS) : AM_ROW_H;
+    if (s_view_grid && row_h < AM_ICON_SIZE + 18) row_h = AM_ICON_SIZE + 18;
+    int max_row = s_view_grid ? am_max_scroll() : 0;
+    if (!s_view_grid) {
+        int mv = (UI_SCREEN_H - content_top) / AM_ROW_H;
+        max_row = s_list_n - mv;
+        if (max_row < 0) max_row = 0;
+    }
+    float g = (float)ui_scroll_offset(&s_am_sc) / (float)(row_h > 0 ? row_h : 1);
+    if (g < 0) g = 0;
+    if (g > (float)max_row + 1.0f) g = (float)max_row + 1.0f;
+    if (g != s_gcam) { s_gcam = g; ch = true; }
+    return ch;
 }
 
 /* ==== 模块 ==== */
@@ -1639,6 +1934,9 @@ static void p_am_exit(ui_ctx_t *ctx) {
     (void)ctx;
     if (s_am_leave_child > 0) s_am_leave_child--;
     else                      s_store_wifi_asked = false;
+    /* ★ 2026-10-24 规范化: 整列缓冲 (PSRAM, 64 行 × 41B ≈ 63KB) 原来只在 on_enter 分配、
+     *   on_exit 不还 —— 违反 linit "退出就释放" 铁律。退出即 free, 下次进页面重分配。 */
+    if (s_col) { free(s_col); s_col = NULL; s_col_dirty = true; }
     ESP_LOGI(TAG, "exit: child=%d asked=%d", s_am_leave_child, (int)s_store_wifi_asked);
 }
 static const os_module_t s_mod_app_manager = {
@@ -1651,6 +1949,10 @@ static const os_module_t s_mod_app_manager = {
     .touch      = p_am_touch,
     .poll       = p_am_poll,
     .fullscreen = false,   /* 显示状态栏 */
+    /* ★ 2026-10-25 linit: 商店下载/解压 20MB+ 要 1~3 分钟，期间没有任何按键 ⇒
+     *   原来的"空闲自动回主菜单"会把用户踢出去(看起来像"到 100% 就退回桌面")。
+     *   应用中心是浏览/装卸的主场，允许长时间停留。 */
+    .keep_on_idle = true,
 };
 
 void os_page_app_manager_register(void) {

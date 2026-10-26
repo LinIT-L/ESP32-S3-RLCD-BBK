@@ -9,5 +9,6 @@ idf_component_register(
         audio_player
         virtual_keys
         cheater
+        vid_tune
         log
 )

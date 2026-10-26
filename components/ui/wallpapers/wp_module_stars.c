@@ -85,7 +85,7 @@ static void wp_time_str(char *out, size_t n) {
     snprintf(out, n, "%02d:%02d", ti.tm_hour, ti.tm_min);
 }
 
-static void render_stars(st7305_handle_t *lcd, uint32_t now_ms) {
+static int render_stars(st7305_handle_t *lcd, uint32_t now_ms) {
     if (!s_stars_ready) stars_init();
 
     st7305_clear(lcd, ST7305_COLOR_WHITE);
@@ -377,6 +377,7 @@ static void render_stars(st7305_handle_t *lcd, uint32_t now_ms) {
         st7305_draw_pixel(lcd, x, prog_y - 1, ST7305_COLOR_BLACK);
         st7305_draw_pixel(lcd, x, prog_y, ST7305_COLOR_BLACK);
     }
+    return 1;      /* 动态壁纸: 每帧都有变化, 需要 flush */
 }
 
 

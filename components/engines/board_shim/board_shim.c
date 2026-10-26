@@ -15,6 +15,7 @@
 #include "audio_player.h"
 #include "virtual_keys.h"
 #include "cheat_float.h"
+#include "vid_tune.h"        /* 画面优化器 (shade→黑点数 可调) */
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -52,12 +53,13 @@ static int g_gb_gray = 1;
 #define NES_PACKED_256x224 (256 * 224 / 4)                       /* 14336 */
 static uint8_t s_rowbits[4][2][16];
 static void board_shim_rebuild_nes_rowbits(void);
+static void board_shim_apply_tune(void);
 
 void board_shim_set_gb_gray(int mode) {
     if (mode < 0) mode = 0;
     if (mode > 2) mode = 2;
     g_gb_gray = mode;
-    board_shim_rebuild_nes_rowbits();
+    board_shim_apply_tune();
 }
 
 /* st7305 句柄 (由 board_shim_set_lcd 设置) */
@@ -229,6 +231,7 @@ static void board_video_flush_task(void *arg)
             }
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
+            if (!takeover) vid_tune_overlay_tick(s_lcd);
             board_rlcd_fb_unlock();
             if (!takeover) st7305_flush_from(s_lcd, s_lcd->fb);
         } else if (s_gbc_src && s_gbc_w > 0 && s_gbc_h > 0) {
@@ -292,6 +295,7 @@ static void board_video_flush_task(void *arg)
             }
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
+            if (!takeover) vid_tune_overlay_tick(s_lcd);
             board_rlcd_fb_unlock();
             s_gbc_conv_us = esp_timer_get_time() - c0;
             int64_t s0 = esp_timer_get_time();
@@ -302,6 +306,7 @@ static void board_video_flush_task(void *arg)
             board_rlcd_fb_lock();
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
+            if (!takeover) vid_tune_overlay_tick(s_lcd);
             if (!takeover)
                 memcpy(s_flush_snapshot, s_lcd->fb, ST7305_WIDTH * ST7305_HEIGHT / 8);
             board_rlcd_fb_unlock();
@@ -389,6 +394,9 @@ void board_rlcd_video_task_stop(void)
 
 void board_shim_set_lcd(st7305_handle_t *lcd) {
     s_lcd = lcd;
+    /* 画面优化器: 参数一变就重建 shade→黑点表 (回调里会立即跑一次) */
+    vid_tune_init();
+    vid_tune_set_rebuild_cb(board_shim_apply_tune);
 }
 
 st7305_handle_t *board_shim_get_lcd(void) {
@@ -481,29 +489,6 @@ static inline void write_masked_pixel(uint8_t *fb, uint32_t index, uint8_t mask,
 /* 点聚(clustered)半色调表: 每个游戏像素占 2x2 物理点, 用"聚在一起的黑色点数"表达灰阶.
  * 黑点聚成实心块 (非散点抖动), 静态图案 -> 低刷新率下不闪烁.
  * 每个 shade 的行: [top-left, top-right, bottom-left, bottom-right] */
-static const uint8_t s_cluster_4[4][4] = {
-    /* shade 0 (白): 0 黑 */
-    { ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE },
-    /* shade 1 (浅灰): 1 黑 (左上) */
-    { ST7305_COLOR_BLACK, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE },
-    /* shade 2 (中灰): 2 黑 (左上+右上, 聚成上排) */
-    { ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE },
-    /* shade 3 (深灰): 4 黑 (全黑) */
-    { ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK },
-};
-
-/* 散点抖动 (Bayer 2x2): 黑点离散分布表达灰阶, 层次更细腻 (低刷新率下可能微闪) */
-static const uint8_t s_scatter[4][4] = {
-    /* shade 0 (白): 0 黑 */
-    { ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE },
-    /* shade 1 (浅灰): 1 黑 (左上) */
-    { ST7305_COLOR_BLACK, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE },
-    /* shade 2 (中灰): 2 黑 (左上+右下, 对角散点) */
-    { ST7305_COLOR_BLACK, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_BLACK },
-    /* shade 3 (深灰): 3 黑 (右下外全黑) */
-    { ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK },
-};
-
 /* 纯黑白: shade>=2 为黑, 否则白 */
 static const uint8_t s_cluster_bw[4][4] = {
     { ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE },
@@ -512,19 +497,36 @@ static const uint8_t s_cluster_bw[4][4] = {
     { ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK },
 };
 
+/* ★★★ 2026-10-25 linit: 画面优化器 —— shade→黑点数 由用户曲线决定, 图案运行时生成.
+ *   "点聚/散点" 只决定**黑点落哪几个象限**, 黑点个数(0..4)来自 vid_tune 的曲线。
+ *   这样 GB/GBC/NES/MD/SMS 全部走同一张表, 一处可调处处生效。 */
+static uint8_t s_tune_pat[4][4];
+static void board_shim_apply_tune(void)
+{
+    uint8_t dots[4] = { 0, 1, 2, 3 };
+    vid_tune_get_dots(dots);
+    static const uint8_t ord_cluster[4] = { 0, 1, 2, 3 };   /* 左上 右上 左下 右下 (聚成块) */
+    static const uint8_t ord_scatter[4] = { 0, 3, 1, 2 };   /* 左上 右下 右上 左下 (对角散开) */
+    const uint8_t *ord = (g_gb_gray == 2) ? ord_scatter : ord_cluster;
+    for (int sh = 0; sh < 4; sh++) {
+        for (int q = 0; q < 4; q++) s_tune_pat[sh][q] = ST7305_COLOR_WHITE;
+        for (int k = 0; k < dots[sh] && k < 4; k++)
+            s_tune_pat[sh][ord[k]] = ST7305_COLOR_BLACK;
+    }
+    board_shim_rebuild_nes_rowbits();
+}
+
 /* 按当前灰度模式取 shade 对应的 2x2 图案: 0=纯黑白, 1=点聚灰度, 2=散点抖动 */
 static const uint8_t *board_shim_cluster_get(uint8_t shade)
 {
     shade &= 0x03;
-    if (g_gb_gray == 0) return s_cluster_bw[shade];
-    if (g_gb_gray == 2) return s_scatter[shade];
-    return s_cluster_4[shade];
+    if (g_gb_gray == 0) return s_cluster_bw[shade];   /* 纯黑白档不走调曲线 */
+    return s_tune_pat[shade];
 }
 
 static void board_shim_rebuild_nes_rowbits(void)
 {
-    const uint8_t (*pat)[4] = (g_gb_gray == 0) ? s_cluster_bw :
-                              (g_gb_gray == 2) ? s_scatter : s_cluster_4;
+    const uint8_t (*pat)[4] = (g_gb_gray == 0) ? s_cluster_bw : s_tune_pat;
     for (int ly = 0; ly < 4; ly++) {
         for (int par = 0; par < 2; par++) {
             for (int pair = 0; pair < 16; pair++) {
@@ -596,9 +598,15 @@ static inline uint8_t board_rlcd_rgb565_be_to_gbc_shade(uint16_t rgb565_be)
     uint8_t b5 = (uint8_t)(rgb & 0x1FU);
     uint16_t gray = (uint16_t)(r5 * 38U + g6 * 75U + b5 * 15U);
 
-    if (gray >= 4800U) return 0;
-    if (gray >= 3200U) return 1;
-    if (gray >= 1600U) return 2;
+    /* ★★★ 2026-10-17 修正 (依据社区反馈 andjiang0083 的分析, 同一个原理):
+     *   4 档的实际等效亮度(2x2 抖动, 白点数 4/3/2/1) = 6368 / 4776 / 3184 / 1592;
+     *   要让"离哪一档最近就归哪一档", 分界必须取相邻两档的中点:
+     *     (6368+4776)/2=5572 · (4776+3184)/2=3980 · (3184+1592)/2=2388
+     *   原来用等分 4800/3200/1600 ⇒ 暗端门限被抬高(1600 vs 2388),
+     *   暗色元素(如暗绿文字/图标)被判成全黑而消失。 */
+    if (gray >= 5572U) return 0;
+    if (gray >= 3980U) return 1;
+    if (gray >= 2388U) return 2;
     return 3;
 }
 

@@ -10,6 +10,7 @@
 #include "os.h"
 #include "os_internal.h"
 #include "ui_common.h"
+#include "ui_col.h"
 #include "os_wifi.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
@@ -71,6 +72,8 @@ static inline uint32_t wp_rnd(void)
 static int  s_view = WP_VIEW_AP;
 static int  s_sel = 0;          /* 雷达选中圆球 / 列表选中行 */
 static int  s_scroll = 0;       /* 列表滚动偏移 (热力图/探针) */
+static ui_col_t s_wcol;          /* 列表整列缓冲 (滚动只抄窗) */
+static bool s_wdirty = true;
 static bool s_detail = false;   /* 雷达详情小窗口是否弹出 */
 static bool s_running = false;  /* 是否正在监听 */
 static uint32_t s_poll_tick = 0;
@@ -97,7 +100,7 @@ static void wp_ensure_sniff(void)
 static void wp_set_view(int v)
 {
     s_view = v;
-    s_scroll = 0;
+    s_scroll = 0; s_wdirty = true;
     s_sel = 0;
     s_detail = false;
     if (v == WP_VIEW_AP) os_wifi_scan();
@@ -475,17 +478,27 @@ static void wp_render_probe(ui_ctx_t *ctx)
     int n = os_wifi_probe_count();
     snprintf(buf, sizeof(buf), "%s %d", "\xe5\x8f\x91\xe7\x8e\xb0", n);
     wp_txt(lcd, 4, WP_TOP + 28, buf, false);
-    int rows = (UI_SCREEN_H - (WP_TOP + 46)) / 20;
-    for (int i = 0; i < rows; i++) {
-        int idx = s_scroll + i;
-        if (idx >= n) break;
-        const wp_probe_t *pr = os_wifi_probe_get(idx);
-        int y = WP_TOP + 46 + i * 20;
-        bool inv = (i == s_sel);
-        wp_txt_cap(lcd, 4, y, pr->ssid, inv, 200);
-        snprintf(buf, sizeof(buf), "x%lu CH%d", (unsigned long)pr->count, pr->channel);
-        wp_txt(lcd, 230, y, buf, inv);
+    /* ★ 列表 = 整列缓冲 + 抄窗: 内容变化才重建, 滚动只 blit (商店同款) */
+    int rows = (UI_SCREEN_H - (WP_TOP + 46)) / 20; (void)rows;
+    int list_y = WP_TOP + 46;
+    if (s_wdirty) {
+        int need_h = n * 20;
+        if (need_h < UI_SCREEN_H - list_y) need_h = UI_SCREEN_H - list_y;
+        if (need_h < 20) need_h = 20;
+        if (ui_col_init(&s_wcol, UI_SCREEN_W, need_h)) {
+            ui_col_clear(&s_wcol);
+            for (int i = 0; i < n; i++) {
+                const wp_probe_t *pr = os_wifi_probe_get(i);
+                if (!pr) break;
+                char b2[40];
+                ui_col_text16(&s_wcol, 4, i * 20 + 2, pr->ssid, false);
+                snprintf(b2, sizeof(b2), "x%lu CH%d", (unsigned long)pr->count, pr->channel);
+                ui_col_text16(&s_wcol, 230, i * 20 + 2, b2, false);
+            }
+            s_wdirty = false;
+        }
     }
+    if (s_wcol.buf) ui_col_present(&s_wcol, lcd, 0, list_y, UI_SCREEN_H - list_y, s_scroll * 20);
     if (n == 0)
         wp_txt_c(lcd, 200, 140, "\xe5\x9c\xa8\xe7\xad\x89\xe6\x8e\xa2\xe9\x92\x88\xe6\xb0\x94\xe5\x91\xb3\xe2\x80\xa6", false);
 }
@@ -496,7 +509,7 @@ static void wp_enter(ui_ctx_t *ctx)
     os_wifi_probe_init();
     os_statusbar_set_invert(true);     /* 本页状态栏反白 (退出还原) */
     s_view = WP_VIEW_AP;
-    s_scroll = 0; s_sel = 0; s_detail = false; s_running = false;
+    s_scroll = 0; s_sel = 0; s_detail = false; s_running = false; s_wdirty = true;
     wp_set_view(WP_VIEW_AP);
     ctx->needs_redraw = true;
 }

@@ -23,12 +23,14 @@ idf_component_register(
         tone_player
         audio_player   # 2026-10-09: remcon 加 audio/vol/esr/esw 音频诊断命令
         gps            # 2026-10-09: remcon 加 gps 电源状态诊断 (耗电排查)
+        espnow         # 2026-10-20: remcon 加 `now` ESP-NOW 诊断命令
         vibrator
         engine_manager
         board_shim
         sd_scan
         usb_bt
         usb_net
+        espsdr         # espsdr_reclaim_boot: 频谱仪禁用则回收 64KB 采集区
         nes_emu
         spiffs
         lua

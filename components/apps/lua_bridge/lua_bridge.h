@@ -69,7 +69,7 @@ extern char             s_err[96];
 extern bool             s_err_pending;
 extern bool             s_exit_req;
 /* ★ 全屏程序/游戏退出确认开关 (定义在 page_lua.c): 默认 true;
- *   脚本可 app.exit_confirm(false) 关掉 —— 见 docs/App制作规则.md「退出确认」。 */
+ *   脚本可 app.exit_confirm(false) 关掉 —— 见 docs/内置应用开发.md「退出确认」。 */
 extern bool             g_lua_exit_ask;
 
 /* ---- 按键 FIFO (定义在 page_lua.c, 由 lua_action 投递) ---- */
@@ -81,7 +81,7 @@ void        key_push(int a);
 /* ---- 公共工具 (定义在 page_lua.c) ---- */
 uint32_t pl_now_ms(void);
 /* ★ 请求退出应用 (定义在 page_lua.c): app.exit() 与框架 BACK 共用的唯一入口。
- *   全屏程序/游戏默认先弹"退出程序?" — 见 docs/App制作规则.md「退出确认」。 */
+ *   全屏程序/游戏默认先弹"退出程序?" — 见 docs/内置应用开发.md「退出确认」。 */
 void lua_request_exit(ui_ctx_t *ctx);
 
 
@@ -122,6 +122,15 @@ void lua_mod_hid_register(lua_State *L);
 void lua_mod_kbd_register(lua_State *L);
 void lua_mod_img_register(lua_State *L);
 void lua_mod_gps_register(lua_State *L);
+void lua_mod_espnow_register(lua_State *L);
+void lua_mod_wiki_register(lua_State *L);
+void lua_mod_util_register(lua_State *L);   /* 2026-10-24: 定时器/随机/序列化/校验/游戏数学 */
+
+/* 定时器驱动: 由 page_lua.c 的 lua_poll() 每帧调用 (定义在 luat_lib_util.c)。
+ * 必须是同一个 lua_State —— 单 VM 天然满足, 换 VM 要先把定时器清空。 */
+void lua_util_tick(lua_State *L);
+/* 应用退出 (lua_stop) 时清空定时器槽 —— 必须在 lua_close() 前后都能安全调用。 */
+void lua_util_reset(void);
 
 /* ---- 几何参数取值器 (定义在 luat_lib_gfx.c, 非 static 供各模块共用) ----
  * 坐标/尺寸一律**容忍小数**(四舍五入); 颜色参数仍走严格的 luaL_checkinteger。

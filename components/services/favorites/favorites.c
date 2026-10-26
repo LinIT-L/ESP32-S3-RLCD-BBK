@@ -28,7 +28,16 @@
 #define FAV_BLOB_MAX (8 * 1024)      /* 序列化上限 */
 
 /* 各引擎独立存储: 路径二维数组 + 数量 + 指针数组 (与原版一致) */
-EXT_RAM_BSS_ATTR static char s_paths[FAV_ENGINE_MAX][FAVORITES_MAX][FAVORITES_PATH_MAX];
+/* ★ 2026-10-25 内存优化: 原来是 102.5KB 的静态 PSRAM 三维数组(9 引擎 × 32 条 × 128B),
+ *   第一次真正需要时才分配 (PSRAM)。索引写法 s_paths[e][i] 与原来完全一致。 */
+static char (*s_paths)[FAVORITES_MAX][FAVORITES_PATH_MAX];
+static bool paths_ensure(void) {
+    if (s_paths) return true;
+    s_paths = heap_caps_calloc(FAV_ENGINE_MAX, sizeof(*s_paths), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_paths) ESP_LOGW(TAG, "收藏路径表分配失败 (%u B)",
+                           (unsigned)(FAV_ENGINE_MAX * sizeof(*s_paths)));
+    return s_paths != NULL;
+}
 static int s_count[FAV_ENGINE_MAX];
 static bool s_loaded_cache = false;   /* [2026-09-16] NVS 已加载标记 */
 EXT_RAM_BSS_ATTR static const char *s_path_ptrs[FAV_ENGINE_MAX][FAVORITES_MAX];
@@ -37,15 +46,15 @@ EXT_RAM_BSS_ATTR static const char *s_path_ptrs[FAV_ENGINE_MAX][FAVORITES_MAX];
 
 fav_engine_t favorites_engine_for_path(const char *path) {
     if (!path) return FAV_ENGINE_BBK;
-    if (strncmp(path, "/sdcard/gbc/", 12) == 0) return FAV_ENGINE_GBC;
-    if (strncmp(path, "/sdcard/gb/", 11) == 0)  return FAV_ENGINE_GB;
-    if (strncmp(path, "/sdcard/nes/", 12) == 0) return FAV_ENGINE_FC;  /* NES 合并到 FC */
-    if (strncmp(path, "/sdcard/AB/", 11) == 0)  return FAV_ENGINE_AB;
+    if (strncmp(path, "/sdcard/roms/gbc/", 12) == 0) return FAV_ENGINE_GBC;
+    if (strncmp(path, "/sdcard/roms/gb/", 11) == 0)  return FAV_ENGINE_GB;
+    if (strncmp(path, "/sdcard/roms/nes/", 12) == 0) return FAV_ENGINE_FC;  /* NES 合并到 FC */
+    if (strncmp(path, "/sdcard/roms/ab/", 11) == 0)  return FAV_ENGINE_AB;
     if (strncmp(path, "/sdcard/books/", 13) == 0) return FAV_ENGINE_BOOK;
-    if (strncmp(path, "/sdcard/lava/", 14) == 0)  return FAV_ENGINE_WQX;
-    if (strncmp(path, "/sdcard/vpet/", 13) == 0)     return FAV_ENGINE_VPET;
-    if (strncmp(path, "/sdcard/md/", 11) == 0)       return FAV_ENGINE_MD;    /* MD/Genesis */
-    if (strncmp(path, "/sdcard/sms/", 12) == 0)      return FAV_ENGINE_SMS;   /* SMS/GG */
+    if (strncmp(path, "/sdcard/roms/lava/", 14) == 0)  return FAV_ENGINE_WQX;
+    if (strncmp(path, "/sdcard/roms/vpet/", 13) == 0)     return FAV_ENGINE_VPET;
+    if (strncmp(path, "/sdcard/roms/md/", 11) == 0)       return FAV_ENGINE_MD;    /* MD/Genesis */
+    if (strncmp(path, "/sdcard/roms/sms/", 12) == 0)      return FAV_ENGINE_SMS;   /* SMS/GG */
     return FAV_ENGINE_BBK;
 }
 
@@ -99,6 +108,7 @@ static void load_all(void) {
         s_loaded_cache = true;
         return;
     }
+    if (!paths_ensure()) { heap_caps_free(buf); s_loaded_cache = true; return; }
     uint32_t off = 5;   /* 跳过 magic + version */
     for (int e = 0; e < FAV_ENGINE_MAX; e++) {
         int cnt = buf[off++];
@@ -127,12 +137,14 @@ void favorites_init(void) {
 bool favorites_contains(fav_engine_t e, const char *path) {
     if (e < 0 || e >= FAV_ENGINE_MAX) return false;
     if (!path || path[0] == '\0') return false;
+    if (!s_paths) return false;                 /* 还没人收藏过 ⇒ 表未分配 */
     for (int i = 0; i < s_count[e]; i++)
         if (strcmp(s_paths[e][i], path) == 0) return true;
     return false;
 }
 
 bool favorites_toggle(fav_engine_t e, const char *path) {
+    if (!paths_ensure()) return false;
     if (e < 0 || e >= FAV_ENGINE_MAX) return false;
     if (!path || path[0] == '\0') { ESP_LOGD(TAG, "拒绝空路径"); return false; }
     int found = -1;
@@ -160,6 +172,7 @@ bool favorites_toggle(fav_engine_t e, const char *path) {
 }
 
 bool favorites_add(fav_engine_t e, const char *path) {
+    if (!paths_ensure()) return false;
     if (e < 0 || e >= FAV_ENGINE_MAX) return false;
     if (!path || path[0] == '\0') { ESP_LOGD(TAG, "拒绝空路径"); return false; }
     if (favorites_contains(e, path)) { ESP_LOGD(TAG, "已在列表中: %s", path); return false; }
@@ -174,6 +187,7 @@ bool favorites_add(fav_engine_t e, const char *path) {
 }
 
 void favorites_remove(fav_engine_t e, const char *path) {
+    if (!paths_ensure()) return;
     if (e < 0 || e >= FAV_ENGINE_MAX) return;
     int found = -1;
     for (int i = 0; i < s_count[e]; i++)

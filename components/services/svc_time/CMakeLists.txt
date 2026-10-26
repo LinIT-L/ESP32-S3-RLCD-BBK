@@ -2,5 +2,5 @@
 idf_component_register(
     SRCS "svc_time.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_netif lwip nvs_flash svc_nvs
+    REQUIRES esp_netif lwip nvs_flash svc_nvs esp_timer freertos
 )

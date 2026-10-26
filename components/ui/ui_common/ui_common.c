@@ -275,6 +275,8 @@ int ui_text16w(const char *s) {
     }
     return w;
 }
+bool ui_text16_ready(void) { return font_zh16_ready(); }   /* ★ 16px 字库是否可用 */
+
 void ui_text16(st7305_handle_t *lcd, int x, int y, const char *s, bool inverted) {
     st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
     int aofs = (ZH16_FONT_H - 16) / 2;
@@ -489,16 +491,19 @@ int text_width_bounded(const char *start, const char *end) {
     }
     return w;
 }
-/* 文本超长裁剪: 只保留前面最多 20 个英文 / 10 个中文 (且总宽不超 max_w),
- * UTF-8 安全 (不切坏多字节字符中间; 输入尾部被外部截断的非法序列直接停止).
- * 返回静态缓冲, 仅供立即绘制. */
+/* 文本超长裁剪: 按**宽度**裁剪, 且不切坏多字节字符中间。
+ * ★★★ 2026-10-24 修: 原来还有 `cjk >= 10` / `ascii >= 20` 的**硬性字数上限** ——
+ *   于是"是否连接网络更新应用？"(10 汉字 + 全角问号 = 11 字) 的第 11 个字被砍,
+ *   弹窗上就是"最后少一个字"(用户报的"确定的确"那个现象)。
+ *   宽度 max_w 已经能保证不溢出, 字数上限纯属多余, 已删除。
+ * 返回静态缓冲, 仅供立即绘制。 */
 const char *text_clip(const char *str, int max_w) {
-    static char s_clip[64];
+    static char s_clip[160];
     char *o = s_clip;
     const char *p = str;
-    int w = 0, cjk = 0, ascii = 0;
+    int w = 0;
     if (max_w <= 0) max_w = 320;
-    while (*p && o - s_clip < (int)sizeof(s_clip) - 4) {
+    while (*p && o - s_clip < (int)sizeof(s_clip) - 5) {
         unsigned char c = (unsigned char)*p;
         int len, cw;
         if (c < 0x80)                { len = 1; cw = 16; }
@@ -507,13 +512,7 @@ const char *text_clip(const char *str, int max_w) {
         else if ((c & 0xF8) == 0xF0) { len = 4; cw = 24; }
         else { p++; continue; }
         if (strlen(p) < (size_t)len) break;      /* 尾部被截断的残缺序列, 丢弃 */
-        if (len == 1) {
-            if (ascii >= 20 || w + cw > max_w) break;
-            ascii++;
-        } else {
-            if (cjk >= 10 || w + cw > max_w) break;
-            cjk++;
-        }
+        if (w + cw > max_w) break;               /* 唯一的裁剪条件: 宽度 */
         w += cw;
         for (int i = 0; i < len; i++) *o++ = *p++;
     }
@@ -537,6 +536,13 @@ void draw_label_centered_at(st7305_handle_t *lcd, int cx, int y, const char *str
     if (x < 0) x = 0;
     if (x + w > UI_SCREEN_W) x = UI_SCREEN_W - w;
     draw_label(lcd, x, y, str, inverted);
+}
+void draw_text_centered_in(st7305_handle_t *lcd, int x0, int x1, int y, const char *str, bool inverted) {
+    int sz = ui_menu_sz();
+    int w = text_width(str) * sz / 24;          /* 菜单缩放后的实际宽度 */
+    int x = x0 + ((x1 - x0) - w) / 2;
+    if (x < x0) x = x0;
+    draw_text(lcd, x, y, str, inverted);
 }
 void draw_text_centered(st7305_handle_t *lcd, int y, const char *str, bool inverted) {
     int w = text_width(str);
@@ -639,7 +645,7 @@ static const uint8_t *icon_bmp_of(int icon_idx) {
     int e = icon_idx - MAIN_ICON_COUNT;
     return (e < s_extra_icon_n) ? s_extra_icon[e] : NULL;
 }
-static int main_icon_index(int icon_idx) {
+__attribute__((unused)) static int main_icon_index(int icon_idx) {
     return icon_bmp_of(icon_idx) ? icon_idx : 0;
 }
 void draw_icon_bitmap(st7305_handle_t *lcd, int cx, int cy, int size, int icon_idx) {

@@ -11,11 +11,12 @@
  *   - 播完按循环模式自动切歌 (单曲=重播本曲 / 列表=下一首 / 随机=随机一首)
  *   - 私有 state 全部 static 留本文件.
  *
- * 注: 文件列表用 opendir 直读 /sdcard/mp3 (POSIX), 不依赖 menu 组件.
+ * 注: 文件列表用 opendir 直读 /sdcard/media/mp3 (并兼容旧的 /sdcard/mp3), 不依赖 menu 组件.
  */
 #include "os.h"
 #include "ui_common.h"
 #include "audio_player.h"
+#include "sd_scan.h"
 #include "vibrator.h"       /* V1.4.x: 随音乐震动 */
 #include "input.h"          /* input_get_touch_multi: 按钮"按下即触发" */
 #include "esp_timer.h"
@@ -24,7 +25,8 @@
 #include "esp_attr.h"
 #include "svc_nvs.h"
 #include "svc_cfg.h"
-#include "mp3_icons_auto.h" /* V1.5.x: 完美图标/音乐 5 组无框图标 (32x32) */
+#include "mp3_icons.h" /* V1.5.x: 完美图标/音乐 5 组无图标 (32x32) */
+#include "ui_scroll.h"   /* ★ 2026-10-24: 全项目统一跟手滚动 (见 docs/列表滚动规范.md) */
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -34,15 +36,22 @@
 
 #define TAG "MP3"
 
-#define MP3_DIR         "/sdcard/mp3"
+#define MP3_DIR         "/sdcard/mp3"        /* 主目录 (linit 指定) */
+/* ★ 2026-10-25 linit 指定: 主目录回到 /sdcard/mp3。
+ *   /sdcard/media/mp3 作为兼容目录仍然扫(老包/老文件不丢), 播放按文件实际目录拼路径。 */
+static const char *const s_mp3_dirs[] = { "/sdcard/mp3", "/sdcard/media/mp3" };
+#define MP3_DIR_COUNT   ((int)(sizeof(s_mp3_dirs) / sizeof(s_mp3_dirs[0])))
 #define MAX_MP3_FILES   64
 #define MP3_FNAME_LEN   128
 
 /* ============ 私有状态 ============ */
 EXT_RAM_BSS_ATTR static char (*s_files)[MP3_FNAME_LEN] = NULL;   /* 播放列表 (PSRAM) */
 static int  s_count   = 0;
+static uint8_t *s_dir_idx = NULL;   /* 与 s_files 平行: 每个文件所在目录下标 */
 static int  s_current = 0;
 static int  s_sel     = 0;         /* 列表选中 */
+static ui_scroll_t s_sc;           /* ★ 统一跟手滚动 (LIST 模式, 行吸附) */
+static bool s_sc_ready = false;    /* ui_scroll_config 只调一次 */
 static bool s_in_player = false;   /* 已在播放 */
 static int  s_last_cd_angle = 0;
 static bool s_scanned = false;
@@ -67,7 +76,7 @@ static int  s_loop_mode = MP3_LOOP_LIST;
 /* V1.4.x: 随音乐震动开关 (NVS mp3/vib_music 持久化, 首次渲染懒加载) */
 static bool s_vib_music = false;
 static bool s_vib_music_loaded = false;
-/* 循环模式图标由完美图标素材提供 (mp3ic_loop_*, 见 mp3_icons_auto.h) */
+/* 循环模式图标由完美图标素材提供 (mp3_icon_loop_*, 见 mp3_icons.h) */
 static const char *s_loop_toast[MP3_LOOP_N] = {
     "\xe5\x8d\x95\xe6\x9b\xb2\xe5\xbe\xaa\xe7\x8e\xaf",   /* 单曲循环 */
     "\xe5\x88\x97\xe8\xa1\xa8\xe5\xbe\xaa\xe7\x8e\xaf",   /* 列表循环 */
@@ -146,18 +155,29 @@ static void mp3_scan_files(void) {
         if (!s_files) { ESP_LOGD(TAG, "MP3 列表内存不足"); return; }
     }
     s_count = 0;
-    DIR *dir = opendir(MP3_DIR);
-    if (dir) {
+    if (!s_dir_idx) {
+        s_dir_idx = heap_caps_malloc(MAX_MP3_FILES, MALLOC_CAP_SPIRAM);
+        if (!s_dir_idx) s_dir_idx = malloc(MAX_MP3_FILES);
+    }
+    for (int d = 0; d < MP3_DIR_COUNT; d++) {
+        DIR *dir = opendir(s_mp3_dirs[d]);
+        if (!dir) continue;
         struct dirent *ent;
         while ((ent = readdir(dir)) != NULL && s_count < MAX_MP3_FILES) {
             const char *n = ent->d_name;
             if (n[0] == '.' && (n[1] == '_' || strcmp(n, ".DS_Store") == 0)) continue;
             const char *dot = strrchr(n, '.');
-            if (dot && (strcasecmp(dot, ".mp3") == 0)) {
-                memcpy(s_files[s_count], n, MP3_FNAME_LEN - 1);
-                s_files[s_count][MP3_FNAME_LEN - 1] = '\0';
-                s_count++;
+            if (!dot || strcasecmp(dot, ".mp3") != 0) continue;
+            /* 同名去重: 两个目录都放同一首时只留一份(优先 media/mp3) */
+            bool dup = false;
+            for (int j = 0; j < s_count; j++) {
+                if (strcmp(s_files[j], n) == 0) { dup = true; break; }
             }
+            if (dup) continue;
+            memcpy(s_files[s_count], n, MP3_FNAME_LEN - 1);
+            s_files[s_count][MP3_FNAME_LEN - 1] = '\0';
+            if (s_dir_idx) s_dir_idx[s_count] = (uint8_t)d;
+            s_count++;
         }
         closedir(dir);
     }
@@ -253,7 +273,9 @@ static int mp3_play_at(int idx) {
     if (idx < 0 || idx >= s_count) return -1;
     s_current = idx;
     char path[256];
-    snprintf(path, sizeof(path), "%s/%s", MP3_DIR, s_files[idx]);
+    const char *base = (s_dir_idx && s_dir_idx[idx] < MP3_DIR_COUNT)
+                       ? s_mp3_dirs[s_dir_idx[idx]] : MP3_DIR;
+    snprintf(path, sizeof(path), "%s/%s", base, s_files[idx]);
     int ret = audio_player_play(path);
     if (ret == 0) {
         s_in_player = true;
@@ -272,7 +294,7 @@ static int mp3_list_scroll(int highlight_idx, int max_visible) {
 }
 
 /* 通用 1bpp 位图绘制 (无框纯图标, 位=1 黑). mirror=true 时水平翻转(用于"下一首"图标).
- * 素材 mp3ic_prev/mp3ic_next 方向相同, next 需翻转后才符合"向右=下一首"直觉. */
+ * 素材 mp3_icon_prev_32/mp3_icon_next_32 方向相同, next 需翻转后才符合"向右=下一首"直觉. */
 static void mp3_blit_1bpp_color(st7305_handle_t *lcd, int x0, int y0,
                                 int w, int h, const uint8_t *src, bool mirror, uint8_t color); /* 前向声明 */
 
@@ -290,7 +312,7 @@ static void mp3_fill_circle(st7305_handle_t *lcd, int cx, int cy, int r, st7305_
 }
 
 /* 无框图标: 在 (cx,cy) 中心按素材原始尺寸 1:1 绘制 (1=黑), 不做缩放/不画背景框.
- * 各图标尺寸不同, 用各自的 W/H 宏 (见 mp3_icons_auto.h). mirror=true 水平翻转. */
+ * 各图标尺寸不同, 用各自的 W/H 宏 (见 mp3_icons.h). mirror=true 水平翻转. */
 static void mp3_draw_icon(st7305_handle_t *lcd, int cx, int cy,
                           int w, int h, const uint8_t *icon, bool mirror)
 {
@@ -300,25 +322,25 @@ static void mp3_draw_icon(st7305_handle_t *lcd, int cx, int cy,
 static const uint8_t *mp3_loop_icon_bitmap(int mode, int *w, int *h)
 {
     switch (mode) {
-    case MP3_LOOP_SINGLE: *w = mp3ic_loop_single_W; *h = mp3ic_loop_single_H; return mp3ic_loop_single;
-    case MP3_LOOP_RANDOM: *w = mp3ic_loop_random_W; *h = mp3ic_loop_random_H; return mp3ic_loop_random;
-    default:              *w = mp3ic_loop_list_W;   *h = mp3ic_loop_list_H;   return mp3ic_loop_list;
+    case MP3_LOOP_SINGLE: *w = mp3_icon_loop_single_32_W; *h = mp3_icon_loop_single_32_H; return mp3_icon_loop_single_32;
+    case MP3_LOOP_RANDOM: *w = mp3_icon_loop_random_32_W; *h = mp3_icon_loop_random_32_H; return mp3_icon_loop_random_32;
+    default:              *w = mp3_icon_loop_list_32_W;   *h = mp3_icon_loop_list_32_H;   return mp3_icon_loop_list_32;
     }
 }
 /* 播放/暂停图标 (原素材 48x48) */
 static const uint8_t *mp3_playpause_bitmap(void)
 {
-    return (audio_player_get_state() == AUDIO_STATE_PLAYING) ? mp3ic_pause : mp3ic_play;
+    return (audio_player_get_state() == AUDIO_STATE_PLAYING) ? mp3_icon_pause_48 : mp3_icon_play_48;
 }
 /* 光盘下方 5 个无框图标: 音量 / 上曲 / 播放暂停 / 下曲 / 循环.
  * 各图标按素材原始尺寸 1:1 绘制 (不缩放), 以各自按钮中心 (按钮行以光盘中心居中). */
 static void mp3_draw_control_icons(st7305_handle_t *lcd)
 {
     int w, h;
-    mp3_draw_icon(lcd, MP3_BTN_X0, MP3_BTN_CY, mp3ic_vol_W, mp3ic_vol_H, mp3ic_vol, false);
-    mp3_draw_icon(lcd, MP3_BTN_X1, MP3_BTN_CY, mp3ic_prev_W, mp3ic_prev_H, mp3ic_prev, false);
-    mp3_draw_icon(lcd, MP3_BTN_X2, MP3_BTN_CY, mp3ic_play_W, mp3ic_play_H, mp3_playpause_bitmap(), false);
-    mp3_draw_icon(lcd, MP3_BTN_X3, MP3_BTN_CY, mp3ic_next_W, mp3ic_next_H, mp3ic_next, true);   /* 下一首: 水平翻转 */
+    mp3_draw_icon(lcd, MP3_BTN_X0, MP3_BTN_CY, mp3_icon_vol_32_W, mp3_icon_vol_32_H, mp3_icon_vol_32, false);
+    mp3_draw_icon(lcd, MP3_BTN_X1, MP3_BTN_CY, mp3_icon_prev_32_W, mp3_icon_prev_32_H, mp3_icon_prev_32, false);
+    mp3_draw_icon(lcd, MP3_BTN_X2, MP3_BTN_CY, mp3_icon_play_48_W, mp3_icon_play_48_H, mp3_playpause_bitmap(), false);
+    mp3_draw_icon(lcd, MP3_BTN_X3, MP3_BTN_CY, mp3_icon_next_32_W, mp3_icon_next_32_H, mp3_icon_next_32, true);   /* 下一首: 水平翻转 */
     { const uint8_t *ic = mp3_loop_icon_bitmap(s_loop_mode, &w, &h);
       mp3_draw_icon(lcd, MP3_BTN_X4, MP3_BTN_CY, w, h, ic, false); }
 }
@@ -350,63 +372,50 @@ static inline void mp3_dither_px(st7305_handle_t *lcd, int x, int y)
 {
     if (((x + y) & 1) == 0) st7305_draw_pixel(lcd, x, y, ST7305_COLOR_BLACK);
 }
-/* 画圆头胶囊描边(黑): 两端各加一个实心圆 ⇒ 两头是圆的 */
-static void mp3_capsule_outline(st7305_handle_t *lcd, int cx, int yt, int yb, int hw)
+/* 胶囊(圆头长条)填色: 半径 r, 两端圆心 (cx,yt)/(cx,yb), 中间用横线扫.
+ * ★ 逐行扫描保证圆头与杆是**同一条路径**, 接缝处不会差 1px ⇒ 源头和棍子看起来是一体的。*/
+static void mp3_capsule_fill(st7305_handle_t *lcd, int cx, int yt, int yb, int r,
+                             st7305_color_t c)
 {
-    draw_vline(lcd, cx - hw, yt, yb, ST7305_COLOR_BLACK);
-    draw_vline(lcd, cx + hw, yt, yb, ST7305_COLOR_BLACK);
-    for (int a = 0; a < 360; a += 3) {
-        float rad = (float)a * 3.14159f / 180.0f;
-        int ox = (int)((float)hw * cosf(rad) + 0.5f);
-        int oy = (int)((float)hw * sinf(rad) + 0.5f);
-        st7305_draw_pixel(lcd, cx + ox, yt + oy, ST7305_COLOR_BLACK);
-        st7305_draw_pixel(lcd, cx + ox, yb + oy, ST7305_COLOR_BLACK);
+    for (int y = yt - r; y <= yb + r; y++) {
+        int yy = y;
+        if (yy < yt) yy = yt; else if (yy > yb) yy = yb;
+        int d = y - yy;
+        int half = (int)lroundf(sqrtf((float)(r * r - d * d)));
+        draw_hline(lcd, cx - half, cx + half, y, c);
     }
 }
-/* 绘制音量竖向滑条 (linit 2026-10-16 V4):
- *  ① 轨道 = 白芯 + 黑描边 + 圆头(胶囊), 外圈棋盘点圈(发白) ⇒ 黑环境下也能看清
- *  ② 圆球 = 黑芯 + 白圈 + 外圈棋盘点圈(发白) */
+/* 胶囊轮廓 (1px): 同一套几何, 每行只取最左/最右两个像素 */
+static void mp3_capsule_stroke(st7305_handle_t *lcd, int cx, int yt, int yb, int r,
+                               st7305_color_t c)
+{
+    for (int y = yt - r; y <= yb + r; y++) {
+        int yy = y;
+        if (yy < yt) yy = yt; else if (yy > yb) yy = yb;
+        int d = y - yy;
+        int half = (int)lroundf(sqrtf((float)(r * r - d * d)));
+        st7305_draw_pixel(lcd, cx - half, y, c);
+        st7305_draw_pixel(lcd, cx + half, y, c);
+    }
+}
+/* 绘制音量竖向滑条 (linit 2026-10-21 定稿):
+ *  ① 棍子 = **白芯 + 黑轮廓 + 外面 3px 白圈** 三层 (白圈宽度与黑色圆球的白圈一致)
+ *  ② 圆球 = 黑芯 + 3px 白圈
+ *  ③ 不再有"已选段黑填充" —— 中间的黑色长条已去掉 */
 static void mp3_draw_vol_slider(st7305_handle_t *lcd)
 {
     const int cx = MP3_VOL_CX;
     const int hw = MP3_VOL_HW;
     int dy = mp3_vol_slider_dot_y();
 
-    /* 轨道外圈"发白"点圈 (先铺, 半径 hw+3) */
-    for (int oy = -(hw + 3); oy <= (MP3_VOL_YB - MP3_VOL_YT) + hw + 3; oy++) {
-        for (int ox = -hw - 3; ox <= hw + 3; ox++) {
-            int px = cx + ox, py = MP3_VOL_YT + oy;
-            /* 在胶囊外、外扩 3px 之内 ⇒ 打棋盘点 */
-            int yy = py;
-            if (yy < MP3_VOL_YT) yy = MP3_VOL_YT;
-            if (yy > MP3_VOL_YB) yy = MP3_VOL_YB;
-            int ddy = py - yy;
-            int d2 = ox * ox + ddy * ddy;
-            if (d2 <= hw * hw) continue;              /* 胶囊内不画 */
-            if (d2 > (hw + 3) * (hw + 3)) continue;   /* 只到外扩 3px */
-            mp3_dither_px(lcd, px, py);
-        }
-    }
-    /* 白芯胶囊: 两端用实心圆做圆头 */
-    mp3_fill_circle(lcd, cx, MP3_VOL_YT, hw, ST7305_COLOR_WHITE);
-    mp3_fill_circle(lcd, cx, MP3_VOL_YB, hw, ST7305_COLOR_WHITE);
-    fill_rect(lcd, cx - hw, MP3_VOL_YT, cx + hw, MP3_VOL_YB, ST7305_COLOR_WHITE);
-    /* 已选段(球下方)填黑 = 当前音量高度 */
-    if (dy < MP3_VOL_YB)
-        fill_rect(lcd, cx - hw + 1, dy, cx + hw - 1, MP3_VOL_YB, ST7305_COLOR_BLACK);
-    /* 黑描边(圆头胶囊) */
-    mp3_capsule_outline(lcd, cx, MP3_VOL_YT, MP3_VOL_YB, hw);
+    /* ① 棍子三层: 外白圈(3px) → 黑轮廓 → 白芯 */
+    mp3_capsule_fill(lcd, cx, MP3_VOL_YT, MP3_VOL_YB, hw + 3, ST7305_COLOR_WHITE);
+    mp3_capsule_stroke(lcd, cx, MP3_VOL_YT, MP3_VOL_YB, hw, ST7305_COLOR_BLACK);
+    mp3_capsule_fill(lcd, cx, MP3_VOL_YT, MP3_VOL_YB, hw - 1, ST7305_COLOR_WHITE);
 
-    /* 圆球: 外圈棋盘点(发白) → 白圈 → 黑芯 */
-    for (int oy = -MP3_VOL_DOT_R - 3 - MP3_VOL_HALO; oy <= MP3_VOL_DOT_R + 3 + MP3_VOL_HALO; oy++)
-        for (int ox = -MP3_VOL_DOT_R - 3 - MP3_VOL_HALO; ox <= MP3_VOL_DOT_R + 3 + MP3_VOL_HALO; ox++) {
-            int d2 = ox * ox + oy * oy;
-            if (d2 <= (MP3_VOL_DOT_R + 3) * (MP3_VOL_DOT_R + 3)) continue;
-            if (d2 > (MP3_VOL_DOT_R + 3 + MP3_VOL_HALO) * (MP3_VOL_DOT_R + 3 + MP3_VOL_HALO)) continue;
-            mp3_dither_px(lcd, cx + ox, dy + oy);
-        }
-    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R + 3, ST7305_COLOR_WHITE);   /* 白圈(黑底上看得见) */
-    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R, ST7305_COLOR_BLACK);       /* 黑芯 */
+    /* ② 圆球: 白圈固定 3px + 黑芯 */
+    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R + 3, ST7305_COLOR_WHITE);
+    mp3_fill_circle(lcd, cx, dy, MP3_VOL_DOT_R, ST7305_COLOR_BLACK);
 }
 
 /* ============ V1.4.x: 随音乐震动 (保留能力, 由 NVS 控制; 图标按钮已从 UI 移除) ============ */
@@ -462,12 +471,27 @@ static void p_mp3_render(ui_ctx_t *ctx)
     int list_h = MP3_LIST_BOTTOM - list_y;   /* 底部让给循环模式按钮 */
     int line_h = 26;
     int max_visible = list_h / line_h;
-    int scroll = mp3_list_scroll(highlight_idx, max_visible);
+    /* ★★★ 2026-10-24 统一滚动: 列表偏移只由 ui_scroll 管（像素级跟手 + 惯性 + 回弹）。
+     *   容量变化才 init（init 会清惯性/回弹, 不能每帧调）。 */
+    static int s_sc_content = -1;
+    if (!s_sc_ready) { ui_scroll_config(&s_sc, UI_SCROLL_LIST, 0); s_sc_ready = true; }
+    if (s_sc_content != s_count * line_h) {
+        ui_scroll_init(&s_sc, line_h, list_h, s_count * line_h);
+        s_sc_content = s_count * line_h;
+    }
+    /* 不在这里 ensure_visible —— 否则用户把选中项拖出视野后会被拉回来, 拖不动。
+     * 只在按键上下选择时由 p_mp3_action 把人拉回可见区。 */
 
-    for (int i = 0; i < s_count && i < max_visible; i++) {
-        int idx = i + scroll;
+    int off   = ui_scroll_offset(&s_sc);
+    int first = off / line_h;
+    int sub   = off % line_h;
+
+    for (int i = 0; i <= max_visible; i++) {
+        int idx = i + first;
         if (idx >= s_count) break;
-        int yy = list_y + 2 + i * line_h;
+        int yy = list_y + 2 + i * line_h - sub;
+        if (yy >= MP3_LIST_BOTTOM) break;          /* 越过列表底: 停 */
+        if (yy + line_h <= list_y) continue;       /* 顶部被裁: 跳过 */
         const char *name = s_files[idx];
         char disp[64];
         int nl = strlen(name);
@@ -624,12 +648,14 @@ static void p_mp3_action(ui_ctx_t *ctx, os_action_t a)
         if (s_count == 0) break;
         s_sel = (s_sel - 1 + s_count) % s_count;
         if (!s_in_player) s_current = s_sel;
+        ui_scroll_ensure_visible(&s_sc, s_sel * 26, 26);   /* 26 = 列表行高 */
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_DOWN:
         if (s_count == 0) break;
         s_sel = (s_sel + 1) % s_count;
         if (!s_in_player) s_current = s_sel;
+        ui_scroll_ensure_visible(&s_sc, s_sel * 26, 26);
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_LEFT:
@@ -696,6 +722,19 @@ static void mp3_vol_slider_toggle(ui_ctx_t *ctx)
 /* 按下音量大图标 (touchez 调用) */
 static void p_mp3_poll(ui_ctx_t *ctx)
 {
+    /* ★★★ 2026-10-24 统一滚动: 列表区(左侧 x<195)喂给 ui_scroll。
+     *   一旦开始拖动, 即使手指滑出列表区也继续跟手（靠 s_sc.pressed 判断）。 */
+    {
+        int tx = 0, ty = 0;
+        bool down = input_get_touch_pos(&tx, &ty);
+        if (down && (tx < 195 || s_sc.pressed)) {
+            if (ui_scroll_touch_xy(&s_sc, tx, ty, down)) ctx->needs_redraw = true;
+        } else if (!down && s_sc.pressed) {
+            ui_scroll_touch_xy(&s_sc, tx, ty, false);
+        }
+        if (ui_scroll_poll(&s_sc)) ctx->needs_redraw = true;
+    }
+
     audio_state_t st = audio_player_get_state();
 
     /* 音量滑条拖动: 只有"真拖动"(位移 ≥4px)才改音量.
@@ -743,6 +782,10 @@ int ddy = py - s_vol_drag_y;
 static bool p_mp3_touch(ui_ctx_t *ctx, int x, int y)
 {
     const int list_x = 0, list_w = 195, list_y = 28, line_h = 26;
+
+    /* ★ 2026-10-24 统一滚动: 手指在列表上拖动时吃掉这一下 —— 不点选、不切歌。
+     *   `true` 表示事件已消费, 上层不会再当点击处理。 */
+    if (ui_scroll_dragging(&s_sc)) return true;
 
     /* 音量滑条区 (已打开): 点滑条圆点附近=拖动 (poll 持续调), 点图标区域外空白=收起 */
     if (s_vol_slider) {
@@ -849,9 +892,20 @@ static bool p_mp3_touch(ui_ctx_t *ctx, int x, int y)
 }
 
 /* ============ 模块契约 ============ */
+static void p_mp3_enter(ui_ctx_t *ctx)
+{
+    (void)ctx;
+    /* ★ 2026-10-24: 卡挂载是后台任务, 进页面时可能还没完成 → 先过门闸再扫,
+     *   否则扫到空列表 (linit: "MP3 读不到卡")。已挂载立即返回。 */
+    sd_wait_ready(1200, true);
+    s_scanned = false;              /* 强制重扫一次 */
+    mp3_scan_files();
+}
+
 static const os_module_t s_mod_mp3 = {
     .name      = "mp3",
     .page_id   = OS_PAGE_MP3_PLAYER,
+    .on_enter  = p_mp3_enter,
     .render    = p_mp3_render,
     .action    = p_mp3_action,
     .poll      = p_mp3_poll,

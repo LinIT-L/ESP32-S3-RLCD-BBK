@@ -15,14 +15,13 @@
 #include "os_sources.h"
 
 static const char *const S[] = {
-    /* ★ 主源 (2026-10-16 linit 定): Gitee raw —— 国内直连、免费、零运维(git push 即发布) */
-    "https://gitee.com/LinIT-L/ESP32-S3-RLCD-BBK/raw/master/store",
-    /* ⛔ 自有站已移除: 服务器不稳时会白等一次超时, 拖慢整个回退过程。
-     *   要恢复请把它放在 Gitee **之后**(备源), 并先确认真的能下到。 */
-    /* "https://bbk.linit.cn/bbk", */
-    /* 备源: GitHub raw / jsDelivr CDN —— 国内体验差, 等真推上去了再启用 */
-    /* "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store", */
-    /* "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store", */
+    /* ★★★ 2026-10-18: **自有服务器已恢复上线** ⇒ 主源换成 bbk.linit.cn(国内直连最快) ✓
+     *   实测: index.json 200/2621B ✓ · pkgs/英雄坛说.lua 200/63947B(=本地大小) ✓ · 无 WordPress 301 ✓ */
+    "https://bbk.linit.cn/bbk",
+    /* 备源: jsDelivr CDN(GitHub 镜像) */
+    "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store",
+    /* 兜底: GitHub raw */
+    "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store",
 };
 
 int os_sources_count(void) { return (int)(sizeof(S) / sizeof(S[0])); }

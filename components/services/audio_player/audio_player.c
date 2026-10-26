@@ -95,7 +95,10 @@ void audio_player_apply_pins(int mclk, int bclk, int ws, int dout, int din,
 #define I2C_SCL     47
 
 /* 解码缓冲区 (PSRAM) */
-#define MP3_FRAME_BUF_SIZE  4096        /* MP3 帧数据读取缓冲 */
+/* ★ 2026-10-25 性能优化: 4K → 32K. 4K 时几乎每解码 1-2 帧就要 fread 一次,
+ *   FATFS+TF 卡小读延迟直接吃进解码循环; 32K 让 TF 大块读摊薄延迟.
+ *   播放时才分配(PSRAM), 停止即释放, 不常驻. */
+#define MP3_FRAME_BUF_SIZE  32768       /* MP3 帧数据读取缓冲 */
 
 /* 状态 */
 static audio_state_t s_state = AUDIO_STATE_IDLE;
@@ -122,7 +125,10 @@ static bool s_natural_end = false;
 /* minimp3 解码器
  * V1.0.44: 移到 PSRAM, 释放 6.6KB 内部 DRAM.
  * MP3 解码非实时高频访问, PSRAM 带宽足够. */
-EXT_RAM_BSS_ATTR static mp3dec_t s_mp3dec;
+/* ★ 2026-10-25 性能优化: 原来解码器热数据(mdicct ring/scratch ~10KB)静态放 PSRAM,
+ *   解码主循环每次访问都走 cache → 慢. 改为播放开始时分配在内部 RAM,
+ *   播放结束(cleanup)即释放 —— 不播放时不占内部 RAM, 符合工程约定. */
+static mp3dec_t *s_mp3dec;
 static uint8_t *s_mp3_buf = NULL;       /* PSRAM 分配 */
 static int  s_mp3_buf_pos = 0;    /* 已填充位置 */
 static int  s_mp3_buf_len = 0;    /* 有效数据长度 */
@@ -133,11 +139,12 @@ static i2s_chan_handle_t s_rx_chan = NULL;
 static bool s_mic_active = false;
 
 /* === 环形缓冲区 (游戏模拟器音频输出) === */
-/* 64KB = 32768 个 int16 = 16384 帧, 约 682ms @24000Hz stereo.
- * 游戏音频是突发式生成(每帧末一次性喂入), 缓冲越大越能吸收负载抖动/欠载,
- * 避免 audio_out_task 掏空缓冲导致的"哒哒哒"小缝隙. */
-#define PCM_RING_SIZE 32768
-/* 首次播放前先让环形缓冲攒够 ~373ms 音频再开始掏空,
+/* ★ 2026-10-25 加大: 64KB(682ms) → 256KB(131072 个 int16 = 65536 帧 ≈ 1486ms @44100Hz).
+ *   实测游戏内出现过 avail=256 / underruns=142872 / play=705Hz 的严重欠载,
+ *   64KB 在 SD 读取/换曲/场景加载这类几百 ms 的抖动面前不够厚, 一掏空就断音。
+ *   缓冲全在 PSRAM(见 s_pcm_ring 分配), 不占内部 RAM。 */
+#define PCM_RING_SIZE 131072
+/* 首次播放前先让环形缓冲攒够 ~186ms 音频再开始掏空,
  * 吸收模拟器帧抖动, 避免声音一卡一卡 (生产/消耗速率几乎相等时尤其重要).
  * 20260812: 4096 帧在 GB/GBC 45fps 抖动下仍偶发欠载, 翻倍到 8192. */
 #define PCM_RING_PRIME_FRAMES 8192
@@ -180,7 +187,8 @@ static volatile uint32_t s_last_data_ms = 0;       /* 上次真正有 PCM 数据
 /* V1.0.55: 3072 字 (12KB) 在加入播放速率日志 (ESP_LOGI 格式化) 时爆栈,
  * 任务栈在 PSRAM, 直接给 24KB 余量. */
 #define PCM_OUT_STACK_WORDS  6144   /* 24576 字节 */
-EXT_RAM_BSS_ATTR static StackType_t s_pcm_out_stack[PCM_OUT_STACK_WORDS];
+/* ★ LINTOS 2026-10-25: 任务栈原来静态常驻 PSRAM, 改成首次用到才分配 (不播放就不占) */
+static StackType_t *s_pcm_out_stack;
 static StaticTask_t s_pcm_out_tcb;
 /* V1.0.45: 共享采样率 — feed_pcm 设置, audio_out_task 读取.
  * 之前 audio_out_task 硬编码 44100 并每轮调用 i2s_init(44100),
@@ -199,12 +207,17 @@ static SemaphoreHandle_t s_i2s_mutex = NULL;
 
 /* 功放控制 + I2S 初始化 (前向声明, 供 audio_out_task 调用) */
 static void pa_enable(bool on);
+static void ensure_out_active(void);
 static int i2s_init(int sample_rate);
 
 /* CPU1 音频输出任务: 从环形缓冲读 PCM → I2S */
 static void audio_out_task(void *arg) {
     (void)arg;
-    int16_t local_buf[512];  /* 栈缓冲, 一次读取最多 256 帧 */
+    /* ★ 2026-10-25: 每次最多取 1024 帧(≈23ms) —— 与 sdl_aud 的回调块长对齐。
+     *   原来只取 256 帧(5.8ms), 意味着每秒要成功调度 172 次才能喂满,
+     *   任务被抢占几次就直接欠载(实测 play 掉到 705Hz)。
+     *   local_buf 从栈上 512 改成静态 2048, 避免撑爆 audio_out 的栈。 */
+    static int16_t local_buf[2048];
     bool primed = false;
     uint32_t underruns = 0;
     uint32_t iter = 0;
@@ -245,21 +258,20 @@ static void audio_out_task(void *arg) {
                          (unsigned)(unow - s_last_underrun_ms));
             }
             s_last_underrun_ms = unow;
-            /* V1.7.x: 空闲静音 —— 连续 ≥300ms 没有 PCM 数据 → 关功放 + 停 I2S 时钟.
-             * 这样"出声结束"后立刻安静 (NS4168 CTRL 拉低关断 / ES8311 软静音),
-             * 且停时钟顺带消掉空闲 BCLK 对 D 类功放的干扰.
-             * 任务**不退出** (只静音), 避免与 audio_out_start 重复建任务竞争. */
-            if (s_amp_on && (esp_log_timestamp() - s_last_data_ms) >= 300) {
-                /* 顺序: **关功放 → 再停 I2S 时钟** (反过来会有一声"咔")。
-                 * ⚠ pa_enable 里有 30ms 消爆音等待 ⇒ 必须在**锁外**做,
-                 *   否则别的音频路径(MP3/按键音)要一起等这把锁。 */
-                pa_enable(false);
-                if (s_i2s_mutex) xSemaphoreTake(s_i2s_mutex, portMAX_DELAY);
-                if (s_tx_chan) i2s_channel_disable(s_tx_chan);
-                if (s_i2s_mutex) xSemaphoreGive(s_i2s_mutex);
-                s_amp_on = false;
-                ESP_LOGI(TAG, "空闲静音: 关功放 + 停 I2S 时钟 (消底噪)");
-            }
+            /* ★★★ 2026-10-25 linit 定：**进游戏后不自动关功放**。
+             *   关闭功放只允许三种时机：①睡眠 ②关机 ③用户主动关闭音频/静音。
+             *
+             *   原来这里"连续 300ms 没 PCM 就关功放 + 停 I2S 时钟"。问题在于恢复
+             *   完全依赖"下一批数据能写进 I2S"：
+             *     · 游戏音频天然有几百 ms 的静音段（过场、无声段落）⇒ 每次都会关一次；
+             *     · 一旦上游卡一下（实测 MP3 句柄残留让 feed_pcm 无超时死等），
+             *       就再也没有"下一批数据" ⇒ 功放永远开不回来。
+             *   实测现场：日志出现 `功放使能: GPIO46=0 (静音)` + `空闲静音: 关功放`
+             *   之后**再无任何 SDLAUD 行**，游戏还在正常跑，用户听到的就是"进游戏没声音"，
+             *   而且全程不报错、不提示。
+             *
+             *   代价：空闲时 I2S 位时钟继续跑（底噪略高、多几 mA），换来"不会因为一次抖动
+             *   就永久丢声音"。手动静音走 s_muted / audio_pa_force_off，不受这里影响。 */
             vTaskDelay(1);
             continue;
         }
@@ -272,18 +284,13 @@ static void audio_out_task(void *arg) {
             ESP_LOGI(TAG, "PCM 环形缓冲已预填充 %u 帧, 开始播放", (unsigned)avail);
         }
 
-        if (avail > 256) avail = 256;
+        if (avail > 1024) avail = 1024;
         frames_total += avail;
         /* V1.7.x: 有数据 → 打时间戳; 若刚被"空闲静音"关过, 这里恢复功放 + I2S 时钟.
          * (必须在写 I2S 之前恢复, 否则通道禁用时 i2s_channel_write 会超时报错) */
         s_last_data_ms = esp_log_timestamp();
         if (!s_amp_on) {
-            /* 顺序: **启 I2S 时钟 → 再开功放** (锁外做, pa_enable 内含 20ms 消爆音等待) */
-            if (s_i2s_mutex) xSemaphoreTake(s_i2s_mutex, portMAX_DELAY);
-            if (s_tx_chan) i2s_channel_enable(s_tx_chan);
-            if (s_i2s_mutex) xSemaphoreGive(s_i2s_mutex);
-            pa_enable(true);
-            s_amp_on = true;
+            ensure_out_active();      /* 启 I2S 时钟 → 再开功放 */
             ESP_LOGI(TAG, "恢复出声: 开功放 + 启 I2S 时钟");
         }
 
@@ -304,10 +311,18 @@ static void audio_out_task(void *arg) {
          * 两平台统一立体声: 每帧 L+R 两个样本. NS4168 虽然是单声道功放,
          * 但 I2S 配置为 STEREO, 数据复制到 L/R, 功放内部按 CTRL 取一路. */
         uint32_t sample_count = avail * 2;
-        for (uint32_t i = 0; i < sample_count; i++) {
-            local_buf[i] = s_pcm_ring[(tail + i) % PCM_RING_SIZE];
+        /* ★ 2026-10-25 性能: 原来每样本一次 % 取模(软件除法) → 最多两段 memcpy.
+         *   环形缓冲跨尾部时拆成"尾部→末尾" + "开头→剩余" 两段, 语义完全等价。 */
+        {
+            uint32_t first = PCM_RING_SIZE - tail;
+            if (first > sample_count) first = sample_count;
+            memcpy(local_buf, &s_pcm_ring[tail], (size_t)first * sizeof(int16_t));
+            if (sample_count > first) {
+                memcpy(&local_buf[first], &s_pcm_ring[0],
+                       (size_t)(sample_count - first) * sizeof(int16_t));
+            }
         }
-        tail = (tail + avail * 2) % PCM_RING_SIZE;
+        tail = (tail + sample_count) % PCM_RING_SIZE;
         s_ring_tail = tail;
 
         /* 确保 I2S 初始化, 使用 feed_pcm 设置的采样率 (不再硬编码 44100) */
@@ -320,12 +335,14 @@ static void audio_out_task(void *arg) {
             continue;
         }
         
-        /* 应用音量 */
-        float vol_scale = s_volume / 100.0f;
+        /* 应用音量 (★ 2026-10-25 性能: 改 Q15 定点乘移位, 免每样本 int16↔float 转换) */
+        int vol_q15 = s_volume * 32768 / 100;
         /* [V2.x] 最小缩放下限: 非静音时最低 10%, 防极低百分比仍无声 */
-        if (vol_scale > 0.0f && vol_scale < 0.10f) vol_scale = 0.10f;
-        for (uint32_t i = 0; i < sample_count; i++) {
-            local_buf[i] = (int16_t)(local_buf[i] * vol_scale);
+        if (s_volume > 0 && vol_q15 < 3277) vol_q15 = 3277;
+        if (vol_q15 < 32768) {
+            for (uint32_t i = 0; i < sample_count; i++) {
+                local_buf[i] = (int16_t)(((int32_t)local_buf[i] * vol_q15) >> 15);
+            }
         }
         
         /* V1.0.71: 喂振幅表 (游戏/音效 PCM 路径) */
@@ -368,6 +385,10 @@ static void audio_out_start(void) {
     s_last_data_ms = esp_log_timestamp();
     
     /* V1.0.45: 栈从 4096 → 6144, 冷启动时大帧数据 + 音量缩放 + I2S 写入容易栈溢出 panic */
+    if (!s_pcm_out_stack) {
+        s_pcm_out_stack = heap_caps_malloc(sizeof(StackType_t) * PCM_OUT_STACK_WORDS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_pcm_out_stack) s_pcm_out_stack = heap_caps_malloc(sizeof(StackType_t) * PCM_OUT_STACK_WORDS, MALLOC_CAP_8BIT);
+    }
     s_audio_out_task = xTaskCreateStaticPinnedToCore(audio_out_task, "audio_out",
                                                      PCM_OUT_STACK_WORDS, NULL, 8,
                                                      s_pcm_out_stack, &s_pcm_out_tcb, 1);
@@ -423,7 +444,8 @@ static int i2s_init_locked(int sample_rate) {
      * V1.0.67: DMA 降到 6×576 (13.5KB), 给 WiFi 腾 DMA 内存 (蓝牙+音频已占 113KB).
      * 6×576=3456 帧 ≈ 72ms@24kHz, 足够吸收模拟器帧抖动不欠载. */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 4;   /* ★2026-10-16 内存优化: 6→4, 每方向省 2×2304B=4.6KB, 两方向共 ~9.2KB */
+    chan_cfg.dma_desc_num = 3;   /* 2026-10-16: 6→4 (省 9.2KB); 2026-10-24: 4→3 (再省 4.6KB)
+                                  * 3×576=1728 帧 ≈ 36ms@24kHz, 仍能吸收模拟器帧抖动 */
     chan_cfg.dma_frame_num = 576;
     chan_cfg.auto_clear = true;
     esp_err_t ret = i2s_new_channel(&chan_cfg, &s_tx_chan, &s_rx_chan);
@@ -662,6 +684,20 @@ void audio_pa_force_off(void)
 /* 老调用点统一走 audio_pa_set (带消爆音时序) */
 static void pa_enable(bool on) { audio_pa_set(on); }
 
+/* ★ 2026-10-20: 空闲静音会把 I2S 通道也关掉(消底噪), 但 MP3 是**自己直接写 I2S**,
+ *   不走 PCM 环形缓冲 ⇒ 播放 300ms 后通道被关, 之后每次 i2s_channel_write 都报
+ *   "The channel is not enabled", 表现就是无声 + 每隔一个缓冲"咔"一下。
+ *   写之前统一走这个函数把 通道+功放 拉起来。 */
+static void ensure_out_active(void)
+{
+    if (s_amp_on) return;
+    if (s_i2s_mutex) xSemaphoreTake(s_i2s_mutex, portMAX_DELAY);
+    if (s_tx_chan) i2s_channel_enable(s_tx_chan);
+    if (s_i2s_mutex) xSemaphoreGive(s_i2s_mutex);
+    pa_enable(true);
+    s_amp_on = true;
+}
+
 /* ============ 多帧扫描估算 ============ */
 static int64_t estimate_total_samples(FILE *f, int64_t file_size) {
     uint8_t *buf = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM);
@@ -755,7 +791,8 @@ static int64_t estimate_total_samples(FILE *f, int64_t file_size) {
 #define AUDIO_TASK_STACK_BYTES  65536   /* 64KB */
 #define AUDIO_TASK_STACK_WORDS  ((AUDIO_TASK_STACK_BYTES + sizeof(StackType_t) - 1) / sizeof(StackType_t))
 #define I2S_WRITE_TIMEOUT_MS   500     /* I2S 写入超时 */
-EXT_RAM_BSS_ATTR static StackType_t s_audio_stack[AUDIO_TASK_STACK_WORDS];
+/* ★ LINTOS 2026-10-25: 同上, 64KB 解码任务栈改成首次播放时分配 */
+static StackType_t *s_audio_stack;
 static StaticTask_t s_audio_tcb;
 static uint32_t s_task_stack_words = AUDIO_TASK_STACK_WORDS; /* 用于日志 */
 
@@ -786,7 +823,15 @@ static void audio_play_task(void *arg) {
     es8311_set_volume(s_muted ? 0 : s_volume);
 
     ESP_LOGI(TAG, "[5/6] \u5206\u914D\u89E3\u7801\u7F13\u51B2\u533A...");
-    mp3dec_init(&s_mp3dec);
+    /* ★ 2026-10-25: 解码器热数据进内部 RAM(优先), PSRAM 兜底; 播放结束释放 */
+    s_mp3dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s_mp3dec) s_mp3dec = heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_SPIRAM);
+    if (!s_mp3dec) s_mp3dec = malloc(sizeof(mp3dec_t));
+    if (!s_mp3dec) {
+        ESP_LOGD(TAG, "mp3dec_t \u5206\u914D\u5931\u8D25");
+        goto cleanup;
+    }
+    mp3dec_init(s_mp3dec);
     s_mp3_buf_pos = 0;
     s_mp3_buf_len = 0;
     int current_sample_rate = sample_rate;
@@ -834,7 +879,7 @@ static void audio_play_task(void *arg) {
 
         /* \u89E3\u7801\u4E00\u5E27 MP3 */
         mp3dec_frame_info_t info;
-        int samples = mp3dec_decode_frame(&s_mp3dec,
+        int samples = mp3dec_decode_frame(s_mp3dec,
             s_mp3_buf + s_mp3_buf_pos,
             s_mp3_buf_len - s_mp3_buf_pos,
             pcm, &info);
@@ -882,15 +927,19 @@ static void audio_play_task(void *arg) {
             if (info.hz != current_sample_rate || first_frame) {
                 /* MP3 任务的重配序列也要与 audio_out_task/feed_pcm 互斥 */
                 if (s_i2s_mutex) xSemaphoreTake(s_i2s_mutex, portMAX_DELAY);
-                if (!first_frame) {
-                    i2s_channel_disable(s_tx_chan);
-                }
+                /* ★ 2026-10-25 [LINTOS] 「声音很怪/很闷/慢慢吞吞」根因：
+                 *   原来**首帧只调 es8311_set_sample_rate()，不重配 I2S 时钟** ——
+                 *   而 I2S 是按 [2/6] 时的默认率(44100)初始化的，
+                 *   于是 22050Hz 的数据被 44100 的位时钟送出去 ⇒ 音调/速度全错。
+                 *   这里改成**首帧也统一重配时钟**（先 disable 再 reconfig 再 enable）。 */
+                i2s_channel_disable(s_tx_chan);
                 current_sample_rate = info.hz;
                 ESP_LOGI(TAG, "\u91C7\u6837\u7387: %d Hz, \u58F0\u9053: %d, \u5E27\u5B57\u8282: %d", info.hz, info.channels, info.frame_bytes);
                 if (first_frame) {
                     first_frame = false;
                     ESP_LOGI(TAG, ">>> \u5F00\u59CB\u89E3\u7801MP3\u97F3\u9891\u6570\u636E <<<");
-                } else {
+                }
+                {
                     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(current_sample_rate);
                     i2s_channel_reconfig_std_clock(s_tx_chan, &clk_cfg);
                     i2s_channel_enable(s_tx_chan);
@@ -915,20 +964,27 @@ static void audio_play_task(void *arg) {
             }
             frame_count = samples * 2;
 
-            /* 音量调节 (NS4168 无 DAC 音量, 纯数字缩放; 0=静音, 1~9 保底 10% 防断崖) */
+            /* 音量调节 (NS4168 无 DAC 音量, 纯数字缩放; 0=静音, 1~9 保底 10% 防断崖)
+             * ★ 2026-10-25 性能: Q15 定点乘移位, 免每样本 int16↔float 转换 */
             {
-                float vol = (float)s_volume / 100.0f;
-                if (vol > 0.0f && vol < 0.10f) vol = 0.10f;
-                if (vol < 1.0f) {
+                int vol_q15 = s_volume * 32768 / 100;
+                if (s_volume > 0 && vol_q15 < 3277) vol_q15 = 3277;   /* 保底 10% */
+                if (vol_q15 < 32768) {
                     for (int i = 0; i < frame_count; i++)
-                        pcm_out[i] = (int16_t)(pcm_out[i] * vol);
+                        pcm_out[i] = (int16_t)(((int32_t)pcm_out[i] * vol_q15) >> 15);
                 }
             }
+
+            /* ★ 2026-10-25 [LINTOS] 叠加游戏音效（SDLPal 的 VOC 实时合成）。
+             *   放在音量缩放之后、喂振幅表之前，这样响度表反映的是最终输出。
+             *   音效与音乐同为 44100Hz 立体声交错 int16，直接逐样本相加。 */
+            audio_player_fx_mix(pcm_out, (uint32_t)frame_count);
 
             /* V1.0.71: 喂振幅表 (MP3 路径) */
             audio_meter_feed(pcm_out, (uint32_t)frame_count);
 
             /* \u5199\u5165 I2S */
+            ensure_out_active();          /* ★ 通道可能被空闲静音关过, 先拉起 */
             size_t bytes_written = 0;
             size_t to_write = (size_t)frame_count * sizeof(int16_t);
             esp_err_t wret = i2s_channel_write(s_tx_chan, pcm_out, to_write,
@@ -950,6 +1006,7 @@ static void audio_play_task(void *arg) {
 
 cleanup:
     pa_enable(false);
+    if (s_mp3dec) { free(s_mp3dec); s_mp3dec = NULL; }   /* ★ 解码器退回, 不常驻内部 RAM */
     if (pcm) free(pcm);
     if (pcm_out) free(pcm_out);
     s_state = AUDIO_STATE_STOPPED;
@@ -1097,10 +1154,19 @@ int audio_player_play(const char *filepath) {
     if (s_task_handle) {
         s_stop_requested = true;
         xSemaphoreGive(s_mutex);
-        while (s_task_handle) vTaskDelay(pdMS_TO_TICKS(10));
+        /* ★ 2026-10-25: 同 feed_pcm, 无超时死等会锁死调用者(这里是播放新的 MP3) */
+        for (int w = 0; w < 50 && s_task_handle; w++) vTaskDelay(pdMS_TO_TICKS(10));
+        if (s_task_handle) {
+            ESP_LOGW(TAG, "MP3 任务 500ms 未退 ⇒ 强制结束(播放新文件前)");
+            vTaskDelete(s_task_handle);
+            s_task_handle = NULL;
+        }
         xSemaphoreTake(s_mutex, portMAX_DELAY);
     }
     s_stop_requested = false;
+    /* ★ 2026-10-25: 解码器是播放时分配的 —— 若上一任务被强制结束(vTaskDelete),
+     *   它没能走到 cleanup 释放, 会漏在堆里(每次 6.5KB 内部 RAM). 这里兜底回收. */
+    if (s_mp3dec) { free(s_mp3dec); s_mp3dec = NULL; }
 
     const char *name = strrchr(filepath, '/');
     if (name) name++; else name = filepath;
@@ -1144,8 +1210,18 @@ int audio_player_play(const char *filepath) {
     /* 创建播放任务: 静态栈缓冲在 PSRAM (EXT_RAM_BSS_ATTR),
      * 开 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM 后通过栈内存断言, 不会重启。 */
     s_task_stack_words = AUDIO_TASK_STACK_WORDS;
+    /* ★ LINTOS: 解码任务栈(64KB)首次播放才分配, 不播放不占 PSRAM */
+    if (!s_audio_stack) {
+        s_audio_stack = heap_caps_malloc(sizeof(StackType_t) * AUDIO_TASK_STACK_WORDS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_audio_stack) s_audio_stack = heap_caps_malloc(sizeof(StackType_t) * AUDIO_TASK_STACK_WORDS, MALLOC_CAP_8BIT);
+    }
+    /* ★ LINTOS: 解码任务栈(64KB)首次播放才分配, 不播放不占 PSRAM */
+    if (!s_audio_stack) {
+        s_audio_stack = heap_caps_malloc(sizeof(StackType_t) * AUDIO_TASK_STACK_WORDS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_audio_stack) s_audio_stack = heap_caps_malloc(sizeof(StackType_t) * AUDIO_TASK_STACK_WORDS, MALLOC_CAP_8BIT);
+    }
     s_task_handle = xTaskCreateStaticPinnedToCore(audio_play_task, "audio_play",
-                                                   AUDIO_TASK_STACK_WORDS, NULL, 1,
+                                                   AUDIO_TASK_STACK_WORDS, NULL, 2,
                                                    s_audio_stack, &s_audio_tcb, 1);
     if (s_task_handle == NULL) {
         ESP_LOGD(TAG, "音频静态任务创建失败!");
@@ -1192,7 +1268,13 @@ void audio_player_stop(void) {
     xSemaphoreGive(s_mutex);
     pa_enable(false);            /* ⚠ 放锁外: pa_enable 内含 30ms 消爆音等待, 别卡住 s_mutex */
 
-    while (s_task_handle) vTaskDelay(pdMS_TO_TICKS(10));
+    /* ★ 2026-10-25: 无超时死等会让"停止播放"永久卡住(句柄残留时) */
+    for (int w = 0; w < 50 && s_task_handle; w++) vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_task_handle) {
+        ESP_LOGW(TAG, "MP3 任务 500ms 未退 ⇒ 强制结束(停止播放)");
+        vTaskDelete(s_task_handle);
+        s_task_handle = NULL;
+    }
     s_state = AUDIO_STATE_STOPPED;
     audio_out_stop();   /* 解耦: 一并停掉游戏 PCM 输出任务 */
     ESP_LOGI(TAG, "\u505C\u6B62\u64AD\u653E");
@@ -1355,7 +1437,17 @@ void audio_player_deinit(void) {
  * 顺序: 先给 codec 下电(I2C 此刻还活着), 再关功放并 hold 低电平。 */
 void audio_player_sleep_for_off(void)
 {
+    /* 先把播放/输出任务收干净, 再动通道 —— 否则任务可能正卡在 i2s_channel_write
+     * 或持有 s_i2s_mutex, 直接删通道会卡死关机流程(电就一直耗着)。 */
+    if (s_hw_initialized && s_mutex) audio_player_stop();
     es8311_shutdown();       /* ES8311: 0x32=0(静音) + 0x00=0(power down) */
+    /* ★ 2026-10-24: 麦克风 ADC(ES7210) 和它供的 MICBIAS 原来只在"录音结束"时才关，
+     *   深睡路径没关 → 整夜常供 1~2mA。这里补上（deinit 内部幂等）。 */
+    es7210_deinit();
+    /* ★ 2026-10-20: 把 I2S 收发通道整条拆掉 —— 通道只是 disable 的话,
+     *   MCLK/BCLK 仍由 I2S 外设输出, ES8311/ES7210 会一直"有钟无数据"地挂着耗电;
+     *   拆掉后外设时钟全停, 深睡电流回到 µA 级。 */
+    i2s_deinit();
     audio_pa_force_off();    /* 功放 OFF + gpio_hold_en + gpio_deep_sleep_hold_en */
 }
 
@@ -1371,7 +1463,22 @@ size_t audio_player_feed_pcm(const int16_t *data, size_t frames, int sample_rate
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_stop_requested = true;
         xSemaphoreGive(s_mutex);
-        while (s_task_handle) vTaskDelay(pdMS_TO_TICKS(10));
+        /* ★★★ 2026-10-25 修复「进游戏后没声音且音频任务静默卡死」:
+         *   原来这里是 `while (s_task_handle) vTaskDelay(10)` —— **无超时死等**。
+         *   MP3 任务只有在 976 行那条正常退出路径上才会把句柄清 NULL;
+         *   一旦它因任何原因没走到那里(被强杀/卡在 I2S 写/异常返回), 句柄永久非 NULL
+         *   ⇒ 第一个调 feed_pcm 的引擎(仙剑 sdl_aud)就永久卡在这行:
+         *     不再产出 PCM → audio_out 300ms 后触发"空闲静音"关功放 →
+         *     实测日志: `功放使能 GPIO46=0` 之后**再也不出现任何 SDLAUD 行**,
+         *     而游戏本身还在正常运行(PSRAM 仍是游戏占用)。用户听到的就是"进游戏没声音"。
+         *   现在最多等 500ms, 还不退就强杀并清句柄 —— MP3 是后台播放, 杀掉不影响游戏,
+         *   总比把整个音频链路锁死好。 */
+        for (int w = 0; w < 50 && s_task_handle; w++) vTaskDelay(pdMS_TO_TICKS(10));
+        if (s_task_handle) {
+            ESP_LOGW(TAG, "MP3 任务 500ms 未退 ⇒ 强制结束并清句柄(否则音频链路会锁死)");
+            vTaskDelete(s_task_handle);
+            s_task_handle = NULL;
+        }
         s_state = AUDIO_STATE_STOPPED;
     }
 
@@ -1406,15 +1513,24 @@ size_t audio_player_feed_pcm(const int16_t *data, size_t frames, int sample_rate
     if (!s_pcm_ring) return 0;
 
     size_t written = 0;
-    for (size_t i = 0; i < frames; i++) {
-        /* 检查环形缓冲是否满 */
-        uint32_t next_head = (s_ring_head + 2) % PCM_RING_SIZE;
-        if (next_head == s_ring_tail) break;  /* 缓冲满, 丢弃剩余帧 */
-
-        s_pcm_ring[s_ring_head] = data[i * 2];      /* L */
-        s_pcm_ring[s_ring_head + 1] = data[i * 2 + 1]; /* R */
-        s_ring_head = next_head;
-        written++;
+    /* ★ 2026-10-25 性能: 原来逐帧(2 样本)+每帧一次 % 取模 → 分两段 memcpy 块拷贝.
+     *   语义保持: head+2==tail 视为满(保留一帧间隙), 缓冲满时丢弃剩余帧并返回已写帧数。 */
+    while (written < frames) {
+        uint32_t head = s_ring_head, tail = s_ring_tail;
+        uint32_t used = (head >= tail) ? (head - tail) : (PCM_RING_SIZE - tail + head);
+        uint32_t free_samples = PCM_RING_SIZE - 2 - used;      /* 预留一帧间隙 */
+        if (free_samples < 2) break;                            /* 缓冲满 */
+        size_t can = free_samples / 2;
+        size_t want = frames - written;
+        if (can > want) can = want;
+        size_t n = can * 2;                                     /* 本次要写的样本数 */
+        uint32_t cont = PCM_RING_SIZE - head;                   /* 到缓冲末端的连续空间 */
+        if (n > cont) n = cont;
+        memcpy(&s_pcm_ring[head], &data[written * 2], n * sizeof(int16_t));
+        head += (uint32_t)n;
+        if (head >= PCM_RING_SIZE) head -= PCM_RING_SIZE;
+        s_ring_head = head;
+        written += n / 2;
     }
     return written;
 }
@@ -1423,6 +1539,55 @@ size_t audio_player_feed_pcm(const int16_t *data, size_t frames, int sample_rate
 void audio_player_flush_pcm(void)
 {
     s_pcm_flush_requested = true;
+}
+
+/* === 音效混音缓冲（★ 2026-10-25）===
+ * MP3 模式下 I2S 归 MP3 解码任务独占，SDLPal 的音效合成结果没地方去。
+ * sdl_audio.c 每块把音效 PCM 推进来，MP3 解码循环写 I2S 前叠加。
+ * ⚠ 缓冲**必须大于 sdl_audio 单次推入量**，否则边写边丢、等于没声音：
+ *   块长 2048 帧 → 一次推 4096 个 int16。所以取 8192 个 int16（4096 帧 ≈ 93ms），
+ *   能装 2 批，延迟比原来 32768(372ms) 小 4 倍，同时保证不会写出即丢。 */
+#define FX_RING_SIZE 32768
+static int16_t *s_fx_ring = NULL;
+static volatile uint32_t s_fx_head = 0, s_fx_tail = 0;
+
+void audio_player_fx_reset(void)
+{
+    s_fx_head = s_fx_tail = 0;
+}
+
+void audio_player_fx_push(const int16_t *data, int frames)
+{
+    if (!data || frames <= 0) return;
+    if (!s_fx_ring) {
+        s_fx_ring = (int16_t *)heap_caps_calloc(FX_RING_SIZE, sizeof(int16_t),
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_fx_ring) s_fx_ring = (int16_t *)calloc(FX_RING_SIZE, sizeof(int16_t));
+        if (!s_fx_ring) return;
+    }
+    for (int i = 0; i < frames; i++) {
+        uint32_t next = (s_fx_head + 2) % FX_RING_SIZE;
+        if (next == s_fx_tail) {
+            /* 满: 丢最旧的一帧，保证延迟不累积 */
+            s_fx_tail = (s_fx_tail + 2) % FX_RING_SIZE;
+        }
+        s_fx_ring[s_fx_head]     = data[i * 2];       /* L */
+        s_fx_ring[s_fx_head + 1] = data[i * 2 + 1];   /* R */
+        s_fx_head = next;
+    }
+}
+
+void audio_player_fx_mix(int16_t *pcm, uint32_t samples)
+{
+    if (!s_fx_ring || !pcm) return;
+    for (uint32_t i = 0; i < samples; i++) {
+        if (s_fx_tail == s_fx_head) break;            /* 音效缓冲已空 */
+        int32_t v = (int32_t)pcm[i] + (int32_t)s_fx_ring[s_fx_tail];
+        if (v > 32767)  v = 32767;                    /* 防削波 */
+        if (v < -32768) v = -32768;
+        pcm[i] = (int16_t)v;
+        s_fx_tail = (s_fx_tail + 1) % FX_RING_SIZE;
+    }
 }
 
 /* 按键反馈音选项已移除 (见 menu_system 游戏设置): 不再提供蜂鸣声. */

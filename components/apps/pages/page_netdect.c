@@ -14,6 +14,8 @@
 #include "os.h"
 #include "os_hw.h"      /* os_hw_lease_acquire/release (进入强制开 WiFi, 退出按原状态还原) */
 #include "ui_common.h"
+#include "ui_col.h"
+#include "ui_scroll.h"   /* ★ 2026-10-24 全项目统一跟手滚动 (docs/列表滚动规范.md) */
 #include "input.h"
 #include "os_net.h"
 #include "keyboard.h"
@@ -130,7 +132,11 @@ static const char *const s_clk[2][4] = {
 static uint32_t s_conn_t0 = 0;         /* 开始连接时间戳(ms) */
 static uint32_t s_fail_t0 = 0;         /* 连接失败提示起始(ms) */
 #define CONNECT_TIMEOUT_MS 20000
-static int s_scrollpx = 0;             /* 主机列表像素级滚动偏移(平滑跟手) */
+static int s_scrollpx = 0;
+static ui_scroll_t s_nd_sc;            /* ★ 统一滚动控制器 (扫描/端口/口令 三视图共用) */
+static bool s_nd_sc_ready = false;
+static int  s_nd_sc_vh = -1, s_nd_sc_cnt = -1;
+static ui_col_t s_ndcol;                                           /* 主机列表像素级滚动偏移(平滑跟手) */
 static int s_rptpx = 0;                /* 报告像素级滚动偏移 */
 static int s_rpt_nlin = 0;             /* 报告可取总行数 (render 缓存, 供 poll 算可滚范围) */
 /* ---- 分步推进 (每步完成暂停, 需按"下一步") ---- */
@@ -555,7 +561,7 @@ static void map_isp_china(void){
 static void fetch_pub_info(void){
     char resp[1024];
     s_pub_ip[0]=0; s_isp_brand[0]=0; s_city[0]=0; s_net_scenario[0]=0;
-    /* ① 首选 ip9.com.cn/get: UTF-8 中文, 设备实测可达 (福建/莆田/中国电信) */
+    /* ① 首选 ip9.com.cn/get: UTF-8 中文, 设备实测可达 (示例地区/运营商) */
     if(nd_http_get("https://ip9.com.cn/get", resp, sizeof(resp))){
         char ip[20]="", prov[24]="", city[24]="", isp[24]="";
         json_get_str(resp,"ip",ip,sizeof(ip));
@@ -883,12 +889,12 @@ static void nd_back_to_connect(ui_ctx_t *ctx){
     if(wifi_manager_get_scan_count()<=0) wifi_manager_scan_start();   /* 有列表则复用, 避免卡顿 */
     ctx->needs_redraw=true;
 }
-/* 报告导出到 TF 卡 /sdcard/log/netreport.txt */
+/* 报告导出到 TF 卡 /sdcard/data/log/netreport.txt */
 static void fmt_ip(uint32_t ip, char *b, int cap);   /* 前向声明 */
 static char s_export_msg[48]="";
 static void nd_export_report(void){
-    mkdir("/sdcard/log",0755);
-    FILE *f=fopen("/sdcard/log/netreport.txt","w");
+    mkdir("/sdcard/data/log",0755);
+    FILE *f=fopen("/sdcard/data/log/netreport.txt","w");
     if(!f){ snprintf(s_export_msg,sizeof(s_export_msg),"SD 导出失败"); return; }
     fprintf(f,"网络分析报告\n");
     if(s_essaid[0]) fprintf(f,"无线 %s [%s]\n",s_essaid,s_auth);
@@ -909,7 +915,7 @@ static void nd_export_report(void){
     }
     fprintf(f,"\n评价: 请查看设备报告页\n");
     fclose(f);
-    snprintf(s_export_msg,sizeof(s_export_msg),"已导出 /sdcard/log/netreport.txt");
+    snprintf(s_export_msg,sizeof(s_export_msg),"已导出 /sdcard/data/log/netreport.txt");
 }
 static void nd_start_engine(void){
     s_wait_start=false; s_nhost=0; s_scrollpx=0; s_rptpx=0; s_rpt_nlin=0; s_done=false;
@@ -1028,18 +1034,28 @@ static void netdect_poll(ui_ctx_t *ctx){
         }
         return;
     }
-    /* ---- 列表像素级跟手拖动 (参考电脑诊断: 在每帧 poll 采样触控, 而非 touch 事件) ---- */
+    /* ---- ★ 2026-10-24 统一滚动: 三个视图共用 ui_scroll (LIST 模式, 行高 18)。
+     *   技巧: 算完把 offset 写回 s_scrollpx, 渲染侧一行都不用改。 ---- */
     {   int vs=nd_view_step();
         if(vs==ST_SCAN || vs==ST_PORT || vs==ST_CRED){
             int tx,ty; bool down=input_get_touch_pos(&tx,&ty);
             const int line=18, vh=CT_BOT-CT_TOP-2;
             int cnt = (vs==ST_SCAN)? s_nhost : nd_vis_count();
             int maxpx = (cnt*line>vh)? (cnt*line-vh):0;
-            static int dy0p=-1, dpx0p=0; static bool dragp=false;
-            if(down && ty>=CT_TOP && ty<=CT_BOT){
-                if(!dragp){ dragp=true; dy0p=ty; dpx0p=s_scrollpx; }
-                else { int off=dpx0p + (dy0p-ty); if(off<0)off=0; if(off>maxpx)off=maxpx; if(off!=s_scrollpx){ s_scrollpx=off; ctx->needs_redraw=true; } }
-            } else { dragp=false; }
+            if (!s_nd_sc_ready) { ui_scroll_config(&s_nd_sc, UI_SCROLL_LIST, 0); s_nd_sc_ready = true; }
+            if (s_nd_sc_vh != vh || s_nd_sc_cnt != cnt) {
+                ui_scroll_init(&s_nd_sc, line, vh, cnt*line);
+                s_nd_sc_vh = vh; s_nd_sc_cnt = cnt;
+            }
+            if (down && ty>=CT_TOP && ty<=CT_BOT)
+                ui_scroll_touch_xy(&s_nd_sc, tx, ty, true);
+            else
+                ui_scroll_touch_xy(&s_nd_sc, tx, ty, false);
+            if (ui_scroll_poll(&s_nd_sc)) ctx->needs_redraw = true;
+            int off = ui_scroll_offset(&s_nd_sc);
+            if (off < 0) off = 0;
+            if (off > maxpx) off = maxpx;
+            s_scrollpx = off;
         }
     }
     {   /* 分析中: 步切换立即刷新; 同一步内按 33ms 刷新(逐IP顺序显示, 不再跳) */
@@ -1057,41 +1073,50 @@ static void fmt_ip(uint32_t ip, char *b, int cap){ snprintf(b,cap,"%u.%u.%u.%u",
 
 /* 主机列表渲染: 左IP, 括号=本机或MAC(不发设备名); 品牌右对齐; 像素级平滑滚动 */
 static void nd_draw_hostlist(st7305_handle_t *l){
-    const int line=18, y0=CT_TOP+2;
-    int yoff = s_scrollpx % line;
-    int idx  = s_scrollpx / line;
-    int y = y0 - yoff;
-    for(int i=idx; i<s_nhost && y<=CT_BOT-2; i++, y+=line){
-        if(y < y0 || y+line-1 > CT_BOT-2) continue;   /* 越出内容框的行跳过, 屏蔽滑动时界外残留 */
-        host_t *h=&s_h[i];
-        char ipb[16]; fmt_ip(h->ip,ipb,sizeof(ipb));
-        const char *note=NULL; char macnote[24];
-        if(h->local) note="\xe6\x9c\xac\xe6\x9c\xba";       /* 本机 */
-        else if(h->macok){ snprintf(macnote,sizeof(macnote),"%02X:%02X:%02X:%02X:%02X:%02X",h->mac[0],h->mac[1],h->mac[2],h->mac[3],h->mac[4],h->mac[5]); note=macnote; } /* 完整MAC */
-        char left[44];
-        if(note) snprintf(left,sizeof(left),"%s (%s)",ipb,note);
-        else snprintf(left,sizeof(left),"%s",ipb);
-        nd16(l,CT_X0+2,y,left,false);
-        if(!h->local && h->macok && h->vendor[0] && h->vendor[0]!='?')
-            nd16(l, CT_X1-2-nd16w(h->vendor), y, h->vendor, false);   /* 品牌右对齐 */
+    const int line = 18;
+    int need_h = s_nhost * line;
+    int view_h = CT_BOT - (CT_TOP + 2);
+    if (need_h < view_h) need_h = view_h;
+    if (need_h < line) need_h = line;
+    if (ui_col_init(&s_ndcol, 380, need_h)) {
+        ui_col_clear(&s_ndcol);
+        for (int i = 0; i < s_nhost; i++) {
+            host_t *h = &s_h[i];
+            char ipb[16]; fmt_ip(h->ip, ipb, sizeof(ipb));
+            const char *note = NULL; char macnote[24];
+            if (h->local) note = "\xe6\x9c\xac\xe6\x9c\xba";
+            else if (h->macok) { snprintf(macnote, sizeof(macnote), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                          h->mac[0],h->mac[1],h->mac[2],h->mac[3],h->mac[4],h->mac[5]); note = macnote; }
+            char left[44];
+            if (note) snprintf(left, sizeof(left), "%s (%s)", ipb, note);
+            else      snprintf(left, sizeof(left), "%s", ipb);
+            ui_col_text16(&s_ndcol, 2, i * line + 1, left, false);
+            if (!h->local && h->macok && h->vendor[0] && h->vendor[0] != '?')
+                ui_col_text16(&s_ndcol, 380 - 2 - ui_text16w(h->vendor), i * line + 1, h->vendor, false);
+        }
+        ui_col_present(&s_ndcol, l, CT_X0, CT_TOP + 2, view_h, s_scrollpx);
     }
 }
 
 /* 端口/口令页 共用: 左侧IP(+品牌), 右侧按需的端口/口令文本, 支持s_scrollpx滚动 */
 static void nd_draw_hostrows(st7305_handle_t *l, void (*rightfn)(char*,int,const host_t*)){
-    const int line=18, y0=CT_TOP+2;
-    int yoff = s_scrollpx % line;
-    int idx  = s_scrollpx / line;
-    int y = y0 - yoff;
-    for(int i=idx; i<s_nhost && y<=CT_BOT-2; i++, y+=line){
-        if(y < y0 || y+line-1 > CT_BOT-2) continue;   /* 越出内容框的行跳过 */
-        host_t *h=&s_h[i];
-        char ipb[16]; fmt_ip(h->ip,ipb,sizeof(ipb));
-        char r[32]; rightfn(r,sizeof(r),h);
-        char row[80];
-        if(r[0]) snprintf(row,sizeof(row),"%-12s %s",ipb,r);
-        else snprintf(row,sizeof(row),"%s",ipb);
-        nd16(l,CT_X0+2,y,row,false);
+    const int line = 18;
+    int need_h = s_nhost * line;
+    int view_h = CT_BOT - (CT_TOP + 2);
+    if (need_h < view_h) need_h = view_h;
+    if (need_h < line) need_h = line;
+    if (ui_col_init(&s_ndcol, 380, need_h)) {
+        ui_col_clear(&s_ndcol);
+        for (int i = 0; i < s_nhost; i++) {
+            host_t *h = &s_h[i];
+            char ipb[16]; fmt_ip(h->ip, ipb, sizeof(ipb));
+            char r[32]; rightfn(r, sizeof(r), h);
+            char row[80];
+            if (r[0]) snprintf(row, sizeof(row), "%-12s %s", ipb, r);
+            else      snprintf(row, sizeof(row), "%s", ipb);
+            ui_col_text16(&s_ndcol, 2, i * line + 1, row, false);
+        }
+        ui_col_present(&s_ndcol, l, CT_X0, CT_TOP + 2, view_h, s_scrollpx);
     }
 }
 static void nd_right_ports(char*r,int c,const host_t*h){

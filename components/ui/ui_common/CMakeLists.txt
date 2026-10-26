@@ -5,7 +5,7 @@
 # 依赖 menu 组件仅取其位图图标资源 (icons_main.inc/cat_icons.inc);
 # 字库来自 components/fonts; 方向为 ui_common -> menu/fonts (单向, 无循环).
 idf_component_register(
-    SRCS "ui_common.c"
+    SRCS "ui_common.c" "ui_scroll.c" "ui_col.c"
     INCLUDE_DIRS "."
     REQUIRES st7305 fonts
 )

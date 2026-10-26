@@ -14,11 +14,14 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>   /* mkdir */
+#include "am_asset.h"   /* ★ 2026-10-25 资源包卸载(递归删目录) */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "am_internal.h"
+#include "wifi_manager.h"   /* ★ 下载前判断是否联网 */
+#include "esp_timer.h"   /* ★ 扫描 busy 超时判断 */
 #include "apppack.h"   /* LAPP 单文件资源包: 取名称/简介 */
 
 #define TAG "AMSTORE"
@@ -44,6 +47,7 @@ typedef struct {
     int      pref;       /* 推荐安装目标: 0=内置固件 1=TF卡 */
     char     fname[48];  /* 文件名 xxx.lua */
     char     desc[96];   /* LAPP 简介 (无打包则空) */
+    char     cat_zh[16]; /* ★ 中文分类(游戏/运维/软件...) —— app.cat 指向这里, 不能用局部数组(悬空) */
     uint8_t  kind;       /* 0=本地已有包(可安装)  1=云端包(需先下载) —— 2026-10-04 */
     int16_t  ridx;       /* kind=1 时: 对应 am_rstore_get() 的下标 */
 } am_pkg_entry_t;
@@ -52,7 +56,10 @@ static int s_pkg_n = 0;
 static volatile int s_pkg_scanned = -1;   /* 0=已扫描 (数据可用)  -1=未扫/扫描中 (后台任务写入) */
 static volatile bool s_pkg_busy  = false;   /* 后台扫描任务进行中 */
 static volatile bool s_pkg_done  = false;   /* 后台扫描已完成 (UI 线程取货) */
+static volatile bool s_uninst_done = false;   /* ★ 后台卸载刚完成 ⇒ UI 需刷新一次 */
 static bool s_pkg_inst[AM_PKG_MAX]; /* 每包安装状态缓存: 渲染用, 避免每帧 fopen(SD/SPIFFS 慢)致商店卡顿 */
+
+
 
 /* ---- 云端包视图 (2026-10-04) ----
  * 索引里的包**不直接进 s_pkg[]** —— s_pkg[] 是后台扫描任务的产物, 而索引是另一个
@@ -71,21 +78,46 @@ static bool am_file_exist(const char *p) {
     if (f) { fclose(f); return true; }
     return false;
 }
-/* 安装目标默认值: 0=内置固件 /store/apps, 1=TF 卡 /sdcard/apps。
- * (原"运维类包推荐装 TF 卡"的按名规则随预置包一并移除; 以后需要可按包名再扩展) */
-static int am_pkg_prefer(const char *fname) { (void)fname; return 0; }
+/* 安装目标: 0=内置固件 /store/apps, 1=TF 卡 /sdcard/apps。
+ * ★★★ 2026-10-24 linit 定案: **所有应用默认装 TF 卡**（/sdcard/apps/<分类>/）。
+ *   固件内置 SPIFFS(apps 分区) 不再放任何应用 —— 出厂只有 _ui.lua。
+ *   好处: ① 4MB apps 分区彻底让给"引擎包"等将来用途 ② 应用随卡走, 换机不用重下
+ *   ③ 删应用不动 flash。要改回内置: 返回 0。 */
+static int am_pkg_prefer(const char *fname) { (void)fname; return 1; }
 /* 商店列表要的是 main_icons 索引, 而 LAPP 头里带的是 64x64 位图(应用管家用) ——
  * 两者没有反查关系。原实现把所有包硬写成 ICON_MINI_GAMES(迷你游戏), 看着像 bug。
  * 这里给已知包名一个小映射, 未知包沿用默认。 */
-static int am_store_icon_of(const char *fname) {
+/* ★★★ 2026-10-17 linit: 按【分类】给默认图标 —— 之前没有专属图标的包一律回退
+ *   ICON_MINI_GAMES(迷你游戏) ⇒ 商店里所有云包都长一个游戏图标, 看着毫无分类。
+ *   engine(游戏/引擎)=迷你游戏 · ops(运维)=终端 · app(软件)=应用中心。 */
+/* ★★★ 2026-10-17 linit: **每个分类一个默认图标** —— 应用自己没带图标时用它。
+ *   五类全用现成图标(实测都合适):
+ *     游戏 → 迷你游戏 · 软件 → 应用中心 · 标准 → 设置 · 运维 → 终端 · 学习 → 阅读器 */
+static int am_store_cat_icon(const char *cat) {
+    if (!cat || !cat[0])            return ICON_APP_MGR;
+    if (strcmp(cat, "游戏") == 0)   return ICON_MINI_GAMES;
+    if (strcmp(cat, "运维") == 0)   return ICON_TERMINAL;
+    if (strcmp(cat, "标准") == 0)   return ICON_SETTINGS;
+    if (strcmp(cat, "学习") == 0)   return ICON_BOOK;
+    /* ★ 2026-10-25 linit: 动态壁纸/资源包 用自己的图标, 不再回退成"应用中心" */
+    if (strcmp(cat, "壁纸") == 0 ||
+        strcmp(cat, "动态壁纸") == 0 ||
+        strcmp(cat, "资源") == 0 ||
+        strcmp(cat, "wallpaper") == 0) return ICON_WALLPAPER;
+    if (strcmp(cat, "engine") == 0) return ICON_MINI_GAMES;   /* 兼容旧目录名 */
+    if (strcmp(cat, "ops") == 0)    return ICON_TERMINAL;
+    if (strcmp(cat, "game") == 0)   return ICON_MINI_GAMES;
+    if (strcmp(cat, "study") == 0)  return ICON_BOOK;
+    return ICON_APP_MGR;                                      /* 软件/其它 */
+}
+static int am_store_icon_of(const char *fname, const char *cat) {
     static const struct { const char *f; int ic; } T[] = {
-        { "biossim.lua", ICON_BIOSSIM },          /* BIOS 装机模拟器 (原借 ICON_DIAG) */
-        { "planeradar.lua", ICON_PLANERADAR },    /* 航班雷达 (2026-10-15 补: 漏了这条 →
-                                                   *   商店里一直显示"迷你游戏"默认图标) */
+        { "biossim.lua", ICON_BIOSSIM },          /* BIOS 装机模拟器 */
+        { "planeradar.lua", ICON_PLANERADAR },    /* 航班雷达 */
     };
     for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++)
         if (strcmp(T[i].f, fname) == 0) return T[i].ic;
-    return ICON_MINI_GAMES;
+    return am_store_cat_icon(cat);                /* ★ 无专属图标 ⇒ 用分类默认图标 */
 }
 static bool am_copy_file(const char *src, const char *dst) {
     FILE *in = fopen(src, "rb");
@@ -112,8 +144,22 @@ static void am_pkg_scan(void) {
      * ("一直正在扫描"根因). */
     if (s_pkg_scanned == 0) return;
     s_pkg_n = 0;
-    const char *bases[2] = { AM_STORE_SRC1, AM_STORE_SRC2 };
-    for (int b = 0; b < 2; b++) {
+    /* ★★★ 2026-10-17 linit: 除了"待下载"目录, **也扫已安装目录** ——
+     *   这样本地已装的应用(哪怕云端索引里没有)也会出现在商店里, 方便直接卸载。
+     *   b<2 = 待下载源(store 根 / SD store_pkg); b>=2 = 已安装目录(/store/apps/{cat})。 */
+    /* ★★★ 2026-10-27 linit「哪怕在内存卡里面也显示安装」的根因修复:
+     *   原来只扫 **内置** 已安装目录 /store/apps/{app,engine,ops}, **完全没扫 TF 卡**
+     *   ⇒ 装在 /sdcard/apps 下的应用在商店里根本不存在这条记录, 只能从云端索引露一行,
+     *     而云端行的按钮天然是"下载/安装" ⇒ 明明装了却显示"安装"。
+     *   现在把 TF 已安装目录也扫进来, 并且把 dst/dst_sd **两条候选路径都填上** ——
+     *   卸载时才能把"内置一份 + TF 一份"一起删干净(linit 定: 卸载必须删干净)。
+     *   b < 2  = 待下载源(/store 根, /sdcard/store_pkg)
+     *   b 2..4 = 内置已安装(/store/apps/{app,engine,ops})
+     *   b 5..7 = TF 已安装(/sdcard/apps/{app,engine,ops}) */
+    const char *bases[8] = { AM_STORE_SRC1, AM_STORE_SRC2,
+                             AM_STORE_DST "/app", AM_STORE_DST "/engine", AM_STORE_DST "/ops",
+                             "/sdcard/apps/app", "/sdcard/apps/engine", "/sdcard/apps/ops" };
+    for (int b = 0; b < 8; b++) {
         DIR *d = opendir(bases[b]);
         if (!d) continue;
         struct dirent *e;
@@ -142,30 +188,106 @@ static void am_pkg_scan(void) {
                  * -Werror=restrict (编译器无法排除 nm 与 s_pkg 重叠)。 */
                 char nb[64];
                 snprintf(nb, sizeof(nb), "%.*s", (int)len - 4, nm);
+                /* ★★★ 2026-10-17 linit: `/sdcard/store_pkg` 是**商店自己的下载目录**,
+                 *   只显示云端索引里存在的包 —— 旧的英文名残留文件(改名前的下载)自动隐藏,
+                 *   商店里不会再出现"英文名 + 中文名"两份。/store(SPIFFS 根)放宽, 允许用户自己放。 */
                 /* LAPP 打包则用包内 name/desc (可中文), 否则文件名 */
                 char spath[192];
                 snprintf(spath, sizeof(spath), "%s/%s", bases[b], nm);
-                apppack_meta_t meta;
-                if (apppack_parse(spath, &meta) == ESP_OK && meta.name[0]) {
-                    snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%s", meta.name);
-                    snprintf(s_pkg[k].desc, sizeof(s_pkg[k].desc), "%s", meta.desc);
-                } else {
-        snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%.*s", (int)sizeof(s_pkg[k].label) - 1, nb);
+                /* ★ 2026-10-17 linit: 商店自己的下载目录里, 索引中没有的残留包**直接删除**
+                 *   (改名/过期留下的旧文件), 不再隐藏。手动往 /store 放的不受影响。 */
+                if (b == 1) {
+                    bool known = false;
+                    int rn = am_rstore_count();
+                    for (int r = 0; r < rn; r++) {
+                        const am_rpkg_t *rp = am_rstore_get(r);
+                        if (rp && strcmp(rp->name, nb) == 0) { known = true; break; }
+                    }
+                    if (!known) {
+                        ESP_LOGW("AMSTORE", "删除残留包: %s", spath);
+                        remove(spath);
+                        continue;
+                    }
                 }
-                snprintf(s_pkg[k].cat, sizeof(s_pkg[k].cat), "app");
-                snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/app/%s", AM_STORE_DST, nm);
-                snprintf(s_pkg[k].dst_sd, sizeof(s_pkg[k].dst_sd), "/sdcard/apps/app/%s", nm);
-                s_pkg[k].pref = am_pkg_prefer(nm);
+                apppack_meta_t meta;
+                /* ★★★ 2026-10-17 linit 定: **显示名以文件名(去 .lua)为准** —— 游戏/模拟器习惯用文件名,
+                 *   LAPP 里的 name 仅作兜底(文件名为空时)。分类/图标仍读 LAPP 头。 */
+                apppack_parse(spath, &meta);
+                snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%.*s", (int)len - 4, nm);
+                if (!s_pkg[k].label[0] && meta.name[0])
+                    snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%s", meta.name);
+                snprintf(s_pkg[k].desc, sizeof(s_pkg[k].desc), "%s", meta.desc);
+                /* ★★★ 2026-10-17: 本地包也按【云端索引里的 cat】分类 —— 之前写死 "app" +
+                 *   app.cat=NULL ⇒ 所有包都显示在"软件", 且在游戏/运维子分类里看不到。
+                 *   索引里查不到同名包才回退 app。 */
+                /* ★★★ 分类**优先读应用自带的 LAPP 头**(--@app cat=), 这是唯一真相源;
+                 *   包头里没有分类时, 才用云端索引里同名包的 cat 兜底, 再不行归"软件"。 */
+                /* ★★★ 2026-10-17 修: **分类优先取云端索引**(索引里的 cat 由 store_build 从各应用
+                 *   LAPP 头生成, 已验证正确 ✓); `meta.cat` 作兜底 —— 实测 apppack_parse 没填 cat,
+                 *   导致所有包都掉到默认"软件"。 */
+                char icat[16];
+                snprintf(icat, sizeof(icat), "%s", "");
+                {
+                    char bn[48];
+                    snprintf(bn, sizeof(bn), "%.*s", (int)(len - 4), nm);
+                    int rn = am_rstore_count();
+                    for (int r = 0; r < rn; r++) {
+                        const am_rpkg_t *rp = am_rstore_get(r);
+                        if (rp && strcmp(rp->name, bn) == 0 && rp->cat[0]) { snprintf(icat, sizeof(icat), "%s", rp->cat); break; }
+                    }
+                }
+                if (!icat[0] && meta.cat[0]) snprintf(icat, sizeof(icat), "%s", meta.cat);
+                if (!icat[0]) snprintf(icat, sizeof(icat), "软件");
+                /* 中文分类 → 安装目录: 游戏→engine / 运维·工具→ops / 其它→app */
+                const char *pcat = "app";
+                /* ★ 2026-10-18 linit: **游戏改装到 app/(应用→游戏)**, 引擎只留模拟器 */
+                if (strcmp(icat, "游戏") == 0) pcat = "app";
+                else if (strcmp(icat, "运维") == 0 || strcmp(icat, "工具") == 0) pcat = "ops";
+                snprintf(s_pkg[k].cat, sizeof(s_pkg[k].cat), "%s", pcat);
+                snprintf(s_pkg[k].dst, sizeof(s_pkg[k].dst), "%s/%s/%s", AM_STORE_DST, pcat, nm);
+                snprintf(s_pkg[k].dst_sd, sizeof(s_pkg[k].dst_sd), "/sdcard/apps/%s/%s", pcat, nm);
+                /* ★ 2026-10-17 linit: **一律装到内置** (/store/apps), 不再默认装 TF 卡 */
+                s_pkg[k].pref = 0;
+                (void)am_pkg_prefer;
                 s_pkg[k].app.id        = s_pkg[k].id;
                 s_pkg[k].app.label     = s_pkg[k].label;
-                s_pkg[k].app.icon_idx  = am_store_icon_of(nm);
                 s_pkg[k].app.page      = OS_PAGE_LUA;
                 s_pkg[k].app.hidden    = true;
                 s_pkg[k].app.touch_only= false;
-                s_pkg[k].app.cat       = NULL;
+                /* ★★★ 2026-10-17 修: 必须拷进结构体自己的字段再指过去 ——
+                 *   原来直接指局部数组 icat ⇒ 悬空指针 ⇒ 分类过滤读垃圾 ⇒ 全部掉默认"软件"。 */
+                snprintf(s_pkg[k].cat_zh, sizeof(s_pkg[k].cat_zh), "%s",
+                         (strcmp(icat, "工具") == 0) ? "运维" : icat);
+                s_pkg[k].app.cat       = s_pkg[k].cat_zh;
+                /* ★★★ 2026-10-25 修: icon 必须在 cat_zh 填好**之后**再算 ——
+                 *   原来在上面先算, cat_zh 还是空串, am_store_cat_icon("") 一律返回
+                 *   ICON_APP_MGR ⇒ 商店所有包都长同一个"应用中心"图标。 */
+                s_pkg[k].app.icon_idx  = am_store_icon_of(nm, s_pkg[k].cat_zh);
+                ESP_LOGI("AMSTORE", "扫描包: %-16s cat='%s' app.cat='%s' dir=%s",
+                         nm, s_pkg[k].cat, s_pkg[k].app.cat, bases[b]);
                 s_pkg[k].app.reveal    = false;
             }
             snprintf(s_pkg[k].src, sizeof(s_pkg[k].src), "%s/%s", bases[b], nm);
+            /* ★★★ 2026-10-17 linit: 在**已安装目录**里扫到的条目, dst 必须是"它实际所在的那个文件" ——
+             *   否则卸载会删另一条路径 ⇒ 文件残留、商店里一直在(linit 报"卸载了还在"的根因)。
+             *   b>=2 = /store/apps/{app,engine,ops} 已安装目录。 */
+            if (b >= 2) {
+                /* ★ 2026-10-27: 已安装目录里扫到的条目 —— **两条候选路径都填**:
+                 *   内置目录 → dst=实际文件, dst_sd=TF 同名候选
+                 *   TF 目录   → dst_sd=实际文件, dst=内置同名候选
+                 *   (原来 b>=2 一律把 dst_sd 清空 ⇒ 只有 TF 装了也判"未安装",
+                 *    而且有内置+TF 两份时卸载只会删掉一份) */
+                const char *dc = strrchr(bases[b], '/'); dc = dc ? dc + 1 : bases[b];
+                if (b <= 4) {
+                    snprintf(s_pkg[k].dst,    sizeof(s_pkg[k].dst),    "%s/%s", bases[b], nm);
+                    snprintf(s_pkg[k].dst_sd, sizeof(s_pkg[k].dst_sd), "/sdcard/apps/%s/%s", dc, nm);
+                    ESP_LOGI("AMSTORE", "已安装条目(内置): %s (dir=%s)", s_pkg[k].dst, dc);
+                } else {
+                    snprintf(s_pkg[k].dst_sd, sizeof(s_pkg[k].dst_sd), "%s/%s", bases[b], nm);
+                    snprintf(s_pkg[k].dst,    sizeof(s_pkg[k].dst),    "%s/%s/%s", AM_STORE_DST, dc, nm);
+                    ESP_LOGI("AMSTORE", "已安装条目(TF卡): %s (dir=%s)", s_pkg[k].dst_sd, dc);
+                }
+            }
             /* 缓存安装状态: 仅扫描时算一次, 渲染不再逐帧 fopen */
             s_pkg_inst[k] = am_file_exist(s_pkg[k].dst) || am_file_exist(s_pkg[k].dst_sd);
         }
@@ -203,16 +325,54 @@ static void am_pkg_scan_task(void *arg) {
     s_pkg_busy = false;
     vTaskDelete(NULL);
 }
+/* ★★★ 2026-10-18 linit: **每次联网进商店都后台自动更新索引** ——
+ *   原来 `am_rstore_prefetch()` 只用 s_fetched 保证"只拉一次" ✗ ⇒ 永远看第一次的列表
+ *   ⇒ 现在每次进商店(距上次刷新 > 60 秒)就把 s_fetched 清掉, 让它重新拉一次 ✓
+ *   拉取在后台任务里做, 失败**不清旧数据**(离线仍能浏览) ✓ 不阻塞界面 ✓ */
+void am_store_refresh_index_if_due(void) {
+    extern bool am_rstore_refresh_due(void);
+    if (am_rstore_refresh_due()) am_rstore_refresh_force();
+}
+
 void am_store_prefetch(void) {
-    if (s_pkg_scanned == 0 || s_pkg_busy) return;
+    /* ★★★ 2026-10-18 linit **必修**: `s_pkg_busy` 一旦卡死(扫描任务异常退出/创建失败)
+     *   就再也不会重扫 ⇒ `am_total_n()` 永远 0 ⇒ **商店空白 + 索引也不拉** ✗
+     *   ⇒ 加 3 秒超时: 超时认为扫描已死, 强制解锁重来 ✓ */
+    if (s_pkg_busy) {
+        static int64_t busy_t0 = 0;
+        if (busy_t0 == 0) busy_t0 = esp_timer_get_time();
+        if ((esp_timer_get_time() - busy_t0) > 3000000) {
+            ESP_LOGW(TAG, "商店扫描卡住超 3s ⇒ 强制解锁重扫");
+            s_pkg_busy = false;
+            s_pkg_scanned = -1;
+            s_pkg_done = false;
+            busy_t0 = 0;
+        } else {
+            return;
+        }
+    } else {
+        ; /* 未 busy: 走下面的正常流程 */
+    }
+    if (s_pkg_scanned == 0) return;
+    /* ★ 每次进商店(>60s)顺带把云端索引也刷新一次 ✓ */
+    {
+        extern void am_rstore_refresh_force(void);
+        extern bool am_rstore_refresh_due(void);
+        if (am_rstore_refresh_due()) am_rstore_refresh_force();
+    }
     s_pkg_busy = true;
     s_pkg_done = false;
     /* V1.2 修复: 原实现忽略返回值 —— 任务创建失败(内存不足)时 s_pkg_busy 永久为 true,
      * 商店会一直显示"正在扫描…"且无法重试 (prefetch 被 busy 挡退). 失败须回滚标志. */
-    if (xTaskCreatePinnedToCore(am_pkg_scan_task, "pkgscan", 8192, NULL, 3, NULL, 0) != pdPASS) {
+    /* ★★★ 2026-10-18 linit **必修**: 栈 8192 → **4096**。
+     *   实测开机内部 RAM 只剩 ~10KB, 8KB 栈的任务**创建失败** ✗
+     *   ⇒ 扫描永不执行 ⇒ `s_pkg_scanned` 永远 != 0 ⇒ 商店空白 "无法获取应用列表" ✓✓
+     *   (本任务只做 opendir/fopen/strcmp, 4KB 足够; 必须内部 RAM —— 读 flash 时禁缓存,
+     *    PSRAM 栈会崩) */
+    if (xTaskCreatePinnedToCore(am_pkg_scan_task, "pkgscan", 4096, NULL, 3, NULL, 0) != pdPASS) {
         s_pkg_busy = false;
         s_pkg_done = false;
-        ESP_LOGD(TAG, "商店扫描任务创建失败(内存不足?), 保留上次结果并允许重试");
+        ESP_LOGW(TAG, "商店扫描任务创建失败(内存不足?) ⇒ 保留上次结果, 下帧重试");
     }
 }
 /* 商店源清理 (V1.6.x): 商店"本地源" = /store 根目录的 .lua 待装包; "已安装"只认
@@ -247,7 +407,8 @@ static int am_rview_find(const os_app_t *a) {
  * ⚠ 已下载到商店源目录的包要**剔掉** —— 否则它会以"云端条目"再出现一次, 同一个包
  *   在列表里显示两条(一条可安装、一条还在"下载"), 与"商店里两个 BIOS 模拟器"同款 bug。 */
 static void am_store_sync_remote(void) {
-    if (!am_store_ready()) return;
+    /* ★ 同上: 不再要求"包扫描完成" —— 没 TF 卡也要能显示云端列表 ✓ */
+    if (am_rstore_count() == 0) return;
     int want = am_rstore_count();
     if (want == s_rview_synced) return;
     s_rview_n = 0;
@@ -267,27 +428,41 @@ static void am_store_sync_remote(void) {
         e->pref  = 0;
         snprintf(e->fname, sizeof(e->fname), "%s", fn);
         snprintf(e->label, sizeof(e->label), "%s", rp->label);
-        /* ⚠ cat 一律取 "app": 下载完成后本地扫描 (am_pkg_scan) 也是按 "app" 建的条目,
-         *   两边必须同源, 否则"下载前/下载后"的安装目录会不一致。索引里的 cat 暂只作参考。 */
-        snprintf(e->cat,   sizeof(e->cat),   "app");
+        /* ★★★ 2026-10-17 linit: 按索引里的 cat 归类(不再一律塞"软件")。
+         *   索引 cat: game/ops/app ; 本地合法目录: engine/ops/app(无 game) ⇒ game→engine(独立游戏)。
+         *   安装目录随分类变化, 下载前后同源(本地扫描按目录判分类 ⇒ 一致)。 */
+        const char *icat = (rp->cat[0]) ? rp->cat : "程序";   /* 索引里的中文分类 */
+        /* ★ 2026-10-18 linit: 游戏 → app(应用→游戏); 引擎分类只留模拟器 */
+        const char *cat  = (strcmp(icat, "运维") == 0 || strcmp(icat, "工具") == 0) ? "ops" : "app";
+        snprintf(e->cat,   sizeof(e->cat),   "%s", cat);
         snprintf(e->id,    sizeof(e->id),    "pkg:%s", fn);
         snprintf(e->src,   sizeof(e->src),   "%s/%s", AM_STORE_SRC2, fn);
-        snprintf(e->dst,   sizeof(e->dst),   "%s/app/%s", AM_STORE_DST, fn);
-        snprintf(e->dst_sd,sizeof(e->dst_sd),"/sdcard/apps/app/%s", fn);
+        snprintf(e->dst,   sizeof(e->dst),   "%s/%s/%s", AM_STORE_DST, cat, fn);
+        snprintf(e->dst_sd,sizeof(e->dst_sd),"/sdcard/apps/%s/%s", cat, fn);
         e->app.id   = e->id;
         e->app.label = e->label;
-        e->app.icon_idx = am_store_icon_of(fn);
         e->app.page   = OS_PAGE_LUA;
         e->app.hidden = true;
         e->app.touch_only = false;
-        e->app.cat    = NULL;
+        /* ★★★ 2026-10-17: 商店顶部子分类用的是**中文分类名**(与内置应用 .cat 同一套:
+         *   游戏/软件(程序)/系统/运维/学习) —— 之前直接塞英文 "engine/ops/app" ⇒ 全部对不上
+         *   ⇒ 所有云包都掉进"其他"。这里做一次映射: 安装目录仍用英文(e->cat), 显示用中文。 */
+        /* ★ 同上: 拷进结构体字段, 避免指向局部数组 */
+        snprintf(e->cat_zh, sizeof(e->cat_zh), "%s",
+                 (strcmp(icat, "工具") == 0) ? "运维" : icat);
+        e->app.cat = e->cat_zh;
+        /* ★★★ 2026-10-25 同上: 必须在 cat_zh 赋值之后再算分类图标 */
+        e->app.icon_idx = am_store_icon_of(fn, e->cat_zh);
         e->app.reveal = false;
         s_rview_n++;
     }
     s_rview_synced = want;
 }
 /* 总条目数 / 取第 k 条: 前 s_pkg_n 条是本地包, 后面接云端视图 */
-static int am_total_n(void) { return (s_pkg_scanned == 0) ? (s_pkg_n + s_rview_n) : 0; }
+/* ★★★ 2026-10-18 linit **必修**: 原来 `(s_pkg_scanned == 0) ? ... : 0`
+ *   ⇒ **没插 TF 卡时包扫描永远完不成** ⇒ 列表恒为 0 ⇒ "无法获取应用列表" ✗
+ *   ⇒ 现在直接返回本地+云端条数; 扫描没完只是本地那部分为空, **云端列表照常显示** ✓ */
+static int am_total_n(void) { return s_pkg_n + s_rview_n; }
 static const am_pkg_entry_t *am_entry(int k) {
     if (k < 0 || k >= am_total_n()) return NULL;
     return (k < s_pkg_n) ? &s_pkg[k] : &s_rview[k - s_pkg_n];
@@ -303,9 +478,56 @@ static void am_reload_pkg_inst(int k) {
     if (k < 0 || k >= s_pkg_n) return;
     s_pkg_inst[k] = am_file_exist(s_pkg[k].dst) || am_file_exist(s_pkg[k].dst_sd);
 }
+/* ★★★ 2026-10-18 linit: **下载完成后自动安装**(一步到位, 不用再点"安装")。
+ *   按文件名在本地包里找 → 复制到 /store/apps/{cat}/, 与手动"安装"完全等价。 */
+bool am_store_auto_install(const char *fname) {
+    if (!fname || !fname[0]) return false;
+    /* 去掉 .lua 得到包名 */
+    char stem[48];
+    snprintf(stem, sizeof(stem), "%s", fname);
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = 0;
+
+    /* ★ 2026-10-18: **不依赖 s_pkg**(扫描可能还没跑完) —— 直接按索引决定分类目录,
+     *   从下载目录复制到 /store/apps/{cat}/ ✓ */
+    const char *sub = "app";
+    int n = am_rstore_count();
+    for (int i = 0; i < n; i++) {
+        const am_rpkg_t *rp = am_rstore_get(i);
+        if (rp && strcmp(rp->name, stem) == 0) {
+            if (strcmp(rp->cat, "游戏") == 0) sub = "app";   /* 游戏 → 应用→游戏 */
+            else if (strcmp(rp->cat, "运维") == 0 || strcmp(rp->cat, "工具") == 0) sub = "ops";
+            break;
+        }
+    }
+    char src[192], dst[192], catdir[96];
+    snprintf(src, sizeof(src), "/sdcard/store_pkg/%s", fname);
+    if (!am_file_exist(src)) snprintf(src, sizeof(src), "%s/%s", AM_STORE_SRC1, fname);
+    snprintf(catdir, sizeof(catdir), "%s/%s", AM_STORE_DST, sub);
+    snprintf(dst, sizeof(dst), "%s/%s", catdir, fname);
+    mkdir(AM_STORE_DST, 0755);
+    mkdir(catdir, 0755);
+    if (am_file_exist(dst)) { ESP_LOGI("AMSTORE", "自动安装: 已存在 %s", dst); return true; }
+    if (am_copy_file(src, dst)) {
+        ESP_LOGI("AMSTORE", "自动安装完成: %s -> %s", src, dst);
+        am_lua_invalidate();
+        am_store_invalidate();
+        return true;
+    }
+    ESP_LOGW("AMSTORE", "自动安装失败: %s -> %s", src, dst);
+    return false;
+}
+
 /* 安装目标选择回调: result 0=内置固件 1=TF卡 */
 /* 确认安装回调 (V1.6.x): 安装目标不再让用户选择, 由应用自身默认 s_pkg[k].pref 决定
  * (结果 0=确认安装; 1=取消). 现有应用默认装内置; 以后大的游戏在对应应用设默认装 TF. */
+/* ★ 2026-10-18 linit: 商店的 安装/卸载/下载 三类确认框**标题统一 16px** —— 应用名长短不一,
+ *   24px 会挤成两行; 16px 一行放得下, 三类弹窗规格也一致。 */
+static void am_dlg_title16(ui_ctx_t *ctx) {
+    os_dlg_stack_t *d = os_dialog_top_mut(ctx);
+    if (d) d->title_small = true;
+}
+
 static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
     int k = (int)(long)ud;
     if (k < 0 || k >= s_pkg_n) return;
@@ -317,7 +539,10 @@ static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
     mkdir(base, 0755);
     mkdir(catdir, 0755);
     const char *dest = to_tf ? s_pkg[k].dst_sd : s_pkg[k].dst;
+    /* ★ 2026-10-17 诊断: 安装到底从哪复制到哪、cat 是什么 —— "报成功但应用里看不到" 时看这行 */
+    ESP_LOGI("AMSTORE", "安装: k=%d cat='%s' src=%s dst=%s", k, s_pkg[k].cat, s_pkg[k].src, dest);
     if (am_copy_file(s_pkg[k].src, dest)) {
+        ESP_LOGI("AMSTORE", "安装完成: %s", dest);
         os_dialog_toast(ctx, to_tf ? "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85\xe5\x88\xb0TF\xe5\x8d\xa1"   /* 已安装到TF卡 */
                                    : "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85\xe5\x88\xb0\xe5\x86\x85\xe7\xbd\xae"); /* 已安装到内置 */
         am_lua_invalidate();   /* Lua 列表下次重扫 */
@@ -326,9 +551,12 @@ static void am_store_install_cb(ui_ctx_t *ctx, int result, void *ud) {
         os_dialog_toast(ctx, "\xe5\xae\x89\xe8\xa3\x85\xe5\xa4\xb1\xe8\xb4\xa5");   /* 安装失败 */
     }
     am_rebuild_keep();
-    /* ★ 2026-10-02: 原来安装完**不关**确认框, 要用户手动按返回才消失
-     *   (卸载路径一直有 os_dialog_pop, 安装路径漏了)。这里补上, 与卸载对称。 */
-    os_dialog_pop(ctx);
+    /* ★★★ 2026-10-17 linit: 原来这里 os_dialog_pop —— 但 toast 已经把确认框关掉了,
+     *   再 pop 一次就把**商店页本身**弹出去了("安装完就退出商店"的根因)。
+     *   改用 mark_handled: 只关闭当前弹窗, 不额外弹栈。 */
+    /* ★★★ 2026-10-18 定案: **回调里什么都不做** —— 框架(os_dialog)在回调返回后
+     *   会自己关掉这个确认框(dlg_finish_top)。手动 pop 反而多退一层 ⇒
+     *   表现就是"显示已卸载 ⇒ 直接回主桌面" ✗ (os_dialog_pop 在 s_top==0 时会 os_pop 弹窗页) */
     ctx->needs_redraw = true;
 }
 /* ========== 商店 云端包: 先下载到商店源目录, 再走普通安装 (2026-10-04) ==========
@@ -338,33 +566,129 @@ static void am_store_dl_cb(ui_ctx_t *ctx, int result, void *ud) {
     int rk = (int)(long)ud;
     if (result != 0) { am_rebuild_keep(); return; }   /* 取消: 弹窗由框架自动关 */
     int rpos = (rk >= 0 && rk < s_rview_n) ? s_rview[rk].ridx : -1;
+    /* ★★★ 2026-10-18 彻底修 (linit 反复报"无法开始下载"):
+     *   原来直接用**缓存的 ridx** —— 索引刷新后(尤其失败回退内置索引)包顺序会变,
+     *   ridx 就指向错的包或越界 ⇒ `am_rstore_dl_start()` 立刻拒绝 ✗
+     *   改为**按文件名重新查找当前索引里真正的下标** ✓ */
+    if (rpos < 0 || rpos >= am_rstore_count()) {
+        const char *fn = (rk >= 0 && rk < s_rview_n) ? s_rview[rk].fname : NULL;
+        rpos = -1;
+        if (fn && fn[0]) {
+            char stem[48];
+            snprintf(stem, sizeof(stem), "%s", fn);
+            char *dot = strrchr(stem, '.');
+            if (dot) *dot = 0;
+            for (int i = 0; i < am_rstore_count(); i++) {
+                const am_rpkg_t *rp = am_rstore_get(i);
+                if (rp && strcmp(rp->name, stem) == 0) { rpos = i; break; }
+            }
+            ESP_LOGI("AMSTORE", "按文件名重定位: %s -> idx %d (共 %d 个包)", stem, rpos, am_rstore_count());
+        }
+    }
     if (rpos < 0 || !am_rstore_dl_start(rpos))
         os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe5\xbc\x80\xe5\xa7\x8b\xe4\xb8\x8b\xe8\xbd\xbd"); /* 无法开始下载 */
     am_rebuild_keep();
-    os_dialog_pop(ctx);
+    /* 同上: 交给框架自己关, 不要手动 pop */
     ctx->needs_redraw = true;
 }
 /* 云端条目被点 → 弹"下载 XX (123KB)?" */
 static void am_store_download_ask(ui_ctx_t *ctx, int rk) {
     if (rk < 0 || rk >= s_rview_n) return;
+    /* ★★ 2026-10-18 linit: 未联网时**直接提示"请连接网络"**，不再弹"下载 XX?"。
+     *   原来的问题是: 先弹确认 → 点确定 → dl_start 被拒 → 只弹一句"无法开始下载"，
+     *   用户以为卡住了。这里提前拦掉，少一次无意义点击。 */
+    if (!wifi_manager_is_connected()) {
+        os_dialog_toast(ctx, "\xe8\xaf\xb7\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c"); /* 请连接网络 */
+        return;
+    }
     const am_rpkg_t *rp = am_rstore_get(s_rview[rk].ridx);
     char title[72];
     if (rp)
-        snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s (%uKB)?",   /* 下载 XX (NKB)? */
-                 rp->label, (unsigned)((rp->size + 1023u) / 1024u));
+        snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s?", rp->label);   /* 下载 XX? (不再带大小) */
     else
         snprintf(title, sizeof(title), "\xe4\xb8\x8b\xe8\xbd\xbd %s?", s_rview[rk].label);
     os_dialog_confirm_ex(ctx, title, 0, 0, am_store_dl_cb, (void *)(long)rk);
+    /* ★ 只有这个弹窗用 16px 标题(名字长也不挤), 其他弹窗保持 24px ✓ */
+    am_dlg_title16(ctx);
 }
 
 /* ★ 商店行统一入口 (2026-10-02 linit: "商店只负责安装/卸载, 卸载不负责启动应用"):
  *   已安装 → 弹"卸载 XXX?" ; 未安装 → 弹"安装 XXX?" ; 云端未下载 → 弹"下载 XXX?" 。
  *   **商店里永远不启动应用** —— 要运行请到「应用」分类点它。
  *   (原来已安装时走这里会直接运行, 用户点了按钮却跑起来、卸载还藏在长按里, 等于点不到) */
+
+/* ================= 资源包 (type=asset) 助手 (2026-10-25 linit) =================
+ * 资源包没有 .lua 文件可扫, 所以"装没装"只能看 target 目录在不在。
+ * 装完 → 商店里按钮变"卸载", 再点就递归删目录。 */
+static void am_store_asset_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a);
+
+/* ★★★ 2026-10-25 linit「仙剑还是不能点卸载」的根因修复：
+ *   原来只认"条目指针来自 s_rview"这一种情况 ⇒ 同一个资源包有两种行：
+ *     ① 商店里的云端行（来自 s_rview）      → 认
+ *     ② 注册表里的 C 应用行（如 page_pal）  → **认不出**，按钮永远"下载"、点了没反应
+ *   现在统一按"资源包身份"找，与行从哪来无关。 */
+static int am_asset_pkg_find(const os_app_t *a)
+{
+    if (!a) return -1;
+    int r = am_rview_find(a);                 /* ① 云端行 */
+    if (r >= 0) {
+        int rid = s_rview[r].ridx;
+        const am_rpkg_t *rp = am_rstore_get(rid);
+        if (rp && strcmp(rp->type, "asset") == 0 && rp->target[0]) return rid;
+    }
+    if (am_rstore_count() == 0) return -1;
+
+    /* ② 注册表行：按 label / id / 包名词干(去掉 .zip 与目录) 匹配 */
+    char stem_id[48];
+    snprintf(stem_id, sizeof(stem_id), "%s", a->id ? a->id : "");
+    for (int i = 0; i < am_rstore_count(); i++) {
+        const am_rpkg_t *rp = am_rstore_get(i);
+        if (!rp || strcmp(rp->type, "asset") != 0 || !rp->target[0]) continue;
+        if (a->label && a->label[0] && strcmp(rp->name, a->label) == 0) return i;
+        if (a->label && a->label[0] && strcmp(rp->label, a->label) == 0) return i;
+        if (stem_id[0] && strcmp(rp->name, stem_id) == 0) return i;
+        const char *base = strrchr(rp->path, '/');
+        base = base ? base + 1 : rp->path;
+        char stem[48];
+        snprintf(stem, sizeof(stem), "%s", base);
+        char *dot = strrchr(stem, '.');
+        if (dot) *dot = 0;
+        if (stem_id[0] && strcmp(stem, stem_id) == 0) return i;
+    }
+    return -1;
+}
+
+static bool am_asset_target_of(const os_app_t *a, char *out, size_t cap)
+{
+    int i = am_asset_pkg_find(a);
+    if (i < 0) return false;
+    const am_rpkg_t *rp = am_rstore_get(i);
+    if (!rp) return false;
+    snprintf(out, cap, "%s", rp->target);
+    return true;
+}
+
+static bool am_asset_installed(const os_app_t *a)
+{
+    char dir[96];
+    if (!am_asset_target_of(a, dir, sizeof(dir))) return false;
+    struct stat st;
+    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 void am_store_toggle(ui_ctx_t *ctx, const os_app_t *a) {
     if (!a) return;
+    /* 资源包 (下载 zip + 解压到 target): 装没装看目录, 双态都是同一条行为 */
+    if (am_asset_pkg_find(a) >= 0) {
+        if (am_asset_installed(a)) { am_store_asset_uninstall_ask(ctx, a); return; }
+        int rk = am_rview_find(a);
+        if (rk >= 0) am_store_download_ask(ctx, rk);
+        return;
+    }
     int rk = am_rview_find(a);
-    if (rk >= 0) { am_store_download_ask(ctx, rk); return; }   /* 云端包: 先下载 */
+    if (rk >= 0) {
+        am_store_download_ask(ctx, rk); return;   /* 云端包: 先下载 */
+    }
     int k = am_pkg_find(a);
     if (k < 0) return;
     if (am_pkg_installed(k)) { am_store_uninstall_ask(ctx, a); return; }
@@ -373,41 +697,91 @@ void am_store_toggle(ui_ctx_t *ctx, const os_app_t *a) {
 
 /* 商店选中: 已安装(内置或卡) → 运行; 未安装 → 弹"安装 XXX?" 确认 (目标是应用默认, 不选) */
 void am_store_activate(ui_ctx_t *ctx, const os_app_t *a) {
+    if (am_asset_pkg_find(a) >= 0) {
+        if (am_asset_installed(a)) { am_store_asset_uninstall_ask(ctx, a); return; }
+        int rk0 = am_rview_find(a);
+        if (rk0 >= 0) am_store_download_ask(ctx, rk0);
+        return;
+    }
     int rk = am_rview_find(a);
-    if (rk >= 0) { am_store_download_ask(ctx, rk); return; }   /* 云端包: 先下载 */
+    if (rk >= 0) {
+        am_store_download_ask(ctx, rk); return;   /* 云端包: 先下载 */
+    }
     int k = am_pkg_find(a);
     if (k < 0) return;
     if (am_pkg_installed(k)) {
-        const char *run = am_file_exist(s_pkg[k].dst) ? s_pkg[k].dst : s_pkg[k].dst_sd; /* 优先内置, 否则TF卡 */
-        am_lua_open_path(ctx, run);     /* 统一入口: 带 `need=wifi` 门禁 (未联网先弹窗连网) */
+        /* ★★★ 2026-10-18 linit 反复报"点卸载就退出应用中心"的真因:
+         *   商店里点**已安装的行**原来会 `am_lua_open_path()` **直接启动应用** ✗
+         *   ⇒ 用户以为"退出应用中心" ✓ (实际是被拉去跑那个应用了)
+         *   商店里**永远不启动应用**(只负责装/卸) ⇒ 已安装的点一下就弹"卸载?" ✓ */
+        am_store_uninstall_ask(ctx, a);
         return;
     }
     char title[64];
     snprintf(title, sizeof(title), "\xe5\xae\x89\xe8\xa3\x85 %s ?", s_pkg[k].label); /* 安装 XXX ? */
     os_dialog_confirm_ex(ctx, title, 0, 0, am_store_install_cb, (void *)(long)k);
+    am_dlg_title16(ctx);
 }
 
 /* ========== 商店 卸载 (删除已装包 + 移出主菜单 + 重新扫描) ========== */
+/* ★★★ 2026-10-18 linit: **卸载放后台任务** —— 原来在 UI 线程删 4 个文件 + 写两次 NVS,
+ *   会卡住界面。现在 UI 立刻弹 toast, 文件删除/记录清理在后台做完再刷新列表。 */
+typedef struct {
+    char paths[4][192];
+    char lid[64];
+    int  npaths;
+} am_uninst_job_t;
+
+static void am_uninst_task(void *arg) {
+    am_uninst_job_t *j = (am_uninst_job_t *)arg;
+    for (int i = 0; i < j->npaths; i++)
+        if (j->paths[i][0]) remove(j->paths[i]);
+    os_app_set_mainmenu(j->lid, false);
+    os_app_set_hidden(j->lid, true);
+    /* ★★ 2026-10-18: **卸载后不再触发全量重扫** —— 文件已删, `am_store_installed_of()`
+     *   按文件存在性判断, 自动变"下载"; 重扫只会拖慢(linit 反馈"卸载慢") ✗
+     *   只让 Lua 列表失效(应用管家里那条要消失) ✓ */
+    am_lua_invalidate();
+    ESP_LOGI("AMSTORE", "后台卸载完成: %s (删了 %d 个文件)", j->lid, j->npaths);
+    s_uninst_done = true;    /* ★ 通知 UI 刷新(它只重绘, 不重建列表) */
+
+    free(j);
+    vTaskDelete(NULL);
+}
+
 static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
     if (k < 0 || k >= s_pkg_n) return;
     if (!am_pkg_installed(k)) { os_dialog_toast(ctx, "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85"); return; } /* 未安装 */
-    remove(s_pkg[k].dst);                                  /* 删掉 /store/apps/{cat}/{file} */
-    char sd[192];
-    snprintf(sd, sizeof(sd), "/sdcard/apps/%s/%s", s_pkg[k].cat, s_pkg[k].fname); /* 联动删 SD 卡同名副本 */
-    if (am_file_exist(sd)) remove(sd);
-    char lid[64];
-    snprintf(lid, sizeof(lid), "lua:%s", s_pkg[k].fname);  /* 同步清掉对应 Lua 项的主菜单记录 */
-    os_app_set_mainmenu(lid, false);
-    os_app_set_hidden(lid, true);
-    am_lua_invalidate();   /* Lua 列表下次重扫 */
-    os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8d\xb8\xe8\xbd\xbd");   /* 已卸载 */
-    am_reload_pkg_inst(k);                       /* 卸载后只刷新该包缓存一次 */
-    am_rebuild_keep();
+    /* ★★★ 2026-10-18: **不再用"忙标志"挡** —— 之前任务异常退出会把标志永久置 true
+     *   ⇒ "点卸载没反应" ✗。卸载是幂等的(删不存在的文件只返回错误),
+     *   连点/重复完全无害 ⇒ 直接放行, 由后台任务各删各的 ✓ */
+    am_uninst_job_t *j = calloc(1, sizeof(*j));
+    if (!j) return;
+
+    /* 先把要删的路径拷进任务(任务跑的时候 s_pkg 可能已被重扫 ✗)
+     * ★ 2026-10-27: dst/dst_sd 现在由扫描显式填好(内置/ TF 两条候选路径),
+     *   直接照抄即可 —— 不再用 cat 现拼, 免得 cat 与实际所在目录不一致时删错路径。 */
+    if (s_pkg[k].dst[0])    snprintf(j->paths[j->npaths++], 192, "%s", s_pkg[k].dst);
+    if (s_pkg[k].dst_sd[0]) snprintf(j->paths[j->npaths++], 192, "%s", s_pkg[k].dst_sd);
+    snprintf(j->paths[j->npaths++], 192, "/sdcard/store_pkg/%s", s_pkg[k].fname);
+    snprintf(j->paths[j->npaths++], 192, "/store/%s", s_pkg[k].fname);
+    snprintf(j->lid, sizeof(j->lid), "lua:%s", s_pkg[k].fname);
+    s_pkg_inst[k] = false;   /* UI 立刻认为未安装(按钮变"下载") */
+    os_dialog_toast(ctx, "\xe5\x8d\xb8\xe8\xbd\xbd\xe4\xb8\xad...");   /* 卸载中... (后台删完会刷新列表) */
     ctx->needs_redraw = true;
+    if (xTaskCreate(am_uninst_task, "am_uninst", 6144, j, 3, NULL) != pdPASS) {
+        /* 任务建不起来: 退化为同步删(至少保证功能正确) */
+        am_uninst_task(j);
+    }
 }
+
 static void am_store_uninstall_cb(ui_ctx_t *ctx, int result, void *ud) {
+    /* ★★★ 2026-10-18 修(弹窗不关): **先关确认框再执行** ——
+     *   因为 os_dialog_toast() 会把 s_cb_handled 置 true, 框架的 dlg_finish_top
+     *   就**不再自动关**了 ⇒ 弹窗一直挂着 ✗ */
+    if (os_dialog_depth() > 0) os_dialog_pop(ctx);
     if (result == 0) am_store_uninstall_do(ctx, (int)(long)ud);
-    os_dialog_pop(ctx);                                    /* 关掉确认框 (toast 会置 handled, 这里补关) */
+    /* 同上: 交给框架自己关, 不要手动 pop */
     ctx->needs_redraw = true;
 }
 /* 选中的商店项若已安装 → 弹"卸载 XX?" 确认 */
@@ -418,10 +792,59 @@ void am_store_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a) {
     char msg[64];
     snprintf(msg, sizeof(msg), "\xe5\x8d\xb8\xe8\xbd\xbd %s?", s_pkg[k].label); /* 卸载 XX? */
     os_dialog_confirm_ex(ctx, msg, 0, 0, am_store_uninstall_cb, (void *)(long)k);
+    am_dlg_title16(ctx);
+}
+
+/* ---------- 资源包卸载: 后台递归删 target 目录 ---------- */
+static void am_asset_uninst_task(void *arg)
+{
+    char *dir = (char *)arg;
+    bool ok = am_asset_rmdir(dir);
+    ESP_LOGI("AMSTORE", "资源包卸载 %s: %s", dir, ok ? "OK" : "失败");
+    free(dir);
+    s_uninst_done = true;    /* 通知 UI 刷新(按钮回到"下载") */
+    vTaskDelete(NULL);
+}
+
+static void am_store_asset_uninstall_cb(ui_ctx_t *ctx, int result, void *ud)
+{
+    char *dir = (char *)ud;
+    if (os_dialog_depth() > 0) os_dialog_pop(ctx);
+    if (result == 0 && dir) {
+        char *copy = strdup(dir);
+        free(dir);
+        if (copy) {
+            if (xTaskCreate(am_asset_uninst_task, "am_asset_rm", 4096, copy, 3, NULL) != pdPASS) {
+                am_asset_uninst_task(copy);   /* 建不出任务就同步删 */
+            }
+        }
+        os_dialog_toast(ctx, "\xe5\x8d\xb8\xe8\xbd\xbd\xe4\xb8\xad...");   /* 卸载中... */
+    } else {
+        free(dir);
+    }
+    ctx->needs_redraw = true;
+}
+
+static void am_store_asset_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a)
+{
+    char dir[96];
+    if (!am_asset_target_of(a, dir, sizeof(dir))) return;
+    char msg[64];
+    snprintf(msg, sizeof(msg), "\xe5\x8d\xb8\xe8\xbd\xbd %s?", a->label);   /* 卸载 XX? */
+    char *ud = strdup(dir);
+    if (!ud) return;
+    os_dialog_confirm_ex(ctx, msg, 0, 0, am_store_asset_uninstall_cb, ud);
+    am_dlg_title16(ctx);
 }
 
 /* ==================== 对外接口 (声明见 am_internal.h) ==================== */
 bool am_store_ready(void) { return s_pkg_scanned == 0; }
+/* ★ 2026-10-18: 取"卸载完成"事件(取一次即清), UI 用它触发一次重绘 ✓ */
+bool am_store_take_uninst_done(void) {
+    if (!s_uninst_done) return false;
+    s_uninst_done = false;
+    return true;
+}
 int  am_store_count(void) { return am_total_n(); }
 
 const os_app_t *am_store_app(int k) {
@@ -431,8 +854,11 @@ const os_app_t *am_store_app(int k) {
 bool am_store_owns(const os_app_t *a) { return am_pkg_find(a) >= 0 || am_rview_find(a) >= 0; }
 bool am_store_installed_of(const os_app_t *a) {
     int k = am_pkg_find(a);
-    /* 读缓存: 渲染路径不能逐帧 fopen。云端包 (kind=1) 永远不算"已装"—— 还没下载呢 */
-    return (k >= 0) && s_pkg_inst[k];
+    /* 读缓存: 渲染路径不能逐帧 fopen。普通云端包 (kind=1) 不算"已装"—— 还没下载呢。
+     * ★ 2026-10-25: **资源包例外** —— 它没有 .lua 可扫, 装完就靠 target 目录在不在。
+     *   (渲染每帧调一次, stat 一个目录比 fopen 便宜得多; 目录不存在时立即返回) */
+    if (k >= 0) return s_pkg_inst[k];
+    return am_asset_installed(a);
 }
 const char *am_store_fname_of(const os_app_t *a) {
     int k = am_pkg_find(a);
@@ -442,23 +868,70 @@ const char *am_store_fname_of(const os_app_t *a) {
 }
 /* 商店行第二行文案: 本地包 → LAPP 简介 (可能 NULL → 不画);
  *                    云端包 → "未下载 · NKB" (让用户知道点了要下多少) */
+/* ★ 2026-10-18 linit: 该条目正在下载时返回进度(0..1000), 否则 -1。
+ *   行渲染据此把第二行画成进度条(顶掉应用说明)。 */
+int am_store_dl_permille_of(const os_app_t *a) {
+    const char *nm = NULL;
+    int kk = am_pkg_find(a);
+    if (kk >= 0) nm = s_pkg[kk].fname;
+    else { int rr = am_rview_find(a); if (rr >= 0) nm = s_rview[rr].fname; }
+    char stem[48];
+    snprintf(stem, sizeof(stem), "%s", nm ? nm : "");
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = 0;
+
+    const char *dl = am_rstore_dl_name();
+    if (!dl || !dl[0] || strcmp(stem, dl) != 0) return -1;
+    int pm = am_rstore_dl_permille();
+    return (pm < 0) ? 0 : pm;
+}
+
 const char *am_store_sub_of(const os_app_t *a) {
+    /* ★★★ 2026-10-18 linit: **正在下载的那一条, 第二行临时显示进度**(顶掉应用说明) ——
+     *   不再靠弹窗。返回静态缓冲(渲染路径每帧调, 不能 malloc)。 */
+    {
+        const char *nm = NULL;
+        int kk = am_pkg_find(a);
+        if (kk >= 0) nm = s_pkg[kk].fname;
+        else { int rr = am_rview_find(a); if (rr >= 0) nm = s_rview[rr].fname; }
+        const char *dl = am_rstore_dl_name();
+        /* ★ 2026-10-18 修: 条目 fname 带 ".lua", dl_name 不带 ⇒ 去掉后缀再比, 否则进度永远不显示 */
+        char stem[48];
+        snprintf(stem, sizeof(stem), "%s", nm ? nm : "");
+        char *dot = strrchr(stem, '.');
+        if (dot) *dot = 0;
+        if (nm && dl && dl[0] && strcmp(stem, dl) == 0) {
+            static char s_pg[28];
+            int pm = am_rstore_dl_permille();
+            if (pm < 0) snprintf(s_pg, sizeof(s_pg), "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad ...");   /* 下载中 ... */
+            else        snprintf(s_pg, sizeof(s_pg), "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad %d%%", pm / 10); /* 下载中 42% */
+            return s_pg;
+        }
+    }
     int k = am_pkg_find(a);
     if (k >= 0) return s_pkg[k].desc[0] ? s_pkg[k].desc : NULL;
     int r = am_rview_find(a);
     if (r < 0) return NULL;
     const am_rpkg_t *rp = am_rstore_get(s_rview[r].ridx);
     if (!rp) return NULL;
-    static char s_sub[40];   /* 渲染路径每帧调, 不能 malloc */
-    snprintf(s_sub, sizeof(s_sub), "\xe6\x9c\xaa\xe4\xb8\x8b\xe8\xbd\xbd \xc2\xb7 %uKB",  /* 未下载 · NKB */
-             (unsigned)((rp->size + 1023u) / 1024u));
-    return s_sub;
+    /* ★ 2026-10-17 linit: 第二行统一显示**应用说明**(不再显示"未下载 · NKB") */
+    return rp->desc[0] ? rp->desc : NULL;
 }
 /* 右侧按钮文案: 下载 / 卸载 / 安装 (同一行只会是其中一种) */
 const char *am_store_btn_of(const os_app_t *a) {
+    /* ★★★ 2026-10-25 linit「装完还是显示下载」的根因：原来只要行来自云端就
+     *   无条件返回"下载"，资源包装好了也不变 ⇒ 用户永远看不到"卸载"。
+     *   资源包必须双态：目录在 = 卸载，不在 = 下载。 */
+    if (am_asset_pkg_find(a) >= 0)
+        return am_asset_installed(a) ? "\xe5\x8d\xb8\xe8\xbd\xbd"        /* 卸载 */
+                                     : "\xe4\xb8\x8b\xe8\xbd\xbd";       /* 下载 */
     if (am_rview_find(a) >= 0) return "\xe4\xb8\x8b\xe8\xbd\xbd";        /* 下载 */
+    /* ★ 2026-10-27 linit 定的全局规则: 商店里**只有两种动作** ——
+     *   未安装 = "下载"(下载完成自动安装, 本地已有包则直接安装)
+     *   已安装 = "卸载"(把 TF 与内置分区一起删干净)
+     *   不再出现"安装"这个中间态(它让用户以为已经装了却要再点一次)。 */
     return am_store_installed_of(a) ? "\xe5\x8d\xb8\xe8\xbd\xbd"          /* 卸载 */
-                                    : "\xe5\xae\x89\xe8\xa3\x85";          /* 安装 */
+                                    : "\xe4\xb8\x8b\xe8\xbd\xbd";         /* 下载 */
 }
 /* 目录变化(装入/卸载/下载完成)后调用: 下次进商店重新扫描。
  * ⚠ 不要清 s_pkg_busy —— 扫描任务可能还在跑, 清了就允许**再起一个并发扫描**,

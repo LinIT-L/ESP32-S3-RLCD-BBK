@@ -34,6 +34,11 @@ bool wifi_manager_has_saved(void);
  * 之后连接/断线重连全由本模块的自愈任务负责, 上层只管查 is_connected。 */
 void wifi_manager_autostart(void);
 
+/* ★ 2026-10-18: 用户显式开关意图 (持久化) —— 设置页 WLAN 开关调用, 重启后按它决定状态。
+ * get_want_on: -1=从未手动设置(auto: 有凭据才开机开), 0=手动关, 1=手动开。 */
+int  wifi_manager_get_want_on(void);
+void wifi_manager_set_want_on(bool on);
+
 /* V1.0.46: 消费"刚刚连接成功"事件 (供菜单弹 0.5s 提示), 返回 true=本次刚连上 */
 bool wifi_manager_consume_connected_event(void);
 
@@ -51,6 +56,11 @@ void wifi_manager_clear_saved(void);
 
 /* 读取 NVS 保存的配置 (无保存时 ssid[0]='\0') */
 void wifi_manager_get_saved(char *ssid, size_t ssid_sz, char *pass, size_t pass_sz);
+/* ==== 连接记录 (最多 5 条, 最近的在前) ====
+ * 供"网络配置"页展示历史 + 逐个忘记。自动连接仍只用 get_saved() 那条。 */
+int  wifi_manager_history_count(void);
+bool wifi_manager_history_get(int i, char *ssid, size_t ssz, char *pass, size_t psz);
+bool wifi_manager_forget(const char *ssid);
 
 /* V1.0.46: 扫描附近的 Wi-Fi 网络 (异步, 完成后结果可用) */
 bool wifi_manager_scan_start(void);

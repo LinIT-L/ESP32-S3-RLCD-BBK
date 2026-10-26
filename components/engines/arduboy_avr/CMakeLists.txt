@@ -43,7 +43,8 @@ idf_component_register(
         "avr/simavr/cores"
         "avr/simavr/cores/avr"
         "avr/simavr/parts"
-    PRIV_REQUIRES "st7305" "freertos" "esp_timer" "driver" "audio_player" "virtual_keys" "bt_ctl" "input"
+    PRIV_REQUIRES
+        vid_tune "st7305" "freertos" "esp_timer" "driver" "audio_player" "virtual_keys" "bt_ctl" "input"
     "cheater" "board_shim"  
 )
 

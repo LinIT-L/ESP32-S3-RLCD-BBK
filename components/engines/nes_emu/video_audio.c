@@ -37,7 +37,10 @@ uint8_t *nes_video_shade_packed = NULL;
 volatile bool nes_video_frame_ready = false;
 volatile uint32_t nes_audio_peak = 0;   /* 诊断: 最近一帧音频峰值 */
 static uint16_t *myPalette = NULL;
-static uint8_t s_shade_lut[256];        /* 调色板索引 -> 4 级灰度 */
+/* ★ 2026-10-22 性能: 每像素都要查这张表 (NES 打包时 src[i] -> 灰度)。
+ *   本组件 linker.lf 把整库 .bss 扫进 PSRAM ⇒ 原来它也在 PSRAM, 每像素一次 cache miss。
+ *   DRAM_ATTR 强制留在内部 RAM (仅 256B, 收益远大于成本)。 */
+static DRAM_ATTR uint8_t s_shade_lut[256];   /* 调色板索引 -> 4 级灰度 */
 static bitmap_t *myBitmap = NULL;
 static uint8_t s_hw_dummy[4];           /* lock_write 占位 (实际不走硬件位图) */
 
@@ -192,7 +195,9 @@ static void nes_drv_set_palette(rgb_t *pal)
 {
     if (!pal) return;
     if (!myPalette) {
-        myPalette = heap_caps_malloc(256 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        /* ★ 热表: 每像素查一次, 必须内部 RAM (512B) */
+        myPalette = heap_caps_malloc(256 * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!myPalette) myPalette = heap_caps_malloc(256 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     if (!myPalette) return;
     for (int i = 0; i < 256; i++) {

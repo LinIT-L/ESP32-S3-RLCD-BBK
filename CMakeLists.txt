@@ -42,7 +42,22 @@ set(EXTRA_COMPONENT_DIRS
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
+# ★ 模拟器模式 (2026-10-25): 必须在 project() 之前用 idf_build_set_property 挂全局
+#   编译定义——add_compile_definitions 在 project() 之后调用对 ESP-IDF 组件不生效。
+#   开启后：① 跳过板型自适应死循环 ② st7305 每帧把 framebuffer 从 UART 吐出来，
+#   由 PC 端脚本渲染成窗口。真机固件不含任何这部分代码。
+#   用法: idf.py -DLINTOS_EMU_MODE=1 build
+if(DEFINED LINTOS_EMU_MODE)   # 命令行 -D 传的是无类型缓存变量, if(VAR) 会判 false, 必须用 DEFINED
+    message(STATUS "★ 模拟器模式: LINTOS_EMU_MODE=1 (跳过板型自适应 + 导出 framebuffer)")
+    idf_build_set_property(COMPILE_DEFINITIONS "LINTOS_EMU_MODE=1" APPEND)
+endif()
+
 project(LinTOS)
+
+# ★ 2026-10-25 [LINTOS] 模拟器模式（esp-emu 无 I2C 触摸/无屏幕输出）
+#   开启后：① 跳过板型自适应死循环 ② st7305 每帧把 framebuffer 从 UART 吐出来，
+#   由 PC 端脚本渲染成窗口。真机固件不含任何这部分代码。
+#   用法: idf.py -DLINTOS_EMU_MODE=1 build  (定义已在 project() 前通过 idf_build_set_property 挂载)
 
 # === V1.2 分层依赖守卫接入构建 (批次 6) ===
 # 每次构建前自动跑 tools/check_deps.py; 出现「未登记的反向依赖」直接让构建失败,

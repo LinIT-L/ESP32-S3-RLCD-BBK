@@ -5,6 +5,8 @@
  * 加新 API: 本文件写 static int l_xxx(lua_State *L), 再在文件末尾的 register 里加一行。
  */
 #include "lua_bridge.h"
+#include "audio_player.h"   /* app.volume / app.mute (2026-10-24 补) */
+#include "bt_manager.h"     /* app.bt 状态 (2026-10-24 补) */
 
 
 /* app.log(...) → 打到串口控制台, 带 [APP] 前缀, 用 remcon / 串口日志就能捞回来。
@@ -222,6 +224,41 @@ static int l_dlg_result(lua_State *L) {
     return 1;
 }
 
+/* ===== 2026-10-24 补齐 "设备类" API =====
+ * 之前 Lua 应用拿不到音量/静音/蓝牙状态, 只能画个假滑块 (音乐/游戏都卡在这)。
+ * C 侧一直有这些能力, 只是桥没暴露 —— 这里按 lua_bridge.h 的三步规则补上。 */
+
+/* app.volume([0-100]) → 当前音量百分比
+ * 不传参 = 查询; 传参 = 设为该值(会被夹到 0-100 再映射到 0-9 硬件档)。
+ * ⚠ 与系统音量是**同一个值**: 应用改完退出, 系统里看到的也是新值(符合直觉)。 */
+static int l_volume(lua_State *L) {
+    if (lua_gettop(L) >= 1) {
+        int v = (int)luaL_checkinteger(L, 1);
+        if (v < 0)   v = 0;
+        if (v > 100) v = 100;
+        audio_player_set_volume(v);
+    }
+    lua_pushinteger(L, audio_player_get_volume());
+    return 1;
+}
+
+/* app.mute([true|false]) → 当前是否静音 (不传参 = 查询)
+ * 静音只关输出, 不关播放进度; 与应用内的"暂停"是两件事。 */
+static int l_mute(lua_State *L) {
+    if (lua_gettop(L) >= 1) audio_player_set_muted(lua_toboolean(L, 1) != 0);
+    lua_pushboolean(L, audio_player_is_muted());
+    return 1;
+}
+
+/* app.bt() → 0=未启用  1=射频就绪(未连)  2=已连接(手柄/耳机)
+ * 应用不需要自己开蓝牙: 开机不拉射频, 进设置页/手柄页才由 os_hw 拉起。 */
+static int l_bt_state(lua_State *L) {
+    int st = 0;
+    if (bt_manager_is_ready()) st = bt_manager_is_connected() ? 2 : 1;
+    lua_pushinteger(L, st);
+    return 1;
+}
+
 void lua_mod_sys_register(lua_State *L)
 {
     lua_pushcfunction(L, l_log);                 lua_setfield(L, -2, "log");
@@ -229,6 +266,10 @@ void lua_mod_sys_register(lua_State *L)
     lua_pushcfunction(L, l_tone_async);          lua_setfield(L, -2, "tone_async");
     lua_pushcfunction(L, l_melody);              lua_setfield(L, -2, "melody");
     lua_pushcfunction(L, l_vibrate);             lua_setfield(L, -2, "vibrate");
+    /* ★ 2026-10-24 补齐的设备类 API (见上方注释) */
+    lua_pushcfunction(L, l_volume);              lua_setfield(L, -2, "volume");
+    lua_pushcfunction(L, l_mute);                lua_setfield(L, -2, "mute");
+    lua_pushcfunction(L, l_bt_state);            lua_setfield(L, -2, "bt");
     lua_pushcfunction(L, l_exit);                lua_setfield(L, -2, "exit");
     lua_pushcfunction(L, l_exit_confirm);        lua_setfield(L, -2, "exit_confirm");
     lua_pushcfunction(L, l_sbar_invert);         lua_setfield(L, -2, "sbar");

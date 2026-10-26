@@ -23,7 +23,7 @@ esac
 echo "总长 $LEN B ($(echo "scale=1; $LEN/1048576" | bc) MB)  并发 $N"
 
 # ---- ② 算分块边界 (Python 保证不手抖) ----
-<HOME>/.workbuddy/binaries/python/envs/default/bin/python - "$LEN" "$N" > "$DIR/ranges" <<'PY'
+/Users/linit/.workbuddy/binaries/python/envs/default/bin/python - "$LEN" "$N" > "$DIR/ranges" <<'PY'
 import sys
 n = int(sys.argv[1]); k = int(sys.argv[2])
 step = (n + k - 1) // k

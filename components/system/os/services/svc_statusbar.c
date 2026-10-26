@@ -11,7 +11,7 @@
  */
 #include "os.h"
 #include "ui_common.h"
-#include "status_icons12.inc"
+#include "status_icons.inc"
 #include "usb_bt.h"
 #include "usb_net.h"
 #include "usb_hid.h"
@@ -75,8 +75,8 @@ static void svc_draw_battery(st7305_handle_t *lcd, int x, int y, uint8_t percent
     else if (percent <= 10) idx = 0;                /* ≤10% 一律空格 */
     else                    idx = 1 + (int)(((int)percent - 10) * (BAT_ICON_N - 2) / 60);
     if (idx >= BAT_ICON_N) idx = BAT_ICON_N - 1;
-    if (s_inv) svc_blit_inv(lcd, x, y, BAT_ICON_W, BAT_ICON_H, (BAT_ICON_W + 7) / 8, bat_icon[idx]);
-    else       st7305_draw_bitmap_1bit(lcd, x, y, BAT_ICON_W, BAT_ICON_H, bat_icon[idx]);
+    if (s_inv) svc_blit_inv(lcd, x, y, BAT_ICON_W, BAT_ICON_H, (BAT_ICON_W + 7) / 8, status_icon_bat_32x16[idx]);
+    else       st7305_draw_bitmap_1bit(lcd, x, y, BAT_ICON_W, BAT_ICON_H, status_icon_bat_32x16[idx]);
 }
 
 /* 1bpp 位图反白最近邻放大 (见 s_inv: 白图或黑图) */
@@ -102,6 +102,11 @@ static void svc_draw_status_icon(st7305_handle_t *lcd, int x, int y,
 static uint32_t s_last_bat_ms = 0;
 static uint8_t  s_bat         = 255;
 static int      s_last_minute = -1;
+/* ★ 2026-10-27: 状态栏刷新策略 = "1 分钟一跳 (时间) + 任何状态变化立刻一跳"
+ *   之前只盯电池(60s 采样)和分钟, Wi-Fi 由关到开 / 由未连到连上都**不触发重绘**,
+ *   图标要等下一次分钟跳变才出现 (最坏晚 60 秒) —— 这就是"网络图标出现得慢"的真因。 */
+static uint8_t  s_wifi_state  = 0xFF;   /* bit0=已开 bit1=已连; 0xFF=尚未采样 */
+static uint8_t  s_bt_state    = 0xFF;   /* bit0=已开 bit1=已连 */
 
 /* V1.2 性能: time()/localtime() 结果缓存 (最多每秒刷新一次).
  * 原先 svc_tick 每帧调一次, render 里 left/time 两个函数又各调一次 —— 每帧 3 次
@@ -138,6 +143,19 @@ static void svc_tick(ui_ctx_t *ctx)
     if (t && t->tm_min != s_last_minute) {
         s_last_minute = t->tm_min;
         ctx->needs_redraw = true;
+    }
+    /* ★ 2026-10-27 linit: "正常 1 分钟更新一次, 但收到新信息 (电池/其它) 要及时刷新"。
+     *   电量变化上面已经在刷 (60s 采样, 变化才重绘); 这里补上**连接类状态**:
+     *   Wi-Fi / 蓝牙 由关到开、由未连到连上, 一变就立刻重绘一次(不等分钟跳变)。
+     *   代价: 每帧两次只读 bool, 可忽略。 */
+    {
+        uint8_t ws = 0, bs = 0;
+        if (s_ops->wifi_enabled   && s_ops->wifi_enabled())   ws |= 1;
+        if (s_ops->wifi_connected && s_ops->wifi_connected()) ws |= 2;
+        if (s_ops->bt_enabled     && s_ops->bt_enabled())     bs |= 1;
+        if (s_ops->bt_connected   && s_ops->bt_connected())   bs |= 2;
+        if (ws != s_wifi_state) { s_wifi_state = ws; ctx->needs_redraw = true; }
+        if (bs != s_bt_state)   { s_bt_state   = bs; ctx->needs_redraw = true; }
     }
 }
 
@@ -178,7 +196,7 @@ static void svc_draw_common_right(st7305_handle_t *lcd, int text_y, int SCREEN_W
     if (pad_connected) {
         svc_draw_status_icon(lcd, right_x - STATUS_ICON_W, text_y,
                              PAD_ICON_W, PAD_ICON_H, (PAD_ICON_W + 7) / 8,
-                             STATUS_ICON_W, STATUS_ICON_H, pad12_icon);
+                             STATUS_ICON_W, STATUS_ICON_H, status_icon_pad_32x16);
         right_x -= STATUS_ICON_W + GAP;
     }
     if (out_right_x) *out_right_x = right_x;
@@ -193,7 +211,10 @@ static void svc_render(ui_ctx_t *ctx)
     const int GAP = 4;
     const int SCREEN_W = ui_screen_w();
 
-    if (s_inv) fill_rect(lcd, 0, 0, SCREEN_W - 1, SB_STRIP_H - 1, ST7305_COLOR_BLACK);
+    /* ★ 2026-10-19: 状态栏区域**必须铺底**(普通=白/反色=黑), 否则页面画到 y<24 的文字
+     * 会透上来和状态栏文字叠在一起 (linit: 很多界面都覆盖到状态栏了)。 */
+    fill_rect(lcd, 0, 0, SCREEN_W - 1, SB_STRIP_H - 1,
+              s_inv ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
 
     svc_draw_common_left(lcd, text_y);
     svc_draw_common_time(lcd, text_y, SCREEN_W);
@@ -206,17 +227,28 @@ static void svc_render(ui_ctx_t *ctx)
     if (data_active && !usb_bt_is_running()) {
         svc_draw_status_icon(lcd, right_x - STATUS_ICON_W, text_y,
                              DATA_ICON_W, DATA_ICON_H, (DATA_ICON_W + 7) / 8,
-                             STATUS_ICON_W, STATUS_ICON_H, data12_icon);
+                             STATUS_ICON_W, STATUS_ICON_H, status_icon_data_32x16);
         right_x -= STATUS_ICON_W + GAP;
     }
     bool wifi_on = s_ops && s_ops->wifi_enabled && s_ops->wifi_enabled();
     bool wifi_conn = s_ops && s_ops->wifi_connected && s_ops->wifi_connected();
-    if (wifi_on && wifi_conn) {
+    /* ★ 2026-10-27 linit: "网络图标要及时出现" —— 只要 Wi-Fi 射频已开就画图标,
+     *   不再等"已连上"(连 AP 通常要 2~5 秒, 那几秒状态栏是空的, 看着像没开)。
+     *   未连上时图标右下角加一个 3×3 小叉, 和"已连"区分开(不换图标资源)。 */
+    if (wifi_on) {
         /* ★ 2026-10-15: 目标框按**图标自身尺寸 (16×16 方形)** 画, 不再套 STATUS_ICON_W(32) ——
          *   否则 16 宽源图被横向拉成 2 倍, 弧线糊成一团 (linit: "WiFi 图标太丑")。 */
         svc_draw_status_icon(lcd, right_x - WIFI_ICON_W, text_y,
                              WIFI_ICON_W, WIFI_ICON_H, (WIFI_ICON_W + 7) / 8,
-                             WIFI_ICON_W, WIFI_ICON_H, wifi12_icon);
+                             WIFI_ICON_W, WIFI_ICON_H, status_icon_wifi_16);
+        if (!wifi_conn) {
+            /* 未连接: 右下角画一个小叉 (3 像素对角线), 状态栏高度只有 24px, 不能再大 */
+            int cx = right_x - 4, cy = text_y + WIFI_ICON_H - 4;
+            for (int k = 0; k < 3; k++)
+                st7305_draw_pixel(lcd, cx + k, cy + k, s_inv ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK);
+            for (int k = 0; k < 3; k++)
+                st7305_draw_pixel(lcd, cx + 2 - k, cy + k, s_inv ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK);
+        }
         right_x -= WIFI_ICON_W + GAP;
     }
     if (usb_bt_is_running()) {

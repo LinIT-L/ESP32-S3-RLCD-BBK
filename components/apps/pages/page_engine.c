@@ -28,7 +28,8 @@
 #include "arduboy_avr.h"
 #include "favorites.h"
 #include "virtual_keys.h"
-#include "board_rlcd.h"          /* board_shim_set_gb_gray 抗锯齿 */
+#include "board_rlcd.h"
+#include "vid_tune.h"   /* 画面优化器 */          /* board_shim_set_gb_gray 抗锯齿 */
 #include "audio_player.h"        /* 统一音量档位与 volume 接口 */
 #include "svc_nvs.h"
 #include "svc_cfg.h"
@@ -100,14 +101,14 @@ static void eng_loading_start(ui_ctx_t *ctx, const char *path) {
 }
 
 /* ==== 各引擎文件过滤 / 根目录 ==== */
-#define GB_ROOT    "/sdcard/gb"
-#define GBC_ROOT   "/sdcard/gbc"
-#define NES_ROOT   "/sdcard/nes"
-#define MD_ROOT    "/sdcard/md"
-#define SMS_ROOT   "/sdcard/sms"
-#define LAVAX_ROOT "/sdcard/lava"
-#define VPET_ROOT  "/sdcard/vpet"
-#define AB_ROOT    "/sdcard/AB"
+#define GB_ROOT    "/sdcard/roms/gb"
+#define GBC_ROOT   "/sdcard/roms/gbc"
+#define NES_ROOT   "/sdcard/roms/nes"
+#define MD_ROOT    "/sdcard/roms/md"
+#define SMS_ROOT   "/sdcard/roms/sms"
+#define LAVAX_ROOT "/sdcard/roms/lava"
+#define VPET_ROOT  "/sdcard/roms/vpet"
+#define AB_ROOT    "/sdcard/roms/ab"
 
 static bool is_ab(const char *name) {
     size_t len = strlen(name);
@@ -126,7 +127,7 @@ static bool is_nes(const char *name) {
     size_t len = strlen(name);
     return (len > 4) && (strcasecmp(name + len - 4, ".nes") == 0);
 }
-static bool is_md(const char *name) {
+__attribute__((unused)) static bool is_md(const char *name) {
     size_t len = strlen(name);
     return (len > 3 && strcasecmp(name + len - 3, ".md") == 0) ||
            (len > 4 && strcasecmp(name + len - 4, ".gen") == 0) ||
@@ -277,6 +278,8 @@ static void eng_settings_render(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1,
                    eng_pad_label(buf, sizeof(buf), 5, "\xe9\x9f\xb3\xe9\x87\x8f", vbuf); break; } /*音量*/
         case 5: eng_pad_label(buf, sizeof(buf), 5, "\xe6\x8c\x89\xe9\x94\xae\xe5\xa3\xb0\xe9\x9f\xb3", esnd_name()); break; /*按键声音*/
         case 6: eng_pad_label(buf, sizeof(buf), 5, "\xe8\xa7\xa6\xe6\x91\xb8\xe9\x9c\x87\xe5\x8a\xa8", evib_name()); break; /*触摸震动*/
+        case 7: eng_pad_label(buf, sizeof(buf), 5, "\xe7\x94\xbb\xe9\x9d\xa2\xe4\xbc\x98\xe5\x8c\x96\xe5\x99\xa8",
+                              vid_tune_enabled() ? "\xe5\xbc\x80" : "\xe5\x85\xb3"); break; /*画面优化器 开/关*/
         }
         int ry = list_y + i * 32 - off_mod; bool sel = (p->focus == 1 && idx == p->sel_item);
         if (sel) fill_rect(lcd, rx0, ry, rx1, ry + 30, ST7305_COLOR_BLACK);
@@ -295,6 +298,7 @@ static void eng_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
     }
     else if (item == 5) { s_esnd ^= 1;  input_set_engine_sound(s_esnd != 0); }   /* 按键声音 */
     else if (item == 6) { s_evib ^= 1;  input_set_engine_vib(s_evib != 0); }     /* 触摸震动 */
+    else if (item == 7) { vid_tune_set_enabled(!vid_tune_enabled()); }           /* 画面优化器 */
     egs_save(); ctx->needs_redraw = true;
 }
 
@@ -317,7 +321,7 @@ static void pane_setup(os_pane_t *p, ui_ctx_t *ctx, const char *root,
         p->all_label = NULL;
         /* 左栏最上方"引擎优化", 右栏内联设置 (3.3) */
         p->settings_label = "\xe5\xbc\x95\xe6\x93\x8e\xe4\xbc\x98\xe5\x8c\x96"; /* 引擎优化 */
-        p->settings_count = 7;   /* 显示模式 / 虚拟按键 / 抗锯齿 / 灰度 / 音量 / 按键声音 / 触摸震动 */
+        p->settings_count = 8;   /* …/ 触震 / 画面优化器 */
         p->settings_render = eng_settings_render;
         p->on_settings_select = eng_settings_select;
         p->list_y = 30;   /* 状态栏(24)下方 */
@@ -432,7 +436,7 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
 static void gb_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char *name) {
     (void)p; (void)name;
     ESP_LOGI(TAG, "启动GB: %s", path);
-    gb_emu_set_save_dir("/sdcard/dict/GB");
+    gb_emu_set_save_dir("/sdcard/data/saves/GB");
     eng_loading_start(ctx, path);               /* 0-100 加载进度 */
     gb_emu_set_progress_cb(eng_load_progress_cb);
     gb_emu_rom_t rom;
@@ -462,7 +466,7 @@ static void gb_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char 
 static void gbc_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char *name) {
     (void)p; (void)name;
     ESP_LOGI(TAG, "启动GBC: %s", path);
-    gbc_emu_set_save_dir("/sdcard/dict/GBC");
+    gbc_emu_set_save_dir("/sdcard/data/saves/GBC");
     eng_loading_start(ctx, path);               /* 0-100 加载进度 */
     gbc_emu_set_progress_cb(eng_load_progress_cb);
     input_set_gamepad_nav_enabled(false);
@@ -572,13 +576,36 @@ static void vpet_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const cha
 }
 
 /* ==== 各页面静态双栏 state (PSRAM, 省内部 RAM) ==== */
-static EXT_RAM_BSS_ATTR os_pane_t s_gb_p;
-static EXT_RAM_BSS_ATTR os_pane_t s_gbc_p;
-static EXT_RAM_BSS_ATTR os_pane_t s_nes_p;
-static EXT_RAM_BSS_ATTR os_pane_t s_md_p;
-static EXT_RAM_BSS_ATTR os_pane_t s_sms_p;
-static EXT_RAM_BSS_ATTR os_pane_t s_lav_p;
-static EXT_RAM_BSS_ATTR os_pane_t s_vpet_p;
+/* ★★★ 2026-10-25 内存优化 (linit): 引擎列表 pane 每个 59168B, 原来 7 个**静态常驻** 404KB。
+ *   现在: **进哪个游戏页才分配那一个**, 退出页面(on_exit)立刻归还 ⇒ 平时 0, 浏览列表时 59KB。
+ *   列表内容本来就是进页面时 pane_setup() 重扫目录重建的, 不需要落 TF/Flash 缓存
+ *   (写入只增加磨损和延迟, 扫描本身很便宜)。写法 (s_gb_p.x / &s_gb_p) 保持原样。 */
+enum { PANE_GB, PANE_GBC, PANE_NES, PANE_MD, PANE_SMS, PANE_LAV, PANE_VPET, PANE_AB, PANE_N };
+static os_pane_t *s_panes;
+static int        s_pane_idx = -1;
+static os_pane_t *panes_get(int i) {
+    if (s_panes && s_pane_idx != i) { heap_caps_free(s_panes); s_panes = NULL; }   /* 换页先还旧的 */
+    if (!s_panes) {
+        s_panes = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_panes) ESP_LOGW("ENGINE", "列表 pane 分配失败 (%u B)", (unsigned)sizeof(os_pane_t));
+        else s_pane_idx = i;
+    }
+    if (!s_panes) s_panes = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_8BIT);   /* 兜底: 内部 RAM */
+    return s_panes;
+}
+/* 页面退出: 释放该页的列表 pane (on_exit 里调用) */
+static void eng_page_exit(ui_ctx_t *ctx) {
+    (void)ctx;
+    if (s_panes) { heap_caps_free(s_panes); s_panes = NULL; s_pane_idx = -1; }
+}
+#define s_gb_p   (*panes_get(PANE_GB))
+#define s_gbc_p  (*panes_get(PANE_GBC))
+#define s_nes_p  (*panes_get(PANE_NES))
+#define s_md_p   (*panes_get(PANE_MD))
+#define s_sms_p  (*panes_get(PANE_SMS))
+#define s_lav_p  (*panes_get(PANE_LAV))
+#define s_vpet_p (*panes_get(PANE_VPET))
+#define s_ab_p   (*panes_get(PANE_AB))
 
 /* ==== GB 页面 ==== */
 static void gb_enter(ui_ctx_t *ctx) {
@@ -594,6 +621,7 @@ static void gb_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_gb_p); }
 static const os_module_t s_mod_gb = {
     .name       = "engine_gb",
     .page_id    = OS_PAGE_GB_GAME,
+    .on_exit   = eng_page_exit,
     .on_enter   = gb_enter,
     .render     = gb_render,
     .action     = gb_action,
@@ -616,6 +644,7 @@ static void gbc_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_gbc_p); }
 static const os_module_t s_mod_gbc = {
     .name       = "engine_gbc",
     .page_id    = OS_PAGE_GBC_GAME,
+    .on_exit   = eng_page_exit,
     .on_enter   = gbc_enter,
     .render     = gbc_render,
     .action     = gbc_action,
@@ -638,6 +667,7 @@ static void nes_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_nes_p); }
 static const os_module_t s_mod_nes = {
     .name       = "engine_nes",
     .page_id    = OS_PAGE_NES_GAME,
+    .on_exit   = eng_page_exit,
     .on_enter   = nes_enter,
     .render     = nes_render,
     .action     = nes_action,
@@ -682,6 +712,7 @@ static void md_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_md_p); }
 static const os_module_t s_mod_md = {
     .name       = "engine_md",
     .page_id    = OS_PAGE_MD_GAME,
+    .on_exit   = eng_page_exit,
     .on_enter   = md_enter,
     .render     = md_render,
     .action     = md_action,
@@ -726,6 +757,7 @@ static void sms_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_sms_p); }
 static const os_module_t s_mod_sms = {
     .name       = "engine_sms",
     .page_id    = OS_PAGE_SMS_GAME,
+    .on_exit   = eng_page_exit,
     .on_enter   = sms_enter,
     .render     = sms_render,
     .action     = sms_action,
@@ -751,6 +783,7 @@ static void lavax_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_lav_p); }
 static const os_module_t s_mod_lavax = {
     .name       = "engine_lavax",
     .page_id    = OS_PAGE_WQX,
+    .on_exit   = eng_page_exit,
     .on_enter   = lavax_enter,
     .render     = lavax_render,
     .action     = lavax_action,
@@ -773,6 +806,7 @@ static void vpet_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_vpet_p); }
 static const os_module_t s_mod_vpet = {
     .name       = "engine_vpet",
     .page_id    = OS_PAGE_VPET,
+    .on_exit   = eng_page_exit,
     .on_enter   = vpet_enter,
     .render     = vpet_render,
     .action     = vpet_action,
@@ -782,7 +816,6 @@ static const os_module_t s_mod_vpet = {
 };
 
 /* ==== ArduBoy 页面 (os_pane 双栏: 扫描 /sdcard/AB 下的 .hex, 经 simavr ATmega32u4 运行) ==== */
-static EXT_RAM_BSS_ATTR os_pane_t s_ab_p;
 
 static void ab_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const char *name) {
     (void)p; (void)name;
@@ -815,6 +848,7 @@ static void ab_poll(ui_ctx_t *ctx)     { pane_poll(ctx, &s_ab_p); }
 static const os_module_t s_mod_arduboy = {
     .name       = "engine_arduboy",
     .page_id    = OS_PAGE_ARDUBOY_GAME,
+    .on_exit   = eng_page_exit,
     .on_enter   = ab_enter,
     .render     = ab_render,
     .action     = ab_action,
@@ -822,6 +856,8 @@ static const os_module_t s_mod_arduboy = {
     .poll       = ab_poll,
     .fullscreen = false,
 };
+
+
 
 /* ==== 注册全部引擎页面 ==== */
 void os_page_engine_register_all(void) {

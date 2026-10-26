@@ -7,7 +7,7 @@
 
 用法:
     python3 tools/map_prov_check.py --dir dist/map/fj --prefix fj \\
-        --center 25.4335,119.0110 --zoom 14 --out docs/screenshots/福建样张.png
+        --center 39.9042,116.4074 --zoom 14 --out sample.png
 """
 import argparse
 import json

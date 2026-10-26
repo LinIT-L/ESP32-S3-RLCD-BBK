@@ -333,19 +333,8 @@ static const hid_key_t k76_row4[] = {   /* 第5排: Fn Ctrl Alt Space ← ↓ �
 /* 行集合: 供渲染与命中复用的通用结构 */
 typedef struct { const hid_key_t *keys; int count; } hid_rowarr_t;
 
-/* 方向箭头字形 (8x12) */
-static const uint8_t ARROW_UP[12] = {
-    0x18,0x3C,0x7E,0x7E,0x7E,0x18,0x18,0x18,0x18,0x18,0x18,0x18,
-};
-static const uint8_t ARROW_DOWN[12] = {
-    0x18,0x18,0x18,0x18,0x18,0x18,0x7E,0x7E,0x7E,0x3C,0x18,0x18,
-};
-static const uint8_t ARROW_LEFT[12] = {
-    0x00,0x00,0x18,0x18,0x38,0xF8,0xF8,0x38,0x18,0x18,0x00,0x00,
-};
-static const uint8_t ARROW_RIGHT[12] = {
-    0x00,0x00,0x18,0x18,0x1C,0x1F,0x1F,0x1C,0x18,0x18,0x00,0x00,
-};
+/* 方向箭头字形 (8x12): 已抽到独立资源文件 usbhid_arrow_icons.inc 并统一命名 */
+#include "usbhid_arrow_icons.inc"
 
 /* ============ 私有状态 ============ */
 static hid_layout_t s_hid_layout = HID_LAYOUT_OP;   /* 当前布局 */
@@ -368,7 +357,6 @@ static const char *s_press_label;
 static const hid_key_t *s_press_key;
 static uint32_t s_press_ms;
 
-static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 /* ============ 基础功能 ============ */
 static void hid_ui_reset(void) {
@@ -415,10 +403,10 @@ static void hid_draw_label_centered(st7305_handle_t *lcd, int x, int w,
             (unsigned char)q[1] == 0x86 && (unsigned char)q[2] >= 0x90 && (unsigned char)q[2] <= 0x93) {
             adv = 3;
             switch (q[2]) {
-                case 0x90: bmp = ARROW_LEFT;  break;
-                case 0x91: bmp = ARROW_UP;    break;
-                case 0x92: bmp = ARROW_RIGHT; break;
-                case 0x93: bmp = ARROW_DOWN;  break;
+                case 0x90: bmp = usbhid_arrow_left_8x12;  break;
+                case 0x91: bmp = usbhid_arrow_up_8x12;    break;
+                case 0x92: bmp = usbhid_arrow_right_8x12; break;
+                case 0x93: bmp = usbhid_arrow_down_8x12;  break;
             }
         }
         if (bmp) {
@@ -614,7 +602,7 @@ static bool hid_ui_hit(ui_ctx_t *ctx, int x, int y) {
                 s_press_x1 = k->x + k->w - 1; s_press_y1 = k->y + k->h - 1;
                 s_press_label = hid_key_label(k);
                 s_press_key = k;
-                s_press_ms = now_ms();
+                s_press_ms = os_millis();
                 s_press_active = true;
                 hid_key_press_exec(k);
                 ctx->needs_redraw = true;
@@ -636,7 +624,7 @@ static void hid_trackpad_poll(ui_ctx_t *ctx) {
     bool down = input_get_touch_pos(&tx, &ty);
 
     if (s_hid_layout == HID_LAYOUT_28) return;
-    uint32_t now = now_ms();
+    uint32_t now = os_millis();
     bool in_tp = down && tx >= 0 && tx < UI_SCREEN_W &&
                  ty >= s_tp_top && ty <= HID_TP_Y1;
     if (in_tp && s_show_mbtn) {
@@ -776,7 +764,7 @@ static void p_hid_render(ui_ctx_t *ctx) {
     ctx->fullscreen = true;
 
     /* 按击反馈超时还原 */
-    if (s_press_active && now_ms() - s_press_ms > PRESS_FLASH_MS) {
+    if (s_press_active && os_millis() - s_press_ms > PRESS_FLASH_MS) {
         s_press_active = false;
     }
 

@@ -15,6 +15,12 @@ typedef struct {
 } board_battery_status_t;
 
 esp_err_t board_battery_init(void);
+
+/* 充电中检测 (板型表 .chrg, LGS4056HDA 的 CHRG 脚, 开漏低有效)。
+ * 本板没接时返回 false / -1, 调用方据此退化成"靠 VBUS 推断"。 */
+bool board_battery_charging(void);          /* 直接读脚 */
+bool board_battery_charging_cached(void);   /* 500ms 缓存 + 变化日志, 上层 1Hz 调这个 */
+int  board_battery_chrg_pin(void);
 esp_err_t board_battery_read(board_battery_status_t *status);
 
 /* 统一 60s 节流缓存读取 (linit 2026-09-20: 全系统单一采样节拍器).
@@ -33,7 +39,10 @@ esp_err_t board_battery_read_cached(board_battery_status_t *status);
  *   睡眠期间**不采样**(没有主循环), 醒来自动补成 0xFF ⇒ 波形中间断开、连线跨过去。 */
 typedef struct { uint32_t t; uint16_t mv; } bat_sample_t;
 #define BOARD_BATTERY_WAVE_MAX 720           /* 一次最多取多少点给绘制 (够 330px 屏) */
-#define BOARD_BATTERY_SPAN_MAX (7u * 86400u) /* 最长显示 7 天 */
+/* ★ 2026-10-26 linit: 波形图最长只显示**最近 24 小时** (原来 7 天)。
+ *   存储仍是 7 天 1 字节/分钟 (BAT_KEEP_DAYS=7, 10KB PSRAM + 按天 NVS),
+ *   这里只是**显示窗口上限** —— 以后要看 7 天改回 (7u * 86400u) 即可, 数据都还在。 */
+#define BOARD_BATTERY_SPAN_MAX (24u * 3600u) /* 最长显示 24 小时 */
 
 /* 已有历史的时间跨度(秒); 无数据返回 0 */
 uint32_t board_battery_hist_span_s(void);

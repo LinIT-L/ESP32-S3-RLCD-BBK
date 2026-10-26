@@ -41,6 +41,13 @@ void app_board_init_battery(app_board_t *board);
  * 以后要用定位: 调 gps_wakeup() 唤醒, 再自行解析 NMEA/UBX (gps_read / gps_send_ubx). */
 void app_board_init_gps(app_board_t *board);
 
+/* ★ 2026-10-20 GPS 一次性识别 (写完固件的第一次开机只跑一次, 见 hw_cfg_gps_probed)。
+ * 真去 UART 上听 UBX/NMEA: 有 ⇒ 送软件待机(46µA)并返回 true; 没有 ⇒ 卸 UART 返回 false。
+ * async 版在后台任务里跑, 不占启动路径。 */
+bool app_board_gps_probe(void);
+void app_board_gps_probe_async(void);
+void board_gps_boot_task(void *arg);   /* 已识别到 GPS 时的后台初始化+送待机 */
+
 #ifdef __cplusplus
 }
 #endif

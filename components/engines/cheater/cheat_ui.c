@@ -13,9 +13,18 @@
  * 交互: 手柄直读电平(UP/DOWN/CONFIRM/BACK/LEFT/RIGHT) + input 触摸动作, 均进程全局.
  * 循环每轮 vTaskDelay(16) 让出 CPU; 不调用 esp_task_wdt_reset (app_main 等未注册
  * TWDT 的任务调用会刷屏 error, 与 gam4980 原逻辑一致, 靠让出 CPU 保持喂狗正常).
+ *
+ * ★ 2026-10-25 强化 (参照 烧饼修改器 / 八门神器):
+ *   ① 主菜单 4 项: 搜索 / 过滤(带剩余数) / 记录(候选列表) / 锁定(锁定表);
+ *   ② 候选列表与锁定列表改 **ui_scroll 统一跟手滚动** (惯性+回弹+行吸附),
+ *      原来手写 1:1 拖动, 8000 条候选要拖到手酸;
+ *   ③ 点选某条 → 行操作菜单 (改值 / 锁定·解锁 / 删除), 触屏与手柄同一套;
+ *   ④ 过滤菜单增「撤销上一步」: 误选"变大/变小"能退回;
+ *   ⑤ 头部显示 "候选 N · 第 R 轮", 搜索后回显耗时 (性能可观测).
  */
 #include "cheat_ui.h"
 #include "ui_common.h"
+#include "ui_scroll.h"
 #include "input.h"
 #include "bt_manager.h"
 #include "esp_attr.h"
@@ -478,20 +487,268 @@ static void cheat_wait_any_key(uint32_t ms)
     }
 }
 
-/* ================= 主菜单 / 搜索 / 过滤 / 记录 ================= */
+/* ================= 列表数据源 (候选 / 锁定 共用一套窗口) ================= */
+typedef struct {
+    int      count;
+    bool     lock_mode;                  /* true = 锁定表, false = 候选列表 */
+    uint16_t (*addr)(int);
+    uint32_t (*value)(int);
+    uint8_t  (*width)(int);
+} cheat_listsrc_t;
+
+static void cheat_fmt_row(char *buf, size_t n, int idx, const cheat_listsrc_t *src)
+{
+    uint16_t a = src->addr(idx);
+    uint32_t v = src->value(idx);
+    uint8_t  w = src->width(idx);
+    bool mark = src->lock_mode ? true : cheater_cand_locked(idx);
+    snprintf(buf, n, "0x%04X %c %lu%s",
+             (unsigned)a, (w == (uint8_t)CHEAT_BITS_16) ? 'W' : 'B',
+             (unsigned long)v, mark ? " *" : "");
+}
+
+/* ---- 锁定表适配: 界面按 0..count-1 连续下标, 内部换算到锁定槽 ---- */
+static uint16_t lk_addr(int i)  { int l = cheater_lock_nth(i); return l < 0 ? 0 : cheater_lock_addr(l); }
+static uint32_t lk_value(int i) { int l = cheater_lock_nth(i); return l < 0 ? 0 : cheater_lock_value(l); }
+static uint8_t  lk_width(int i) { int l = cheater_lock_nth(i); return l < 0 ? 8 : cheater_lock_width(l); }
+
+/* 行操作: 返回 true = 列表条数变了(需重算 content) */
+static bool cheat_row_actions(st7305_handle_t *lcd, int idx, bool lock_mode)
+{
+    int      l  = lock_mode ? cheater_lock_nth(idx) : -1;
+    uint32_t cur = lock_mode ? (l < 0 ? 0 : cheater_lock_value(l)) : cheater_read(idx);
+    bool locked  = lock_mode ? (l >= 0) : cheater_cand_locked(idx);
+
+    const char *its[3];
+    int n = 0;
+    its[n++] = "\xe6\x94\xb9\xe5\x80\xbc";                 /* 改值 */
+    its[n++] = locked ? "\xe8\xa7\xa3\xe9\x94\x81"         /* 解锁 */
+                      : "\xe9\x94\x81\xe5\xae\x9a";        /* 锁定 */
+    if (!lock_mode) its[n++] = "\xe5\x88\xa0\xe9\x99\xa4"; /* 删除 */
+
+    int r = cheat_menu_loop(lcd, its, n, n);
+    if (r == 0) {
+        uint32_t v = cur;
+        if (cheat_value_edit(lcd, "\xe6\x96\xb0\xe5\x80\xbc", &v) == 0) {
+            if (lock_mode) {
+                if (l >= 0) cheater_lock_set_value(l, v);
+            } else {
+                cheater_write(idx, v);
+                int cl = cheater_cand_lock_index(idx);
+                if (cl >= 0) cheater_lock_set_value(cl, v);   /* 已锁的同步锁定值 */
+            }
+        }
+        return false;
+    }
+    if (r == 1) {
+        if (locked) {
+            if (lock_mode) { cheater_unlock(l); return true; }
+            cheater_cand_unlock(idx);
+        } else {
+            if (cheater_lock(idx) < 0) {
+                cheat_center_msg(lcd, "\xe9\x94\x81\xe5\xae\x9a\xe6\xbb\xa1");  /* 锁定满 */
+                cheat_wait_any_key(800);
+            }
+        }
+        return false;
+    }
+    if (r == 2 && !lock_mode) {
+        cheater_remove(idx);
+        return true;
+    }
+    return false;
+}
+
+/* 通用列表窗口: ui_scroll 跟手滚动 + 行点选操作
+ * 返回 true = 有删除发生 (调用方需重算候选数) */
+static bool cheat_list_window(st7305_handle_t *lcd, const cheat_listsrc_t *src)
+{
+    static ui_scroll_t sc;
+    static bool sc_rdy = false;
+
+    const int win_w   = 300;
+    const int win_x0  = (ST7305_WIDTH - win_w) / 2, win_x1 = win_x0 + win_w - 1;
+    const int row_h   = 28, foot_h = CUI_ROW_H, hdr_h = 34;
+    int win_h = hdr_h + 5 * row_h + foot_h + 8;
+    if (win_h > 292) win_h = 292;
+    const int win_y0 = (ST7305_HEIGHT - win_h) / 2, win_y1 = win_y0 + win_h - 1;
+    const int content_y0 = win_y0 + hdr_h;
+    const int footer_y   = win_y1 - foot_h - 2;
+    const int vis_h      = footer_y - 2 - content_y0;
+
+    int cnt = src->count;
+    if (!sc_rdy) {
+        ui_scroll_config(&sc, UI_SCROLL_LIST, 0);
+        sc_rdy = true;
+    }
+    ui_scroll_init(&sc, row_h, vis_h, cnt * row_h);
+    ui_scroll_to_top(&sc);
+
+    cheat_flush_input();
+    int sel = 0;
+    bool changed = false;
+    bool conn = bt_manager_is_connected();
+    bool up_prev = conn && bt_manager_is_key_pressed(F_UP);
+    bool dn_prev = conn && bt_manager_is_key_pressed(F_DOWN);
+    bool ok_prev = conn && bt_manager_is_key_pressed(F_CONFIRM);
+    bool bk_prev = conn && bt_manager_is_key_pressed(F_BACK);
+
+    for (;;) {
+        /* ---- 渲染 ---- */
+        if (lcd->fb) memcpy(lcd->fb, s_cheat_bg, FB_BYTES);
+        fill_rect(lcd, win_x0, win_y0, win_x1, win_y1, ST7305_COLOR_WHITE);
+        for (int k = 0; k < 2; k++) {
+            draw_hline(lcd, win_x0 + k, win_x1 - k, win_y0 + k, ST7305_COLOR_BLACK);
+            draw_hline(lcd, win_x0 + k, win_x1 - k, win_y1 - k, ST7305_COLOR_BLACK);
+            draw_vline(lcd, win_x0 + k, win_y0 + k, win_y1 - k, ST7305_COLOR_BLACK);
+            draw_vline(lcd, win_x1 - k, win_y0 + k, win_y1 - k, ST7305_COLOR_BLACK);
+        }
+        {
+            char hdr[48];
+            if (src->lock_mode) {
+                snprintf(hdr, sizeof(hdr), "\xe9\x94\x81\xe5\xae\x9a %d \xe4\xb8\xaa", cnt);
+            } else {
+                snprintf(hdr, sizeof(hdr),
+                         "\xe5\x80\x99\xe9\x80\x89 %d \xc2\xb7 \xe7\xac\xac%d\xe8\xbd\xae",
+                         cnt, cheater_round());
+            }
+            draw_text_centered(lcd, win_y0 + 5, hdr, false);
+        }
+        draw_hline(lcd, win_x0 + 6, win_x1 - 6, content_y0 - 1, ST7305_COLOR_BLACK);
+
+        int roff = ui_scroll_offset(&sc);
+        if (roff < 0) roff = 0;
+        int first = roff / row_h;
+        int skip  = roff % row_h;
+        int rx0 = win_x0 + 6, rx1 = win_x1 - 8;
+
+        st7305_set_clip_y(lcd, content_y0, footer_y - 2);
+        for (int i = 0; ; i++) {
+            int idx = first + i;
+            if (idx >= cnt) break;
+            int ry = content_y0 - skip + i * row_h;
+            if (ry >= footer_y - 2) break;
+            char rb[40];
+            cheat_fmt_row(rb, sizeof(rb), idx, src);
+            if (idx == sel)
+                fill_rect(lcd, rx0, ry, rx1 - 1, ry + row_h - 1, ST7305_COLOR_BLACK);
+            draw_text(lcd, rx0 + 6, ry + (row_h - 24) / 2, rb, idx == sel);
+        }
+        st7305_reset_clip_y(lcd);
+
+        if (cnt > 0 && vis_h > 4)
+            ui_scroll_drawbar(&sc, lcd, win_x1 - 3, content_y0, footer_y - 3);
+
+        draw_hline(lcd, win_x0 + 6, win_x1 - 6, footer_y - 1, ST7305_COLOR_BLACK);
+        cheat_draw_row(lcd, win_x0, win_y0, win_w, footer_y, CUI_FOOT, false);
+        st7305_flush(lcd);
+
+        /* ---- 触摸: 跟手滚动 (只喂内容区; 拖出区外继续跟手) ---- */
+        int tx, ty;
+        bool down = input_get_touch_pos(&tx, &ty);
+        bool in_area = down &&
+                       tx >= win_x0 && tx <= win_x1 &&
+                       ty >= content_y0 && ty < footer_y - 2;
+        bool feed = down && (in_area || sc.pressed);
+        ui_scroll_touch_xy(&sc, tx, ty, feed);
+
+        /* ---- 输入 ---- */
+        menu_action_t act = input_get_action();
+        bool activate = false;
+
+        if (act == MENU_ACTION_UP) {
+            if (sel > 0) sel--;
+        } else if (act == MENU_ACTION_DOWN) {
+            if (sel < cnt - 1) sel++;
+        } else if (act == MENU_ACTION_BACK) {
+            ui_scroll_cancel(&sc);
+            return changed;
+        } else if (act == MENU_ACTION_CONFIRM) {
+            int x2, y2;
+            if (input_consume_tap(&x2, &y2)) {
+                if (ui_scroll_dragging(&sc)) {
+                    /* 刚拖过, 松手不当作点击 */
+                } else if (x2 < win_x0 || x2 > win_x1 || y2 < win_y0 ||
+                           y2 > win_y1 || y2 >= footer_y) {
+                    ui_scroll_cancel(&sc);      /* 窗外 / 返回键 */
+                    return changed;
+                } else if (y2 >= content_y0) {
+                    int rr = (y2 - content_y0 + ui_scroll_offset(&sc)) / row_h;
+                    if (rr >= 0 && rr < cnt) { sel = rr; activate = true; }
+                }
+            } else if (cnt > 0 && sel < cnt) {
+                activate = true;                /* 手柄 CONFIRM */
+            }
+        }
+
+        if (activate && cnt > 0 && sel < cnt) {
+            cui_touch_vib();
+            if (cheat_row_actions(lcd, sel, src->lock_mode)) {
+                changed = true;
+                cnt = src->lock_mode ? cheater_lock_count() : cheater_count();
+                if (cnt <= 0) { ui_scroll_cancel(&sc); return changed; }
+                if (sel >= cnt) sel = cnt - 1;
+                ui_scroll_set_content(&sc, cnt * row_h);
+            }
+        }
+
+        if (conn) {
+            bool up = bt_manager_is_key_pressed(F_UP);
+            bool dn = bt_manager_is_key_pressed(F_DOWN);
+            bool ok = bt_manager_is_key_pressed(F_CONFIRM);
+            bool bk = bt_manager_is_key_pressed(F_BACK);
+            if (dn && !dn_prev) { if (sel < cnt - 1) sel++; }
+            if (up && !up_prev) { if (sel > 0) sel--; }
+            if (ok && !ok_prev && cnt > 0 && sel < cnt) {
+                if (cheat_row_actions(lcd, sel, src->lock_mode)) {
+                    changed = true;
+                    cnt = src->lock_mode ? cheater_lock_count() : cheater_count();
+                    if (cnt <= 0) { ui_scroll_cancel(&sc); return changed; }
+                    if (sel >= cnt) sel = cnt - 1;
+                    ui_scroll_set_content(&sc, cnt * row_h);
+                }
+            }
+            if (bk && !bk_prev) { ui_scroll_cancel(&sc); return changed; }
+            up_prev = up; dn_prev = dn; ok_prev = ok; bk_prev = bk;
+        }
+
+        /* 选中行跟随 + 推进惯性/吸附 */
+        ui_scroll_ensure_visible(&sc, sel * row_h, row_h);
+        ui_scroll_poll(&sc);
+        vTaskDelay(pdMS_TO_TICKS(16));
+    }
+}
+
+/* ================= 主菜单 / 搜索 / 过滤 / 记录 / 锁定 ================= */
 #define CUI_NEW  0
 #define CUI_FILT 1
 #define CUI_BROW 2
-#define CUI_BACK 3
+#define CUI_LOCK 3
+#define CUI_BACK 4
 
+/* 主菜单 4 项, 标签带实时计数 (候选/锁定), 比纯文字更有信息量 */
 static int cheat_menu(st7305_handle_t *lcd)
 {
-    static const char *items[3] = {
-        "\xe6\x90\x9c\xe7\xb4\xa2",     /* 搜索 */
-        "\xe8\xbf\x87\xe6\xbb\xa4",     /* 过滤 */
-        "\xe8\xae\xb0\xe5\xbd\x95",     /* 记录 */
-    };
-    return cheat_menu_loop(lcd, items, 3, CUI_BACK);
+    static char mi[4][40];
+    int cnt = cheater_count();
+    int lk  = cheater_lock_count();
+
+    snprintf(mi[0], sizeof(mi[0]), "\xe6\x90\x9c\xe7\xb4\xa2");   /* 搜索 */
+    if (cnt >= 0)
+        snprintf(mi[1], sizeof(mi[1]), "\xe8\xbf\x87\xe6\xbb\xa4 %d", cnt);   /* 过滤 N */
+    else
+        snprintf(mi[1], sizeof(mi[1]), "\xe8\xbf\x87\xe6\xbb\xa4");          /* 过滤 */
+    if (cnt > 0)
+        snprintf(mi[2], sizeof(mi[2]), "\xe8\xae\xb0\xe5\xbd\x95 %d", cnt);   /* 记录 N */
+    else
+        snprintf(mi[2], sizeof(mi[2]), "\xe8\xae\xb0\xe5\xbd\x95");          /* 记录 */
+    if (lk > 0)
+        snprintf(mi[3], sizeof(mi[3]), "\xe9\x94\x81\xe5\xae\x9a %d", lk);    /* 锁定 N */
+    else
+        snprintf(mi[3], sizeof(mi[3]), "\xe9\x94\x81\xe5\xae\x9a");          /* 锁定 */
+
+    const char *items[4] = { mi[0], mi[1], mi[2], mi[3] };
+    return cheat_menu_loop(lcd, items, 4, CUI_BACK);
 }
 
 static void cheat_new_search(st7305_handle_t *lcd)
@@ -501,12 +758,16 @@ static void cheat_new_search(st7305_handle_t *lcd)
                          &val) != 0) return;
     cheater_begin(&s_reg, s_bits);
     cheat_center_msg(lcd, "\xe6\x90\x9c\xe7\xb4\xa2\xe4\xb8\xad\xe2\x80\xa6"); /* 搜索中… */
-    int64_t t0 = esp_timer_get_time();
     int n = cheater_first_scan(val);
-    ESP_LOGI(CUI_TAG, "first_scan val=%lu -> %d 个, scan=%.1fms",
-             (unsigned long)val, n, (double)(esp_timer_get_time() - t0) / 1000.0);
-    char msg[48];
-    snprintf(msg, sizeof(msg), "\xe6\x89\xbe\xe5\x88\xb0 %d \xe4\xb8\xaa", n); /* 找到 N 个 */
+    ESP_LOGI(CUI_TAG, "first_scan val=%lu -> %d 个, scan=%dms",
+             (unsigned long)val, n, cheater_scan_ms());
+    char msg[56];
+    if (n < 0) {
+        snprintf(msg, sizeof(msg), "\xe6\x9c\xaa\xe7\x99\xbb\xe8\xae\xb0\xe5\x8c\xba\xe5\x9f\x9f"); /* 未登记区域 */
+    } else {
+        snprintf(msg, sizeof(msg), "\xe6\x89\xbe\xe5\x88\xb0 %d \xe4\xb8\xaa %dms",
+                 n, cheater_scan_ms());   /* 找到 N 个 Xms */
+    }
     cheat_center_msg(lcd, msg);
     cheat_wait_any_key(1000);
 }
@@ -518,21 +779,36 @@ static void cheat_filter(st7305_handle_t *lcd)
         vTaskDelay(pdMS_TO_TICKS(700));
         return;
     }
-    static const char *items[5] = {
+    /* 顺序须与 cheater_op_t 一致: EQ/GT/LT/CHANGED/UNCHANGED */
+    static const char *base[5] = {
         "\xe7\xad\x89\xe4\xba\x8e\xe2\x80\xa6",         /* 等于… */
         "\xe5\x8f\x98\xe5\xa4\xa7",                     /* 变大 */
         "\xe5\x8f\x98\xe5\xb0\x8f",                     /* 变小 */
         "\xe6\x9c\x89\xe5\x8f\x98\xe5\x8c\x96",         /* 有变化 */
         "\xe6\x97\xa0\xe5\x8f\x98\xe5\x8c\x96",         /* 无变化 */
     };
-    int sel = cheat_menu_loop(lcd, items, 5, 5);
-    if (sel >= 5 || sel < 0) return;
+    const char *items[6];
+    int n = 0;
+    for (int i = 0; i < 5; i++) items[n++] = base[i];
+    bool can_undo = cheater_can_undo();
+    if (can_undo) items[n++] = "\xe6\x92\xa4\xe9\x94\x80";   /* 撤销 */
+
+    int sel = cheat_menu_loop(lcd, items, n, n);
+    if (sel < 0 || sel >= n) return;
+
+    if (sel == 5) {                    /* 撤销上一步 */
+        int back = cheater_undo();
+        char msg[48];
+        if (back < 0) snprintf(msg, sizeof(msg), "\xe6\x97\xa0\xe5\x8f\xaf\xe6\x92\xa4\xe9\x94\x80"); /* 无可撤销 */
+        else          snprintf(msg, sizeof(msg), "\xe5\x89\xa9 %d \xe4\xb8\xaa", back);              /* 剩 N 个 */
+        cheat_center_msg(lcd, msg);
+        cheat_wait_any_key(900);
+        return;
+    }
     if (cheater_count() <= 0) return;
 
-    int before = cheater_count();
-    (void)before;
     uint32_t eqval = 0;
-    int out = -1;
+    int out;
     if (sel == 0) {   /* 等于: 需输数值 */
         if (cheat_value_edit(lcd, "\xe7\xad\x89\xe4\xba\x8e\xe6\x95\xb0\xe5\x80\xbc", /* 等于数值 */
                              &eqval) != 0) return;
@@ -544,165 +820,48 @@ static void cheat_filter(st7305_handle_t *lcd)
     if (out < 0) snprintf(msg, sizeof(msg), "\xe9\x94\x99\xe8\xaf\xaf");  /* 错误 */
     else         snprintf(msg, sizeof(msg), "\xe5\x89\xa9 %d \xe4\xb8\xaa", out); /* 剩 N 个 */
     cheat_center_msg(lcd, msg);
-    cheat_wait_any_key(1000);
+    cheat_wait_any_key(900);
 }
 
 static void cheat_browse(st7305_handle_t *lcd)
 {
     int cnt = cheater_count();
-    if (cnt < 0 || cnt == 0) {
+    if (cnt < 0) {
+        cheat_center_msg(lcd, "\xe8\xaf\xb7\xe5\x85\x88\xe6\x90\x9c\xe7\xb4\xa2"); /* 请先搜索 */
+        vTaskDelay(pdMS_TO_TICKS(700));
+        return;
+    }
+    if (cnt == 0) {
         cheat_center_msg(lcd, "\xe6\x9a\x82\xe6\x97\xa0\xe5\x80\x99\xe9\x80\x89"); /* 暂无候选 */
         vTaskDelay(pdMS_TO_TICKS(700));
         return;
     }
-    cheat_flush_input();
-    /* 列表窗口: 一次显示多行(地址+值), 可上下拖拉滚动 */
-    const int win_w = 280;
-    const int win_x0 = (ST7305_WIDTH - win_w) / 2, win_x1 = win_x0 + win_w - 1;
-    const int row_h = 28, foot_h = CUI_ROW_H, hdr_h = 34;
-    int win_h = hdr_h + 5 * row_h + foot_h + 8;
-    if (win_h > 292) win_h = 292;
-    const int win_y0 = (ST7305_HEIGHT - win_h) / 2, win_y1 = win_y0 + win_h - 1;
-    int vis = (win_y1 - (win_y0 + hdr_h) - foot_h - 4) / row_h; if (vis < 2) vis = 2;
-    const int content_y0 = win_y0 + hdr_h;
-    const int footer_y   = win_y1 - foot_h - 2;
+    cheat_listsrc_t src = {
+        .count = cnt,
+        .lock_mode = false,
+        .addr  = cheater_addr,
+        .value = cheater_read,
+        .width = cheater_width,
+    };
+    cheat_list_window(lcd, &src);
+}
 
-    int sel = 0, scroll = 0;
-    bool conn = bt_manager_is_connected();
-    bool up_prev = conn && bt_manager_is_key_pressed(F_UP);
-    bool dn_prev = conn && bt_manager_is_key_pressed(F_DOWN);
-    bool ok_prev = conn && bt_manager_is_key_pressed(F_CONFIRM);
-    bool bk_prev = conn && bt_manager_is_key_pressed(F_BACK);
-    int drag_y = -1, drag_sel0 = 0;
-    bool dragged = false;
-    for (;;) {
-        if (sel >= vis) scroll = sel - vis + 1; else scroll = 0;
-        if (lcd->fb) memcpy(lcd->fb, s_cheat_bg, FB_BYTES);
-        fill_rect(lcd, win_x0, win_y0, win_x1, win_y1, ST7305_COLOR_WHITE);
-        for (int k = 0; k < 2; k++) {
-            draw_hline(lcd, win_x0 + k, win_x1 - k, win_y0 + k, ST7305_COLOR_BLACK);
-            draw_hline(lcd, win_x0 + k, win_x1 - k, win_y1 - k, ST7305_COLOR_BLACK);
-            draw_vline(lcd, win_x0 + k, win_y0 + k, win_y1 - k, ST7305_COLOR_BLACK);
-            draw_vline(lcd, win_x1 - k, win_y0 + k, win_y1 - k, ST7305_COLOR_BLACK);
-        }
-        {
-            char hdr[40];
-            snprintf(hdr, sizeof(hdr), "\xe5\x80\x99\xe9\x80\x89 %d \xe4\xb8\xaa", cnt); /* 候选 N 个 */
-            draw_text_centered(lcd, win_y0 + 5, hdr, false);
-        }
-        draw_hline(lcd, win_x0 + 6, win_x1 - 6, content_y0 - 1, ST7305_COLOR_BLACK);
-        int rows_end = footer_y - 2;
-        for (int i = 0; i < vis; i++) {
-            int idx = scroll + i;
-            if (idx >= cnt) break;
-            int ry = content_y0 + i * row_h;
-            if (ry + row_h - 1 > rows_end) break;
-            char rb[40];
-            snprintf(rb, sizeof(rb), "0x%04X  %lu",
-                     (unsigned)cheater_addr(idx), (unsigned long)cheater_read(idx));
-            int rx0 = win_x0 + 6, rx1 = win_x1 - 6;
-            if (idx == sel)
-                fill_rect(lcd, rx0, ry, rx1 - 1, ry + row_h - 1, ST7305_COLOR_BLACK);
-            draw_text(lcd, rx0 + 8, ry + (row_h - 24) / 2, rb, idx == sel);
-        }
-        if (cnt > vis) {
-            int bar_x = win_x1 - 3;
-            draw_vline(lcd, bar_x, content_y0, rows_end, ST7305_COLOR_BLACK);
-            int track = rows_end - content_y0 + 1;
-            int th = (track * vis) / cnt; if (th < 4) th = 4;
-            int maxs = cnt - vis;
-            int by0 = content_y0 + (maxs > 0 ? (track - th) * scroll / maxs : 0);
-            if (by0 < content_y0) by0 = content_y0;
-            if (by0 + th > rows_end + 1) by0 = rows_end + 1 - th;
-            draw_vline(lcd, bar_x - 1, by0, by0 + th - 1, ST7305_COLOR_BLACK);
-            draw_vline(lcd, bar_x + 1, by0, by0 + th - 1, ST7305_COLOR_BLACK);
-            for (int yy = by0; yy < by0 + th; yy++)
-                st7305_draw_pixel(lcd, bar_x, yy, ST7305_COLOR_BLACK);
-        }
-        draw_hline(lcd, win_x0 + 6, win_x1 - 6, footer_y - 1, ST7305_COLOR_BLACK);
-        int mid = (win_x0 + win_x1) / 2;
-        cheat_draw_row(lcd, win_x0, win_y0, mid - win_x0 + 1, footer_y, "\xe5\x88\xa0\xe9\x99\xa4", false); /* 删除 */
-        cheat_draw_row(lcd, mid + 1, win_y0, win_x1 - mid, footer_y, "\xe8\xbf\x94\xe5\x9b\x9e", false); /* 返回 */
-        st7305_flush(lcd);
-
-        /* 触摸: 上下拖拉滚动 */
-        int tx, ty;
-        bool down = input_get_touch_pos(&tx, &ty);
-        if (down) {
-            if (drag_y < 0) { drag_y = ty; drag_sel0 = sel; }
-            else {
-                int dy = ty - drag_y;
-                int ady = dy < 0 ? -dy : dy;
-                if (ady > 12) {
-                    dragged = true;
-                    int ns = drag_sel0 - dy / row_h;   /* 上拖 → 滚向更后面的记录 */
-                    if (ns < 0) ns = 0;
-                    if (ns >= cnt) ns = cnt - 1;
-                    sel = ns;
-                }
-            }
-        } else {
-            drag_y = -1;
-        }
-
-        menu_action_t act = input_get_action();
-        if (act == MENU_ACTION_UP) { if (sel > 0) sel--; }
-        else if (act == MENU_ACTION_DOWN) { if (sel < cnt - 1) sel++; }
-        else if (act == MENU_ACTION_BACK) return;
-        else if (act == MENU_ACTION_CONFIRM) {
-            if (input_consume_tap(&tx, &ty)) {
-                bool was_drag = dragged; dragged = false;
-                if (was_drag) continue;                 /* 刚拖过, 松手不当作点击 */
-                if (tx < win_x0 || tx > win_x1 || ty < win_y0 || ty > win_y1) return; /* 窗=返回 */
-                if (ty >= footer_y && ty < footer_y + foot_h) {
-                    if (tx < mid) {                     /* 删除当前记录 */
-                        cui_touch_vib();
-                        cheater_remove(sel);
-                        cnt = cheater_count();
-                        if (cnt <= 0) return;
-                        if (sel >= cnt) sel = cnt - 1;
-                        if (sel < 0) sel = 0;
-                    } else {
-                        cui_touch_vib();
-                        return;
-                    }
-                    continue;
-                }
-                int rel = ty - (content_y0 - scroll * row_h);
-                int rr = rel / row_h;
-                if (rr >= 0 && rr < vis && (scroll + rr) < cnt) {
-                    sel = scroll + rr;
-                    cui_touch_vib();
-                    uint32_t v = cheater_read(sel);
-                    if (cheat_value_edit(lcd, "\xe6\x96\xb0\xe5\x80\xbc", &v) == 0)
-                        cheater_write(sel, v);
-                    cnt = cheater_count();
-                }
-            } else {
-                uint32_t v = cheater_read(sel);
-                if (cheat_value_edit(lcd, "\xe6\x96\xb0\xe5\x80\xbc", &v) == 0)
-                    cheater_write(sel, v);
-                cnt = cheater_count();
-            }
-        }
-        if (conn) {
-            bool up = bt_manager_is_key_pressed(F_UP);
-            bool dn = bt_manager_is_key_pressed(F_DOWN);
-            bool ok = bt_manager_is_key_pressed(F_CONFIRM);
-            bool bk = bt_manager_is_key_pressed(F_BACK);
-            if (up && !up_prev) { if (sel > 0) sel--; }
-            if (dn && !dn_prev) { if (sel < cnt - 1) sel++; }
-            if (ok && !ok_prev) {
-                uint32_t v = cheater_read(sel);
-                if (cheat_value_edit(lcd, "\xe6\x96\xb0\xe5\x80\xbc", &v) == 0)
-                    cheater_write(sel, v);
-                cnt = cheater_count();
-            }
-            if (bk && !bk_prev) return;
-            up_prev = up; dn_prev = dn; ok_prev = ok; bk_prev = bk;
-        }
-        vTaskDelay(pdMS_TO_TICKS(16));
+static void cheat_locks(st7305_handle_t *lcd)
+{
+    int cnt = cheater_lock_count();
+    if (cnt <= 0) {
+        cheat_center_msg(lcd, "\xe6\xb2\xa1\xe6\x9c\x89\xe9\x94\x81\xe5\xae\x9a\xe9\xa1\xb9"); /* 没有锁定项 */
+        vTaskDelay(pdMS_TO_TICKS(700));
+        return;
     }
+    cheat_listsrc_t src = {
+        .count     = cnt,
+        .lock_mode = true,
+        .addr      = lk_addr,
+        .value     = lk_value,
+        .width     = lk_width,
+    };
+    cheat_list_window(lcd, &src);
 }
 
 /* ================= 主流程 (阻塞) ================= */
@@ -728,9 +887,10 @@ void cheat_ui_open(st7305_handle_t *lcd, const cheater_region_t *reg, cheater_bi
 
     for (;;) {
         int r = cheat_menu(lcd);
-        if (r == 0) cheat_new_search(lcd);
-        else if (r == 1) cheat_filter(lcd);
-        else if (r == 2) cheat_browse(lcd);
+        if (r == CUI_NEW)       cheat_new_search(lcd);
+        else if (r == CUI_FILT) cheat_filter(lcd);
+        else if (r == CUI_BROW) cheat_browse(lcd);
+        else if (r == CUI_LOCK) cheat_locks(lcd);
         else break;   /* 返回 */
     }
     input_set_key_sim_ctx_block(false);

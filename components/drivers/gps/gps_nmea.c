@@ -53,6 +53,20 @@ static bool    s_demo;
 static bool    s_task_running;
 static volatile bool s_stop_req;   /* 2026-10-09: 让服务任务优雅退出 (Lua 应用退出时用) */
 
+/* ---- 逐颗卫星 (2026-10-24 卫星信息页) ----
+ * GSV 是"多句分片"的: 每个星座每轮 1~4 句, 每句 4 组 (PRN/仰角/方位/SNR)。
+ * 收齐靠: msg==1 时先清掉该星座旧条目, 后面几句往里追加。
+ * GSA 给"参与解算"的 PRN 列表 → used 位图 (按星座分开, GN 混合句进 s_used_any)。 */
+static gps_sat_t s_sats[GPS_MAX_SATS];
+static int       s_sat_n;
+/* ★ 2026-10-27: 每条卫星最后一次被 GSV 提到的时刻(ms)。用来做"超时剔除",
+ *   这样一轮 GSV 未走完时数量不会掉, 卫星真消失后 15s 内自动移除。 */
+static uint32_t  s_sat_ms[GPS_MAX_SATS];
+#define SAT_TTL_MS 15000u
+static uint64_t  s_used[6];
+static uint64_t  s_used_any;
+static int       s_cur_sys;        /* 当前句子所属星座 (由 talker 前缀决定) */
+
 /* ---- 时基 ---- */
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
@@ -67,6 +81,9 @@ void gps_nmea_reset(void)
     memset(&s_fix, 0, sizeof(s_fix));
     s_fix.demo = demo;
     fix_unlock();
+    s_sat_n = 0;
+    s_used_any = 0;
+    memset(s_used, 0, sizeof(s_used));
     s_line_len = 0;
 }
 
@@ -253,16 +270,112 @@ static void on_vtg(char **f, int n)
 static void on_gsa(char **f, int n)
 {
     if (n < 18) return;
-    unsigned dim = 0, hdop_x10 = 0;
+    unsigned dim = 0;
     parse_u(f[2], &dim);
     float hdop = 0;
     bool ok_hdop = parse_f(f[16], &hdop);
-    (void)hdop_x10;
+
+    /* 参与解算的 PRN 列表: 字段 3..14 */
+    uint64_t mask = 0;
+    for (int k = 3; k <= 14 && k < n; k++) {
+        unsigned prn = 0;
+        if (parse_u(f[k], &prn) && prn > 0 && prn < 64) mask |= (1ULL << prn);
+    }
 
     fix_lock();
     if (dim >= 1 && dim <= 3) s_fix.fix_dim = (uint8_t)dim;
     if (ok_hdop && hdop > 0)  s_fix.hdop = hdop;   /* GSA 的 HDOP 比 GGA 细 */
+    if (s_cur_sys >= 0 && s_cur_sys < 6) s_used[s_cur_sys] = mask;   /* 每轮覆盖, 不是累加 */
+    else                                 s_used_any = mask;
     fix_unlock();
+}
+
+/* ---- GSV: 一次给出 4 组卫星 (PRN, 仰角, 方位, SNR) ---- */
+static void on_gsv(char **f, int n)
+{
+    /* 调试: 打一条原始 GSV 看字段 (只打前 2 条, 之后静默) */
+    static int dbg = 0;
+    if (dbg < 2) {
+        dbg++;
+        char raw[160]; raw[0] = 0;
+        for (int k = 0; k < n && k < 20; k++) {
+            strncat(raw, f[k] ? f[k] : "(nil)", sizeof(raw) - strlen(raw) - 2);
+            strncat(raw, "|", sizeof(raw) - strlen(raw) - 2);
+        }
+        ESP_LOGI("GPSGSV", "n=%d fields: %s", n, raw);
+    }
+    unsigned cur = 0;
+    parse_u(f[2], &cur);                     /* f[1]=总句数, f[2]=当前第几句 */
+    fix_lock();
+    /* ★★★ 2026-10-27 修「卫星数量忽多忽少」(linit):
+     *   原来 `cur == 1` 就把**本星座旧条目整批删掉**再从头追加 ⇒ 一轮 GSV 里
+     *   s_sat_n 从 4 颗一路长到 12 颗, 任何时刻去读都可能读到中间态;
+     *   多星座(GP/GL/GA/GB)轮流刷新又各自清空 ⇒ 界面上数量每秒乱跳。
+     *   现在: 按 (sys,prn) **就地更新**, 不清空; 每条记录带"最后出现时刻"(s_sat_ms),
+     *   超过 SAT_TTL_MS 没再被任何一条 GSV 提到才剔除 —— 数量只会在卫星真的
+     *   看不见时减少, 不会因为帧边界而抖。 */
+    {
+        uint32_t now = (uint32_t)now_ms();
+        uint8_t  sys = (uint8_t)s_cur_sys;
+        for (int k = 4; k + 3 < n; k += 4) {
+            unsigned prn = 0, el = 0, az = 0, sn = 0;
+            if (!parse_u(f[k], &prn) || prn == 0) continue;
+            bool ok_el = parse_u(f[k + 1], &el);
+            bool ok_az = parse_u(f[k + 2], &az);
+            bool ok_sn = parse_u(f[k + 3], &sn);
+            int idx = -1;
+            for (int i = 0; i < s_sat_n; i++)
+                if (s_sats[i].sys == sys && s_sats[i].prn == (uint8_t)prn) { idx = i; break; }
+            if (idx < 0) {
+                if (s_sat_n < GPS_MAX_SATS) {
+                    idx = s_sat_n++;
+                } else {
+                    /* 表满: 顶掉最久没更新的那条, 别把新卫星丢掉 */
+                    int oldest = 0; uint32_t om = 0xFFFFFFFFu;
+                    for (int i = 0; i < s_sat_n; i++)
+                        if (s_sat_ms[i] < om) { om = s_sat_ms[i]; oldest = i; }
+                    idx = oldest;
+                }
+            }
+            gps_sat_t *s = &s_sats[idx];
+            s->sys  = sys;
+            s->prn  = (uint8_t)prn;
+            s->elev = ok_el ? (int8_t)el : -1;
+            s->azim = ok_az ? (int16_t)az : -1;
+            s->snr  = ok_sn ? (int8_t)sn  : -1;
+            s->used = 0;
+            s_sat_ms[idx] = now;
+        }
+    }
+    fix_unlock();
+}
+
+/* 取卫星列表 (加锁拷贝) */
+int gps_nmea_sats(gps_sat_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    fix_lock();
+    /* ★ 2026-10-27: 先做"超时剔除" —— 15s 没再被 GSV 提到才算真的看不见了。
+     *   这一步同时把表压紧(原地搬移), 后面的拷贝就不用管空洞。 */
+    {
+        uint32_t now = (uint32_t)now_ms();
+        int w = 0;
+        for (int i = 0; i < s_sat_n; i++) {
+            if ((uint32_t)(now - s_sat_ms[i]) > SAT_TTL_MS) continue;
+            if (w != i) { s_sats[w] = s_sats[i]; s_sat_ms[w] = s_sat_ms[i]; }
+            w++;
+        }
+        s_sat_n = w;
+    }
+    int n = (s_sat_n < max) ? s_sat_n : max;
+    for (int i = 0; i < n; i++) {
+        out[i] = s_sats[i];
+        uint64_t m = s_used_any;
+        if (s_sats[i].sys < 6) m |= s_used[s_sats[i].sys];
+        out[i].used = (uint8_t)(((m >> (s_sats[i].prn & 63)) & 1ULL) ? 1 : 0);
+    }
+    fix_unlock();
+    return n;
 }
 
 /* ---- GLL ---- */
@@ -312,18 +425,39 @@ static void parse_sentence(char *line)
 
     fix_lock(); s_fix.sentences++; fix_unlock();
 
+    /* talker 前缀 → 星座 (GSV/GSA 用来区分"哪一套星") */
+    s_cur_sys = 6;
+    if      (f[0][0] == 'G' && f[0][1] == 'P') s_cur_sys = 0;
+    else if (f[0][0] == 'G' && f[0][1] == 'L') s_cur_sys = 1;
+    else if (f[0][0] == 'G' && f[0][1] == 'A') s_cur_sys = 2;
+    else if (f[0][0] == 'B' && (f[0][1] == 'D' || f[0][1] == 'D')) s_cur_sys = 3;
+    else if (f[0][0] == 'G' && f[0][1] == 'Q') s_cur_sys = 4;
+    else if (f[0][0] == 'G' && f[0][1] == 'I') s_cur_sys = 5;
+
     const char *type = f[0] + 2;          /* 跳过 2 字符 talker (GP/GN/GL/BD…) */
     if      (!strcmp(type, "GGA")) on_gga(f, n);
     else if (!strcmp(type, "RMC")) on_rmc(f, n);
     else if (!strcmp(type, "VTG")) on_vtg(f, n);
     else if (!strcmp(type, "GSA")) on_gsa(f, n);
+    else if (!strcmp(type, "GSV")) on_gsv(f, n);
     else if (!strcmp(type, "GLL")) on_gll(f, n);
-    /* 其余 (GSV/ZDA/TXT…) 暂不解析: 北斗/伽利略星数可用 GGA 的"参与解算数"覆盖 */
 }
 
 void gps_nmea_feed(const uint8_t *buf, size_t len)
 {
     if (!buf) return;
+    /* 线路活性统计: rx_bytes=0 说明模块根本没说话(没焊/没电/TX-RX 没交叉);
+     * age_rx 一直变大说明中途掉线。同时在输入里数 UBX 同步头。 */
+    {
+        uint32_t ubx = 0;
+        for (size_t i = 0; i + 1 < len; i++)
+            if (buf[i] == 0xB5 && buf[i + 1] == 0x62) ubx++;
+        fix_lock();
+        s_fix.rx_bytes += (uint32_t)len;
+        s_fix.last_rx_ms = now_ms();
+        s_fix.ubx_frames += ubx;
+        fix_unlock();
+    }
     for (size_t i = 0; i < len; i++) {
         char c = (char)buf[i];
         if (c == '\n' || c == '\r') {
@@ -340,7 +474,7 @@ void gps_nmea_feed(const uint8_t *buf, size_t len)
 }
 
 /* ================= 演示模式: 内置运动模型 =================
- * 湄洲岛环岛: 起点 25.0460N 119.1190E, 航向匀速右转画圈, 速度带加减速波动.
+ * 示例轨迹: 起点 39.9042N 116.4074E, 航向匀速右转画圈, 速度带加减速波动.
  * 目的只有一个 —— 让上层 UI 在没星/没接线时也能跑出真实感的数据流. */
 #define DEMO_LAT0   25.046000
 #define DEMO_LON0   119.119000
@@ -382,6 +516,26 @@ static void demo_step(void)
         if (++s_fix.sec >= 60) { s_fix.sec = 0; if (++s_fix.min >= 60) { s_fix.min = 0; s_fix.hour = (uint8_t)((s_fix.hour + 1) % 24); } }
     }
     s_fix.sentences++;
+
+    /* 演示星座: 18 颗, 分属 GPS/GLONASS/BeiDou/Galileo, 方位缓慢转动 → 卫星页能看出"在动" */
+    {
+        static const uint8_t dsys[] = { 0,0,0,0,0,0,0, 1,1,1,1, 3,3,3,3,3, 2,2 };
+        static const uint8_t dprn[] = { 3,6,11,17,19,22,28, 65,72,78,81, 7,19,24,30,38, 5,11 };
+        int n = (int)(sizeof(dsys) / sizeof(dsys[0]));
+        if (n > GPS_MAX_SATS) n = GPS_MAX_SATS;
+        s_sat_n = n;
+        for (int i = 0; i < n; i++) {
+            float ph = t * 0.22f + (float)i * 0.83f;
+            s_sats[i].sys  = dsys[i];
+            s_sats[i].prn  = dprn[i];
+            s_sats[i].elev = (int8_t)(12 + (int)(68.0f * (0.5f + 0.5f * sinf(ph))));
+            s_sats[i].azim = (int16_t)fmodf((float)i * 41.0f + t * 7.0f, 360.0f);
+            s_sats[i].snr  = (int8_t)(i < 5 ? 0 : (int)(22.0f + 20.0f * (0.5f + 0.5f * sinf(ph * 1.6f))));
+            s_sats[i].used = (uint8_t)((i < 9) ? 1 : 0);
+        }
+        s_used_any = 0;
+        memset(s_used, 0, sizeof(s_used));
+    }
     fix_unlock();
 }
 
@@ -412,6 +566,8 @@ static void gps_service_task(void *arg)
 }
 
 /* ★ 2026-10-09: 停服务 (供 Lua 应用退出时调用)。最多等 ~600ms 让任务自己退出。 */
+bool gps_service_is_running(void) { return s_task_running; }
+
 void gps_service_stop(void)
 {
     if (!s_task_running) return;
@@ -433,11 +589,14 @@ esp_err_t gps_service_start(void)
         return ESP_OK;
     }
 
-    /* 先探一下线到底通不通: 1.2s 内收到任意 NMEA 字节就说明波特率/接线对 */
+    /* 先探一下线到底通不通: 收到任意 NMEA 字节就说明波特率/接线对。
+     * ★ 2026-10-24: 窗口 1200ms → 600ms。gps_wakeup() 已经叫醒模块, 1Hz NMEA
+     *   在 600ms 内必然吐 1 句以上; 这 600ms 是**同步**的(卡应用打开),
+     *   原来 1.2s 让码表/地图开门明显顿一下。收到 64 字节即提前收工。 */
     uint8_t probe[256];
     int got = 0;
     uint32_t t0 = now_ms();
-    while (now_ms() - t0 < 1200 && got < 64) {
+    while (now_ms() - t0 < 600 && got < 64) {
         int n = gps_read(probe, sizeof(probe), 150);
         if (n > 0) {
             got += n;

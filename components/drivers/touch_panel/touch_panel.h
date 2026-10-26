@@ -86,6 +86,9 @@ void touch_panel_deinit(void);
 void touch_panel_recover(void);
 
 /* V1.0.68: 非阻塞请求触摸恢复 (input.c 连续读失败时调用, 由后台看门狗执行) */
+/* 深睡前关断触摸 IC（RST 拉低 + hold） */
+void touch_panel_power_down(void);
+
 void touch_panel_request_recover(void);
 
 /* 返回当前检测到的芯片类型 (调试/日志用). */
@@ -96,9 +99,19 @@ tp_chip_t touch_panel_get_chip(void);
 bool touch_panel_is_present(void);
 bool touch_panel_reprobe(void);  /* 运行时重新探测触摸芯片 (应用管家重检用) */
 
+/* ★ FT6236 方向参数 (运行时, NVS 落盘): bit0 = 交换 XY, bit1 = Y 取反。
+ *   只对 FT6236 生效; CST836U / GT911 的读点路径完全不同, 不受影响。
+ *   串口: `ftaxis 0..3` 可实时切换并保存, 不用重编固件。 */
+uint8_t touch_panel_get_ft_axis(void);
+void    touch_panel_set_ft_axis(uint8_t v);
+
 /* [二分定位·测试版] 暂停/恢复触摸看门狗任务: 浅睡窗口内暂停, 避免其周期醒来
  * 访问 I2C 驱动(代码在 flash)触发禁缓存 panic. 暂停后看门狗不再检查/恢复. */
 void touch_panel_set_paused(bool paused);
+
+/* 深睡前调用: 把触摸 IC 按进复位态并把 I2C 上拉关掉 (省掉睡眠期间的扫描电流).
+ * 唤醒是完整重启, 无需还原. */
+void touch_panel_sleep(void);
 
 /* 返回面板分辨率 (原始坐标最大值), 用于把触摸点映射到屏幕坐标.
  * GT911 从寄存器读出; 其它芯片返回 TP_DEFAULT_RES_X/Y. */

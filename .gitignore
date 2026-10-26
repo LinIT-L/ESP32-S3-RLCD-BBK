@@ -1,6 +1,228 @@
-build/
-dist/
+# ===== ESP-IDF 构建产物 (可重新生成) =====
+build*
 managed_components/
-*.bin
-*.elf
-*.map
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# ===== 发布 / 打包产物 =====
+dist/
+release/
+backups/
+merged_*.bin
+*.zip
+
+# ===== 本地开发环境 hack (不影响其他机器) =====
+idf_patched.py
+python_wrapper.py
+sitecustomize.py
+custom_toolchain.cmake
+check_python_dependencies_*.py
+
+# ===== 开发临时目录 =====
+.cowork-temp/
+.workbuddy/
+icons_choices/
+icons_preview/
+third_party_gbemu_firmware/
+# 原始 Zepp 参考源(本地参考, 构建不需要, 不入库)
+third_party/vpet-emu-zepp/
+
+# 第三方参考源码(527MB, 本地查阅用, 不入库): bluepad32 / 乐鑫方案 / 阅读器开源项目等
+reference/
+
+# ===== 主程序调试历史 / 替代实现 =====
+main/main.c.backup
+main/main_diagnostic.c
+main/main_hello.c
+main/main_minimal_test.c
+
+# ===== 运行时日志 =====
+*.log
+boot_log.txt
+build_chk*.log
+flash_chk*.log
+cap*.log
+capture*.log
+
+# ===== 操作系统 / 编辑器 / Python =====
+.DS_Store
+*.bak
+*.swp
+*.tmp
+.cache/
+.pytest_cache/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.engine_backup/
+*.spec.md
+
+# ===== 版本管理整合 (2026-10-02): 快照/归档/暂存 一律不入库 =====
+# 这些目录是"重构期间的历史快照", 内容已被 git 历史取代 —— 留在本地做回滚参考即可
+backup_*/
+.trash_*/
+*.bak_*
+*.orig
+*.rej
+
+# 构建 apps(SPIFFS) 分区的暂存目录 (由 tools 脚本生成)
+lua_fs/
+tf_stage/
+
+# 代理/编辑器配置
+.trae/
+.cursor/
+
+# 调试抓取产物 (串口/唤醒/内存)
+sleep_monitor.txt
+wake_capture.txt
+*_capture.txt
+
+# ===== 地图数据大包 (发布到 bbk.linit.cn / TF 卡, 不入库) =====
+store/maps/*.bin
+
+# ===== 地图制作缓存与临时产物 =====
+cache_map/
+_xz.bin
+dlg_out/
+sleep_lab_min/
+device_preview.html
+gps_pop.png
+gps_state.png
+*.osm.pbf
+
+# ===== macOS / Python =====
+.DS_Store
+__pycache__/
+*.pyc
+
+# ===== 在线刷机页里的固件本体 (16MB, 用 dist/ 发布) =====
+flash/merged_16mb.bin
+
+# ===== 过程文档 / 预览稿（本地保留，不入库）=====
+休眠分步测试计划.md
+docs/archive/
+docs/screenshots/
+docs/apps/
+docs/游戏优化计划/
+docs/preview_sat*.html
+
+# ===== 个人调试脚本（本地保留，不入库）=====
+boot_capture_regen.py
+cap_boot.py
+diag_sleep_capture.py
+read_esp.py
+reboot_capture.py
+ss_crash.py
+ss_watch.py
+mem_analyze.py
+mem_iram_attr.py
+
+# ===== 个人工具与素材（本地保留，不入库）=====
+tools/font_preview/
+tools/key_sound_candidates/
+tools/ui_designer/
+tools/ref_icon.jpg
+tools/pal_tune.html
+tools/sdr_pan_sim.html
+tools/pixel_icon_editor.html
+maintenance.py
+
+# ===== 个人抓日志 / remcon 调试脚本（本地保留）=====
+tools/cap_keys.py
+tools/cap_now.py
+tools/cap_serial.py
+tools/capture30.py
+tools/capture_boot.py
+tools/capture_usb.py
+tools/read_serial.py
+tools/read_serial_reset.py
+tools/serial_capture.py
+tools/rc_audio_probe.py
+tools/rc_cmd.py
+tools/rc_drive.py
+tools/rc_drive_netdect.py
+tools/rc_mem.py
+tools/rc_netdect_mem.py
+tools/rc_repro.py
+tools/rc_scan_diag.py
+tools/rc_scan_diag2.py
+tools/rc_scan_icmp.py
+tools/rc_scan_icmp2.py
+tools/rc_view.py
+tools/rc_watch.py
+tools/sermon.py
+tools/traecap.py
+tools/hid_cap.py
+tools/decode_jwt.py
+tools/dead_code_clean.py
+tools/patch_anykey.py
+tools/test_guillemets.py
+tools/append_missing_punct.py
+tools/esp_bin_gpio_scan.py
+tools/knl_unpack.py
+tools/pe_exports.py
+tools/lin_screen.py
+tools/emu_screen.py
+tools/emu_ui.html
+tools/preview_icons_v2.py
+tools/preview_hardcore.py
+tools/_gen_pal_icon.py
+
+# ===== 预览图（本地保留）=====
+tools/icons_preview_*.png
+tools/fonts/preview_800x600.*
+
+# ===== 字库源字体（约 49MB，本地保留；设备字库 bin 已随仓库，正常编译不需要）=====
+tools/fonts/
+
+# ===== 一次性生成器 / 素材加工脚本（本地保留，别人用 AI 重写即可）=====
+tools/apply_audit.py
+tools/biossim_gen_brand_icons.py
+tools/biossim_gen_lua.py
+tools/biossim_gen_official.py
+tools/bmp_dump.py
+tools/fw_fonts.py
+tools/gen_diag_icons.py
+tools/gen_icons_48.py
+tools/gen_icons_hardcore.py
+tools/gen_icons_pixel.py
+tools/gen_lifeguide_lua.py
+tools/gen_map_icon.py
+tools/gen_mp3_iconts.py
+tools/generate_arduboy_icon.py
+tools/generate_book_font.py
+tools/generate_book_icon.py
+tools/generate_font.py
+tools/generate_icons.py
+tools/generate_logo.py
+tools/generate_status_icons.py
+tools/kcmp.py
+tools/lua_strings.py
+tools/map_build.py
+tools/mem_audit.py
+tools/pal_music_build.sh
+tools/qqart_gen.py
+tools/qqt_sheet.py
+tools/qqt_spr.py
+tools/scan_zh_chars.py
+tools/sel_box_designer.html
+tools/sprite_sheet.py
+tools/ui_layout_studio.html
+tools/ui_parity.py
+tools/wuxia_art_gen.py
+tools/wuxia_gen_data.py
+tools/wuxia_world_gen.py
+tools/pack_games.py
+tools/push_bbk_games.sh
+tools/flash_bbk.sh
+tools/store_selftest.py
+tools/image_convert/gen_cat_icons_64.py
+tools/image_convert/gen_main_icons_64.py
+tools/image_convert/gen_modtool_icon.py
+tools/image_convert/gen_status_icons_12.py
+
+# ===== 真实地图数据（从服务器分发，不入库）=====
+store/maps/

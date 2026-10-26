@@ -8,6 +8,7 @@
  * 私有 state 一律 static 留在本文件.
  */
 #include "os.h"
+#include "sd_scan.h"
 #include "os_pane.h"
 #include "ui_common.h"
 #include "gam4980_emu.h"
@@ -25,7 +26,7 @@
 
 #define TAG "PGAME"
 
-#define GAM_ROOT "/sdcard/gam"
+#define GAM_ROOT "/sdcard/roms/gam"
 
 /* ==== 引擎优化设置 (3.3 游戏设置: 状态栏设置/显示模式/虚拟按键/抗锯齿) ====
  * 用 NVS 持久化 (namespace os_gset), 启动游戏时应用到 gam4980. */
@@ -236,10 +237,25 @@ static void p_game_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
              s_gs.key_sound, s_gs.key_vib);
 }
 
-static EXT_RAM_BSS_ATTR os_pane_t s_gp;   /* 双栏模板状态 (PSRAM, 省 30KB 内部 RAM) */
+/* ★ LINTOS 2026-10-25: 列表 pane(约 59KB) 原来静态常驻 PSRAM, 改为进页面才分配/退出即还 */
+static os_pane_t *s_gp__p;
+static os_pane_t *s_gp__get(void) {
+    if (!s_gp__p) {
+        s_gp__p = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_gp__p) ESP_LOGW("PANE", "列表 pane 分配失败 (%u B)", (unsigned)sizeof(os_pane_t));
+    }
+    if (!s_gp__p) s_gp__p = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_8BIT);   /* 兜底: 内部 RAM */
+    return s_gp__p;
+}
+static inline void s_gp__free(void) { if (s_gp__p) { heap_caps_free(s_gp__p); s_gp__p = NULL; } }
+#define s_gp (*s_gp__get())
+static void sg_exit(ui_ctx_t *ctx) { (void)ctx; s_gp__free(); }
 
 static void p_select_game_enter(ui_ctx_t *ctx) {
     gs_load();   /* 读取引擎优化设置 */
+    /* ★ 2026-10-24: 先等 TF 卡就绪再列游戏 —— 挂载是后台任务, 早一步扫就是空列表
+     *   (linit: "换了张卡引擎里一个游戏都没有")。已挂载时立即返回。 */
+    sd_wait_ready(1200, true);
     /* 管家后台默认加载 gam4980 引擎 (幂等; 返回主菜单由 os_mgr 及时清理) */
     engine_manager_load(ENGINE_GAM4980, ctx->lcd);
     if (!s_gp.loaded) {
@@ -283,6 +299,7 @@ static void p_select_game_poll(ui_ctx_t *ctx) {
 }
 
 static const os_module_t s_mod_select_game = {
+    .on_exit   = sg_exit,
     .name       = "select_game",
     .page_id    = OS_PAGE_SELECT_GAME,
     .on_enter   = p_select_game_enter,

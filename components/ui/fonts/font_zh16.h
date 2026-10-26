@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #ifndef FONT_ZH16_H
 #define FONT_ZH16_H
 
@@ -9,7 +10,8 @@ extern "C" {
 
 /* V1.0.86: 软件介绍用文泉驿点阵宋体 16px 紧凑二进制字库 (font_zh16.bin, Flash XIP)
  * 布局: [8B magic "ZH1FNT01"][u32 count][字符表 count*3][字形 count*32] */
-extern const char *zh16_chars;                 /* 字符表 (每字 3 字节 UTF-8) */
+extern const char *zh16_chars;
+bool font_zh16_ready(void);   /* ★ 字库是否可用(否则 ui_text16 会崩) */                 /* 字符表 (每字 3 字节 UTF-8) */
 extern const uint8_t (*zh16_font_data)[32];    /* 字形表 (每字 32 字节) */
 
 #define ZH16_FONT_W 16

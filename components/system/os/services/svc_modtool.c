@@ -80,7 +80,7 @@ static void svc_modtool_render(ui_ctx_t *ctx)
     st7305_handle_t *lcd = ctx->lcd;
     if (!lcd) return;
     st7305_draw_bitmap_1bit(lcd, MODTOOL_ICON_X, MODTOOL_ICON_Y,
-                            MODTOOL_MINI_W, MODTOOL_MINI_H, modtool_mini_icon);
+                            MODTOOL_MINI_W, MODTOOL_MINI_H, modtool_icon_mini_24);
 }
 
 static const os_service_t s_svc_modtool = {

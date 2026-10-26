@@ -3,6 +3,7 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
     REQUIRES
+        vid_tune
         gbc_emu
         heap
         log

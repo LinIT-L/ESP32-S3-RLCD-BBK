@@ -4,9 +4,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* 底部手势区厚度 (逻辑 px; 屏高 300 的底部 50px ≈ 17%). 与 gesture_back.c 同源,
- * input.c 兜底分支也用这个值判定"起点是否在底部带", 保证单一来源. */
-#define GB_BAND_THICK 50
+/* 底部手势区: **厚度 30px, 宽度 200px, 水平居中贴底** (2026-10-18 linit 定).
+ * 原来 50px 全宽 (400) 太大, 稍微划一下就返回; 现在只认屏幕正中下沿这条窄带。 */
+#define GB_BAND_THICK 30
+#define GB_BAND_WIDE  200
 
 #ifdef __cplusplus
 extern "C" {

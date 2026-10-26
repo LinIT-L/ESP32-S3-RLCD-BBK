@@ -89,7 +89,7 @@ VENDOR_MAP = {
 }
 
 # 假公网信息 JSON (app.net.http_get): 与 C 版首选源 ip9.com.cn/get 的字段一致
-FAKE_PUBJSON = '{"ip":"112.5.20.31","prov":"福建","city":"莆田","isp":"中国电信"}'
+FAKE_PUBJSON = '{"ip":"112.5.20.31","prov":"示例省","city":"示例市","isp":"示例运营商"}'
 
 # 假 IP 定位应答 (app.net.fetch_start): 首选 api.ip.sb 给 latitude/longitude,
 # 兜底 ip-api.com 给 lat/lon —— 与 planeradar.lua 的 GEO_URLS 对应
@@ -98,7 +98,7 @@ FAKE_GEO_IPAPI  = '{"status":"success","country":"\u4e2d\u56fd","regionName":"\u
 
 # 假 ADS-B 应答 (app.net.fetch_start/fetch_poll + app.json.pick) —— 字段与 adsb.fi
 # v2 接口 (https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{nm}) 一致,
-# 含该接口**已算好的** dst(距离NM)/dir(方位角)。以湄洲岛为中心、50NM 内的十几个目标。
+# 含该接口**已算好的** dst(距离NM)/dir(方位角)。以默认城市为中心、50NM 内的十几个目标。
 FAKE_ADSB = ('{"now":1790951848.001,"resultCount":9,"ptime":0.11,"aircraft":['
              '{"hex":"780abc","flight":"CES2345 ","r":"B-1234","t":"B738","lat":25.31,"lon":119.42,'
              '"alt_baro":31000,"alt_geom":31450,"gs":445.2,"track":212.4,"baro_rate":-640,"squawk":"3024",'
@@ -692,7 +692,7 @@ class Sim:
                                list=lambda t, items, sel=0: self._dlg_list(t, items, sel),
                                result=lambda: self.dlg_result)
         # GPS: 字段与固件 luat_lib_gps.c **逐项对齐** (整数定标, 不用浮点传经纬度)。
-        # 假轨迹绕莆田市中心画圈 + 高度缓升缓降 —— 这样地图应用的
+        # 假轨迹绕默认城市中心画圈 + 高度缓升缓降 —— 这样地图应用的
         # 移动距离 / 爬升高度 / 当前配速 / 卫星数 全都能动起来被验证。
         a.gps = self.lua.table(start=lambda: True,
                                fix=lambda: self._gps_fix(),
@@ -1052,7 +1052,7 @@ class Sim:
     def _gps_fix(self):
         """假 GPS 快照 (字段/定标与固件 luat_lib_gps.c 一致)。
 
-        绕莆田市中心画圈 + 高度缓升缓降: 让 移动距离/爬升高度/当前配速/卫星 都能动,
+        绕默认城市中心画圈 + 高度缓升缓降: 让 移动距离/爬升高度/当前配速/卫星 都能动,
         否则地图应用的指标条在模拟器里永远是 "--"。
         """
         t = self.ms / 1000.0
@@ -1071,6 +1071,9 @@ class Sim:
             "hdop100": 80, "sats": 11, "quality": 1, "dim": 3,
             "hh": hh, "mm": mm, "ss": ss, "yy": 2026, "mo": 10, "dd": 5,
             "age_ms": 0, "sentences": 120, "badcs": 0,
+            # 2026-10-24 新增: 链路诊断 (与 luat_lib_gps.c 对齐)
+            "rx": 2909, "ubx": 2, "age_rx": 30, "baud": 38400,
+            "link": True, "proto": "NMEA",
         }
 
     def _dlg_geom(self):

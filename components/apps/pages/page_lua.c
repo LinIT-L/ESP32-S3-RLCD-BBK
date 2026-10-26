@@ -19,6 +19,8 @@
 #include "netscan.h"   /* V1.2: 端口探测/ARP解析/MAC厂商 (L1 服务) */
 #include "os_pane.h"
 #include "lua_bridge.h"   /* 模块化后: 桥 API 在 components/apps/lua_bridge/ */
+#include "gps.h"        /* 退出应用时兜底关 GPS (见 lua_stop) */
+#include "gps_nmea.h"    /* gps_service_stop() */
 #include "ui_common.h"
 #include "os_notify.h"
 #include "esp_timer.h"
@@ -170,7 +172,18 @@ void key_push(int a) {
 }
 
 /* ---- 双栏列表 (PSRAM 状态, 省内部 RAM) ---- */
-static EXT_RAM_BSS_ATTR os_pane_t s_pane;
+/* ★ LINTOS 2026-10-25: 列表 pane(约 59KB) 原来静态常驻 PSRAM, 改为进页面才分配/退出即还 */
+static os_pane_t *s_pane__p;
+static os_pane_t *s_pane__get(void) {
+    if (!s_pane__p) {
+        s_pane__p = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_pane__p) ESP_LOGW("PANE", "列表 pane 分配失败 (%u B)", (unsigned)sizeof(os_pane_t));
+    }
+    if (!s_pane__p) s_pane__p = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_8BIT);   /* 兜底: 内部 RAM */
+    return s_pane__p;
+}
+static inline void s_pane__free(void) { if (s_pane__p) { heap_caps_free(s_pane__p); s_pane__p = NULL; } }
+#define s_pane (*s_pane__get())
 
 static bool is_lua(const char *name) {
     size_t len = strlen(name);
@@ -455,6 +468,14 @@ static void lua_stop(ui_ctx_t *ctx) {
         }
         lua_close(s_L);
     }
+    /* ★ 2026-10-24 GPS 硬闸门: 任何 Lua 应用退出(码表/地图/…), 一律停解析任务
+     *   并把模块送回 UBX-RXM-PMREQ 待机(46µA)。脚本自己调 app.gps.stop() 是"应该做的",
+     *   但它可能忘记 / 崩了 / 没写 on_exit ⇒ 在这里兜底, 否则退出后 GPS 仍在
+     *   ~10mA 连续跟踪, 一夜就没电。两个函数都是幂等的, 多调无害。 */
+    if (gps_is_ready()) {
+        gps_service_stop();
+        gps_release();   /* ★ 2026-10-24: 待机 + 卸 UART + 还原引脚, 不留任何常驻 */
+    }
     s_L = NULL;
     s_mode = LUA_MODE_LIST;
     s_exit_req = false;
@@ -648,6 +669,9 @@ static void lua_poll(ui_ctx_t *ctx) {
         return;
     }
     if (s_err_pending) { s_err_pending = false; os_dialog_toast(ctx, s_err); }
+    if (s_L) {
+        lua_util_tick(s_L);            /* ★ 2026-10-24: 驱动 app.util 的 after/every 定时器 */
+    }
     if (s_L) lua_call_optional(ctx, "poll", -1);
     if (s_mode == LUA_MODE_RUN) { s_lua_ctx = ctx; s_ran = true; }   /* 真跑起来了 → 退出才值得弹确认 */
     if (s_mode == LUA_MODE_RUN && ctx) ctx->needs_redraw = true;   /* 逐帧重绘: 支撑动画/触屏 */
@@ -658,6 +682,7 @@ static void lua_poll(ui_ctx_t *ctx) {
 }
 
 static void lua_on_exit(ui_ctx_t *ctx) {
+    s_pane__free();   /* LINTOS: 页面退出归还列表 pane */
     /* 页面退栈 (BACK/HOME/回主菜单) 时兜底释放, 防止 lua_State 泄漏 */
     if (s_mode == LUA_MODE_RUN) lua_stop(ctx);
     s_lcd = NULL;

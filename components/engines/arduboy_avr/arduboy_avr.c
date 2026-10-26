@@ -10,6 +10,7 @@
  *   - 直接渲染 SSD1306 显存到 ST7305 反射屏 (无虚拟硬件)
  */
 #include "arduboy_avr.h"
+#include "vid_tune.h"      /* 画面优化器 (按引擎独立存档) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -260,6 +261,7 @@ static void arduboy_avr_render(void)
     virtual_keys_draw(s_lcd);
     /* 独立修改机浮标: 画浮标+检测呼出 (触发后交独立修改机任务, 本任务停走) */
     bool takeover = cheat_float_overlay_tick(s_lcd);
+    if (!takeover) vid_tune_overlay_tick(s_lcd);   /* 画面优化器浮标/面板 */
     if (!takeover) st7305_flush(s_lcd);
     ssd1306_set_flag(&s_disp, SSD1306_FLAG_DIRTY, 0);
 }
@@ -592,6 +594,7 @@ void arduboy_avr_unload(void)
 
 esp_err_t arduboy_avr_start(const char *path)
 {
+    vid_tune_attach("arduboy");   /* 画面优化器: 载入本引擎自己的画面档 */
     if (!s_initialized) {
         esp_err_t r = arduboy_avr_init();
         if (r != ESP_OK) return r;

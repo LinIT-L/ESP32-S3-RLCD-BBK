@@ -46,6 +46,10 @@ LAYER_RANK = {
 
 # ---- 已登记的历史欠债 (只警告, 不失败). 还清后请删除对应行. ----
 ALLOW_INVERSIONS = {
+    # vid_tune(ui) = 画面优化器浮标/面板: 必须读触摸(ui→system) + 存档(ui→services)。
+    # 它本质是"覆盖在游戏画面上的 UI 控件", 放 ui 层最合理, 与 wallpapers 同性质登记。
+    ("vid_tune", "input"),
+    ("vid_tune", "svc_nvs"),
     # wallpapers(ui) 需要蓝牙/音频/输入做电源与屏保, 属 ui→services 倒置;
     # 彻底修法: 把电源部分拆出 services/power, 由 os 回调驱动 (P5 待做).
     # ★ 2026-10-13: wallpapers 的深睡按键定义已改为引用 board_pins(引脚唯一真相源),

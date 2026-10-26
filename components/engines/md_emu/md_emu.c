@@ -4,6 +4,7 @@
  *   - 取 BoxEmu 桩当前帧 -> RGB565 转 4 级灰度 2bit 打包 -> board_rlcd NES shade 管线
  *   - 音频由 BoxEmu 桩直接喂 audio_player (53267/2 Hz 立体声) */
 #include "md_emu.h"
+#include "vid_tune.h"      /* 画面优化器 (按引擎独立存档) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,7 +77,7 @@ static void md_emu_set_save_path(const char *rom_path)
     const char *dot = strrchr(name, '.');
     int len = dot ? (int)(dot - name) : (int)strlen(name);
     if (len <= 0 || len > 96) len = 32;
-    snprintf(s_save_path, sizeof(s_save_path), "/sdcard/dict/MD/%.*s.sav", len, name);
+    snprintf(s_save_path, sizeof(s_save_path), "/sdcard/data/saves/MD/%.*s.sav", len, name);
 }
 
 void md_emu_set_progress_cb(md_emu_progress_cb_t cb) { s_progress_cb = cb; }
@@ -181,6 +182,7 @@ void md_emu_unload(void)
 
 esp_err_t md_emu_start(const char *path)
 {
+    vid_tune_attach("md");   /* 画面优化器: 载入本引擎自己的画面档 */
     if (!path || s_task_running) return ESP_ERR_INVALID_ARG;
 
     FILE *f = fopen(path, "rb");

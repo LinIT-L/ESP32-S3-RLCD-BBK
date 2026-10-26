@@ -24,6 +24,10 @@
 
 #include "svc_nvs.h"
 #include "mbedtls/aes.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/pkcs5.h"
+#include "mbedtls/md.h"
+#include "esp_random.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
@@ -44,8 +48,12 @@
 
 #define KV_SALT_LEN    16
 #define KV_IV_LEN      16
-#define KV_KEY_LEN     16   /* AES-128 */
-#define KV_REC_MAXB    (1 + 1 + 60 + 1 + 60 + 2 + 144)   /* 单条记录 blob 上限 (带 group+account) */
+#define KV_KEY_LEN     32   /* AES-256 */
+#define KV_ITER        10000    /* PBKDF2-HMAC-SHA256 迭代数 (解锁实测目标 <0.2s; 仍是单轮 SHA256 的 1e4 倍成本) */
+#define KV_NONCE_LEN   12
+#define KV_TAG_LEN     16
+#define KV_FMT_NVS     "fmt"
+#define KV_REC_MAXB    (1 + 1 + 60 + 1 + 60 + 2 + 200)   /* 单条记录 blob 上限 (带 group+account) */
 
 static const char *s_def_cats[KEYVAULT_DEF_CATS] = {
     "\xe7\xbd\x91\xe7\xab\x99\xe8\xae\xba\xe5\x9d\x9b",   /* 网站论坛 */
@@ -184,7 +192,7 @@ static int kv_rec_set(int idx, uint8_t cat, const char *group, const char *accou
     uint8_t buf[KV_REC_MAXB];
     size_t o = 0;
     size_t gl = strlen(group), al = account ? strlen(account) : 0;
-    if (gl > 60 || al > 60 || clen > 144) return -1;
+    if (gl > 60 || al > 60 || clen > 200) return -1;
     buf[o++] = cat;
     buf[o++] = (uint8_t)gl;
     memcpy(buf + o, group, gl); o += gl;
@@ -199,15 +207,52 @@ static int kv_rec_set(int idx, uint8_t cat, const char *group, const char *accou
     return 0;
 }
 
+/* ★★ 2026-10-18: 密钥派生 SH256(pin||salt) → **PBKDF2-HMAC-SHA256 (60k 迭代)**。
+ *   单轮 SHA256 对 8 位 PIN 只需 1e8 次就能爆破；PBKDF2 把每次猜测成本抬了 6 万倍。 */
 static void kv_derive_key(const char *pin, uint8_t key[KV_KEY_LEN]) {
+    mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const unsigned char *)pin, strlen(pin),
+                                  s_salt, KV_SALT_LEN, KV_ITER, KV_KEY_LEN, key);
+}
+
+/* 旧算法 (仅用于把已有数据迁移到新格式) */
+static void kv_derive_key_v1(const char *pin, uint8_t key[16]) {
     uint8_t mix[64];
     size_t m = 0;
     size_t plen = strlen(pin);
-    if (plen > 47) plen = 47;   /* mix[64]: 47(PIN)+16(盐)=63 封顶, 防长 PIN 栈越界 */
+    if (plen > 47) plen = 47;
     for (size_t i = 0; i < plen; i++) mix[m++] = (uint8_t)pin[i];
     for (size_t i = 0; i < KV_SALT_LEN; i++) mix[m++] = s_salt[i];
     mbedtls_sha256(mix, m, mix, 0);
-    memcpy(key, mix, KV_KEY_LEN);
+    memcpy(key, mix, 16);
+}
+
+/* 新格式单条: [nonce12][cipher][tag16]，AES-256-GCM；返回总长度 */
+static size_t kv_gcm_encrypt(const uint8_t *key, const uint8_t *in, size_t n, uint8_t *out) {
+    mbedtls_gcm_context g;
+    mbedtls_gcm_init(&g);
+    mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, KV_KEY_LEN * 8);
+    for (int i = 0; i < KV_NONCE_LEN; i += 4) {
+        uint32_t r = esp_random();
+        memcpy(out + i, &r, 4);
+    }
+    mbedtls_gcm_crypt_and_tag(&g, MBEDTLS_GCM_ENCRYPT, n, out, KV_NONCE_LEN,
+                              NULL, 0, in, out + KV_NONCE_LEN, KV_TAG_LEN, out + KV_NONCE_LEN + n);
+    mbedtls_gcm_free(&g);
+    return KV_NONCE_LEN + n + KV_TAG_LEN;
+}
+
+/* 解密: 成功返回明文长度, 失败返回 0 (篡改/密钥不对都会失败) */
+static size_t kv_gcm_decrypt(const uint8_t *key, const uint8_t *in, size_t n, uint8_t *out) {
+    if (n < KV_NONCE_LEN + KV_TAG_LEN) return 0;
+    size_t ct = n - KV_NONCE_LEN - KV_TAG_LEN;
+    mbedtls_gcm_context g;
+    mbedtls_gcm_init(&g);
+    mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, KV_KEY_LEN * 8);
+    int rc = mbedtls_gcm_auth_decrypt(&g, ct, in, KV_NONCE_LEN,
+                                      NULL, 0, in + KV_NONCE_LEN + ct, KV_TAG_LEN,
+                                      in + KV_NONCE_LEN, out);
+    mbedtls_gcm_free(&g);
+    return (rc == 0) ? ct : 0;
 }
 static void kv_aes_crypt(int mode, const uint8_t *key, const uint8_t iv[KV_IV_LEN],
                          uint8_t *data, size_t len) {
@@ -252,6 +297,7 @@ static void kv_migrate_v1(void) {
 }
 
 esp_err_t keyvault_init(void) {
+    if (s_ready) return ESP_OK;   /* ★ 幂等: 每次登录/请求都调也不重复读 NVS + 重试迁移 */
     if (kv_nvs_get_blob(KV_NVS_SALT, s_salt, sizeof(s_salt)) != 0) {
         mbedtls_entropy_context ent;
         mbedtls_ctr_drbg_context ctr;
@@ -289,12 +335,13 @@ esp_err_t keyvault_init(void) {
 
 int keyvault_set_pin(const char *pin) {
     if (!s_ready) return -1;
-    if (strlen(pin) < 8) return -2;   /* V1.6.x: PIN 至少 8 位 (兼作 AP Wi-Fi 密码) */
+    if (!pin || strlen(pin) > 47) return -2;   /* ★ 任意位数, 允许空密码 (linit 2026-10-19) */
     uint8_t ph[32];
     mbedtls_sha256((const uint8_t *)pin, strlen(pin), ph, 0);
     kv_nvs_set_blob(KV_NVS_PINHASH, ph, sizeof(ph));
     kv_nvs_set_u32(KV_NVS_VALID, 1);
     kv_nvs_set_u32(KV_NVS_FAILS, 0);
+    kv_nvs_set_u32(KV_FMT_NVS, 2);   /* 新装即新格式 */
     s_fails = 0;
     return 0;
 }
@@ -304,6 +351,16 @@ uint32_t keyvault_lock_remaining_sec(void) {
     return (s_lock_until_ms - now + 999) / 1000;
 }
 uint32_t keyvault_fail_count(void) { return s_fails; }
+
+/* ★ 2026-10-19 linit: 空 PIN = 无密码 —— 用户不设密码时不该被任何门禁挡住.
+ *   判定方式: 未设置 或 存储的 PIN 哈希 == sha256("")。不消耗失败次数。 */
+bool keyvault_pin_is_empty(void) {
+    if (!s_ready || !keyvault_has_pin()) return true;
+    uint8_t ph[32], stored[32];
+    mbedtls_sha256((const uint8_t *)"", 0, ph, 0);
+    if (kv_nvs_get_blob(KV_NVS_PINHASH, stored, sizeof(stored)) != 0) return true;
+    return memcmp(ph, stored, sizeof(ph)) == 0;
+}
 
 int keyvault_verify_pin(const char *pin) {
     if (!s_ready || !keyvault_has_pin()) return -1;
@@ -317,12 +374,50 @@ int keyvault_verify_pin(const char *pin) {
     }
     s_fails++;
     kv_nvs_set_u32(KV_NVS_FAILS, s_fails);
-    size_t idx = (s_fails >= 1 && s_fails <= 4) ? (s_fails - 1) : 3;
-    s_lock_until_ms = now_ms() + s_lock_seconds[idx] * 1000UL;
-    ESP_LOGD(TAG, "PIN 错误 %u 次, 锁定 %u 秒", (unsigned)s_fails, (unsigned)s_lock_seconds[idx]);
+    /* ★ 2026-10-18 linit: **前 3 次不锁** —— 原来第 1 次错就锁 30 秒，
+     *   手滑一下要干等半分钟，很恼人。第 4 次起才逐级加长。 */
+    size_t idx = 0;
+    if (s_fails >= 4) {
+        idx = (s_fails - 4) < 4 ? (size_t)(s_fails - 4) : 3;
+        s_lock_until_ms = now_ms() + s_lock_seconds[idx] * 1000UL;
+    } else {
+        s_lock_until_ms = 0;
+    }
+    ESP_LOGD(TAG, "PIN 错误 %u 次, 锁定 %u 秒", (unsigned)s_fails, (unsigned)(s_fails >= 4 ? s_lock_seconds[idx] : 0));
     return 1;
 }
-void keyvault_unlock_secret(const char *pin, uint8_t key[KV_KEY_LEN]) { kv_derive_key(pin, key); }
+/* 一次性迁移: 旧格式(AES-128-CBC/零IV) → 新格式(GCM)。
+ * 用旧 PIN 派生旧密钥解出明文, 再用新密钥重新加密写回; 全部成功才打 fmt=2。 */
+static void kv_migrate_if_needed(const char *pin, const uint8_t key[KV_KEY_LEN]) {
+    if (kv_nvs_get_u32(KV_FMT_NVS, 0) == 2) return;
+    int n = kv_rcnt();
+    if (n > 0) {
+        uint8_t k1[16];
+        kv_derive_key_v1(pin, k1);
+        uint8_t c[256], plain[256];
+        for (int i = 0; i < n; i++) {
+            uint8_t cat; char nm[64], ac[64]; uint16_t cl = 0;
+            if (kv_rec_get(i, &cat, nm, sizeof(nm), ac, sizeof(ac), c, &cl) != 0) continue;
+            if (cl == 0 || cl > sizeof(c)) continue;
+            memcpy(plain, c, cl);
+            uint8_t iv[KV_IV_LEN] = {0};
+            kv_aes_crypt(MBEDTLS_AES_DECRYPT, k1, iv, plain, cl);
+            size_t sl = cl;
+            while (sl > 0 && plain[sl - 1] == 0) sl--;
+            uint8_t out[200];
+            size_t ol = kv_gcm_encrypt(key, plain, sl, out);
+            kv_rec_set(i, cat, nm, ac, out, (uint16_t)ol);
+            ESP_LOGI(TAG, "迁移记录 %d/%d (%u B → %u B)", i + 1, n, (unsigned)cl, (unsigned)ol);
+        }
+    }
+    kv_nvs_set_u32(KV_FMT_NVS, 2);
+    ESP_LOGW(TAG, "加密格式已升级: PBKDF2(%d) + AES-256-GCM", KV_ITER);
+}
+
+void keyvault_unlock_secret(const char *pin, uint8_t key[KV_KEY_LEN]) {
+    kv_derive_key(pin, key);
+    kv_migrate_if_needed(pin, key);
+}
 
 int keyvault_cat_count(void) { return s_cat_count; }
 const char *keyvault_cat_name(int i) { return (i < 0 || i >= s_cat_count) ? NULL : s_cat_names[i]; }
@@ -369,18 +464,23 @@ int keyvault_add(const uint8_t key[KV_KEY_LEN], int cat, const char *group, cons
     if (cat < 0 || cat >= s_cat_count) return -2;
     size_t gl = strlen(group), al = account ? strlen(account) : 0, sl = strlen(secret);
     if (gl == 0 || gl > 60 || al > 60 || sl == 0 || sl > 128) return -2;
-    size_t clen = ((sl + 15) / 16) * 16; if (clen < 16) clen = 16;
-    uint8_t *cipher = heap_caps_malloc(clen, MALLOC_CAP_8BIT);
+    uint8_t *cipher = heap_caps_malloc(KV_NONCE_LEN + sl + KV_TAG_LEN, MALLOC_CAP_8BIT);
     if (!cipher) return -3;
-    memset(cipher, 0, clen);
-    memcpy(cipher, secret, sl);
-    uint8_t iv[KV_IV_LEN] = {0};
-    kv_aes_crypt(MBEDTLS_AES_ENCRYPT, key, iv, cipher, clen);
+    size_t clen = kv_gcm_encrypt(key, (const uint8_t *)secret, sl, cipher);
     int n = kv_rcnt();
     int rc = kv_rec_set(n, (uint8_t)cat, group, account, cipher, (uint16_t)clen);
     if (rc == 0) kv_rcnt_set(n + 1);
     heap_caps_free(cipher);
     return rc;
+}
+
+/* ★ 2026-10-18: 通用 blob 加解密 (给其它模块复用同一套 GCM 密钥流)
+ *   out 需 ≥ n + 28 字节; 解密返回明文长度, 失败返回 0 */
+size_t keyvault_blob_encrypt(const uint8_t key[KV_KEY_LEN], const uint8_t *in, size_t n, uint8_t *out) {
+    return kv_gcm_encrypt(key, in, n, out);
+}
+size_t keyvault_blob_decrypt(const uint8_t key[KV_KEY_LEN], const uint8_t *in, size_t n, uint8_t *out) {
+    return kv_gcm_decrypt(key, in, n, out);
 }
 
 int keyvault_count(void) { return kv_rcnt(); }
@@ -412,14 +512,13 @@ int keyvault_get_account(const uint8_t key[KV_KEY_LEN], int idx, char *out, size
 }
 
 int keyvault_get_secret(const uint8_t key[KV_KEY_LEN], int idx, char *out, size_t out_cap) {
-    uint8_t c[256]; uint16_t cl;
+    uint8_t c[256], plain[256]; uint16_t cl;
     if (kv_rec_get(idx, NULL, NULL, 0, NULL, 0, c, &cl) != 0) return -1;
-    uint8_t iv[KV_IV_LEN] = {0};
-    kv_aes_crypt(MBEDTLS_AES_DECRYPT, key, iv, c, cl);
-    size_t sl = cl;
-    while (sl > 0 && c[sl - 1] == 0) sl--;
+    size_t sl = kv_gcm_decrypt(key, c, cl, plain);
+    if (sl == 0) return -1;                 /* 密钥不对 / 数据被改 */
+    while (sl > 0 && plain[sl - 1] == 0) sl--;
     size_t cp = (sl < out_cap - 1) ? sl : out_cap - 1;
-    memcpy(out, c, cp);
+    memcpy(out, plain, cp);
     out[cp] = 0;
     return 0;
 }

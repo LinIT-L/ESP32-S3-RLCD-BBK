@@ -4,6 +4,7 @@ idf_component_register(
   SRC_DIRS "." "src" "smsplus" "smsplus/cpu" "smsplus/sound"
   PRIV_INCLUDE_DIRS "." "smsplus" "smsplus/cpu" "smsplus/sound"
   REQUIRES
+        vid_tune
   st7305
   shared_memory
   input

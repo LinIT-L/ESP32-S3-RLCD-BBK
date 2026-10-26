@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include "str_trunc.h"   /* str_trunc(): 短字段的有意截断拷贝 */
 
 #define TAG "LOGD"
 
@@ -235,7 +236,7 @@ static const ld_card_t s_cards[6] = {
       "\xe7\xa8\x8b\xe5\xba\x8f\xe5\xb4\xa9\xe6\xba\x83\xe8\xae\xb0\xe5\xbd\x95",           /* 程序崩溃记录 */
       s_c_log, LOG_N, s_d_log, 0 },
     { "\xe7\xbd\x91\xe7\xbb\x9c\xe9\x85\x8d\xe7\xbd\xae",           /* 网络配置 */
-      "IP\xc2\xb7DNS\xc2\xb7\xe8\xb7\xaf\xe7\x94\xb1",                                                        /* IP·DNS·路由 */
+      "IP\xc2\xb7" "DNS\xc2\xb7\xe8\xb7\xaf\xe7\x94\xb1",                                                        /* IP·DNS·路由 */
       "\xe7\xab\xaf\xe5\x8f\xa3\xc2\xb7\xe4\xbb\xa3\xe7\x90\x86",                                            /* 端口·代理 */
       "\xe9\x98\xb2\xe7\x81\xab\xe5\xa2\x99\xc2\xb7\xe5\x85\xb1\xe4\xba\xab",                                /* 防火墙·共享 */
       s_c_net, NET_N, s_d_net, 0 },
@@ -520,7 +521,7 @@ static void ld_analyze(void)
 
     char b[48];
     snprintf(b, sizeof(b), "\xe7\x94\xb5\xe8\x84\x91: %s", s_pcname);                              /* 电脑: xxx */
-    snprintf(s_text[s_text_n++], 44, "%s", b);
+    str_trunc(s_text[s_text_n++], 44, b);
     if (s_rx_len == 0) {
         snprintf(s_text[s_text_n++], 44, "%s", "\xe6\x97\xa0\xe5\x9b\x9e\xe4\xbc\xa0\xe6\x95\xb0\xe6\x8d\xae");          /* 无回传数据 */
         snprintf(s_text[s_text_n++], 44, "%s", "\xe8\xaf\xb7\xe5\x85\x88\xe6\x89\xa7\xe8\xa1\x8c\xe9\x87\x87\xe9\x9b\x86\xe5\x86\x8d\xe5\x9b\x9e\xe4\xbc\xa0");  /* 请先执行采集再回传 */
@@ -597,7 +598,7 @@ static void ld_render_hist(st7305_handle_t *l)
     }
 }
 
-static void ld_render_text(st7305_handle_t *l, const char *title)
+__attribute__((unused)) static void ld_render_text(st7305_handle_t *l, const char *title)
 {
     ld_zh(l, 16, 10, title, false);
     draw_hline(l, 10, 389, 34, ST7305_COLOR_BLACK);

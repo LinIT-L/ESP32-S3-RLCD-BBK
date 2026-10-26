@@ -77,6 +77,7 @@ idf_component_register(
         "nofrendo/sndhrdw"
         "nofrendo/mappers"
     REQUIRES
+        vid_tune
         board_shim
         audio_player
         esp_timer

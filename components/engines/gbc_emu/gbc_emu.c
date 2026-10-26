@@ -12,6 +12,7 @@
  *   - 刷新: board_rlcd_flush_async() 交给 core0 独立刷新任务, 不阻塞模拟
  */
 #include "gbc_emu.h"
+#include "vid_tune.h"      /* 画面优化器 (按引擎独立存档) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,8 +60,11 @@ static const char *TAG = "gbc_emu";
 #define GBC_EMU_FRAME_US         16667
 #define GBC_EMU_IDLE_DELAY_INTERVAL 30
 
-#define GBC_EMU_AUDIO_SAMPLE_RATE 24000  /* V1.0.61: 恢复官方 esp-box-emu gnuboy 采样率 (旧适配器同款, GB 声音正常) */
-#define GBC_EMU_AUDIO_MAX_SAMPLES 8192   /* int16 数 (立体声交错), ~171ms @24kHz */
+/* ★ 2026-10-18 linit: GBC 无声 —— 抓帧证据: want=24000Hz 但 play=30576Hz,
+ *   且 ES8311 在 44100↔24000 间反复重配 ⇒ **24kHz 这条 I2S/codec 路径本身有问题**。
+ *   GB 走 44100 一直正常 ⇒ GBC 也统一到 44100 (gnuboy 内部按 pcm.hz 自动重采样). */
+#define GBC_EMU_AUDIO_SAMPLE_RATE 44100
+#define GBC_EMU_AUDIO_MAX_SAMPLES 16384  /* int16 数 (立体声交错), ~186ms @44.1kHz */
 
 /* V1.0.53: 任务栈 PSRAM 静态, 不占内部 RAM */
 EXT_RAM_BSS_ATTR static StackType_t s_gbc_task_stack[GBC_EMU_TASK_STACK_SIZE / sizeof(StackType_t)];
@@ -105,7 +109,7 @@ static int  s_display_mode = 1;   /* 0=点对点(1x), 1=全屏(2x), 2=强制拉�
 static volatile uint8_t s_output_volume = 80;
 static gbc_emu_progress_cb_t s_progress_cb = NULL;
 static char s_save_path[160] = {0};   /* 电池存档路径 (派生自 ROM 路径) */
-static char s_save_dir[64] = "/sdcard/dict/GB";   /* 电池存档目录 (gbc_emu_set_save_dir 可改) */
+static char s_save_dir[64] = "/sdcard/data/saves/GB";   /* 电池存档目录 (gbc_emu_set_save_dir 可改) */
 
 /* === 修改机(cheat)内存 region: 整片模拟可寻址内存 (通用做法) ===
  * 直接经 gnuboy 自己的 mem_read/mem_write 扫整片 [0x8000,0x10000), 涵盖:
@@ -123,7 +127,7 @@ static cheater_region_t gbc_cheat_region = {
 
 /* === 电池存档持久化 (V1.0.53) ===
  * 格式: 8 字节头 ('GBSR' + uint32 size) + 原始 SRAM (8192 * mbc.ramsize 字节).
- * 目录: /sdcard/dict/GB/ (与步步高 /sdcard/dict/ 分开, 避免同名冲突). */
+ * 目录: /sdcard/data/saves/GB/ (与步步高 /sdcard/data/saves/ 分开, 避免同名冲突). */
 #define GB_SRAM_MAGIC 0x52534247  /* 'GBSR' 小端 */
 
 static void gbc_make_save_path(const char *rom_path)
@@ -143,7 +147,7 @@ void gbc_emu_set_save_path(const char *rom_path)
     gbc_make_save_path(rom_path);
 }
 
-/* 设置电池存档目录 (默认 "/sdcard/dict/GB"). gb_emu 兼容层用它对 GB/GBC 分区存档.
+/* 设置电池存档目录 (默认 "/sdcard/data/saves/GB"). gb_emu 兼容层用它对 GB/GBC 分区存档.
  * 在 load_rom / start 之前调用生效. */
 void gbc_emu_set_save_dir(const char *dir)
 {
@@ -180,7 +184,7 @@ static void gbc_emu_save_sram(void)
 {
     if (!mbc.batt || !ram.sbank || !mbc.ramsize || !ram.loaded || s_save_path[0] == 0) return;
     size_t sram_len = (size_t)8192 * mbc.ramsize;
-    mkdir("/sdcard/dict", 0777);
+    mkdir("/sdcard/data/saves", 0777);
     mkdir(s_save_dir, 0777);
     FILE *f = fopen(s_save_path, "wb");
     if (!f) return;
@@ -384,7 +388,26 @@ esp_err_t gbc_emu_background_init(void)
     memset(var, 0, (size)); \
 } while (0)
 
-    GB_ALLOC(16 * 1024, s_vram, "vram");
+/* ★ 2026-10-22 性能: **热数据优先内部 RAM, 拿不到再回退 PSRAM**。
+ *   判定标准 = "PPU/CPU 每帧随机访问多少次":
+ *     · VRAM 16KB      — 每行扫描线都要读 tile/属性表, 全帧最热
+ *     · gbc_scan ~1.6KB — 每行扫描的 bg/wnd/pri/buf 状态, 逐行读改写
+ *     · lcd ~0.4KB      — OAM + 调色板, 精灵渲染每行都碰
+ *     · bgdup 256B      — 背景重复行缓存
+ *   这些原来全在 PSRAM ⇒ 每次随机访问 cache miss (~40-80 周期), 是 GB/GBC
+ *   只能跑 40~57fps 的主因(WRAM 之前已挪内部并见效)。内部 RAM 现在有余量(~200KB),
+ *   一共只多占 ~18KB; 分配失败会自动回退 PSRAM, 不会变砖。 */
+#define GB_ALLOC_HOT(size, var, name) do { \
+    var = heap_caps_malloc((size), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT); \
+    if (!var) { \
+        var = heap_caps_malloc((size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); \
+        if (var) ESP_LOGW(TAG, "%s 内部 RAM 不足, 回退 PSRAM (性能略降)", name); \
+    } \
+    if (!var) { ESP_LOGD(TAG, "分配 %s 失败 (%d B)", name, (int)(size)); goto fail; } \
+    memset(var, 0, (size)); \
+} while (0)
+
+    GB_ALLOC_HOT(16 * 1024, s_vram, "vram");
     /* V1.0.60: WRAM (CPU 工作内存) 是每指令随机访问的热数据, 放内部 RAM 提速
      * (32KB, 内部最大连续块 ~39KB 可容纳). PSRAM 随机访问 + 缓存抖动是
      * GB/GBC 只有 40-57fps 的主因. */
@@ -396,10 +419,10 @@ esp_err_t gbc_emu_background_init(void)
     if (!s_wram) goto fail;
     memset(s_wram, 0, 32 * 1024);
     GB_ALLOC(sizeof(struct cpu), cpu, "cpu");
-    GB_ALLOC(sizeof(struct lcd), lcd, "lcd");
-    GB_ALLOC(sizeof(struct gbc_scan), scan, "scan");
+    GB_ALLOC_HOT(sizeof(struct lcd), lcd, "lcd");            /* OAM/调色板: 精灵每行都碰 */
+    GB_ALLOC_HOT(sizeof(struct gbc_scan), scan, "scan");     /* 逐行扫描状态: 全帧最热 */
     GB_ALLOC(4096, gbc_filebuf, "gbc_filebuf");
-    GB_ALLOC(256, bgdup, "bgdup");
+    GB_ALLOC_HOT(256, bgdup, "bgdup");                       /* 背景重复行缓存 */
     GB_ALLOC(GBC_EMU_AUDIO_MAX_SAMPLES * sizeof(int16_t), s_audio_buf, "audio");
     GB_ALLOC(GBC_EMU_SCREEN_WIDTH * GBC_EMU_SCREEN_HEIGHT * 2, displayBuffer[0], "fb0");
     GB_ALLOC(GBC_EMU_SCREEN_WIDTH * GBC_EMU_SCREEN_HEIGHT * 2, displayBuffer[1], "fb1");
@@ -523,6 +546,7 @@ esp_err_t gbc_emu_start_data(uint8_t *data, size_t size, bool owned)
 
 esp_err_t gbc_emu_start(const char *path)
 {
+    vid_tune_attach("gbc");   /* 画面优化器: 载入本引擎自己的画面档 */
     if (!path) return ESP_ERR_INVALID_ARG;
 
     gbc_make_save_path(path);

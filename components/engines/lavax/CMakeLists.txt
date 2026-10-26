@@ -25,6 +25,7 @@ idf_component_register(
         "${CMAKE_SOURCE_DIR}/components/system/input"
         "${CMAKE_SOURCE_DIR}/components/ui/virtual_keys"
     REQUIRES
+        vid_tune
     bt_ctl
         "st7305"
         "input"

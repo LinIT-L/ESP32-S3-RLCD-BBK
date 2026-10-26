@@ -39,11 +39,14 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "am_internal.h"
+#include "am_asset.h"   /* ★ 2026-10-25: 资源包(zip)解包 */
 #include "os_sources.h"
+#include "store_index_builtin.h"   /* ★ 固件内置商店索引(离线可用) */
 #include "am_store_json.h"
 #include "sd_scan.h"
 #include "wifi_manager.h"
 #include "net_client.h"
+#include "str_trunc.h"   /* str_trunc(): 短字段的有意截断拷贝 */
 
 #define TAG "AMSTORENET"
 
@@ -104,14 +107,32 @@ static void am_idx_task(void *arg) {
      *   Lua 地图应用共用的唯一真相源), 再用上次 index.json 解析出的 mirrors 补位。
      *   首次运行时 s_mir_n 为 0, 纯靠内置源; 内置源通了, 它返回的 mirrors[]
      *   就覆盖/扩展后续要用的源列表 (所以"加源"通常连固件都不用刷)。 */
-    char tries[AM_MIRROR_MAX + 1][AM_MIRROR_LEN];
+    /* ★ 2026-10-25: 这张表挪到 PSRAM 静态 —— 它是本任务最大的局部数组(1.3KB),
+     *   原来占栈, 与本函数里另外两三份 mir[][] 叠加后 6KB 栈不够, 实测启动即
+     *   "A stack overflow in task am_idx"。单任务使用, 静态无并发问题。 */
+    static EXT_RAM_BSS_ATTR char tries[AM_MIRROR_MAX + 1][AM_MIRROR_LEN];
     int  ntry = 0;
     for (int i = 0; i < os_sources_count() && ntry < AM_MIRROR_MAX + 1; i++)
         snprintf(tries[ntry++], AM_MIRROR_LEN, "%s", os_sources_get(i));
     for (int i = 0; i < s_mir_n && ntry < AM_MIRROR_MAX + 1; i++)
-        snprintf(tries[ntry++], AM_MIRROR_LEN, "%s", s_mir[i]);
+        str_trunc(tries[ntry++], AM_MIRROR_LEN, s_mir[i]);
 
     int rc = -99;
+    bool have_builtin = false;
+    /* ★★★ 2026-10-17 linit: 先用【固件内置索引】铺底 —— 离线/网络不通也能看到应用列表 */
+    {
+        char mir[AM_MIRROR_MAX][AM_MIRROR_LEN];
+        int  mn = 0, pn = 0;
+        if (am_store_json_parse(STORE_INDEX_BUILTIN, s_rpkg, AM_RPKG_MAX, &pn,
+                                mir, AM_MIRROR_MAX, &mn) == 0) {
+            memcpy(s_mir, mir, sizeof(s_mir));
+            s_mir_n = mn; s_rpkg_n = pn;
+            have_builtin = true;
+            ESP_LOGI(TAG, "★ 内置索引已加载: %d 个包(离线可用)", pn);
+        } else {
+            ESP_LOGW(TAG, "内置索引解析失败(编译进固件的那份有问题)");
+        }
+    }
     for (int i = 0; i < ntry; i++) {
         char url[AM_MIRROR_LEN + 32];
         url3(url, sizeof(url), tries[i], "/index.json", NULL);
@@ -139,9 +160,46 @@ static void am_idx_task(void *arg) {
             int pr = am_store_json_parse(s_idx, s_rpkg, AM_RPKG_MAX, &pn,
                                          mir, AM_MIRROR_MAX, &mn);
             if (pr == 0) {
-                memcpy(s_mir, mir, sizeof(s_mir));
-                s_mir_n = mn;
+                /* ★★★ 2026-10-18 linit: **把拉到的索引缓存到 apps 安装分区**(SPIFFS /store) ✓
+                 *   ⇒ 下次开机/离线时优先读它 ⇒ 不用联网也能看到"上次联网的列表" ✓
+                 *   (以前只有编译进固件的内置索引 ⇒ 云端加了新应用, 离线就永远看不到) */
+                {
+                    FILE *fc = fopen("/store/index.json", "wb");
+                    if (fc) {
+                        size_t w = fwrite(s_idx, 1, (size_t)total, fc);
+                        fclose(fc);
+                        ESP_LOGI(TAG, "索引已缓存到 /store/index.json (%u B)", (unsigned)w);
+                    } else {
+                        ESP_LOGW(TAG, "索引缓存写入失败(SPIFFS 满? 无所谓, 用内置索引)");
+                    }
+                }
+                /* ★★★ 2026-10-17 修: 云端索引的 mirrors 可能来自 CDN 旧缓存(含已下线源) ⇒
+                 *   不能直接覆盖! 云端源打头, 再把**固件内置源**追加进来去重 ⇒
+                 *   旧缓存再也不会把设备带向死服务器。 */
+                int k = 0;
+                for (int a = 0; a < mn && k < AM_MIRROR_MAX; a++)
+                    str_trunc(s_mir[k++], AM_MIRROR_LEN, mir[a]);
+                for (int a = 0; a < os_sources_count() && k < AM_MIRROR_MAX; a++) {
+                    const char *u = os_sources_get(a);
+                    bool dup = false;
+                    for (int b = 0; b < k; b++) if (strcmp(s_mir[b], u) == 0) { dup = true; break; }
+                    if (!dup) snprintf(s_mir[k++], AM_MIRROR_LEN, "%s", u);
+                }
+                s_mir_n = k;
                 s_rpkg_n = pn;
+                /* ★★★ 2026-10-17: 云端索引解析出 0 个包 ⇒ 说明索引损坏/是旧格式(如 crc32 被写成数字),
+                 *   此时**回退到固件内置索引** —— 坏索引再也不会把商店清空。 */
+                if (pn == 0) {
+                    char mir2[AM_MIRROR_MAX][AM_MIRROR_LEN];
+                    int mn2 = 0, pn2 = 0;
+                    if (am_store_json_parse(STORE_INDEX_BUILTIN, s_rpkg, AM_RPKG_MAX, &pn2,
+                                            mir2, AM_MIRROR_MAX, &mn2) == 0 && pn2 > 0) {
+                        s_rpkg_n = pn2;
+                        memcpy(s_mir, mir2, sizeof(s_mir));
+                        s_mir_n = mn2;
+                        ESP_LOGW(TAG, "云端索引 0 个包(格式异常) ⇒ 已回退内置索引: %d 个包", pn2);
+                    }
+                }
                 ESP_LOGI(TAG, "索引 OK: %d 个包, %d 个镜像源, 跳过 %d 条",
                          s_rpkg_n, s_mir_n, am_store_json_skipped());
                 rc = 0;
@@ -151,7 +209,8 @@ static void am_idx_task(void *arg) {
             ESP_LOGD(TAG, "索引解析失败 rc=%d (跳过 %d 条)", pr, am_store_json_skipped());
         }
     }
-    if (rc == 0) {
+    if (rc == 0 || have_builtin) {     /* ★ 有内置索引 ⇒ 即使网络全挂也进 READY(离线商店) */
+        if (rc != 0) ESP_LOGW(TAG, "云端索引失败, 使用内置索引(离线模式)");
         __sync_synchronize();          /* 先写完数据, 再放状态 */
         s_state = ARS_READY;
     } else {
@@ -171,21 +230,82 @@ static void am_idx_task(void *arg) {
 static volatile bool     s_retry_wait;
 static volatile uint32_t s_retry_ms;
 
+/* ★ 2026-10-18: 距上次索引刷新是否已过 60 秒(且当前没在拉) */
+bool am_rstore_refresh_due(void) {
+    if (s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) return false;
+    static int64_t last_ms = 0;
+    int64_t now = esp_timer_get_time() / 1000;
+    if (last_ms == 0 || now - last_ms > 60000) { last_ms = now; return true; }
+    return false;
+}
+/* ★ 强制重新拉一次索引(后台, 不阻塞; 失败不清旧数据) */
+void am_rstore_refresh_force(void) {
+    s_fetched = false;
+    s_retry_wait = false;
+    am_rstore_prefetch();
+}
+
 void am_rstore_prefetch(void) {
     if (s_fetched || s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) return;
     /* ★ 失败退避: 上电/服务器抖动导致第一次没拉到 → 隔 RETRY_MS 再试, 不必重启 */
     if (s_retry_wait &&
         (uint32_t)(esp_timer_get_time() / 1000) - s_retry_ms < RETRY_MS) return;
+    /* ★★★ 2026-10-18 linit: **没联网也要有列表!**
+     *   原来 WiFi 判断在加载内置索引之前 ⇒ 离线直接 return ⇒ 商店一片空白 ✗
+     *   现在先把**固件内置索引**装上(离线可浏览 8 个应用), 再判断要不要联网刷新 ✓ */
+    if (s_rpkg_n == 0) {
+        char mir[AM_MIRROR_MAX][AM_MIRROR_LEN];
+        int  mn = 0, pn = 0;
+        bool got = false;
+
+        /* ★★★ 2026-10-18 linit: **优先用 apps 分区里的缓存索引**(上次联网拉到的) ——
+         *   离线/没网也能看到最新应用列表 ✓ 缓存坏了/不存在再退回固件内置 ✓ */
+        FILE *fc = fopen("/store/index.json", "rb");
+        if (fc) {
+            size_t n = fread(s_idx, 1, AM_IDX_MAX - 1, fc);
+            fclose(fc);
+            s_idx[n] = 0;
+            if (n > 16 && am_store_json_parse(s_idx, s_rpkg, AM_RPKG_MAX, &pn,
+                                              mir, AM_MIRROR_MAX, &mn) == 0) {
+                memcpy(s_mir, mir, sizeof(s_mir));
+                s_mir_n = mn; s_rpkg_n = pn;
+                got = true;
+                ESP_LOGI(TAG, "★ 离线: 已用**上次联网缓存**索引 %d 个包(/store/index.json %u B)",
+                         pn, (unsigned)n);
+            }
+        }
+        if (!got && am_store_json_parse(STORE_INDEX_BUILTIN, s_rpkg, AM_RPKG_MAX, &pn,
+                                        mir, AM_MIRROR_MAX, &mn) == 0) {
+            memcpy(s_mir, mir, sizeof(s_mir));
+            s_mir_n = mn; s_rpkg_n = pn;
+            ESP_LOGI(TAG, "★ 离线: 已启用内置索引 %d 个包", pn);
+        }
+    }
     if (!wifi_manager_is_connected()) return;   /* ★ 见文件头 ①: 没联网一律不发请求 */
     s_retry_wait = false;
     s_fetched = true;
     s_state = ARS_FETCHING;
     /* 任务栈必须内部 RAM (TLS 会短暂禁中断; 8KB 与 luat_lib_net 的 fetch 任务同规格) */
-    if (xTaskCreatePinnedToCore(am_idx_task, "am_idx", 8192, NULL, 4, NULL, 0) != pdPASS) {
+    /* ★ 2026-10-18: 栈 8192 → **6144**(TLS 握手实测够用) ——
+     *   内部 RAM 紧张时 8KB 任务会创建失败 ⇒ 索引永远拉不到 ✓ */
+    /* 栈 6144 → 12288: 拉索引这条链路要容纳 net_client(HTTP+TLS 已不算)
+     *   + json 解析 + 两三份 mir[][] 局部表, 6144 实测启动即栈溢出 panic。 */
+    if (xTaskCreatePinnedToCore(am_idx_task, "am_idx", 12288, NULL, 4, NULL, 0) != pdPASS) {
         ESP_LOGD(TAG, "索引任务创建失败(内存不足)");
         s_state = ARS_FAIL;
         s_fetched = false;
     }
+}
+
+/* ★ 2026-10-17 linit: 清掉商店缓存(索引/镜像/包列表), 下次进商店会重新拉取。
+ *   入口: 应用商店左栏"商店"图标长按 3 秒。 */
+void am_rstore_clear_cache(void) {
+    s_fetched    = false;
+    s_retry_wait = false;
+    s_state      = ARS_IDLE;
+    s_rpkg_n     = 0;
+    s_mir_n      = 0;
+    ESP_LOGI(TAG, "商店缓存已清空(用户长按), 下次请求将重新拉取索引");
 }
 
 int am_rstore_state(void) { return s_state; }
@@ -217,7 +337,33 @@ void am_rstore_ack(void) {
 /* crc32 已移到 net_client (netc_crc32): 下载时 want_crc=true, 收完直接比 —— 
  * 全工程共用同一份实现, 保证与 tools/store_build.py 的 binascii.crc32 一致。 */
 
+/* ★★★ 2026-10-17: 包文件名可能是中文(linit 定: 用文件名做应用显示名) ⇒
+ *   拼 URL 前必须百分号编码 —— esp_http_client 不做编码, 直接把 UTF-8 塞进 URL 会 400/404。 */
+static void am_url_encode(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < cap; p++) {
+        unsigned char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = "0123456789ABCDEF"[c >> 4];
+            out[o++] = "0123456789ABCDEF"[c & 0x0F];
+        }
+    }
+    out[o] = 0;
+}
+
 /* ==================== 后台: 下载一个包 ==================== */
+/* 解包进度 0..1000 → 总进度 70%..100% */
+static void am_asset_prog_70200(int permille)
+{
+    if (permille < 0) permille = 0;
+    if (permille > 1000) permille = 1000;
+    s_permille = 700 + permille * 300 / 1000;
+}
+
 static void am_dl_task(void *arg) {
     int idx = (int)(intptr_t)arg;
     const am_rpkg_t *pk = &s_rpkg[idx];
@@ -228,20 +374,35 @@ static void am_dl_task(void *arg) {
 
     /* 目标目录: 优先 TF 卡 (不占宝贵的 4MB SPIFFS; 且写卡不受"禁 flash cache"影响),
      * 没插卡才退回 SPIFFS 根 —— 与 am_store.c 的两个扫描源一一对应。 */
+    /* ★ 2026-10-25: 资源包 (type=asset) 不落"商店源目录", 直接落 TF 卡根,
+     *   下完就地解到 target, 解完删 zip —— 它不是一个可安装的 .lua。 */
+    const bool is_asset = (strcmp(pk->type, "asset") == 0);
     const bool to_sd = sd_is_mounted();
     const char *dir = to_sd ? AM_SRC_SD : AM_SRC_SPIFFS;
     if (to_sd) mkdir(AM_SRC_SD, 0777);
     char dst[192];
-    snprintf(dst, sizeof(dst), "%s/%s.lua", dir, pk->name);
-    ESP_LOGI(TAG, "下载 %s -> %s (%u B)", pk->name, dst, (unsigned)pk->size);
+    if (is_asset) {
+        const char *base = strrchr(pk->path, '/');
+        base = base ? base + 1 : pk->path;
+        snprintf(dst, sizeof(dst), "/sdcard/%s", base);
+    } else {
+        snprintf(dst, sizeof(dst), "%s/%s.lua", dir, pk->name);
+    }
+    ESP_LOGI(TAG, "下载 %s -> %s (%u B)%s", pk->name, dst, (unsigned)pk->size,
+             is_asset ? " [资源包]" : "");
 
-    int rc = 0;   /* 0=OK 1=HTTP 2=连接 3=写盘 4=校验 */
+    /* ★★★ 2026-10-17 修: 初值必须非 0 —— 否则下面的"重试循环"一次都不进(死了一个源就整体失败) */
+    int rc = 9;   /* 9=未尝试 / 0=OK 1=HTTP 2=连接 3=写盘 4=校验 */
     uint32_t crc = 0;
     int total = 0, status = 0;
 
-    for (int i = 0; i < s_mir_n && rc == 0; i++) {
-        char url[AM_MIRROR_LEN + 128];
-        url3(url, sizeof(url), s_mir[i], "/", pk->path);
+    /* ★★★ 2026-10-17 修: 原为 `rc == 0`(只要成功就继续) ⇒ 逻辑反了:
+     *   第一个镜像失败后循环立刻退出, 永不重试后续镜像。改为 `rc != 0`(失败才继续试下一个)。 */
+    for (int i = 0; i < s_mir_n && rc != 0; i++) {
+        char url[AM_MIRROR_LEN + 256];
+        char enc[224];
+        am_url_encode(pk->path, enc, sizeof(enc));   /* ★ 中文文件名 ⇒ %XX */
+        url3(url, sizeof(url), s_mir[i], "/", enc);
         if (i > 0) ESP_LOGD(TAG, "换源重试: %s", url);
 
         /* ★ 2026-10-15 联网收口: 流式落盘 + crc32 全交给 net_client;
@@ -254,9 +415,18 @@ static void am_dl_task(void *arg) {
         if (!netc_start(&r)) { rc = 2; break; }  /* 客户端忙 → 当连接失败 */
         s_permille = 0;
         uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
-        while (netc_busy() && (uint32_t)(esp_timer_get_time() / 1000) - t0 < 180000) {
+        /* 资源包动辄 20MB+, 180s 不够 (Wi-Fi 200KB/s ⇒ 26MB 约 130s, 余量太小),
+         * 给 asset 单独放宽到 10 分钟; 普通 .lua 包仍是 180s。 */
+        const uint32_t dl_limit_ms = is_asset ? 600000u : 180000u;
+        while (netc_busy() && (uint32_t)(esp_timer_get_time() / 1000) - t0 < dl_limit_ms) {
             int g = netc_got();
-            if (pk->size > 0) s_permille = (int)((int64_t)g * 1000 / (int64_t)pk->size);
+            /* ★ 2026-10-25 linit: 资源包把进度条按 7:3 切开 ——
+             *   下载只走 0..70%, 剩下 30% 留给"解压安装", 到 100% 才是真完成。
+             *   普通 .lua 包仍按 0..100% (下载完即装完)。 */
+            if (pk->size > 0) {
+                int span = is_asset ? 700 : 1000;
+                s_permille = (int)((int64_t)g * span / (int64_t)pk->size);
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         status = netc_http(); total = netc_len(); crc = netc_crc32();
@@ -276,22 +446,58 @@ static void am_dl_task(void *arg) {
         remove(dst);      /* 不许留半个包在商店源目录里 (会被当成"待安装") */
         s_dl_err = rc;
         s_permille = -1;
-        ESP_LOGD(TAG, "下载失败 rc=%d (%s)", rc, dst);
+        ESP_LOGW(TAG, "下载失败 rc=%d (%s)", rc, dst);
+        /* ★★★ 2026-10-18 修: 失败也必须**清掉"正在下载"的名字** ——
+         *   否则列表那行永远停在"下载中" ✗ (linit 报"一直显示下载中无法下载") */
+        s_dl_name[0] = 0;
         __sync_synchronize();
         s_state = ARS_DLFAIL;
     } else {
         s_permille = 1000;
         ESP_LOGI(TAG, "下载完成: %s (%d B)", dst, total);
-        __sync_synchronize();
-        s_state = ARS_OK;
+        /* ★★★ 2026-10-18 修顺序: **先用名字去自动安装, 再清空** ——
+         *   之前先清 s_dl_name 再用 ⇒ fn 变成 ".lua" ⇒ 永远装不上 ✗ */
+        if (is_asset) {
+            /* 资源包: 就地解压到 target, 完事删掉 zip (TF 卡省空间)
+             * ★ 解压阶段把进度从 70% 接到 100% (回调里映射) */
+            s_permille = 700;
+            bool ok = am_asset_install_cb(dst, pk->target, am_asset_prog_70200);
+            ESP_LOGI(TAG, "资源包解包 %s → %s : %s", dst, pk->target, ok ? "OK" : "失败");
+            remove(dst);
+            s_dl_name[0] = 0;
+            __sync_synchronize();
+            s_state = ok ? ARS_OK : ARS_DLFAIL;
+            if (!ok) { s_permille = -1; vTaskDelete(NULL); return; }
+        } else {
+            extern bool am_store_auto_install(const char *fname);
+            char nm[48], fn[56];
+            snprintf(nm, sizeof(nm), "%s", s_dl_name);
+            if (nm[0]) {
+                snprintf(fn, sizeof(fn), "%s.lua", nm);
+                if (am_store_auto_install(fn)) ESP_LOGI(TAG, "已自动安装: %s", fn);
+                else                           ESP_LOGW(TAG, "自动安装失败: %s", fn);
+            }
+            s_dl_name[0] = 0;   /* 装完再清 ⇒ 列表第二行从"下载中"恢复成应用说明 ✓ */
+            __sync_synchronize();
+            s_state = ARS_OK;
+        }
     }
     vTaskDelete(NULL);
 }
 
 bool am_rstore_dl_start(int i) {
-    if (i < 0 || i >= s_rpkg_n) return false;
-    if (s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) return false;
-    if (!wifi_manager_is_connected()) return false;
+    if (i < 0 || i >= s_rpkg_n) {
+        ESP_LOGW(TAG, "dl_start 拒绝: 索引越界 i=%d rpkg_n=%d", i, s_rpkg_n);
+        return false;
+    }
+    if (s_state == ARS_FETCHING || s_state == ARS_DOWNLOADING) {
+        ESP_LOGW(TAG, "dl_start 拒绝: 状态忙 state=%d (1=正在刷索引 4=正在下载)", s_state);
+        return false;
+    }
+    if (!wifi_manager_is_connected()) {
+        ESP_LOGW(TAG, "dl_start 拒绝: WiFi 未连接");
+        return false;
+    }
     s_permille = -1;
     s_state = ARS_DOWNLOADING;
     if (xTaskCreatePinnedToCore(am_dl_task, "am_dl", 8192, (void *)(intptr_t)i, 4, NULL, 0) != pdPASS) {

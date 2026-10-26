@@ -28,17 +28,26 @@ typedef enum {
 } sd_mnt_state_t;
 
 const char *sd_get_cid_name(void);        /* 卡的 CID 卡名 (出厂固化), 无卡返回 "-" */
+/* ★ 2026-10-18: CID 的 name 是**出厂型号名**(很多 4G 卡就写 "SD16G"), 不是容量 —— UI 别拿它当容量。
+ *   要显示"品牌 + 真实容量"用下面两个。 */
+const char *sd_get_vendor_str(void);      /* 按 CID MID 推断品牌 (SanDisk/Samsung/...), 未知返回 "通用卡" */
+uint64_t    sd_get_size_bytes(void);      /* 卡原始容量 (字节), 无卡返回 0 */
 sd_mnt_state_t sd_get_mnt_state(void);
 const char *sd_get_mnt_state_str(void);   /* 中文短句 (已挂载/卡无响应/exFAT 不支持/无文件系统) */
 
 /* 重新挂载 TF 卡: 换卡/插卡后不必重启 (SD Watcher 的自动补挂是禁用状态) */
 esp_err_t sd_remount(void);
 
-/* 扫描 /sdcard/gam/ 下所有 .gam 文件 (文曲星游戏)
+/* 挂载门闸: 开机挂载是异步任务, 任何"要读 /sdcard"的页面在首次 opendir 前先过这道闸 ——
+ * 已挂载立刻返回; 正在挂载则最多等 wait_ms; retry=true 时还没挂上会补挂一次。
+ * 返回是否已挂载。⚠ 有阻塞, 只在页面入口/首次扫描用, 别放渲染循环里。 */
+bool sd_wait_ready(uint32_t wait_ms, bool retry);
+
+/* 扫描 /sdcard/roms/gam/ 下所有 .gam 文件 (文曲星游戏)
  * 写入 out (去后缀), 返回文件数 */
 int scan_bbk_games(char out[][64], int max_out);
 
-/* 扫描 /sdcard/gam/ 下的子文件夹名 (按字母序, 跳过 . 和 ..)
+/* 扫描 /sdcard/roms/gam/ 下的子文件夹名 (按字母序, 跳过 . 和 ..)
  * 返回文件夹数 (>=0), 写入 out (每个名字 <= 63 字节 + NUL)
  * 失败 (无 SD 卡, 目录不存在) 返回 0 */
 int scan_bbk_folders(char out[][64], int max_out);
@@ -48,7 +57,7 @@ int scan_bbk_folders(char out[][64], int max_out);
  * 失败 (无 SD 卡, 目录不存在) 返回 0 */
 int scan_bbk_games_in_folder(const char *folder_name, char out[][64], int max_out);
 
-/* V1.0.46: GB 分栏菜单 (与电子词典一致) — 扫描 /sdcard/gb/ 下的子文件夹名 */
+/* V1.0.46: GB 分栏菜单 (与电子词典一致) — 扫描 /sdcard/roms/gb/ 下的子文件夹名 */
 int scan_gb_folders(char out[][64], int max_out);
 /* V1.0.46: 扫描指定 GB 子目录下的 .gb/.gbc 文件 (ext: ".gb" 或 ".gbc"; folder_name 为 NULL/"" 时扫描 /sdcard/gb) */
 int scan_gb_games_in_folder(const char *folder_name, const char *ext, char out[][64], int max_out);
@@ -62,7 +71,7 @@ int scan_platform_games(const char *dir_path, const char *folder_name, const cha
 const char *platform_game_path(const char *dir_path, const char *folder_name, int idx,
                                const char *ext, char *out, size_t out_size);
 
-/* 扫描 /sdcard/gb/ 下的 .gb 文件 (GB 模拟器)
+/* 扫描 /sdcard/roms/gb/ 下的 .gb 文件 (GB 模拟器)
  * 返回文件数 (>=0), 写入 out (每个名字去后缀)
  * 失败 (无 SD 卡, 目录不存在) 返回 0 */
 int scan_gb_games(char out[][64], int max_out);
@@ -142,7 +151,7 @@ typedef struct {
 } file_entry_t;
 
 /* 扫描任意路径下的文件和目录
- * - path: 绝对路径, e.g. "/sdcard", "/sdcard/gam"
+ * - path: 绝对路径, e.g. "/sdcard", "/sdcard/roms/gam"
  * - out: 输出数组
  * - max_out: 最大输出项数
  * 返回: 实际写入项数 (0 = 路径不存在或空)
@@ -150,7 +159,7 @@ typedef struct {
  * 不递归, 只扫当前层 */
 int scan_path(const char *path, file_entry_t *out, int max_out);
 
-/* 扫描屏保图片目录 /sdcard/screensaver/
+/* 扫描屏保图片目录 /sdcard/media/screensaver/
  * 返回文件路径列表, 支持 .bmp, .jpg, .jpeg, .png, .gif */
 int scan_screensaver_images(char paths[][128], int max_paths);
 

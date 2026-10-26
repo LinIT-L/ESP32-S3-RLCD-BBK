@@ -245,8 +245,7 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
      * 自驱动全屏引擎/弹窗下层, toast 由 overlay 绘制, 底层不处理 → 这里统一兜底即时关. */
     if (os_dialog_toast_active()) {
         if (a != OS_ACTION_HOME) {
-            os_dialog_toast_clear();
-            ctx->needs_redraw = true;
+            os_dialog_toast_dismiss(ctx);   /* 一并收掉 toast 开的弹窗页, 否则下层页会被下一次 BACK 关掉 */
             return;
         }
     }
@@ -337,7 +336,7 @@ bool os_handle_touch(ui_ctx_t *ctx, int x, int y)
     if (ctx->map_touch) ctx->map_touch(&x, &y);
     /* V1.6.x: 提示弹窗(单独 toast)显示时, 任意触摸点击先关闭它 (不落到底层模块) */
     if (os_dialog_toast_active()) {
-        os_dialog_toast_clear();
+        os_dialog_toast_dismiss(ctx);
         ctx->needs_redraw = true;
         return true;
     }
@@ -435,6 +434,35 @@ void os_tick(ui_ctx_t *ctx)
  * 注: 历史上曾有一根"跟手"黑色指示横条 (draw_back_gesture_hint), 用户明确表示不需要显示,
  * 已于 2026-09-20 删除 —— 上滑返回手势本身保留, 仅不再画提示条. */
 
+/* === 性能统计 (2026-10-24): 给 remcon fps 用 === */
+static uint32_t s_frames_total = 0;
+static uint64_t s_acc_us = 0;
+static uint32_t s_acc_n = 0;
+static uint32_t s_avg_us = 0;
+static uint32_t s_last_draw_us = 0;
+static uint32_t s_last_flush_us = 0;
+/* 帧间隔抖动: 平均耗时好看但偶发 40ms 卡顿最影响"顺不顺"的手感,
+ * 所以额外记最大间隔 + 超过 30ms 的帧数(掉帧次数)。 */
+static uint32_t s_max_gap_us = 0;
+static uint32_t s_slow_frames = 0;
+static uint32_t s_last_frame_end_us = 0;
+
+void os_get_frame_gap(uint32_t *max_gap_us, uint32_t *slow_frames, uint32_t *last_frame_us)
+{
+    if (max_gap_us)   *max_gap_us = s_max_gap_us;
+    if (slow_frames)  *slow_frames = s_slow_frames;
+    if (last_frame_us) *last_frame_us = s_last_draw_us + s_last_flush_us;
+}
+void os_reset_frame_gap(void) { s_max_gap_us = 0; s_slow_frames = 0; s_last_frame_end_us = 0; }
+
+void os_get_render_stats(uint32_t *frames, uint32_t *avg_us, uint32_t *last_draw_us, uint32_t *last_flush_us)
+{
+    if (frames)        *frames = s_frames_total;
+    if (avg_us)        *avg_us = s_avg_us;
+    if (last_draw_us)  *last_draw_us = s_last_draw_us;
+    if (last_flush_us) *last_flush_us = s_last_flush_us;
+}
+
 void os_render(ui_ctx_t *ctx)
 {
     /* 屏保: 渲染交给独立监视任务(强制最高级, 不被主循环/游戏阻塞), 此处仅保持
@@ -445,11 +473,24 @@ void os_render(ui_ctx_t *ctx)
     if (ss_now) { ctx->needs_redraw = true; s_prev_ss = true; return; }
     uint32_t nowms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (s_prev_ss) { s_wake_ms = nowms; s_prev_ss = false; }
-    /* ★ 2026-10-02: 唤醒后**持续**强制重绘 200ms, 不再只靠"退出那一帧"的边沿。
-     *   原因: 屏保监督任务(另一核)可能在唤醒瞬间还画了一帧星空, 把边沿那一帧的页面盖掉
-     *   → 用户看到"按一次键画面定住, 要按第二次才返回"。这里给一个保护窗口兜底。 */
-    bool woke_up = (s_wake_ms != 0) && ((uint32_t)(nowms - s_wake_ms) < 200u);
+    /* ★ 唤醒后**持续**强制重绘 1 秒, 不再只靠"退出那一帧"的边沿。
+     *   原因: 屏保监督任务在另一核(52ms 一帧), 它那一帧可能落在窗口之后 ——
+     *   那一帧会把屏幕刷成壁纸, 而此时 needs_redraw 已是 false ⇒ 没人再画,
+     *   屏幕就停在"最后一张壁纸", 必须再摸一下才回到菜单。
+     *   窗口从 200ms 提到 1000ms: 覆盖监督任务最长的一个整轮(含它 250ms 的空闲分支)。
+     *   代价只是唤醒后多画 1 秒(同一画面, 指纹相同会被跳过送屏)。 */
+    bool woke_up = (s_wake_ms != 0) && ((uint32_t)(nowms - s_wake_ms) < 1000u);
     if (!ctx->needs_redraw && !woke_up) return;
+
+    /* ★★★ 2026-10-25 linit「主界面不够流畅，保持 16fps 但要丝滑」:
+     *   帧率上限**放在这里**做"跳过"，不在 st7305_flush 里 vTaskDelay 等待。
+     *   以前的等待会阻塞主循环最长 62ms —— 滑动时输入处理和下一帧都被推迟，手感发滞。
+     *   现在: 距上一帧不足 62ms 就本轮不画(needs_redraw 保持 true, 下一轮必画), 
+     *   输入/滚动每轮都在跑 ⇒ 16fps 匀速, 但操作跟手。
+     *   屏保/唤醒那 1 秒的强制重绘不受限(帧内容相同, 送屏会被忽略)。 */
+    /* ★ 2026-10-25 linit「非常卡 不要限制了」⇒ 这里不再按 16fps 跳过。
+     *   UI 本来就是"有变化才重绘", 自己就会限流; 再硬性跳过反而丢帧、显得卡。
+     *   (驱动层同样已解除限速。) */
     if (!ctx->lcd) return;
 
     const os_module_t *m = os_cur_mod();
@@ -489,7 +530,9 @@ void os_render(ui_ctx_t *ctx)
      * 普通页面上的 modal 弹窗(存储/设置菜单等)不隐藏状态栏 —— 弹窗是 350×250 居中,
      * 与顶部 24px 状态条不重叠, 保留系统栏信息(时间/电量)更符合预期.
      * 注: "弹窗叠在全屏页之上"的情况已由上面的 pm->fullscreen 判定置 fullscreen=true 覆盖. */
-    if (!fullscreen) {
+    /* ★ 滚动期间不重画状态栏: 时间/电量/信号都没变，每帧重画纯属浪费。 */
+    extern bool os_dialog_scrolling(void);
+    if (!fullscreen && !os_dialog_scrolling()) {
         /* 状态栏显隐状态机日志: 仅在显↔隐翻转时打一行, 供排查"状态栏消失"
          * (区分全屏门控的正常隐藏 vs 异常隐藏). */
         static bool s_sb_prev = true;
@@ -519,7 +562,22 @@ void os_render(ui_ctx_t *ctx)
         uint64_t t_now = (uint64_t)esp_timer_get_time();
         uint64_t d_frame = t_now - t_frame0;
         uint64_t d_flush = t_now - t_flush0;
-        if (d_frame >= 50000)
+        /* 统计 (供 remcon fps 查看真实帧率/帧耗时) */
+        if (s_last_frame_end_us) {
+            uint32_t gap = (uint32_t)(t_now - s_last_frame_end_us);
+            if (gap > s_max_gap_us) s_max_gap_us = gap;
+            if (gap > 30000) s_slow_frames++;
+        }
+        s_last_frame_end_us = (uint32_t)t_now;
+        s_frames_total++;
+        s_acc_us += d_frame;
+        s_last_draw_us = d_frame - d_flush;
+        s_last_flush_us = d_flush;
+        if (++s_acc_n >= 64) {
+            s_avg_us = (uint32_t)(s_acc_us / s_acc_n);
+            s_acc_us = 0; s_acc_n = 0;
+        }
+        if (d_frame >= 20000)   /* 临时: 20ms 以上都打, 用于定位弹窗拖动卡 */
             ESP_LOGD(TAG, "render 慢: 总 %llu us = 绘制 %llu + flush %llu (page=%d %s)",
                      d_frame, d_frame - d_flush, d_flush, ctx->current_page, m ? m->name : "-");
     }

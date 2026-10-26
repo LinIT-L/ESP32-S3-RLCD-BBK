@@ -95,12 +95,8 @@ extern const vib_pattern_t VIB_PAT_RAMP_DOWN;  /* 渐弱 */
 extern const vib_pattern_t VIB_PAT_ALARM;      /* 闹铃: 无限循环 */
 extern const vib_pattern_t VIB_PAT_CLICK;       /* 按键模拟: 按下+释放双脉冲 (苹果触控板式) */
 
-/* V1.4.x: 按键模拟 — 触摸点击时用 CLICK 双脉冲模拟机械按键"按下/释放"手感.
- * 由设置页"声音震动 → 按键模拟"开关控制 (NVS 由设置页持久化). */
-void vibrator_set_key_sim(bool en);
-bool vibrator_key_sim_enabled(void);
-/* 点击反馈统一入口 (触摸点击判定处调用): 开启按键模拟 → CLICK 双脉冲,
- * 关闭 → 保持普通 UI tap. 遵循 UI 震动开关. */
+/* 点击反馈 (触摸点击判定处调用): 归 **UI 震动** 通道 (2026-10-24: 原独立的
+ * "触摸反馈"开关已合并进来) —— 关掉 UI 震动, 点击就确实不震. */
 void vibrator_click(void);
 
 /* 是否已初始化 (任一种驱动就绪). */

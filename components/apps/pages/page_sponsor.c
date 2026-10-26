@@ -6,7 +6,7 @@
  */
 #include "os.h"
 #include "ui_common.h"
-#include "sponsor_qr.inc"   /* 收款码位图: QR_W/H + s_qr_bitmap */
+#include "sponsor_qr.inc"   /* 收款码位图: QR_W/H + sponsor_icon_qr_300 */
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -18,7 +18,7 @@ static void p_sponsor_render(ui_ctx_t *ctx) {
     st7305_clear(lcd, ST7305_COLOR_WHITE);
     /* 全屏 1:1 显示收款码 (与旧版一致: 400x300 屏, 300x300 居中 (50,0)) */
     st7305_draw_bitmap_1bit(lcd, (UI_SCREEN_W - QR_W) / 2,
-                            (UI_SCREEN_H - QR_H) / 2, QR_W, QR_H, s_qr_bitmap);
+                            (UI_SCREEN_H - QR_H) / 2, QR_W, QR_H, sponsor_icon_qr_300);
 }
 
 static void sponsor_tap(ui_ctx_t *ctx);   /* fwd: 5 连点切换 */

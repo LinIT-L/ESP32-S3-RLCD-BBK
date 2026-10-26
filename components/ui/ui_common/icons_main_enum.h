@@ -9,7 +9,7 @@
 #define MAIN_ICON_W 64
 #define MAIN_ICON_H 64
 #define MAIN_ICON_BYTES ((64*64)/8)
-#define MAIN_ICON_COUNT 37
+#define MAIN_ICON_COUNT 40
 
 typedef enum {
     ICON_APP_MGR = 0,
@@ -49,6 +49,9 @@ typedef enum {
     ICON_SDR = 34,
     ICON_BIOSSIM = 35,
     ICON_PLANERADAR = 36,
+    ICON_BILI = 37,
+    ICON_GITHUB = 38,
+    ICON_PAL = 39,          /* 仙剑奇侠传 (复用 NPE 空出的 39 号槽: NPE 引擎已删除) */
 } icon_id_t;
 
 #endif /* ICONS_MAIN_ENUM_H */

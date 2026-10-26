@@ -5,6 +5,7 @@
  *        → 1bpp 缓存 (160*96/8 = 1920 bytes) → 直接 blit 到 ST7305 fb
  */
 #include "gam4980_emu.h"
+#include "vid_tune.h"
 #include "libretro.h"
 #include "cheater.h"
 #include "cheat_float.h"
@@ -753,6 +754,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
         }
         virtual_keys_draw(g_lcd);   /* V1.0.68 fix: 补画屏幕虚拟按键 */
         bool takeover = cheat_float_overlay_tick(g_lcd);  /* 独立修改机插件: 浮标+热键/点按呼出 */
+        if (!takeover) vid_tune_overlay_tick(g_lcd);      /* 画面优化器浮标/面板 */
         if (!takeover) st7305_flush(g_lcd);               /* 触发接管则本帧不再送屏 */
     } else {
         /* 点对点模式: 清空整个 fb 为白色 */
@@ -828,7 +830,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
             if (s_statusbar_cb) s_statusbar_cb(g_lcd, g_status_battery, g_status_pad_connected);
         }
         virtual_keys_draw(g_lcd);   /* V1.0.68 fix: 补画屏幕虚拟按键 */
-        if (!cheat_float_overlay_tick(g_lcd)) st7305_flush(g_lcd);  /* 独立修改机插件: 浮标+呼出, 接管则本帧不送屏 */
+        if (!cheat_float_overlay_tick(g_lcd)) { vid_tune_overlay_tick(g_lcd); st7305_flush(g_lcd); }  /* 独立修改机插件: 浮标+呼出, 接管则本帧不送屏 */
     }
 }
 
@@ -1692,7 +1694,7 @@ void gam4980_emu_unload(void) {
 /* === 游戏存档持久化 (SD 卡) ===
  * 解决用户反馈: "游戏退出后再进入能看到进度, 但重启后丢失"
  * 原因: 之前完全没把 PSRAM 的 sys_flash 存档区写回 SD 卡, 重启 PSRAM 数据丢失.
- * 修复: 退出游戏时把真正的存档区 (32KB) 写入 /sdcard/dict/<romname>.sav,
+ * 修复: 退出游戏时把真正的存档区 (32KB) 写入 /sdcard/data/saves/<romname>.sav,
  *       进入游戏时 (retro_load_game 之后) 从该文件恢复.
  * 大小: 0x8000 = 32768 字节 = sys_flash[0x0000..0x7FFF] (游戏视角 0x1F8000-0x1FFFFF
  *       旋转后区域, libretro 注释为 "last 32 KiB for save file").
@@ -1701,7 +1703,7 @@ void gam4980_emu_unload(void) {
  * 历史问题 (V1.0.7 及之前): 曾用 0x14000 (80KB) 3 段拼接, 但 libretro 视角的"非存档
  *   段 2/段 3"实际对应 sys_flash[0x8000+] 游戏数据区, 保存/恢复时会破坏游戏数据,
  *   导致重启后游戏卡死 (BRK) 且进度看似丢失. 修复: 缩小到真正只有存档的 32KB. */
-#define SAVE_DIR          "/sdcard/dict"
+#define SAVE_DIR          "/sdcard/data/saves"
 #define SAVE_SIZE         0x8000      /* 32KB, 真正的用户存档区 (修正: 之前 0x14000 有 bug) */
 #define SAVE_MAGIC        0x53415645  /* 'SAVE' 魔数, 验证文件类型 */
 

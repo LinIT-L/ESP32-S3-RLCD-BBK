@@ -1,19 +1,15 @@
 # Name,     Type, SubType,  Offset,   Size,     Flags
-# ESP32-S3 16MB Flash - 模块化 OS 存储方案 (布局 2026-09-22 定案)
-# 布局: 单固件区 + 系统nvs(合并core_db) + 数据区 + 应用安装区
-#   nvs     = 系统nvs与核心互通数据库合并, 统一256KB (金币/经验/玩家档案等核心小KV; app.db 走此 nvs)
+# ESP32-S3 16MB Flash — 单固件 + 系统nvs + 数据区 + 应用安装区
+#   nvs     = 系统 nvs + 核心库合并, 256KB (设置/凭据/板型/玩家档案)
 #   phy_init= RF 校准参数 4KB (保留不动, 必需)
-#   factory = 系统固件 5MB (os 内核/驱动/模拟器/MAC厂商库/LVGL; 实测 4.04MB, 余 ~1MB)
-#   appdata = 统一数据区 6.3125MB (永不擦写; 字库/8.BIN/E.BIN 按 label 相对 mmap, base 平移安全)
-#   apps    = 应用安装区 4MB (SPIFFS; 装 Lua 应用+游戏存档/ROM; 固定开销 360KB, 可用 ≈3.65MB)
+#   factory = 系统固件 5MB (os/驱动/模拟器/页面; 2026-10-24 实测 3.72MB, 余 26%)
+#   appdata = 统一数据区 6.625MB (永不擦写; 字库按 label 相对 mmap, base 平移安全)
+#   apps    = 应用安装区 4MB (SPIFFS; Lua 应用+存档/ROM; 固定开销 360KB, 可用 ≈3.65MB)
 #
-# 2026-09-22 定案 (见 docs/固件占用审计与空间规划.md):
-#   ① 原 apps 5.625MB 只用了 7.9%, 而 factory 4MB 只剩 247.6KB, 连 MAC OUI 厂商库(287.5KB)都放不下;
-#   ② 最终 factory=5MB(接裁剪版 LVGL 够用) / apps=4MB(装应用与 ROM 足够) / 多余的全给 appdata。
-#   历史: 曾为省 flash 把 OUI 库摘成空桩, 现已接回 (os_net_mac_vendor → macoui_lookup)。
-# 需要重烧整机; font_part.h 用 appdata **相对**偏移、lua_launch.c 用 **label** → 均无需改。
+# ⚠ 出厂 apps 为空 —— Lua 应用一律装到 TF 卡 /sdcard/apps/<分类>/ (见 am_store.c)。
+#
 # SubType 0x40 = raw (custom data partition)
-# ⚠ 改本文件后无需改 merge_flash.sh / tools/sync_apps.py —— 二者已改为**本表自动解析偏移与大小**。
+# ⚠ 改本文件后无需改 merge_flash.sh / tools/sync_apps.py —— 二者按本表自动解析偏移与大小。
 nvs,      data, nvs,     0x10000, 0x40000,
 phy_init, data, phy,     0x50000, 0x1000,
 factory,  app,  factory, 0x60000, 0x500000,

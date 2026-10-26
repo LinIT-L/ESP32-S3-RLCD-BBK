@@ -208,7 +208,9 @@ static int l_net_ping(lua_State *L) {
  *   net_client 的**单请求槽**天然实现了原来那句"同一时刻只允许一个请求"。 */
 #define NET_BODY_MAX  (128 * 1024)   /* 内存落点上限: 地图索引 fj.json 有 47KB */
 /* ★ PSRAM: 纯 socket 读, 无 DMA/无禁 cache 窗口, 内部 RAM 更该省着用 */
-static EXT_RAM_BSS_ATTR char s_fetch_body[NET_BODY_MAX + 1];
+/* ★ 2026-10-25 内存优化: 原来 128KB 静态常驻 PSRAM —— 只有"非流式 fetch"才用得到,
+ *   改成首次用到时分配 (PSRAM), 用不到就一直不占。 */
+static char *s_fetch_body;
 static bool s_fetch_streaming;       /* 本次请求是否流式落盘 (决定 poll 返回几个值) */
 
 
@@ -226,7 +228,13 @@ static int l_net_fetch_start(lua_State *L) {
     r.url = url;
     r.timeout_ms = timeout > 0 ? timeout : 8000;
     if (path && path[0]) { r.sink_path = path; s_fetch_streaming = true; }   /* 流式落盘 */
-    else { r.body = s_fetch_body; r.body_cap = (int)sizeof(s_fetch_body); s_fetch_streaming = false; }
+    else {
+        if (!s_fetch_body) {
+            s_fetch_body = heap_caps_malloc(NET_BODY_MAX + 1, MALLOC_CAP_SPIRAM);
+            if (!s_fetch_body) { lua_pushboolean(L, false); return 1; }   /* 分配不到就不发请求 */
+        }
+        r.body = s_fetch_body; r.body_cap = NET_BODY_MAX + 1; s_fetch_streaming = false;
+    }
     /* net_client 忙 (上一次还在跑) 或参数不合法 → false, 与原来"上一个还在跑"语义一致 */
     lua_pushboolean(L, netc_start(&r));
     return 1;
@@ -247,7 +255,7 @@ static int l_net_fetch_poll(lua_State *L) {
         netc_reset();
         lua_pushstring(L, "ok");
         if (streaming) lua_pushnil(L);                       /* 流式: body 在文件里 */
-        else lua_pushlstring(L, s_fetch_body, (size_t)n);
+        else lua_pushlstring(L, s_fetch_body ? s_fetch_body : "", (size_t)n);
         lua_pushinteger(L, code);
         if (streaming) lua_pushinteger(L, n);                /* 第 4 个值: 落盘字节数 */
         return streaming ? 4 : 3;

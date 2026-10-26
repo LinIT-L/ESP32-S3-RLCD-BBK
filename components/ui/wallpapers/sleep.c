@@ -23,8 +23,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "driver/rtc_io.h"   /* rtc_gpio_pullup_en: RTC 域上拉(深睡期间数字域掉电, 数字上拉会失效) */
+#include "driver/rtc_io.h"
+/* ★ 深睡: 卸掉 TF 卡(待机可到 mA 级)。sd_scan 的头文件没在本组件 include 路径里 ⇒ 前置声明 */
+void sd_unmount(void);
+   /* rtc_gpio_pullup_en: RTC 域上拉(深睡期间数字域掉电, 数字上拉会失效) */
 #include "esp_attr.h"
+#include "esp_pm.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -32,11 +36,14 @@
 #include "audio_player.h"   /* audio_pa_force_off(): 进深睡前关功放并 hold 低电平 */
 #include "gps.h"            /* gps_sleep(): 进深睡前把 GPS 送进 backup 待机 (2026-10-09) */
 
+#include "svc_nvs.h"     /* 复位历史落 NVS (供 remcon rst 取证) */
 #include "sleep.h"
+#include "wallpapers.h"   /* wp_sleep_wallpaper_draw(): 休眠到点时的整屏画面 */
 #include "power_stat.h"     /* power_stat_on_deep_sleep(): 睡前结账 (电池信息页) */
 #include "st7305.h"
 #include "bt_manager.h"
 #include "wifi_manager.h"
+#include "touch_panel.h"    /* touch_panel_sleep(): 深睡前把触摸 IC 按进复位态 */
 
 #define TAG "PWR"
 
@@ -173,7 +180,9 @@ void wp_power_off(int origin)
      *      的空闲高电平上, 从根上不给它边沿。
      *   ⚠ 顺序: 先 gps_sleep() (要发 UBX, 需要 UART 还能工作) 再 hold。 */
     gps_sleep();
-    {
+    /* ★ 2026-10-20: GPS 是选装件(默认关) ⇒ 没开启就一个脚都别碰,
+     *   免得去 hold 一个可能已被别的东西占用的引脚。 */
+    if (gps_is_ready()) {
         const gps_config_t *gc = gps_default_config();
         if (gc && gc->pin_tx >= 0) {
             gpio_hold_en((gpio_num_t)gc->pin_tx);   /* 冻住当前电平 (UART 空闲 = 高) */
@@ -187,11 +196,35 @@ void wp_power_off(int origin)
     audio_player_sleep_for_off();
 
     if (s_lcd) {
+        /* ★ 2026-10-27 linit「自动关机和长按关机效果一模一样」:
+         *   原来只有**手动**关机刷白, 自动关机动到点直接关屏(黑) —— 两条路径观感不同。
+         *   现在统一:**两条路径都先刷整屏白再关**。 */
         st7305_clear(s_lcd, ST7305_COLOR_WHITE);
         st7305_flush_override(s_lcd);
     }
 
-    const uint64_t mask = (origin == WP_OFF_AUTO) ? ANY_KEY_MASK : PWR_MASK;
+    /* ================= 睡前"能关的全关" (2026-10-24) =================
+     * 目标: 除 MCU 的 RTC 域外, 所有外设进各自最低功耗态。
+     * 顺序有讲究: 必须在最后一帧刷完之后, 在 esp_deep_sleep_start 之前。 */
+    /* ① TF 卡: 只声明没调用过 —— 卡在深睡里一直是待机态(0.5~2mA)。
+     *    先卸载文件系统再断 VFS, 避免卡侧还挂着命令队列。 */
+    sd_unmount();
+    /* ② 触摸 IC: RST 拉低 + hold。唤醒源是 EXT1 按键, 不靠触摸, 睡死没副作用。 */
+    touch_panel_power_down();
+    /* ③ 屏: **完全关闭** (st7305_sleep_in, 默认 mode 2 = 0x28 + 0x10)。
+     *    ★ 2026-10-26 linit「深睡完全关闭屏幕」: Display OFF + Sleep In ⇒ 连内部升压
+     *    VGH/VGL 一起断, 面板待机 ~1-5µA。
+     *    ⚠ 代价已知: 本板 lcd_rst 没接, 万一面板锁死只能拔电池(重刷无效)。
+     *    要回到"可恢复的关显示"用 `remcon slptest 4`(只发 0x28)。 */
+    st7305_sleep_in(s_lcd);
+    ESP_LOGI(TAG, "外设已全部关断: TF卡卸载 / 触摸RST低 / 屏已完全关闭(mode %d) / 麦克风ADC / 功放(前面已关)",
+             st7305_get_sleep_mode());
+
+    /* ★ 2026-10-26 linit「深睡唤醒只要电源键, 其他通通屏蔽」:
+     *   原来自动关机时用 ANY_KEY_MASK(PWR + LEFT) ⇒ 碰左键也会唤醒。
+     *   现在**固定只用 PWR**（自动/手动关机一致）, 触摸/左键/右键都不再是唤醒源。
+     *   注: 右键(GPIO0)本来就被排除（strapping 脚, 深睡电平保不住会自唤醒）; */
+    const uint64_t mask = PWR_MASK;
     s_off_origin = ORIGIN_MAGIC | (uint32_t)((unsigned)origin & 0xFFu);
 
     /* 诊断: 关机前的三键电平(1=松开 0=按下)。某键恒 0 = 浮空/被外部拉低 → 会被 EXT1 误唤醒。 */
@@ -204,23 +237,142 @@ void wp_power_off(int origin)
     wake_src_set(mask);
     wake_pins_hold(mask);   /* ★ 锁住唤醒键的上拉配置, 否则深睡数字域掉电→浮空→秒醒 */
 
-    ESP_LOGI(TAG, "关机: 进入深睡 (来源=%s, 唤醒=%s, 掩码=0x%llX)",
+    ESP_LOGI(TAG, "关机: 进入深睡 (来源=%s, 唤醒=PWR 键按住 0.5s, 掩码=0x%llX)",
              (origin == WP_OFF_AUTO) ? "休眠到点" : "手动",
-             (origin == WP_OFF_AUTO) ? "任意键" : "PWR 键按住 0.5s",
              (unsigned long long)mask);
     power_stat_on_deep_sleep();   /* 结账"醒着段", 记下入睡时刻 (电池信息页用) */
+
+    /* ★★★ 2026-10-18 linit: **深睡省电加深** —— 把 IDF 里能关的电源域全关掉。
+     *   这些是纯软件开关, 不占内存, 实测能省几十 µA 到 ~1mA:
+     *   · RTC_SLOW_MEM / RTC_FAST_MEM: 深睡不用 RTC 内存(没开 ULP) ⇒ 断电 ✓
+     *   · XTAL: 深睡用 RC32K 就够, 主晶振断电 ✓
+     *   · VDDSDIO: flash/PSRAM 供电域断电(数据已在 flash 里, 醒来重新初始化) ✓
+     *   · RTC_PERIPH 必须 ON —— EXT1 唤醒依赖 RTC 域里的上拉, 关了就叫不醒 ✗ */
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH,   ESP_PD_OPTION_ON);    /* 唤醒必需 */
+    /* ⚠ ESP32-S3 的 IDF 里没有 RTC_SLOW_MEM / RTC_FAST_MEM 这两个域(仅 C6/H2 有) */
+    esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL,         ESP_PD_OPTION_OFF);
+    esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO,      ESP_PD_OPTION_OFF);
+    /* ★ 2026-10-20: MODEM 域(WiFi/BLE 射频 + PHY)显式断电。
+     *   默认是 AUTO —— WiFi 处于 AP 模式时 wifi_manager_disable() 只 stop 不 deinit,
+     *   射频域会被一直供着(百 µA ~ mA 级)。深睡唤醒是完整重启, 断电没有副作用。 */
+    esp_sleep_pd_config(ESP_PD_DOMAIN_MODEM,        ESP_PD_OPTION_OFF);
+
+    /* ★ 2026-10-24: 入睡前把 CPU 降到最低档。
+     *   ⚠ 说清楚: **深睡期间 CPU 是断电的, 调频对深睡电流没有影响**。
+     *   这里降频是为了 ①入睡前的收尾阶段少耗一点 ②万一这版被改成"浅睡"也已经是低频。
+     *   真正有用的是屏保态降频(=醒着但没人在看), 那个在 wallpapers.c 的监督任务里。 */
+    {
+        esp_pm_config_t pm = { .max_freq_mhz = 80, .min_freq_mhz = 80, .light_sleep_enable = false };
+        esp_pm_configure(&pm);
+    }
+
+    /* ★★★ 2026-10-18 linit: 微雪 LCD RST(GPIO41) 平时被强制拉高("释放"电平),
+     *   深睡前把它**拉低**并保持 —— 屏已 deinit, RST 高会让面板复位电路持续耗电 ✓
+     *   (其他板 lcd_rst 不接/不同, 不动) */
+    {
+        const board_pins_t *bpw2 = board_pins_get();
+        if (bpw2->id == BOARD_ID_WEIXUE && bpw2->lcd_rst >= 0) {
+            gpio_set_level((gpio_num_t)bpw2->lcd_rst, 0);
+            gpio_hold_en((gpio_num_t)bpw2->lcd_rst);   /* 深睡期间保持低 */
+            ESP_LOGI(TAG, "微雪: LCD RST(GPIO%d) 已拉低并 hold(省电)", bpw2->lcd_rst);
+        }
+    }
+
+    /* ★ 屏幕进低功耗(SPI 停 + 面板待机): 原来只清屏没 deinit ⇒ 面板还在扫描,
+     *   实测 ST7305 正常工作 ~50-100µA, 待机 ~1-5µA ✓ (清屏已在上面做过) */
+    if (s_lcd) {
+        st7305_deinit(s_lcd);
+        ESP_LOGI(TAG, "屏已 deinit(面板待机)");
+    }
+
+    ESP_LOGI(TAG, "深睡电源域: RTC_PERIPH=ON(唤醒用), XTAL/VDDSDIO/MODEM=OFF");
+
+    /* ★★★ 2026-10-18 linit: **TF 卡必须卸载** —— 否则卡在深睡期间仍保持"传输态",
+     *   待机电流可达**几 mA**(来源: "SD 卡的待机电流可能很大(几十毫安!), 进入深睡前
+     *   一定要正确卸载并切断电源")。卸载后卡进入 idle, 耗电降到 µA 级 ✓
+     *   (深睡唤醒=完整重启 ⇒ 会重新 mount ✓) */
+    sd_unmount();
+
+    /* ★ 2026-10-20: 触摸 IC 按入复位态 + I2C 上拉关掉。
+     *   CST836U 常温工作电流 ~1mA 级, 深睡期间没人复位它就一直扫屏。
+     *   (tp_rst 已在 app_board 的开机 gpio_deep_sleep_hold_dis() 里有释放项) */
+    touch_panel_sleep();
+
+    /* ★ 2026-10-20: 卸载后 SD 总线闲着 —— 把 CLK 钉低、CMD/D0 钉高(卡的空闲态),
+     *   避免引脚浮空被卡片当成时钟/命令噪声而反复醒来。 */
+    {
+        const board_pins_t *bps = board_pins_get();
+        if (bps && bps->sd_clk >= 0) {
+            gpio_set_level((gpio_num_t)bps->sd_clk, 0); gpio_hold_en((gpio_num_t)bps->sd_clk);
+            if (bps->sd_cmd >= 0) { gpio_set_level((gpio_num_t)bps->sd_cmd, 1); gpio_hold_en((gpio_num_t)bps->sd_cmd); }
+            if (bps->sd_d0  >= 0) { gpio_set_level((gpio_num_t)bps->sd_d0,  1); gpio_hold_en((gpio_num_t)bps->sd_d0);  }
+        }
+    }
+
+    /* ★★★ 2026-10-18 linit: **隔离所有不用的引脚** —— 官方文档明确推荐:
+     *   "Some ESP32-S3 IOs have internal pullups/pulldowns, which are enabled by default.
+     *    如果外部电路驱动这些脚, 电流会经过上下拉电阻 ⇒ 增加深睡电流。
+     *    调 rtc_gpio_isolate() 可避免。"
+     *   ⇒ 除了【唤醒键(必须有上拉)】【GPS TX(已 hold 高)】【功放脚(已 hold 低)】,
+     *     其余全部隔离 ✓ 这一步通常是深睡电流从 mA 级压到 µA 级的关键。 */
+    {
+        const int keep[3] = { PWR_KEY, KEY_LEFT, KEY_RIGHT };
+        const gps_config_t *gc2 = gps_default_config();
+        /* GPS 没启用 ⇒ 它的脚按"普通未用脚"处理(隔离), 不要留在白名单里 */
+        int gpstx = (gps_is_ready() && gc2 && gc2->pin_tx >= 0) ? gc2->pin_tx : -1;
+        const board_pins_t *bp = board_pins_get();
+        int papin = bp ? bp->pa_pin : -1;
+
+        /* ★★★★ 2026-10-18 linit **严重回归修复**: 之前对**所有**引脚去上下拉+隔离,
+         *   把 I2C(触摸/编解码)、屏、SD、触摸 INT/RST 这些**功能脚**也动了 ✗
+         *   ⇒ 深睡唤醒后 I2C 探测失败 ⇒ 板型识别回落到默认(小智) ⇒ 触摸失灵 + 按键错位 ✓✓
+         *   ⇒ 现在**只处理真正未使用的脚**: board_pins 里定义过的功能脚全部跳过 ✓ */
+        int fn[40]; int fn_n = 0;
+        #define KEEP_PIN(x) do { int _v=(int)(x); if (_v >= 0) fn[fn_n++ < 40 ? fn_n : 39] = _v; } while (0)
+        if (bp) {
+            KEEP_PIN(bp->lcd_dc);  KEEP_PIN(bp->lcd_cs);  KEEP_PIN(bp->lcd_sck); KEEP_PIN(bp->lcd_mosi);
+            KEEP_PIN(bp->lcd_rst);
+            KEEP_PIN(bp->tp_sda);  KEEP_PIN(bp->tp_scl);  KEEP_PIN(bp->tp_int);  KEEP_PIN(bp->tp_rst);
+            KEEP_PIN(bp->codec_sda); KEEP_PIN(bp->codec_scl);
+            KEEP_PIN(bp->sd_clk);  KEEP_PIN(bp->sd_cmd);  KEEP_PIN(bp->sd_d0);
+            KEEP_PIN(bp->sd_cs);   KEEP_PIN(bp->sd_sck);  KEEP_PIN(bp->sd_mosi); KEEP_PIN(bp->sd_miso);
+        }
+        int niso = 0;
+        for (int g = 0; g <= 48; g++) {
+            if (g == keep[0] || g == keep[1] || g == keep[2]) continue;  /* 唤醒键: 必须留上拉 */
+            if (g == gpstx || g == papin) continue;                      /* 已 hold 固定电平 */
+            int skip = 0;
+            for (int j = 0; j < fn_n && j < 40; j++) if (fn[j] == g) { skip = 1; break; }
+            if (skip) continue;                                          /* ★ 功能脚一律不动 */
+            /* ★★★ 关键(来源: "10 Things Draining Your ESP32 Battery"):
+             *   "Each enabled internal pull-up/pull-down sources current through a ~45kΩ
+             *    resistor — that's 10..50 µA PER PIN, and they stay enabled through deep
+             *    sleep unless explicitly disabled."
+             *   ⇒ **先关内部上下拉**(全部引脚, 包括非 RTC 脚) ✗ 之前只做 isolate
+             *     (rtc_gpio_isolate 只对 RTC 引脚 0~21 生效, 22~48 是空操作) ✓
+             *   ⇒ RTC 引脚再额外 isolate(切断数字域到 pad 的通路) */
+            gpio_pullup_dis((gpio_num_t)g);
+            gpio_pulldown_dis((gpio_num_t)g);
+            if (g <= 21) rtc_gpio_isolate((gpio_num_t)g);
+            niso++;
+        }
+        ESP_LOGI(TAG, "已关上下拉+隔离 %d 个引脚(唤醒键/GPS_TX/PA 除外)", niso);
+    }
+
     esp_deep_sleep_start();
     /* 不返回 */
 }
 
 /* ---- 开机最早期门控 ----
- * MANUAL 关机唤醒: 要求 PWR 键保持按住 ≥0.5s, 不足(碰一下) → 判为误触, 立即回深睡。
- * AUTO 关机唤醒 / 非关机唤醒(上电等): 直接放行。 */
+ * ★ 2026-10-27 linit「自动关机和长按电源键效果一模一样」:
+ *   原来两条路径行为不同 —— MANUAL 要求 PWR 按住 ≥0.5s(不足判误触立即回深睡),
+ *   而 AUTO 直接放行(碰一下就开机)。现在**统一按 MANUAL 的规矩办**:
+ *   不管哪种关机, 唤醒都必须按住 PWR ≥0.5s, 不足一律判误触 → 立即回深睡。
+ *   非关机唤醒(上电/复位) 本来就不带 s_off_origin 标记, 仍然直接放行。 */
 void wp_power_wake_gate(void)
 {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return;
     if ((s_off_origin & ORIGIN_MASK) != ORIGIN_MAGIC) return;      /* 非本模块记录 → 放行 */
-    if ((s_off_origin & 0xFFu) == (uint32_t)WP_OFF_AUTO) return;   /* 自动关机: 任意键直接开机 */
 
     keys_config(PWR_MASK);
     uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
@@ -228,7 +380,7 @@ void wp_power_wake_gate(void)
         if (gpio_get_level(PWR_KEY) != 0) {
             /* 松手了 / 按住不足 0.5s → 误触: 直接回深睡(保持手动语义) */
             wait_keys_released(PWR_MASK);
-            s_off_origin = ORIGIN_MAGIC | (uint32_t)WP_OFF_MANUAL;
+            s_off_origin = ORIGIN_MAGIC | (s_off_origin & 0xFFu);   /* 保留原来源(自动/手动), 只重写 magic */
             wake_src_set(PWR_MASK);
             /* 进深睡前的统一不变量: 功放必须关断并 hold 低电平
              * (这条路径在 app_board_init 之前, 但同样不能漏 —— 睡眠期间功放耗电是
@@ -243,7 +395,9 @@ void wp_power_wake_gate(void)
      *      的空闲高电平上, 从根上不给它边沿。
      *   ⚠ 顺序: 先 gps_sleep() (要发 UBX, 需要 UART 还能工作) 再 hold。 */
     gps_sleep();
-    {
+    /* ★ 2026-10-20: GPS 是选装件(默认关) ⇒ 没开启就一个脚都别碰,
+     *   免得去 hold 一个可能已被别的东西占用的引脚。 */
+    if (gps_is_ready()) {
         const gps_config_t *gc = gps_default_config();
         if (gc && gc->pin_tx >= 0) {
             gpio_hold_en((gpio_num_t)gc->pin_tx);   /* 冻住当前电平 (UART 空闲 = 高) */
@@ -277,18 +431,80 @@ int wp_power_wake_origin(void)
     return (int)(s_off_origin & 0xFFu);
 }
 
+/* 复位/唤醒原因 → 人话 (参考 esp-mosaico 的 low_power_wakeup 做法:
+ *   "开机能知道自己是怎么醒的" 是排查睡眠问题的第一手信息; 数字码要翻手册, 没人记) */
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+        case ESP_RST_POWERON:  return "上电/换电池";
+        case ESP_RST_EXT:      return "外部复位脚";
+        case ESP_RST_SW:       return "软件重启(esp_restart)";
+        case ESP_RST_PANIC:    return "异常panic";
+        case ESP_RST_INT_WDT:  return "中断看门狗";
+        case ESP_RST_TASK_WDT: return "任务看门狗";
+        case ESP_RST_WDT:      return "其它看门狗";
+        case ESP_RST_DEEPSLEEP:return "深睡唤醒(正常)";
+        case ESP_RST_BROWNOUT: return "掉电/电压跌落(BROWNOUT)";
+        case ESP_RST_SDIO:     return "SDIO";
+        case ESP_RST_USB:      return "USB 复位(串口/烧录工具)";
+        case ESP_RST_JTAG:     return "JTAG";
+        case ESP_RST_EFUSE:    return "efuse 错误";
+        case ESP_RST_PWR_GLITCH: return "电源毛刺";
+        case ESP_RST_CPU_LOCKUP: return "CPU 锁死(双异常)";
+        default:               return "未知";
+    }
+}
+static const char *wake_cause_str(esp_sleep_wakeup_cause_t w)
+{
+    switch (w) {
+        case ESP_SLEEP_WAKEUP_UNDEFINED: return "非深睡(上电/复位)";
+        case ESP_SLEEP_WAKEUP_EXT1:      return "EXT1(按键)";
+        case ESP_SLEEP_WAKEUP_TIMER:     return "定时器";
+        case ESP_SLEEP_WAKEUP_GPIO:      return "GPIO";
+        case ESP_SLEEP_WAKEUP_UART:      return "UART";
+        case ESP_SLEEP_WAKEUP_TOUCHPAD:  return "触摸板";
+        default:                         return "其它";
+    }
+}
+
+/* ★ 2026-10-20: 把"异常复位"记进 NVS(只记非 USB 复位 —— USB 复位是烧录/开串口造成的,
+ *   会盖掉我们要查的那条)。收藏夹开了 USB HID 之后串口就没了, 崩了也看不到 panic,
+ *   只能靠这条"事后取证": 重启完串口回来, 发 `rst` 就能看到上次是 PANIC 还是 WDT。 */
+static void rst_hist_record(esp_reset_reason_t r)
+{
+    if (r == ESP_RST_USB || r == ESP_RST_POWERON) return;   /* 烧录/上电, 不算异常 */
+    nvs_handle_t h;
+    if (svc_nvs_open("pst", NVS_READWRITE, &h) != ESP_OK) return;
+    uint8_t hist[8] = {0};
+    size_t n = sizeof(hist);
+    svc_nvs_get_blob(h, "rst", hist, &n);
+    uint8_t idx = hist[0];
+    if (idx >= 8) idx = 0;
+    hist[1 + idx] = (uint8_t)r;
+    hist[0] = (uint8_t)((idx + 1) % 8);
+    svc_nvs_set_blob(h, "rst", hist, sizeof(hist));
+    svc_nvs_commit(h);
+    svc_nvs_close(h);
+}
+
 void wp_sleep_boot_diag(void)
 {
     esp_reset_reason_t r        = esp_reset_reason();
     esp_sleep_wakeup_cause_t w  = esp_sleep_get_wakeup_cause();
     int o = wp_power_wake_origin();
+    rst_hist_record(r);
     /* ext1_status: 触发本次唤醒的键掩码(按 GPIO 号; 0 = 非 EXT1 唤醒)。 */
     uint64_t ws = (w == ESP_SLEEP_WAKEUP_EXT1) ? esp_sleep_get_ext1_wakeup_status() : 0;
-    ESP_LOGI(TAG, "开机: reset_reason=%d wakeup_cause=%d 关机来源=%s ext1_status=0x%llX "
+    const char *which = (ws & PWR_MASK) ? "PWR"
+                      : (ws & (1ULL << KEY_LEFT))  ? "左键"
+                      : (ws & (1ULL << KEY_RIGHT)) ? "右键"
+                      : (w == ESP_SLEEP_WAKEUP_EXT1) ? "(无键位, 疑似噪声误触!)" : "-";
+    ESP_LOGI(TAG, "开机: %s (%d) | 唤醒=%s (%d) | 关机来源=%s | 唤醒键=%s status=0x%llX "
                   "(PWR%d=%d LEFT%d=%d RIGHT%d=%d)",
-             (int)r, (int)w,
+             reset_reason_str(r), (int)r,
+             wake_cause_str(w), (int)w,
              (o == WP_OFF_MANUAL) ? "手动" : (o == WP_OFF_AUTO) ? "休眠到点" : "非关机唤醒",
-             (unsigned long long)ws,
+             which, (unsigned long long)ws,
              (int)PWR_KEY,     (ws & PWR_MASK) ? 1 : 0,
              (int)KEY_LEFT,    (ws & (1ULL << KEY_LEFT)) ? 1 : 0,
              (int)KEY_RIGHT,   (ws & (1ULL << KEY_RIGHT)) ? 1 : 0);

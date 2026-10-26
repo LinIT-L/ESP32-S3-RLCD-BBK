@@ -9,6 +9,7 @@
  */
 #include "os_pane.h"
 #include "ui_common.h"
+#include "ui_col.h"
 #include "input.h"
 #include "favorites.h"
 #include <dirent.h>
@@ -181,6 +182,7 @@ void os_pane_reset(os_pane_t *p) {
     p->sel_item = 0;
     p->item_off = 0;
     p->folder_scroll = 0;
+    p->sel_last = -1;        /* ★ 首帧允许一次"跟随选中"自动对位 */
     p->item_scroll = 0;
     p->built_folder = -1;   /* 强制首次 build */
     p->loaded = true;
@@ -345,8 +347,20 @@ void os_pane_draw_left(st7305_handle_t *lcd, os_pane_t *p) {
     int total = pane_total(p);
     int max_vis = (pane_bottom(p) - list_y) / ROW_H;
     if (max_vis < 1) max_vis = 1;
-    if (p->sel_folder < p->folder_scroll) p->folder_scroll = p->sel_folder;
-    if (p->sel_folder >= p->folder_scroll + max_vis) p->folder_scroll = p->sel_folder - max_vis + 1;
+    /* ★★ 2026-10-20: 只在**选中项变了**时才把左栏拽到能看到它的位置。
+     *   原来每帧无条件夹一次 ⇒ 选中项在顶部时 folder_scroll 被按回 0,
+     *   手指往下拖多少弹回多少 (分类一多左栏根本滑不动, 收藏夹/阅读器都踩过)。 */
+    if (p->sel_folder != p->sel_last) {
+        p->sel_last = p->sel_folder;
+        if (p->sel_folder < p->folder_scroll) p->folder_scroll = p->sel_folder;
+        if (p->sel_folder >= p->folder_scroll + max_vis) p->folder_scroll = p->sel_folder - max_vis + 1;
+    }
+    if (p->folder_scroll < 0) p->folder_scroll = 0;
+    {   /* 拖到最底时不留空行 */
+        int maxs = total - max_vis;
+        if (maxs < 0) maxs = 0;
+        if (p->folder_scroll > maxs) p->folder_scroll = maxs;
+    }
     int sel_top = -1, sel_bot = -1;
     int y = list_y;
     for (int i = 0; i < max_vis && (p->folder_scroll + i) < total; i++) {
@@ -416,29 +430,54 @@ void os_pane_render(ui_ctx_t *ctx, os_pane_t *p) {
         return;
     }
 
-    /* 右栏: 游戏/内容, 选中整行反色. 平滑跟手滚动由 item_off(像素) 驱动 */
+    /* 右栏内容: **整列缓冲 + 抄窗**（滚动只 blit, 与商店同结构） */
     int view_h = pane_bottom(p) - list_y;
-    int max_vis = view_h / ROW_H;
-    if (max_vis < 1) max_vis = 1;
-    int off = p->item_off;
-    if (off < 0) off = 0;
-    int top_row = off / ROW_H;
-    int off_mod = off % ROW_H;
-    int n_vis = (p->item_count - top_row) > (max_vis + 1) ? (max_vis + 1) : (p->item_count - top_row);
-    for (int i = 0; i < n_vis; i++) {
-        int idx = top_row + i;
-        bool sel = (p->focus == 1 && idx == p->sel_item);
-        int py = list_y + i * ROW_H - off_mod;   /* 平滑纵坐标, 跟随手指 */
-        if (sel && py + ROW_H - 2 >= list_y && py < pane_bottom(p)) {
-            int fy = py < list_y ? list_y : py;
-            int ty = py + ROW_H - 2; if (ty > pane_bottom(p) - 1) ty = pane_bottom(p) - 1;
-            fill_rect(lcd, rx0, fy, RIGHT_EDGE, ty, ST7305_COLOR_BLACK);
+    int col_w  = RIGHT_EDGE - rx0 + 1;
+    if (col_w > 0 && p->item_count > 0) {
+        static ui_col_t s_pcol;
+        static int s_pn = -1;
+        static char s_phead[64] = {0};          /* ★ 缓存键: 首行"内容" (指针永远不变, 不能拿来判变化) */
+        const char *pfirst = p->items[0];
+        if (s_pn != p->item_count || strcmp(s_phead, pfirst) != 0) {   /* ★ 只在内容变化时重建 */
+            int need_h = p->item_count * ROW_H;
+            if (need_h < view_h) need_h = view_h;
+            if (ui_col_init(&s_pcol, col_w, need_h)) {
+                ui_col_clear(&s_pcol);
+                for (int i = 0; i < p->item_count; i++) {
+                    bool sel = (p->focus == 1 && i == p->sel_item);
+                    int y = i * ROW_H;
+                    if (sel) ui_col_fill(&s_pcol, 0, y, col_w - 1, y + ROW_H - 2, true);
+                    /* 超宽截断: 用 24px 宽度 (ASCII=16/CJK=24) 累加, 超出 col_w-4 就停 */
+                    char tb[128]; tb[0] = 0; int bn = 0;   /* ★ 必须先置空: text_width(tb) 会读它 */
+                    for (const char *q = p->items[i]; *q && bn < (int)sizeof(tb) - 1;) {
+                        int adv = ((uint8_t)*q < 0x80) ? 1 : ((((uint8_t)*q & 0xF0) == 0xE0) ? 3 : 2);
+                        char tmp[8]; memcpy(tmp, q, adv); tmp[adv] = 0;
+                        if (text_width(tb) + text_width(tmp) > col_w - 4) break;
+                        memcpy(tb + bn, q, adv); bn += adv; tb[bn] = 0; q += adv;
+                    }
+                    int tw = text_width(tb);
+                    int tx = (col_w - tw) / 2;
+                    if (tx < 0) tx = 0;
+                    ui_col_text24(&s_pcol, tx, y + 4, tb, sel);
+                }
+                s_pn = p->item_count;
+                snprintf(s_phead, sizeof(s_phead), "%s", pfirst);
+            }
         }
-        if (py + ROW_H < list_y || py >= pane_bottom(p)) continue;
-        int tw = text_width(p->items[idx]);
-        int tx = rx0 + ((RIGHT_EDGE - rx0) - tw) / 2;   /* 右栏水平居中 */
-        if (tx < rx0) tx = rx0;
-        draw_text(lcd, tx, py + 4, p->items[idx], sel);   /* 24px 字在 32px 行垂直居中 */
+        if (s_pcol.buf) {
+            ui_col_present(&s_pcol, lcd, rx0, list_y, view_h, p->item_off);
+            /* 选中行: 屏上单独画 (不参与整列缓存, 拖动才不会每帧重建) */
+            if (p->focus == 1 && p->sel_item >= 0 && p->sel_item < p->item_count) {
+                int sy = list_y + p->sel_item * ROW_H - p->item_off;
+                if (sy + ROW_H > list_y && sy < pane_bottom(p)) {
+                    fill_rect(lcd, rx0, sy, RIGHT_EDGE, sy + ROW_H - 2, ST7305_COLOR_BLACK);
+                    int tw = text_width(p->items[p->sel_item]);
+                    int tx = rx0 + (col_w - tw) / 2;
+                    if (tx < rx0) tx = rx0;
+                    draw_text(lcd, tx, sy + 4, p->items[p->sel_item], true);
+                }
+            }
+        }
     }
     /* 收藏栏为空提示: 右栏内居中 (不越过左/右分割线), 文案=长按确认游戏加入收藏 */
     if (p->fav_mode && p->item_count == 0) {

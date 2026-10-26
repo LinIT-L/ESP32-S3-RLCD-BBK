@@ -3,7 +3,7 @@
  *
  * 基于 vpet-emu-zepp 的 E0C6200 4-bit CPU 核心 (components/vpet/e0c6200_cpu.c),
  * 模拟第一代虚拟宠物设备 (Tamagotchi P1/P2、Digimon 等). ROM 为 .bin 文件,
- * 从 TF 卡 /sdcard/vpet/ 目录加载.
+ * 从 TF 卡 /sdcard/roms/vpet/ 目录加载.
  *
  * 生命周期 (由 engine_manager + menu 驱动, 与 arduboy/lavax 一致):
  *   - vpet_emu_background_init(): 进入暴龙机二级菜单时后台初始化 (分配 PSRAM, 预热 tone)

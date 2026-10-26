@@ -31,8 +31,12 @@ static void sd_mount_task(void *arg)
     if (b) b->sd_ok = (r == ESP_OK);
     if (r == ESP_OK) {
         ESP_LOGI(TAG, "TF 卡挂载成功 (后台异步)");
+    } else if (r == ESP_FAIL) {
+        /* sd_mount 用 ESP_FAIL 表示"quick_probe 没探到卡"(不是文件系统坏) —— 别提示格式化 */
+        ESP_LOGI(TAG, "未检测到 TF 卡 (未插卡或卡座接触不良)");
     } else {
-        ESP_LOGW(TAG, "TF 卡挂载失败: %s (进入菜单后可手动格式化)", esp_err_to_name(r));
+        /* ★ 2026-10-18: 卡被识别但挂不上(文件系统不认/需要格式化)走这里, 原因见 SDSCAN 日志 */
+        ESP_LOGW(TAG, "TF 卡已识别但挂载失败: %s (见 SDSCAN 的判定行)", esp_err_to_name(r));
     }
     vTaskDelete(NULL);
 }
@@ -50,6 +54,13 @@ esp_err_t app_board_init(app_board_t *board)
      *   小智: LCD DC7/CS11/SCK9/MOSI10 · 震动8 · 触摸5/13/12/6 · 按键1/0/4 */
     /* ★ 2026-10-16: 解锁列表**按板型表**给出(小智/微雪/自制各自不同), 不再写死。 */
     {
+        /* ★★★★ 2026-10-18 linit **严重 bug 修复**: `gpio_deep_sleep_hold_en()` 是**全局锁存开关**,
+         *   只逐个 `gpio_hold_dis(pin)` 是解不掉的 ✗
+         *   ⇒ 必须**先** `gpio_deep_sleep_hold_dis()` 关掉全局锁存, 再逐脚释放 ✓
+         *   症状(只在"睡过一觉后"出现): **按键读错电平 + 触摸失灵** ✓✓
+         *   (深睡时 sleep.c 调了 gpio_deep_sleep_hold_en(), 醒来这里从没关过 ✗) */
+        gpio_deep_sleep_hold_dis();
+
         const board_pins_t *bp0 = board_pins_get();
         gpio_hold_dis((gpio_num_t)bp0->lcd_dc);
         gpio_hold_dis((gpio_num_t)bp0->lcd_cs);
@@ -63,7 +74,15 @@ esp_err_t app_board_init(app_board_t *board)
             gpio_hold_dis((gpio_num_t)bp0->tp_sda); gpio_hold_dis((gpio_num_t)bp0->tp_scl);
             gpio_hold_dis((gpio_num_t)bp0->tp_int); gpio_hold_dis((gpio_num_t)bp0->tp_rst);
         }
-        gpio_hold_dis((gpio_num_t)(BOARD_IS_WEIXUE ? 48 : 8));   /* 震动 */
+        if (bp0->vib >= 0) gpio_hold_dis((gpio_num_t)bp0->vib);   /* 震动 (按板型表, 8/48) */
+        /* ★★★ 2026-10-20 严重 bug 修复: deep sleep 前把 **SD 总线**也 hold 住了
+         *   (CLK 钉低 / CMD+D0 钉高), 但这里从来没释放 ⇒ 只要睡过一次再重启(烧录也算),
+         *   SD 三个脚就一直被冻结: 卡收不到时钟、CMD 被硬拉高 ⇒ `sdmmc_io_reset 0x108`,
+         *   表现为"TF 卡认不到, 必须断电重启"(只有真掉电才会清掉 RTC 里的 hold)。
+         *   ⇒ 开机必须像 LCD/触摸那样把 SD 脚一起解锁。 */
+        if (bp0->sd_clk >= 0) gpio_hold_dis((gpio_num_t)bp0->sd_clk);
+        if (bp0->sd_cmd >= 0) gpio_hold_dis((gpio_num_t)bp0->sd_cmd);
+        if (bp0->sd_d0  >= 0) gpio_hold_dis((gpio_num_t)bp0->sd_d0);
     }
 
     /* 1. 初始化 LCD (必须最先, 显示开机 Logo) */
@@ -95,6 +114,20 @@ esp_err_t app_board_init(app_board_t *board)
         return ret;
     }
     ESP_LOGI(TAG, "ST7305 初始化成功");
+
+    /* ★★★ 2026-10-18 linit: **微雪版 LCD RST(GPIO41) 必须常拉高** ——
+     *   微雪 RLCD 面板的 RESET 是"高有效(释放)"脚, 初始化完成后必须由固件
+     *   强制输出高电平并保持; 否则面板可能回到未释放状态 ⇒ 花屏/全黑/触摸异常。
+     *   ⛔ **只有微雪这么做** —— 小智模块的屏 RST 不接(lcd_rst = -1), 标准扩展也不同 ✓
+     *   ⛔ 睡眠时例外: sleep.c 深睡前会把它拉低省电(屏已 deinit) ✓ */
+    {
+        const board_pins_t *bpw = board_pins_get();
+        if (bpw->id == BOARD_ID_WEIXUE && bpw->lcd_rst >= 0) {
+            gpio_set_direction((gpio_num_t)bpw->lcd_rst, GPIO_MODE_OUTPUT);
+            gpio_set_level((gpio_num_t)bpw->lcd_rst, 1);      /* 保持高 = 释放复位 */
+            ESP_LOGW(TAG, "微雪: LCD RST(GPIO%d) 已强制拉高并保持", bpw->lcd_rst);
+        }
+    }
     /* ★★★ 2026-10-16 关键修复(第2处): 屏保门禁。
      *   wallpapers.c 屏保激活时会 st7305_set_flush_blocked(true), 此后**所有普通
      *   st7305_flush 在第一行就 return ESP_OK(静默丢弃)** ⇒ 屏收不到任何数据 ⇒ 全黑且无报错。
@@ -172,10 +205,13 @@ void app_board_init_audio(app_board_t *board)
 {
     int audio_ret = audio_player_init();
     board->audio_ok = (audio_ret == 0);
+    /* 带上内部堆余量：I2S DMA 只能从内部 RAM 拿，余量不够就会"显示正常但完全没声" */
     if (board->audio_ok) {
-        ESP_LOGI(TAG, "音频硬件初始化成功");
+        ESP_LOGI(TAG, "音频硬件初始化成功（内部堆余 %u B）",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     } else {
-        ESP_LOGW(TAG, "音频初始化返回 %d", audio_ret);
+        ESP_LOGW(TAG, "音频初始化失败 ret=%d（内部堆余 %u B）", audio_ret,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     }
 }
 
@@ -193,13 +229,54 @@ void app_board_init_battery(app_board_t *board)
 /* 阶段5: GPS (u-blox MAX-M10S, UART). 见 gps.h 的接线与 API 说明. */
 void app_board_init_gps(app_board_t *board)
 {
-    esp_err_t ret = gps_init(NULL);   /* NULL = 驱动内置默认配置 (43/44 ↔ GPS, EXTINT 47, 921600) */
+    /* ★★★ 2026-10-24 开机只做"停靠", 不做完整初始化:
+     *   开机唯一目的是别让模块 10mA 空转 —— 不需要 autobaud、不需要 GSV 提频、
+     *   不需要解析服务。gps_boot_park() 静听 300ms: 没输出=本来就在睡(不动),
+     *   有输出=发 PMREQ 送睡, 乱码=完整初始化兜底; 结束时 UART 已卸载、内部 RAM 归零。
+     *   应用要定位时 app.gps.start() 会自己 gps_init()+gps_wakeup() 全套重来。
+     *   实测: 原同步路径 900~4200ms → 现在 ~320ms, 且不占任何常驻资源。 */
+    esp_err_t ret = gps_boot_park();
     board->gps_ok = (ret == ESP_OK);
-    if (!board->gps_ok) {
-        ESP_LOGW(TAG, "GPS 驱动初始化失败: %s", esp_err_to_name(ret));
-        return;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "GPS 开机停靠失败: %s", esp_err_to_name(ret));
     }
-    /* 模块 VCC 常通电而固件当前不用定位 → 立刻送软件待机, 把 25~30mA 降到 µA 级.
-     * 顺带减轻 3V3 负载 (与"SD/WiFi 负载突变掉电复位"是同一类隐患). */
-    gps_sleep();
+}
+
+/* ★ 2026-10-20 启动提速: GPS 初始化搬到后台任务跑 (main.c 里创建)。
+ *   原因: 波特率自适应 ~1.4s + 送待机 ~0.6s, 同步跑会把桌面拖到 3.9s。
+ *   board 指针来自 app_main 的栈帧, 而 app_main 进主循环后不返回 ⇒ 生命周期安全。 */
+void board_gps_boot_task(void *arg)
+{
+    app_board_t *b = (app_board_t *)arg;
+    app_board_init_gps(b);
+    ESP_LOGI(TAG, "GPS 后台初始化完成 (gps_ok=%d)", b ? (int)b->gps_ok : -1);
+    vTaskDelete(NULL);
+}
+
+/* ★★ GPS 一次性识别 (写完固件的第一次开机才跑一次, 见 hw_cfg_gps_probed):
+ *   真探一次 UART —— 听得到 UBX/NMEA 才算"焊了", 否则 gps_init 内部会把 UART 卸掉、
+ *   引脚还原并返回 ESP_ERR_NOT_FOUND (不留后台耗电)。 */
+bool app_board_gps_probe(void)
+{
+    esp_err_t r = gps_init(NULL);
+    if (r != ESP_OK) {
+        ESP_LOGW(TAG, "GPS 识别: 未识别到模块 (%s)", esp_err_to_name(r));
+        return false;
+    }
+    gps_sleep();                      /* 焊了: 立刻送软件待机 (46µA) */
+    ESP_LOGW(TAG, "GPS 识别: 已识别到模块, 已送待机");
+    return true;
+}
+
+static void gps_probe_task(void *arg)
+{
+    (void)arg;
+    hw_cfg_set_gps_present(app_board_gps_probe());
+    vTaskDelete(NULL);
+}
+
+void app_board_gps_probe_async(void)
+{
+    if (xTaskCreate(gps_probe_task, "gps_probe", 4096, NULL, 2, NULL) != pdPASS)
+        hw_cfg_set_gps_present(app_board_gps_probe());   /* 建任务失败就同步探 */
 }

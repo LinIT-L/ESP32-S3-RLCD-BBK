@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include "esp_attr.h"
+#include "esp_pm.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -18,6 +19,7 @@
 #include "svc_nvs.h"
 #include "board_rlcd.h"   /* 屏保独占 LCD: 冻结游戏帧刷新, 壁纸恒在最上层 */
 #include "input.h"        /* 统一"最近输入"时钟: 独立监视据此判定空闲 */
+#include "wifi_manager.h"  /* ★ 进屏保关 WiFi 射频 / 解锁恢复 */
 
 /* [二分定位·测试版] 屏保/睡眠期间彻底关日志: 由 main.c 提供.
  * suspend=true 时 log_to_file_vprintf 直接 return 0(连 vsnprintf 都不执行),
@@ -34,6 +36,10 @@
 #define WP_MAX_MODULES 8
 static wp_module_t s_modules[WP_MAX_MODULES];
 static int s_module_count = 0;
+
+/* 当前选中的屏保壁纸 id (NVS "os_wp"/"prog", 默认星空)。
+ * 在 supervisor_start(内部 RAM 栈上下文) 读一次 —— 屏保任务栈在 PSRAM, 不宜自己读 NVS。 */
+static int s_ss_prog = WP_PROG_STARS;
 
 void wp_register_module(const wp_module_t *m) {
     if (s_module_count >= WP_MAX_MODULES) return;
@@ -55,9 +61,10 @@ const char *wp_prog_name(int id) {
     return m ? m->name : "";
 }
 
-void wp_program_render(st7305_handle_t *lcd, int prog, uint32_t now_ms) {
+int wp_program_render(st7305_handle_t *lcd, int prog, uint32_t now_ms) {
     const wp_module_t *m = wp_get_module(prog);
-    if (m && m->render) m->render(lcd, now_ms);
+    if (m && m->render) return m->render(lcd, now_ms);
+    return 0;
 }
 /* ==== 屏保状态机 (从 os_mgr 迁移归位: 屏保职责归壁纸模块) ==== */
 #define WP_TAG "WPSS"
@@ -140,9 +147,9 @@ static uint32_t wp_ss_delay_ms(void)
 }
 void wp_screensaver_set_delay_ms(uint32_t ms) { s_ss_delay_ms = ms; }
 uint32_t wp_screensaver_delay_ms(void) { return wp_ss_delay_ms(); }   /* 供阻塞引擎循环在内部做空闲息屏 */
-/* 设置页"关机时间"档位写入点: 本版本不使用该档位(自动关机由"休眠时间"驱动), 值忽略。 */
-void wp_screensaver_set_shutdown_ms(uint32_t ms) { (void)ms; }
-/* 设置页"休眠时间"档位写入点: 屏保播满该时长 → 自动关机(任意键唤醒)。 */
+/* 设置页「关机时间」写入点: 屏保播满该时长 → 自动关机(任意键唤醒)。ms=0 表示不关机。 */
+void wp_screensaver_set_shutdown_ms(uint32_t ms) { s_ss_run_ms = (ms > 0) ? ms : UINT32_MAX; }
+/* 老接口, 保留给壁纸页/remcon (同一个量 = 关机时间) */
 void wp_screensaver_set_run_ms(uint32_t ms) { s_ss_run_ms = ms; }
 /* "休眠时间"(ms); UINT32_MAX = 永不休眠(档位 0)。 */
 static uint32_t wp_ss_run_ms(void)
@@ -156,19 +163,23 @@ static uint32_t wp_ss_run_ms(void)
 static void wp_ss_prime(void)
 {
     s_ss_delay_ms = (uint32_t)10 * 60000UL;  /* 壁纸(息屏)延时: 默认 10 分钟 */
-    s_ss_run_ms   = (uint32_t)10 * 60000UL;  /* 休眠时间: 默认 10 分钟 → 屏保播满即自动关机 */
+    s_ss_run_ms   = (uint32_t)10 * 60000UL;  /* 关机时间: 默认 10 分钟 → 屏保播满即自动关机 */
     s_touch_wake  = 0;                        /* 默认触摸不唤醒 */
     nvs_handle_t h;
     if (svc_nvs_open("os_wp", NVS_READONLY, &h) == ESP_OK) {
         int32_t t = 0;
         if (svc_nvs_get_i32(h, "min",    &t) == ESP_OK) s_ss_delay_ms = (t <= 0) ? UINT32_MAX : ((uint32_t)t * 60000UL);
-        if (svc_nvs_get_i32(h, "wp_run", &t) == ESP_OK) s_ss_run_ms   = (t <= 0) ? UINT32_MAX : ((uint32_t)t * 60000UL);
+        /* ★ 2026-10-24 linit: 「休眠时间」取消, 统一成 **关机时间**(os_wp/wp_shut)。
+         *   旧档位 wp_run 只作迁移兜底读一次, 以后不再写。 */
+        if (svc_nvs_get_i32(h, "wp_shut", &t) != ESP_OK &&
+            svc_nvs_get_i32(h, "wp_run",  &t) != ESP_OK) t = 10;
+        s_ss_run_ms = (t <= 0) ? UINT32_MAX : ((uint32_t)t * 60000UL);
         if (svc_nvs_get_i32(h, "wp_touch",&t) == ESP_OK) s_touch_wake  = (int)t;
         svc_nvs_close(h);
     }
     s_ss_cache_ok = true;
     /* 开机打印生效的屏保参数 (NVS "os_wp" 有值则优先于代码默认; -1 = 永不) */
-    ESP_LOGI(WP_TAG, "屏保参数: 息屏延时=%d分, 休眠时间=%d分, 触摸唤醒=%d",
+    ESP_LOGI(WP_TAG, "屏保参数: 息屏延时=%d分, 关机时间=%d分, 触摸唤醒=%d",
              (s_ss_delay_ms == UINT32_MAX) ? -1 : (int)(s_ss_delay_ms / 60000),
              (s_ss_run_ms   == UINT32_MAX) ? -1 : (int)(s_ss_run_ms / 60000),
              s_touch_wake);
@@ -207,11 +218,25 @@ void wp_screensaver_set_touch_wake(bool en)
  * "游戏内无法休眠、退出游戏才休眠". 本任务独立于所有页面/游戏运行, 无论
  * 前台/后台在干什么, 只要统一输入时钟停摆超过设定延时就强制进入壁纸并独占渲染。
  * 本任务只负责"进壁纸 + 渲染", 不产生任何关机动作。 */
-#define SS_SUPER_STACK  8192   /* words(→32KB)：全屏星空渲染 + SPI 独占刷屏 + 时间格式化栈占用大，
-                                * 8KB(xTaskCreate)曾触发 task sse 栈溢出→进屏保即重启。用 PSRAM 静态栈充盈 */
+#define SS_SUPER_STACK  4096   /* words(→16KB, PSRAM)。
+                                * 历史: 8KB(xTaskCreate=2048 words)曾栈溢出→进屏保就重启；
+                                * 实测(屏保未激活时)仅用 7.6KB。取 16KB = 历史爆掉值的 2 倍。
+                                * ★ 2026-10-26 linit「不用就不给」: 32KB→16KB, 省 16KB PSRAM。 */
 EXT_RAM_BSS_ATTR static StackType_t s_ss_stack[SS_SUPER_STACK];  /* 静态 PSRAM 栈(同 board_shim 视频任务模式) */
 static StaticTask_t s_ss_tcb;
 static TaskHandle_t s_ss_task_h = NULL;  /* 深睡前 vTaskSuspend */
+static int s_ss_pm_mode = -1;      /* 屏保分档: -1=未定 0=静态省电 1=动态流畅 (退出时复位) */
+/* ★ 2026-10-26 linit「进屏保直接关 WiFi」: 射频 20~30mA。
+ *   即使 MIN_MODEM 也要按 DTIM 醒来收包; disable() 才真正 stop+deinit 并释放内部 RAM。
+ *   短暂息屏也一样关（linit 要求）; 解锁后后台重新初始化，不阻塞界面。 */
+static volatile bool s_ss_wifi_off = false;
+static void wifi_restore_task(void *arg)
+{
+    (void)arg;
+    wifi_manager_enable();
+    ESP_LOGI(WP_TAG, "解锁: WiFi 已恢复");
+    vTaskDelete(NULL);
+}
 static st7305_handle_t *s_ss_lcd = NULL;
 
 #include "sleep.h"   /* 电源模块: wp_power_init(绑定 LCD + 注册深睡唤醒源) */
@@ -220,6 +245,10 @@ static st7305_handle_t *s_ss_lcd = NULL;
 
 /* USB(主机已枚举) 期间不自动休眠: 插在电脑上时正在传文件/调试/充电, 不希望它息屏甚至自动关机。 */
 static bool s_usb_suppress_prev = false;
+
+/* ---- 页面级"别息屏"占位 (2026-10-20) ---- */
+static volatile bool s_idle_hold = false;
+static volatile uint32_t s_idle_hold_off_ms = 0;
 
 static void ss_supervisor_task(void *arg) {
     (void)arg;
@@ -252,16 +281,72 @@ static void ss_supervisor_task(void *arg) {
                 continue;
             }
             /* 屏保中: 独占渲染星空 (主循环可能正被游戏阻塞, 不能等它) */
+            int drew = 0;
             if (s_ss_lcd) {
                 uint32_t t = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                wp_program_render(s_ss_lcd, WP_PROG_STARS, t);
-                st7305_flush_override(s_ss_lcd);   /* 屏保期间唯一允许写屏的通道 */
+                /* ★ 只有"本帧有新内容"才送屏: 静态壁纸(人生指南)每分钟才刷一次,
+                 *   动态壁纸(星空)每帧都返回 1。避免静态壁纸白刷 15000B/帧 耗电。 */
+                drew = wp_program_render(s_ss_lcd, s_ss_prog, t);
+                if (drew)
+                    st7305_flush_override(s_ss_lcd);   /* 屏保期间唯一允许写屏的通道 */
             }
-            /* 流畅优先: 星空 16fps (1000/62). 必须有 vTaskDelay 让出 CPU **并喂狗**,
-             * 否则本任务(优先级 IDLE+2)在此分支 100% 空转, 饿死同一核上的主循环/输入,
-             * 表现为"任意键(含锁屏键)都点不醒壁纸"+ task_wdt(CPU0: sse). */
-            vTaskDelay(pdMS_TO_TICKS(52));
+            /* ★ 2026-10-24 linit: **动态壁纸恢复常速**, 不再按"进屏保多久"降帧。
+             *   之前搞过 60s 后 250ms / 5min 后 1000ms 的三档 —— 实测就是"一秒一秒的",
+             *   用户明确要求恢复。现在只按**壁纸类型**分:
+             *     动画壁纸(星空, 每帧都返回 1) → 52ms ≈19fps, 常速;
+             *     静态壁纸(人生指南, 大多数帧返回 0) → 1000ms 轮询, 它本来就不动, 不亏画面。
+             * 省电仍靠: 屏保期 CPU 降到 80MHz + 静态壁纸不刷屏 + 面板 LPM(仅空闲时)。
+             * 必须有 vTaskDelay 让出 CPU **并喂狗**, 否则本任务(优先级 IDLE+2)在此分支
+             * 100% 空转, 饿死同一核上的主循环/输入, 表现为"任意键都点不醒壁纸"+ task_wdt。 */
+            {
+                /* ★★★ 2026-10-26 linit「动态壁纸要流畅」: 按壁纸类型分档。
+                 *   动态(星空, 每帧都有新内容) ⇒ max=240/min=80 + **不开浅睡**, 62ms/帧(16fps);
+                 *     浅睡会让帧间隔变得不可预测(抖), 动画看着就卡。
+                 *   静态(人生指南, 大多数帧无变化) ⇒ 80MHz + 开浅睡, 1000ms 轮询(省电).
+                 *   两种模式只在切换时调一次 esp_pm_configure, 不逐帧调。 */
+                /* s_ss_pm_mode: 文件作用域(-1=未定 0=静态 1=动态), 退出屏保时复位 */
+                int want = drew ? 1 : 0;
+                if (want != s_ss_pm_mode) {
+                    s_ss_pm_mode = want;
+                    esp_pm_config_t pm = want
+                        ? (esp_pm_config_t){ .max_freq_mhz = 240, .min_freq_mhz = 80,  .light_sleep_enable = false }
+                        : (esp_pm_config_t){ .max_freq_mhz = 80,  .min_freq_mhz = 80,  .light_sleep_enable = true  };
+                    esp_pm_configure(&pm);
+                    ESP_LOGI(WP_TAG, "屏保分档: %s (%dms/帧, 浅睡=%d)",
+                             want ? "动态流畅 240MHz" : "静态省电 80MHz",
+                             want ? 62 : 1000, want ? 0 : 1);
+                }
+                /* ★ 2026-10-26 linit「进入屏保直接关 WiFi」: 射频占 20~30mA, 是屏保期最大耗电项。
+                 *   disable() = disconnect + stop + deinit(释放内部 RAM); 解锁后后台恢复(约 2s)。 */
+                if (!s_ss_wifi_off && wifi_manager_is_enabled()) {
+                    s_ss_wifi_off = true;
+                    wifi_manager_disable();
+                    ESP_LOGI(WP_TAG, "屏保: WiFi 已关闭 (省 20~30mA), 解锁后自动恢复");
+                }
+                uint32_t dly = drew ? 62u : 1000u;   /* ★ 2026-10-26 linit: 动态 16fps (62.5ms) */
+                vTaskDelay(pdMS_TO_TICKS(dly));
+            }
         } else {
+
+            {   /* 退出屏保: 频率恢复 240MHz */
+                static bool s_pm_fast = false;
+                if (!s_pm_fast) {
+                    s_pm_fast = true;
+                    s_ss_pm_mode = -1;   /* 退出屏保: 分档状态复位, 下次进入重新判定 */
+                    if (s_ss_wifi_off) {   /* 屏保期间关过 WiFi ⇒ 后台恢复 (不阻塞解锁) */
+                        s_ss_wifi_off = false;
+                        xTaskCreate(wifi_restore_task, "wifi_rest", 4096, NULL, 2, NULL);
+                    }
+                    /* ★★ 2026-10-26 linit「动态调频省电」: min 从 240 改为 80 ——
+                     *   原来 min=max=240 把 DFS **锁死**了, CPU 永远满频。
+                     *   现在 max=240 (有任务/动画自动跑满, 性能不变),
+                     *   min=80 (纯空闲时由 IDF 的 DFS 自动降频;
+                     *   CONFIG_PM_DFS_INIT_AUTO=y 已开, FreeRTOS 有任务就会拉回 240)。
+                     *   APB 仍是 80MHz ⇒ SPI 屏/PSRAM 时序不受影响。 */
+                    esp_pm_config_t pm = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = false };
+                    esp_pm_configure(&pm);
+                }
+            }
             /* 空闲检测 (低频省电) —— USB 插着就不进屏保(也就不会连锁到自动关机) */
             bool usb = usb_hid_host_mounted();
             if (usb != s_usb_suppress_prev) {
@@ -270,10 +355,15 @@ static void ss_supervisor_task(void *arg) {
                          usb ? "暂停自动休眠/自动关机" : "恢复自动休眠");
             }
             uint32_t last_in = input_last_any_ms();
+            /* ★ 2026-10-20: 页面可以"占住"不休眠 (wp_idle_hold(1)), 例如收藏夹的
+             *   设置管理界面 —— 用户在那儿翻配置, 不该被息屏打断。
+             *   解除 hold 的那一刻重新开始算空闲, 否则一松手就立刻息屏。 */
+            if (s_idle_hold_off_ms && (int32_t)(s_idle_hold_off_ms - last_in) > 0)
+                last_in = s_idle_hold_off_ms;
             /* ★ 2026-10-09: "正在玩(按住游戏键)不自动进屏保" —— 按住不再刷新 last_in,
              *   所以这里必须显式避开, 否则按住键玩 10 分钟会被判空闲而进屏保。
              *   (松开的一瞬间 input_mark_game_held() 会重置时钟, 于是"放下手柄才开始计时") */
-            if (!usb && last_in != 0 && !input_game_key_held() &&
+            if (!usb && !s_idle_hold && last_in != 0 && !input_game_key_held() &&
                 now - last_in >= wp_ss_delay_ms()) {
                 ESP_LOGD(WP_TAG, "独立监视: 空闲超时, 强制进入壁纸");
                 os_screensaver_force_enter();
@@ -282,6 +372,15 @@ static void ss_supervisor_task(void *arg) {
         }
     }
 }
+
+void wp_idle_hold(bool on)
+{
+    if (s_idle_hold == on) return;
+    s_idle_hold = on;
+    if (!on) s_idle_hold_off_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    ESP_LOGD(WP_TAG, "空闲占位 %s", on ? "开(不息屏)" : "关(恢复计时)");
+}
+bool wp_idle_held(void) { return s_idle_hold; }
 
 /* 关机前钩子: 挂起屏保监督任务 + 解除屏保独占。
  * 该任务栈在 PSRAM 且持续刷屏, 深睡瞬间禁用 flash/PSRAM 缓存会撞断言 → 关机变重启。
@@ -292,11 +391,25 @@ void wp_screensaver_halt(void) {
 }
 
 /* 创建独立屏保监视任务 (由 os_init 传入 LCD 调用一次) */
-void wp_stars_register_module(void);   /* 星空模块函数声明, 实现在 wp_module_stars.c */
+void wp_stars_register_module(void);       /* 星空, 见 wp_module_stars.c */
+void wp_lifeguide_register_module(void);   /* 人生指南, 见 wp_module_lifeguide.c */
+
 void wp_screensaver_supervisor_start(st7305_handle_t *lcd) {
     s_ss_lcd = lcd;
     wp_ss_prime();   /* 内部栈上下文预载 NVS 缓存(必须在创建 PSRAM 栈监督任务前) */
-    wp_stars_register_module();   /* 星空模块显式注册(不依赖 constructor, 防 gc-sections 丢弃导致壁纸空白) */
+    wp_stars_register_module();      /* 显式注册(不依赖 constructor, 防 gc-sections 丢弃) */
+    wp_lifeguide_register_module();  /* 人生指南文字壁纸 */
+    {
+        /* 读 NVS "os_wp"/"prog" (用已有的 svc_nvs, 避免 ui→services 新增反向依赖) */
+        int p = WP_PROG_STARS;
+        nvs_handle_t h;
+        if (svc_nvs_open("os_wp", NVS_READONLY, &h) == ESP_OK) {
+            int32_t v = WP_PROG_STARS;
+            if (svc_nvs_get_i32(h, "prog", &v) == ESP_OK) p = (int)v;
+            svc_nvs_close(h);
+        }
+        s_ss_prog = wp_get_module(p) ? p : WP_PROG_STARS;   /* 越界/模块不存在 → 回星空 */
+    }
     static bool started = false;
     if (started) return;
     started = true;

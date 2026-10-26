@@ -23,6 +23,22 @@
 #include "st7305.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+
+/* ===== 统一时间源 (2026-10-24 规范化) =====
+ * 全项目"开机以来多少毫秒"只用这一个函数。
+ * 起因: 排查发现 21 个文件共 55 处各自写 `xTaskGetTickCount() * portTICK_PERIOD_MS`,
+ *       其中 4 个文件还各有一份同名 static now_ms() —— 写法不一, 漏乘 portTICK_PERIOD_MS
+ *       就会变成"1 tick 当 1ms"(本板 TICK_RATE=1000 恰好相等, 换配置立刻错)。
+ * 为什么用 static inline: 它只是读一次 tick, 不该为它付函数调用开销。
+ * ⛔ 新代码不要再写 xTaskGetTickCount()*portTICK_PERIOD_MS, 一律 os_millis()。
+ * ⛔ 需要"跨深睡不丢"的时间用 esp_rtc_get_time_us() (睡眠期间 tick 会停)。 */
+static inline uint32_t os_millis(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,6 +97,14 @@ typedef enum {
      *         注册项也已 hidden ⇒ 纯占体积。把这里改回 1 即可恢复(需同时把
      *         CMakeLists 里被删掉的 md_emu 加回 os/apps 两个组件的 REQUIRES)。 */
 #ifndef LINTOS_ENABLE_MD
+/* ===== 未完成功能总开关 (2026-10-24 linit 定) =====
+ * 发布前一律置 0: 不注册页面、不进应用中心/引擎分类、不占内部 RAM。
+ * 代码保留在仓库里但**默认编译关闭**, 需要时改 1 即可恢复。
+ * ★ 2026-10-24: NPE (诺亚舟 9288T) 已**整体删除** —— 组件/页面/命令全部移除, 不再有开关。 */
+#ifndef LINTOS_ENABLE_KEYMGR
+#define LINTOS_ENABLE_KEYMGR   0   /* 密钥管理器 (占位页, 功能未完成) */
+#endif
+
 #define LINTOS_ENABLE_MD 0
 #endif
     OS_PAGE_SMS_GAME,          /* SMS/GG 游戏 (SMSPlus) */
@@ -107,6 +131,7 @@ typedef enum {
     OS_PAGE_FAV,               /* 收藏夹: 账号/密码 一键模拟键盘输入 */
     OS_PAGE_LUA,               /* Lua 单文件程序 (可放到内存卡运行) */
     OS_PAGE_SDR,                   /* 频谱仪 (new_app.py 生成) */
+    OS_PAGE_PAL,                   /* 仙剑奇侠传 (new_app.py 生成) */
     OS_PAGE_COUNT
 } os_page_t;
 
@@ -142,6 +167,11 @@ struct os_module {
      *                 (usb_hid 二级菜单 / lua 脚本可控确认), 它们在"真要退出"处自行调
      *                 `os_request_exit_confirm()`。 */
     bool exit_confirm;
+    /* ★ 2026-10-20 linit: **收藏夹这类"工具页"不能被空闲超时弹回桌面**。
+     * 内核 life_tick 会按空闲时长把非全屏页 os_pop_to_main(); 但收藏夹/终端这种
+     * 用户是"打开着慢慢填"的，弹走等于丢现场。置 true = 空闲不自动退回。
+     * (与 fullscreen 无关: fullscreen 还管状态栏显隐，不能为了不弹走而误设。) */
+    bool keep_on_idle;
 };
 
 /* ==== 全局服务契约 — 状态栏/音量/电量 等, 不占页面栈, 可在任意页面上方叠加 ==== */
@@ -246,6 +276,29 @@ void os_screensaver_force_enter(void);   /* 锁屏键点按: 强制进入壁纸�
  * 回调 result: -1=取消/BACK, >=0 选中索引 (确认框: 0=确定 1=取消). */
 typedef void (*os_dialog_cb_t)(ui_ctx_t *ctx, int result, void *ud);
 
+/* ★★ 2026-10-19: **统一弹窗入口** —— 应用只描述"说什么", 显示/关闭全由模块负责.
+ *   规则见 docs/UI规范.md. 旧的 os_dialog_toast/confirm_ex/list 仍然可用(内部转调). */
+typedef enum {
+    OS_DLG_TOAST = 0,     /* 提示条: msg, timeout_ms 可选 */
+    OS_DLG_CONFIRM = 1,   /* 确认框: msg, cb(result: 0=确定 1=取消) */
+    OS_DLG_LIST = 2,      /* 列表选择: title, items, count, sel, cb(result=索引, -1=返回) */
+} os_dlg_type_t;
+
+typedef struct {
+    os_dlg_type_t   type;
+    const char     *title;          /* LIST 用 */
+    const char     *msg;            /* TOAST / CONFIRM 用 */
+    const char *const *items;       /* LIST 用 */
+    int             count;          /* LIST 用 */
+    int             sel;            /* LIST 初始选中 */
+    uint32_t        timeout_ms;     /* 0=不超时 */
+    int             timeout_result; /* 超时结果 */
+    os_dialog_cb_t  cb;             /* 回调 (模块在回调返回后自动关闭) */
+    void           *ud;
+} os_dlg_cfg_t;
+
+void os_dlg_open(ui_ctx_t *ctx, const os_dlg_cfg_t *cfg);
+
 void os_dialog_list(ui_ctx_t *ctx, const char *title,
                     const char *const *items, int count, int sel,
                     os_dialog_cb_t cb, void *ud);
@@ -273,6 +326,7 @@ void os_dialog_draw_overlay(ui_ctx_t *ctx);             /* 全局顶层 toast �
 /* V1.6.x: toast 查询/清除 — os_core 在按键/触摸分发最前调用, 保证任意场景提示即时关闭 */
 bool os_dialog_toast_active(void);
 void os_dialog_toast_clear(void);
+void os_dialog_toast_dismiss(ui_ctx_t *ctx);   /* 关提示 + 收掉 toast 自己开的弹窗页 */
 /* V1.7.x: 全局 toast 超时清理 — os_core 每帧调用 (任意页面/弹窗上 toast 1s 自动关+重绘) */
 void os_dialog_toast_tick(ui_ctx_t *ctx);
 /* V1.6.x: AP 热点激活标志 — 任一模块开热点时置位, 状态栏据此显示 NET 图标 */
@@ -303,6 +357,7 @@ struct os_dlg_stack {
     bool  no_footer;             /* true=无底部"返回"行 (如确认框: 确定/取消) */
     bool  small;                 /* true=小自适应确认弹窗 (退出等, 3.3 notice 样式); false=大窗 350×250 */
     bool  auto_h;                /* true=列表自适应高度(内容少自动收窄, 多则满高滚动); false=固定 350×250 */
+    bool  title_small;           /* ★ 标题用 16px(小字) — 仅应用中心"下载 XX?"用; 其他一律 24px */
     bool  row_x;                 /* true=每行内容最右侧显示删除"×", 点击 x 命中该行→弹删除确认 (长按即时同义) */
     const uint8_t *icon;         /* 可选: 确认弹窗文字区下方居中的 1bpp 位图 (如挂载/传输图标); NULL=无 */
     int   icon_w, icon_h;        /* icon 宽高 (bitmap 每行 ceil(w/8) 字节, 位=1 黑像素) */
@@ -334,6 +389,10 @@ struct os_app {
     bool        touch_only;/* true=必须触摸屏才可用 (无触摸时自动隐藏) */
     const char *cat;       /* 商店子分类: "游戏"/"程序"/"网络"/"运维"/"手册"/"学习", NULL=无分类 */
     bool        reveal;    /* true=彩蛋(赞助页5连点)揭示类: 开关打开后仅显示引擎游戏+应用管家 */
+    /* ★★★ 2026-10-25: 资源包类应用 —— 依赖目录不存在时**整条不显示**。
+     *   例: 仙剑 requires="/sdcard/pal" ⇒ 没装游戏数据时应用列表里看不到它,
+     *   商店安装资源包解压到该目录后自动出现。以后同类"安装包型"应用照这个填。 */
+    const char *requires;
 };
 
 /* 编译期/运行期注册应用 (商店安装后运行时注册, 主菜单自动出现). */
@@ -344,6 +403,9 @@ const os_app_t *os_app_get(int idx);
 bool os_app_hidden_visible(void);
 void os_app_toggle_hidden_visible(void);
 bool os_app_visible(const os_app_t *a);
+/* ★ 2026-10-25: 只判断"资源是否就绪"(requires), 不涉及主菜单显示策略。
+ *   应用管家列表要用这个 —— 用 os_app_visible 会把所有 hidden 应用(引擎/工具)全过滤掉。 */
+bool os_app_available(const os_app_t *a);
 int  os_app_visible_count(void);
 const os_app_t *os_app_visible_at(int idx);
 

@@ -21,6 +21,7 @@ idf_component_register(
         "gwenesis/src/io"
         "gwenesis/src/savestate"
     REQUIRES
+        vid_tune
     st7305
     shared_memory
     input

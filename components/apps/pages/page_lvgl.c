@@ -145,6 +145,7 @@ static const os_module_t s_mod_lvgl = {
     .on_enter = lv_enter, .on_exit = lv_exit,
     .render = lv_render, .action = lv_action, .touch = lv_touch, .poll = lv_poll,
     .fullscreen = true,
+    .exit_confirm = true,   /* ★ 2026-10-25 linit: 应用页按返回键先弹"退出程序?" */
 };
 
 void os_page_lvgl_register(void) { os_register(&s_mod_lvgl); }

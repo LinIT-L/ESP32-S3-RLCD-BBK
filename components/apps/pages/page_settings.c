@@ -31,12 +31,15 @@
 #include "esp_heap_caps.h"
 #include "board_battery.h"
 #include "hw_cfg.h"
+#include "esp_netif.h"   /* 网络配置页: IP/掩码/网关/DNS */
+#include "esp_wifi.h"    /* 网络配置页: RSSI/加密方式/信道 */
 #include "svc_nvs.h"
 #include "svc_cfg.h"
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 #include <sys/time.h>
+#include "str_trunc.h"   /* str_trunc(): 短字段的有意截断拷贝 */
 
 #define TAG "PSET"
 #define SET_NS "os_settings"
@@ -53,7 +56,6 @@ static const char *const s_set_items[5] = {
 /* 震动开关状态 (vibrator 无 get, 自行跟踪 + NVS). V1.2.x: 拆为 UI / 游戏 两个独立通道 */
 static bool s_vib_ui   = true;   /* UI 震动: 拖拉/菜单导航/设置调整 */
 static bool s_vib_game = true;   /* 游戏震动: 游戏内按键 */
-static bool s_key_sim  = true;   /* V1.4.x: 触摸反馈 — 触摸点击=触控板"按下/释放"双脉冲 */
 /* 暗黑模式三态 (V1.3.x): 0=关闭 1=暗黑UI模式(除游戏外全反色) 2=全部暗黑模式(含游戏全反色).
  * 面板反色 (黑↔白) 由 st7305_set_inversion 实现; "暗黑UI"在进入游戏时自动恢复正常,
  * 退出游戏恢复反色 — 由 service tick 监听 input_is_game_mode() 驱动. */
@@ -109,9 +111,7 @@ static void settings_load(void) {
     else if (svc_nvs_get_u8(h, "vib", &v) == ESP_OK)      s_vib_game = v;
     vibrator_set_ui_enabled(s_vib_ui);
     vibrator_set_game_enabled(s_vib_game);
-    /* V1.4.x: 按键模拟开关 (触控板式点击双脉冲) */
-    if (svc_nvs_get_u8(h, "vib_key", &v) == ESP_OK) s_key_sim = v;
-    vibrator_set_key_sim(s_key_sim);
+    /* ★ 2026-10-24: "触摸反馈"已并入 UI 震动, 不再单独读 NVS vib_key */
     svc_nvs_close(h);
 }
 
@@ -126,15 +126,20 @@ static void build_sysinfo(void) {
     /* ★ 2026-10-16: 行号紧凑排列(0..4) —— 删掉"内部版本"后必须连续编号, 否则中间空行 */
     snprintf(s_info_lines[0], sizeof(s_info_lines[0]),
              "\xe7\x89\x88\xe6\x9c\xac\xe5\x8f\xb7:%.18s", os_version_public());   /* 版本号:1.4 */
+    /* ★★★ 2026-10-18 linit: 核心内存用**英文标签 + KB 单位**显示, 只显示空闲量。
+     *   RAM = 内核内部 RAM(最紧张的资源), PSRAM = 外部 8MB。 */
     snprintf(s_info_lines[1], sizeof(s_info_lines[1]),
-             "\xe5\x89\xa9\xe4\xbd\x99PSRAM:%uKB", /* 剩余PSRAM:XXKB */
-             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+             "RAM:%uKB",                  /* 核心内部 RAM 空闲 KB */
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     snprintf(s_info_lines[2], sizeof(s_info_lines[2]),
-             "\xe4\xbd\x9c\xe8\x80\x85\xe4\xbf\xa1\xe6\x81\xaf:LinIT"); /* 作者信息:LinIT */
+             "PSRAM:%uKB",                /* 外部 PSRAM 空闲 KB */
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     snprintf(s_info_lines[3], sizeof(s_info_lines[3]),
-             "\xe6\x9e\x84\xe5\xbb\xba:%.24s", os_build_stamp());       /* 构建:2026-10-02 11:00 */
+             "\xe4\xbd\x9c\xe8\x80\x85\xe4\xbf\xa1\xe6\x81\xaf:LinIT"); /* 作者信息:LinIT */
     snprintf(s_info_lines[4], sizeof(s_info_lines[4]),
-             "\xe6\x8f\x90\xe4\xba\xa4:%.24s", os_git_desc());          /* 提交:v1.4.0-xx-gxxxxxxx */
+             "\xe6\x9e\x84\xe5\xbb\xba:%.24s", os_build_stamp());       /* 构建:2026-10-02 11:00 */
+    /* ★ 2026-10-18 linit: 删掉"提交:xxx" 那一行 —— 内容是 git 描述(v1.4.0-3-g88140ce)，
+     *   英文+哈希对用户没意义，需要看版本时看"版本号/构建"两行就够。 */
     s_info_n = 5;
 }
 
@@ -563,23 +568,9 @@ static void open_sleep_dlg(ui_ctx_t *ctx) {
     dlg.on_touch  = wheel_touch;
     os_dialog_push(ctx, &dlg);
 }
-/* 休眠时间(菜单标签): 复用同款滚轮 UI, 数据源=os_wp/wp_run (档位 s_wpgrp_mins).
- * 注: 函数名 open_wp_dlg / wpgrp_* 为历史命名(旧称"壁纸时间"), 按当前标签其为"休眠时间". */
-static int wpgrp_min_get(void);   /* 定义在后 (休眠相关区) */
-static int wpgrp_index_of(int min) { for (int i = 0; i < WPGRP_MINS_N; i++) if (s_wpgrp_mins[i] == min) return i; return 0; }
-static void open_wp_dlg(ui_ctx_t *ctx) {
-    s_wheel_sleep = 1;
-    s_wheel_kind = 1;
-    s_sleep_idx = wpgrp_index_of(wpgrp_min_get());
-    os_dlg_stack_t dlg;
-    memset(&dlg, 0, sizeof(dlg));
-    dlg.no_footer = true;
-    dlg.on_render = wheel_render;
-    dlg.on_key    = wheel_key;
-    dlg.on_poll   = wheel_poll;
-    dlg.on_touch  = wheel_touch;
-    os_dialog_push(ctx, &dlg);
-}
+/* ★ 2026-10-24 linit: 「休眠时间」取消 —— 只留一个「关机时间」(os_wp/wp_shut)。
+ *   原来两档分工是"壁纸播多久进休眠(wp_run)" + 一个没接线的 wp_shut, 概念重复。
+ *   现在: 壁纸时间=多久没操作进屏保; 关机时间=屏保播满多久 → 直接关机(深睡)。 */
 
 /* ---- 字体大小档位 (V1.7.x 保留: 供 ui_common/page_main 全局渲染字号) ---- */
 /* [V1.0.9x 精简: 设置页"字体调整"菜单(粗细/大小)已整体移除, 字号固定取 NVS 存档或默认] */
@@ -619,12 +610,9 @@ static void open_dark_dlg(ui_ctx_t *ctx) {
  * (linit 2026-10-14: 触摸唤醒常驻**最下面**, 开关类放末尾) */
 static void open_disp_dlg(ui_ctx_t *ctx, int sel);
 static void open_sleepgrp_dlg(ui_ctx_t *ctx, int sel);
-/* 休眠时间 (与壁纸页共用 NVS "os_wp"/"wp_run"; 档位数组见上方 s_wpgrp_mins) */
-static int wpgrp_min_get(void) {
-    return (int)svc_cfg_get_i32(SLEEP_NS, "wp_run", 10);
-}
+/* 关机时间 (os_wp/wp_shut): 屏保播满该时长 → 自动关机 */
 static int shutgrp_min_get(void) {
-    return (int)svc_cfg_get_i32(SLEEP_NS, "wp_shut", 1440);
+    return (int)svc_cfg_get_i32(SLEEP_NS, "wp_shut", 10);
 }
 static int shutgrp_index_of(int min) { for (int i = 0; i < SHUTGRP_MINS_N; i++) if (s_shutgrp_mins[i] == min) return i; return 0; }
 static void open_shutgrp_min_dlg(ui_ctx_t *ctx) {
@@ -643,7 +631,8 @@ static void open_shutgrp_min_dlg(ui_ctx_t *ctx) {
 }
 /* ============ 电池信息 (休眠与电源 → 电池信息) ============
  * 自绘整层弹窗 (on_render 全接管): 上方当前电压, 主体是**横向电压波形图**。
- *   数据 = board_battery_history() 的真实采样点 (60s 一条, 环形 ≤64 条 ≈ 近 1 小时),
+ *   数据 = board_battery_wave() 的真实采样点 (60s 一条, 存储 7 天, **显示窗口最长 24 小时**,
+ *          24h=1440 点 > 720 上限 ⇒ 自动抽稀成 2 分钟一点),
  *   纵轴固定 3.3V(空) ~ 4.2V(满), 与电量换算同口径。
  * ★ 尺寸/底栏必须与 os_dialog 标准列表弹窗**完全一致** (linit 要求):
  *   350×250 (屏 400×300 − DLG_MARGIN 25×2) · 边框 2px ·
@@ -687,9 +676,10 @@ static bool batinfo_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         draw_vline(lcd, bx + BI_W - 1 - k, by + k, by + BI_H - 1 - k, ST7305_COLOR_BLACK);
     }
 
-    /* ---- 历史样本: 1 字节/分钟, 保留 7 天 (PSRAM + 按天 NVS), 绘制时按窗口抽稀 ---- */
+    /* ---- 历史样本: 1 字节/分钟, 存储保留 7 天 (PSRAM + 按天 NVS), 绘制时按窗口抽稀 ---- */
     static EXT_RAM_BSS_ATTR bat_sample_t smp[BOARD_BATTERY_WAVE_MAX];
-    /* 窗口 = 实际已有数据跨度, 上限 7 天 ⇒ 有几条就撑满整宽 (linit: "实时填满") */
+    /* 窗口 = 实际已有数据跨度, **最长只显示最近 24 小时** (linit 2026-10-26);
+     * 不满 24h 时有几条就撑满整宽 ("实时填满"); 满 24h 后固定滚动看最近一天。 */
     uint32_t win = board_battery_hist_span_s();
     if (win > BOARD_BATTERY_SPAN_MAX) win = BOARD_BATTERY_SPAN_MAX;
     if (win < 600u) win = 600u;
@@ -780,14 +770,13 @@ static void on_sleepgrp_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     switch (result) {
     case 0: open_sleep_dlg(ctx); break;          /* 壁纸时间 (os_wp/min: 无操作多久进壁纸) */
-    case 1: open_wp_dlg(ctx); break;             /* 休眠时间 (os_wp/wp_run: 壁纸播多久进休眠) */
-    case 2: open_shutgrp_min_dlg(ctx); break;    /* 关机时间 */
-    case 3: open_batinfo_dlg(ctx); break;        /* 电池信息 (电压波形图) */
-    case 4: {  /* 触摸唤醒壁纸开关 (V1.5.x, 常驻最下面) */
+    case 1: open_shutgrp_min_dlg(ctx); break;    /* 关机时间 (os_wp/wp_shut: 壁纸播多久 → 关机) */
+    case 2: open_batinfo_dlg(ctx); break;        /* 电池信息 (电压波形图) */
+    case 3: {  /* 触摸唤醒壁纸开关 (V1.5.x, 常驻最下面) */
         bool en = !wp_screensaver_touch_wake_enabled();
         wp_screensaver_set_touch_wake(en);
         os_dialog_pop(ctx);
-        open_sleepgrp_dlg(ctx, 4);
+        open_sleepgrp_dlg(ctx, 3);
         os_dialog_toast(ctx, en ?
             "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x8f\xaf\xe5\x94\xa4\xe9\x86\x92\xe5\xa3\x81\xe7\xba\xb8" :   /* 触摸可唤醒壁纸 */
             "\xe8\xa7\xa6\xe6\x91\xb8\xe4\xb8\x8d\xe5\x94\xa4\xe9\x86\x92\xe5\xa3\x81\xe7\xba\xb8");  /* 触摸不唤醒壁纸 */
@@ -797,17 +786,16 @@ static void on_sleepgrp_select(ui_ctx_t *ctx, int result, void *ud) {
     }
 }
 static void open_sleepgrp_dlg(ui_ctx_t *ctx, int sel) {
-    char items[5][24];
-    const char *ptrs[5];
+    char items[4][24];
+    const char *ptrs[4];
     snprintf(items[0], sizeof(items[0]), "\xe5\xa3\x81\xe7\xba\xb8\xe6\x97\xb6\xe9\x97\xb4");  /* 壁纸时间(os_wp/min=无操作多久进壁纸) */
-    snprintf(items[1], sizeof(items[1]), "\xe4\xbc\x91\xe7\x9c\xa0\xe6\x97\xb6\xe9\x97\xb4");  /* 休眠时间(os_wp/wp_run=壁纸播多久进休眠) */
-    snprintf(items[2], sizeof(items[2]), "\xe5\x85\xb3\xe6\x9c\xba\xe6\x97\xb6\xe9\x97\xb4");  /* 关机时间 */
-    snprintf(items[3], sizeof(items[3]), "\xe7\x94\xb5\xe6\xb1\xa0\xe4\xbf\xa1\xe6\x81\xaf");  /* 电池信息 */
-    snprintf(items[4], sizeof(items[4]), "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x94\xa4\xe9\x86\x92:%s",  /* 触摸唤醒:开/关 */
+    snprintf(items[1], sizeof(items[1]), "\xe5\x85\xb3\xe6\x9c\xba\xe6\x97\xb6\xe9\x97\xb4");  /* 关机时间(os_wp/wp_shut=壁纸播多久→关机) */
+    snprintf(items[2], sizeof(items[2]), "\xe7\x94\xb5\xe6\xb1\xa0\xe4\xbf\xa1\xe6\x81\xaf");  /* 电池信息 */
+    snprintf(items[3], sizeof(items[3]), "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x94\xa4\xe9\x86\x92:%s",  /* 触摸唤醒:开/关 */
              wp_screensaver_touch_wake_enabled() ? "\xe5\xbc\x80" : "\xe5\x85\xb3");
-    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3]; ptrs[4] = items[4];
-    sel = (sel < 0) ? 0 : (sel > 4 ? 4 : sel);
-    os_dialog_list(ctx, "\xe4\xbc\x91\xe7\x9c\xa0\xe7\x9b\xb8\xe5\x85\xb3", ptrs, 5, sel, on_sleepgrp_select, NULL);
+    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3];
+    sel = (sel < 0) ? 0 : (sel > 3 ? 3 : sel);
+    os_dialog_list(ctx, "\xe4\xbc\x91\xe7\x9c\xa0\xe7\x9b\xb8\xe5\x85\xb3", ptrs, 4, sel, on_sleepgrp_select, NULL);
 }
 
 /* ---- 显示与时间弹窗: 平铺 4 项 (日期/时间/字体/暗黑; 休眠独立为主菜单项) ---- */
@@ -892,10 +880,6 @@ static void on_snd_select(ui_ctx_t *ctx, int result, void *ud) {
         s_vib_game = !s_vib_game;
         vibrator_set_game_enabled(s_vib_game);
         settings_save_u8("vib_game", s_vib_game ? 1 : 0);
-    } else if (result == 4) {   /* 触摸反馈开关 (V1.4.x) */
-        s_key_sim = !s_key_sim;
-        vibrator_set_key_sim(s_key_sim);
-        settings_save_u8("vib_key", s_key_sim ? 1 : 0);
     } else {
         return;   /* 返回/其它: 不刷新 */
     }
@@ -905,17 +889,16 @@ static void on_snd_select(ui_ctx_t *ctx, int result, void *ud) {
     open_snd_dlg(ctx, result);
 }
 static void open_snd_dlg(ui_ctx_t *ctx, int sel) {
-    char items[5][30];
-    const char *ptrs[5];
+    char items[4][30];
+    const char *ptrs[4];
     snprintf(items[0], sizeof(items[0]), "\xe5\xa3\xb0\xe9\x9f\xb3:%s", audio_player_is_muted() ? "\xe5\x85\xb3" : "\xe5\xbc\x80");  /* 声音:关/开 */
     snprintf(items[1], sizeof(items[1]), "\xe9\x9f\xb3\xe9\x87\x8f:%d", /* 音量:N */
              audio_player_vol_to_step(audio_player_get_volume()));
     snprintf(items[2], sizeof(items[2]), "UI\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib_ui ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* UI震动:开/关 */
     snprintf(items[3], sizeof(items[3]), "\xe6\xb8\xb8\xe6\x88\x8f\xe9\x9c\x87\xe5\x8a\xa8:%s", s_vib_game ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 游戏震动:开/关 */
-    snprintf(items[4], sizeof(items[4]), "\xe8\xa7\xa6\xe6\x91\xb8\xe5\x8f\x8d\xe9\xa6\x88:%s", s_key_sim ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 触摸反馈:开/关 */
-    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3]; ptrs[4] = items[4];
-    sel = (sel < 0) ? 0 : (sel > 4 ? 4 : sel);
-    os_dialog_list(ctx, "", ptrs, 5, sel, on_snd_select, NULL);
+    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3];
+    sel = (sel < 0) ? 0 : (sel > 3 ? 3 : sel);
+    os_dialog_list(ctx, "", ptrs, 4, sel, on_snd_select, NULL);
 }
 
 /* ---- 无线连接弹窗: 蓝牙/WiFi 开关 + 连接WiFi (WiFi 开时显示) ---- */
@@ -924,7 +907,11 @@ static void open_wifi_scan(ui_ctx_t *ctx);
 static void open_info_dlg(ui_ctx_t *ctx);
 static void open_hw_selfcheck_dlg(ui_ctx_t *ctx);   /* ★硬件自检 */
 static void open_hw_cfg_dlg(ui_ctx_t *ctx);         /* ★硬件配置 */
-static int  s_wifi_idx_selfcheck = -1, s_wifi_idx_hwcfg = -1;
+static int  s_wifi_idx_selfcheck = -1;
+/* 乐观 UI (定义在后): 蓝牙/WiFi 开关的"在途"状态 + 后台执行入口 */
+static volatile int s_bt_opt;
+static volatile int s_wifi_opt;
+static void hw_opt_start(bool bt);
 
 /* USB 网卡菜单"连接WiFi"入口: 复用以设置页同样的扫描→输密码 流程.
  * 需在设置页同编译单元内, 故放这里并导出让 page_usb_net 调用. */
@@ -944,22 +931,30 @@ void settings_wifi_connect_open(ui_ctx_t *ctx) {
     if (!wifi_is_on()) { os_hw_request(OS_HW_WIFI); s_wifi_conn_we_opened = true; }
     open_wifi_scan(ctx);
 }
+static void open_wifi_netcfg(ui_ctx_t *ctx);   /* 网络配置二级弹窗 (定义在后) */
 static void on_wifi_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     /* ★ 2026-10-16: 硬件自检 / 硬件配置 (位置动态, 用记录的下标判断) */
     if (result >= 0 && result == s_wifi_idx_selfcheck) { open_hw_selfcheck_dlg(ctx); return; }
-    if (result == 0) {   /* 蓝牙开关 (懒加载 os_hw) */
-        if (bt_is_on()) { os_hw_release(OS_HW_BT); bt_manager_disable(); }  /* 计数错位时兜底直关 */
-        else            os_hw_request(OS_HW_BT);
-        os_dialog_pop(ctx); open_wifi_dlg(ctx, result);   /* 原地替换, 层级不加深 */
-    } else if (result == 1) {   /* WiFi 开关 */
-        if (wifi_is_on()) { os_hw_release(OS_HW_WIFI); wifi_manager_disable(); }
-        else              os_hw_request(OS_HW_WIFI);
-        os_dialog_pop(ctx); open_wifi_dlg(ctx, result);   /* 原地替换, 层级不加深 */
+    if (result == 0) {   /* 蓝牙开关 —— ★ 乐观 UI: 先改标签+震动, 后台真开/真关 */
+        if (s_bt_opt) return;                       /* 上一个还在跑, 忽略连点 */
+        s_bt_opt = bt_is_on() ? 2 : 1;
+        vibrator_click();                           /* 立刻给触觉反馈 */
+        os_dialog_pop(ctx);
+        open_wifi_dlg(ctx, result);                 /* 立刻重画: 标签变"开···"/"关···" */
+        hw_opt_start(true);
+    } else if (result == 1) {   /* WiFi 开关 —— 同上 */
+        if (s_wifi_opt) return;
+        s_wifi_opt = wifi_is_on() ? 2 : 1;
+        vibrator_click();
+        os_dialog_pop(ctx);
+        open_wifi_dlg(ctx, result);
+        hw_opt_start(false);                        /* 意图(WiFi 重启是否自启)在任务里写 NVS */
     } else if (result == 2) {
-        /* WiFi 开时 = "连接WiFi"; WiFi 关时该项为"系统信息" (固定末项映射) */
-        if (wifi_is_on()) open_wifi_scan(ctx);
-        else open_info_dlg(ctx);
+        /* WiFi 开且已连接 → "网络配置"; 仅开未连 → 直接扫描; WiFi 关 → 系统信息 */
+        if (wifi_is_on() && wifi_manager_is_connected()) open_wifi_netcfg(ctx);
+        else if (wifi_is_on())                           open_wifi_scan(ctx);
+        else                                             open_info_dlg(ctx);
     } else if (result == 3) {   /* WiFi 开时末项 = 系统信息 */
         open_info_dlg(ctx);
     }
@@ -1278,46 +1273,225 @@ static void open_wifi_pwd_dlg(ui_ctx_t *ctx, const char *ssid) {
 }
 
 /* ---- WiFi 扫描列表弹窗 (3.3: 同一列表模板扫描/选择, 选后再输密码) ---- */
+/* ★★★ 2026-10-27 修两个真问题 (linit 报: "扫描特别慢 / 看不见网络名称 / 画面刷新很慢"):
+ *   ① 填充判据原来是 `cnt != d->count`, 而 d->count 初值就是 1 (占位行 "正在扫描 WiFi...")
+ *      ⇒ **只扫到 1 个网络时 cnt==d->count, 条件不成立, 列表永远不填充**, 界面一直停在
+ *      "正在扫描 WiFi...", 一个名字都看不到。改成显式哨兵 s_scan_ui_cnt(-1=未填充)。
+ *   ② wifi_manager_scan_start() 原来在 **UI 线程**里同步跑 (要 esp_wifi_start + 断开
+ *      + 两次 vTaskDelay + 失败重试 200ms) ⇒ 射频启动那 1~2 秒整屏不刷新, 手感像卡死。
+ *      改成: 弹窗立刻出现 → 后台任务开射频+扫描 → poll 只在结果变化时重绘。 */
+static volatile int  s_scan_ui_cnt = -1;   /* -1=还没填充过; >=0=已填充的条数 */
+static volatile bool s_scan_busy   = false;/* 后台 scan_start 正在跑 */
+static volatile bool s_scan_failed = false;/* 本次 scan_start 失败 */
+static volatile bool s_scan_cancel = false;/* 弹窗已关, 后台别再留扫描 */
+
+static void wifi_scan_task(void *arg)
+{
+    (void)arg;
+    bool ok = wifi_manager_scan_start();
+    if (s_scan_cancel) wifi_manager_scan_stop();   /* 弹窗已关: 别让扫描空转/占驱动内存 */
+    s_scan_failed = !ok;
+    s_scan_busy   = false;
+    vTaskDelete(NULL);
+}
+
 static void wifi_scan_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)ud;
     int cnt = wifi_manager_get_scan_count();
-    if (cnt != d->count && cnt > 0) {
-        if (cnt > 60) cnt = 60;
-        d->count = cnt;
-        for (int i = 0; i < cnt; i++) {
-            char ssid[33];
-            if (wifi_manager_get_scan_ssid(i, ssid, sizeof(ssid)) && ssid[0])
-                snprintf(d->items[i], sizeof(d->items[i]), "%.*s", (int)sizeof(d->items[i]) - 1, ssid);
-            else
-                snprintf(d->items[i], sizeof(d->items[i]), "??");
+    if (cnt > 24) cnt = 24;                    /* MAX_AP (wifi_manager.h) */
+    if (cnt > 0) {
+        if (cnt != s_scan_ui_cnt) {            /* 结果有变化才重建列表 */
+            d->count = cnt;
+            for (int i = 0; i < cnt; i++) {
+                char ssid[33];
+                if (wifi_manager_get_scan_ssid(i, ssid, sizeof(ssid)) && ssid[0])
+                    snprintf(d->items[i], sizeof(d->items[i]), "%.*s", (int)sizeof(d->items[i]) - 1, ssid);
+                else
+                    snprintf(d->items[i], sizeof(d->items[i]), "??");
+            }
+            if (d->sel >= d->count) d->sel = d->count - 1;
+            s_scan_ui_cnt = cnt;
+            ctx->needs_redraw = true;
         }
-        if (d->sel >= d->count) d->sel = d->count - 1;
-        ctx->needs_redraw = true;
-    } else if (cnt == 0 && wifi_manager_is_scan_done() && d->count == 1) {
-        /* 扫描完成但没搜到任何网络 → 显示"未找到", 避免一直卡在"正在扫描..." */
-        snprintf(d->items[0], sizeof(d->items[0]), "\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0\xe7\xbd\x91\xe7\xbb\x9c"); /* 未找到网络 */
-        ctx->needs_redraw = true;
+        return;
+    }
+    /* cnt == 0: 结果还没到 / 真没有 / 起不来 */
+    if (s_scan_ui_cnt < 0 && !s_scan_busy) {
+        if (s_scan_failed) {
+            snprintf(d->items[0], sizeof(d->items[0]),
+                     "\xe6\x89\xab\xe6\x8f\x8f\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x8c\xe8\xaf\xb7\xe9\x87\x8d\xe8\xaf\x95"); /* 扫描失败，请重试 */
+            d->count = 1; d->sel = 0; s_scan_ui_cnt = 0;
+            ctx->needs_redraw = true;
+        } else if (wifi_manager_is_scan_done()) {
+            /* 扫描完成但没搜到任何网络 → 显示"未找到", 不卡在"正在扫描..." */
+            snprintf(d->items[0], sizeof(d->items[0]),
+                     "\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0\xe7\xbd\x91\xe7\xbb\x9c"); /* 未找到网络 */
+            d->count = 1; d->sel = 0; s_scan_ui_cnt = 0;
+            ctx->needs_redraw = true;
+        }
     }
 }
 static void wifi_scan_dlg_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
+    s_scan_cancel = true;              /* 告诉后台任务: 弹窗已关, 起完扫描自行收尾 */
     wifi_manager_scan_stop();
+    s_scan_ui_cnt = -1;                /* 下次进来重新填充 */
     if (result < 0) {   /* 返回/取消: 若本次仅为扫码而开 WiFi 且尚未连上 → 关掉, 避免射频常开 */
         if (s_wifi_conn_we_opened && !wifi_manager_is_connected()) os_hw_release(OS_HW_WIFI);
         s_wifi_conn_we_opened = false;
         return;
     }
     char ssid[33];
-    if (wifi_manager_get_scan_ssid(result, ssid, sizeof(ssid)) && ssid[0]) {
-        /* 选网 → 同一弹窗原位变为"输密码+键盘"界面 (不再跳独立全屏键盘页). */
-        open_wifi_pwd_dlg(ctx, ssid);
-    }
-}
-static void open_wifi_scan(ui_ctx_t *ctx) {
-    if (!wifi_manager_scan_start()) {          /* 失败 (含内部一次重试) → 提示并留在原菜单 */
-        os_dialog_toast(ctx, "\xe6\x89\xab\xe6\x8f\x8f\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x8c\xe8\xaf\xb7\xe9\x87\x8d\xe8\xaf\x95"); /* 扫描失败，请重试 */
+    if (!wifi_manager_get_scan_ssid(result, ssid, sizeof(ssid)) || !ssid[0]) return;
+
+    /* ★ 2026-10-20 linit 定的三条规则 */
+    char saved_ssid[33] = {0}, saved_pass[65] = {0};
+    wifi_manager_get_saved(saved_ssid, sizeof(saved_ssid), saved_pass, sizeof(saved_pass));
+    bool same = (saved_ssid[0] && strcmp(saved_ssid, ssid) == 0);
+
+    /* ① 点的就是当前已连的那个 ⇒ 只看信息, **不要重连** */
+    if (same && wifi_manager_is_connected()) {
+        char ip[16] = "-";
+        wifi_manager_get_ip(ip, sizeof(ip));
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%.20s  IP %s", ssid, ip);
+        os_dialog_toast(ctx, msg);
         return;
     }
+    /* ② 有保存密码的同名网络 ⇒ 直接用保存的密码连, 不弹键盘;
+     *    连不上再说 (自愈任务会重试, 用户也可以再点一次, 这次会走③输密码) */
+    if (same && saved_pass[0]) {
+        /* ★ 2026-10-20: 三种情况给三种提示, 不再"点了没反应" */
+        if (!wifi_manager_connect(ssid, saved_pass)) {
+            os_dialog_toast(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5\xef\xbc\x8c\xe8\xaf\xb7\xe7\xa8\x8d\xe5\x80\x99"); /* 正在连接，请稍候 */
+            return;
+        }
+        os_dialog_toast(ctx, "\xe7\x94\xa8\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98\xe5\xaf\x86\xe7\xa0\x81\xe8\xbf\x9e\xe6\x8e\xa5\xe2\x80\xa6"); /* 用已保存密码连接… */
+        return;
+    }
+    /* ③ 其余 (新网络 / 密码变了) → 输密码键盘 */
+    open_wifi_pwd_dlg(ctx, ssid);
+}
+/* ================= 网络配置 (二级) =================
+ * 连接记录(可逐个忘记) + 扫描新网络 + 当前 Wi-Fi 信息(IP/网关/DNS/密码明文)。 */
+static void info_noop(ui_ctx_t *ctx, int result, void *ud);   /* 只读列表回调 (定义在后) */
+static char s_netcfg_ssid[33];
+#define WIFI_HIST_MAX_UI 6
+
+static void wifi_info_dlg(ui_ctx_t *ctx)
+{
+    static char L[10][44];
+    const char *ptrs[10];
+    int n = 0;
+    char ssid[33] = "", pass[65] = "";
+    wifi_manager_get_saved(ssid, sizeof(ssid), pass, sizeof(pass));
+
+    char ip[16] = "-", mask[16] = "-", gw[16] = "-", d1[16] = "-", d2[16] = "-";
+    uint8_t ch = 0; int rssi = 0; int auth = -1;
+    esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (nif) {
+        esp_netif_ip_info_t ii;
+        if (esp_netif_get_ip_info(nif, &ii) == ESP_OK) {
+            snprintf(ip,   sizeof(ip),   IPSTR, IP2STR(&ii.ip));
+            snprintf(mask, sizeof(mask), IPSTR, IP2STR(&ii.netmask));
+            snprintf(gw,   sizeof(gw),   IPSTR, IP2STR(&ii.gw));
+        }
+        esp_netif_dns_info_t d;
+        if (esp_netif_get_dns_info(nif, ESP_NETIF_DNS_MAIN,   &d) == ESP_OK)
+            snprintf(d1, sizeof(d1), IPSTR, IP2STR(&d.ip.u_addr.ip4));
+        if (esp_netif_get_dns_info(nif, ESP_NETIF_DNS_BACKUP, &d) == ESP_OK &&
+            d.ip.u_addr.ip4.addr != 0)
+            snprintf(d2, sizeof(d2), IPSTR, IP2STR(&d.ip.u_addr.ip4));
+    }
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) { rssi = ap.rssi; auth = ap.authmode; }
+    wifi_second_chan_t sc;
+    esp_wifi_get_channel(&ch, &sc);
+
+    const char *auths = (auth == WIFI_AUTH_OPEN) ? "开放"
+                      : (auth == WIFI_AUTH_WEP)  ? "WEP"
+                      : (auth >= WIFI_AUTH_WPA3_PSK) ? "WPA3"
+                      : (auth >= WIFI_AUTH_WPA2_PSK) ? "WPA2" : "WPA";
+
+    snprintf(L[n], 44, "\xe7\xbd\x91\xe7\xbb\x9c:%s", ssid);              n++;  /* 网络: */
+    snprintf(L[n], 44, "\xe5\xaf\x86\xe7\xa0\x81:%s", pass[0] ? pass : "-"); n++; /* 密码: 明文 */
+    snprintf(L[n], 44, "IP:%s", ip);                                      n++;
+    snprintf(L[n], 44, "\xe6\x8e\xa9\xe7\xa0\x81:%s", mask);              n++;  /* 掩码: */
+    snprintf(L[n], 44, "\xe7\xbd\x91\xe5\x85\xb3:%s", gw);                 n++;  /* 网关: */
+    snprintf(L[n], 44, "DNS:%s", d1);                                     n++;
+    snprintf(L[n], 44, "\xe5\xa4\x87\xe7\x94\xa8" "DNS:%s", d2);   /* 备用 + DNS (断开字符串, 免 \xa8D 被当成三字节转义) */             n++;  /* 备用DNS: */
+    snprintf(L[n], 44, "\xe4\xbf\xa1\xe5\x8f\xb7:%d dBm", rssi);           n++;  /* 信号: */
+    snprintf(L[n], 44, "\xe5\x8a\xa0\xe5\xaf\x86:%s  \xe4\xbf\xa1\xe9\x81\x93:%d", auths, ch); n++; /* 加密/信道 */
+    for (int i = 0; i < n; i++) ptrs[i] = L[i];
+    os_dialog_list(ctx, "", ptrs, n, 0, info_noop, NULL);
+}
+
+static void wifi_forget_cb(ui_ctx_t *ctx, int result, void *ud)
+{
+    (void)ud;
+    if (result == 0) wifi_manager_forget(s_netcfg_ssid);
+    os_dialog_pop(ctx);
+    open_wifi_netcfg(ctx);          /* 重开刷新记录列表 */
+}
+
+/* 三级: 连接记录 (已连过的 Wi-Fi, 点一条 → 忘记?) */
+static void wifi_hist_cb(ui_ctx_t *ctx, int result, void *ud)
+{
+    (void)ud;
+    if (result < 0) return;
+    if (wifi_manager_history_get(result, s_netcfg_ssid, sizeof(s_netcfg_ssid), NULL, 0))
+        os_dialog_confirm_ex(ctx, "\xe5\xbf\x98\xe8\xae\xb0\xe8\xbf\x99\xe4\xb8\xaa\xe7\xbd\x91\xe7\xbb\x9c?",
+                             0, -1, wifi_forget_cb, NULL);   /* 忘记这个网络? */
+}
+
+static void open_wifi_hist(ui_ctx_t *ctx)
+{
+    static char items[WIFI_HIST_MAX_UI][40];
+    const char *ptrs[WIFI_HIST_MAX_UI];
+    int n = 0, cnt = wifi_manager_history_count();
+    for (int i = 0; i < cnt && n < WIFI_HIST_MAX_UI; i++) {
+        char ssid[33];
+        if (wifi_manager_history_get(i, ssid, sizeof(ssid), NULL, 0))
+            snprintf(items[n], sizeof(items[n]), "%.*s", (int)sizeof(items[0]) - 1, ssid);
+        else
+            snprintf(items[n], sizeof(items[n]), "-");
+        ptrs[n] = items[n]; n++;
+    }
+    if (n == 0) {                                     /* 一条都没有 */
+        snprintf(items[0], sizeof(items[0]), "\xe6\x9a\x82\xe6\x97\xa0\xe8\xae\xb0\xe5\xbd\x95");  /* 暂无记录 */
+        ptrs[0] = items[0]; n = 1;
+    }
+    os_dialog_list(ctx, "", ptrs, n, 0, wifi_hist_cb, NULL);
+}
+
+/* 二级: 三个固定入口 */
+static void wifi_netcfg_cb(ui_ctx_t *ctx, int result, void *ud)
+{
+    (void)ud;
+    if (result == 0)      open_wifi_hist(ctx);                                   /* 连接记录 */
+    else if (result == 1) wifi_info_dlg(ctx);                                    /* 当前Wi-Fi信息 */
+    else if (result == 2) { os_dialog_pop(ctx); open_wifi_scan(ctx); }           /* 扫描新网络 */
+}
+
+static void open_wifi_netcfg(ui_ctx_t *ctx)
+{
+    static char items[3][40];
+    const char *ptrs[3];
+    int n = 0;
+    snprintf(items[n], sizeof(items[n]), "\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xb0\xe5\xbd\x95"); n++;              /* 连接记录 */
+    snprintf(items[n], sizeof(items[n]), "\xe5\xbd\x93\xe5\x89\x8dWi-Fi\xe4\xbf\xa1\xe6\x81\xaf"); n++;         /* 当前Wi-Fi信息 */
+    snprintf(items[n], sizeof(items[n]), "\xe6\x89\xab\xe6\x8f\x8f\xe6\x96\xb0\xe7\xbd\x91\xe7\xbb\x9c"); n++;  /* 扫描新网络 */
+    for (int i = 0; i < n; i++) ptrs[i] = items[i];
+    os_dialog_list(ctx, "", ptrs, n, 0, wifi_netcfg_cb, NULL);
+}
+
+static void open_wifi_scan(ui_ctx_t *ctx) {
+    /* ★★★ 2026-10-27: 先把弹窗顶上去, 再后台开射频+扫描 —— 射频启动 1~2 秒不再冻住 UI。
+     *   原来这里同步调 wifi_manager_scan_start(), 它会 esp_wifi_start() + 断开 + 两次
+     *   vTaskDelay, 全程占着 UI 线程 ⇒ "扫描特别慢 / 画面刷新很慢" 的主因。 */
+    s_scan_ui_cnt = -1;
+    s_scan_failed = false;
+    s_scan_cancel = false;
     os_dlg_stack_t dlg;
     memset(&dlg, 0, sizeof(dlg));
     snprintf(dlg.items[0], sizeof(dlg.items[0]), "%s", "\xe6\xad\xa3\xe5\x9c\xa8\xe6\x89\xab\xe6\x8f\x8f WiFi..."); /* 正在扫描 WiFi... */
@@ -1326,33 +1500,127 @@ static void open_wifi_scan(ui_ctx_t *ctx) {
     dlg.on_poll = wifi_scan_dlg_poll;
     dlg.cb = wifi_scan_dlg_cb;
     os_dialog_push(ctx, &dlg);
-    ESP_LOGI(TAG, "WiFi 扫描开始");
+    if (!s_scan_busy) {
+        s_scan_busy = true;
+        if (xTaskCreate(wifi_scan_task, "wifi_scan", 5120, NULL, 4, NULL) != pdPASS) {
+            s_scan_busy = false;
+            s_scan_failed = true;
+        }
+    }
+    ESP_LOGI(TAG, "WiFi 扫描开始(后台)");
+}
+
+/* ================= 乐观 UI: 蓝牙/WiFi 开关 (2026-10-25 linit) =================
+ * 问题: 点"蓝牙/ WiFi 开关"要等 bt_manager_enable()/esp_wifi_start() 真正跑完
+ *       (蓝牙 300ms~1s, WiFi 1~3s) 才重画列表 —— 这段时间界面是**死的**, 按键无反应。
+ * 做法: 点击瞬间先改状态标签("开···"/"关···")+ 震动反馈 + 立即重画, 真正启用丢到
+ *       后台任务里跑; 跑完由 wifi_dlg_poll 把标签刷新成最终值。
+ *       ⇒ 手感上"点了就生效", 实际耗时被藏到后面。 */
+/* s_bt_opt / s_wifi_opt 已在文件上方前置声明 (0=空闲 1=正在开 2=正在关) */
+
+static void hw_opt_task(void *arg)
+{
+    bool bt = (bool)(intptr_t)arg;
+    if (bt) {
+        int want = s_bt_opt;
+        if (want == 1)      os_hw_request(OS_HW_BT);
+        else if (want == 2) { os_hw_release(OS_HW_BT); bt_manager_disable(); }
+        s_bt_opt = 0;
+    } else {
+        int want = s_wifi_opt;
+        if (want == 1)      { os_hw_request(OS_HW_WIFI); wifi_manager_set_want_on(true); }
+        else if (want == 2) { os_hw_release(OS_HW_WIFI); wifi_manager_disable();
+                              wifi_manager_set_want_on(false); }
+        s_wifi_opt = 0;
+    }
+    ESP_LOGI("SETTINGS", "%s 后台切换完成 (bt_is_on=%d wifi_is_on=%d)",
+             bt ? "蓝牙" : "WiFi", (int)bt_is_on(), (int)wifi_is_on());
+    vTaskDelete(NULL);
+}
+
+static void hw_opt_start(bool bt)
+{
+    if (xTaskCreate(hw_opt_task, "hw_opt", 4096, (void *)(intptr_t)bt, 3, NULL) != pdPASS) {
+        /* 任务建不出来 (内存极端紧张): 退回同步执行, 功能正确但不乐观 */
+        if (bt) { int w = s_bt_opt; s_bt_opt = 0;
+                  if (w == 1) os_hw_request(OS_HW_BT);
+                  else if (w == 2) { os_hw_release(OS_HW_BT); bt_manager_disable(); } }
+        else    { int w = s_wifi_opt; s_wifi_opt = 0;
+                  if (w == 1) { os_hw_request(OS_HW_WIFI); wifi_manager_set_want_on(true); }
+                  else if (w == 2) { os_hw_release(OS_HW_WIFI); wifi_manager_disable();
+                                     wifi_manager_set_want_on(false); } }
+    }
+}
+
+/* 状态文字: 有在途操作时显示"开···/关···", 否则显示真实状态 */
+static const char *bt_state_str(void)
+{
+    if (s_bt_opt == 1) return "开\xc2\xb7\xc2\xb7\xc2\xb7";
+    if (s_bt_opt == 2) return "关\xc2\xb7\xc2\xb7\xc2\xb7";
+    return bt_is_on() ? "开" : "关";
+}
+static const char *wifi_state_str(void)
+{
+    if (s_wifi_opt == 1) return "开\xc2\xb7\xc2\xb7\xc2\xb7";
+    if (s_wifi_opt == 2) return "关\xc2\xb7\xc2\xb7\xc2\xb7";
+    return wifi_is_on() ? "开" : "关";
+}
+
+/* 按当前(乐观)状态生成菜单项. 返回条数. */
+static int wifi_dlg_build(char items[][32], const char *ptrs[], int cap)
+{
+    int n = 0;
+    if (n < cap) { snprintf(items[n], 32, "蓝牙:%s", bt_state_str());   ptrs[n] = items[n]; n++; }
+    if (n < cap) { snprintf(items[n], 32, "WiFi:%s", wifi_state_str()); ptrs[n] = items[n]; n++; }
+    if (wifi_is_on() && n < cap) {
+        snprintf(items[n], 32, "%s",
+                 wifi_manager_is_connected() ? "网络配置" : "连接WiFi");
+        ptrs[n] = items[n]; n++;
+    }
+    if (n < cap) { snprintf(items[n], 32, "系统信息"); ptrs[n] = items[n]; n++; }
+    s_wifi_idx_selfcheck = n;
+    if (n < cap) { snprintf(items[n], 32, "硬件管理"); ptrs[n] = items[n]; n++; }
+    return n;
+}
+
+/* 在途操作跑完 / WiFi 连上 ⇒ 就地把标签刷新成最终值 (不重开弹窗, 不打断用户) */
+static void wifi_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud)
+{
+    (void)ud;
+    static uint32_t last = 0;
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (now - last < 150) return;      /* 150ms 节流, 别每帧重排字符串 */
+    last = now;
+
+    char items[8][32];
+    const char *ptrs[8];
+    int n = wifi_dlg_build(items, ptrs, 8);
+    bool changed = (n != d->count);
+    for (int i = 0; i < n && !changed; i++)
+        if (strcmp(d->items[i], items[i]) != 0) changed = true;
+    if (!changed) return;
+
+    for (int i = 0; i < n; i++) snprintf(d->items[i], sizeof(d->items[0]), "%s", items[i]);
+    d->count = n;
+    if (d->sel >= n) d->sel = n - 1;
+    if (d->sel < 0)  d->sel = 0;
+    ctx->needs_redraw = true;
 }
 
 static void open_wifi_dlg(ui_ctx_t *ctx, int sel) {
     char items[8][32];
     const char *ptrs[8];
-    int n = 0;
-    snprintf(items[n], sizeof(items[n]), "\xe8\x93\x9d\xe7\x89\x99:%s", bt_is_on() ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* 蓝牙:开/关 */
-    ptrs[n] = items[n]; n++;
-    snprintf(items[n], sizeof(items[n]), "WiFi:%s", wifi_is_on() ? "\xe5\xbc\x80" : "\xe5\x85\xb3");  /* WiFi:开/关 */
-    ptrs[n] = items[n]; n++;
-    if (wifi_is_on()) {
-        /* 已连 WiFi → 该项显示"已连接:<IP>"; 未连 → "连接WiFi" */
-        char ip[16] = "";
-        if (wifi_manager_get_ip(ip, sizeof(ip)) && ip[0])
-            snprintf(items[n], sizeof(items[n]), "\xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5:%s", ip);  /* 已连接:<IP> */
-        else
-            snprintf(items[n], sizeof(items[n]), "\xe8\xbf\x9e\xe6\x8e\xa5WiFi");  /* 连接WiFi */
-        ptrs[n] = items[n]; n++;
-    }
-    snprintf(items[n], sizeof(items[n]), "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xbf\xa1\xe6\x81\xaf");  /* 系统信息 */
-    ptrs[n] = items[n]; n++;
-    s_wifi_idx_selfcheck = n;
-    snprintf(items[n], sizeof(items[n]), "\xe7\xa1\xac\xe4\xbb\xb6\xe7\xae\xa1\xe7\x90\x86");  /* 硬件管理 */
-    ptrs[n] = items[n]; n++;
+    int n = wifi_dlg_build(items, ptrs, 8);
     sel = (sel < 0) ? 0 : (sel >= n ? n - 1 : sel);
-    os_dialog_list(ctx, "", ptrs, n, sel, on_wifi_select, NULL);
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    dlg.count = n;
+    for (int i = 0; i < n; i++) snprintf(dlg.items[i], sizeof(dlg.items[0]), "%s", ptrs[i]);
+    dlg.sel = sel;
+    dlg.cb  = on_wifi_select;
+    /* ★ 乐观 UI 的"刷新"半边: 后台开关跑完 / WiFi 连上后自动更新标签 */
+    dlg.on_poll = wifi_dlg_poll;
+    os_dialog_push(ctx, &dlg);
 }
 
 /* ---- 系统信息: 只读列表弹窗, 每秒刷新(内存等实时值) ---- */
@@ -1379,7 +1647,8 @@ static const char *HWCFG_NAMES[6] = { "触摸", "SD卡", "音频", "电池", "GP
 /* 自检页: 板型 + 6 项"检测到/未检测到(开/关)" + 最后一行"重新自检" */
 static int hwsc_build(char lines[][28]) {
     int k = 0;
-    snprintf(lines[k++], 28, "板型:%s", hw_cfg_board_name());
+    /* ★ 2026-10-20: 板型挪到弹窗标题, 列表只剩 6 项硬件 + 重新自检 = 7 行。
+     *   原来 8 行超出一屏, 要滚一屏才看到 GPS, 而滚动会回弹 ⇒ 点不到 GPS。 */
     for (int i = 0; i < HW_COUNT; i++)
         snprintf(lines[k++], 28, "%s:%s%s", HWCFG_NAMES[i],
                  hw_cfg_detected((hw_id_t)i) ? "检测到" : "未检测到",
@@ -1394,7 +1663,7 @@ static void hwsc_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     if (now - last < 1000) return;
     last = now;
     char L[8][28]; int n = hwsc_build(L);
-    for (int i = 0; i < n; i++) snprintf(d->items[i], sizeof(d->items[i]), "%s", L[i]);
+    for (int i = 0; i < n; i++) str_trunc(d->items[i], sizeof(d->items[i]), L[i]);
     d->count = n; ctx->needs_redraw = true;
 }
 /* ★ 只有 音频/GPS/震动 可点击开关; 触摸/SD卡/电池 只显示不可点(linit 2026-10-16) */
@@ -1412,6 +1681,20 @@ static void hwmg_confirm_cb(ui_ctx_t *ctx, int result, void *ud) {
     os_dialog_pop(ctx);
     open_hw_selfcheck_dlg(ctx);                   /* 重开刷新状态 */
 }
+/* ★ 2026-10-20: GPS 是选装件 —— 没识别到也可以点它"重新识别一遍"
+ *   (焊上模块后不用刷固件, 在这里点一次就行)。 */
+static void hwsc_gps_reprobe_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result == 0) {
+        extern void app_board_gps_probe_async(void);
+        hw_cfg_gps_invalidate();          /* 清掉"未识别"的记录 ⇒ 允许重探 */
+        app_board_gps_probe_async();      /* 后台探 (~1.5s), 完事列表自己刷新 */
+        os_dialog_toast(ctx, "正在识别 GPS…");
+    }
+    s_hwmg_id = -1;
+    os_dialog_pop(ctx);
+    open_hw_selfcheck_dlg(ctx);
+}
 static void hwsc_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     char L[8][28]; int n = hwsc_build(L);
@@ -1419,14 +1702,22 @@ static void hwsc_select(ui_ctx_t *ctx, int result, void *ud) {
         hw_cfg_rescan();
         os_dialog_pop(ctx);
         open_hw_selfcheck_dlg(ctx);
-        os_dialog_toast(ctx, "已重新自检");
+        /* 重新自检会换引脚表，但外设已按旧表初始化 ⇒ 必须重启才真正生效 */
+        os_dialog_toast(ctx, "已重新自检，重启后生效");
         return;
     }
-    /* 第 1..HW_COUNT 行 = 硬件项(第 0 行是板型标题, 不可点) */
-    if (result >= 1 && result <= HW_COUNT) {
-        int id = result - 1;
+    /* 第 0..HW_COUNT-1 行 = 硬件项 (板型已挪到标题) */
+    if (result >= 0 && result < HW_COUNT) {
+        int id = result;
         if (!hwmg_clickable(id)) return;                 /* 触摸/SD/电池: 点击无反应 */
-        if (!hw_cfg_detected((hw_id_t)id)) return;       /* 未检测到: 无反应 */
+        if (!hw_cfg_detected((hw_id_t)id)) {
+            /* 未检测到的只有 GPS 允许"重新识别"(选装件, 用户可能刚焊上) */
+            if (id == HW_GPS) {
+                s_hwmg_id = id;
+                os_dialog_confirm_ex(ctx, "重新识别 GPS?", 0, -1, hwsc_gps_reprobe_cb, NULL);
+            }
+            return;
+        }
         s_hwmg_id = id;
         char msg[48];
         snprintf(msg, sizeof(msg), "%s%s?", hw_cfg_enabled((hw_id_t)id) ? "禁用" : "启用",
@@ -1437,8 +1728,9 @@ static void hwsc_select(ui_ctx_t *ctx, int result, void *ud) {
 static void open_hw_selfcheck_dlg(ui_ctx_t *ctx) {
     os_dlg_stack_t dlg; memset(&dlg, 0, sizeof(dlg));
     char L[8][28]; int n = hwsc_build(L);
-    for (int i = 0; i < n; i++) snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", L[i]);
+    for (int i = 0; i < n; i++) str_trunc(dlg.items[i], sizeof(dlg.items[i]), L[i]);
     dlg.count = n; dlg.sel = -1; dlg.on_poll = hwsc_poll; dlg.cb = hwsc_select;
+    snprintf(dlg.title, sizeof(dlg.title), "%s", hw_cfg_board_name());   /* 板型显示在标题 */
     os_dialog_push(ctx, &dlg);
 }
 
@@ -1495,10 +1787,13 @@ static bool settings_main_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, v
     (void)ud;
     switch (a) {
     case OS_ACTION_UP:
-        if (d->sel > 0) { d->sel--; ctx->needs_redraw = true; }
+        d->sel = (d->sel > 0) ? (d->sel - 1) : 4;   /* ★ 2026-10-17: 首尾循环(原来夹紧在 0) */
+        ctx->needs_redraw = true;
+        if (0) { }
         return true;
     case OS_ACTION_DOWN:
-        if (d->sel < 4) { d->sel++; ctx->needs_redraw = true; }   /* 5 项 (含喝杯水) */
+        d->sel = (d->sel < 4) ? (d->sel + 1) : 0;   /* 5 项 (含喝杯水), 首尾循环 */
+        ctx->needs_redraw = true;
         return true;
     case OS_ACTION_CONFIRM:
         if (d->sel >= d->count) return false;   /* 底部"返回"行 → 默认处理 (关闭) */

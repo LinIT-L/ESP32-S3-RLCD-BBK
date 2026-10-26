@@ -480,7 +480,7 @@ rominfo_t *nes_rom_load(const char *filename)
 
    /* V1.0.53: 原生 rom_loadsram 会从 ROM 文件本身读 SRAM 大小的数据
     * (osd_newextension 被注释), 得到的是 ROM 头部垃圾. 存档由 nes_emu 适配层
-    * 独立读写 /sdcard/dict/NES/<rom>.sav. */
+    * 独立读写 /sdcard/data/saves/NES/<rom>.sav. */
    // rom_loadsram(rominfo);
 
    /* See if there's a palette we can load up */

@@ -96,7 +96,7 @@ game_exit_result_t gam4980_emu_run(void);
 void gam4980_emu_stop(void);
 
 /* === 游戏存档持久化 (解决重启后存档丢失问题) ===
- * 文件路径: /sdcard/dict/<romname>.sav (32KB, sys_flash[0..0x7FFF] 真正存档区)
+ * 文件路径: /sdcard/data/saves/<romname>.sav (32KB, sys_flash[0..0x7FFF] 真正存档区)
  * - gam4980_emu_save_state: 退出游戏时调用, 把 PSRAM 中的存档写入 SD 卡
  * - gam4980_emu_load_state: 进入游戏时调用, 从 SD 卡恢复存档到 PSRAM
  * 调用方需保证 rom_path 指向已加载的 .gam 文件, 与 gam4980_emu_load 传入的路径一致.

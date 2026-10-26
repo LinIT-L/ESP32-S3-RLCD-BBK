@@ -1,10 +1,11 @@
 {
   "ver": 1,
   "site": "https://bbk.linit.cn/bbk",
-  "updated": "2026-10-17 21:55:57",
+  "updated": "2026-10-25 06:59:21",
   "mirrors": [
-    "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store",
-    "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store"
+    "https://bbk.linit.cn/bbk",
+    "https://cdn.jsdelivr.net/gh/LinIT-L/ESP32-S3-RLCD-BBK@main/store",
+    "https://raw.githubusercontent.com/LinIT-L/ESP32-S3-RLCD-BBK/main/store"
   ],
   "pkgs": [
     {
@@ -80,12 +81,24 @@
     {
       "name": "航班雷达",
       "label": "航班雷达",
-      "cat": "运维",
+      "cat": "软件",
       "desc": "自动定位当前位置, 扫描附近空域航班: 距离/方位/高度/地速/呼号",
       "ver": 1,
       "size": 51199,
       "crc32": "30fb5afa",
       "path": "pkgs/航班雷达.lua"
+    },
+    {
+      "name": "仙剑奇侠传",
+      "label": "仙剑奇侠传",
+      "cat": "游戏",
+      "desc": "DOS 经典: 下载后解到 TF 卡, 游戏分类里自动出现",
+      "ver": 2,
+      "size": 29226110,
+      "crc32": "710cab08",
+      "path": "pkgs/pal.zip",
+      "type": "asset",
+      "target": "/sdcard/apps/app/pal"
     }
   ]
 }

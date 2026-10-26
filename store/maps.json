@@ -9,7 +9,7 @@
   "packs": [
     {
       "id": "fj",
-      "label": "福建省",
+      "label": "示例省",
       "files": [
         "maps/fj.bin",
         "maps/fj.json"
@@ -17,7 +17,7 @@
     },
     {
       "id": "putian",
-      "label": "莆田市区",
+      "label": "示例市区",
       "files": [
         "maps/putian_road.ltm",
         "maps/putian_contour.ltm",

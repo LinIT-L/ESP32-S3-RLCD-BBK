@@ -11,6 +11,8 @@
 #include "esp_timer.h"
 #include "esp_rtc_time.h"   /* esp_rtc_get_time_us(): 窗口"天"计时, 跨深睡继续走 */
 #include "nvs_flash.h"      /* 一个月电池日档持久化 (跨天写一次) */
+#include "driver/gpio.h"
+#include "board_pins.h"     /* board_pins_get()->chrg: 充电中检测脚 */
 
 static const char *TAG = "board_battery";
 
@@ -250,6 +252,57 @@ static void board_battery_init_calibration(void)
     ESP_LOGD(TAG, "ADC calibration unavailable, battery voltage will use raw estimate");
 }
 
+/* ---------------- 充电中检测 (LGS4056HDA CHRG) ----------------
+ * CHRG 是**开漏低有效**: 充电中拉低, 不充电时高阻 ⇒ 必须上拉才能读。
+ * 内部上拉(≈45k)就够用; 外部再加 100k 到 3V3 更稳(⛔ 不能上拉到 VBUS)。
+ * 引脚来自板型表 `.chrg` (-1 = 本板没接), 所以这里按需懒初始化,
+ * 避免在"板型还没识别完"的时候就把脚配错。 */
+static int s_chrg_pin = -2;        /* -2 = 还没解析过 */
+
+static void chrg_ensure(void) {
+    if (s_chrg_pin != -2) return;
+    const board_pins_t *bp = board_pins_get();
+    s_chrg_pin = bp ? bp->chrg : -1;
+    if (s_chrg_pin >= 0) {
+        gpio_config_t io = {
+            .pin_bit_mask = (1ULL << s_chrg_pin),
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io);
+        ESP_LOGI(TAG, "CHRG 检测脚 = GPIO%d (开漏低有效: 低=充电中)", s_chrg_pin);
+    } else {
+        ESP_LOGI(TAG, "CHRG 检测脚: 本板未接 (充电状态只能靠 VBUS 推断)");
+    }
+}
+
+int  board_battery_chrg_pin(void) { chrg_ensure(); return s_chrg_pin; }
+bool board_battery_charging(void) {
+    chrg_ensure();
+    if (s_chrg_pin < 0) return false;              /* 没接 → 不知道, 一律报"未充电" */
+    return gpio_get_level((gpio_num_t)s_chrg_pin) == 0;
+}
+
+/* 轮询版: 500ms 缓存一次, 状态翻转时打一行日志。
+ * 上层(状态栏/管家/省电)按 1Hz 调这个就够 —— CHRG 是慢信号, 没必要每帧读。
+ * ⚠ 共用 GPIO18 时(GPS EXTINT 是输入, 不主动驱动), 本函数只读不配, 不会和 GPS 抢线。 */
+bool board_battery_charging_cached(void) {
+    static bool     s_val = false;
+    static int64_t  s_t   = 0;
+    static bool     s_init = false;
+    int64_t now = esp_timer_get_time();
+    if (!s_init || (now - s_t) > 500000) {
+        bool v = board_battery_charging();
+        if (!s_init || v != s_val) {
+            ESP_LOGI(TAG, "充电状态: %s", v ? "充电中" : "未充电");
+        }
+        s_val = v; s_t = now; s_init = true;
+    }
+    return s_val;
+}
+
 esp_err_t board_battery_init(void)
 {
     if (s_initialized) {
@@ -351,7 +404,15 @@ static uint32_t s_cache_ms    = 0;
 #define BAT_SLOTS        (BAT_MIN_PER_DAY * BAT_KEEP_DAYS)   /* 10080 = 7 天 */
 #define BAT_NODATA       0xFFu
 #define BAT_MV_BASE      3000u        /* 编码 (mv-3000)/10 → 0..254 */
-#define BAT_FLUSH_S      600u         /* 落盘节拍 10 分钟 (只重写"当前这一天"那块) */
+#define BAT_FLUSH_S      3600u        /* 落盘节拍 (只重写"当前这一天"那块)
+                                       * ★ 2026-10-26 linit「避免频繁写 NVS」: 600s(10分钟) → 3600s(1小时)。
+                                       *   代价说明 (按实情, 不是磨损):
+                                       *   ① 写 NVS 期间 **flash cache 被关**, 从 flash 执行的代码会停顿十几~
+                                       *      几十 ms ⇒ 界面掉帧、音频可能抖一下。10 分钟一次 = 每小时 6 次停顿。
+                                       *   ② 磨损其实不是主因: NVS 分区 256KB(64 页) 会轮换使用, 144 次/天 摊到
+                                       *      64 页 ≈ 每页 2 天一次擦除, 远低于 10 万次寿命。
+                                       *   改成 1 小时: 停顿从 6 次/小时降到 1 次/小时; 突然掉电最多丢 1 小时波形
+                                       *   (深睡期间本来就不采样)。 */
 #define BAT_HIST_SKIP_BOOT_US 10000000ull  /* 开机 10s 静默期: boot 时 WiFi/SD/LCD 齐上电的真实压降不记 */
 #define BAT_HMETA_NS     "batcal"
 #define BAT_HMETA_KEY    "hmeta"

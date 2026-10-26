@@ -14,6 +14,7 @@ idf_component_register(
         "${CMAKE_SOURCE_DIR}/components/services/tone_player"
         "${CMAKE_SOURCE_DIR}/components/ui/virtual_keys"
     REQUIRES
+        vid_tune
     "st7305"
         "tone_player"
         "virtual_keys"

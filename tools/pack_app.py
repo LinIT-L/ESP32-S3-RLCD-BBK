@@ -23,7 +23,7 @@
     # 打包 (图标从桌面 PNG 取)
     python3 tools/pack_app.py pack apps/lua/diag.lua --name 电脑诊断 --cat 运维 \
             --desc "按现象追问, 概率排序给出故障配件与排除方案" \
-            --icon <HOME>/Desktop/完美图标/应用管家/运维/电脑诊断.png
+            --icon /Users/linit/Desktop/完美图标/应用管家/运维/电脑诊断.png
     # 图标也可直接引用固件已有图标 (从 icons_main.inc 按枚举名取 64x64 1bpp)
     python3 tools/pack_app.py pack apps/lua/netdect.lua --name 网络扫描 --cat 运维 \
             --icon-from-main ICON_NETDECT

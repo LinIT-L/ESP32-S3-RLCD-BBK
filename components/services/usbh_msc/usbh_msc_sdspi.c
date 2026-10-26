@@ -8,7 +8,7 @@
  *   - 挂载时: 先暂停串口控制台 (log_console_suspend, 只写文件日志) → 切到纯 MSC
  *     设备 (usb_composite_enter_msc) → tinyusb_msc_new_storage_sdmmc 注册 TF 卡.
  *   - 退出时: tinyusb_msc_delete_storage → usb_composite_exit 切回正常模式 → 恢复串口.
- *   - 挂载期间串口控制台被暂停, 日志只写 /sdcard/log/bbk.log, 彻底避免写已卸载串口.
+ *   - 挂载期间串口控制台被暂停, 日志只写 /sdcard/data/log/bbk.log, 彻底避免写已卸载串口.
  *   - 调用方 (page_storage) 负责: 挂载前 sd_unmount_vfs_keep_card (释放 VFS),
  *     卸载后 sd_remount_vfs_from_card (重挂本机).
  */

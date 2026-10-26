@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define KEYVAULT_KEY_LEN 16
+#define KEYVAULT_KEY_LEN 32   /* ★ 2026-10-18: AES-256 (原 16 = AES-128) */
 #define KEYVAULT_MAX_NAME 60
 #define KEYVAULT_MAX_SECRET 128
 #define KEYVAULT_MAX_ENTRIES 64
@@ -25,6 +25,9 @@ esp_err_t keyvault_init(void);
 
 /* 是否已设置 PIN */
 bool keyvault_has_pin(void);
+
+/* ★ 2026-10-19: 空 PIN 等同「无密码」——门禁/网页一律直接放行 (含未设置) */
+bool keyvault_pin_is_empty(void);
 
 /* 首次设置 PIN (>=4 位). 0=成功, -2=太短 */
 int keyvault_set_pin(const char *pin);
@@ -52,6 +55,10 @@ int         keyvault_cat_remove(int i);             /* 0=ok, -1=越界, -2=仍�
  * 同一网站可加多条记录实现「多账号」; 列表/取用/删除均按"全局条目序号" idx.
  * V1→V2 自动迁移: 旧记录变 group=原网站名, account="" (见 keyvault_init). */
 int keyvault_add(const uint8_t key[KEYVAULT_KEY_LEN], int cat, const char *group, const char *account, const char *secret);
+/* 通用 blob 加解密 (AES-256-GCM, 自带 nonce/tag). out 容量 ≥ n+28; 解密返回明文长度, 0=失败 */
+size_t keyvault_blob_encrypt(const uint8_t key[KEYVAULT_KEY_LEN], const uint8_t *in, size_t n, uint8_t *out);
+size_t keyvault_blob_decrypt(const uint8_t key[KEYVAULT_KEY_LEN], const uint8_t *in, size_t n, uint8_t *out);
+
 int keyvault_count(void);
 int keyvault_list(char names[][64], int cats[], int n_cap);  /* 返回条目数, 每项分类填到 cats[i] */
 int keyvault_get_account(const uint8_t key[KEYVAULT_KEY_LEN], int idx, char *out, size_t out_cap); /* 取账号(网站名用 list) */

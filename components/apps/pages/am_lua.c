@@ -11,6 +11,7 @@
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -24,8 +25,12 @@
 #define TAG "AMLUA"
 
 /* 扫描状态 (原声明在商店块, 拆分后归本模块) */
-static int s_lua_scan_cat = -1;   /* 已扫描(或正在扫)的分类 */
-static int s_lua_ok_cat   = -1;   /* 当前有效数据对应的分类 */
+/* ★★★ 2026-10-25 linit「切换分类要等接近1秒」:
+ *   原来 s_lua 只有**一份**数据、且按 s_cat 逐分类扫 —— 切一次分类就要整趟重扫
+ *   (opendir + 每个 .lua 读包头的 SD I/O), 而且来回切会反复重扫。
+ *   现在: **一次把 engine/app/ops 三个目录全扫进来**, 每条带 fid 标记,
+ *   切分类只做内存过滤 ⇒ 切换立刻出列表, 不再等 SD。 */
+static bool s_lua_scanned = false;    /* 三个目录已扫完 (数据可用) */
 
 /* ========== Lua 文件项 (应用管家接管 Lua 启动) ==========
  * 扫描 /store/apps 与 /sdcard/apps 下 engine/game/app 三分目录, 合并去重
@@ -41,6 +46,7 @@ typedef struct {
     char     cat[16];       /* LAPP 分类 (无打包则空) —— app.cat 指向这里 */
     int      icon_idx;      /* LAPP icon= 反查主图标表得到的下标 */
     bool     need_wifi;     /* LAPP `need=wifi`: 启动前须联网 (见文件末门禁) */
+    uint8_t  fid;           /* 来自哪个目录: 0=engine 1=app 2=ops (切分类时按它过滤) */
 } am_lua_entry_t;
 static am_lua_entry_t s_lua[AM_LUA_MAX];
 static int s_lua_n = 0;
@@ -51,7 +57,6 @@ static am_lua_entry_t s_lua_bg[AM_LUA_MAX];   /* 后台扫描影子缓冲 */
 static int            s_lua_bg_n = 0;
 static volatile bool  s_lua_busy = false;     /* 后台扫描进行中 */
 static volatile bool  s_lua_done = false;     /* 后台扫描完成 (UI 取货) */
-static int            s_lua_scan_task_cat = -1; /* 本次后台扫描的分类 (任务线程设置) */
 
 /* 该应用指针是否为 Lua 文件项; 是则回填完整路径 */
 bool am_lua_is_entry(const os_app_t *a, const char **path_out) {
@@ -204,24 +209,78 @@ static int am_lua_icon_idx(const apppack_meta_t *m) {
     }
     return ICON_MINI_GAMES;
 }
-/* 分类 -> 英文目录 (引擎/游戏/应用) */
-static const char *am_cat_folder(int cat) {
-    switch (cat) {
-    case AM_CAT_ENGINE: return "engine";
-    case AM_CAT_OPS:    return "ops";
-    default:            return "app";
-    }
-}
+/* 分类 -> 英文目录: 只在"按分类过滤"里用到映射关系, 扫描已改成三目录一次扫完,
+ * 所以这里保留成对照说明 (engine=引擎 / app=应用 / ops=运维)。 */
 /* 分类 Lua 扫描 (后台任务执行, 写影子缓冲 s_lua_bg): 全局唯一函数, 扫指定分类目录
  * /store/apps 与 /sdcard/apps/{engine|app|ops}, 已扫分类(防重入)早退.
  * 结果暂存 s_lua_bg, 由 UI 线程 poll 迁移到 s_lua 并使用. */
-static bool am_lua_scan(int cat, bool bg) {
-    if (s_lua_scan_cat == cat) return true;             /* 已扫过 → 数据就绪 */
+/* ★ 2026-10-25: TF 卡首次使用/换新卡时自动建好三个分类目录, 用户不用手动建。
+ *   /sdcard/apps/{engine|app|ops} —— 与 am_cat_folder() 的映射一致。
+ *   幂等: 已存在时 mkdir 返回 EEXIST, 忽略即可。 */
+/* ★★★ 2026-10-25 目录规范化: 旧布局 → 新布局 (按类型分二级目录)。
+ *   rename 同分区瞬间完成, 不复制不耗时; 目标已存在则跳过(不覆盖)。
+ *   老卡插上第一次进应用管家就自动搬好, 用户不用手动整理。 */
+static void am_migrate_tf_layout(void)
+{
+    static const struct { const char *old; const char *newp; } M[] = {
+        { "/sdcard/gb",          "/sdcard/roms/gb"          },
+        { "/sdcard/gbc",         "/sdcard/roms/gbc"         },
+        { "/sdcard/nes",         "/sdcard/roms/nes"         },
+        { "/sdcard/md",          "/sdcard/roms/md"          },
+        { "/sdcard/sms",         "/sdcard/roms/sms"         },
+        { "/sdcard/AB",          "/sdcard/roms/ab"          },
+        { "/sdcard/lava",        "/sdcard/roms/lava"        },
+        { "/sdcard/vpet",        "/sdcard/roms/vpet"        },
+        { "/sdcard/gam",         "/sdcard/roms/gam"         },
+        { "/sdcard/mp3",         "/sdcard/media/mp3"        },
+        { "/sdcard/screensaver", "/sdcard/media/screensaver"},
+        { "/sdcard/dict",        "/sdcard/data/saves"       },
+        { "/sdcard/log",         "/sdcard/data/log"         },
+        { "/sdcard/App",         "/sdcard/apps/data"        },
+    };
+    struct stat st;
+    for (size_t i = 0; i < sizeof(M) / sizeof(M[0]); i++) {
+        if (stat(M[i].old, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (stat(M[i].newp, &st) == 0) {
+            /* 目标已存在: 不合并(风险), 只记一条日志让用户知道 */
+            ESP_LOGW("AMLUA", "迁移跳过 %s (目标已存在)", M[i].old);
+            continue;
+        }
+        if (rename(M[i].old, M[i].newp) == 0)
+            ESP_LOGI("AMLUA", "迁移 %s → %s", M[i].old, M[i].newp);
+        else
+            ESP_LOGW("AMLUA", "迁移失败 %s", M[i].old);
+    }
+}
+
+static void am_lua_ensure_dirs(void) {
+    /* ★ 只需要第一次做: 每次切分类都跑 7 个 mkdir + 迁移检查, 在 TF 上是实打实的
+     *   磁盘操作(每条约 5~30ms) ⇒ 曾让"切分类"白等几百毫秒。一次启动做一遍就够。 */
+    static bool done = false;
+    if (done) return;
+    done = true;
+    mkdir("/sdcard/apps", 0777);
+    mkdir("/sdcard/apps/engine", 0777);
+    mkdir("/sdcard/apps/app", 0777);
+    mkdir("/sdcard/apps/ops", 0777);
+    mkdir("/sdcard/apps/data", 0777);
+    mkdir("/sdcard/roms", 0777);
+    mkdir("/sdcard/media", 0777);
+    mkdir("/sdcard/data", 0777);
+    am_migrate_tf_layout();
+}
+
+/* 一次扫完 engine/app/ops 三个目录 (每条记 fid), 之后切分类只做内存过滤。 */
+static bool am_lua_scan(bool bg) {
+    am_lua_ensure_dirs();
+    if (s_lua_scanned) return true;                     /* 已扫过 → 数据就绪 */
     am_lua_entry_t *L = bg ? s_lua_bg : s_lua;          /* 后台走影子缓冲, 前台直写 */
     int *pn = bg ? &s_lua_bg_n : &s_lua_n;
     *pn = 0;
-    const char *folder = am_cat_folder(cat);
+    static const char *const folders[3] = { "engine", "app", "ops" };
     const char *bases[2] = { "/store/apps", "/sdcard/apps" };
+    for (int fi = 0; fi < 3; fi++) {
+    const char *folder = folders[fi];
     for (int b = 0; b < 2; b++) {
         char dir[128];
         snprintf(dir, sizeof(dir), "%s/%s", bases[b], folder);
@@ -249,6 +308,7 @@ static bool am_lua_scan(int cat, bool bg) {
             }
             if (*pn >= AM_LUA_MAX) break;
             int k = (*pn)++;
+            L[k].fid = (uint8_t)fi;
             snprintf(L[k].id, sizeof(L[k].id), "lua:%s", nm);
             L[k].cat[0] = 0;
             { /* 显示名: LAPP 打包则用包内 name (可中文), 否则用文件名(去 .lua);
@@ -284,27 +344,24 @@ static bool am_lua_scan(int cat, bool bg) {
         }
         closedir(d);
     }
-    if (!bg) s_lua_scan_cat = cat;        /* 前台直写完成才标记已扫 */
+    }   /* for fi (engine/app/ops) */
+    if (!bg) s_lua_scanned = true;        /* 前台直写完成才标记已扫 */
     return true;
 }
-/* 分类 Lua 后台扫描任务: 扫当前分类直到标记 done, 由 UI poll 取货. */
+/* 后台扫描任务: 一次扫完三个目录, 由 UI poll 取货. */
 static void am_lua_scan_task(void *arg) {
-    int cat = (int)(long)arg;
-    s_lua_scan_task_cat = cat;
-    am_lua_scan(cat, true);
+    (void)arg;
+    am_lua_scan(true);
     s_lua_done = true;
     s_lua_busy = false;
     vTaskDelete(NULL);
 }
-/* 启动分类 Lua 后台扫描 (幂等): 已扫/扫描中早退; 保证前台 rebuild 永不被 SPIFFS 阻塞.
- * 不查 s_lua_done: done 表示后台已完成等待 UI 取货, 与"启动新扫描"无关 (取货后置 false). */
-static void am_lua_scan_async(int cat) {
-    if (s_lua_scan_cat == cat || s_lua_busy) return;
+/* 启动后台扫描 (幂等): 已扫/扫描中早退; 保证前台 rebuild 永不被 SPIFFS 阻塞. */
+static void am_lua_scan_async(void) {
+    if (s_lua_scanned || s_lua_busy) return;
     s_lua_busy = true;
     s_lua_done = false;
-    /* V1.2 修复: 与 am_store_prefetch 同 —— 任务创建失败必须回滚 busy,
-     * 否则该分类永久卡在"正在扫描…"且无法重试. */
-    if (xTaskCreatePinnedToCore(am_lua_scan_task, "am_luascan", 8192, (void *)(long)cat, 3, NULL, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(am_lua_scan_task, "am_luascan", 8192, NULL, 3, NULL, 0) != pdPASS) {
         s_lua_busy = false;
         s_lua_done = false;
         ESP_LOGD(TAG, "Lua 扫描任务创建失败(内存不足?), 允许重试");
@@ -332,8 +389,12 @@ static bool am_lua_is_ops(const am_lua_entry_t *e) {
  *   ⚠ 不能对所有分类都过滤: s_sub 切左侧分类时**不会复位**, 在"应用→游戏"后切到"引擎",
  *     残留的 s_sub=游戏 会把引擎类 Lua 文件全滤掉 (引擎分类本来也没有子分类条)。 */
 static void am_append_lua(bool ops_only) {
+    /* 目录归属过滤: 引擎/应用/运维 各只显示自己目录里的 Lua。
+     * (原来靠"逐分类重扫"天然隔离, 现在一份数据共享, 必须显式按 fid 过滤) */
+    const int want = (am_cat() == AM_CAT_ENGINE) ? 0 : (am_cat() == AM_CAT_OPS) ? 2 : 1;
     for (int i = 0; i < s_lua_n; i++) {   /* 上限由 am_push_app 判定 */
         am_lua_entry_t *e = &s_lua[i];
+        if ((int)e->fid != want) continue;
         if (am_lua_is_ops(e) != ops_only) continue;
         if (!ops_only && am_cat() == AM_CAT_APP && !am_sub_want_cat(e->app.cat)) continue;
         am_push_app(&e->app);
@@ -342,22 +403,21 @@ static void am_append_lua(bool ops_only) {
 
 
 /* ==================== 对外接口 (声明见 am_internal.h) ==================== */
-/* 切分类时调用: 已扫过 → 标记就绪; 未扫 → 启动后台扫描 (幂等) */
+/* 切分类时调用: 已扫过 → 立刻可用; 未扫 → 启动后台扫描 (幂等)。
+ * ★ 现在数据与分类无关(一份全目录数据), 所以切分类不用再等扫描。 */
 void am_lua_prefetch(int cat) {
-    if (s_lua_scan_cat == cat) { s_lua_ok_cat = cat; return; }
-    am_lua_scan_async(cat);
-    s_lua_ok_cat = -1;
+    (void)cat;
+    if (!s_lua_scanned) am_lua_scan_async();
 }
-bool am_lua_ready(int cat) { return s_lua_ok_cat == cat; }
+bool am_lua_ready(int cat) { (void)cat; return s_lua_scanned; }
 void am_lua_append(bool ops_only) { am_append_lua(ops_only); }
-void am_lua_invalidate(void) { s_lua_scan_cat = -1; s_lua_ok_cat = -1; }
+void am_lua_invalidate(void) { s_lua_scanned = false; }
 /* 每帧取货: 影子缓冲搬进正式缓冲并标记就绪; true = 数据有更新, 调用方应重建列表 */
 bool am_lua_tick(void) {
     if (!s_lua_done) return false;
     s_lua_done = false;
     s_lua_n = s_lua_bg_n;
     if (s_lua_n > 0) memcpy(s_lua, s_lua_bg, sizeof(am_lua_entry_t) * (size_t)s_lua_n);
-    s_lua_scan_cat = s_lua_scan_task_cat;
-    s_lua_ok_cat   = s_lua_scan_cat;
+    s_lua_scanned = true;
     return true;
 }

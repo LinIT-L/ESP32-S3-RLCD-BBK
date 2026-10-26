@@ -17,6 +17,7 @@
 #include "ui_common.h"
 #include "input.h"
 #include "os_keyvault.h"
+#include "applock.h"   /* 通用应用锁 (统一 PIN 弹窗) */
 #include "os_hid.h"
 #include "keyboard.h"
 #include "wifi_manager.h"   /* is_connected/get_ip 等 */
@@ -67,11 +68,23 @@ static uint32_t s_lan_t0 = 0;           /* 等待 WiFi 连接的超时起点 (60
 /* 系统"连接WiFi"流程 (局域网手柄同款: 扫描列表+密码键盘, 复用) */
 
 /* ---- os_pane 适配 (双栏模板状态放 PSRAM, 省 ~57KB 内部 RAM, 与阅读器/游戏菜单一致) ---- */
-static EXT_RAM_BSS_ATTR os_pane_t s_km_pane;
+/* ★ LINTOS 2026-10-25: 列表 pane(约 59KB) 原来静态常驻 PSRAM, 改为进页面才分配/退出即还 */
+static os_pane_t *s_km_pane__p;
+static os_pane_t *s_km_pane__get(void) {
+    if (!s_km_pane__p) {
+        s_km_pane__p = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_km_pane__p) ESP_LOGW("PANE", "列表 pane 分配失败 (%u B)", (unsigned)sizeof(os_pane_t));
+    }
+    if (!s_km_pane__p) s_km_pane__p = heap_caps_calloc(1, sizeof(os_pane_t), MALLOC_CAP_8BIT);   /* 兜底: 内部 RAM */
+    return s_km_pane__p;
+}
+static inline void s_km_pane__free(void) { if (s_km_pane__p) { heap_caps_free(s_km_pane__p); s_km_pane__p = NULL; } }
+#define s_km_pane (*s_km_pane__get())
 static EXT_RAM_BSS_ATTR int s_km_map[OS_PANE_ITEM_MAX];   /* pane item idx -> keyvault 全局条目序号 */
 
 /* ---- PIN 弹窗 ---- */
-static bool  s_pin_open = false;      /* 是否叠加 PIN 二级弹窗 */
+static bool  s_pin_open = false;      /* 仅「修改密码」用 (进入门禁已交给 applock) */
+static bool  s_authed = false;        /* 本次进入是否已通过 applock 门禁 */
 static bool  s_pin_set  = false;      /* true=设置PIN false=解锁 */
 static bool  s_pin_from_admin = false;/* true=设置->修改PIN 打开; 此时 BACK 关弹窗回列表(而非退出页面) */
 static int   s_pin_step = 0;          /* 设置PIN: 0=第一次 1=再次确认 */
@@ -217,9 +230,9 @@ static void km_settings_render(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1,
     st7305_handle_t *lcd = ctx->lcd;
     if (!lcd) return;
     static const char *labels[5] = {
-        "\xe9\x85\x8d\xe7\xbd\xae\xe5\xaf\xbc\xe5\x87\xba",  /* 配置导出 */
-        "\xe9\x85\x8d\xe7\xbd\xae\xe5\xaf\xbc\xe5\x85\xa5",  /* 配置导入 */
-        "\xe4\xbf\xae\xe6\x94\xb9\xe5\xaf\x86\xe7\xa0\x81",  /* 修改密码 */
+        "\xe5\xaf\xbc\xe5\x87\xba\xe5\xa4\x87\xe4\xbb\xbd",  /* 导出备份 */
+        "\xe5\xaf\xbc\xe5\x85\xa5\xe5\xa4\x87\xe4\xbb\xbd",  /* 导入备份 */
+        "\xe4\xbf\xae\xe6\x94\xb9PIN",      /* 修改PIN */
         "\xe7\x83\xad\xe7\x82\xb9\xe9\x85\x8d\xe7\xbd\xae",  /* 热点配置 */
         "IP\xe9\x85\x8d\xe7\xbd\xae",                        /* IP配置 */
     };
@@ -229,7 +242,7 @@ static void km_settings_render(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1,
         if (ry + 32 < list_y || ry >= list_bottom) continue;
         bool sel = (p->focus == 1 && idx == p->sel_item);
         if (sel) fill_rect(lcd, rx0, ry, rx1, ry + 30, ST7305_COLOR_BLACK);
-        draw_text_centered(lcd, ry + 4, labels[idx], sel);
+        draw_text_centered_in(lcd, rx0, rx1, ry + 4, labels[idx], sel);   /* 右栏内居中 */
     }
 }
 static void km_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
@@ -282,7 +295,7 @@ static void km_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
 #define KP_PIN_H   46
 #define KP_TOP     (KP_PIN_Y + KP_PIN_H + 12)
 #define KP_COL_W   88
-#define KP_COL_X0  (KP_WIN_X + 20)
+#define KP_COL_X0  (KP_WIN_X + 12)    /* 3*88+2*8=280, 左右各 12 → 真正居中 */
 #define KP_COL_GAP 8
 #define KP_ROW_H   36
 #define KP_ROW_GAP 4
@@ -299,10 +312,13 @@ static void km_draw_cell(st7305_handle_t *lcd, int cx, int cy, int w, int h,
     /* 按钮交互统一规则: 有触屏→按下格子瞬时黑底/松手恢复(不做常驻选中);
      * 无触屏→黑底代表当前选中(cur). 框线恒显示. */
     bool touchdev = input_has_touch();
-    bool active = touchdev ? pressed : cur;
+    (void)cur;
+    bool active = touchdev ? pressed : false;   /* 不常驻反色: 键盘操作不黑, 触摸按下才黑 */
     draw_rect_outline(lcd, cx, cy, cx + w - 1, cy + h - 1, ST7305_COLOR_BLACK);
     if (active) fill_rect(lcd, cx + 1, cy + 1, cx + w - 2, cy + h - 2, ST7305_COLOR_BLACK);
-    draw_label_centered_at(lcd, cx + w / 2, cy + (h - fh) / 2, text, active);
+    /* ★ 2026-10-18: ASCII 字形墨迹偏下 ⇒ 上移 2px 才视觉居中 */
+    int ty = cy + (h - fh) / 2 - (fh == 16 ? 6 : 1);   /* 实测: ASCII 墨迹偏下 4px, 多减 4 */
+    draw_label_centered_at(lcd, cx + w / 2, ty, text, active);
 }
 static char kp_cell_char(int r, int c) {
     if (r < 0 || r >= 3) return 0;
@@ -325,7 +341,7 @@ static void km_pin_del(ui_ctx_t *ctx) {
 }
 static void km_pin_submit(ui_ctx_t *ctx) {
     if (s_pin_set) {
-        if (s_pin_len < 8) { os_dialog_toast(ctx, "最少要八位"); return; }   /* 至少 8 位 */
+        if (s_pin_len > 47) return;   /* 任意位数, 允许空密码 */
         if (s_pin_step == 0) {
             memcpy(s_pin_again, s_pin, sizeof(s_pin_again) - 1);
             s_pin_again[sizeof(s_pin_again) - 1] = '\0';
@@ -348,8 +364,11 @@ static void km_pin_submit(ui_ctx_t *ctx) {
         if (r == 0) {
             os_keyvault_unlock_secret(s_pin, s_key);
             strncpy(s_pin_plain, s_pin, sizeof(s_pin_plain) - 1); s_pin_plain[sizeof(s_pin_plain) - 1] = 0; /* 存明文供 AP 密码 */
-        } else if (r == 1) { os_dialog_toast(ctx, "PIN 错误"); s_pin[0]=0; s_pin_len=0; redraw(ctx); return; }
-        else if (r == 2) { os_dialog_toast(ctx, "已锁定, 请稍后"); s_pin[0]=0; s_pin_len=0; redraw(ctx); return; }
+        } else {
+            char m[48];
+            os_dialog_toast(ctx, os_keyvault_pin_msg(r, m, sizeof(m)));
+            s_pin[0] = 0; s_pin_len = 0; redraw(ctx); return;
+        }
     }
     s_pin[0] = 0; s_pin_len = 0; s_pin_again[0] = 0; s_again_len = 0;
     s_pin_open = false; s_pin_step = 0;
@@ -370,8 +389,8 @@ static void km_render_pin_popup(st7305_handle_t *lcd) {
     }
     /* 标题 (白底黑字, 不再有黑色标题条) */
     const char *t = s_pin_set
-        ? (s_pin_step == 1 ? "\xe5\x86\x8d\xe6\xac\xa1\xe8\xbe\x93\xe5\x85\xa5" : "\xe8\xae\xbe\xe7\xbd\xaePin") /* 再次输入 / 设置Pin */
-        : "\xe8\xbe\x93\xe5\x85\xa5Pin"; /* 输入Pin */
+        ? (s_pin_step == 1 ? "\xe5\x86\x8d\xe6\xac\xa1\xe8\xbe\x93\xe5\x85\xa5" : "\xe8\xae\xbe\xe7\xbd\xaePIN") /* 再次输入 / 设置PIN */
+        : "\xe8\xbe\x93\xe5\x85\xa5PIN"; /* 输入PIN */
     int tw = text_width(t);
     draw_text(lcd, KP_WIN_X + (KP_WIN_W - tw) / 2, KP_WIN_Y + 5, t, false);
     /* PIN 单一输入框: 增大, 输入一个加一个 * (不限制数量) */
@@ -437,6 +456,7 @@ static void on_export_or_import_ex(ui_ctx_t *ctx, bool is_export) {
 
 /* ---- 渲染主入口 ---- */
 static void km_render(ui_ctx_t *ctx) {
+    if (!s_authed) { applock_render(ctx->lcd); return; }   /* 门禁弹窗优先 */
     st7305_handle_t *lcd = ctx->lcd;
     if (!lcd) return;
     st7305_clear(lcd, ST7305_COLOR_WHITE);
@@ -589,6 +609,7 @@ static bool km_pin_touch(ui_ctx_t *ctx, int x, int y) {
 
 /* ---- 按键 ---- */
 static void km_action(ui_ctx_t *ctx, os_action_t a) {
+    if (!s_authed) { applock_action(ctx, a); if (!applock_active()) s_authed = true; redraw(ctx); return; }
     /* PIN 弹窗优先 */
     if (s_pin_open) {
         if (a == OS_ACTION_UP)   { if (s_cursor_r > 0) { s_cursor_r--; kp_clamp_cursor(); redraw(ctx);} return; }
@@ -610,14 +631,15 @@ static void km_action(ui_ctx_t *ctx, os_action_t a) {
                 s_pin_open = false; s_pin[0]=0; s_pin_len=0; s_pin_step=0;
                 s_pin_from_admin = false; redraw(ctx); return;
             }
-            /* 未输入密码按返回 → 直接退出本页 (不进主列表) */
-            os_pop(ctx); return;
+            /* 未输入密码按返回 → 退出本页 (先进统一退出确认) */
+            os_request_exit_confirm(ctx); return;
         }
         return;
     }
 
     if (s_state == KM_LIST) {
-        if (a == OS_ACTION_BACK || a == OS_ACTION_HOME) { os_pop(ctx); return; }
+        /* ★ 2026-10-25: 最外层按返回 → 先弹"退出程序?"确认 */
+        if (a == OS_ACTION_BACK || a == OS_ACTION_HOME) { os_request_exit_confirm(ctx); return; }
         if (os_pane_action(ctx, &s_km_pane, a)) return;
         return;
     }
@@ -671,6 +693,7 @@ static void km_cat_manage_confirm(ui_ctx_t *ctx) {
 
 /* ---- 触摸 ---- */
 static bool km_touch(ui_ctx_t *ctx, int x, int y) {
+    if (!s_authed) { applock_touch(ctx, x, y); if (!applock_active()) s_authed = true; redraw(ctx); return true; }
     if (x < 0 || y < 0) return false;
     if (s_pin_open) return km_pin_touch(ctx, x, y);
 
@@ -1150,6 +1173,7 @@ static void km_press_release(ui_ctx_t *ctx) {
 }
 
 static void km_poll(ui_ctx_t *ctx) {
+    applock_tick(ctx);   /* 门禁期间: 手指按下/抬起触发重绘 */
     km_press_release(ctx);           /* 弹窗/列表共用: 松手恢复按键原色 */
     /* IP配置 (STA): 等待 WiFi 连接后自动启动密钥服务 (1:1 复用局域网手柄流程) */
     if (s_lan_pending) {
@@ -1227,8 +1251,8 @@ static void km_enter(ui_ctx_t *ctx) {
     /* PIN 引导: 直接进入主列表, 再弹二级弹窗设置/解锁 */
     s_state = KM_LIST;
     s_pin_from_admin = false;
-    s_pin_open = true;
-    s_pin_set  = !os_keyvault_has_pin();   /* 无 PIN → 引导设置; 有 PIN → 解锁 */
+    s_pin_open = false;                    /* 进入门禁统一交给 applock (不再用本地弹窗) */
+    s_authed = applock_gate(ctx, "km", "\xe5\xaf\x86\xe9\x92\xa5\xe7\xae\xa1\xe7\x90\x86\xe5\x99\xa8");
     s_pin_step = 0;
     s_pin[0] = 0; s_pin_len = 0;
     s_pin_again[0] = 0; s_again_len = 0;
@@ -1236,6 +1260,7 @@ static void km_enter(ui_ctx_t *ctx) {
     ctx->needs_redraw = true;
 }
 static void km_exit(ui_ctx_t *ctx) {
+    s_km_pane__free();   /* LINTOS: 页面退出归还列表 pane */
     (void)ctx;
     if (s_web_mode == 0) km_web_stop(ctx);   /* 退出应用自动关闭 热点(AP); IP/局域网服务保留 (1:1 手柄) */
     s_state = KM_LIST;

@@ -14,6 +14,7 @@
 #include "lua_bridge.h"
 #include "gps.h"
 #include "gps_nmea.h"
+#include "hw_cfg.h"        /* ★ 2026-10-26: 启动成功时补记"已识别" */
 
 /* app.gps.start() → bool: 初始化 UART、**唤醒模块**、起后台解析任务 (幂等)
  * ★ 2026-10-09 修: 原来漏了 gps_wakeup() —— 开机时 app_board 已经把 GPS 送进
@@ -24,6 +25,19 @@ static int l_gps_start(lua_State *L) {
     if (!gps_is_ready()) e = gps_init(NULL);
     if (e == ESP_OK) e = gps_wakeup();
     if (e == ESP_OK) e = gps_service_start();
+
+    /* ★★ 2026-10-26 linit 兜底: 启动成功就把"已识别/已启用"补记回去。
+     *   背景: 开机一次性识别时模块冷启动慢 / 波特率乱 ⇒ 被记成"未识别",
+     *   hw_cfg 把 GPS 位清掉并标记 probed ⇒ 之后每次开机“什么都不做”
+     *   (连待机都不送, 模块可能 10mA 空转), 设置页也一直显示未启用。
+     *   现在: 只要这次从 GPS 应用里真起来了(init+wakeup+service 全部成功),
+     *   就把"已识别 + 已启用"写回 ⇒ 设置页正确, 下次开机恢复 boot_park 送待机。
+     *   ⚠ 只在"未识别"(detected=0) 时补记; 用户手动关掉的(detected=1/enabled=0) 绝不覆盖。 */
+    if (e == ESP_OK && !hw_cfg_detected(HW_GPS)) {
+        hw_cfg_set_gps_present(true);
+        ESP_LOGW("GPS", "启动成功 ⇒ 补记已识别/已启用 (下次开机会自动送待机)");
+    }
+
     lua_pushboolean(L, e == ESP_OK);
     return 1;
 }
@@ -33,7 +47,7 @@ static int l_gps_start(lua_State *L) {
  * (待机只需 46µA) —— 直接吃电池。 */
 static int l_gps_stop(lua_State *L) {
     gps_service_stop();
-    gps_sleep();
+    gps_release();      /* ★ 2026-10-24: 送待机 + 卸 UART 驱动 + 还原引脚 (内部 RAM 全归还) */
     lua_pushboolean(L, true);
     return 1;
 }
@@ -76,6 +90,13 @@ static int l_gps_fix(lua_State *L) {
     PUT_INT("age_ms", f.last_fix_ms ? (int32_t)(now - f.last_fix_ms) : -1);
     PUT_INT("sentences", (int32_t)f.sentences);   /* 收了多少句 → 判断线通不通 */
     PUT_INT("badcs",     (int32_t)f.bad_checksum); /* 校验失败数 → 波特率/接线的指纹 */
+    PUT_INT("rx",        (int32_t)f.rx_bytes);     /* UART 收到的总字节数 (0 = 线没通) */
+    PUT_INT("ubx",       (int32_t)f.ubx_frames);   /* UBX 同步头数 */
+    PUT_INT("age_rx",    f.last_rx_ms ? (int32_t)(now - f.last_rx_ms) : -1);
+    PUT_INT("baud",      (int32_t)gps_baud());     /* 实际生效波特率 */
+    PUT_BOOL("link",     f.last_rx_ms && (now - f.last_rx_ms) < 5000);  /* 5s 内有字节 */
+    lua_pushstring(L, f.sentences ? "NMEA" : (f.ubx_frames ? "UBX" : "-"));
+    lua_setfield(L, -2, "proto");
 
 #undef PUT_INT
 #undef PUT_BOOL
@@ -96,12 +117,33 @@ static int l_gps_reset(lua_State *L) {
     return 0;
 }
 
+/* app.gps.sats() → 数组, 每项 {sys,prn,el,az,snr,used}
+ * 卫星信息页画地球用。sys: 0=GPS 1=GLONASS 2=Galileo 3=BeiDou 4=QZSS 5=NavIC 6=混合
+ * el=仰角 0..90, az=方位 0..359 (真北=0 顺时针), snr=-1 表示无, used=1 参与解算。 */
+static int l_gps_sats(lua_State *L) {
+    static gps_sat_t v[GPS_MAX_SATS];
+    int n = gps_nmea_sats(v, GPS_MAX_SATS);
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; i++) {
+        lua_createtable(L, 0, 6);
+        lua_pushinteger(L, v[i].sys);  lua_setfield(L, -2, "sys");
+        lua_pushinteger(L, v[i].prn);  lua_setfield(L, -2, "prn");
+        lua_pushinteger(L, v[i].elev); lua_setfield(L, -2, "el");
+        lua_pushinteger(L, v[i].azim); lua_setfield(L, -2, "az");
+        lua_pushinteger(L, v[i].snr);  lua_setfield(L, -2, "snr");
+        lua_pushboolean(L, v[i].used != 0); lua_setfield(L, -2, "used");
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
 void lua_mod_gps_register(lua_State *L)
 {
     lua_newtable(L);
     lua_pushcfunction(L, l_gps_start);   lua_setfield(L, -2, "start");
     lua_pushcfunction(L, l_gps_stop);    lua_setfield(L, -2, "stop");
     lua_pushcfunction(L, l_gps_fix);     lua_setfield(L, -2, "fix");
+    lua_pushcfunction(L, l_gps_sats);    lua_setfield(L, -2, "sats");
     lua_pushcfunction(L, l_gps_demo);    lua_setfield(L, -2, "demo");
     lua_pushcfunction(L, l_gps_reset);   lua_setfield(L, -2, "reset");
     lua_setfield(L, -2, "gps");

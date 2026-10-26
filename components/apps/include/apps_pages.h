@@ -40,4 +40,6 @@ void os_page_sdr_register(void);             /* 频谱仪 */
 /* ★ 连接后自动映射 (C5): 让手柄页 on_enter 直接打开按键映射向导 (任何页面可触发) */
 void page_gamepad_request_map_on_enter(void);
 
+void os_page_pal_register(void);             /* 仙剑奇侠传 */
+
 #endif /* APPS_PAGES_H */

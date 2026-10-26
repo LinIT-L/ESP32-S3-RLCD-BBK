@@ -131,6 +131,14 @@ void audio_player_mic_stop(void);
 int  audio_player_mic_read(int16_t *buf, int frames, int timeout_ms);
 bool audio_player_mic_active(void);
 
+/* ★ 2026-10-25 [LINTOS] 音效混音（MP3 音乐 + 游戏音效）
+ *   MP3 模式下音乐由解码任务独占 I2S，SDLPal 的音效（VOC 实时合成）无处输出。
+ *   sdl_audio.c 把音效 PCM 推进独立环形缓冲，MP3 解码循环写 I2S 前叠加。
+ *   两者都是 44100Hz 立体声交错 int16（采样率由 SDL_OpenAudio 统一），可直接相加。 */
+void audio_player_fx_push(const int16_t *data, int frames);   /* 音效入队（满则丢） */
+void audio_player_fx_mix(int16_t *pcm, uint32_t samples);     /* 叠加到 pcm（含防削波） */
+void audio_player_fx_reset(void);                             /* 换曲时清空残留 */
+
 #ifdef __cplusplus
 }
 #endif

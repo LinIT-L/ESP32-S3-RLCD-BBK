@@ -2,13 +2,12 @@
  * @file gps.h
  * @brief u-blox MAX-M10S GNSS 驱动 (UART + UBX 协议) —— **模块化 API**.
  *
- * 接线 (来源: 用户网表 Netlist_Schematic1_2026-09-29.enet, 器件 U5):
- *   GPS.TXD(2) → ESP U0RXD → **GPIO44**   (ESP 收)
- *   GPS.RXD(3) → ESP U0TXD → **GPIO43**   (ESP 发)
- *   GPS.EXTINT(5)          → **GPIO47**   (备用唤醒脚)
- *   GPS.VCC(8) / V_BCKP(6) / VCC_RF(14) → VCC3V3 (常通电)
- *   ⚠ GPS.V_IO(7) 网表**未接** —— V_IO 是模块的 I/O 电源域, 不接则 UART/EXTINT 全不工作,
- *     本驱动会正常发指令但模块收不到。硬件需把 pin7 接 3V3(VIO_SEL 已接 3V3 = 3.3V 逻辑域)。
+ * 接线 (来源: 原理图网表 2026-10-24, 器件 U3):
+ *   ① 小智一体版: GPS.TXD(2)→GPIO14 · GPS.RXD(3)→GPIO41 · EXTINT(5)→GPIO18
+ *   ③ 标准扩展版: GPS.TXD(2)→U0RXD=GPIO44 · GPS.RXD(3)→U0TXD=GPIO43 · EXTINT(5)→GPIO47
+ *   引脚一律取 `board_pins_get()`（三张表里 gps_tx/gps_rx/gps_extint），不在本文件写死。
+ *   波特率: 模块 MAX-M10S-00B-01, 出厂 **38400**；驱动仍带自动波特率兜底。
+ *   GPS.VCC(8) / VCC_RF(14) → VCC3V3 (常通电)；V_IO(7) 两版都已接 VCC3V3。
  *
  * 设计约定 (与其他驱动一致):
  *   - 句柄/引脚/波特率都在 gps_config_t 里, 不写死在调用方 → 换板只改一处;
@@ -52,6 +51,9 @@ esp_err_t gps_init(const gps_config_t *cfg);
 /* 是否已初始化 */
 bool gps_is_ready(void);
 
+/* 实际生效的波特率 (自动波特率识别后的值; 未初始化 = 配置值) */
+uint32_t gps_baud(void);
+
 /* 当前电源状态 */
 gps_power_state_t gps_power_state(void);
 
@@ -68,6 +70,15 @@ esp_err_t gps_sleep(void);
 /* 唤醒: 先给 UART RX 送一个无害的 UBX-MON-VER 轮询; 若配置了 drive_extint 再补一个脉冲
  * (覆盖 EXTINT 高/低两种有效极性). 返回 ESP_OK 时状态置 ACTIVE. */
 esp_err_t gps_wakeup(void);
+
+/* ★ 2026-10-24 应用退出用: gps_sleep() + **彻底释放** (卸 UART 驱动 + 还原引脚 + s_ready=0)。
+ *   下次 gps_init()/app.gps.start() 会重装。幂等, 未初始化返回 ESP_OK。 */
+esp_err_t gps_release(void);
+
+/* ★ 2026-10-24 开机用: 只把模块送进待机(不 autobaud / 不起服务 / 不占后台)。
+ *   静听 300ms 判定: 无输出=本来就在睡(不动它) / 有输出=送 PMREQ / 乱码=完整初始化兜底。
+ *   结束后 UART 已卸载, 内部 RAM 归零。 */
+esp_err_t gps_boot_park(void);
 
 #ifdef __cplusplus
 }

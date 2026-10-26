@@ -1,7 +1,7 @@
 // svc_log — 日志服务 (收拢 main.c 的日志缓存/落盘/串口暂停)
 /* V1.0.90: 自动保存日志到 TF 卡 (排查随机重启/内存问题).
  * 通过 esp_log_set_vprintf 接管日志: 串口照常打印, 同时按行缓存进内部缓冲,
- * 再由主循环 svc_log_drain() 追加写入 /sdcard/log/bbk.log. 只在 SD 挂载后写盘,
+ * 再由主循环 svc_log_drain() 追加写入 /sdcard/data/log/bbk.log. 只在 SD 挂载后写盘,
  * 失败静默跳过; 文件超过上限后从 0 回绕重建, 避免无限膨胀.
  * s_log_skip 用于多任务/写盘期间的重入保护, 防止日志递归写盘死循环. */
 #include <stdarg.h>
@@ -17,7 +17,7 @@
 
 #define LOG_SAVE_BUF       4096
 #define LOG_SAVE_MAX       (1024UL * 1024)   /* 单个日志文件上限 1MB */
-#define LOG_SAVE_PATH      "/sdcard/log/bbk.log"
+#define LOG_SAVE_PATH      "/sdcard/data/log/bbk.log"
 EXT_RAM_BSS_ATTR static char          s_log_buf[LOG_SAVE_BUF];
 static volatile size_t    s_log_len = 0;
 static volatile bool      s_log_skip = false;

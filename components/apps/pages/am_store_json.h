@@ -14,16 +14,23 @@
 
 #define AM_RPKG_MAX     40
 #define AM_MIRROR_MAX   4
-#define AM_MIRROR_LEN   128
+#define AM_MIRROR_LEN   256
 
 /* 一条云端包记录 (字段名与 tools/store_build.py 产出的 index.json 一一对应) */
 typedef struct {
     char     name[32];    /* 包名 bikecomp (文件名主干) */
     char     label[48];   /* 中文名 (LAPP label=) */
     char     cat[16];     /* app / ops */
+    char     desc[96];    /* 商店列表第二行: 应用说明 */
     uint32_t size;        /* 字节数 */
     uint32_t crc;         /* crc32 (zlib/以太网, 由 hex 文本转来) */
     char     path[96];    /* 相对路径 pkgs/xxx.lua */
+    /* ★ 2026-10-25 资源包类 (仙剑这类"只装游戏数据"的包):
+     *   type   = "app"(默认, 装 .lua) / "asset"(下载 zip 解到 target)
+     *   target = asset 的解包目录, 例如 /sdcard/apps/app/pal
+     * 老索引没有这两个字段 ⇒ type 为空, 行为与以前完全一致 (向后兼容)。 */
+    char     type[12];
+    char     target[80];
 } am_rpkg_t;
 
 /* 解析 index.json。成功返回 0 (且 out_n/mir_n 均 > 0), 失败返回负数:

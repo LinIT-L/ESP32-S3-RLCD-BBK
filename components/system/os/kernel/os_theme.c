@@ -9,6 +9,7 @@
  * 惰性加载: 首次 os_theme_get() 时读一次 NVS, 因此不依赖启动顺序。
  */
 #include "os_theme.h"
+#include "theme_renderer.h"
 #include "ui_common.h"
 #include "svc_cfg.h"
 #include <string.h>
@@ -80,3 +81,18 @@ const char *os_theme_name(int id) {
     if (id < 0 || id >= THEME_COUNT) return "";
     return s_themes[id].name;
 }
+
+/* ============ 主题引擎绑定 (P0) ============
+ * 页面(page_main) 提供 host, 引擎自己注册; os_theme 只做"当前引擎"的存放与转交。
+ * ⚠ 引擎不能反向依赖 apps 组件 —— 所以这里只存指针, 不 #include 具体引擎。 */
+static const theme_host_t     *s_host = NULL;
+static const theme_renderer_t *s_rd   = NULL;
+
+void os_theme_bind(const theme_host_t *host, const theme_renderer_t *rd) {
+    if (host) s_host = host;
+    if (rd)   s_rd   = rd;
+}
+
+const theme_host_t *os_theme_host(void) { return s_host; }
+
+const theme_renderer_t *os_theme_renderer(void) { return s_rd; }

@@ -8,6 +8,7 @@
  *   - 显示: RGB565 -> 4 级灰度 1x, 经 board_rlcd_draw_gb_line 画到 1bit LCD
  */
 #include "nes_emu.h"
+#include "vid_tune.h"      /* 画面优化器 (按引擎独立存档) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,7 +92,7 @@ static bool s_sram_saved = false;      /* 本次会话存档已写回 */
 
 /* === NES 电池存档 (V1.0.53) ===
  * 格式: 8 字节头 ('NESR' + uint32 size) + 原始 SRAM (0x400 * sram_banks 字节).
- * 目录: /sdcard/dict/NES/ (与步步高/GB 分开). */
+ * 目录: /sdcard/data/saves/NES/ (与步步高/GB 分开). */
 #define NES_SRAM_MAGIC 0x5253454E  /* 'NESR' */
 #define NES_SRAM_BANK_LENGTH 0x0400
 
@@ -104,7 +105,7 @@ static void nes_make_save_path(const char *rom_path)
     const char *dot = strrchr(name, '.');
     int len = dot ? (int)(dot - name) : (int)strlen(name);
     if (len <= 0 || len > 96) len = 32;
-    snprintf(s_save_path, sizeof(s_save_path), "/sdcard/dict/NES/%.*s.sav", len, name);
+    snprintf(s_save_path, sizeof(s_save_path), "/sdcard/data/saves/NES/%.*s.sav", len, name);
 }
 
 static void nes_emu_load_sram(void)
@@ -133,8 +134,8 @@ static void nes_emu_save_sram(void)
     if (!nes_context || !nes_context->rominfo || !nes_context->rominfo->sram ||
         nes_context->rominfo->sram_banks <= 0 || s_save_path[0] == 0) return;
     size_t sram_len = NES_SRAM_BANK_LENGTH * (size_t)nes_context->rominfo->sram_banks;
-    mkdir("/sdcard/dict", 0777);
-    mkdir("/sdcard/dict/NES", 0777);
+    mkdir("/sdcard/data/saves", 0777);
+    mkdir("/sdcard/data/saves/NES", 0777);
     FILE *f = fopen(s_save_path, "wb");
     if (!f) return;
     uint32_t magic = NES_SRAM_MAGIC;
@@ -348,6 +349,7 @@ void nes_emu_unload(void)
 
 esp_err_t nes_emu_start(const char *path)
 {
+    vid_tune_attach("nes");   /* 画面优化器: 载入本引擎自己的画面档 */
     if (!path) return ESP_ERR_INVALID_ARG;
     if (s_task_running) return ESP_ERR_INVALID_STATE;
 

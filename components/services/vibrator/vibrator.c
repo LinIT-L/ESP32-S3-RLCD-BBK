@@ -54,7 +54,10 @@ typedef enum { VIB_NONE = 0, VIB_TM6604 = 1 } vib_mode_t;
  *      拿 LEDC 去驱动会把电量采样搅成垃圾。
  * ⚠ 原 GPIO42 让给了 LCD 片选(42 同样在 24 个可用脚里 ✓)。 */
 #include "board_pins.h"
-#define VIB_PWM_PIN   ((gpio_num_t)(BOARD_IS_WEIXUE ? 48 : 8))   /* ★按板型: 微雪=48, 小智=8 */
+/* ★★ 2026-10-18: 震动脚改成**运行时**从板型表取（小智=8 / 微雪=48 / 标准扩展=48）。
+ *   原来是 `BOARD_IS_WEIXUE ? 48 : 8` —— 编译期常量，一个固件通吃三块板时
+ *   换板不会变 ⇒ 微雪板上拿 GPIO8（= 微雪的 I2S DOUT）去斩 PWM，音频直接废。 */
+static gpio_num_t s_vib_pin = GPIO_NUM_NC;
 #define VIB_TIMER     LEDC_TIMER_1
 #define VIB_CHANNEL   LEDC_CHANNEL_1
 #define VIB_RES       LEDC_TIMER_8_BIT
@@ -67,12 +70,9 @@ typedef enum { VIB_NONE = 0, VIB_TM6604 = 1 } vib_mode_t;
 #define VIB_RES_FREQ  190
 
 static vib_mode_t s_mode = VIB_NONE;
-static bool       s_enabled = true;   /* 硬件总开关: ui||game||key_sim 任一开则开 */
-static bool       s_vib_ui   = true;  /* UI 震动开关 (拖拉/菜单导航/设置调整) */
-static bool       s_vib_game = true;  /* 游戏震动开关 (游戏内按键) */
-/* V1.4.x: 按键模拟开关 (触控板式点击反馈, NVS vib_key, 内存默认开) —
- * 与 UI/游戏震动三开关互不重叠: 关 → 触摸点击完全不震. */
-static bool       s_key_sim  = true;
+static bool       s_enabled = true;   /* 硬件总开关: ui||game 任一开则开 */
+static bool       s_vib_ui   = true;  /* ① UI 震动: 触摸点击 / 菜单导航 / 设置调整 (含原"触摸反馈") */
+static bool       s_vib_game = true;  /* ② 游戏震动: 引擎内按键 (各引擎"引擎优化→触摸震动"可再细分) */
 static TimerHandle_t s_tap_timer = NULL;
 static TimerHandle_t s_pat_timer = NULL;
 
@@ -85,14 +85,14 @@ static volatile bool s_music_on;
  *   新板震动电源默认常开 + GPIO42 归了屏 CS ⇒ EN 与 PWM 合并到 GPIO48 一根线,
  *   drv_enable()/VIB_EN_PIN 整条删掉 (停止震动 = duty 归 0)。 */
 static bool ledc_init(void) {
-    gpio_reset_pin(VIB_PWM_PIN);
+    gpio_reset_pin(s_vib_pin);
     ledc_timer_config_t tc = {
         .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = VIB_TIMER,
         .duty_resolution = VIB_RES, .freq_hz = VIB_RES_FREQ, .clk_cfg = LEDC_AUTO_CLK,
     };
     if (ledc_timer_config(&tc) != ESP_OK) return false;
     ledc_channel_config_t ch = {
-        .gpio_num = VIB_PWM_PIN, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = VIB_CHANNEL,
+        .gpio_num = s_vib_pin, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = VIB_CHANNEL,
         .timer_sel = VIB_TIMER, .duty = 0, .hpoint = 0,
     };
     if (ledc_channel_config(&ch) != ESP_OK) return false;
@@ -114,12 +114,12 @@ static void out_set(uint8_t strength01) {   /* strength 0..100 */
      *   会被**冻结在当前电平** ⇒ LEDC 写 duty 一切正常但**引脚不再变化** ——
      *   与实测现象完全一致("开机前几秒能震, 之后彻底没反馈")。
      *   ⇒ 每次输出前**显式解冻** GPIO8, 确保 LEDC 能真正驱动它。 */
-    gpio_hold_dis(VIB_PWM_PIN);
+    gpio_hold_dis(s_vib_pin);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
     esp_rom_delay_us(300);                       /* 保证下降沿被芯片看到 */
-    esp_err_t r1 = ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, duty);
-    esp_err_t r2 = ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
 }
 static void out_off(void) {
     if (s_mode == VIB_NONE) return;
@@ -133,15 +133,21 @@ static void tap_timer_cb(TimerHandle_t t) { (void)t; out_off(); }
 /* ================= 对外接口 ================= */
 void vibrator_init(void) {
     if (s_mode != VIB_NONE) return;
+    /* ★ 每次 init 都按当前板型表取脚（换板后 hw_cfg 已把表切好） */
+    s_vib_pin = (gpio_num_t)board_pins_get()->vib;
+    if ((int)s_vib_pin < 0) {
+        ESP_LOGW(TAG, "本板无震动脚 (板型表 vib=-1), 震动不可用");
+        return;
+    }
     if (!ledc_init()) {
-        ESP_LOGD(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)VIB_PWM_PIN);
+        ESP_LOGD(TAG, "LEDC PWM 配置失败 (GPIO%d), 震动不可用", (int)s_vib_pin);
         return;
     }
     s_mode = VIB_TM6604;
     s_tap_timer = xTimerCreate("vib_tap", pdMS_TO_TICKS(50), pdFALSE, NULL, tap_timer_cb);
     s_pat_timer = xTimerCreate("vib_pat", pdMS_TO_TICKS(50), pdFALSE, NULL, pat_timer_cb);
     ESP_LOGI(TAG, "震动驱动就绪: PWM=GPIO%d (%dHz), 电源默认常开 (无 EN 脚)",
-             (int)VIB_PWM_PIN, VIB_RES_FREQ);
+             (int)s_vib_pin, VIB_RES_FREQ);
 
     /* ★ 2026-10-13 (linit 要求「开机震动可以保留」):
      *   以前开机那一下是 **GPIO8 浮空被误触发**(时长/强度都不可控);
@@ -165,25 +171,26 @@ void vibrator_set_enabled(bool en) {
     }
 }
 
-/* V1.2.x: 三个独立震动通道 (UI / 游戏 / 按键模拟) 的开关与触发.
- * 任一通道开 → 硬件总开关开; 全部关 → duty 归 0 (新板电源常开, 无法靠 EN 断电). */
+/* ★ 2026-10-24 linit 定: **只保留两个开关**
+ *   ① UI 震动  = 触摸点击(原"触摸反馈"合并进来) + 菜单导航 + 设置调整
+ *   ② 游戏震动  = 引擎/游戏内的按键
+ *   关掉哪个, 对应那类就彻底不震 (不再"任一开就都震")。
+ *   两个都关 → 硬件总开关关, duty 归 0 (新板电源常开, 无法靠 EN 断电). */
 void vibrator_set_ui_enabled(bool en) {
     s_vib_ui = en;
-    vibrator_set_enabled(s_vib_ui || s_vib_game || s_key_sim);
+    vibrator_set_enabled(s_vib_ui || s_vib_game);
 }
 void vibrator_set_game_enabled(bool en) {
     s_vib_game = en;
-    vibrator_set_enabled(s_vib_ui || s_vib_game || s_key_sim);
+    vibrator_set_enabled(s_vib_ui || s_vib_game);
 }
 void vibrator_tap_ui(uint16_t ms, uint8_t strength) {
     if (s_vib_ui) vibrator_tap(ms, strength);
 }
 void vibrator_tap_game(uint16_t ms, uint8_t strength) {
-    /* 2026-09-29 用户规范: UI 能震、游戏不震的割裂体验不可接受.
-     * 原来游戏震动单独由"设置→游戏震动"门控, 一旦被关 (或在别处被误关) 游戏里就永远不震,
-     * 而 UI 照常震 —— 用户实测正是这个现象. 现改为: **UI/游戏任一通道开启即生效**,
-     * 要单独关掉"游戏内的按键震动"请用各引擎的「引擎优化→触摸震动」(per-engine 开关). */
-    if (s_vib_game || s_vib_ui) vibrator_tap(ms, strength);
+    /* 只认"游戏震动"开关 —— 与 UI 震动彻底拆开(linit 2026-10-24): 关掉游戏震动后,
+     * 游戏里就该完全不震, 不再借用 UI 通道. 各引擎还可用「引擎优化→触摸震动」再细分. */
+    if (s_vib_game) vibrator_tap(ms, strength);
 }
 
 void vibrator_set(uint8_t strength) {
@@ -350,18 +357,17 @@ const vib_pattern_t VIB_PAT_RAMP_DOWN = { s_seg_down,   5, 1 };
 const vib_pattern_t VIB_PAT_ALARM     = { s_seg_alarm,  2, 0 };   /* 无限循环 */
 const vib_pattern_t VIB_PAT_CLICK     = { s_seg_click,  1, 1 };   /* 按键模拟: 一次=一下短震 */
 
-/* ================= V1.4.x: 按键模拟 (触摸点击反馈) =================
- * 苹果触控板式: 无实体按键, 用单段 18ms 短脉冲模拟机械按键"哒"一下.
- * V1.5.x: 去掉"按下+释放"双脉冲 (一次手势 4 个脉冲是"震好多下"根因).
- * 长按(>0.5s)松手补震由 input.c 释放分支再调一次 vibrator_click (按下1次+弹起1次).
- * V1.5.x: 归"按键模拟"开关独立控制 (s_key_sim, NVS vib_key, 内存默认开) —
- * 与 UI震动/游戏震动三开关互不重叠: 按键模拟关 → 触摸点击完全不震 (不降级);
- * UI震动/游戏震动不影响本通道. 硬件总开关 s_enabled 含本通道. */
-
-void vibrator_set_key_sim(bool en) { s_key_sim = en; vibrator_set_enabled(s_vib_ui || s_vib_game || s_key_sim); }
-bool vibrator_key_sim_enabled(void) { return s_key_sim; }
+/* ================= 触摸点击反馈 (已并入 UI 震动) =================
+ * 苹果触控板式: 单段 18ms 短脉冲模拟机械按键"哒"一下.
+ * 长按(>0.5s)松手补震由 input.c 释放分支再调一次 (按下1次+弹起1次).
+ * ★ 2026-10-24: 原来它归独立的"触摸反馈"开关(NVS vib_key)，现在**合并进 UI 震动**，
+ *   只保留两个开关: UI 震动(含点击) / 游戏震动。 */
 
 void vibrator_click(void) {
-    if (s_mode == VIB_NONE || !s_enabled || !s_key_sim) return;
-    vibrator_play_pattern(&VIB_PAT_CLICK);
+    if (s_mode == VIB_NONE || !s_enabled) return;
+    /* ★ 2026-10-24 linit: "触摸反馈"已**合并进 UI 震动** —— 点击只受 `s_vib_ui` 控制:
+     *   关掉 UI 震动 → 点击也确实不震 (不再有"两个开关各管一半"的困惑)。
+     *   走 vibrator_tap(18ms/100%) 这条已验证可用的输出路径。 */
+    if (!s_vib_ui) return;
+    vibrator_tap(18, 100);
 }

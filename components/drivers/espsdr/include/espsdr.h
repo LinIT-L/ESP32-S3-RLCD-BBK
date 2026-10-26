@@ -64,6 +64,23 @@ esp_err_t espsdr_enter(void);   /* 接管射频: 起 WiFi(NULL+混杂) + PHY 准
 void      espsdr_exit(void);    /* 归还: 停抓取 + 还原寄存器 + 关混杂 (WiFi 由上层恢复) */
 bool      espsdr_ready(void);
 
+/* ---- 启用/释放 (NVS 持久, 重启生效; 不并入 hw_cfg, 频谱仪自管) ----
+ * 采集区 64KB (0x3fcd0000) 由 SOC_RESERVE_MEMORY_REGION 在开机 heap_init 时
+ * 从内部堆保留 —— 但**默认不占用**: 开机 espsdr_reclaim_boot(touch_ok) 若未启用
+ * 就用 heap_caps_add_region 把它加回堆 ⇒ 平时省 64KB。
+ * 使用流程 = "USB 网卡同款重启范式":
+ *   进入频谱仪(未启用) → 提示"启用并重启" → 写 NVS + esp_restart → 下次开机保留;
+ *   退出频谱仪(已启用) → 提示"重启释放" → 清 NVS + esp_restart → 下次开机回收。
+ * (ESP-IDF 没有 heap_caps_remove_region, 堆一旦启用某段就无法安全摘除,
+ *  故只能"开机按 NVS 一次性决定", 切换必须重启。) */
+bool espsdr_nvs_enabled(void);   /* NVS 里的启用标记 (默认关闭) */
+void espsdr_set_enabled(bool en);/* 写 NVS; 重启后才改变 64KB 归属 */
+bool espsdr_usable(void);        /* 本次开机的实际可用性 (由 reclaim_boot 定格) */
+bool espsdr_touch_ok(void);      /* 本机是否带触摸 (无触摸: 只显示图标, 不允许打开) */
+/* 开机调用一次: touch_ok = 屏幕带触摸(微雪原版无触摸→频谱仪用不了, 强制回收)。
+ * 仅当 "NVS启用 && touch_ok" 才保留 64KB; 否则 heap_caps_add_region 加回堆。 */
+void espsdr_reclaim_boot(bool touch_ok);
+
 /* ---- 参数 ---- */
 void espsdr_tune(unsigned mhz);     /* 中心频率 (WiFi 信道走 chanfreq, 其它走 PLL 直设) */
 void espsdr_set_gain(int code);     /* ESPSDR_GAIN_AUTO 或 0..gain_max() */

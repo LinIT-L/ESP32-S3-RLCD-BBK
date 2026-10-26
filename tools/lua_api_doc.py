@@ -37,6 +37,8 @@ MODULE_DESC = {
     "hid":    "USB 键鼠（`hid` 子表）",
     "kbd":    "软键盘（`kbd` 子表）",
     "img":    "大图与精灵（`img` 子表：1bpp BMP 载入 PSRAM + 窗口位块传输，地图/角色用）",
+    "gps":    "定位（NMEA 解析结果，经纬度走整数微度）",
+    "espnow": "ESP-NOW 点对点/广播（≤250 字节/包，不用路由器；双机联机、遥控、信标）",
 }
 
 REG = re.compile(r'lua_pushcfunction\(L,\s*(l_\w+)\);\s*lua_setfield\(L,\s*-2,\s*"([^"]+)"\)')

@@ -16,6 +16,7 @@
  */
 #include "os.h"
 #include "ui_common.h"
+#include "ui_scroll.h"   /* ★ 2026-10-25 弹窗列表滚动统一走模块 */
 #include "input.h"
 #include "bt_manager.h"   /* os_confirm_exit_blocking: 手柄退出确认直读电平 */
 #include "esp_timer.h"
@@ -93,6 +94,45 @@ static void dlg_geom(const os_dlg_stack_t *d, int *x, int *y, int *w, int *h) {
 /* 统一布局计算 (渲染/触摸/滚动共用, 保证三者几何完全一致).
  * 确认框: 标题(消息) 在 y+14, 分隔线 y+38, 按钮行区从 y+44 起垂直居中;
  * 列表  : 内容区 y+4 .. 返回分隔线上方 垂直居中, 底部固定"返回"行. */
+/* ★★ 弹窗正在拖动/回弹?
+ *   dlg_render 用它走"只重画内容区"的快速路径（边框/标题/底栏沿用上一帧），
+ *   解决"目录列表上下滑动非常卡"。 */
+static bool  s_scroll_busy = false;
+/* ★★★ 2026-10-25 linit: 弹窗列表滚动改用统一 ui_scroll 模块。
+ *   原来这里是全项目**最后一份**自写滚动 (s_fling×0.86 + 手写子像素回弹),
+ *   硬件管理 / 系统信息 / 网络列表 / 文件浏览 等**所有弹窗列表**都吃它。
+ *   现在 sel / scroll_px 退化为"渲染镜像" —— 渲染代码一行未改:
+ *       内容偏移 off = sel*DLG_LINE_H - scroll_px
+ *   反向同步靠下面两个 shadow 值检测"外部改了 sel"(按键 UP/DOWN、页内逻辑)。 */
+static ui_scroll_t s_dlg_sc;
+static bool s_dlg_sc_rdy = false;
+static int  s_dlg_sc_cnt = -1;    /* 已建控制器时的条目数 */
+static int  s_dlg_sc_vh  = -1;    /* 已建控制器时的可视高 */
+static int  s_dlg_shadow_sel = -1, s_dlg_shadow_px = 0;
+
+static int s_top_fwd(void);       /* 前向: 判断弹窗是否还开着 */
+
+/* ★★ 2026-10-24 修 "状态栏消失":
+ *   s_scroll_busy 原来只在 dlg_poll 里更新, 而 dlg_poll **只在弹窗是当前模块时**才跑。
+ *   一旦弹窗在"正在拖动/回弹(scroll_px!=0)"时被关掉(超时/选中/BACK/换页), 这个标志就
+ *   永久停在 true ⇒ os_core 从此每帧都跳过状态栏 ⇒ 顶部信息条再也不出现, 主循环还会
+ *   一直按 8ms 跑(费电)。这里给一个显式的复位入口, 关窗时无条件清干净。 */
+static void dlg_scroll_state_reset(void)
+{
+    s_scroll_busy = false;
+    ui_scroll_cancel(&s_dlg_sc);     /* 清 pressed/dragging/fling/anchor */
+    s_dlg_sc_cnt = -1;
+    s_dlg_sc_vh  = -1;
+    s_dlg_shadow_sel = -1;
+    s_dlg_shadow_px  = 0;
+}
+
+bool os_dialog_scrolling(void)
+{
+    /* 没有弹窗时"正在滚动"必然不成立 —— 兜底, 防止任何路径漏复位 */
+    return s_scroll_busy && s_top_fwd() >= 0;
+}
+
 typedef struct {
     int x, y, w, h;
     int footer_y;        /* 底部"返回"行顶 (无则 -1) */
@@ -151,12 +191,12 @@ static int dlg_visible_rows(const os_dlg_stack_t *d) {
 /* 弹窗栈 (每层一份完整状态, 弹栈时恢复父层). 放 PSRAM, 不占内部 SRAM. */
 EXT_RAM_BSS_ATTR static os_dlg_stack_t s_stack[DLG_MAX_DEPTH];
 static int s_top = -1;
+static int s_top_fwd(void) { return s_top; }
 
 /* toast (不占弹窗栈: 瞬时提示) */
 static char     s_toast_msg[72];   /* 72B=24 个汉字(UTF-8 3B/字), 避免长中文提示被截到汉字中间成乱码 */
 static uint32_t s_toast_ms;
 
-static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 static os_dlg_stack_t *top(void) { return (s_top >= 0) ? &s_stack[s_top] : NULL; }
 
 /* 提示弹窗显示时长: 默认 0.5s 自动消失 (用户规范 2026-09-22)。os_dialog_toast_ms 可指定自定义时长. */
@@ -164,7 +204,7 @@ static os_dlg_stack_t *top(void) { return (s_top >= 0) ? &s_stack[s_top] : NULL;
 static uint32_t s_toast_dur_ms = TOAST_MS;   /* V1.5.x: 当前 toast 显示时长 (ms) */
 /* 是否需要显示 toast 提示 (有弹窗时也叠在弹窗之上显示, 到时自动消失) */
 static bool toast_active(void) {
-    return (s_toast_msg[0] != 0) && (now_ms() - s_toast_ms < s_toast_dur_ms);
+    return (s_toast_msg[0] != 0) && (os_millis() - s_toast_ms < s_toast_dur_ms);
 }
 
 /* ============ 渲染 (不清屏, 覆盖在底层之上) ============ */
@@ -212,6 +252,7 @@ static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
     const char *t = text;
     if (text_width(text) > x1 - x0) t = text_clip(text, x1 - x0);
     int top = abs_y + (DLG_LINE_H - 24) / 2;
+    /* ⚠ 16px 方案已回滚(2026-10-17): font_zh16 未加载时 ui_text16() 会崩 —— 先保持 24px */
     if (selected) {
         fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_BLACK);
         draw_text_centered(lcd, top, t, true);
@@ -327,7 +368,13 @@ static void dlg_render(ui_ctx_t *ctx) {
             draw_vline(lcd, L.x + L.w - 1 - k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
         }
         /* 消息居中在上 (距上边框内沿 5px) */
-        draw_text_centered(lcd, L.y + 7, d->title, false);
+        /* ★★★ 2026-10-18 linit 明确: **只有"应用中心→下载 XX?"那个弹窗用 16px**,
+         *   其余所有弹窗(含确认框/列表/提示)**一律 24px**, 与底部按钮同尺寸 ✓
+         *   (之前无条件改 16px ⇒ 全项目弹窗都变小了 ✗) */
+        if (d->title_small && ui_text16_ready())
+            ui_text16c(lcd, L.x + L.w / 2, L.y + 11, d->title, false);
+        else
+            draw_text_centered(lcd, L.y + 7, d->title, false);
         /* 按钮区: 横杠/竖线连接到弹窗边框 (横杠连左右, 竖线连横杠与底边框),
          * 确定/取消 对称居中于左右两半 */
         int bx0 = L.x + 2, bx1 = L.x + L.w - 1 - 2;   /* 按钮白底区: 不覆盖左右边框 */
@@ -353,6 +400,49 @@ static void dlg_render(ui_ctx_t *ctx) {
         draw_text(lcd, cx1 - text_width(s1) / 2, ty, s1, (!touch_scheme && d->sel == 1));
         if (toast_active()) dlg_draw_toast(lcd);
         return;
+    }
+
+    /* ★★★ 2026-10-23 真优化 (linit: "目录滑动非常卡"):
+     *   拖动/回弹期间，弹窗的白底、2px 边框、标题行、底部"返回"栏**全都没变**，
+     *   每帧把它们重画一遍纯属浪费（整窗白底 87K 像素 + 8 条边线 + 标题 + 底栏）。
+     *   这里只清「内容区」再重画可见行与滚动条，其余保留上一帧 ⇒ 每帧工作量大幅下降。
+     *   ⚠ 只有"可滚动列表"走这条路；确认框/图标框/短列表保持原样。 */
+    if (s_scroll_busy && !is_confirm && d->count > 0 && L.footer_y >= 0) {
+        fill_rect(lcd, L.x + 2, L.clip_top, L.x + L.w - 3, L.clip_bottom, ST7305_COLOR_WHITE);
+
+        for (int i = -1; i <= L.visible; i++) {
+            int idx = i + L.scroll;
+            if (idx < 0 || idx >= L.content_count) continue;
+            int row_y = L.content_y0 + i * DLG_LINE_H + L.px;
+            if (row_y + DLG_LINE_H <= L.clip_top || row_y >= L.clip_bottom) continue;
+            dlg_draw_row(lcd, &L, row_y, d->items[idx], (!touch_scheme && idx == d->sel), false);
+            if (d->row_x && row_y >= L.clip_top && row_y + DLG_LINE_H - 2 <= L.clip_bottom) {
+                bool sel = (!touch_scheme && idx == d->sel);
+                int ox = L.x + L.w - 6 - 16;
+                int oy = row_y + (DLG_LINE_H - 24) / 2;
+                draw_text(lcd, ox, oy, "X", sel);
+            }
+        }
+
+        if (L.content_count > L.visible) {
+            int bar_x = L.x + L.w - 3;
+            int bar_y0 = L.content_y0;
+            int bar_y1 = L.content_y0 + L.visible * DLG_LINE_H - 1;
+            draw_vline(lcd, bar_x, bar_y0, bar_y1, ST7305_COLOR_BLACK);
+            int track_h = bar_y1 - bar_y0 + 1;
+            int thumb_h = (track_h * L.visible) / L.content_count;
+            if (thumb_h < 4) thumb_h = 4;
+            int max_scroll = L.content_count - L.visible;
+            int thumb_y = bar_y0 + (max_scroll > 0 ? (track_h - thumb_h) * L.scroll / max_scroll : 0);
+            if (thumb_y < bar_y0) thumb_y = bar_y0;
+            if (thumb_y + thumb_h > bar_y1 + 1) thumb_y = bar_y1 + 1 - thumb_h;
+            draw_vline(lcd, bar_x - 1, thumb_y, thumb_y + thumb_h - 1, ST7305_COLOR_BLACK);
+            draw_vline(lcd, bar_x + 1, thumb_y, thumb_y + thumb_h - 1, ST7305_COLOR_BLACK);
+            for (int ty = thumb_y; ty < thumb_y + thumb_h; ty++)
+                st7305_draw_pixel(lcd, bar_x, ty, ST7305_COLOR_BLACK);
+        }
+        if (toast_active()) dlg_draw_toast(lcd);
+        return;                      /* 边框/标题/底栏沿用上一帧 */
     }
 
     /* 弹窗整体白底覆盖底层 */
@@ -467,13 +557,16 @@ static void dlg_action(ui_ctx_t *ctx, os_action_t a) {
     int content_count = dlg_content_count(d);   /* 不含底部返回行 */
     int max_sel = d->no_footer ? (d->count - 1) : content_count;   /* list 含底部返回行 */
     switch (a) {
+    /* ★★★ 2026-10-17 (社区反馈: 无触摸机型只有几个物理键):
+     *   ① 首尾循环 —— 到底再按就回第一条, 不用反向按到底
+     *   ② LEFT/RIGHT 等同 UP/DOWN —— 只有上下键的机器也能用, 四个方向都能翻 */
     case OS_ACTION_UP:
-        if (d->sel > 0) d->sel--;
+        d->sel = (d->sel > 0) ? (d->sel - 1) : max_sel;
         d->scroll_px = 0;   /* 按键导航吸附回正 */
         ctx->needs_redraw = true;
         break;
     case OS_ACTION_DOWN:
-        if (d->sel < max_sel) d->sel++;
+        d->sel = (d->sel < max_sel) ? (d->sel + 1) : 0;
         d->scroll_px = 0;   /* 按键导航吸附回正 */
         ctx->needs_redraw = true;
         break;
@@ -495,6 +588,15 @@ static void dlg_action(ui_ctx_t *ctx, os_action_t a) {
             int n = (d->count == 2) ? 2 : 3;
             if (a == OS_ACTION_LEFT) d->sel = (d->sel + n - 1) % n;
             else d->sel = (d->sel + 1) % n;
+            ctx->needs_redraw = true;
+        } else if (!d->no_footer && max_sel >= 0) {
+            /* ★ 2026-10-17 (社区反馈): 列表弹窗原来"左右键忽略" ⇒ 无触摸机型只有方向键时
+             *   少一半按键可用。改为左右键也能翻, 且首尾循环。 */
+            int n = max_sel + 1;
+            if (a == OS_ACTION_LEFT) d->sel = (d->sel > 0) ? (d->sel - 1) : max_sel;
+            else                     d->sel = (d->sel < max_sel) ? (d->sel + 1) : 0;
+            (void)n;
+            d->scroll_px = 0;
             ctx->needs_redraw = true;
         }
         break;
@@ -584,6 +686,7 @@ static bool dlg_touch(ui_ctx_t *ctx, int x, int y) {
     return false;
 }
 
+/* 拖动/惯性产生的子像素偏移 -> 行吸附: 滚过整行就换选中行, 并回收到 (-LINE_H, LINE_H) */
 static void dlg_poll(ui_ctx_t *ctx) {
     /* 空 DIALOG 页自愈: 独立 toast 已消失 (超时/被任意输入清除) 但页面未退出时自动回
      * 底层 — 防止"提示没了却卡在空白弹窗页, 按键/触摸全无效" (触摸路径只清 toast 不弹页) */
@@ -593,14 +696,14 @@ static void dlg_poll(ui_ctx_t *ctx) {
     }
     /* toast 超时: 到时后自动关闭 (回到弹出提示前的位置).
      * 注意不能用 toast_active() 判断 (它要求 < 时长, 与超时判断矛盾) */
-    if (s_toast_msg[0] && now_ms() - s_toast_ms >= s_toast_dur_ms) {
+    if (s_toast_msg[0] && os_millis() - s_toast_ms >= s_toast_dur_ms) {
         if (s_top < 0) os_pop(ctx);   /* 独立 toast: 关弹窗页; 叠弹窗上的提示仅清消息 */
         s_toast_msg[0] = 0;
         ctx->needs_redraw = true;
     }
     /* 弹窗超时: 打开后 timeout_ms 毫秒未操作, 自动以 timeout_result 完成 */
     os_dlg_stack_t *d = top();
-    if (d && d->timeout_ms > 0 && now_ms() - d->open_ms >= d->timeout_ms) {
+    if (d && d->timeout_ms > 0 && os_millis() - d->open_ms >= d->timeout_ms) {
         dlg_finish_top(ctx, d->timeout_result);
         d = top();
     }
@@ -633,55 +736,75 @@ static void dlg_poll(ui_ctx_t *ctx) {
         }
     }
 
-    /* 触摸拖动滚动 (跟手): 手指上滑内容跟着上滑, 下滑内容跟着下滑.
-     * 通过子像素偏移 scroll_px 平移渲染内容; 平移满 1 行高则切换选中行并回退偏移,
-     * 保证平滑连续且选中项随拖动手高 '跟手'. */
-    static int s_drag_last_y = -1;
-    static bool s_drag_active = false;
-    /* ★★★ 2026-10-16 松手回弹(linit): 非拖动状态下子像素偏移按 ×0.8 衰减到 0 ——
-     *   越界拉出的余量弹回、行内偏移吸附整行 (<2px 归零)。项目"跟手滚动"铁律。 */
+    /* ================= 触摸滚动 (统一 ui_scroll 模块) =================
+     * 只有"内容超一屏的列表"才滚; 确认框/短列表原样不动。
+     * 手感与主界面列表完全一致: 12px 判定 / 惯性 ×0.86 / 越界回弹 / 松手吸附整行。 */
     {
-        os_dlg_stack_t *dr = top();
-        if (!s_drag_active && dr && !dr->no_footer && dr->scroll_px != 0) {
-            dr->scroll_px = (int)((float)dr->scroll_px * 0.8f);
-            if (dr->scroll_px > -2 && dr->scroll_px < 2) dr->scroll_px = 0;
-            ctx->needs_redraw = true;
-        }
-    }
-    int tx, ty;
-    if (input_get_touch_pos(&tx, &ty)) {
-        if (s_drag_last_y < 0) { s_drag_last_y = ty; s_drag_active = false; }
-        else {
-            int dy = ty - s_drag_last_y;
-            s_drag_last_y = ty;
-            os_dlg_stack_t *dd = top();
-            if (dd && !dd->no_footer && dlg_content_count(dd) > dlg_visible_rows(dd)) {
-                s_drag_active = true;   /* 内容超一屏才算拖动 (短路列表点选不受影响) */
-                int max_sel = dlg_content_count(dd);   /* 含底部返回行 */
-                dd->scroll_px += dy;                    /* 内容跟随手指平移 */
-                bool moved = false;
-                /* 平移满 1 行高: 切换到下一/上一行, 并把偏移回收到 (-LINE_H, LINE_H) */
-                while (dd->scroll_px <= -DLG_LINE_H && dd->sel < max_sel) {
-                    dd->sel++; dd->scroll_px += DLG_LINE_H; moved = true;
-                }
-                while (dd->scroll_px >= DLG_LINE_H && dd->sel > 0) {
-                    dd->sel--; dd->scroll_px -= DLG_LINE_H; moved = true;
-                }
-                /* ★ 顶/底边界(改): 不再硬归零, 保留最多 1 行余量 ⇒ 可继续拉, 松手弹回 */
-                if (dd->sel <= 0 && dd->scroll_px > DLG_LINE_H) dd->scroll_px = DLG_LINE_H;
-                if (dd->sel >= max_sel && dd->scroll_px < -DLG_LINE_H) dd->scroll_px = -DLG_LINE_H;
-                if (moved || dy != 0) ctx->needs_redraw = true;
+        os_dlg_stack_t *d2 = top();
+        bool list = d2 && !d2->no_footer;
+        int cnt = list ? dlg_content_count(d2) : 0;
+        int vis = list ? dlg_visible_rows(d2) : 0;
+        bool scrollable = list && vis > 0 && cnt > vis;
+
+        if (!scrollable) {
+            if (s_dlg_sc_rdy) ui_scroll_cancel(&s_dlg_sc);
+            s_dlg_sc_cnt = -1;
+            s_dlg_sc_vh  = -1;
+            if (list) d2->scroll_px = 0;
+            s_scroll_busy = false;
+        } else {
+            if (!s_dlg_sc_rdy) {
+                ui_scroll_config(&s_dlg_sc, UI_SCROLL_LIST, 0);
+                s_dlg_sc_rdy = true;
             }
-        }
-    } else {
-        s_drag_last_y = -1;
-        if (s_drag_active) {
-            s_drag_active = false;
-            os_dlg_stack_t *dd = top();
-            if (dd) {
-                /* 松手: 不直接置 0 ⇒ 交给顶部回弹衰减(越界弹回 + 吸附整行) */
+            int view = vis * DLG_LINE_H;
+            if (s_dlg_sc_cnt != cnt || s_dlg_sc_vh != view) {
+                /* 换弹窗 / 条目数变了: 重建并对齐到当前 sel (此刻一定没在动) */
+                ui_scroll_init(&s_dlg_sc, DLG_LINE_H, view, cnt * DLG_LINE_H);
+                s_dlg_sc_cnt = cnt;
+                s_dlg_sc_vh  = view;
+                int o = d2->sel * DLG_LINE_H - d2->scroll_px;
+                int mx = ui_scroll_max(&s_dlg_sc);
+                if (o < 0) o = 0;
+                if (o > mx) o = mx;
+                s_dlg_sc.off = o;
+                s_dlg_sc.sub = 0;
+                s_dlg_sc.fling = 0.0f;
+            } else if (!ui_scroll_busy(&s_dlg_sc) &&
+                       (d2->sel != s_dlg_shadow_sel || d2->scroll_px != s_dlg_shadow_px)) {
+                /* ★ 外部改了 sel (按键 UP/DOWN 导航、长按删行、页内跳转)
+                 *   ⇒ 反向同步回控制器, 否则下一帧就被镜像拉回旧位置。 */
+                int o = d2->sel * DLG_LINE_H - d2->scroll_px;
+                int mx = ui_scroll_max(&s_dlg_sc);
+                if (o < 0) o = 0;
+                if (o > mx) o = mx;
+                s_dlg_sc.off = o;
+                s_dlg_sc.sub = 0;
+                s_dlg_sc.fling = 0.0f;
+            }
+
+            int tx, ty;
+            bool down = input_get_touch_pos(&tx, &ty);
+            ui_scroll_touch_xy(&s_dlg_sc, tx, ty, down);   /* 内部按 12px 判定拖动 */
+            ui_scroll_poll(&s_dlg_sc);
+
+            /* 镜像回 sel / scroll_px (渲染与命中判定仍读这两个字段) */
+            int o = ui_scroll_offset(&s_dlg_sc);   /* 含越界 sub, 保留回弹观感 */
+            int sel = o / DLG_LINE_H;
+            if (sel < 0) sel = 0;
+            if (sel > cnt) sel = cnt;
+            int px = -(o - sel * DLG_LINE_H);
+            int pxmax = DLG_LINE_H + DLG_LINE_H / 2;
+            if (px >  pxmax) px =  pxmax;
+            if (px < -pxmax) px = -pxmax;
+            if (d2->sel != sel || d2->scroll_px != px) {
+                d2->sel = sel;
+                d2->scroll_px = px;
                 ctx->needs_redraw = true;
             }
+            s_dlg_shadow_sel = d2->sel;
+            s_dlg_shadow_px  = d2->scroll_px;
+            s_scroll_busy = ui_scroll_busy(&s_dlg_sc);
         }
     }
 }
@@ -704,7 +827,7 @@ void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg) {
     if (s_top + 1 >= DLG_MAX_DEPTH) return;   /* 栈满: 拒绝 */
     if (s_top < 0) os_push(ctx, OS_PAGE_DIALOG);   /* 首层: 打开弹窗页 */
     s_stack[++s_top] = *dlg;                       /* 整体拷贝, 含回调/ud/自定义 */
-    s_stack[s_top].open_ms = now_ms();             /* 记录打开时刻 (供超时) */
+    s_stack[s_top].open_ms = os_millis();             /* 记录打开时刻 (供超时) */
     ESP_LOGI(TAG, "push: \"%s\" top=%d", s_stack[s_top].title, s_top);
     s_cb_handled = true;   /* cb 内调用=下一步同窗替换, 不自动关闭父层 */
 }
@@ -713,6 +836,7 @@ void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg) {
 void os_dialog_clear_all(ui_ctx_t *ctx) {
     ESP_LOGI(TAG, "clear_all: top=%d (无回调直清!)", s_top);
     while (s_top >= 0) os_dialog_pop(ctx);
+    dlg_scroll_state_reset();
     s_toast_msg[0] = 0;
     ctx->needs_redraw = true;
 }
@@ -725,6 +849,9 @@ void os_dialog_pop(ui_ctx_t *ctx) {
         s_top = -1;
         os_pop(ctx);   /* 关闭弹窗页, 恢复底层 */
     }
+    /* ★ 2026-10-24: 关窗即清滚动状态。否则"拖动中被关掉"会让 s_scroll_busy 永久为真,
+     *   os_core 从此不画状态栏 (顶部信息条整块消失)。 */
+    dlg_scroll_state_reset();
     s_cb_handled = true;   /* cb 内显式弹栈=已接管, 避免 dlg_finish_top 再自动关 */
     ctx->needs_redraw = true;
 }
@@ -916,21 +1043,51 @@ void os_dialog_wheel(ui_ctx_t *ctx, const char *const *items, int n, int sel,
     os_dialog_push(ctx, &dlg);
 }
 
+/* ============ 统一入口 (2026-10-19) ============ */
+void os_dlg_open(ui_ctx_t *ctx, const os_dlg_cfg_t *cfg) {
+    if (!ctx || !cfg) return;
+    switch (cfg->type) {
+    case OS_DLG_TOAST:
+        os_dialog_toast_ms(ctx, cfg->msg, cfg->timeout_ms);
+        break;
+    case OS_DLG_CONFIRM:
+        os_dialog_confirm_ex(ctx, cfg->msg, cfg->timeout_ms, cfg->timeout_result, cfg->cb, cfg->ud);
+        break;
+    case OS_DLG_LIST:
+        os_dialog_list(ctx, cfg->title, cfg->items, cfg->count, cfg->sel, cfg->cb, cfg->ud);
+        break;
+    default: break;
+    }
+}
+
 void os_dialog_toast(ui_ctx_t *ctx, const char *msg) {
     os_dialog_toast_ms(ctx, msg, TOAST_MS);
 }
 
 /* V1.6.x: toast 查询/清除 (os_core 任意按键/触摸即时关闭) */
+static bool s_toast_owns_page = false;   /* 弹窗页是 toast 自己开的 ⇒ 关提示时要把它一起收掉 */
+
 bool os_dialog_toast_active(void) { return toast_active(); }
 void os_dialog_toast_clear(void) {
     s_toast_msg[0] = 0;
     s_toast_dur_ms = TOAST_MS;
 }
+/* ★★ 2026-10-20 修"点提示后直接退回桌面":
+ *   原来按键/触摸关提示只清文案, **toast 自己打开的 DIALOG 页留在栈上** ⇒ 用户再按一次
+ *   BACK 就把下层页(手柄/收藏夹)关掉, 表现为"关个提示结果退到桌面"。
+ *   这里把关提示与"收掉自己开的弹窗页"绑成一个动作。 */
+void os_dialog_toast_dismiss(ui_ctx_t *ctx) {
+    bool owns = s_toast_owns_page;
+    s_toast_owns_page = false;
+    os_dialog_toast_clear();
+    if (ctx && owns) os_pop(ctx);
+    if (ctx) ctx->needs_redraw = true;
+}
 /* V1.7.x: 全局 toast 超时清理 — 由 os_core 每帧调用 (不依赖 DIALOG 页的 dlg_poll,
  * 保证 toast 叠在普通弹窗/页面之上时同样 1s 自动关并重绘, 不残留不卡死) */
 void os_dialog_toast_tick(ui_ctx_t *ctx) {
-    if (s_toast_msg[0] && now_ms() - s_toast_ms >= s_toast_dur_ms) {
-        if (s_top < 0) os_pop(ctx);   /* 独立 toast: 关弹窗页 */
+    if (s_toast_msg[0] && os_millis() - s_toast_ms >= s_toast_dur_ms) {
+        if (s_toast_owns_page) { if (ctx) os_pop(ctx); s_toast_owns_page = false; }
         s_toast_msg[0] = 0;
         if (ctx) ctx->needs_redraw = true;
     }
@@ -940,10 +1097,12 @@ void os_dialog_toast_tick(ui_ctx_t *ctx) {
 void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms) {
     s_toast_dur_ms = (ms == 0) ? TOAST_MS : ms;
     snprintf(s_toast_msg, sizeof(s_toast_msg), "%s", msg ? msg : "");
-    s_toast_ms = now_ms();
-    if (s_top < 0) os_push(ctx, OS_PAGE_DIALOG);   /* 无弹窗栈时需打开弹窗页 */
+    s_toast_ms = os_millis();
+    if (s_top < 0) { os_push(ctx, OS_PAGE_DIALOG); s_toast_owns_page = true; }   /* 无弹窗栈时需打开弹窗页 */
     ctx->needs_redraw = true;                      /* 立即触发重绘, 让 toast 叠在顶层显示 */
-    s_cb_handled = true;   /* cb 内提示: 保持当前弹窗, 关闭后回到原位置 */
+    /* ★★ 2026-10-19 linit: **toast 不得保活弹窗**。
+     * 原来这里置 s_cb_handled=true ⇒ 回调里只要弹了 toast，确认框就永远不关
+     * (全系统 12 个 confirm 回调都是这个毛病)。toast 只是覆盖层，与弹窗生命周期无关。 */
 }
 
 /* 全局顶层 toast 覆盖: 由 os_render 在**所有模块渲染之后、flush 之前**调用,

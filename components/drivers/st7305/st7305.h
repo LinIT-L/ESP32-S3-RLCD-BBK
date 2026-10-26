@@ -58,9 +58,13 @@ esp_err_t st7305_resume(st7305_handle_t *dev);
 
 void st7305_deinit(st7305_handle_t *dev);
 
+/* 重建面板互斥量: 有任务持锁被强杀后调用, 否则后续送屏永远超时(表现为卡死) */
+void st7305_lock_recover(void);
+
 void st7305_clear(st7305_handle_t *dev, st7305_color_t color);
 
 void st7305_draw_pixel(st7305_handle_t *dev, int x, int y, st7305_color_t color);
+
 void st7305_set_clip_y(st7305_handle_t *dev, int y0, int y1);   /* ★y裁剪带(弹窗滚动用) */
 void st7305_reset_clip_y(st7305_handle_t *dev);
 
@@ -80,6 +84,9 @@ void st7305_draw_text(st7305_handle_t *dev, int x, int y, const char *text);
 /* 带 1px 白描边的文字: 先对每个字形做一次 1px 二值膨胀画白 (描边), 再画黑色实体.
  * 用于虚拟按键等需要叠在黑色游戏画面上仍清晰可辨的场景 (V1.0.69). */
 void st7305_draw_text_outlined(st7305_handle_t *dev, int x, int y, const char *text);
+
+/* 深睡前把屏送进 SLPIN（Display OFF + Sleep In） */
+esp_err_t st7305_sleep_in(st7305_handle_t *dev);
 
 esp_err_t st7305_flush(st7305_handle_t *dev);
 
@@ -140,6 +147,36 @@ esp_err_t st7305_set_low_power(st7305_handle_t *dev, bool on);
 
 /* 运行时设置帧率控制 (0xB2) — 测试不同刷新率对细纹/棋盘闪烁的影响 */
 esp_err_t st7305_set_frame_rate(st7305_handle_t *dev, uint8_t v);
+/* 读回当前 B2 值（驱动侧记录的真实值, 不是猜的） */
+uint8_t    st7305_get_frame_rate(void);
+
+/* 面板自刷新档位: lpm=true → 0x39 (≈1Hz 极省电) / false → 0x38 (≈32Hz) */
+esp_err_t st7305_set_lpm(st7305_handle_t *dev, bool lpm);
+/* 强制自刷新档位(排除性实验): -1=自动, 0=强制 HPM(0x38), 1=强制 LPM(0x39) */
+void    st7305_set_lpm_force(int mode);
+int     st7305_get_lpm_force(void);
+/* 每帧调一次: 有绘制(drew=true)回 HPM; 连续 500ms 没画自动掉 LPM */
+void st7305_idle_tick(st7305_handle_t *dev, bool drew, uint32_t now_ms);
+/* 让局刷基线作废 (旋转变化/整帧重画后) */
+void st7305_partial_invalidate_pub(void);
+/* 局刷(只送变化的 12 行带)开关, **默认关** —— 整帧更稳, 面板 16Hz 下省字节无收益 */
+/* 作废"已送帧"指纹: 面板内容被旁路刷过(屏保壁纸)之后必须调, 否则下次重绘会被
+ * "内容没变"判据跳过, 屏幕停在旧画面上。 */
+void st7305_invalidate_frame(void);
+
+void st7305_set_partial(bool on);
+bool st7305_get_partial(void);
+
+/* ---- 深睡关屏方式 (2026-10-24, 实测哪一步会抹掉画面) ----
+ * 0x28 Display OFF / 0x10 Sleep In 都可能让 MIP 屏"清屏"。
+ * mode 0 = 不发命令(保持显示, 面板继续自刷新 ≈50~100µA)
+ * mode 1 = 只发 0x10 Sleep In
+ * mode 2 = 0x28 + 0x10 (默认, 最省电)
+ * 默认值在 st7305.c 里, 用 `remcon slptest N` 现场试。 */
+void st7305_set_sleep_mode(int mode);
+int  st7305_get_sleep_mode(void);
+/* 从 Sleep In / Display OFF 唤醒面板 (0x11 + 0x29) */
+esp_err_t st7305_wake_out(st7305_handle_t *dev);
 
 #ifdef __cplusplus
 }

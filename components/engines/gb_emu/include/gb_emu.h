@@ -35,7 +35,7 @@ esp_err_t gb_emu_load_rom(const char *path, gb_emu_rom_t *rom);
 void gb_emu_free_rom(gb_emu_rom_t *rom);
 void gb_emu_log_rom_info(const gb_emu_rom_t *rom);
 
-/* 设置电池存档目录 (默认 "/sdcard/dict/GB"). GB/GBC 复用同一 Peanut-GB 核心,
+/* 设置电池存档目录 (默认 "/sdcard/data/saves/GB"). GB/GBC 复用同一 Peanut-GB 核心,
  * 用不同存档目录区分. 在 gb_emu_load_rom 之前调用生效. */
 void gb_emu_set_save_dir(const char *dir);
 

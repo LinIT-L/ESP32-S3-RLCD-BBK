@@ -54,6 +54,13 @@ def apps_part():
 #    对应动作: apps/lua/apps 下的包已移出到 backup_lua_apps_20260928/;
 #    C 版已在 components/apps/apps_registry.c 的 s_builtin_apps[] 登记 (工厂内置, 商店不显示)。
 #    ⚠ 要恢复发行 Lua 版: 取消下面 MANIFEST 的注释 + 重跑本脚本 + 撤掉那 10 条内置登记。
+# ★★★ 2026-10-24 linit 定案: **固件不内置任何 Lua 应用**, 一律「应用中心 → 商店」联网下载。
+#   出厂 /store 里只剩 apps/_ui.lua (运行时 UI 库, 应用 require 它)。
+#   BUILD_INTERNAL=False 时本脚本不复制、不打包、不预装, 只生成空的 apps 分区镜像。
+#   要构建期调试(把 MANIFEST 里的应用塞回固件): 改成 True 再跑。
+#   ⚠ 商店包不在这里生成 —— 用 tools/store_build.py (它直接读 ~/Desktop/LinTOS/src)。
+BUILD_INTERNAL = False
+
 MANIFEST = {
     # BIOS 装机模拟器（掌机版）: 纯黑白 1bpp，7 家品牌真实菜单结构 + 8 个装机任务。
     # 数据与电脑版 apps/biossim/biossim.html 同源（tools/biossim_gen_lua.py 生成数据段）。
@@ -72,6 +79,15 @@ MANIFEST = {
     # ★ 《英雄坛说》掌机版 (对标 gmud.online): 全屏 400×300, 原版整图地图 + 原版精灵 + 原版数据。
     #   数据由 tools/wuxia_gen_data.py 从该站 4 个 JSON 生成 → /store/wuxia_data.lua
     #   素材由 tools/wuxia_pack.py / wuxia_world_gen.py 打包 → /store/wuxia/
+    # ★ 人生指南: 676 条高性价比建议 (源自 zectrix-life-guide, Unlicense 公有领域)
+    #   数据由 tools/gen_lifeguide_lua.py 生成 → 单文件 ~365KB (数据段 130K 字符)
+    #   三个页面: 随机一条(像壁纸) / 按章节列表 / 详情可滚动
+    "lifeguide": ("app", "人生指南", "学习",
+                  "676 条高性价比建议：随机一条看，也能按章节翻阅", "ICON_BOOK"),
+    # ★ 离线维基: TF 卡上的 /sdcard/wiki/<库名>/ 逐行流式阅读
+    #   数据由 ~/AI/nomad-wiki/tools/build_wiki_db.py 从 ZIM 生成；解压在 C 侧（app.wiki.*）
+    "wiki": ("app", "离线维基", "学习",
+             "TF 卡上的维基百科：随机一条或按标题浏览，逐行解压不占内存", "ICON_BOOK"),
     "wuxia": ("app", "英雄坛说", "游戏",
               "原版地图整图 + 原版人物 + 63 张场景: 拜师/行囊/回合战斗/走江湖", "ICON_MINI_GAMES"),
     "qqtang": ("app", "QQ堂冒险", "游戏",
@@ -178,7 +194,9 @@ def main():
     ap.add_argument("--check-only", action="store_true")
     args = ap.parse_args()
 
-    names = args.apps or list(MANIFEST)
+    names = args.apps or list(MANIFEST) if BUILD_INTERNAL else []
+    if not names:
+        print("固件不内置任何 Lua 应用 (BUILD_INTERNAL=False) ⇒ 跳过复制/打包, 只出空镜像")
     for n in names:
         if n not in MANIFEST:
             raise SystemExit("MANIFEST 里没有这个应用: %s (已有: %s)"

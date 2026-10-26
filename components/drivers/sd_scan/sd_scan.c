@@ -118,6 +118,40 @@ static sd_mnt_state_t s_mnt_state = SD_MNT_UNKNOWN;
 static char           s_cid_name[12] = "";
 
 const char *sd_get_cid_name(void) { return s_cid_name[0] ? s_cid_name : "-"; }
+
+/* ★ 2026-10-18: 品牌 + 真实容量 (替代"把 CID 型号名当容量显示")。
+ *   CID 的 `name[8]` 是**出厂型号名**，不是容量 —— 实测 3834MB 的卡上印的是 "SD16G"，
+ *   用户看到就以为容量显示错了。品牌取 CID 的 MID (SD-3C 厂商号)。
+ *   MID 表按多家实测统计 (SD-3C 不公开官方表)：Linux `mmc` 打印 / cameramemoryspeed /
+ *   bahjeez 微 SD 普查 三处交叉一致。⛔ 常见误传: 0x28 不是 Kingston 而是 **Lexar(旧)**，
+ *   Kingston 是 0x41；0x27 是 **Phison 代工**（Lexar/PNY/Verbatim/Delkin 等贴牌）。 */
+const char *sd_get_vendor_str(void)
+{
+    if (!s_card) return "-";
+    switch (s_card->cid.mfg_id) {
+        case 0x01: return "Panasonic";
+        case 0x02: return "Toshiba";     /* 现 Kioxia */
+        case 0x03: return "SanDisk";
+        case 0x09: return "ATP";
+        case 0x1B: return "Samsung";
+        case 0x1D: return "ADATA";
+        case 0x27: return "Phison";      /* 代工厂: Lexar/PNY/Verbatim/Delkin… */
+        case 0x28: return "Lexar";
+        case 0x31: return "SiliconPower";
+        case 0x41: return "Kingston";
+        case 0x6F: return "Netac";       /* 也供 HP/Kodak/Hiksemi 等 */
+        case 0x74: return "Transcend";
+        case 0xAD: return "Longsys";     /* 新 Lexar / Amazon Basics / RPi */
+        case 0xFE: return "无名";        /* 白牌/贴牌常见 */
+        default:   return "未知";
+    }
+}
+
+uint64_t sd_get_size_bytes(void)
+{
+    if (!s_card) return 0;
+    return (uint64_t)s_card->csd.capacity * 512ULL;   /* capacity 单位 = 512B 扇区 */
+}
 sd_mnt_state_t sd_get_mnt_state(void) { return s_mnt_state; }
 const char *sd_get_mnt_state_str(void)
 {
@@ -167,6 +201,13 @@ static void sd_probe_permutations(void)
         }
         ESP_LOGD(TAG, "   SD 排列自检 [%d/6] ✗ CLK=%d CMD=%d D0=%d", n, pins[i], pins[j], pins[k]);
     }
+    /* ★★★ 2026-10-18 真机 bug: 6 种排列全失败时主机**停在已初始化状态** ⇒ 紧接着的
+     *   sd_probe_pins() 里 sdmmc_host_init() 变成空操作("already initialized"),
+     *   init_slot 沿用上一组脚的时钟配置 → set_card_clk 返回 0x107 → 1 秒超时后判"没有卡"。
+     *   ⇒ 而 sd_quick_probe 的兜底排列又**跳过了固件里那组正确顺序**(以为"上面已试过")
+     *   ⇒ 结果: **正确接法从来没被真正测过一次**，卡插着也报"未检测到 TF 卡"。
+     *   修法: 无论成败, 退出前一律 deinit, 保证后面拿到的是干净主机。 */
+    sdmmc_host_deinit();
     ESP_LOGD(TAG, "★★ SD 排列自检: 6 种排列全部失败 ⇒ 卡未插/接触不良/焊接");
 }
 
@@ -232,6 +273,55 @@ esp_err_t sd_remount(void)
     return sd_mount();
 }
 
+/* ================= 挂载门闸 (2026-10-24) =================
+ * 问题: 开机挂载是**异步任务**(app_board 里 xTaskCreate), 页面/引擎/MP3 可能在挂载完成前
+ *   就去 opendir("/sdcard") → 拿到空列表并记住"没卡", 之后再也不会重扫
+ *   (linit: "存储信息文件全空"、"引擎MP3读不到")。
+ * 做法: sd_mount 包一层, 记录"正在挂载/已尝试"; 任何消费者在首次读卡前调 sd_wait_ready(),
+ *   它会等这次挂载收尾, 还没挂上就**补挂一次**。这样"顺序"不再依赖谁先起来。 */
+static SemaphoreHandle_t s_mnt_mutex = NULL;
+static volatile bool     s_mounting   = false;   /* sd_mount 正在执行 */
+static volatile bool     s_mount_tried = false;  /* 至少尝试过一次 */
+
+static inline void mnt_lazy_init(void)
+{
+    if (!s_mnt_mutex) s_mnt_mutex = xSemaphoreCreateMutex();
+}
+
+static esp_err_t sd_mount_body(void);
+
+esp_err_t sd_mount(void)
+{
+    mnt_lazy_init();
+    if (s_mnt_mutex) xSemaphoreTake(s_mnt_mutex, portMAX_DELAY);
+    esp_err_t r = sd_mount_body();
+    s_mounting = false;
+    s_mount_tried = true;
+    if (s_mnt_mutex) xSemaphoreGive(s_mnt_mutex);
+    return r;
+}
+
+/* 等挂载就绪; retry=true 时若还没挂上会补挂一次 (页面入口用)。
+ * ⚠ 有阻塞: wait_ms 是**上限**, 正常路径(已挂载)立即返回。 */
+bool sd_wait_ready(uint32_t wait_ms, bool retry)
+{
+    mnt_lazy_init();
+    if (sd_is_mounted()) return true;
+
+    uint32_t t0 = xTaskGetTickCount();
+    while (s_mounting) {
+        if ((uint32_t)(xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(wait_ms)) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (sd_is_mounted()) return true;
+    }
+    if (sd_is_mounted()) return true;
+    if (!retry || s_mounting) return sd_is_mounted();
+
+    ESP_LOGI(TAG, "[门闸] 需要读卡但未挂载 (tried=%d) → 补挂一次", (int)s_mount_tried);
+    sd_remount();
+    return sd_is_mounted();
+}
+
 /* 挂载 SD 卡 (SDMMC 1-bit 模式, ESP32-S3 专用 SDMMC 控制器)
  *
  * 重要发现: Waveshare 官方 Arduino 示例代码用的是 SDMMC 模式!
@@ -276,6 +366,9 @@ static esp_err_t sd_probe_pins(int clk, int cmd, int d0) {
     slot.cd = -1; slot.wp = -1; slot.flags = 0;
 
     esp_err_t r = ESP_FAIL;
+    /* ★ 2026-10-18: 进函数先 deinit。sdmmc_host_init() 在"已初始化"时是**空操作**,
+     *   会拿上一组脚的 slot 配置继续用（排列自检失败后就是这种状态）⇒ 必然 0x107。 */
+    sdmmc_host_deinit();
     if (sdmmc_host_init() != ESP_OK) return ESP_FAIL;
     if (sdmmc_host_init_slot(SDMMC_HOST_SLOT_1, &slot) == ESP_OK) {
         sdmmc_card_t *card = heap_caps_malloc(sizeof(sdmmc_card_t), MALLOC_CAP_INTERNAL);
@@ -358,7 +451,8 @@ static void sd_pin_health_check(void) {
     ESP_LOGD(TAG, "  ⚠ 体检判不出【虚焊 / 断线】(断了会浮空读到 1) —— 重点查 CMD 与 D0 是否各有一个 10k 上拉到 3V3");
 }
 
-esp_err_t sd_mount(void) {
+static esp_err_t sd_mount_body(void) {
+    s_mounting = true;
     sd_probe_permutations();   /* ★开机先找正确排列(插着卡时 6 种全试) */
 #if !SD_SCAN_ENABLE
     ESP_LOGD("SDSCAN", "新载板: SD 暂未启用(旧 SDMMC 脚 13/10/14 与触摸 SCL、LCD MOSI 撞车) ⇒ 已跳过");
@@ -381,7 +475,35 @@ esp_err_t sd_mount(void) {
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 
     /* 0. 先确认有没有卡 —— 没卡就安静跳过, 不刷错误 (2026-10-05) */
-    if (sd_quick_probe() != ESP_OK) {
+    /* ★★ 2026-10-20: 卡偶尔会停在"锁死态"(`sdmmc_io_reset: unexpected return 0x108`),
+     *   以前只能断电重启。这里在放弃前做 3 轮: **拉低 CLK 静默 150ms + 重新 host_init 再探** ——
+     *   等效于给卡一段"没时钟的冷静期", 大多数锁死态能被拉回 idle。
+     *   仍失败才判"无卡"(此时确实只能拔插/断电)。 */
+    esp_err_t pr = sd_quick_probe();
+    for (int k = 0; k < 3 && pr != ESP_OK; k++) {
+        ESP_LOGW(TAG, "未应答(0x108/超时), 第 %d 次强制空闲重探...", k + 1);
+        sdmmc_host_deinit();
+        /* ★★★ 关键: 按 SD 规范打 **80 个 CLK 时钟**(CMD/D0 保持高) —— 这才是"让卡回到
+         *   idle 态"的官方序列。只把 CLK 拉低不动是没用的: 卡没时钟就什么都不做。
+         *   刷机多次后卡停在 1-bit 传输态, ESP32 复位不等于卡掉电 ⇒ 必须补这段时钟。 */
+        if (s_sd_clk >= 0) {
+            gpio_config_t io = { 0 };
+            io.pin_bit_mask = (1ULL << s_sd_clk);
+            io.mode = GPIO_MODE_OUTPUT;
+            gpio_config(&io);
+            if (s_sd_cmd >= 0) { gpio_set_direction((gpio_num_t)s_sd_cmd, GPIO_MODE_INPUT);
+                                 gpio_pullup_en((gpio_num_t)s_sd_cmd); }
+            if (s_sd_d0  >= 0) { gpio_set_direction((gpio_num_t)s_sd_d0,  GPIO_MODE_INPUT);
+                                 gpio_pullup_en((gpio_num_t)s_sd_d0); }
+            for (int c = 0; c < 80; c++) {
+                gpio_set_level((gpio_num_t)s_sd_clk, 0); esp_rom_delay_us(2);
+                gpio_set_level((gpio_num_t)s_sd_clk, 1); esp_rom_delay_us(2);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        pr = sd_quick_probe();
+    }
+    if (pr != ESP_OK) {
         s_mnt_state = SD_MNT_NO_CARD;
         s_cid_name[0] = '\0';
         s_card = NULL;
@@ -395,6 +517,8 @@ esp_err_t sd_mount(void) {
      *    2026-09-30: 末尾补一档 **400kHz** —— 这是 SD 规范规定的"识别阶段"频率,
      *    只要卡和线是通的就一定能挂上。**若只有 400kHz 能挂上 = 信号完整性/走线/电源问题**
      *    (日志会体现), 而不是卡的问题 → 修板子, 别在这上面继续降速。 */
+    /* 2026-10-20: 实测降到 10MHz 也救不回"认不到"(连 400k 都不应答, 是卡锁死态),
+     *   所以恢复高速梯度。真正救法见 sd_quick_probe() 里的多次强制空闲重试。 */
     const uint32_t speeds_khz[] = { 25000, 20000, 5000, 400 };
     const uint32_t delays_ms[]  = {  50,  100,  150, 200 };
     const int retry_count = sizeof(speeds_khz) / sizeof(speeds_khz[0]);
@@ -416,7 +540,7 @@ esp_err_t sd_mount(void) {
 
         esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
             .format_if_mount_failed = false,
-            .max_files = 5,
+            .max_files = 24,
             /* 2026-09-30: 16KB → 0(=按扇区)。已核实 IDF 源码 (fatfs/src/ff.c:1679 +
              * vfs_fat_sdmmc.c:220): allocation_unit_size 只影响**格式化时的簇大小**
              * 与报告给 diskio 的分配单元, FatFs 的读窗口缓冲仍是 SS(fs)=512B。
@@ -470,23 +594,23 @@ esp_err_t sd_mount(void) {
 
             /* 自动检测并创建所有需要的目录 */
             const char *need_dirs[] = {
-                "/sdcard/gam",
-                "/sdcard/mp3",
-                "/sdcard/screensaver",
-                "/sdcard/dict",  /* 电子词典存档目录 */
-                "/sdcard/gb",    /* GB 模拟器 ROM 目录 */
-                "/sdcard/gbc",   /* GBC 模拟器 ROM 目录 */
-                "/sdcard/nes",   /* NES 模拟器 ROM 目录 */
-                "/sdcard/md",    /* MD/Genesis 模拟器 ROM 目录 (Gwenesis) */
-                "/sdcard/sms",   /* SMS/GG 模拟器 ROM 目录 (SMSPlus) */
-                "/sdcard/AB",    /* arduboy ROM 目录 */
+                "/sdcard/roms/gam",
+                "/sdcard/media/mp3",
+                "/sdcard/media/screensaver",
+                "/sdcard/data/saves",  /* 电子词典存档目录 */
+                "/sdcard/roms/gb",    /* GB 模拟器 ROM 目录 */
+                "/sdcard/roms/gbc",   /* GBC 模拟器 ROM 目录 */
+                "/sdcard/roms/nes",   /* NES 模拟器 ROM 目录 */
+                "/sdcard/roms/md",    /* MD/Genesis 模拟器 ROM 目录 (Gwenesis) */
+                "/sdcard/roms/sms",   /* SMS/GG 模拟器 ROM 目录 (SMSPlus) */
+                "/sdcard/roms/ab",    /* arduboy ROM 目录 */
                 "/sdcard/books", /* 电子书目录 */
-                "/sdcard/lava", /* 文曲星 .lav 目录 (wqx) */
-                "/sdcard/lava/LavaData", /* 遗留只读回退: 旧布局共享存档, V1.6 起只用于只读兼容(写一律落各游戏自身 LavaData) */
-                "/sdcard/vpet",    /* 暴龙机 .bin ROM 目录 (vpet) */
-                "/sdcard/App",     /* 应用数据根目录 */
-                "/sdcard/App/\xe5\x9b\xbe\xe7\x89\x87", /* 画布图片目录 (App/图片) */
-                "/sdcard/log",     /* 系统日志目录 (main.c log_drain 写 bbk.log) */
+                "/sdcard/roms/lava", /* 文曲星 .lav 目录 (wqx) */
+                "/sdcard/roms/lava/LavaData", /* 遗留只读回退: 旧布局共享存档, V1.6 起只用于只读兼容(写一律落各游戏自身 LavaData) */
+                "/sdcard/roms/vpet",    /* 暴龙机 .bin ROM 目录 (vpet) */
+                "/sdcard/apps/data",        /* 应用数据根 (原 /sdcard/App, 2026-10-25 合并进 apps) */
+                "/sdcard/apps/data/\xe5\x9b\xbe\xe7\x89\x87", /* 画布图片目录 (apps/data/图片) */
+                "/sdcard/data/log",     /* 系统日志目录 (main.c log_drain 写 bbk.log) */
                 NULL
             };
             for (int i = 0; need_dirs[i]; i++) {
@@ -510,15 +634,15 @@ esp_err_t sd_mount(void) {
     }
 
     /* 走到这里说明**卡是被识别到的**, 只是挂载失败 —— 这才是真该报的错误。
-     * (没插卡的情况已经在 sd_quick_probe() 那一步安静返回了。) */
-    ESP_LOGD(TAG, "=== sd_mount 全部 %d 次尝试都失败 ===", retry_count);
-    ESP_LOGD(TAG, "  卡已被识别但挂载失败 ⇒ 不是没插卡, 可能是:");
-    ESP_LOGD(TAG, "    - 文件系统不识别 (要 FAT32; 固件不支持 exFAT)");
-    ESP_LOGD(TAG, "    - 卡损坏 / 需要重新格式化");
-    ESP_LOGD(TAG, "  建议: 进菜单 → TF卡 → 格式化TF卡");
+     * (没插卡的情况已经在 sd_quick_probe() 那一步安静返回了。)
+     * ★ 2026-10-18: 这几行原来是 LOGD(默认看不见) ⇒ 用户只看到"未检测到 TF 卡",
+     *   分不清"没卡"和"卡在但文件系统不认"。改 LOGW, 并返回**独立错误码**。 */
+    ESP_LOGW(TAG, "=== sd_mount 全部 %d 次尝试都失败 (卡已被识别, 不是没插卡) ===", retry_count);
     /* 2026-09-29: 探测失败原因 (无卡 / exFAT / 无文件系统) 供 UI 显示 */
     sd_probe_fail_reason();
-    return ESP_FAIL;
+    ESP_LOGW(TAG, "  判定: %s", sd_get_mnt_state_str());
+    ESP_LOGW(TAG, "  处理: 菜单 → 存储 → 格式化TF卡 (固件只支持 FAT32, 不支持 exFAT)");
+    return ESP_ERR_INVALID_STATE;   /* ≠ ESP_FAIL: 让上层区分"卡在但挂不上" */
 }
 
 /* 卸载 SD 卡 (SDMMC 模式)
@@ -579,7 +703,7 @@ int sd_remount_vfs_from_card(void) {
         &(esp_vfs_fat_conf_t){
             .base_path = s_mount_point,
             .fat_drive = drive_str,
-            .max_files = 5,
+            .max_files = 24,
         },
         &fs
     );
@@ -632,7 +756,7 @@ static void strip_bom(char *s) {
     }
 }
 
-/* 扫描 /sdcard/gam/ 目录下的 .gam 文件
+/* 扫描 /sdcard/roms/gam/ 目录下的 .gam 文件
  * 单次最大 1000 个 (避免堆栈溢出)
  * 内存: 1 个 out[64] = 64 字节, 1000 个 = 64KB, 用 malloc 分配 */
 int scan_bbk_games(char out[][64], int max_out) {
@@ -646,7 +770,7 @@ int scan_bbk_games(char out[][64], int max_out) {
         }
     }
 
-    const char *dir_path = "/sdcard/gam";
+    const char *dir_path = "/sdcard/roms/gam";
 
     /* 检查目录是否存在 */
     struct stat st;
@@ -754,15 +878,15 @@ static DIR *open_dir_with_remount(const char *dir_path) {
     return dir;
 }
 
-/* 扫描 /sdcard/gam/ 下的子文件夹名 */
+/* 扫描 /sdcard/roms/gam/ 下的子文件夹名 */
 int scan_bbk_folders(char out[][64], int max_out) {
     if (max_out <= 0 || out == NULL) return 0;
     if (!s_mounted) {
         if (sd_mount() != ESP_OK) return 0;
     }
-    DIR *dir = open_dir_with_remount("/sdcard/gam");
+    DIR *dir = open_dir_with_remount("/sdcard/roms/gam");
     if (!dir) {
-        ESP_LOGD(TAG, "scan_bbk_folders: 无法打开 /sdcard/gam");
+        ESP_LOGD(TAG, "scan_bbk_folders: 无法打开 /sdcard/roms/gam");
         return 0;
     }
     int n = 0;
@@ -776,7 +900,7 @@ int scan_bbk_folders(char out[][64], int max_out) {
             is_dir = true;
         } else if (ent->d_type == DT_UNKNOWN) {
             char full[300];
-            snprintf(full, sizeof(full), "/sdcard/gam/%s", ent->d_name);
+            snprintf(full, sizeof(full), "/sdcard/roms/gam/%s", ent->d_name);
             struct stat fst;
             if (stat(full, &fst) == 0 && S_ISDIR(fst.st_mode)) {
                 is_dir = true;
@@ -854,12 +978,12 @@ int scan_bbk_games_in_folder(const char *folder_name, char out[][64], int max_ou
     }
     char dir_path[160];
     if (folder_name == NULL || folder_name[0] == '\0') {
-        snprintf(dir_path, sizeof(dir_path), "/sdcard/gam");
+        snprintf(dir_path, sizeof(dir_path), "/sdcard/roms/gam");
     } else {
         /* 防止用户目录名带 '/' 污染路径: 仅取 basename 部分 */
         const char *base = strrchr(folder_name, '/');
         base = base ? base + 1 : folder_name;
-        snprintf(dir_path, sizeof(dir_path), "/sdcard/gam/%s", base);
+        snprintf(dir_path, sizeof(dir_path), "/sdcard/roms/gam/%s", base);
     }
     return scan_gam_in_dir(dir_path, out, max_out);
 }
@@ -872,11 +996,11 @@ const char *bbk_game_path_in_folder(const char *folder_name, int idx, char *out,
     }
     char dir_path[160];
     if (folder_name == NULL || folder_name[0] == '\0') {
-        snprintf(dir_path, sizeof(dir_path), "/sdcard/gam");
+        snprintf(dir_path, sizeof(dir_path), "/sdcard/roms/gam");
     } else {
         const char *base = strrchr(folder_name, '/');
         base = base ? base + 1 : folder_name;
-        snprintf(dir_path, sizeof(dir_path), "/sdcard/gam/%s", base);
+        snprintf(dir_path, sizeof(dir_path), "/sdcard/roms/gam/%s", base);
     }
     DIR *dir = open_dir_with_remount(dir_path);
     if (!dir) return NULL;
@@ -957,7 +1081,7 @@ static int scan_folders_in_dir(const char *dir_path, char out[][64], int max_out
 }
 
 int scan_gb_folders(char out[][64], int max_out) {
-    return scan_folders_in_dir("/sdcard/gb", out, max_out);
+    return scan_folders_in_dir("/sdcard/roms/gb", out, max_out);
 }
 
 /* 扫描 dir_path 下的子文件夹名 (各平台专用目录) */
@@ -1021,7 +1145,7 @@ static int scan_games_in_dir(const char *dir_path, const char *folder_name, cons
 
 /* 扫描指定 GB 子目录下的 .gb/.gbc (folder_name==NULL/"" 等价于 /sdcard/gb) */
 int scan_gb_games_in_folder(const char *folder_name, const char *ext, char out[][64], int max_out) {
-    return scan_games_in_dir("/sdcard/gb", folder_name, ext, out, max_out);
+    return scan_games_in_dir("/sdcard/roms/gb", folder_name, ext, out, max_out);
 }
 
 /* 扫描指定平台子目录下指定后缀的文件 */
@@ -1080,7 +1204,7 @@ static const char *game_path_in_dir(const char *dir_path, const char *folder_nam
 
 /* 获取 GB 子目录中第 idx 个 .gb/.gbc 的完整路径 (ext: ".gb" 或 ".gbc") */
 const char *gb_game_path_in_folder(const char *folder_name, int idx, const char *ext, char *out, size_t out_size) {
-    return game_path_in_dir("/sdcard/gb", folder_name, idx, ext, out, out_size);
+    return game_path_in_dir("/sdcard/roms/gb", folder_name, idx, ext, out, out_size);
 }
 
 /* 获取指定平台子目录中第 idx 个指定后缀文件的完整路径 */
@@ -1094,7 +1218,7 @@ int count_bbk_games(void) {
     if (!s_mounted) {
         if (sd_mount() != ESP_OK) return 0;
     }
-    const char *dir_path = "/sdcard/gam";
+    const char *dir_path = "/sdcard/roms/gam";
     DIR *dir = opendir(dir_path);
     if (!dir) return 0;
     int n = 0;
@@ -1234,7 +1358,7 @@ static int sd_full_remount(uint8_t format_if_needed) {
 #endif
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
         .format_if_mount_failed = format_if_needed,
-        .max_files = 5,
+        .max_files = 24,
         .allocation_unit_size = 16 * 1024,
     };
 
@@ -1438,8 +1562,8 @@ int sd_format_and_create_dirs(void) {
     ESP_LOGD(TAG, "[进度 ⑯] 创建 gam, screensaver 目录...");
     s_fmt_pct = 92; s_fmt_stage = "\xe5\xbb\xba\xe7\x9b\xae\xe5\xbd\x95"; /* 建目录 */
     int dir_err = 0;
-    const char *dirs[] = { "/sdcard/gam", "/sdcard/screensaver", "/sdcard/dict",
-                           "/sdcard/gb", "/sdcard/gbc", "/sdcard/nes", "/sdcard/AB",
+    const char *dirs[] = { "/sdcard/roms/gam", "/sdcard/media/screensaver", "/sdcard/data/saves",
+                           "/sdcard/roms/gb", "/sdcard/roms/gbc", "/sdcard/roms/nes", "/sdcard/roms/ab",
                            "/sdcard/books", NULL };
     for (int i = 0; dirs[i]; i++) {
         char tmp[64];
@@ -1534,7 +1658,7 @@ const char *bbk_game_path(int idx, char *out, size_t out_size) {
     }
     if (out_size < 128) return NULL;
 
-    const char *dir_path = "/sdcard/gam";
+    const char *dir_path = "/sdcard/roms/gam";
     DIR *dir = opendir(dir_path);
     if (!dir) {
         ESP_LOGD(TAG, "bbk_game_path: opendir失败, 尝试重新挂载SD卡");
@@ -1577,7 +1701,7 @@ const char *bbk_game_path(int idx, char *out, size_t out_size) {
 }
 
 /* === GB 游戏扫描 ===
- * GB 模拟器扫描 /sdcard/gb/ 目录
+ * GB 模拟器扫描 /sdcard/roms/gb/ 目录
  * 复用 open_dir_with_remount() + has_ext() 工具函数 */
 
 /* 通用: 扫描 dir_path 目录下指定后缀 (如 ".gb") 的文件
@@ -1670,14 +1794,14 @@ static const char *file_path_by_ext(const char *dir_path, const char *ext,
     return result;
 }
 
-/* 扫描 /sdcard/gb/ 下的 .gb 文件 */
+/* 扫描 /sdcard/roms/gb/ 下的 .gb 文件 */
 int scan_gb_games(char out[][64], int max_out) {
-    return scan_files_by_ext("/sdcard/gb", ".gb", out, max_out);
+    return scan_files_by_ext("/sdcard/roms/gb", ".gb", out, max_out);
 }
 
 /* 获取第 idx 个 .gb 文件的完整路径 */
 const char *gb_game_path(int idx, char *out, size_t out_size) {
-    return file_path_by_ext("/sdcard/gb", ".gb", idx, out, out_size);
+    return file_path_by_ext("/sdcard/roms/gb", ".gb", idx, out, out_size);
 }
 
 /* 文件浏览器: 通用目录扫描
@@ -1772,7 +1896,7 @@ int scan_path(const char *path, file_entry_t *out, int max_out) {
     return n;
 }
 
-/* 扫描屏保图片目录 /sdcard/screensaver/
+/* 扫描屏保图片目录 /sdcard/media/screensaver/
  * 返回文件完整路径列表, 支持 .bmp, .jpg, .jpeg, .png, .gif */
 int scan_screensaver_images(char paths[][128], int max_paths) {
     if (max_paths <= 0 || paths == NULL) return 0;
@@ -1781,7 +1905,7 @@ int scan_screensaver_images(char paths[][128], int max_paths) {
         if (sd_mount() != ESP_OK) return 0;
     }
 
-    const char *dir_path = "/sdcard/screensaver";
+    const char *dir_path = "/sdcard/media/screensaver";
     struct stat st;
     if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         ESP_LOGD(TAG, "屏保目录不存在: %s", dir_path);
@@ -1867,6 +1991,12 @@ static bool dir_has_lav(const char *dir)
  * 命中即把它当作游戏文件夹记录(命名用本目录名), 且不再深入 Lava 遍历, 减少扫描文件夹. */
 static bool wqx_dir_is_game(const char *dir)
 {
+    /* ★ 2026-10-25 linit: LavaData 是**所有文曲星游戏共享的存档目录**, 不是游戏。
+     *   它偶尔也会带 .lav(旧包遗留), 会被误判成"游戏"显示在列表里 —— 直接排除。 */
+    const char *base = strrchr(dir, '/');
+    base = base ? base + 1 : dir;
+    if (strcasecmp(base, "LavaData") == 0) return false;
+
     if (dir_has_lav(dir)) return true;
     char sub[WQX_DIR_LEN + 8];
     snprintf(sub, sizeof(sub), "%s/Lava", dir);
@@ -1914,7 +2044,7 @@ static void wqx_collect(const char *dir, const char *root, char game_dirs[][160]
  * 性能优化(用户反馈二级菜单卡): 递归读 SD 是慢操作, 同一会话内结果缓存,
  * 每次只扫一次; 上层(进入文曲星页/重新进页)通过 wqx_invalidate() 失效以便读到新加游戏.
  *
- * scope: 当前收集范围(""= /sdcard/lava 整根; 否则 /sdcard/lava/<scope> 某个分类子目录).
+ * scope: 当前收集范围(""= /sdcard/lava 整根; 否则 /sdcard/roms/lava/<scope> 某个分类子目录).
  * 该缓存按 (scope) 区分: 切换分类时范围变化会自动重扫. */
 #define WQX_DIRS_MAX 256
 /* 每个分类文件夹根下写入的隐藏缓存文件名 (以 . 开头; 分类列表只列文件夹, 不会显示它) */
@@ -2006,8 +2136,8 @@ static int wqx_refresh_scoped(const char *scope)
         if (!s_wqx_dirs) return 0;
     }
     char root[WQX_DIR_LEN + 16];
-    if (key[0]) snprintf(root, sizeof(root), "/sdcard/lava/%s", key);
-    else        snprintf(root, sizeof(root), "/sdcard/lava");
+    if (key[0]) snprintf(root, sizeof(root), "/sdcard/roms/lava/%s", key);
+    else        snprintf(root, sizeof(root), "/sdcard/roms/lava");
 
     /* 快速签名 (单次 OPENDIR 分类根), 用于变更检测 */
     uint32_t sig = wqx_sig_hash_from_dir(root);

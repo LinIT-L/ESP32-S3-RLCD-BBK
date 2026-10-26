@@ -95,7 +95,7 @@ static void InitVFS()
 void filesys_init()
 {
 	InitVFS();
-	SetRoot("/sdcard/lava");
+	SetRoot("/sdcard/roms/lava");
 }
 
 static void my_cdup(char *dirname)

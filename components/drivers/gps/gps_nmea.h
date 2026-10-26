@@ -51,6 +51,9 @@ typedef struct {
     uint32_t last_fix_ms;    /* 最近一次有效定位的毫秒时基 (gps_service 内部时钟) */
     uint32_t sentences;      /* 累计校验通过的 NMEA 句子数 (判断"线到底通不通") */
     uint32_t bad_checksum;   /* 累计校验失败数 (波特率/接线问题的指纹) */
+    uint32_t rx_bytes;       /* 累计从 UART 收到的字节数 (0 = 线没通/模块没供电) */
+    uint32_t last_rx_ms;     /* 最近一次收到字节的时基 (0 = 从未收到) */
+    uint32_t ubx_frames;     /* 见到的 UBX 同步头数 (区分模块在说 NMEA 还是 UBX) */
     bool     demo;           /* 当前是否为演示数据 */
 } gps_fix_t;
 
@@ -63,6 +66,21 @@ void gps_nmea_feed(const uint8_t *buf, size_t len);
 /* 取最新快照 (加锁拷贝). 返回 false 表示 out 为空/未初始化. */
 bool gps_nmea_get(gps_fix_t *out);
 
+/* ---- 逐颗卫星 (GSV + GSA) : 卫星信息页画地球用 (2026-10-24) ----
+ * 星座 sys: 0=GPS 1=GLONASS 2=Galileo 3=BeiDou 4=QZSS 5=NavIC 6=混合/未知
+ * snr = -1 无信噪比, elev/azim = -1 未知。 */
+#define GPS_MAX_SATS 40
+typedef struct {
+    uint8_t sys;
+    uint8_t prn;
+    int8_t  elev;    /* 仰角 0..90 */
+    int16_t azim;    /* 方位 0..359 (真北=0, 顺时针) */
+    int8_t  snr;
+    uint8_t used;    /* 1 = 参与本次解算 (GSA 点过名) */
+} gps_sat_t;
+/* 取当前卫星列表 (加锁拷贝), 返回条数 (≤ max)。无数据返回 0。 */
+int gps_nmea_sats(gps_sat_t *out, int max);
+
 /* 演示模式: true = 后台任务不读 UART, 改用内置运动模型生成数据. */
 void gps_nmea_demo(bool on);
 bool gps_nmea_is_demo(void);
@@ -72,6 +90,8 @@ bool gps_nmea_is_demo(void);
 esp_err_t gps_service_start(void);
 /* ★ 2026-10-09: 停掉后台解析任务 (任务自己退出)。退出地图等应用时调用, 别让任务常驻。 */
 void      gps_service_stop(void);
+/* 解析任务是否还在跑 (管家看门狗用: 没人在用就把模块送回待机) */
+bool      gps_service_is_running(void);
 
 #ifdef __cplusplus
 }

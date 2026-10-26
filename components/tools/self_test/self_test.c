@@ -55,13 +55,13 @@ static bool test_heap_baseline(void)
 static bool test_nes_engine(void)
 {
     struct stat stt;
-    if (stat("/sdcard/nes/超级玛丽.nes", &stt) != 0) {
+    if (stat("/sdcard/roms/nes/超级玛丽.nes", &stt) != 0) {
         report("S5 NES 引擎 (无测试 ROM, 跳过)", true, NULL);
         return true;
     }
     uint32_t ifree0, il0, pfree0, pl0;
     mem_snapshot(&ifree0, &il0, &pfree0, &pl0);
-    esp_err_t r = nes_emu_start("/sdcard/nes/超级玛丽.nes");
+    esp_err_t r = nes_emu_start("/sdcard/roms/nes/超级玛丽.nes");
     if (r != ESP_OK) {
         report("S5 NES 引擎 启动失败", false, esp_err_to_name(r));
         return false;

@@ -7,7 +7,10 @@
  *   - 私有 state 全部 static 留本文件.
  */
 #include "os.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "ui_common.h"
+#include "virtual_keys.h"  /* 系统虚拟按键（GBC 同款） */
 #include "input.h"
 #include "gesture_back.h"  /* 底部上滑=返回 的开关: gesture_back_enable(false) */
 #include "sd_scan.h"
@@ -15,6 +18,8 @@
 #include "font_zh16.h"
 #include "keyboard.h"
 #include "board_battery.h"
+#include "pal_entry.h"      /* ★ 仙剑启动器: pal_launch / pal_tick / pal_stop */
+#include "ui_scroll.h"      /* ★ 2026-10-24 全项目统一跟手滚动 (docs/列表滚动规范.md) */
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_chip_info.h"
@@ -28,6 +33,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include <dirent.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #define TAG "TERM"
 
@@ -45,13 +52,28 @@
 #define ZH16_ADV_W 14
 
 /* --- 历史缓冲 (200 行约 10KB). 放 PSRAM, 不占内部 SRAM. --- */
-EXT_RAM_BSS_ATTR static char  s_buf[TM_MAXLINES][TM_LINE_LEN];
+/* ★ 2026-10-25 内存优化: 200 行 × 50B = 10KB 原来静态常驻, 只有打开终端才用 ⇒ 按需分配 */
+static char (*s_buf)[TM_LINE_LEN];
+static char s_buf_dummy[TM_LINE_LEN];
+static bool term_buf_ensure(void) {
+    if (!s_buf) {
+        s_buf = heap_caps_calloc(TM_MAXLINES, TM_LINE_LEN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_buf) ESP_LOGW("TERM", "终端行缓冲分配失败 (%d B)", TM_MAXLINES * TM_LINE_LEN);
+    }
+    return s_buf != NULL;
+}
 EXT_RAM_BSS_ATTR static char  s_cmd[TM_LINE_LEN];
-#define LN(i) (s_buf[(i)])
+#define LN(i) (term_buf_ensure() ? s_buf[(i)] : s_buf_dummy)
 static bool  s_ready = true;
 static int   s_nlines = 0;
 static float s_scroll = 0.0f;
 static float s_scrv   = 0.0f;
+/* ★★★ 2026-10-24 统一滚动: 终端三块区域（输出区 / 帮助列表 / 命令栏横向）
+ *   全部交给 ui_scroll。本文件的 s_scroll/s_hscroll/s_bar_ofs 仍然保留为
+ *   **渲染读的镜像量**（每帧从 ui_scroll 写回），这样渲染代码一行都不用改。 */
+static ui_scroll_t s_sc_out, s_sc_help, s_sc_bar;
+static bool s_sc_ready = false;
+static int  s_sc_out_cap = -1, s_sc_help_cap = -1, s_sc_bar_cap = -1;
 static bool  s_dragout = false;
 static int   s_drag_y0 = 0;
 static int   s_drag_ty = 0;
@@ -76,7 +98,8 @@ static const char *const s_bar[] = {
 
 static const char *const s_allcmds[] = {
     "help","cls","ver","mem","sys","date","time","echo","dir","ls",
-    "type","cat","ipconfig","ip","ping","netstat","shell","exit",
+    "cd","md","rd","del","ren","copy","set","type","cat",
+    "ipconfig","ip","ping","netstat","shell","exit",
     "uptime","whoami","id","uname","ps","tasklist","battery","power",
     "calc","expr","random","rand","free","clear","history","reboot","shutdown",
     "os","switch"
@@ -86,7 +109,8 @@ static const char *const s_allcmds[] = {
 /* ============ 文本绘制 ============ */
 #define GB_W 8
 #define GB_H 16
-static void px(st7305_handle_t*l,int x,int y,int c){ if(x<0||x>=TM_W||y<0||y>=TM_H)return; st7305_draw_pixel(l,x,y,c); }
+static int s_clip_bot = 0;   /* >0: y>=s_clip_bot 不画 —— 滚动内容不得压到输入行/命令条 */
+static void px(st7305_handle_t*l,int x,int y,int c){ if(x<0||x>=TM_W||y<0||y>=TM_H)return; if(s_clip_bot&&y>=s_clip_bot)return; st7305_draw_pixel(l,x,y,c); }
 static void pf(st7305_handle_t*l,int x0,int y0,int x1,int y1,int c){ int t; if(x0>x1){t=x0;x0=x1;x1=t;} if(y0>y1){t=y0;y0=y1;y1=t;} for(int y=y0;y<=y1;y++)for(int x=x0;x<=x1;x++)px(l,x,y,c); }
 static void dascii(st7305_handle_t*l,int x,int y,const char*s,int fg){
     int cx=x; for(const unsigned char*p=(const unsigned char*)s;*p;p++){
@@ -131,8 +155,9 @@ static void line_add(const char*s){ if(!s_ready)return;
 
 /* ============ 命令实现 ============ */
 #define HELP_PER 12
-static bool s_help_active = false;
-static int  s_help_page = 0;
+static bool  s_help_active = false;
+static float s_hscroll = 0.0f;   /* 帮助列表像素滚动量 (0=顶部) */
+static float s_hscrv   = 0.0f;   /* 帮助列表惯性 */
 typedef struct { const char*c; const char*d; } help_item;
 static const help_item s_item_uos[] = {
     {"os","切换系统"}, {"help","帮助"}, {"cls","清屏"}, {"ver","版本"}, {"mem","内存"},
@@ -184,7 +209,7 @@ static const help_item s_item_ps[] = {
 #define PS_N (int)(sizeof(s_item_ps)/sizeof(s_item_ps[0]))
 #define PS_PAGES ((PS_N+HELP_PER-1)/HELP_PER)
 
-static void cmd_help(void){ s_help_active=true; s_help_page=0; }
+static void cmd_help(void){ s_help_active=true; s_hscroll=0.0f; s_hscrv=0.0f; }
 static void cmd_cls(void){ s_nlines=0; for(int i=0;i<TM_MAXLINES;i++)line_set(i,""); }
 static void cmd_ver(void){ char b[48]; snprintf(b,48," ESP-IDF %s",esp_get_idf_version()); line_add(b); line_add(" LinTOS v1.3 (系统终端)"); }
 static void cmd_date(void){ time_t n=time(NULL); struct tm*t=localtime(&n); char b[48]; snprintf(b,48," %04d-%02d-%02d %02d:%02d:%02d",t->tm_year+1900,t->tm_mon+1,t->tm_mday,t->tm_hour,t->tm_min,t->tm_sec); line_add(b); }
@@ -196,7 +221,59 @@ static void cmd_sys(void){ char b[64]; esp_chip_info_t ci; esp_chip_info(&ci);
     snprintf(b,64," 芯片: ESP32-S3  核: %d",(int)ci.cores); line_add(b);
     snprintf(b,64," 主频: %d MHz",CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ); line_add(b);
     uint32_t fsz=0; if(esp_flash_get_size(NULL,&fsz)==ESP_OK){ snprintf(b,64," Flash: %u MB",(unsigned)(fsz/1048576)); line_add(b); } }
-static void cmd_dir(const char*arg){ const char*p=(arg&&arg[0])?arg:"/sdcard"; char b[64];
+static const char *term_cwd(void);   /* 当前目录, 定义见下方 DOS 核心 */
+
+/* ==================== 仙剑启动器 (SDLPal) ====================
+ * 终端当启动器：敲 `pal` 起游戏，游戏画面接管整屏，按返回键请求退出。
+ * 游戏跑在独立任务里（pal_entry.c），终端只在 poll 里调 pal_tick() 上屏，
+ * 所以游戏不会把 UI 卡死。 */
+static bool s_pal_mode = false;
+
+/* ---- 仙剑输入：物理按键走"脉冲"（OS 只给按下事件），虚拟手柄走真实按下/松开 ---- */
+static pal_key_t s_pal_key  = PAL_KEY_NONE;   /* 物理键当前按住的那个（脉冲用） */
+static int       s_pal_hold = 0;              /* 剩余帧数，到 0 自动松开 */
+static uint8_t   s_jp_prev  = 0xFF;           /* 上一帧虚拟按键 joypad 位（低有效） */
+
+static void pal_pulse(pal_key_t k)
+{
+    if (s_pal_key != PAL_KEY_NONE) pal_input(s_pal_key, 0);
+    s_pal_key  = k;
+    s_pal_hold = 14;                 /* ~230ms @60fps：正好走一格 */
+    pal_input(k, 1);
+}
+static void pal_release(void)
+{
+    if (s_pal_key != PAL_KEY_NONE) { pal_input(s_pal_key, 0); s_pal_key = PAL_KEY_NONE; }
+}
+/* 系统虚拟按键 joypad 掩码 -> 游戏键（低电平有效：某位清 0 = 按下）
+ *   bit0=A bit1=B bit2=Select bit3=Start bit4=右 bit5=左 bit6=上 bit7=下 */
+static void pal_sync_joypad(uint8_t jp)
+{
+    uint8_t chg = (uint8_t)(jp ^ s_jp_prev);
+    if (!chg) return;
+    if (chg & 0x40) pal_input(PAL_KEY_UP,    !(jp & 0x40));
+    if (chg & 0x80) pal_input(PAL_KEY_DOWN,  !(jp & 0x80));
+    if (chg & 0x20) pal_input(PAL_KEY_LEFT,  !(jp & 0x20));
+    if (chg & 0x10) pal_input(PAL_KEY_RIGHT, !(jp & 0x10));
+    if (chg & 0x01) pal_input(PAL_KEY_OK,    !(jp & 0x01));   /* A = 确认/对话 */
+    if (chg & 0x02) pal_input(PAL_KEY_MENU,  !(jp & 0x02));   /* B = ESC/菜单 */
+    if (chg & 0x08) pal_input(PAL_KEY_OK,    !(jp & 0x08));   /* Start = 确认 */
+    if (chg & 0x04) pal_input(PAL_KEY_PGUP,  !(jp & 0x04));   /* Select = 翻页 */
+    s_jp_prev = jp;
+}
+
+static void cmd_pal(void)
+{
+    if (pal_is_running() || s_pal_mode) { line_add(" 仙剑已在运行"); return; }
+    if (!sd_is_mounted()) { line_add(" SD 未挂载"); return; }
+    if (!pal_launch())   { line_add(" 启动失败: 检查 /sdcard/pal 数据文件"); return; }
+    s_pal_mode = true;
+    s_pal_key = PAL_KEY_NONE;
+    s_jp_prev = 0xFF;
+    pal_keys_enable(true);
+    line_add(" 启动 仙剑奇侠传 ... (返回键退出)");
+}
+static void cmd_dir(const char*arg){ const char*p=(arg&&arg[0])?arg:term_cwd(); char b[64];
     if(!sd_is_mounted()){ line_add(" SD 未挂载"); return; }
     DIR*d=opendir(p); if(!d){ line_add(" 无法打开目录"); return; }
     struct dirent*e; int n=0;
@@ -295,8 +372,10 @@ static const help_item *help_list(void){
 static int help_count(void){
     switch(s_os){ case 1:return KYLIN_N; case 2:return DOS_N; case 3:return PS_N; default:return UOS_N; }
 }
-static int help_pages(void){
-    switch(s_os){ case 1:return KYLIN_PAGES; case 2:return DOS_PAGES; case 3:return PS_PAGES; default:return UOS_PAGES; }
+/* 帮助列表的最大滚动像素 (总行数*行高 - 可视高) */
+static int help_maxs(void){
+    int rows=(help_count()+1)/2; int xH=TM_OUT_H-GB_H;
+    int tot=rows*HM_ROW; return tot>xH?tot-xH:0;
 }
 
 /* 学习命令表 */
@@ -361,6 +440,337 @@ static const learn_t s_learn[] = {
 #define LEARN_N (sizeof(s_learn)/sizeof(s_learn[0]))
 static int learn_lookup(const char*n){ for(int i=0;i<(int)LEARN_N;i++) if(!strcasecmp(n,s_learn[i].name)) return i; return -1; }
 
+/* ==================== DOS 核心: 当前目录 / 环境变量 / 批处理 ====================
+ * 参考 RetiredWizard/PyDOS（MicroPython 版 DOS shell）的机制, 按 C 重写:
+ *   · 开关解析 → 位掩码            · 引号参数跨 token 合并
+ *   · %VAR% 逐字符展开             · 批处理 label 表 + 行号跳转 (PyDOS 用文件偏移 seek, 这里整文件读进内存按行号跳)
+ *   PyDOS 用 MicroPython 有几十 KB 堆可用; 我们内部 RAM 紧张, 所以:
+ *     .bat 上限 6KB、最多 160 行 / 16 个标签、嵌套最多 3 层。 */
+
+#define TM_CWD_MAX   96
+#define TM_ENV_MAX   10
+#define TM_ENV_NLEN  20
+#define TM_ENV_VLEN  40
+#define TM_BAT_MAX   6144
+#define TM_BAT_LINES 160
+#define TM_BAT_LABS  16
+#define TM_BAT_MAXDEPTH 3
+
+static char s_cwd[TM_CWD_MAX] = "/sdcard";
+static char s_envn[TM_ENV_MAX][TM_ENV_NLEN];
+static char s_envv[TM_ENV_MAX][TM_ENV_VLEN];
+static int  s_envcnt   = 0;
+static int  s_bat_echo = 1;      /* ECHO ON/OFF */
+static int  s_bat_depth = 0;
+static char *s_bat_buf = NULL;   /* .bat 整文件缓冲 (PSRAM, 首次用时分配, 常驻复用) */
+
+static bool exec_one(char *c);   /* 前向声明 (批处理要调) */
+
+static const char *term_cwd(void) { return s_cwd; }
+
+/* 把 arg 解析成绝对路径: 支持相对路径 / 绝对路径 / . / .. */
+static void path_resolve(const char *arg, char *out, size_t n)
+{
+    if (!arg || !arg[0]) { snprintf(out, n, "%s", s_cwd); return; }
+    char tmp[TM_CWD_MAX * 2];
+    if (arg[0] == '/') snprintf(tmp, sizeof(tmp), "%s", arg);
+    else               snprintf(tmp, sizeof(tmp), "%s/%s", s_cwd, arg);
+
+    char *seg[24]; int ns = 0;
+    char work[TM_CWD_MAX * 2];
+    snprintf(work, sizeof(work), "%s", tmp);
+    for (char *p = strtok(work, "/"); p && ns < 24; p = strtok(NULL, "/")) {
+        if (!strcmp(p, ".")) continue;
+        if (!strcmp(p, "..")) { if (ns) ns--; continue; }
+        seg[ns++] = p;
+    }
+    out[0] = 0;
+    for (int i = 0; i < ns; i++) {
+        size_t l = strlen(out);
+        if (l + 1 >= n) break;
+        snprintf(out + l, n - l, "/%s", seg[i]);
+    }
+    if (!out[0]) snprintf(out, n, "/");
+}
+
+/* 拆两个参数 (copy/del 等): a 第一段 b 其余 */
+static void args2(const char *arg, char *a, size_t an, char *b, size_t bn)
+{
+    a[0] = b[0] = 0;
+    if (!arg) return;
+    while (*arg == ' ' || *arg == '\t') arg++;
+    const char *sp = strchr(arg, ' ');
+    if (!sp) { snprintf(a, an, "%s", arg); return; }
+    size_t l = (size_t)(sp - arg);
+    if (l >= an) l = an - 1;
+    memcpy(a, arg, l); a[l] = 0;
+    while (*sp == ' ') sp++;
+    snprintf(b, bn, "%s", sp);
+}
+
+static const char *env_get(const char *k)
+{
+    for (int i = 0; i < s_envcnt; i++) if (!strcasecmp(s_envn[i], k)) return s_envv[i];
+    return "";
+}
+
+/* %VAR% 展开 (结果写 out, 不会原地改 in) */
+static void env_expand(const char *in, char *out, size_t n)
+{
+    size_t o = 0;
+    for (const char *p = in; *p && o + 1 < n; ) {
+        if (*p == '%') {
+            const char *q = p + 1;
+            char key[TM_ENV_NLEN]; size_t k = 0;
+            while (*q && *q != '%' && k + 1 < sizeof(key)) key[k++] = *q++;
+            key[k] = 0;
+            if (*q == '%') {                       /* 成对 ⇒ 变量 */
+                const char *v = key[0] ? env_get(key) : "%";
+                while (*v && o + 1 < n) out[o++] = *v++;
+                p = q + 1;
+                continue;
+            }
+        }
+        out[o++] = *p++;
+    }
+    out[o] = 0;
+}
+
+/* ---- 文件/目录命令 ---- */
+static void cmd_cd(const char *arg)
+{
+    char p[TM_CWD_MAX]; path_resolve(arg, p, sizeof(p));
+    DIR *d = opendir(p);
+    if (!d) { line_add(" 目录不存在"); return; }
+    closedir(d);
+    snprintf(s_cwd, sizeof(s_cwd), "%s", p);
+    char b[TM_LINE_LEN]; snprintf(b, sizeof(b), " %s", s_cwd); line_add(b);
+}
+
+static void cmd_md(const char *arg)
+{
+    if (!arg || !arg[0]) { line_add(" md <目录名>"); return; }
+    if (!sd_is_mounted()) { line_add(" SD 未挂载"); return; }
+    char p[TM_CWD_MAX]; path_resolve(arg, p, sizeof(p));
+    if (mkdir(p, 0777) == 0) line_add(" 已创建");
+    else                     line_add(" 创建失败(已存在?)");
+}
+
+static void cmd_rd(const char *arg)
+{
+    if (!arg || !arg[0]) { line_add(" rd <目录名>"); return; }
+    if (!sd_is_mounted()) { line_add(" SD 未挂载"); return; }
+    char p[TM_CWD_MAX]; path_resolve(arg, p, sizeof(p));
+    if (rmdir(p) == 0) line_add(" 已删除目录");
+    else               line_add(" 删除失败(非空/不存在)");
+}
+
+static void cmd_del(const char *arg)
+{
+    if (!arg || !arg[0]) { line_add(" del <文件名>"); return; }
+    if (!sd_is_mounted()) { line_add(" SD 未挂载"); return; }
+    char p[TM_CWD_MAX]; path_resolve(arg, p, sizeof(p));
+    if (remove(p) == 0) line_add(" 已删除");
+    else                line_add(" 删除失败(文件不存在)");
+}
+
+static void cmd_ren(const char *arg)
+{
+    char a[64], b[64]; args2(arg, a, sizeof(a), b, sizeof(b));
+    if (!a[0] || !b[0]) { line_add(" ren <旧名> <新名>"); return; }
+    if (!sd_is_mounted()) { line_add(" SD 未挂载"); return; }
+    char pa[TM_CWD_MAX], pb[TM_CWD_MAX];
+    path_resolve(a, pa, sizeof(pa));
+    path_resolve(b, pb, sizeof(pb));
+    if (rename(pa, pb) == 0) line_add(" 已重命名");
+    else                     line_add(" 重命名失败");
+}
+
+static void cmd_copy(const char *arg)
+{
+    char a[64], b[64]; args2(arg, a, sizeof(a), b, sizeof(b));
+    if (!a[0] || !b[0]) { line_add(" copy <源> <目标>"); return; }
+    if (!sd_is_mounted()) { line_add(" SD 未挂载"); return; }
+    char pa[TM_CWD_MAX], pb[TM_CWD_MAX];
+    path_resolve(a, pa, sizeof(pa));
+    path_resolve(b, pb, sizeof(pb));
+
+    /* 目标是已存在的目录 ⇒ 自动拼上源文件名 */
+    DIR *d = opendir(pb);
+    if (d) {
+        closedir(d);
+        const char *nm = strrchr(pa, '/'); nm = nm ? nm + 1 : pa;
+        size_t l = strlen(pb);
+        snprintf(pb + l, sizeof(pb) - l, "/%s", nm);
+    }
+
+    FILE *fs = fopen(pa, "rb");
+    if (!fs) { line_add(" 源文件不存在"); return; }
+    FILE *fd = fopen(pb, "wb");
+    if (!fd) { fclose(fs); line_add(" 无法写入目标"); return; }
+    static char cbuf[512];
+    size_t n; unsigned tot = 0;
+    while ((n = fread(cbuf, 1, sizeof(cbuf), fs)) > 0) {
+        if (fwrite(cbuf, 1, n, fd) != n) break;
+        tot += (unsigned)n;
+    }
+    fclose(fs); fclose(fd);
+    char o[TM_LINE_LEN]; snprintf(o, sizeof(o), " 已复制 %u 字节", tot); line_add(o);
+}
+
+static void cmd_set(const char *arg)
+{
+    if (!arg || !arg[0]) {                       /* 不带参数: 列出全部 */
+        for (int i = 0; i < s_envcnt; i++) {
+            char b[TM_LINE_LEN];
+            snprintf(b, sizeof(b), " %s=%s", s_envn[i], s_envv[i]);
+            line_add(b);
+        }
+        if (!s_envcnt) line_add(" (无环境变量)");
+        return;
+    }
+    const char *eq = strchr(arg, '=');
+    if (!eq) {
+        char b[TM_LINE_LEN];
+        snprintf(b, sizeof(b), " %s=%s", arg, env_get(arg));
+        line_add(b);
+        return;
+    }
+    char k[TM_ENV_NLEN]; size_t kl = (size_t)(eq - arg);
+    if (kl >= sizeof(k)) kl = sizeof(k) - 1;
+    memcpy(k, arg, kl); k[kl] = 0;
+    while (kl && (k[kl-1] == ' ')) k[--kl] = 0;
+
+    int idx = -1;
+    for (int i = 0; i < s_envcnt; i++) if (!strcasecmp(s_envn[i], k)) { idx = i; break; }
+    if (idx < 0) {
+        if (s_envcnt >= TM_ENV_MAX) { line_add(" 环境变量已满"); return; }
+        idx = s_envcnt++;
+        snprintf(s_envn[idx], TM_ENV_NLEN, "%s", k);
+    }
+    snprintf(s_envv[idx], TM_ENV_VLEN, "%s", eq + 1);
+    char b[TM_LINE_LEN];
+    snprintf(b, sizeof(b), " %s=%s", s_envn[idx], s_envv[idx]);
+    line_add(b);
+}
+
+/* ---- 批处理执行 (.bat) ---- */
+static void bat_run(const char *path)
+{
+    if (s_bat_depth >= TM_BAT_MAXDEPTH) { line_add(" 批处理嵌套过深"); return; }
+    FILE *f = fopen(path, "r");
+    if (!f) { line_add(" 批处理文件不存在"); return; }
+    if (!s_bat_buf) {
+        s_bat_buf = heap_caps_malloc(TM_BAT_MAX + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_bat_buf) { fclose(f); line_add(" 内存不足"); return; }
+    }
+    size_t n = fread(s_bat_buf, 1, TM_BAT_MAX, f);
+    fclose(f);
+    s_bat_buf[n] = 0;
+
+    /* 切行 */
+    static char *ln[TM_BAT_LINES];
+    int nl = 0;
+    char *p = s_bat_buf;
+    while (*p && nl < TM_BAT_LINES) {
+        ln[nl++] = p;
+        char *e = strchr(p, '\n');
+        if (!e) break;
+        *e = 0;
+        p = e + 1;
+    }
+    /* 标签表 (预扫, 对应 PyDOS 的 batLabels) */
+    static char lab[TM_BAT_LABS][TM_ENV_NLEN];
+    static int  labln[TM_BAT_LABS];
+    int nlab = 0;
+    for (int i = 0; i < nl && nlab < TM_BAT_LABS; i++) {
+        char *s = ln[i];
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == ':') {
+            snprintf(lab[nlab], TM_ENV_NLEN, "%s", s + 1);
+            labln[nlab] = i;
+            nlab++;
+        }
+    }
+
+    s_bat_depth++;
+    int pc = 0;
+    while (pc < nl) {
+        char raw[128];
+        snprintf(raw, sizeof(raw), "%s", ln[pc]);
+        pc++;
+        char *s = raw;
+        while (*s == ' ' || *s == '\t') s++;
+        size_t L = strlen(s);
+        while (L && (s[L-1] == '\r' || s[L-1] == ' ' || s[L-1] == '\t')) s[--L] = 0;
+        if (!*s || *s == ':' || *s == ';') continue;        /* 空行/label/注释 */
+
+        if (!strncasecmp(s, "rem", 3) && (s[3] == 0 || s[3] == ' ')) continue;
+
+        if (!strncasecmp(s, "echo", 4) && (s[4] == 0 || s[4] == ' ')) {
+            char *a = s + 4; while (*a == ' ') a++;
+            if (!strcasecmp(a, "on"))       s_bat_echo = 1;
+            else if (!strcasecmp(a, "off")) s_bat_echo = 0;
+            else { char ex[128]; env_expand(a, ex, sizeof(ex)); line_add(ex); }
+            continue;
+        }
+        if (!strncasecmp(s, "pause", 5) && (s[5] == 0 || s[5] == ' ')) {
+            line_add(" -- 按任意键继续 --");
+            continue;
+        }
+        if (!strncasecmp(s, "goto", 4) && (s[4] == 0 || s[4] == ' ')) {
+            char *a = s + 4; while (*a == ' ') a++;
+            int tgt = -1;
+            for (int i = 0; i < nlab; i++) if (!strcasecmp(lab[i], a)) { tgt = labln[i]; break; }
+            if (tgt < 0) { line_add(" GOTO 标签不存在"); break; }
+            pc = tgt + 1;
+            continue;
+        }
+        if (!strncasecmp(s, "if", 2) && s[2] == ' ') {
+            char *a = s + 2; while (*a == ' ') a++;
+            int neg = 0;
+            if (!strncasecmp(a, "not ", 4)) { neg = 1; a += 4; while (*a == ' ') a++; }
+            int cond = 0;
+            if (!strncasecmp(a, "exist ", 6)) {
+                a += 6; while (*a == ' ') a++;
+                char fn[64];
+                char *sp = strchr(a, ' ');
+                if (sp) {
+                    size_t l = (size_t)(sp - a); if (l >= sizeof(fn)) l = sizeof(fn) - 1;
+                    memcpy(fn, a, l); fn[l] = 0;
+                    a = sp + 1; while (*a == ' ') a++;
+                } else { snprintf(fn, sizeof(fn), "%s", a); a += strlen(a); }
+                char pa[TM_CWD_MAX]; path_resolve(fn, pa, sizeof(pa));
+                struct stat st;
+                cond = (stat(pa, &st) == 0);
+            } else {
+                char *eq = strstr(a, "==");
+                if (!eq) { line_add(" IF 语法错"); continue; }
+                char l[64], r[64];
+                size_t ll = (size_t)(eq - a); if (ll >= sizeof(l)) ll = sizeof(l) - 1;
+                memcpy(l, a, ll); l[ll] = 0;
+                while (ll && l[ll-1] == ' ') l[--ll] = 0;
+                snprintf(r, sizeof(r), "%s", eq + 2);
+                char *sp = strchr(r, ' ');
+                if (sp) { *sp = 0; a = sp + 1; while (*a == ' ') a++; } else { a += strlen(a); }
+                cond = !strcasecmp(l, r);
+            }
+            if (neg) cond = !cond;
+            if (!cond || !*a) continue;
+            char ex[128]; env_expand(a, ex, sizeof(ex));
+            if (s_bat_echo) { char d[TM_LINE_LEN]; snprintf(d, sizeof(d), "> %s", ex); line_add(d); }
+            exec_one(ex);
+            continue;
+        }
+
+        char ex[128];
+        env_expand(s, ex, sizeof(ex));
+        if (s_bat_echo) { char d[TM_LINE_LEN]; snprintf(d, sizeof(d), "> %s", ex); line_add(d); }
+        exec_one(ex);
+    }
+    s_bat_depth--;
+}
+
 static bool exec_one(char*c){
     while(*c==' '||*c=='\t')c++;
     char arg[80]; arg[0]=0; char*sp=strchr(c,' '); if(sp){*sp=0; strncpy(arg,sp+1,sizeof(arg)-1);}
@@ -372,6 +782,16 @@ static bool exec_one(char*c){
     else if(!strcasecmp(c,"mem")||!strcasecmp(c,"meminfo")||!strcasecmp(c,"free"))cmd_mem();
     else if(!strcasecmp(c,"sys")||!strcasecmp(c,"systeminfo"))cmd_sys();
     else if(!strcasecmp(c,"dir")||!strcasecmp(c,"ls"))cmd_dir(arg);
+    /* ==== DOS 核心命令 (参考 PyDOS 补齐的真实实现) ==== */
+    else if(!strcasecmp(c,"cd")||!strcasecmp(c,"chdir"))cmd_cd(arg);
+    else if(!strcasecmp(c,"md")||!strcasecmp(c,"mkdir"))cmd_md(arg);
+    else if(!strcasecmp(c,"rd")||!strcasecmp(c,"rmdir"))cmd_rd(arg);
+    else if(!strcasecmp(c,"del")||!strcasecmp(c,"erase")||!strcasecmp(c,"rm"))cmd_del(arg);
+    else if(!strcasecmp(c,"ren")||!strcasecmp(c,"rename"))cmd_ren(arg);
+    else if(!strcasecmp(c,"copy")||!strcasecmp(c,"cp"))cmd_copy(arg);
+    else if(!strcasecmp(c,"set")||!strcasecmp(c,"setenv"))cmd_set(arg);
+    /* ★ 仙剑启动器 */
+    else if(!strcasecmp(c,"pal")||!strcasecmp(c,"xiuxian")||!strcasecmp(c,"sdlpal"))cmd_pal();
     else if(!strcasecmp(c,"type")||!strcasecmp(c,"cat"))cmd_type(arg);
     else if(!strcasecmp(c,"ipconfig")||!strcasecmp(c,"ip"))cmd_ipconfig();
     else if(!strcasecmp(c,"ping"))cmd_ping(arg);
@@ -390,6 +810,14 @@ static bool exec_one(char*c){
     else if(!strcasecmp(c,"history")){ line_add(" 暂无命令历史 (练习版)"); }
     else if(!strcasecmp(c,"reboot")||!strcasecmp(c,"shutdown")){ line_add(" 已拦截: 用软关机键关机, 勿直接重启"); }
     else {
+        /* .bat 批处理: 直接敲 "文件名.bat" 就跑 (DOS 核心功能, 参考 PyDOS) */
+        int cl = (int)strlen(c);
+        if (cl > 4 && !strcasecmp(c + cl - 4, ".bat")) {
+            char p[TM_CWD_MAX];
+            path_resolve(c, p, sizeof(p));
+            bat_run(p);
+            return true;
+        }
         int li = learn_lookup(c);
         if(li>=0){
             int win = (s_os>=2)?1:0;
@@ -439,8 +867,8 @@ static void key_input(int i){
         case KBD_ACT_SPACE:{ if(s_help_active) s_help_active=false; s_scroll=0.0f; s_scrv=0.0f; if(s_ci<TM_LINE_LEN-2){ memmove(s_cmd+s_cur+1,s_cmd+s_cur,s_ci-s_cur+1); s_cmd[s_cur]=' '; s_ci++; s_cur++; } break; }
         case KBD_ACT_ESC:{ if(s_help_active) s_help_active=false; s_scroll=0.0f; s_scrv=0.0f; s_ci=0; s_cur=0; s_cmd[0]=0; break; }
         case KBD_ACT_TAB:{ if(s_help_active) s_help_active=false; s_scroll=0.0f; s_scrv=0.0f; for(int b=0;b<TM_ALLCMD_N;b++) if(strncmp(s_cmd,s_allcmds[b],s_ci)==0){strcpy(s_cmd,s_allcmds[b]);s_ci=strlen(s_cmd);s_cur=s_ci;break;} break; }
-        case KBD_ACT_UP:  if(s_help_active){ int hp=help_pages(); s_help_page=(s_help_page+hp-1)%hp; } break;
-        case KBD_ACT_DOWN:if(s_help_active){ int hp=help_pages(); s_help_page=(s_help_page+1)%hp; } break;
+        case KBD_ACT_UP:  if(s_help_active){ s_hscroll-=HM_ROW; if(s_hscroll<0)s_hscroll=0; s_hscrv=0; } break;
+        case KBD_ACT_DOWN:if(s_help_active){ s_hscroll+=HM_ROW; int mx=help_maxs(); if(s_hscroll>(float)mx)s_hscroll=(float)mx; s_hscrv=0; } break;
         case KBD_ACT_LEFT:{ if(s_cur>0)s_cur--; break; }
         case KBD_ACT_RIGHT:{ if(s_cur<s_ci)s_cur++; break; }
         default: break;
@@ -494,30 +922,44 @@ static void term_exit(ui_ctx_t *ctx) {
     (void)ctx;
     gesture_back_enable(true);
     term_clear();
+    /* ★ 2026-10-24 规范化: .bat 整文件缓冲(6KB PSRAM)原来"常驻复用", 退出不还 ——
+     *   违反 linit "退出就释放" 铁律。这里退出即 free, 下次进终端第一句 .bat 重分配。 */
+    if (s_bat_buf) { free(s_bat_buf); s_bat_buf = NULL; }
 }
 
 static void p_term_render(ui_ctx_t *ctx) {
     st7305_handle_t*l=ctx->lcd;
+    /* ★ 游戏模式: 整屏交给 SDLPal，终端一行都不画（否则清屏会把游戏画面擦掉） */
+    if(s_pal_mode){ pal_tick(l); return; }
     st7305_clear(l,ST7305_COLOR_WHITE);
     if(s_help_active){
+        /* ★ 2026-10-21 linit: 帮助也改成"游戏列表那种滑动" —— 像素级跟手滚动,
+         *   不再按页翻。s_hscroll = 距顶部的像素量, 渲染只做平移 + 底界裁剪。 */
         const help_item *hl = help_list();
-        int hc = help_count(), hp = help_pages();
-        if(s_help_page>=hp) s_help_page=0;
+        int hc = help_count();
+        if(hc <= 0){ s_help_active=false; ctx->needs_redraw=true; return; }
         const int colw = TM_W/2;
         const int cmdw = 76;
-        const int rowh = HM_ROW;
-        int start = s_help_page*HELP_PER;
-        int n = hc-start; if(n>HELP_PER)n=HELP_PER;
-        for(int i=0;i<n;i++){
-            int col=i%2, row=i/2;
-            int x=2+col*colw, y=2+row*rowh;
-            const help_item *it=&hl[start+i];
-            dascii(l,x,y,it->c,0);
-            dline_clip(l,x+cmdw,y,it->d,colw-cmdw-6);
+        int xH = TM_OUT_H - GB_H;
+        int mx = help_maxs();
+        if(s_hscroll > (float)mx) s_hscroll = (float)mx;
+        if(s_hscroll < 0.0f)      s_hscroll = 0.0f;
+        int first = (int)s_hscroll / HM_ROW;
+        int off   = (int)s_hscroll % HM_ROW;
+        int rows  = (hc + 1) / 2;
+        s_clip_bot = xH;                       /* 内容不得压到输入行/命令条 */
+        for(int r = first; r < rows; r++){
+            int y = 2 + (r - first) * HM_ROW - off;
+            if(y >= xH) break;
+            for(int col = 0; col < 2; col++){
+                int i = r*2 + col;
+                if(i >= hc) break;
+                int x = 2 + col*colw;
+                dascii(l, x, y, hl[i].c, 0);
+                dline_clip(l, x + cmdw, y, hl[i].d, colw - cmdw - 6);
+            }
         }
-        int rows=(n+1)/2;
-        char pg[64]; snprintf(pg,sizeof(pg),"-- %d/%d 页 / 上下滑翻页 --", s_help_page+1, hp);
-        dline(l,2,2+rows*rowh+2,pg,0);
+        s_clip_bot = 0;
         draw_bar(l);
         if(g_kbd.n<=0){ g_kbd=kbd_std; g_kbd.caps=false; g_kbd.shift=false; g_kbd.fn_mode=0; }
         kbd_draw(l,TM_KB_Y,&g_kbd,s_press);
@@ -530,8 +972,14 @@ static void p_term_render(ui_ctx_t *ctx) {
     if(s_scroll < 0)    s_scroll = 0;
     int frac = (int)s_scroll % HM_ROW;
     int idx  = s_nlines - 1 - ((int)s_scroll)/HM_ROW; if(idx<0) idx=0;
-    int yy   = (xH-HM_ROW) - frac;
+    /* ★★ 2026-10-21 linit: 原来写的是 base - frac, 每跨过一个行边界 idx 变一次、
+     *   yy 却跳回 base ⇒ 每滚 16px 画面回跳 31px, 看起来"一格一格跳"。
+     *   正确公式 y(i) = base + s + (i-(n-1))*H 化简后就是 base + frac:
+     *   手指往下拖多少, 内容就往下走多少 (1:1 跟手), 不再回跳。 */
+    int yy   = (xH-HM_ROW) + frac;
+    s_clip_bot = xH;
     for(int i=idx; i>=0 && yy>=0; i--){ dline(l,2,yy,s_buf[i],0); yy-=line_h(s_buf[i]); }
+    s_clip_bot = 0;
     uint32_t tnow = xTaskGetTickCount()*portTICK_PERIOD_MS;
     bool on = ((tnow/500)&1)!=0;
     int in_y = TM_OUT_H - GB_H;
@@ -552,8 +1000,25 @@ static bool p_term_touch(ui_ctx_t *ctx, int x, int y) {
 }
 
 static void p_term_action(ui_ctx_t *ctx, os_action_t a) {
+    /* ★ 仙剑模式：物理按键全部转成游戏键，不再走终端逻辑 */
+    if (s_pal_mode) {
+        switch (a) {
+            case OS_ACTION_BACK:    pal_release(); pal_stop(); break;
+            case OS_ACTION_UP:      pal_pulse(PAL_KEY_UP);    break;
+            case OS_ACTION_DOWN:    pal_pulse(PAL_KEY_DOWN);  break;
+            case OS_ACTION_LEFT:    pal_pulse(PAL_KEY_LEFT);  break;
+            case OS_ACTION_RIGHT:   pal_pulse(PAL_KEY_RIGHT); break;
+            case OS_ACTION_CONFIRM: pal_pulse(PAL_KEY_OK);    break;
+            case OS_ACTION_HOME:    pal_pulse(PAL_KEY_MENU);  break;
+            default: break;
+        }
+        return;
+    }
     switch (a) {
         case OS_ACTION_BACK:
+            /* ★ 游戏模式: 返回键先请求退出仙剑（游戏任务收到 SDL_QUIT 后自行收尾），
+             *   退出后 poll 检测到 not running 自动切回终端。 */
+            if (s_pal_mode) { pal_stop(); break; }
             /* 终端为应用页: 按硬件返回键直接退出 (不弹"退出程序?"确认框, 与白板一致).
              * Task F 已将 os_core 全屏 BACK 门控收窄为仅游戏态拦截, 应用需自行处理退出. */
             os_pop(ctx);
@@ -565,54 +1030,73 @@ static void p_term_action(ui_ctx_t *ctx, os_action_t a) {
 }
 
 static void p_term_poll(ui_ctx_t *ctx) {
-    /* 命令列表横向惯性: 拖动期间由 dx 直接跟手, 松手后按速度滑行并衰减 */
-    if(!s_dragout && s_bar_v != 0.0f){
-        int mx=bar_maxofs();
-        s_bar_ofs += (int)s_bar_v;
-        if(s_bar_ofs<0){ s_bar_ofs=0; s_bar_v=0.0f; }
-        if(s_bar_ofs>mx){ s_bar_ofs=mx; s_bar_v=0.0f; }
-        s_bar_v *= 0.82f;
-        if(s_bar_v>-0.6f && s_bar_v<0.6f) s_bar_v=0.0f;
-        ctx->needs_redraw = true;
-    }
-    uint32_t tw = xTaskGetTickCount()*portTICK_PERIOD_MS;
-    static uint32_t tw_last = 0;
-    if((tw/500)!=(tw_last/500)){ tw_last=tw; ctx->needs_redraw=true; }
-    if(!s_dragout && s_scrv!=0.0f){
-        s_scroll += s_scrv; s_scrv *= 0.85f;
-        if(s_scrv>-0.6f && s_scrv<0.6f) s_scrv=0.0f;
-        int xH=TM_OUT_H-GB_H; int tot=s_nlines*HM_ROW; int mx=tot>xH?tot-xH:0;
-        if(s_scroll>mx){ s_scroll=(float)mx; s_scrv=0.0f; }
-        if(s_scroll<0){ s_scroll=0.0f; s_scrv=0.0f; ctx->needs_redraw=true; }
-        ctx->needs_redraw=true;
-    }
-    /* ★★ 松手回弹对齐整行 (linit 2026-10-14: "滚动哪怕字体只有一半也可以显示,
-     *    只不过放下手弹回到完整的那一排") ★★
-     *   拖动/惯性期间照旧保留**半行**的顺滑跟手; 惯性停下后, 再把顶层对齐到最近的整行。
-     *   用"每帧走剩余距离的 1/3"做缓动, 视觉上是顺滑回弹而不是硬跳。 */
-    if(!s_dragout && s_scrv==0.0f){
-        int sc=(int)s_scroll, frac=sc % HM_ROW;
-        if(frac!=0){
-            int target = (frac > HM_ROW/2) ? (sc - frac + HM_ROW) : (sc - frac);
-            int xH=TM_OUT_H-GB_H; int tot=s_nlines*HM_ROW; int mx=tot>xH?tot-xH:0;
-            if(target>mx) target=mx;
-            if(target<0)  target=0;
-            int diff=target-sc;
-            if(diff!=0){
-                int step=diff/3;
-                if(step==0) step=(diff>0)?2:-2;
-                if((diff>0 && step>diff) || (diff<0 && step<diff)) step=diff;
-                s_scroll+=(float)step;
-                ctx->needs_redraw=true;
-            }
+    /* ★ 游戏模式: 只驱动游戏上屏，终端自己的滚动/惯性全部暂停 */
+    if (s_pal_mode) {
+        if (!pal_is_running()) {          /* 游戏已退出（用户按返回 / 出错）⇒ 切回终端 */
+            s_pal_mode = false;
+            pal_keys_enable(false);
+            pal_release();
+            ctx->needs_redraw = true;
+            line_add(" 已退出仙剑");
+        } else {
+            /* ---- 系统虚拟按键（GBC 同款）：多点轮询 -> joypad 位 -> 游戏键 ---- */
+            tp_point_t pts[TP_MAX_POINTS];
+            int np = 0;
+            input_get_touch_multi(pts, &np);
+            bool d0 = (np >= 1) && pts[0].pressed;
+            bool d1 = (np >= 2) && pts[1].pressed;
+            uint8_t jp = virtual_keys_poll_multi(d0 ? pts[0].x : 0, d0 ? pts[0].y : 0, d0,
+                                                 d1 ? pts[1].x : 0, d1 ? pts[1].y : 0, d1);
+            pal_sync_joypad(jp);
+
+            /* 物理按键是脉冲式：到点自动松开，否则游戏会以为一直按着 */
+            if (s_pal_key != PAL_KEY_NONE && --s_pal_hold <= 0) pal_release();
+
+            pal_tick(ctx->lcd);
         }
+        return;
+    }
+    /* ---- ★★★ 2026-10-24 统一滚动: 三块区域全部由 ui_scroll 推进
+     *   (惯性 ×0.86 / 越界回弹 ×0.8 / 行吸附 —— 全项目同一套手感)。
+     *   本文件不再自己算 s_scrv/s_hscrv/s_bar_v, 每帧从 ui_scroll 写回镜像量。
+     *   输出区与帮助列表用 LIST(行高 HM_ROW) 保留"松手吸附整行"; 命令栏横向用 HORIZ+PIXEL。 */
+    {
+        const int HM = HM_ROW;
+        int xH  = TM_OUT_H - GB_H;
+        int tot = s_nlines * HM;
+        int helpmx = help_maxs();
+        int barmx  = bar_maxofs();
+
+        if (!s_sc_ready) {
+            ui_scroll_config(&s_sc_out,  UI_SCROLL_LIST,  0);
+            ui_scroll_config(&s_sc_help, UI_SCROLL_LIST,  0);
+            ui_scroll_config(&s_sc_bar,  UI_SCROLL_PIXEL, UI_SCROLL_F_HORIZ);
+            s_sc_ready = true;
+        }
+        /* content = 最大偏移 + 可视长 (ui_scroll 内部 max = content - view) */
+        if (s_sc_out_cap  != tot    || s_sc_out_cap  < 0) { ui_scroll_init(&s_sc_out,  HM, xH, tot + xH);      s_sc_out_cap  = tot; }
+        if (s_sc_help_cap != helpmx || s_sc_help_cap < 0) { ui_scroll_init(&s_sc_help, HM, xH, helpmx + xH);    s_sc_help_cap = helpmx; }
+        if (s_sc_bar_cap  != barmx  || s_sc_bar_cap  < 0) { ui_scroll_init(&s_sc_bar,  1,  xH, barmx + xH);     s_sc_bar_cap  = barmx; }
+
+        if (ui_scroll_poll(&s_sc_out))  ctx->needs_redraw = true;
+        if (ui_scroll_poll(&s_sc_help)) ctx->needs_redraw = true;
+        if (ui_scroll_poll(&s_sc_bar))  ctx->needs_redraw = true;
+
+        s_scroll  = (float)ui_scroll_offset(&s_sc_out);
+        s_hscroll = (float)ui_scroll_offset(&s_sc_help);
+        s_bar_ofs = ui_scroll_offset(&s_sc_bar);
+        s_scrv = 0.0f; s_hscrv = 0.0f; s_bar_v = 0.0f;
     }
     int tx,ty; bool down=input_get_touch_pos(&tx,&ty);
     static bool d=false, dbar=false, moved=false;
     static int  dbar_lx=0, dbar_dist=0, dbar_bi=-1;
     if(!down){
         if(d){
-            if(s_dragout){ s_dragout=false; }
+            if(s_dragout){
+                s_dragout=false;
+                ui_scroll_touch_xy(&s_sc_out,  0, 0, false);
+                ui_scroll_touch_xy(&s_sc_help, 0, 0, false);
+            }
             else if(dbar){
                 if(!moved){
                     if(dbar_bi==-2){ s_bar_ofs-=40; if(s_bar_ofs<0)s_bar_ofs=0; }
@@ -622,6 +1106,7 @@ static void p_term_poll(ui_ctx_t *ctx) {
                         exec_cmd(s_cmd); s_ci=0; s_cur=0; s_cmd[0]=0; }
                 }
                 dbar=false;
+                ui_scroll_touch_xy(&s_sc_bar, 0, 0, false);
             }
             s_press=-1; ctx->needs_redraw=true;
         }
@@ -631,40 +1116,33 @@ static void p_term_poll(ui_ctx_t *ctx) {
         d=true;
         if(ty < TM_BAR_Y-1){
             s_dragout=true; s_drag_y0=ty; s_drag_ty=ty;
-            s_drag_sc0=s_scroll; s_scrv=0;
+            s_drag_sc0 = s_help_active ? s_hscroll : s_scroll;
+            s_scrv=0; s_hscrv=0;
             return;
         }
-        if(ty>=TM_BAR_Y && ty<=TM_BAR_Y+TM_BAR_H){ s_bar_ofs>bar_maxofs()?s_bar_ofs=bar_maxofs():0; dbar=true; moved=false; dbar_lx=tx; dbar_dist=0; dbar_bi=hit_bar(tx,ty); return; }
+        if(ty>=TM_BAR_Y && ty<=TM_BAR_Y+TM_BAR_H){ s_bar_ofs>bar_maxofs()?s_bar_ofs=bar_maxofs():0; dbar=true; moved=false; dbar_lx=tx; dbar_dist=0; dbar_bi=hit_bar(tx,ty);
+            ui_scroll_touch_xy(&s_sc_bar, tx, ty, true); return; }
         int ki=kbd_hit(&g_kbd,TM_KB_Y,tx,ty);
         if(ki>=0){ s_press=ki; key_input(ki); ctx->needs_redraw=true; }
         return;
     }
     if(s_dragout){
-        int dy = ty - s_drag_ty; s_drag_ty = ty;
-        if(s_help_active){
-            int dy0 = ty - s_drag_y0; int hp=help_pages();
-            if(dy0 <= -HM_ROW*2){ s_help_page=(s_help_page+1)%hp; s_drag_y0=ty; ctx->needs_redraw=true; }
-            else if(dy0 >= HM_ROW*2){ s_help_page=(s_help_page+hp-1)%hp; s_drag_y0=ty; ctx->needs_redraw=true; }
+        /* ★ 2026-10-24 统一滚动: 1:1 跟手交给 ui_scroll（越界可拉出、松手惯性+回弹）*/
+        if (s_help_active) {
+            if (ui_scroll_touch_xy(&s_sc_help, tx, ty, true)) ctx->needs_redraw = true;
         } else {
-            /* ★ 方向修正 (linit 2026-10-14: "终端的上下拖动方向是反的") ★
-             * s_scroll = "距最新行的偏移"(0=贴底看最新). 手指**往下拖**要把内容往下拉,
-             * 于是看到更早的历史 ⇒ s_scroll 应当**增大**; 原来写成减号, 一拖就往新内容跑, 手感是反的。
-             * 惯性初速同步取 +dy, 方向才一致。 */
-            s_scroll = s_drag_sc0 + (float)(ty - s_drag_y0);
-            s_scrv = (float)(dy);
-            int xH=TM_OUT_H-GB_H; int tot=s_nlines*HM_ROW; int mx=tot>xH?tot-xH:0;
-            if(s_scroll>mx) s_scroll=(float)mx;
-            if(s_scroll<0)  s_scroll=0.0f;
-            ctx->needs_redraw=true;
+            if (ui_scroll_touch_xy(&s_sc_out,  tx, ty, true)) ctx->needs_redraw = true;
         }
         return;
     }
     if(dbar){
-        int dx=tx-dbar_lx; dbar_lx=tx; if(dx<0)dbar_dist+=-dx; else dbar_dist+=dx;
-        int no=s_bar_ofs-dx; if(no<0)no=0; if(no>bar_maxofs())no=bar_maxofs();
-        if(no!=s_bar_ofs){ s_bar_ofs=no; ctx->needs_redraw=true; }
-        s_bar_v = (float)(-dx) * 0.5f;                    /* 松手后作为惯性初速 */
-        if(dbar_dist>8) moved=true;
+        /* ★ 2026-10-24 统一滚动: 命令栏横向也用 ui_scroll（HORIZ + PIXEL）*/
+        int old = s_bar_ofs;
+        if (ui_scroll_touch_xy(&s_sc_bar, tx, ty, true)) ctx->needs_redraw = true;
+        s_bar_ofs = ui_scroll_offset(&s_sc_bar);
+        if (s_bar_ofs != old) ctx->needs_redraw = true;
+        if (tx - dbar_lx > 8 || dbar_lx - tx > 8) moved = true;
+        dbar_lx = tx;
     }
 }
 

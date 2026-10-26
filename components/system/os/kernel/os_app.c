@@ -6,6 +6,7 @@
  * 私有 state 全部 static 留本文件.
  */
 #include "os.h"
+#include <sys/stat.h>
 #include "touch_panel.h"
 
 #include "svc_nvs.h"
@@ -45,8 +46,36 @@ void os_app_toggle_hidden_visible(void) {
     }
     ESP_LOGI(TAG, "隐藏应用: %s", s_hidden_visible ? "显示" : "隐藏");
 }
+/* 只判断资源就绪: 供应用管家列表过滤用 (不碰 hidden/touch_only/主菜单策略) */
+bool os_app_available(const os_app_t *a) {
+    if (!a) return false;
+    if (a->requires && a->requires[0]) {
+        struct stat st;
+        if (stat(a->requires, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    }
+    return true;
+}
+
 bool os_app_visible(const os_app_t *a) {
     if (!a) return false;
+    /* ★★★ 2026-10-25 资源包类应用: 依赖目录不在 ⇒ 整条不显示。
+     *   (仙剑这类"只装资源、装完才出现"的应用靠这一条判断, 每帧调, 装完立刻出现.) */
+    if (a->requires && a->requires[0]) {
+        struct stat st;
+        int rc = stat(a->requires, &st);
+        bool ok = (rc == 0) && S_ISDIR(st.st_mode);
+        /* 诊断: 每个 requires 应用只打一次, 避免每帧刷屏 */
+        static char s_logged[8][24]; static int s_logged_n;
+        bool seen = false;
+        for (int i = 0; i < s_logged_n; i++)
+            if (strncmp(s_logged[i], a->id, 23) == 0) { seen = true; break; }
+        if (!seen && s_logged_n < 8) {
+            snprintf(s_logged[s_logged_n++], 24, "%s", a->id);
+            ESP_LOGI("OS_APP", "%s requires=%s → stat rc=%d dir=%d ⇒ %s",
+                     a->id, a->requires, rc, (int)ok, ok ? "显示" : "隐藏");
+        }
+        if (!ok) return false;
+    }
     /* 无触摸屏 → 触摸专用应用 (白板/触屏测试等) 一律隐藏 */
     if (a->touch_only && !touch_panel_is_present()) return false;
     /* 用户显式隐藏 → 不显示 (无论默认) */
@@ -86,20 +115,47 @@ const os_app_t *os_app_visible_at(int idx) {
  *   2026-09-22 放宽到 512 (NVS str 上限 4000B, 够用)。 */
 #define MAINMENU_MAX 512
 
-/* 读逗号分隔 id 列表, 判断 id 是否在其中 */
+/* ★★★ 2026-10-18 linit 反馈"切分类卡慢"的根因:
+ *   原来**每次判断可见性都 nvs_get_str**(跨 flash 页, 2~5ms), 应用管家 20 个应用
+ *   × 2 个列表 = 40+ 次 ⇒ 40~100ms 卡顿 ✗
+ *   改为 **RAM 缓存**: 首次读入静态缓冲, 之后纯内存比对; 写列表时置脏。 */
+static char s_idlist_cache[2][MAINMENU_MAX];
+static bool s_idlist_ok[2] = { false, false };
+static int idlist_idx(const char *key) {
+    if (strcmp(key, MMHIDE_KEY) == 0)   return 0;
+    if (strcmp(key, MAINMENU_KEY) == 0) return 1;
+    return -1;
+}
+static const char *idlist_get(const char *key) {
+    int i = idlist_idx(key);
+    if (i < 0) return "";
+    if (!s_idlist_ok[i]) {
+        size_t len = sizeof(s_idlist_cache[i]);
+        s_idlist_cache[i][0] = '\0';
+        nvs_handle_t h;
+        if (svc_nvs_open(APPN_NS, NVS_READONLY, &h) == ESP_OK) {
+            if (svc_nvs_get_str(h, key, s_idlist_cache[i], &len) != ESP_OK) s_idlist_cache[i][0] = '\0';
+            svc_nvs_close(h);
+        }
+        s_idlist_ok[i] = true;
+    }
+    return s_idlist_cache[i];
+}
+static void idlist_dirty(const char *key) {
+    int i = idlist_idx(key);
+    if (i >= 0) s_idlist_ok[i] = false;
+}
+
+/* 读逗号分隔 id 列表, 判断 id 是否在其中 (走 RAM 缓存) */
 static bool id_in_list(const char *key, const char *id) {
     if (!id) return false;
-    char buf[MAINMENU_MAX];
-    buf[0] = '\0';
-    nvs_handle_t h;
-    if (svc_nvs_open(APPN_NS, NVS_READONLY, &h) == ESP_OK) {
-        size_t len = sizeof(buf);
-        if (svc_nvs_get_str(h, key, buf, &len) != ESP_OK) buf[0] = '\0';
-        svc_nvs_close(h);
-    }
-    char *p = buf;
+    const char *src = idlist_get(key);
+    if (!src) return false;
+    /* ★ 2026-10-20: 原来拷进 512 字节缓冲, 列表最长 1023 ⇒ 截断后漏判(应用被误隐藏)。
+     *   这里只读不写, 直接在原串上扫, 彻底避免复制截断。 */
+    const char *p = src;
     while (*p) {
-        char *end = strchr(p, ',');
+        const char *end = strchr(p, ',');
         size_t n = end ? (size_t)(end - p) : strlen(p);
         if (n == strlen(id) && strncmp(p, id, n) == 0) return true;
         if (!end) break;
@@ -110,6 +166,7 @@ static bool id_in_list(const char *key, const char *id) {
 /* 把 id 加入 (show=true) 或移出 (show=false) 某个逗号分隔列表 */
 static void id_set_in_list(const char *key, const char *id, bool show) {
     if (!id) return;
+    idlist_dirty(key);              /* ★ 写前失效, 保证读到最新的 NVS 内容 */
     char buf[MAINMENU_MAX];
     buf[0] = '\0';
     nvs_handle_t h;

@@ -10,6 +10,7 @@
  */
 
 #include <stdio.h>
+#include "vid_tune.h"      /* 画面优化器 (按引擎独立存档) */
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -148,7 +149,7 @@ const char *lavax_host_path(const char *path, char *buffer, size_t size)
 }
 
 /* V1.x 共用 LavaData 回退: 游戏自带 LavaData 缺失某数据文件时, 尝试从
- * /sdcard/lava/LavaData/<basename> 取(需先存在该共用目录). 命中返回 1 且改写 buffer.
+ * /sdcard/roms/lava/LavaData/<basename> 取(需先存在该共用目录). 命中返回 1 且改写 buffer.
  *
  * ⚠ V1.6.x 修正(数据丢失): 文曲星/LAVA 社区规范是 **每个游戏的 .app 文件夹里自带
  * LavaData/(数据属于该游戏), 不存在"多游戏共享一份 LavaData"的官方做法。
@@ -165,7 +166,7 @@ static int lavax_shared_lavadata(const char *mapped, char *buffer, size_t size)
     const char *base = strrchr(mapped, '/');
     if (!base || !base[1]) return 0;
     char fb[192];
-    int n = snprintf(fb, sizeof fb, "/sdcard/lava/LavaData/%s", base + 1);
+    int n = snprintf(fb, sizeof fb, "/sdcard/roms/lava/LavaData/%s", base + 1);
     if (n <= 0 || (size_t)n >= sizeof fb) return 0;
     struct stat st;
     if (stat(fb, &st) != 0) return 0;
@@ -386,6 +387,7 @@ void lavax_platform_poll(void)
                 }
                 virtual_keys_draw(g_lcd);   /* 叠加屏幕虚拟按键 (标准布局) */
                 bool takeover = cheat_float_overlay_tick(g_lcd); /* 浮标+检测呼出 */
+                if (!takeover) vid_tune_overlay_tick(g_lcd);     /* 画面优化器浮标/面板 */
                 lavax_draw_exit_confirm(g_lcd);  /* V1.0.9x: 叠加退出确认浮层 */
                 if (!takeover) st7305_flush(g_lcd);   /* 触发接管则本帧不再送屏 */
                 int64_t r1 = esp_timer_get_time();

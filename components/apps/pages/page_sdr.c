@@ -21,7 +21,10 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_system.h"      /* esp_restart: 频谱仪启用/释放 64KB 需重启生效 */
 #include "dsps_fft2r.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -582,8 +585,53 @@ static void sdr_reset_view(void)
     if (s_wf) memset(s_wf, 0, (size_t)SDRV_WF_ROW_B * SDRV_WF_H);
 }
 
+/* ★ 频谱仪 64KB 采集区: 默认不占用(开机已回收进堆), 只有"启用标记"才保留。
+ *   与 USB 网卡同范式 —— 启用/释放都写 NVS 后重启生效 (IDF 无 heap remove_region)。
+ *   s_need_enable : 进入时未启用 → 弹"启用并重启"
+ *   s_need_release: 退出时已启用 → 弹"退出并重启释放 64KB" */
+static bool s_need_enable  = false;
+static bool s_need_release = false;
+static bool s_notouch_msg  = false;   /* 无触摸: 待弹一次"不可用"提示 */
+
+static void sdr_enable_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result == 0) {                       /* 0=确定 1/-1=取消 */
+        espsdr_set_enabled(true);
+        ESP_LOGW(TAG, "频谱仪: 已写启用标记, 重启后保留 64KB");
+        vTaskDelay(pdMS_TO_TICKS(600));      /* 让提示可见 */
+        esp_restart();                       /* 不返回 */
+    }
+    if (ctx) ctx->needs_redraw = true;
+}
+static void sdr_release_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result == 0) {                       /* 0=退出并重启释放 */
+        espsdr_set_enabled(false);
+        ESP_LOGW(TAG, "频谱仪: 已清启用标记, 重启后释放 64KB");
+        vTaskDelay(pdMS_TO_TICKS(600));
+        esp_restart();                       /* 不返回 */
+    }
+    s_need_release = false;                  /* 取消: 留在本页, 返回键可再提示 */
+    if (ctx) ctx->needs_redraw = true;
+}
+
 static void sdr_on_enter(ui_ctx_t *ctx)
 {
+    /* ★ 频谱仪未启用: 采集区 64KB 已于开机回收进堆, 这里绝不碰它。
+     *   ① 本机无触摸 → 频谱仪全触屏操作没法用: 只提示"不可用", 不给启用入口 (图标仍显示);
+     *   ② 有触摸 → 由 poll 弹一次"启用并重启"; 取消则停在空页, 按返回离开。 */
+    if (!espsdr_usable()) {
+        if (!espsdr_touch_ok()) {
+            s_ok = false;
+            s_notouch_msg = true;   /* poll 弹一次"不可用" */
+            ESP_LOGW(TAG, "无触摸屏: 频谱仪不可用 (仅提示)");
+            return;   /* 用户按返回离开 */
+        }
+        s_need_enable = true;
+        s_ok = false;
+        ESP_LOGW(TAG, "频谱仪未启用(64KB已回收): 提示启用");
+        return;
+    }
     ESP_LOGI(TAG, "enter 频谱仪");
     s_ok = false; s_fail_n = 0; s_cap_n = 0; s_last_ms = 0;
     s_wifi_owned = false; s_bt_owned = false;
@@ -957,6 +1005,9 @@ static void sdr_render(ui_ctx_t *ctx)
 {
     st7305_handle_t *lcd = ctx->lcd;
     s_ctx = ctx;                                                          /* 供测试钩子用 */
+    /* ★ 未启用: 采集区已回收进堆, 各缓冲均为 NULL → 直接清屏返回 (不画频谱, 防空指针)。
+     *   此时 poll 正在弹"启用并重启"确认框。 */
+    if (!espsdr_usable()) { st7305_clear(lcd, ST7305_COLOR_WHITE); return; }
     if (s_sliding && !s_offscreen) { sdr_slide_render(ctx); return; }   /* 拖动中: 合成两页 */
     st7305_clear(lcd, ST7305_COLOR_WHITE);
 
@@ -1165,6 +1216,11 @@ static void sdr_set_cb(ui_ctx_t *ctx, int sel, void *ud)
  *  跨度/平均/增益固定为自动最优值 (80MHz / 4 次 / AGC), 不再暴露。 */
 static void sdr_action(ui_ctx_t *ctx, os_action_t a)
 {
+    /* ★ 未启用: 缓冲全为 NULL, 只允许"返回退出", 其它动作一律忽略 (防空指针)。 */
+    if (!espsdr_usable()) {
+        if (a == OS_ACTION_BACK) os_request_exit_confirm(ctx);
+        return;
+    }
     switch (a) {
     case OS_ACTION_CONFIRM:
         sdr_scan_start();                      /* 点确认 = 重新测一次 (结果才更新) */
@@ -1176,7 +1232,15 @@ static void sdr_action(ui_ctx_t *ctx, os_action_t a)
         sdr_goto(s_page + 1);
         break;
     case OS_ACTION_BACK:
-        os_request_exit_confirm(ctx);          /* 最外层: 确认后才退 */
+        if (espsdr_usable()) {
+            /* 已占用 64KB: 退出前提示"重启释放"。选取消则留在本页 (返回键可再提示)。 */
+            if (!s_need_release) {
+                s_need_release = true;
+                os_dialog_confirm_ex(ctx, "退出并重启?\n将释放频谱仪占用的64KB内部内存", 0, 0, sdr_release_cb, NULL);
+            }
+        } else {
+            os_request_exit_confirm(ctx);      /* 未占用: 普通退出确认 */
+        }
         return;
     default: break;
     }
@@ -1186,6 +1250,7 @@ static void sdr_action(ui_ctx_t *ctx, os_action_t a)
 /* 顶栏按**同样等分槽**响应 —— 看到的四个槽就是能点的四个参数 (槽位定义见 sdr_view.h) */
 static bool sdr_touch(ui_ctx_t *ctx, int x, int y)
 {
+    if (!espsdr_usable()) return true;     /* 未启用: 空页, 不吃触摸 (防呆) */
     /* ---- 底栏软键 (与全项目同套): 左「设置」 右「冻结/返回」 ---- */
     if (y >= SDRV_SOFT_LID) {
         if (x < 90) {                                   /* 左软键 = 设置(二级弹窗) */
@@ -1230,6 +1295,19 @@ static bool sdr_touch(ui_ctx_t *ctx, int x, int y)
 
 static void sdr_poll(ui_ctx_t *ctx)
 {
+    /* ★ 频谱仪未启用(默认): 唯一动作 = 弹一次"启用并重启"; 已启用才走正常采集路径。
+     *   (此时 s_ok=false 且所有缓冲为 NULL, 绝不能往下走。) */
+    if (s_notouch_msg) {
+        s_notouch_msg = false;
+        os_dialog_toast(ctx, "本机无触摸屏, 频谱仪不可用");
+        return;
+    }
+    if (s_need_enable) {
+        s_need_enable = false;
+        os_dialog_confirm_ex(ctx, "频谱仪需占用64KB内部内存\n启用后需重启生效\n是否启用?", 0, 0, sdr_enable_cb, NULL);
+        return;
+    }
+    if (!espsdr_usable()) return;   /* 未启用: 空页, 等用户按返回离开 */
     /* ⛔ 开头**不能**是 `if (!s_ok) return`: 第 4 页(音频)走麦克风, 与射频无关,
      *   射频没接管也要能用; 电池读数与拖动手势两条也得照跑。 */
     int64_t now = esp_timer_get_time() / 1000;

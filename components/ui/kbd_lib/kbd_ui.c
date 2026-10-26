@@ -31,13 +31,20 @@ static void kdascii(st7305_handle_t* l, int w, int x, int y, const char* s, int 
 }
 static int kasw(const char* s){ int w=0; for(const unsigned char*p=(const unsigned char*)s;*p;p++) w+=KBD_GB_W; return w; }
 
-/* 方向键三角箭头 (窄边在尖, 宽边在另一端) */
+/* 方向键三角箭头 (尖端在前, 底边在后)
+ * ★ 2026-10-21 修"箭头不在格子中心": 原来 UP 从 cy-8 往上画 8 行、DOWN 从 cy 往上画,
+ *   三角形重心比格子中心高 4px (左右同理偏左 4px)。改成以 cy 为中心上下各 4 行。 */
 static void kdraw_arrow(st7305_handle_t* l, int w, int cx, int cy, int act, int inv){
     int c=inv?1:0;
-    if(act==KBD_ACT_UP){        for(int r=0;r<8;r++)for(int o=-r;o<=r;o++)kpx(l,cx+o,cy-8+r,w,c); }
-    else if(act==KBD_ACT_DOWN){ for(int r=0;r<8;r++)for(int o=-r;o<=r;o++)kpx(l,cx+o,cy-r,w,c); }
-    else if(act==KBD_ACT_LEFT){ for(int r=0;r<8;r++)for(int o=-r;o<=r;o++)kpx(l,cx-8+r,cy+o,w,c); }
-    else {                      for(int r=0;r<8;r++)for(int o=-r;o<=r;o++)kpx(l,cx-r,cy+o,w,c); }
+    if(act==KBD_ACT_UP){                 /* 尖在上, 逐行变宽 */
+        for(int r=0;r<8;r++) for(int o=-r;o<=r;o++) kpx(l,cx+o,cy-4+r,w,c);
+    } else if(act==KBD_ACT_DOWN){        /* 尖在下: 顶行最宽 */
+        for(int r=0;r<8;r++){ int hw=7-r; for(int o=-hw;o<=hw;o++) kpx(l,cx+o,cy-4+r,w,c); }
+    } else if(act==KBD_ACT_LEFT){        /* 尖在左 */
+        for(int r=0;r<8;r++){ int hw=r; for(int o=-hw;o<=hw;o++) kpx(l,cx-4+r,cy+o,w,c); }
+    } else {                             /* 尖在右 */
+        for(int r=0;r<8;r++){ int hw=r; for(int o=-hw;o<=hw;o++) kpx(l,cx+3-r,cy+o,w,c); }
+    }
 }
 
 /* ===== 统一渲染: 屏幕原点 (base_x,base_y) + 映射宽 draw_w + 每排高 row_h + 参与渲染排数 rows(<=0 不裁) =====

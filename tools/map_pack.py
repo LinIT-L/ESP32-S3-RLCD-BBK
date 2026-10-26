@@ -55,17 +55,17 @@ DEFAULT_MIRRORS = [
 # ★ 两种包形态并存 (设备端 map.lua 都认):
 #   ① 单文件包: 每个图层一个 .ltm (putian_*), 无清单 —— 老形态, 小区域够用
 #   ② **省级单文件包**: `<id>.json` 索引 + `<id>.bin` 数据体
-#      为什么不是"一瓦片一个 .ltm": 福建 607 路块 + 564 标块 = 1171 个文件 ⇒
+#      为什么不是"一瓦片一个 .ltm": 607 路块 + 564 标块 = 1171 个文件 ⇒
 #      1171 次 HTTP 请求, 设备端二十分钟下不完。整省平铺进一个 bin,
 #      索引记每块 (off,size), 设备端用 app.fs.read_at 精确读视口那几块 ——
 #      **一次请求下完整省**。见 docs/矢量离线地图-方案与实现.md「省级包」。
 PACKS = [
-    dict(name="fj", label="福建省",
+    dict(name="fj", label="示例省",
          # bin 放前面: 中途中断时"有 bin 没 json" ⇒ 设备端根本认不出包,
          # 干净地退回"未找到地图包"; 反过来会得到一个"半残的包"。
          files=[("bin", "fj.bin"), ("index", "fj.json")],
          sub="fj"),
-    dict(name="putian", label="莆田市区",
+    dict(name="putian", label="示例市区",
          files=[("road", "putian_road.ltm"), ("contour", "putian_contour.ltm"),
                 ("poi", "putian_poi.ltm")]),
 ]
@@ -81,10 +81,10 @@ README = """LinTOS 矢量离线地图 — TF 卡数据包
 
 把本目录下的 **Map 文件夹** 整个拷到 TF 卡根目录, 变成:
 
-    /sdcard/Map/fj.json + fj.bin       福建省 (分块包, 18 MB)
-    /sdcard/Map/putian_road.ltm        莆田市区 道路 (矢量折线 + 路名)
-    /sdcard/Map/putian_contour.ltm     莆田市区 等高线 (20m 等高距)
-    /sdcard/Map/putian_poi.ltm         莆田市区 地标
+    /sdcard/Map/<id>.json + <id>.bin   分块包 (示例: 全省 18 MB)
+    /sdcard/Map/putian_road.ltm        示例市区 道路 (矢量折线 + 路名)
+    /sdcard/Map/putian_contour.ltm     示例市区 等高线 (20m 等高距)
+    /sdcard/Map/putian_poi.ltm         示例市区 地标
 
 然后插卡, 打开应用《矢量地图》即可。装了多个包时在「设置 → 地图包」里切换。
 
@@ -93,7 +93,7 @@ README = """LinTOS 矢量离线地图 — TF 卡数据包
 也可以不拷: 连上 WiFi 后在应用里点「联网下载」,
 会从 https://bbk.linit.cn/bbk/maps.json 自动下载到 TF 卡。
 
-覆盖范围: 福建省 (115.8~120.4E, 23.6~28.3N) · 莆田市区 (118.95~119.10E, 25.36~25.50N)
+覆盖范围: 由 --bbox 指定 (示例: 115.8~120.4E, 23.6~28.3N)
 数据来源: 道路/路名/地标 © OpenStreetMap 贡献者 (ODbL) · 高程 NASA/USGS SRTM (terrarium)
 """
 

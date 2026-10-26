@@ -12,6 +12,7 @@
  */
 
 #include <stdio.h>
+#include "vid_tune.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -161,6 +162,7 @@ static cheater_region_t lavax_cheat_region;
 /* 加载一个 .lav 程序并运行直至退出 */
 esp_err_t lavax_emu_load_and_run(const char *lav_path)
 {
+    vid_tune_attach("lavax");   /* 画面优化器: 本引擎独立档 */
     if (!s_ready)
         return ESP_ERR_INVALID_STATE;
 
@@ -169,7 +171,7 @@ esp_err_t lavax_emu_load_and_run(const char *lav_path)
 
     /* 以游戏所在目录设为 LavaX 文件根, 使程序能读写同级的 LavaData/ 存档目录
      * (例如 暴龙机.app/LavaData/digivice.dat). lav_path 形如
-     * /sdcard/lava/暴龙机/暴龙机.lav; 取目录部分, 去掉文件名.
+     * /sdcard/roms/lava/暴龙机/暴龙机.lav; 取目录部分, 去掉文件名.
      * 若该目录名是 Lava/lava(游戏放 <游戏>/Lava/x.lav, 数据在上级 <游戏>/LavaData),
      * 则再上移一级到游戏主目录. */
     {

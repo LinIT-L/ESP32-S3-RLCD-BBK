@@ -92,6 +92,7 @@ bool input_consume_tap(int *x, int *y);
  * 返回 false 表示当前无手指按下. */
 bool input_get_touch_pos(int *x, int *y);
 
+
 /* V1.7.x: 无副作用"当前按住坐标"查询 (只读, 不消费状态机).
  * 供"按住反黑"等按压反馈使用 — main.c 每帧已消费过一次 input_get_touch_pos,
  * 弹窗/页面 render 再调会破坏其 s_o_armed 锁存, 导致按压反馈失效. */
@@ -101,6 +102,10 @@ bool input_touch_now(int *x, int *y);
  * pts[0..n-1] 各点 (未按下的置 pressed=false), count 返回实际点数 (0..TP_MAX_POINTS).
  * 调用方需在 input_get_action/input_get_touch_pos 同帧读取 (依赖同一触摸缓存). */
 void input_get_touch_multi(tp_point_t pts[TP_MAX_POINTS], int *count);
+/* ★ 2026-10-20: 双分区触摸开关 —— 只有"虚拟手柄/游戏"场景才开, 平时单点,
+ *   避免系统 UI 被第二点(幽灵点/跨中线跳点)干扰。默认关。 */
+void input_set_dual_touch(bool on);
+bool input_dual_touch(void);
 
 /* V1.0.9x: 返回本次手势按下的起点屏幕坐标 (供主菜单拖动排序判定"是否已移动").
  * 未按住或无手势时返回 false. 必须与 input_get_touch_pos 同帧/之后调用. */

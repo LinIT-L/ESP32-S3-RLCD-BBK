@@ -23,6 +23,9 @@
 #include "freertos/task.h"
 #include "soc/soc.h"          /* REG_READ / REG_WRITE */
 #include "heap_memory_layout.h"  /* SOC_RESERVE_MEMORY_REGION (把 64KB 从堆里挖掉) */
+#include "esp_heap_caps_init.h"  /* heap_caps_add_region (禁用时把 64KB 加回堆) */
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #include "espsdr.h"
 
@@ -312,3 +315,65 @@ uint32_t espsdr_last_elapsed_us(void) { return s_last_us; }
 unsigned espsdr_aperture_words(void) { return APERTURE_WORDS; }
 
 int espsdr_overrun_word(void) { return s_overrun_hi; }
+
+/* ============================================================================
+ * 启用开关 (NVS 持久, 重启生效; 不并入 hw_cfg, 频谱仪自管)
+ * ----------------------------------------------------------------------------
+ * 背景: 上方的 SOC_RESERVE_MEMORY_REGION 是无条件执行的 —— 开机 heap_init 就把
+ *   64KB 采集区 (0x3fcd0000) 从堆里挖走, 不用频谱仪也拿不回来。
+ * 方案: 开机早期调 espsdr_reclaim_boot() 一次性决定 (必须在堆分配铺开之前):
+ *   可用   → 不动 (采集区留给 modem, 现状);
+ *   不可用 → heap_caps_add_region() 把这段加回堆 ⇒ 本次开机省 64KB 内部 RAM。
+ *   (0x3fcd0000 在 soc_memory_regions[] 的 Level7 DIRAM 区, add_region 能找到
+ *    并带齐 DMA/INTERNAL caps; 回收的内存普通 malloc / WiFi / TLS 都能用。)
+ * 为什么必须重启: ESP-IDF 只有 add_region 没有 remove_region, 堆启用某段后
+ *   无法安全摘除 (碎片化 + 活跃分配), 故只能开机一次性决定 —— 与 USB 网卡同范式。
+ * 无触摸屏板型 (微雪原版): 频谱仪全触屏操作, 没触摸等于没法用 ⇒ 强制禁用并回收。
+ * ==========================================================================*/
+#define SDR_NVS_NS   "sdr"
+#define SDR_NVS_KEY  "enabled"
+
+/* 本次开机实测定格: 采集区是否真的保留给 modem (开机时确定, 之后只读) */
+static bool s_mem_reserved = false;
+static bool s_touch_ok = false;   /* 本机是否带触摸 (频谱仪全触屏操作; 无触摸只显示图标不可用) */
+
+bool espsdr_nvs_enabled(void)
+{
+    nvs_handle_t h;
+    uint8_t v = 0;                            /* 默认关闭 ⇒ 不开频谱仪就省 64KB */
+    if (nvs_open(SDR_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, SDR_NVS_KEY, &v);
+        nvs_close(h);
+    }
+    return v != 0;
+}
+
+void espsdr_set_enabled(bool en)
+{
+    nvs_handle_t h;
+    if (nvs_open(SDR_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, SDR_NVS_KEY, en ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+bool espsdr_usable(void) { return s_mem_reserved; }
+bool espsdr_touch_ok(void) { return s_touch_ok; }
+
+void espsdr_reclaim_boot(bool touch_ok)
+{
+    s_touch_ok = touch_ok;
+    s_mem_reserved = touch_ok && espsdr_nvs_enabled();
+    if (s_mem_reserved) {
+        ESP_LOGI(TAG, "频谱仪启用: 采集区 64KB 保留给 modem (0x3fcd0000)");
+        return;
+    }
+    esp_err_t e = heap_caps_add_region((intptr_t)APERTURE_BASE, (intptr_t)APERTURE_END);
+    if (e == ESP_OK) {
+        ESP_LOGW(TAG, "频谱仪禁用(%s): 64KB 采集区已回收进内部堆 (+64KB @0x3fcd0000)",
+                 touch_ok ? "NVS关" : "无触摸");
+    } else {
+        ESP_LOGE(TAG, "采集区回收失败: %s (内存布局未变, 不影响运行)", esp_err_to_name(e));
+    }
+}

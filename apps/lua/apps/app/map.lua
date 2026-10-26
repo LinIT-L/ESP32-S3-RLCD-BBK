@@ -113,7 +113,7 @@ local ZMIN, ZMAX, ZDEF = 10, 18, 14
 -- ---- 数据: 只认 TF 卡 ----
 local TIER0    = "/sdcard"
 local MAP_DIRS = { "/sdcard/Map", "/sdcard/maps" }
--- 老的单文件包 (莆田): 没有清单, 靠固定文件名兜底识别
+-- 老的单文件包: 没有清单, 靠固定文件名兜底识别
 local LEGACY_ROAD    = "putian_road.ltm"
 local LEGACY_CONTOUR = "putian_contour.ltm"
 local LEGACY_POI     = "putian_poi.ltm"
@@ -121,14 +121,14 @@ local LEGACY_POI     = "putian_poi.ltm"
 -- ============================================================================
 -- 两种地图包形态 (并存)
 -- ============================================================================
--- ① 单文件包 (莆田): putian_road.ltm / _contour.ltm / _poi.ltm —— 无清单, 兜底识别
--- ② 分块包 (福建省): <id>.json 索引 + <id>.bin 数据体, 块按 (off,size) 内嵌在 bin 里
+-- ① 单文件包: <id>_road.ltm / _contour.ltm / _poi.ltm —— 无清单, 兜底识别
+-- ② 分块包: <id>.json 索引 + <id>.bin 数据体, 块按 (off,size) 内嵌在 bin 里
 --
 -- ★★ 为什么省级必须是 "1 个 bin + 索引" 而不是 "一瓦片一个 .ltm"
---   ① 单文件装不下: 福建省 4.9°×4.9°, 而要素 bbox 是 i2(1e-5°) 时单文件跨度上限
+--   ① 单文件装不下: 示例省 4.9°×4.9°, 而要素 bbox 是 i2(1e-5°) 时单文件跨度上限
 --      只有 0.3277°; 就算 v2 把 bbox 放宽到 i4, 整省路网 18 MB 也远超
 --      `app.fs.read` 的 512 KB 上限 —— 根本读不进来。
---   ② 一瓦片一文件 = 1171 个 HTTP 请求 (福建 607 路块 + 564 标块), 设备端一个个下
+--   ② 一瓦片一文件 = 1171 个 HTTP 请求 (607 路块 + 564 标块), 设备端一个个下
 --      二十分钟都下不完, 每个请求还要重来一遍 TLS 握手。
 --   ③ 所以: 全部块**顺序平铺**进一个 .bin, 索引记每块 (off,size), 设备端用
 --      `app.fs.read_at(bin, off, size)` 精确读当前视口那几块 —— 一次请求下完整省,
@@ -138,7 +138,7 @@ local LEGACY_POI     = "putian_poi.ltm"
 local TILE_Z_DEF = 11
 
 -- 同时在内存里的块数 / 总字节上限。块内是 Lua 字符串 (PSRAM):
--- 福建 610 块, 中位 13.8 KB, 最大 364 KB ⇒ 24 块典型 330 KB, 戴上限 3 MB 也安全。
+-- 示例省 610 块, 中位 13.8 KB, 最大 364 KB ⇒ 24 块典型 330 KB, 戴上限 3 MB 也安全。
 local TILE_CACHE  = 24
 local TILE_BYTES  = 3 * 1024 * 1024
 -- 视口外多留一圈块, 平移时不至于走一步读一次
@@ -360,7 +360,7 @@ local function scan_pkgs()
                 end
             end
         end
-        -- 兜底: 老的单文件包 (莆田), 没有清单。
+        -- 兜底: 老的单文件包, 没有清单。
         -- ⚠ 判重必须按"**同一个目录里已经有老式包**", 不能按"这个目录已经有包":
         --   实际布局下 putian_road.ltm 与 fj.json/fj.bin 都在 /sdcard/Map/,
         --   按目录判重会把老包整个吞掉。
@@ -370,7 +370,7 @@ local function scan_pkgs()
                 if out[j].json == nil and out[j].dir == dir then dup = true end
             end
             if not dup then
-                out[#out + 1] = { id = "putian", name = "莆田", dir = dir,
+                out[#out + 1] = { id = "putian", name = "本地地图", dir = dir,
                                   json = nil, bin = nil,
                                   jsonpath = nil, binpath = nil,
                                   tile = 0, ztile = 99, tiled = false,

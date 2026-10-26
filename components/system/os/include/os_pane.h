@@ -29,7 +29,7 @@ typedef void (*os_pane_settings_cb)(ui_ctx_t *ctx, os_pane_t *p, int item);
 
 struct os_pane {
     /* ==== 调用方提供 (使用前设置) ==== */
-    const char         *root;        /* 扫描根目录, 如 "/sdcard/gam" */
+    const char         *root;        /* 扫描根目录, 如 "/sdcard/roms/gam" */
     bool        (*is_item)(const char *name);   /* 文件过滤 (如 .gam/.txt) */
     /* 可选: 带完整路径的过滤 (如文曲星需把含 Lava 子目录内 .lav 的游戏文件夹当一项).
      * 设置了 is_item_d 时优先用它, 否则用 is_item. */
@@ -87,6 +87,7 @@ struct os_pane {
     int   item_off;              /* 右栏平滑滚动像素偏移 (跟手拖动) */
     int   built_folder;          /* 上次 build_right 的 sel_folder, 同目录不重扫 */
     int   focus;                 /* 0=左栏, 1=右栏 */
+    int   sel_last;              /* 上次绘制时的 sel_folder: 只在它变化时自动对位左栏滚动 */
     bool  hide_all;              /* 根目录无直接文件 → 隐藏左栏"全部"项 (自动计算) */
     bool  settings_mode;         /* 右栏当前显示"引擎优化/设置"项 */
     bool  loaded;

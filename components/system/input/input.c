@@ -122,7 +122,9 @@ static void input_cfg_keys(void) {
         s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, 2000, MENU_ACTION_CONFIRM, MENU_ACTION_BT_SEARCH, false, "KEY" };
     } else {
         /* 无触摸机型: BOOT 短按=右向, 长按=返回; KEY=确认 */
-        s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, 0, MENU_ACTION_RIGHT, MENU_ACTION_BACK, false, "BOOT" };
+        /* ★ 2026-10-17 (社区反馈): long_ms 原为 0 ⇒ 走全局 500ms ⇒ 极易误触"返回";
+         *   无触摸机型只有几个键, 长按必须明显区别于短按 ⇒ 改 2000ms。 */
+        s_btns[0] = (btn_ctx_t){ BTN_GPIO_RIGHT, ST_IDLE, 0, 2000, MENU_ACTION_RIGHT, MENU_ACTION_BACK, false, "BOOT" };
         s_btns[1] = (btn_ctx_t){ BTN_GPIO_LEFT,  ST_IDLE, 0, 2000, MENU_ACTION_CONFIRM, MENU_ACTION_BT_SEARCH, false, "KEY" };
     }
 }
@@ -242,19 +244,33 @@ void input_init(void) {
     };
     esp_err_t _ret = gpio_config(&io_conf);
     ESP_LOGI(TAG, "GPIO ret=%d K%d B%d P%d", _ret,
-             gpio_get_level(GPIO_NUM_4), gpio_get_level(GPIO_NUM_0),
-             gpio_get_level(GPIO_NUM_1));
+             gpio_get_level(BTN_GPIO_LEFT), gpio_get_level(BTN_GPIO_RIGHT),
+             gpio_get_level(BTN_GPIO_PWR));
 
     /* 触摸面板 (V1.0.65): 未检测到芯片时 read 恒返回 false, 零开销
-     * ★ 2026-10-16: 引脚由本层从 board_pins.h 下发 (换板只改那一个文件) ——
-     *   以前触摸引脚写死在 touch_panel.h, 微雪板上与 LCD_DC 撞成同一个 GPIO5,
-     *   I2C 把该脚设成开漏+上拉 → LCD DC 恒 3.3V、"设置不刷新"。 */
+     * ★ 2026-10-18: 引脚按**板型表运行时**下发（原来是编译期 BOARD_TP_* 宏 = 小智的 5/13/12/6，
+     *   在标准扩展版上既打不开触摸、还会把该板的 LCD DC(5) 配成开漏上拉 ⇒ 屏不刷新）。 */
     {
-        tp_pins_t tp = { BOARD_TP_SDA, BOARD_TP_SCL, BOARD_TP_INT, BOARD_TP_RST };
+        const board_pins_t *bp = board_pins_get();
+        tp_pins_t tp = { bp->tp_sda, bp->tp_scl, bp->tp_int, bp->tp_rst };
         touch_panel_set_pins(&tp);
+
+        /* ★ 2026-10-22: 只要**本板有触摸引脚**就初始化驱动 ——
+         *   探不到芯片也无害 (init 返回 NONE, read 恒 false), 但 I2C 总线 / RST / 看门狗
+         *   必须先生好, 否则"触摸排线后来补焊好了"的时候, 后台补探任务
+         *   (main.c touch_retry_task → touch_panel_recover) 连总线都没有, 永远救不回来。
+         *   原来只在 hw_cfg_enabled(HW_TOUCH) 时才 init ⇒ 一旦开机没探到就被判死刑。 */
+        if (bp->tp_sda >= 0 && bp->tp_scl >= 0) {
+            touch_panel_init();
+        } else {
+            ESP_LOGW("INPUT", "本板无触摸引脚 ⇒ 跳过触摸初始化");
+        }
+        /* ⛔⛔ 2026-10-22 血的教训: 这里**绝对不能**再试"另一套板型的触摸引脚"。
+         *   小智板型下 GPIO7 = LCD DC、GPIO11 = LCD CS；标准/微雪板型下 GPIO5 = LCD DC。
+         *   触摸驱动把那些脚改成 I2C 后, `gpio_reset_pin()` 只归还成输入,
+         *   **LCD 驱动不会重配** ⇒ 屏幕立刻撕裂/花屏, 触摸也读不通 (实测失败率 100%)。
+         *   跨板判断必须在 LCD 初始化之前做 (hw_cfg_init 里补探命中会直接改板型+重启)。 */
     }
-if (hw_cfg_enabled(HW_TOUCH)) { touch_panel_init(); }
-    else { ESP_LOGW("INPUT", "触摸未启用(未检测到/被关闭)"); s_has_touch = false; }
     /* V1.0.69: 运行时分清两套机型, 物理键语义按有没有触摸屏分支. */
     s_has_touch = touch_panel_is_present();   /* 开机检测一次 */
     input_cfg_keys();                          /* 按结果配置物理键语义 */
@@ -284,7 +300,7 @@ static menu_action_t tick(btn_ctx_t *b) {
     switch (b->state) {
         case ST_IDLE:
             if (pressed) { b->state = ST_DEBOUNCE; b->press_start = now;
-                ESP_LOGI(TAG, "[dbg] key %s DOWN det=%d", b->name, b->gpio); }
+                ESP_LOGD(TAG, "[dbg] key %s DOWN det=%d", b->name, b->gpio); }   /* ★ 2026-10-26: I→D —— 每次按键写一条 ~5ms@115200, 白耗 CPU且占串口; 障碍时 esp_log_level_set("INPUT", ESP_LOG_DEBUG) 打开 */
             break;
         case ST_DEBOUNCE:
             /* V1.5.x: 按下防抖 (原 DEBOUNCE 只防释放抖动; 按下即触发改为防住
@@ -464,6 +480,12 @@ static bool s_power_armed = false;
 static bool s_power_press_valid = false;   /* 本次按住是否为新按下 (防开机误触) */
 
 bool input_power_should_sleep(void) {
+    /* ★★★ 2026-10-18 linit 实测修复: 电源键与 LEFT/RIGHT 撞脚时(微雪 PWR==KEY==GPIO18),
+     *   input_init 已把"电源键条目"禁用(见上), 但本函数原先**仍在轮询该 GPIO** ⇒
+     *   在"连接蓝牙"等界面按住这个键(=长按搜索/确认键)到 2s, 会**顺带弹出"是否关机?"**
+     *   (用户实测: 某些界面按该键弹出关机确认)。撞脚时此脚是 UI 键, 不是电源键 → 停轮询。 */
+    if (BTN_GPIO_PWR < 0 || BTN_GPIO_PWR == BTN_GPIO_LEFT || BTN_GPIO_PWR == BTN_GPIO_RIGHT)
+        return false;
     bool pressed = (gpio_get_level(BTN_GPIO_PWR) == 0);
     uint32_t now = now_ms();
 
@@ -764,6 +786,7 @@ static menu_action_t touch_gesture_poll(void) {
      * 主菜单/软件管家页 (os_core 置 ctx_block) 不补.
      * V1.7.x: 底部上滑等系统导航手势也不补 —— 它的触觉由动作处理侧统一发出,
      * 否则"按住 >0.5s 再上滑返回"会连响两下. */
+    /* 点击震动统一在 main.c 分发处做（os_handle_touch 命中才震），这里只管长按松手的"弹起" */
     if (!s_key_sim_ctx_block && !s_tg_nav_release && dt > TOUCH_HOLD_VIB_MS) vibrator_click();
     s_tg_state = TG_IDLE;
     }
@@ -1038,6 +1061,10 @@ bool input_touch_now(int *x, int *y) {
 
 /* V1.0.xx: 多点触控 — 返回当前触摸点 (最多 2 点, 已映射屏幕坐标).
  * 复用触摸缓存 (touch_read_once), 须与 input_get_touch_pos/input_get_action 同帧读取. */
+static bool s_dual_touch = false;
+void input_set_dual_touch(bool on) { s_dual_touch = on; }
+bool input_dual_touch(void) { return s_dual_touch; }
+
 void input_get_touch_multi(tp_point_t pts[TP_MAX_POINTS], int *count) {
     if (s_touch_blocked) { if (count) *count = 0; return; }   /* 休眠禁触屏: 无多点 */
     if (count) *count = 0;
@@ -1050,6 +1077,13 @@ void input_get_touch_multi(tp_point_t pts[TP_MAX_POINTS], int *count) {
         return;
     }
     int n = (c > TP_MAX_POINTS) ? TP_MAX_POINTS : c;
+    /* ★ 2026-10-20: 闸门改成"虚拟手柄开着就允许第二点" ——
+     *   原来只在拼 joypad 那一处临时开, 引擎自己直接调多点时会被拦成单点。 */
+    bool dual = s_dual_touch || virtual_keys_is_enabled();
+    if (!dual && n > 1) {
+        for (int i = 1; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
+        n = 1;
+    }
     if (count) *count = n;
     for (int i = 0; i < n; i++) {
         int sx = s_touch_multi[i].x, sy = s_touch_multi[i].y;
@@ -1119,7 +1153,9 @@ uint8_t input_get_held_gb_joypad(void) {
          * 两指同时按下也不互相抢占, 保证格斗等游戏可用虚拟手柄. */
         tp_point_t pts[TP_MAX_POINTS];
         int c = 0;
+        s_dual_touch = true;               /* ★ 仅此刻允许第二点: 虚拟手柄在场 */
         input_get_touch_multi(pts, &c);
+        s_dual_touch = false;
         bool d0 = (c >= 1) && pts[0].pressed;
         bool d1 = (c >= 2) && pts[1].pressed;
         int x0 = d0 ? pts[0].x : 0;

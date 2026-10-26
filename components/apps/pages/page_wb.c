@@ -6,6 +6,8 @@
  * 私有 state 全部 static 留本文件.
  */
 #include "os.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "ui_common.h"
 #include "input.h"
 #include "gesture_back.h"  /* 底部上滑=返回 的开关: gesture_back_enable(false/true) */
@@ -106,7 +108,6 @@ static const uint8_t s_icon[WB_ICON_N][60] = {
     },
 };
 
-EXT_RAM_BSS_ATTR static uint8_t s_canvas[WB_BYTES];
 /* ==== 撤销/重做: 命令日志 + 单张基线快照 ====
  * 旧实现用 s_undo/s_redo 各 10 层 × 整幅位图 = 300KB PSRAM.
  * 改为命令日志式: 每步只记录"参数命令"(WB_CMD_*, 工具/笔粗/坐标点, 十几字节),
@@ -124,10 +125,26 @@ typedef struct {
     int16_t x0, y0;   /* FREE: 首个点; SHAPE: 起点 */
     int16_t x1, y1;   /* FREE: 末个点; SHAPE: 终点 */
 } wb_cmd_t;
-EXT_RAM_BSS_ATTR static uint8_t  s_snap[WB_BYTES];     /* 唯一基线快照 */
-EXT_RAM_BSS_ATTR static wb_cmd_t s_ulog[WB_LOG_N];     /* 撤销命令日志 */
-EXT_RAM_BSS_ATTR static wb_cmd_t s_rlog[WB_LOG_N];     /* 重做命令日志 */
-EXT_RAM_BSS_ATTR static uint8_t  s_pts[WB_PT_CAP];     /* FREE 笔迹点 (x,y,x,y,...) */
+
+/* ★★★ 2026-10-25 内存优化 (linit): 画布+快照+笔迹点+撤销/重做日志 原来静态常驻 PSRAM
+ *   约 40KB, 而只有打开"画板"才用得上 ⇒ 首次访问时一次性分配, 写法(s_canvas[i] 等)不变。 */
+static uint8_t *s_wb_arena;
+static uint8_t  s_wb_dummy[8];
+static uint8_t *wb_arena(void) {
+    if (!s_wb_arena) {
+        size_t need = (size_t)WB_BYTES * 2 + WB_PT_CAP + sizeof(wb_cmd_t) * WB_LOG_N * 2;
+        s_wb_arena = heap_caps_calloc(1, need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_wb_arena) ESP_LOGW("WB", "画板缓冲分配失败 (%u B)", (unsigned)need);
+    }
+    return s_wb_arena ? s_wb_arena : s_wb_dummy;
+}
+#define s_canvas (wb_arena())
+#define s_snap   (wb_arena() + (WB_BYTES))
+#define s_pts    (wb_arena() + (WB_BYTES) * 2)
+#define s_ulog   ((wb_cmd_t *)(wb_arena() + (WB_BYTES) * 2 + (WB_PT_CAP)))
+#define s_rlog   (s_ulog + WB_LOG_N)
+
+
 static int  s_ulog_n = 0, s_rlog_n = 0, s_pts_n = 0;
 
 static int  s_tool  = WB_PEN;
@@ -335,7 +352,7 @@ static void handle_op(int op, ui_ctx_t *ctx) {
 }
 
 /* ================= 保存/加载 (1-bit BMP) ================= */
-#define WB_DIR   "/sdcard/App/\xe5\x9b\xbe\xe7\x89\x87"   /* 画布目录: App/图片 (TF) */
+#define WB_DIR   "/sdcard/apps/data/\xe5\x9b\xbe\xe7\x89\x87"   /* 画布目录: apps/data/图片 (原 App/图片) */
 static const int s_bmp_off = 0x3E;
 
 static bool wb_bmp_write(const char *path) {

@@ -13,10 +13,10 @@
 
 /* ===================== (A) 底部上滑 = 返回 ===================== */
 /* 阈值 (逻辑像素 / ms). GB_BAND_THICK 见 gesture_back.h (单一来源, input.c 兜底用). */
-#define GB_MIN_DIST    36    /* 慢滑返回最小距离 (~12% 屏高, iOS 参考) */
+#define GB_MIN_DIST    26    /* 慢滑返回最小距离 (原 36, 屏高 300 的 ~9%) */
 #define GB_FAST_DIST   22    /* 快滑(flick)最小距离 */
 #define GB_FAST_VEL   500    /* 快滑速度阈值 px/s (低于旧 600, 更灵敏) */
-#define GB_MAX_OFFPATH 60    /* 最大横移容差 (斜度容忍, 超过则不算向上滑) */
+#define GB_MAX_OFFPATH 40    /* 最大横移容差 (原 60) */
 
 /* 手势识别专用的"底部"判定 — 不复用 input_in_bottom_zone(), 因为后者限定了
  * MINX/MAXX 中心 150px (x∈[125,275]), 屏底左右两侧上滑会被排除在外.
@@ -25,7 +25,11 @@
 bool gesture_back_in_bottom_zone(int sx, int sy) {
     /* 注: input.c 的 rotate_screen_coord() 已把屏物理坐标转到逻辑坐标 (sx, sy),
      * 所以手势识别直接用逻辑坐标. 默认 rot=0 时逻辑底 = 物理底 = sy 接近 H. */
-    if (sy >= (ST7305_HEIGHT - GB_BAND_THICK)) return true;
+    /* ★ 2026-10-18 linit: 起点带收窄 —— 底边 30px 高 + 水平居中 200px 宽 */
+    if (sy >= (ST7305_HEIGHT - GB_BAND_THICK)) {
+        int x0 = (ST7305_WIDTH - GB_BAND_WIDE) / 2;
+        if (sx >= x0 && sx < x0 + GB_BAND_WIDE) return true;
+    }
     /* 兜底: 若非默认旋转 (status bar 在侧边), input_in_bottom_zone 已处理,
      * 这里也跟它一致: 只认中心带, 避免把"屏幕短边的水平滑动"误判成上滑. */
     return input_in_bottom_zone(sx, sy, GB_BAND_THICK);

@@ -4,7 +4,7 @@
 
 为什么不能像 `map_vec.py roads` 那样一个大文件了事
 ----------------------------------------------------
-1. **文件太大读不进来**: 设备端 `app.fs.read` 上限 512 KB。福建全省路网
+1. **文件太大读不进来**: 设备端 `app.fs.read` 上限 512 KB。示例省全区路网
    几百万个点 ⇒ 单文件 20+ MB, 直接返回 nil。
 2. **内存也放不下**: 8 MB PSRAM 不可能整省常驻。
 3. **数据源也换了**: Overpass 拉一个省不现实（实测不带值时直接 504）,
@@ -30,8 +30,8 @@
 
 用法
 ----
-    bash tools/dl_chunks.sh <pbf_url> cache_map/fujian.pbf 16
-    python3 tools/map_prov.py --pbf cache_map/fujian.pbf --prefix fj --outdir dist/map/fj
+    bash tools/dl_chunks.sh <pbf_url> cache_map/region.pbf 16
+    python3 tools/map_prov.py --pbf cache_map/region.pbf --prefix reg --outdir dist/map/reg
 """
 import argparse
 import json
@@ -198,7 +198,7 @@ def main():
     ap = argparse.ArgumentParser(description="省级地图编译器 (PBF → 分块 .ltm)")
     ap.add_argument("--pbf", required=True)
     ap.add_argument("--prefix", default="fj", help="产物前缀 (fj → fj.json / fj.bin)")
-    ap.add_argument("--name", default=None, help="包显示名 (默认同前缀), 如 福建省")
+    ap.add_argument("--name", default=None, help="包显示名 (默认同前缀), 如 示例省")
     ap.add_argument("--tile", type=float, default=0.15, help="块大小(度), 默认 0.15°≈17km")
     ap.add_argument("--outdir", default="dist/map/fj")
     ap.add_argument("--bbox", default=None, help="裁剪 s,w,n,e (默认用 PBF 完整范围)")
@@ -322,7 +322,7 @@ def main():
     # 打包: 一个包 = **1 个 .json 索引 + 1 个 .bin 数据体**
     # ------------------------------------------------------------------
     # 为什么不是"一瓦片一个文件":
-    #   福建 = 354 道路块 + 两百多个地标块 ⇒ 600+ 个 HTTP 请求。设备端只能一个一个下,
+    #   示例省 = 354 道路块 + 两百多个地标块 ⇒ 600+ 个 HTTP 请求。设备端只能一个一个下,
     #   二十分钟都下不完, 每个请求还要重来一遍 TLS 握手。
     # 为什么不是"一个 .ltm 大文件":
     #   `app.fs.read` 有 512 KB 上限, 而整省 17 MB ⇒ 根本读不进来。
@@ -333,7 +333,7 @@ def main():
 
     # ---- 概览 (z<=10 用; 必须足够小) ----
     if ov_feats:
-        # ★ 必须先溶解再打包 —— 见 dissolve_ways 的注释: 福建 cls<=1 有 46k 条 way,
+        # ★ 必须先溶解再打包 —— 见 dissolve_ways 的注释: 示例省 cls<=1 有 46k 条 way,
         #   要素表 24 B/条 就是 1.1 MB, 不溶解怎么调容差都压不进 400 KB。
         before = len(ov_feats)
         ov_feats = dissolve_ways(ov_feats)
@@ -368,7 +368,7 @@ def main():
     ov_off = put(ovbytes) if ovbytes else 0
 
     # 索引**一行一块**: 道路与地标共用同一个网格键, 合成一行 ⇒ 索引条数减半
-    # (福建 607 行, 而不是 607+564 条)。设备端建一张 "tx_ty" → 行 的表即可。
+    # (示例省 607 行, 而不是 607+564 条)。设备端建一张 "tx_ty" → 行 的表即可。
     idx = {}
     for (tx, ty) in sorted(poi_tiles):
         tb = (tx * TILE / 1e6, ty * TILE / 1e6, (tx + 1) * TILE / 1e6, (ty + 1) * TILE / 1e6)

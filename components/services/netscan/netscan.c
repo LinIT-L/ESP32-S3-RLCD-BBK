@@ -14,7 +14,7 @@
 #include "lwip/ip4_addr.h"
 #include "esp_log.h"
 
-static const char *TAG = "NETSCAN";
+__attribute__((unused)) static const char *TAG = "NETSCAN";
 
 /* 取"已就绪且带 IPv4 的"网络接口 (优先 STA)。
  * 只用 lwip 公开的 netif_list, 不依赖 esp_netif 私有 API (后者在不同 IDF 版本声明位置不同). */

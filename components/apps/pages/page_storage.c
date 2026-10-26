@@ -48,13 +48,25 @@ static void open_sd_info(ui_ctx_t *ctx) {
     static const char *ptrs[6];
     int n = 0;
     uint64_t total = 0, free = 0;
-    /* 卡名 (CID, 出厂固化): 换卡/认不到卡时一眼看清是哪张卡 (2026-09-29) */
-    snprintf(items[n++], sizeof(items[0]), "\xe5\x8d\xa1: %s", sd_get_cid_name());   /* 卡: xxx */
+    /* ★ 2026-10-18: 第一行原来是 CID 型号名(\"SD16G\"), 用户会当成容量 —— 那是出厂型号, 不是容量。
+     *   现在显示 **品牌 + 标称容量**(按字节换十进制 GB 四舍五入: 3834MB→4G / 14.8GiB→16G),
+     *   型号另起一行明确标注, 换卡时仍能一眼分辨是哪张。 */
+    uint64_t cap_bytes = sd_get_size_bytes();
+    if (cap_bytes > 0) {
+        uint32_t nominal_g = (uint32_t)((cap_bytes + 500000000ULL) / 1000000000ULL);
+        if (nominal_g == 0) nominal_g = 1;
+        snprintf(items[n++], sizeof(items[0]), "\xe4\xbf\xa1\xe6\x81\xaf: %s %uG",      /* 卡: 品牌 XG */
+                 sd_get_vendor_str(), (unsigned)nominal_g);
+        snprintf(items[n++], sizeof(items[0]), "\xe5\x90\x8d\xe7\xa7\xb0: %s", /* 出厂名: xxx */
+                 sd_get_cid_name());
+    } else {
+        snprintf(items[n++], sizeof(items[0]), "\xe4\xbf\xa1\xe6\x81\xaf: %s", sd_get_cid_name());   /* 卡: xxx */
+    }
     if (sd_get_info(&total, &free) == 0) {
         uint32_t total_mb = (uint32_t)(total / (1024ULL * 1024ULL));
         uint32_t free_mb  = (uint32_t)(free  / (1024ULL * 1024ULL));
         uint32_t used_mb  = total_mb > free_mb ? (total_mb - free_mb) : 0;
-        snprintf(items[n++], sizeof(items[0]), "\xe6\x80\xbb\xe5\xae\xb9\xe9\x87\x8f: %luMB", (unsigned long)total_mb); /* 总容量 */
+        snprintf(items[n++], sizeof(items[0]), "\xe5\xae\xb9\xe9\x87\x8f: %luMB", (unsigned long)total_mb); /* 总容量 */
         snprintf(items[n++], sizeof(items[0]), "\xe5\xb7\xb2\xe7\x94\xa8:  %luMB", (unsigned long)used_mb);            /* 已用 */
         snprintf(items[n++], sizeof(items[0]), "\xe5\x89\xa9\xe4\xbd\x99:  %luMB", (unsigned long)free_mb);            /* 剩余 */
     } else {
@@ -329,7 +341,7 @@ static void sd_mount_confirm(ui_ctx_t *ctx, int result, void *ud) {
     snprintf(d->items[0], sizeof(d->items[0]), "\xe5\x8d\xb8\xe8\xbd\xbd");      /* 卸载 */
     snprintf(d->items[1], sizeof(d->items[1]), "\xe5\x8f\x96\xe6\xb6\x88");      /* 取消 */
     d->sel = 0;
-    d->icon = mount_icon_data;                       /* 触发图标窗扩高 */
+    d->icon = mount_icon_tf_64;                       /* 触发图标窗扩高 */
     d->icon_w = MOUNT_ICON_W;
     d->icon_h = MOUNT_ICON_H;
     d->cb = mount_btn_cb;
@@ -569,6 +581,9 @@ static const char *fb_type_label(fb_type_t t) {
 }
 /* 快扫 + 隐藏 + 类型: 用 d_type 判断目录 (FAT 通常直接给), 未识别才 stat */
 static void fb_scan(void) {
+    /* ★ 2026-10-24: 挂载是异步的, 早进来 opendir 会拿到空列表(linit: "文件全空")。
+     *   过门闸: 已挂载立刻返回; 还在挂载就等它收尾, 没了就补挂一次。 */
+    sd_wait_ready(1200, true);
     s_fb_count = 0;
     DIR *d = opendir(fb_dir_path());
     if (!d) return;
@@ -841,6 +856,7 @@ static const os_module_t s_mod_storage = {
     .on_enter   = p_sto_enter,
     .on_exit    = p_sto_exit,
     .fullscreen = false,
+    .exit_confirm = true,   /* ★ 2026-10-25 linit: 应用页按返回键先弹"退出程序?" */
 };
 
 void os_page_storage_register(void) { os_register(&s_mod_storage); }

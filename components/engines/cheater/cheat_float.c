@@ -77,6 +77,7 @@ void cheat_float_attach(const cheater_region_t *reg, cheater_bits_t bits)
 void cheat_float_detach(void)
 {
     s_regp = NULL;
+    cheater_lock_clear();     /* 退出游戏: 锁定地址已失效, 全部作废 */
     cheat_ui_float_clear();
 }
 
@@ -110,6 +111,12 @@ bool cheat_float_overlay_tick(st7305_handle_t *lcd)
 {
     /* 默认不启动修改机: 仅在用户于应用管家选择"后台运行"后才显示浮标/响应呼出. */
     if (!os_modtool_is_running()) return false;
+
+    /* ★ 2026-10-25 锁定写回: 每合成帧把锁定地址按设定值重写一次.
+     *   游戏自己扣血/花钱会在下一帧被覆盖回去 ⇒ 表现为"值恒定".
+     *   只写固定几个地址, 不遍历区域, 开销可忽略 (24 条上限). */
+    cheater_lock_tick();
+
     if (s_active) return false;               /* 修改机任务已独占屏幕, 显示层让渡 */
     if (!s_regp || !lcd) return false;
 

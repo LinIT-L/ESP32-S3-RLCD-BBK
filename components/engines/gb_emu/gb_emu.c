@@ -8,6 +8,7 @@
  * 模拟任务完全退出后再返回, 避免任务仍引用 ROM 时被释放.
  */
 #include "gb_emu.h"
+#include "vid_tune.h"      /* 画面优化器 (按引擎独立存档) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +27,7 @@ void gb_emu_set_progress_cb(gb_emu_progress_cb_t cb)
     s_progress_cb = cb;
 }
 
-/* 设置电池存档目录 (转发 gbc_emu): 菜单用它区分 GB(/sdcard/dict/GB) 与 GBC(/sdcard/dict/GBC).
+/* 设置电池存档目录 (转发 gbc_emu): 菜单用它区分 GB(/sdcard/data/saves/GB) 与 GBC(/sdcard/data/saves/GBC).
  * 必须在 gb_emu_load_rom 之前调用. */
 void gb_emu_set_save_dir(const char *dir)
 {
@@ -140,6 +141,7 @@ void gb_emu_unload(void)
 
 esp_err_t gb_emu_start(const gb_emu_rom_t *rom)
 {
+    vid_tune_attach("gb");   /* 画面优化器: 载入本引擎自己的画面档 */
     if (!rom || !rom->data) return ESP_ERR_INVALID_ARG;
     return gbc_emu_start_data(rom->data, rom->size, false);   /* owned=false: 菜单负责释放 */
 }

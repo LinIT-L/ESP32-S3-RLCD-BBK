@@ -157,10 +157,13 @@ components/
   drivers/    LCD、触摸、SD、板型表、电池、GPS
   libs/       calc、lua
 main/         启动流程、主循环、串口控制台
-docs/         架构、板型 IO、地图、频谱仪
-apps/ store/  Lua 应用源与商店索引
+docs/         开发指南、架构约定、IO 表、应用开发
+apps/         Lua 应用源码与素材
+store/        商店索引与资源包
+hardware/     原理图、PCB、BOM
+flash/        在线刷机页
 system_image/ BBK 词典 ROM
-tools/        图标、字库、商店索引、抓屏脚本
+tools/        字库与图标生成、打包、地图、版本工具
 ```
 
 ## 版权与参考
@@ -171,4 +174,3 @@ tools/        图标、字库、商店索引、抓屏脚本
 - **GB/GBC、NES**: [esp-box-emu](https://github.com/espressif/esp-box-emu)(gnuboy、noFrendo)
 - **Ab 模拟器适配**: 精简自 [UVE5](https://github.com/losehu/UVE5)
 - 部分界面/模拟器思路参考 **esp32-s3-rlcd-gb-emulator**
-- 开发交接文档见 `docs/HANDOVER.md`

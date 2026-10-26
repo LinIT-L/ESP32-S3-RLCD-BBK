@@ -1,7 +1,7 @@
 # components/wallpapers — 内置壁纸程序渲染库
 # 从 menu 组件拆出, 供 menu/桌面与 os/壁纸页 共用, 不依赖 menu 内部.
 idf_component_register(
-    SRCS "wallpapers.c" "sleep.c" "wp_module_stars.c" "power_stat.c"
+    SRCS "wallpapers.c" "sleep.c" "wp_sleep.c" "wp_module_stars.c" "wp_module_lifeguide.c" "power_stat.c"
     INCLUDE_DIRS "."
     REQUIRES st7305 ui_common
     board_pins

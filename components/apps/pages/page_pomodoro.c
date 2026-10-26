@@ -68,7 +68,6 @@ static uint32_t s_ring_pos = 0;
 static const float POMO_NOTES[POMO_NOTE_N] = { 523.25f, 659.25f, 783.99f, 1046.50f };
 static const float POMO_NOTE_LEN[POMO_NOTE_N] = { 0.16f, 0.16f, 0.16f, 0.55f };
 
-static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 /* ---- NVS 持久化 ---- */
 static void pomo_cfg_load(void) {
@@ -149,7 +148,7 @@ static void ring_update(void) {
 static void pomo_start(void) {
     s_work = true;
     s_total_ms = (uint32_t)POMO_IDX_MIN(s_work_idx) * 60 * 1000;
-    s_end_ms = now_ms() + s_total_ms;
+    s_end_ms = os_millis() + s_total_ms;
     s_active = true;
     ESP_LOGI(TAG, "番茄钟开始: 工作 %d 分钟", POMO_IDX_MIN(s_work_idx));
 }
@@ -161,7 +160,7 @@ static void pomo_stop(void) {
 /* 阶段切换 (工作↔休息 循环) */
 static void pomo_tick(void) {
     if (!s_active) return;
-    uint32_t now = now_ms();
+    uint32_t now = os_millis();
     if ((int32_t)(s_end_ms - now) > 0) return;
     s_work = !s_work;
     s_total_ms = (uint32_t)(s_work ? POMO_IDX_MIN(s_work_idx) : POMO_IDX_MIN(s_rest_idx)) * 60 * 1000;
@@ -218,7 +217,7 @@ static void ring_progress(st7305_handle_t *lcd, int cx, int cy, int r_in, int r_
 static void pomo_full_render(st7305_handle_t *lcd) {
     if (!lcd) return;
     st7305_clear(lcd, ST7305_COLOR_WHITE);
-    uint32_t now = now_ms();
+    uint32_t now = os_millis();
     int64_t remain_ms = (int64_t)s_end_ms - (int64_t)now;
     if (remain_ms < 0) remain_ms = 0;
     int64_t remain_s = (remain_ms + 999) / 1000;
@@ -496,7 +495,7 @@ static void p_pomodoro_poll(ui_ctx_t *ctx) {
     pomo_tick();
     ring_update();
     if (s_active || s_ring) {
-        uint32_t now = now_ms();
+        uint32_t now = os_millis();
         int sec = (int)((s_end_ms > now ? s_end_ms - now : 0) / 1000);
         if (sec != s_last_second || s_ring) {
             s_last_second = sec;

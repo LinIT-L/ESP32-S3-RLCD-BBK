@@ -3,7 +3,7 @@
 
 // svc_log — 日志服务 (收拢 main.c 的日志缓存/落盘/串口暂停)
 // 经 esp_log_set_vprintf 接管日志: 串口照常打印, 同时按行缓存进内部缓冲,
-// 再由主循环 svc_log_drain() 追加写入 /sdcard/log/bbk.log.
+// 再由主循环 svc_log_drain() 追加写入 /sdcard/data/log/bbk.log.
 
 #ifdef __cplusplus
 extern "C" {

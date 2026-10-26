@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "font_book.c" "book_reader_old.c" "book_flow.c" "fb2_convert.c" "epub_convert.c"
+    SRCS "font_book.c" "book_reader.c" "book_flow.c" "fb2_convert.c" "epub_convert.c"
          "gb2312_uni.c"
          "miniz/miniz.c" "miniz/miniz_tdef.c" "miniz/miniz_tinfl.c" "miniz/miniz_zip.c"
          "libunibreak/linebreak.c" "libunibreak/linebreakdata.c"

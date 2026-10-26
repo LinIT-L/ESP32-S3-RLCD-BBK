@@ -8,7 +8,7 @@
  *   third_party/vpet-emu-zepp/utils/rom.js       (ROM → big-endian 16 位字)
  *
  * 职责:
- *   - 从 TF 卡 /sdcard/vpet/ 读取 .bin ROM, 转为 16 位大端指令字喂给 CPU
+ *   - 从 TF 卡 /sdcard/roms/vpet/ 读取 .bin ROM, 转为 16 位大端指令字喂给 CPU
  *   - 运行模拟任务 (task 方式): 自适应批次推进 CPU 时钟, 保持接近真实 1.6MHz
  *   - 把 CPU VRAM 渲染为 32x16 虚拟像素 → 1bpp 位图 → ST7305 屏幕
  *   - 音效经 CPU 内置 sound 状态机回调到 tone_player (非阻塞持续音)
@@ -18,6 +18,7 @@
  */
 
 #include "vpet_emu.h"
+#include "vid_tune.h"      /* 画面优化器 (按引擎独立存档) */
 #include "e0c6200_cpu.h"
 #include "tone_player.h"
 #include "virtual_keys.h"
@@ -294,6 +295,7 @@ static void vpet_render(void) {
     virtual_keys_draw(s_lcd);
     /* 独立修改机浮标: 画浮标+检测呼出 (触发后交独立修改机任务, 本任务停走) */
     bool takeover = cheat_float_overlay_tick(s_lcd);
+    if (!takeover) vid_tune_overlay_tick(s_lcd);   /* 画面优化器浮标/面板 */
     if (!takeover) st7305_flush(s_lcd);
 }
 
@@ -399,6 +401,7 @@ esp_err_t vpet_emu_background_init(st7305_handle_t *lcd) {
 }
 
 esp_err_t vpet_emu_start(const char *path) {
+    vid_tune_attach("vpet");   /* 画面优化器: 载入本引擎自己的画面档 */
     if (!path) return ESP_ERR_INVALID_ARG;
     if (!s_ready) {
         esp_err_t r = vpet_emu_background_init(NULL);

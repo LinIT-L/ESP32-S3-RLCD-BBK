@@ -20,6 +20,7 @@ idf_component_register(
         "."
         "third_party/gnuboy/include"
     REQUIRES
+        vid_tune
     st7305
     input
     bt_ctl

@@ -2,7 +2,7 @@
  * page_@@ID@@.c — @@LABEL@@ 应用页
  * 由 tools/new_app.py 生成 (V1.2 应用脚手架). 可直接编译运行, 再按需填充.
  *
- * 契约速查 (详见 docs/App制作规则.md):
+ * 契约速查 (详见 docs/内置应用开发.md):
  *   render(ctx)        整页渲染 (页面非 fullscreen 时, 状态栏由内核画)
  *   action(ctx, a)     按键/手柄动作 (OS_ACTION_*) —— 返回用 os_pop(ctx)
  *   touch(ctx,x,y)     触摸命中: 返回 true 表示已消费该次点击

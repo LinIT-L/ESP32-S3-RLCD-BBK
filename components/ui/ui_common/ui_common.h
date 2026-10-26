@@ -32,7 +32,8 @@ extern const uint8_t (*FONT8X12)[16];
 
 /* ===== mini-UI 基础控件 (类 LVGL 简化, 供全项目统一) =====
  * 统一字体: 中文 font_zh16(16×16) + 英文 8×16; 文案风格一致. */
-int  ui_text16w(const char *s);                              /* 整行像素宽(中16/英8) */
+int  ui_text16w(const char *s);
+bool ui_text16_ready(void);   /* ★ 16px 字库可用才返回 true */                              /* 整行像素宽(中16/英8) */
 void ui_text16(st7305_handle_t *lcd, int x, int y, const char *s, bool inverted); /* 左对齐 */
 void ui_text16c(st7305_handle_t *lcd, int cx, int y, const char *s, bool inverted);/* 居中 */
 
@@ -62,6 +63,9 @@ void draw_text_capped(st7305_handle_t *lcd, int x, int y, const char *str,
                       bool inverted, int max_w);
 void draw_label(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted);
 void draw_text_centered(st7305_handle_t *lcd, int y, const char *str, bool inverted);
+/* ★ 2026-10-19: 在 [x0,x1) 区间内水平居中 (字号跟随菜单缩放, 与 draw_text 完全一致).
+ * 用于右栏列表/设置项: 原来 draw_text_centered 是按整屏居中, 在分栏里会偏左. */
+void draw_text_centered_in(st7305_handle_t *lcd, int x0, int x1, int y, const char *str, bool inverted);
 void draw_label_centered_at(st7305_handle_t *lcd, int cx, int y, const char *str, bool inverted);
 int  text_width(const char *str);
 int  text_width_bounded(const char *start, const char *end);

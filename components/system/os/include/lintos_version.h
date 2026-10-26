@@ -25,15 +25,15 @@
 #pragma once
 
 /* ===== 对外版本 (只往 外面 推送时改) ===== */
-#define LINTOS_VERSION_PUBLIC  "1.4"
+#define LINTOS_VERSION_PUBLIC  "1.4.2"
 
 /* ===== 内部版本 (自测用, 小步走) ===== */
 #define LINTOS_VERSION_MAJOR   1
 #define LINTOS_VERSION_MINOR   4
-#define LINTOS_VERSION_PATCH   0
-#define LINTOS_VERSION_STR     "1.3.1"    /* 内部三段: 主.次.修订 */
-#define LINTOS_VERSION_DATE    "2026-10-02"
-#define LINTOS_VERSION_NAME    "\xe5\x8f\x8c\xe6\x89\x8b\xe6\x9f\x84\xe6\xa1\xa3\xe6\xa1\x88\xe8\xa1\xa8"  /* 本次迭代主题: 双手柄档案表 */
+#define LINTOS_VERSION_PATCH   2
+#define LINTOS_VERSION_STR     "1.4.2"    /* 内部三段: 主.次.修订 */
+#define LINTOS_VERSION_DATE    "2026-10-27"
+#define LINTOS_VERSION_NAME    "\xe5\x8f\x91\xe5\xb8\x83\xe7\x89\x88:\xe9\x98\x85\xe8\xaf\xbb\xe5\x99\xa8/\xe5\xbc\x80\xe6\x9c\xba/\xe7\xbd\x91\xe7\xbb\x9c/\xe5\x95\x86\xe5\xba\x97/\xe5\x9c\xb0\xe5\x9b\xbe"  /* 本次迭代主题: 三板通吃 */
 
 /* ===== 取用接口 (实现: kernel/os_version.c) ===== */
 const char *os_version_public(void);  /* 对外: "1.3" */

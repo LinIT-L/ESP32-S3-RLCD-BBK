@@ -126,6 +126,7 @@ static void mem_tick(ui_ctx_t *ctx)
 
 /* ---- LIFE: 空闲超时自动回主菜单 + 引擎残留兜底 ---- */
 static bool s_was_on_main = false;
+static void orphan_task_tick(bool on_main);   /* 引擎任务残留看门狗 (定义在下面) */
 static void life_tick(ui_ctx_t *ctx, uint32_t now_ms, uint32_t last_input_ms, bool in_dialog)
 {
     bool on_main = os_is_main(ctx);
@@ -133,7 +134,8 @@ static void life_tick(ui_ctx_t *ctx, uint32_t now_ms, uint32_t last_input_ms, bo
     /* 空闲超时: 非主菜单 / 无弹窗 / 非全屏应用(游戏不打断) */
     if (s_idle_timeout_ms > 0 && last_input_ms != 0 && !in_dialog && !on_main && !os_screensaver_active()) {
         const os_module_t *m = ctx->cur;
-        bool busy = m && m->fullscreen;
+        /* busy = 全屏应用(游戏) 或 标记了 keep_on_idle 的工具页(收藏夹等) */
+        bool busy = m && (m->fullscreen || m->keep_on_idle);
         if (!busy && now_ms - last_input_ms >= s_idle_timeout_ms) {
             ESP_LOGI(TAG, "空闲 %ums 自动返回主菜单",
                      (unsigned)(now_ms - last_input_ms));
@@ -153,6 +155,35 @@ static void life_tick(ui_ctx_t *ctx, uint32_t now_ms, uint32_t last_input_ms, bo
         engine_manager_unload_all(false);   /* 周期兜底: 重复卸载, 跳过泄漏复核 */
     }
     s_was_on_main = on_main;
+    orphan_task_tick(on_main);
+}
+
+/* ★★★ 2026-10-25 linit「管家负责这些 / 其他模块有没有类似问题」的审计结论:
+ *   各引擎的 *_stop() 都只是**置标志**, 靠任务自己跑到循环顶部退出 (vTaskDelete(NULL));
+ *   一旦任务卡在事件等待/音频/加载里, 标志永远没人看 ⇒ 任务留在后台继续占 CPU/内存。
+ *   engine_manager_unload_all() 只回收**缓冲区**, 不删任务 ⇒ 拦不住这种残留。
+ *   这里做**任务名**级兜底: 回主菜单后连续 3 次仍按名字查到引擎任务, 就强删。
+ *   (xTaskGetHandle 依赖 FreeRTOS 任务名; 名字表与各引擎 xTaskCreate 的名字保持一致) */
+static int s_orphan_hits = 0;
+static void orphan_task_tick(bool on_main)
+{
+    static const char *const names[] = {
+        "sdlpal", "sdl_aud", "gbc_emu", "nes_emu", "md_emu", "sms_emu",
+        "arduboy_avr", "vpet_emu", "gam4980",
+    };
+    if (!on_main) { s_orphan_hits = 0; return; }
+    TaskHandle_t h = NULL; const char *nm = NULL;
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        TaskHandle_t t = xTaskGetHandle(names[i]);
+        if (t) { h = t; nm = names[i]; break; }
+    }
+    if (!h) { s_orphan_hits = 0; return; }
+    if (++s_orphan_hits < 3) return;      /* 连续 3 个周期(≈3s)才判残留, 避开正常收尾 */
+    ESP_LOGW(TAG, "引擎任务残留: %s 仍在跑 ⇒ 强制结束 (内部=%u PSRAM=%u)",
+             nm, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    vTaskDelete(h);
+    s_orphan_hits = 0;
 }
 
 /* ---- POWER: 低电量告警 (60s 节拍, 与状态栏共用 board_battery 缓存采样; 不强制关外设) ---- */
