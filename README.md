@@ -159,7 +159,6 @@ components/
 main/         启动流程、主循环、串口控制台
 docs/         开发指南、架构约定、IO 表、应用开发
 apps/         Lua 应用源码与素材
-store/        商店索引与资源包
 hardware/     原理图、PCB、BOM
 flash/        在线刷机页
 system_image/ BBK 词典 ROM
