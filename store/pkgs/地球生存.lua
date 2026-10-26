@@ -404,13 +404,14 @@ local function draw_dynamic()
     local function vis(sx, sy) return sx > -40 and sy > CFG.HUD_H - 40 and sx < W and sy < H end
     local S = CFG.TILE
 
-    -- 能量球: 小实心方块
+    -- 能量球: 空心方框 + 中心点（原来是实心方块，和慢敌人同形状只差大小，糊成一片）
     for i = 1, #ORBS do
         local o = ORBS[i]
         local sx, sy = o.x * S - CAM.x + 12, o.y * S - CAM.y + 12
         if vis(sx, sy) then
             dbox(o.x * S + 12, o.y * S + 12, 8, 8)
-            app.fill(sx, sy, sx + 7, sy + 7, BK)
+            app.rect(sx, sy, sx + 7, sy + 7, BK)
+            app.fill(sx + 3, sy + 3, sx + 4, sy + 4, BK)
         end
     end
     -- 无敌星: 实心 + 四角
@@ -431,15 +432,19 @@ local function draw_dynamic()
         dbox(e.x - 10, e.y - 10, 20, 20)
         if vis(sx, sy) then
             if e.fast then
+                -- 倒三角（尖朝下）：和鲨鱼的正三角区分开
                 for k = 0, 7 do
-                    app.hline(sx + 16 - k, sx + 15 + k, sy + 8 + k, BK)
+                    app.hline(sx + 8 + k, sx + 23 - k, sy + 8 + k, BK)
                 end
             else
+                -- 实心方块 + 两只白眼：像"生物"，和能量球的空心框区分
                 app.fill(sx + 8, sy + 8, sx + 23, sy + 23, BK)
+                app.fill(sx + 11, sy + 12, sx + 13, sy + 14, WH)
+                app.fill(sx + 18, sy + 12, sx + 20, sy + 14, WH)
             end
         end
     end
-    -- 鲨鱼: 大三角
+    -- 鲨鱼: 大三角 + 底边（加了底边才像"鱼"，否则和快敌人的三角分不清）
     for i = 1, #SHARKS do
         local s2 = SHARKS[i]
         local gx, gy = math.floor(s2.x) // S, math.floor(s2.y) // S
@@ -449,6 +454,8 @@ local function draw_dynamic()
             for k = 0, 10 do
                 app.hline(sx + 16 - k, sx + 15 + k, sy + 6 + k, BK)
             end
+            app.hline(sx + 8, sx + 23, sy + 17, BK)      -- 底边
+            app.hline(sx + 9, sx + 22, sy + 18, BK)
         end
     end
     -- 玩家: 实心圆 + 无敌时外圈
@@ -489,7 +496,17 @@ local function hud()
     local bw = 90
     app.rect(4, 5, 4 + bw, 14, BK)
     local fw = (bw - 2) * P.energy // 100
-    if fw > 0 then app.fill(5, 6, 4 + fw, 13, BK) end
+    if fw > 0 then
+        if P.energy <= 30 then
+            -- ★ 低电量警告: 单色屏不能变色, 改用**竖条纹**填充 —— 远远一看就和满格实心不同
+            app.fill(5, 6, 4 + fw, 13, BK)              -- 先铺黑
+            for x = 5, 4 + fw, 3 do
+                for y = 6, 13 do app.px(x, y, WH) end   -- 再挖白竖缝
+            end
+        else
+            app.fill(5, 6, 4 + fw, 13, BK)
+        end
+    end
     app.mix(100, 3, "球" .. #ORBS, false)
     app.mix(148, 3, "敌" .. #ENEMIES, false)
     if P.invincible > 0 then app.mix(196, 3, "无敌", false) end
