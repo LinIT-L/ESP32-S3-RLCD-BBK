@@ -499,6 +499,7 @@ static bool s_capture_armed = false; /* 是否已真实捕获到一个按键 (bo
 static int64_t s_map_last_progress = 0;  /* 上次映射推进时刻, 超时未动自动取消 */
 static int64_t s_map_ignore_until = 0;  /* 屏蔽"进入映射界面"那次确认的时间点, 防其被误映射成第一个键 */
 static int64_t s_map_hold_wait = 0;     /* ★ 等待"手里按着的键"松开的起始时刻 (0=没在等) */
+static volatile bool s_map_cancel_req = false;  /* ★ 触摸"取消映射"请求 (由 map_touch 置位, map_poll 处理) */
 
 /* 是否有任意物理键正被按住 —— 进向导时若还按着键，上升沿会把它当成新按下，
  * 导致第一个功能被误配。等它松开再开始捕获。 */
@@ -508,7 +509,7 @@ static bool any_phys_pressed(void) {
     return false;
 }
 static int64_t s_map_done_ms = 0;       /* 映射结束(完成/超时)时刻: 兜底收敛残留弹窗/提示 */
-/* ★ 2026-10-02 "每个按键只映射一次": 本轮已经捕获过的物理键(位图, PHYS_MAX=20)。
+/* ★ 2026-10-02 "每个按键只映射一次": 本轮已经捕获过的物理键(32 位位图, 覆盖 PHYS_MAX=24)。
  *   向导要依次映射 10 个功能, 但没有 Start/Select 的手柄凑不出 10 个键 →
  *   用户被迫把同一个键按给多个功能。记录已用过的键, 再遇到"用过的键"就判定
  *   没有更多键可指了, 直接保存结束向导。 */
@@ -544,6 +545,22 @@ static bool map_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
 /* 每帧轮询: 捕获手柄按键, 推进映射 (V1.0.41 起捕获即自动进入下一个) */
 static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)d; (void)ud;
+    /* ★ 触摸取消 (标志由 map_touch 置位) —— 在这里统一收拾, 不在触摸回调里拆栈 */
+    if (s_map_cancel_req) {
+        s_map_cancel_req = false;
+        s_map_active = false;
+        s_map_done_ms = 0;              /* 不让下面的收敛分支再清一遍 */
+        s_capture_armed = false;
+        s_capture_phys = -1;
+        s_map_hold_wait = 0;
+        input_set_gamepad_nav_enabled(true);
+        bt_manager_restore_key_map();   /* 回滚: 取消不等于"半套生效" */
+        os_dialog_clear_all(ctx);
+        if (ctx->current_page == OS_PAGE_GAMEPAD) p_gamepad_menu(ctx);
+        os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88\xe6\x98\xa0\xe5\xb0\x84"); /* 已取消映射 */
+        ctx->needs_redraw = true;
+        return;
+    }
     if (!s_map_active) {
         /* V1.6.x fix: 映射结束(完成/超时)后本弹窗与"按键映射完成"提示**不会自动关闭**
          * (实测: s_map_active=false 后本函数直接 return, 再没人关它; 而 os_dialog_pop
@@ -564,12 +581,14 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     if (s_map_func < 0 || s_map_func >= FUNC_MAX) return;
     /* 屏蔽"进入映射界面"那次确认键: 短时间(400ms)内不捕获任何按键, 防误映射 */
     if (esp_timer_get_time() < s_map_ignore_until) return;
-    /* ★★ 2026-10-27 兼容修复: 手里还按着键就先别捕获。
+    /* ★★ 2026-10-27 兼容修复: 手里还按着键就先别捕获(仅限"尚未捕获"阶段)。
      *   连上/配对时用户往往还按着某个键(如 home)，而 bt_map 是**上升沿**上报，
      *   400ms 屏蔽只是延后读取、并不清"已按住"状态 ⇒ 屏蔽一结束就把它当成一次新按下，
      *   第一个功能(上)被误配成那个键，之后整个方向都是错的。
-     *   这里等所有物理键松开再开始；最多等 5s(防某个键卡住导致永远进不去)。 */
-    if (any_phys_pressed()) {
+     *   ⚠ 必须排除 s_capture_armed 阶段 —— 那时"s_capture_phys 还按着"正是预期状态,
+     *   由下面 597 行那段负责等松开推进, 否则这里的等待会和它重叠。
+     *   最多等 5s(防某个键卡住导致永远进不去)。 */
+    if (!s_capture_armed && any_phys_pressed()) {
         if (s_map_hold_wait == 0) s_map_hold_wait = esp_timer_get_time();
         if (esp_timer_get_time() - s_map_hold_wait < 5000000LL) {
             s_map_last_progress = esp_timer_get_time();   /* 等待期不算超时 */
@@ -649,6 +668,8 @@ static void finish_key_mapping(ui_ctx_t *ctx) {
     ESP_LOGI(TAG, "按键映射完成, 已保存到 NVS");
     s_map_active = false;
     s_map_done_ms = esp_timer_get_time();   /* 兜底收敛计时起点 */
+    s_map_cancel_req = false;               /* 已保存: 别再让触摸取消去回滚(会和 NVS 打架) */
+    bt_manager_backup_key_map();            /* 把备份同步成已保存的值, 之后误调 restore 也无害 */
     input_set_gamepad_nav_enabled(true);
     os_dialog_pop(ctx);   /* 关映射弹窗回手柄主菜单 */
     os_dialog_toast(ctx, "\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84\xe5\xae\x8c\xe6\x88\x90"); /* 按键映射完成 */
@@ -665,20 +686,13 @@ static bool map_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
 
 /* ★ 2026-10-27: 映射期间**点屏幕 = 取消映射**。
  *   映射时 map_key 吞掉所有系统按键(这是故意的: 要能把任意键映射成"返回/退出"),
- *   所以物理返回键退不出来 —— 原来只能干等 40s 超时。触摸屏留一个明确出口。 */
+ *   所以物理返回键退不出来 —— 原来只能干等 40s 超时。触摸屏留一个明确出口。
+ *   ⚠ 这里**只置标志**, 真正的清理放到 map_poll 里做: 在触摸回调内部直接
+ *   os_dialog_clear_all() 会把当前这一层(回调正在用的 d)一起清掉, 回调返回后
+ *   框架仍可能引用它 —— 属于"在回调里拆自己脚下地板", 不碰为妙。 */
 static bool map_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
-    (void)d; (void)ud; (void)x; (void)y;
-    s_map_active = false;
-    s_map_done_ms = 0;              /* 不让 map_poll 的收敛分支再清一遍 */
-    s_capture_armed = false;
-    s_capture_phys = -1;
-    s_map_hold_wait = 0;
-    input_set_gamepad_nav_enabled(true);
-    bt_manager_restore_key_map();   /* 回滚: 取消不等于"半套生效" */
-    os_dialog_clear_all(ctx);       /* 关向导(以及垫在下面的菜单), 再重开菜单当落点 */
-    if (ctx->current_page == OS_PAGE_GAMEPAD) p_gamepad_menu(ctx);
-    os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88\xe6\x98\xa0\xe5\xb0\x84"); /* 已取消映射 */
-    ctx->needs_redraw = true;
+    (void)ctx; (void)d; (void)x; (void)y; (void)ud;
+    s_map_cancel_req = true;      /* 真正的清理在 map_poll 里做 */
     return true;
 }
 
@@ -692,6 +706,7 @@ static void start_key_mapping(ui_ctx_t *ctx) {
      *   (C5 路径下桌面已经取过, 这里再取一次返回 false, 无害) */
     bt_manager_take_map_pending(NULL, 0);
     bt_manager_backup_key_map();   /* ★ 记住进向导前的映射: 取消/超时用它回滚 */
+    s_map_cancel_req = false;      /* 清掉可能残留的触摸取消请求 */
     s_map_func = 0;
     s_map_used = 0;          /* 新的一轮映射: 清空"已用过的物理键" */
     s_map_active = true;

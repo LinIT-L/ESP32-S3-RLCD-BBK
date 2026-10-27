@@ -463,8 +463,11 @@ bool bt_map_feed(uint8_t report_id, const uint8_t *data, uint16_t len, bt_pad_fr
                 f.axis_rz = process_axis(cp, v); s_pad_axis_raw[BT_AXIS_RZ] = f.axis_rz; break;
             case USAGE_GEN_HAT_SWITCH: {
                 int32_t hv   = (int32_t)v;
+                /* 位宽推最大值的保护: bit_size 到 31/32 时 1<<n 会溢出(UB) */
+                int32_t bit_max = (cp->bit_size >= 31) ? 0x7FFFFFFF
+                                                       : (int32_t)((1u << cp->bit_size) - 1u);
                 int32_t hmax = cp->log_max;
-                if (hmax <= cp->log_min) hmax = (1 << cp->bit_size) - 1;  /* 未声明: 按位宽推 */
+                if (hmax <= cp->log_min) hmax = bit_max;     /* 未声明: 按位宽推 */
                 if (hv < cp->log_min || hv > hmax) {
                     hat = 8;                     /* null = 未推动 */
                 } else {
@@ -472,15 +475,16 @@ bool bt_map_feed(uint8_t report_id, const uint8_t *data, uint16_t len, bt_pad_fr
                     /* 有效取值个数: 有声明按声明算, 没声明按位宽算 (2bit=4值 → 4 向) */
                     int32_t n = (cp->log_max > cp->log_min)
                               ? (cp->log_max - cp->log_min + 1)
-                              : (1 << cp->bit_size);
+                              : bit_max;
                     /* ★★ 2026-10-27 兼容修复: **4 向十字键**。
-                     *   老手柄/廉价手柄的十字只有 2bit(0上 1右 2下 3左),
-                     *   原来一律当 8 向用 ⇒ 按"左"读成"右下"、按"下"读成"右"
-                     *   —— 方向整个错位, 而且映射向导里也会把方向键认错。
-                     *   4 向时映射到 8 向语义(0/1/2/3 → 0/2/4/6)。 */
+                     *   BLE 手柄的描述符差异很大, 十字常见两种: 2bit(0上1右2下3左)、
+                     *   或 0..4(四向 + 4=null)。原来一律当 8 向 ⇒ 按"左"读成"右下",
+                     *   方向整个错位、映射向导也认错键。 */
                     if (n <= 5) {
                         static const uint8_t k_4to8[4] = {0, 2, 4, 6};
-                        hat = k_4to8[rel & 3];
+                        /* ★ 5 个值时 rel==4 是"居中/null", 不能折成 0(上) ——
+                         *   否则会表现为方向键一直按着"上"。 */
+                        hat = (rel >= 4) ? 8 : k_4to8[rel & 3];
                     } else {
                         hat = (uint8_t)(rel > 8 ? 8 : rel);           /* 8 向(0..7, null=8) */
                     }
