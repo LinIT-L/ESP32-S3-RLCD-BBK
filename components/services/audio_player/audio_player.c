@@ -367,10 +367,15 @@ static void audio_out_task(void *arg) {
  *             → prvAddNewTaskToReadyList  StoreProhibited(EXCVADDR 0x4)
  *   修法: 1) start/stop 用互斥锁串行化;  2) 句柄非空就绝不再建。 */
 static SemaphoreHandle_t s_ao_mutex = NULL;
-static void ao_lock(void)
+/* ★ 必须用**超时**取锁: audio_out_stop 持锁期间要等任务退出(最长 500ms),
+ *   而另一核的 feed_pcm 若同时持着 I2S 锁进来等这把锁 ⇒ 两边互等会卡死主循环
+ *   (实测: 日志在 33s 处直接停止, 无 panic、无重启 = 死锁)。
+ *   拿不到锁就跳过本次 start/stop, 下一帧再来, 绝不阻塞调用方。 */
+static bool ao_lock(void)
 {
     if (!s_ao_mutex) s_ao_mutex = xSemaphoreCreateMutex();
-    if (s_ao_mutex) xSemaphoreTake(s_ao_mutex, portMAX_DELAY);
+    if (!s_ao_mutex) return true;                     /* 建不出锁就别卡死功能 */
+    return xSemaphoreTake(s_ao_mutex, pdMS_TO_TICKS(100)) == pdTRUE;
 }
 static void ao_unlock(void)
 {
@@ -379,7 +384,7 @@ static void ao_unlock(void)
 
 /* 启动音频输出任务 (游戏开始时调用) */
 static void audio_out_start(void) {
-    ao_lock();
+    if (!ao_lock()) return;
     /* 句柄还在 ⇒ 任务仍然存活(哪怕 running 标志被清过): 绝不能用同一个静态 TCB 重建 */
     if (s_audio_out_running || s_audio_out_task) {
         s_audio_out_running = true;
@@ -427,7 +432,7 @@ static void audio_out_start(void) {
 
 /* 停止音频输出任务 */
 static void audio_out_stop(void) {
-    ao_lock();
+    if (!ao_lock()) return;
     if (!s_audio_out_running && !s_audio_out_task) { ao_unlock(); return; }
     s_audio_out_running = false;
     /* 等待任务退出 (有界 500ms): 100ms 太短, audio_out 若仍阻塞在 I2S 写就与
