@@ -498,6 +498,15 @@ static phys_t s_capture_phys = -1;   /* 已捕获的物理键 (松开确认用) 
 static bool s_capture_armed = false; /* 是否已真实捕获到一个按键 (bool 门控, 规避 enum>=0 恒真 UB) */
 static int64_t s_map_last_progress = 0;  /* 上次映射推进时刻, 超时未动自动取消 */
 static int64_t s_map_ignore_until = 0;  /* 屏蔽"进入映射界面"那次确认的时间点, 防其被误映射成第一个键 */
+static int64_t s_map_hold_wait = 0;     /* ★ 等待"手里按着的键"松开的起始时刻 (0=没在等) */
+
+/* 是否有任意物理键正被按住 —— 进向导时若还按着键，上升沿会把它当成新按下，
+ * 导致第一个功能被误配。等它松开再开始捕获。 */
+static bool any_phys_pressed(void) {
+    for (int p = 0; p < (int)PHYS_MAX; p++)
+        if (bt_manager_is_phys_pressed((phys_t)p)) return true;
+    return false;
+}
 static int64_t s_map_done_ms = 0;       /* 映射结束(完成/超时)时刻: 兜底收敛残留弹窗/提示 */
 /* ★ 2026-10-02 "每个按键只映射一次": 本轮已经捕获过的物理键(位图, PHYS_MAX=20)。
  *   向导要依次映射 10 个功能, 但没有 Start/Select 的手柄凑不出 10 个键 →
@@ -513,8 +522,8 @@ static bool map_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     if (!lcd) return true;
     char txt[48];
     if (s_map_func >= 0 && s_map_func < FUNC_MAX)
-        snprintf(txt, sizeof(txt), "\xe8\xaf\xb7\xe6\x8c\x89\xe4\xb8\x8b %s \xe6\x8c\x89\xe9\x94\xae",  /* 请按下 X 按键 */
-                 bt_manager_func_name((func_t)s_map_func));
+        snprintf(txt, sizeof(txt), "\xe8\xaf\xb7\xe6\x8c\x89\xe4\xb8\x8b %s \xe6\x8c\x89\xe9\x94\xae %d/%d",  /* 请按下 X 按键 n/10 */
+                 bt_manager_func_name((func_t)s_map_func), s_map_func + 1, FUNC_MAX);
     else
         snprintf(txt, sizeof(txt), "\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84\xe5\xae\x8c\xe6\x88\x90"); /* 按键映射完成 */
     int tw = text_width(txt);
@@ -555,6 +564,20 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     if (s_map_func < 0 || s_map_func >= FUNC_MAX) return;
     /* 屏蔽"进入映射界面"那次确认键: 短时间(400ms)内不捕获任何按键, 防误映射 */
     if (esp_timer_get_time() < s_map_ignore_until) return;
+    /* ★★ 2026-10-27 兼容修复: 手里还按着键就先别捕获。
+     *   连上/配对时用户往往还按着某个键(如 home)，而 bt_map 是**上升沿**上报，
+     *   400ms 屏蔽只是延后读取、并不清"已按住"状态 ⇒ 屏蔽一结束就把它当成一次新按下，
+     *   第一个功能(上)被误配成那个键，之后整个方向都是错的。
+     *   这里等所有物理键松开再开始；最多等 5s(防某个键卡住导致永远进不去)。 */
+    if (any_phys_pressed()) {
+        if (s_map_hold_wait == 0) s_map_hold_wait = esp_timer_get_time();
+        if (esp_timer_get_time() - s_map_hold_wait < 5000000LL) {
+            s_map_last_progress = esp_timer_get_time();   /* 等待期不算超时 */
+            return;
+        }
+        ESP_LOGD(TAG, "按键映射: 有键持续按住 >5s, 放弃等待直接开始");
+    }
+    s_map_hold_wait = 0;
 
     /* 映射无操作 40s 超时: 自动取消, 恢复手柄导航, 避免卡死在映射界面 */
     if ((esp_timer_get_time() - s_map_last_progress) > 40000000LL) {
@@ -563,6 +586,9 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         s_capture_armed = false;
         s_capture_phys = -1;
         input_set_gamepad_nav_enabled(true);
+        /* ★ 2026-10-27: 向导是边按边写内存映射的，超时若不回滚就留下**半套映射**
+         *   ⇒ 用户回游戏方向键错乱, 得重连手柄/重启才恢复。 */
+        bt_manager_restore_key_map();
         os_dialog_pop(ctx);
         os_dialog_toast(ctx, "\xe6\x98\xa0\xe5\xb0\x84\xe8\xb6\x85\xe6\x97\xb6\xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88"); /* 映射超时已取消 */
         return;
@@ -587,12 +613,17 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
 
     /* 尚未捕获: 尝试捕获当前需映射功能的按键 */
     int fc = s_map_func;
+    /* ★ 2026-10-27: poll_new_press 内部会**直接改写 s_map[fc]**，所以先记住旧值 ——
+     *   如果接下来判定"按的是本轮已用过的键"(= 手柄没有更多键)，要把这个重复键还原，
+     *   否则完成时最后一个功能会指向一个错误的重复键。 */
+    phys_t prev_map = bt_manager_get_key_map((func_t)fc);
     int r = bt_manager_poll_new_press((func_t)fc);
     if (r > 0) {
         int phys = (int)bt_manager_get_key_map((func_t)fc);
         /* ★ "每个按键只映射一次": 这个物理键本轮已经映射过了 → 用户手上没有"新键"可指
          *   (典型: 没有 Start/Select 的手柄)。**不再让他重复按同一个键**, 直接保存结束。 */
         if (phys >= 0 && phys < 32 && (s_map_used & (1u << phys))) {
+            bt_manager_set_key_map((func_t)fc, prev_map);   /* 还原, 别把重复键留在映射里 */
             ESP_LOGD(TAG, "按键映射: 键[%s]本轮已映射过 → 判定没有更多键, 提前完成",
                      bt_manager_phys_name((phys_t)phys));
             s_capture_armed = false;
@@ -632,6 +663,25 @@ static bool map_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
     return true;   /* 其他键在映射期间一律忽略 */
 }
 
+/* ★ 2026-10-27: 映射期间**点屏幕 = 取消映射**。
+ *   映射时 map_key 吞掉所有系统按键(这是故意的: 要能把任意键映射成"返回/退出"),
+ *   所以物理返回键退不出来 —— 原来只能干等 40s 超时。触摸屏留一个明确出口。 */
+static bool map_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
+    (void)d; (void)ud; (void)x; (void)y;
+    s_map_active = false;
+    s_map_done_ms = 0;              /* 不让 map_poll 的收敛分支再清一遍 */
+    s_capture_armed = false;
+    s_capture_phys = -1;
+    s_map_hold_wait = 0;
+    input_set_gamepad_nav_enabled(true);
+    bt_manager_restore_key_map();   /* 回滚: 取消不等于"半套生效" */
+    os_dialog_clear_all(ctx);       /* 关向导(以及垫在下面的菜单), 再重开菜单当落点 */
+    if (ctx->current_page == OS_PAGE_GAMEPAD) p_gamepad_menu(ctx);
+    os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88\xe6\x98\xa0\xe5\xb0\x84"); /* 已取消映射 */
+    ctx->needs_redraw = true;
+    return true;
+}
+
 static void start_key_mapping(ui_ctx_t *ctx) {
     if (!bt_manager_is_connected()) {
         os_dialog_toast(ctx, "\xe8\xaf\xb7\xe5\x85\x88\xe8\xbf\x9e\xe6\x8e\xa5\xe6\x89\x8b\xe6\x9f\x84"); /* 请先连接手柄 */
@@ -641,11 +691,13 @@ static void start_key_mapping(ui_ctx_t *ctx) {
      *   都要把它取掉, 保证同一只新手柄只被引导一次。
      *   (C5 路径下桌面已经取过, 这里再取一次返回 false, 无害) */
     bt_manager_take_map_pending(NULL, 0);
+    bt_manager_backup_key_map();   /* ★ 记住进向导前的映射: 取消/超时用它回滚 */
     s_map_func = 0;
     s_map_used = 0;          /* 新的一轮映射: 清空"已用过的物理键" */
     s_map_active = true;
     s_capture_phys = -1;
     s_capture_armed = false;
+    s_map_hold_wait = 0;     /* 清"等待松开"状态 */
     s_map_last_progress = esp_timer_get_time();
     s_map_ignore_until = esp_timer_get_time() + 400000LL;   /* 400ms 内屏蔽, 吞掉"进入页面"的那次确认 */
     /* 清输入残留状态: 防止旧手柄/幽灵状态让"不按任何键映射就自动完成" */
@@ -657,6 +709,7 @@ static void start_key_mapping(ui_ctx_t *ctx) {
     dlg.on_render = map_render;
     dlg.on_key = map_key;
     dlg.on_poll = map_poll;
+    dlg.on_touch = map_touch;    /* ★ 点屏幕取消映射 (映射期间按键全被吞, 需要触摸出口) */
     os_dialog_push(ctx, &dlg);
     ESP_LOGI(TAG, "按键映射启动: 请按下 [%s] 对应按键", bt_manager_func_name(F_UP));
 }

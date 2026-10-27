@@ -462,12 +462,28 @@ bool bt_map_feed(uint8_t report_id, const uint8_t *data, uint16_t len, bt_pad_fr
                 /* RZ 可能既是右摇杆轴也是右扳机, Bluepad32 语义同样落到 axis_ry */
                 f.axis_rz = process_axis(cp, v); s_pad_axis_raw[BT_AXIS_RZ] = f.axis_rz; break;
             case USAGE_GEN_HAT_SWITCH: {
-                int32_t hv = (int32_t)v;
-                if (hv < cp->log_min || hv > cp->log_max) {
+                int32_t hv   = (int32_t)v;
+                int32_t hmax = cp->log_max;
+                if (hmax <= cp->log_min) hmax = (1 << cp->bit_size) - 1;  /* 未声明: 按位宽推 */
+                if (hv < cp->log_min || hv > hmax) {
                     hat = 8;                     /* null = 未推动 */
                 } else {
-                    hat = (uint8_t)(hv - cp->log_min);
-                    if (hat > 8) hat = 8;
+                    int32_t rel = hv - cp->log_min;
+                    /* 有效取值个数: 有声明按声明算, 没声明按位宽算 (2bit=4值 → 4 向) */
+                    int32_t n = (cp->log_max > cp->log_min)
+                              ? (cp->log_max - cp->log_min + 1)
+                              : (1 << cp->bit_size);
+                    /* ★★ 2026-10-27 兼容修复: **4 向十字键**。
+                     *   老手柄/廉价手柄的十字只有 2bit(0上 1右 2下 3左),
+                     *   原来一律当 8 向用 ⇒ 按"左"读成"右下"、按"下"读成"右"
+                     *   —— 方向整个错位, 而且映射向导里也会把方向键认错。
+                     *   4 向时映射到 8 向语义(0/1/2/3 → 0/2/4/6)。 */
+                    if (n <= 5) {
+                        static const uint8_t k_4to8[4] = {0, 2, 4, 6};
+                        hat = k_4to8[rel & 3];
+                    } else {
+                        hat = (uint8_t)(rel > 8 ? 8 : rel);           /* 8 向(0..7, null=8) */
+                    }
                 }
                 have_hat = true;
                 break;
@@ -505,8 +521,19 @@ bool bt_map_feed(uint8_t report_id, const uint8_t *data, uint16_t len, bt_pad_fr
                 s_axis_center[1] = (s_cal_min[1] + s_cal_max[1]) / 2;
                 int spx = s_cal_max[0] - s_cal_min[0];
                 int spy = s_cal_max[1] - s_cal_min[1];
-                int thr = (spx > spy ? spx : spy) * 3 / 2 + 24;
-                if (thr < 40) thr = 40;
+                int span = spx > spy ? spx : spy;
+                int thr;
+                /* ★ 2026-10-27 兼容修复: 校准只在"刚连上的 8 帧"里采样。若用户此时正推着
+                 *   摇杆(很常见: 连上就想试), 采到的 span 会接近满量程 ⇒ 算出的阈值也跟着大
+                 *   ⇒ 之后正常推杆达不到阈值, 表现为"手柄连上了但摇杆没反应"。
+                 *   轴已归一化到 -512..511(总跨度 1023), span>700 说明明显被推过 ⇒ 不采信。 */
+                if (span > 700) {
+                    thr = 220;
+                    BT_LOGI("axis cal: 采样期摇杆被推动(span=%d) → 改用保守阈值", span);
+                } else {
+                    thr = span * 3 / 2 + 24;
+                }
+                if (thr < 60) thr = 60;    /* 下限抬高: 抑制不同手柄的零点漂移 */
                 if (thr > 400) thr = 400;
                 s_axis_thr = thr;
                 s_axis_cal_done = true;

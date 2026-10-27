@@ -546,6 +546,27 @@ void bt_manager_reset_key_map(void)
     memcpy(s_map, k_default_map, sizeof(s_map));
 }
 
+/* ★ 2026-10-27: 映射向导的备份/回滚。
+ *   向导在 map_poll 里**边按边写 s_map**(poll_new_press 内部直接改映射)，所以中途
+ *   取消 / 40s 超时若不管，内存里就留下半套映射 —— 用户回到游戏会发现方向键错乱，
+ *   必须重连手柄或重启才恢复。进向导前 backup，取消/超时 restore。 */
+static phys_t s_map_backup[FUNC_MAX];
+static bool   s_map_backup_valid;
+
+void bt_manager_backup_key_map(void)
+{
+    memcpy(s_map_backup, s_map, sizeof(s_map));
+    s_map_backup_valid = true;
+}
+
+void bt_manager_restore_key_map(void)
+{
+    if (!s_map_backup_valid) return;
+    memcpy(s_map, s_map_backup, sizeof(s_map));
+    s_map_backup_valid = false;
+    ESP_LOGI(TAG, "[EV] 按键映射已回滚 (取消/超时, 保持原映射)");
+}
+
 void bt_manager_set_key_map(func_t f, phys_t p)
 {
     if (f < 0 || f >= FUNC_MAX) return;

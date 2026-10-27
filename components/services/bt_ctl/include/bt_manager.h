@@ -49,7 +49,12 @@ typedef enum {
     P_BTN_1 = 4, P_BTN_2, P_BTN_3, P_BTN_4, P_BTN_5,    /* 通用按钮 4.. */
     P_BTN_6, P_BTN_7, P_BTN_8, P_BTN_9, P_BTN_10,
     P_BTN_11, P_BTN_12, P_BTN_13, P_BTN_14, P_BTN_15, P_BTN_16,
-    PHYS_MAX = 20
+    P_BTN_17, P_BTN_18, P_BTN_19, P_BTN_20,
+    /* ★ 2026-10-27: 16 个按钮不够用 —— 带背键/额外肩键的手柄(常见 17~20 个按钮)
+     *   第 17 个以后的键 raw_to_phys 会返回 -1, 映射向导里"按了没反应"。
+     *   bt_map 的按钮位图本来就有 32 位, 这里把可映射上限放到 20 个。
+     *   ⚠ phys_t 的既有取值不变(0..19), 只是上限扩大 ⇒ NVS 里旧的按键映射继续有效。 */
+    PHYS_MAX = 24
 } phys_t;
 #endif
 
@@ -88,6 +93,10 @@ void bt_manager_wake_reconnect(void);
 int bt_manager_poll_new_press(func_t f);
 void bt_manager_save_key_map(void);
 void bt_manager_reset_key_map(void);   /* 清空并恢复默认 */
+/* ★ 2026-10-27: 映射向导是"边按边写内存映射"的。进入向导前 backup，中途取消/超时
+ *   调 restore 回滚 —— 否则会留下半套映射(方向键错乱)，直到重连/重启才恢复。 */
+void bt_manager_backup_key_map(void);
+void bt_manager_restore_key_map(void);
 void bt_manager_set_key_map(func_t f, phys_t p);
 phys_t bt_manager_get_key_map(func_t f);
 /* 当前是否有任意物理输入处于按下状态 (映射启动时等待松开用). */
