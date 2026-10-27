@@ -20,6 +20,7 @@ static void (*const k_mods[])(lua_State *) = {
     lua_mod_espnow_register,
     lua_mod_wiki_register,
     lua_mod_util_register,
+    lua_mod_rec_register,
 };
 
 void lua_bridge_setup(lua_State *L) {

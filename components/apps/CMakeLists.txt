@@ -46,6 +46,7 @@ idf_component_register(
         "lua_bridge/luat_lib_espnow.c"
         "lua_bridge/luat_lib_wiki.c"
         "lua_bridge/luat_lib_util.c"
+        "lua_bridge/luat_lib_rec.c"
         "pages/page_main.c"
         "pages/page_modtool.c"
         "pages/page_morse.c"

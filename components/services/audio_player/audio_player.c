@@ -1633,3 +1633,278 @@ void audio_player_fx_mix(int16_t *pcm, uint32_t samples)
 }
 
 /* 按键反馈音选项已移除 (见 menu_system 游戏设置): 不再提供蜂鸣声. */
+
+/* ================= 录音机：WAV 录制 + WAV 播放（2026-10-27 v2） =================
+ *
+ * 与 v1 的区别（都是实测踩出来的）：
+ *  ① 录音任务栈 12KB、PCM 缓冲放堆 —— 4KB 栈 + 栈上 2KB 缓冲会在 fwrite 时溢出重启
+ *  ② stop **不阻塞**：只置标志就返回（调用方是 Lua 主循环，等 1 秒会触发 task_wdt）
+ *     收尾（回填 WAV 头 / 关文件 / 关麦 / 自杀）全在任务里做
+ *  ③ 每 5 秒 fflush，掉电只丢最后几秒
+ *  ④ 录音时算峰值 + 16 段频谱，供 UI 画电平/柱状
+ *  ⑤ WAV 播放走 audio_player_feed_pcm（不能直接写 I2S：audio_out 空闲 300ms 会关通道），
+ *     进度按**墙上时间**推进（按已喂字节算会在缓冲灌满时猛跳）
+ */
+#define REC_CH        2
+#define REC_RATE_DEF  16000
+#define REC_STACK     12288
+#define REC_PRIO      8
+#define SPEC_BINS     16
+
+static TaskHandle_t s_rec_task = NULL;
+static volatile bool s_rec_stop = false;
+static FILE *s_rec_fp = NULL;
+static volatile uint32_t s_rec_bytes = 0;
+static int s_rec_rate = REC_RATE_DEF;
+static volatile uint32_t s_rec_ms = 0;
+static volatile int32_t  s_rec_peak = 0;
+static volatile uint8_t  s_spec[SPEC_BINS];
+static char s_rec_path[192] = "";
+
+static TaskHandle_t s_wav_task = NULL;
+static volatile bool s_wav_stop = false;
+static volatile uint32_t s_wav_ms = 0;
+static volatile uint32_t s_wav_total_ms = 0;
+static char s_wav_path[192] = "";
+
+static void wav_header(uint8_t *h, uint32_t data_bytes, int rate, int ch, int bits)
+{
+    uint32_t v32; uint16_t v16;
+    uint32_t byte_rate = (uint32_t)rate * (uint32_t)ch * (uint32_t)bits / 8u;
+    uint16_t align     = (uint16_t)(ch * bits / 8);
+    memcpy(h + 0, "RIFF", 4);
+    v32 = 36u + data_bytes;      memcpy(h + 4,  &v32, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    v32 = 16u;                   memcpy(h + 16, &v32, 4);
+    v16 = 1;                     memcpy(h + 20, &v16, 2);
+    v16 = (uint16_t)ch;          memcpy(h + 22, &v16, 2);
+    v32 = (uint32_t)rate;        memcpy(h + 24, &v32, 4);
+    v32 = byte_rate;             memcpy(h + 28, &v32, 4);
+    v16 = align;                 memcpy(h + 32, &v16, 2);
+    v16 = (uint16_t)bits;        memcpy(h + 34, &v16, 2);
+    memcpy(h + 36, "data", 4);
+    v32 = data_bytes;            memcpy(h + 40, &v32, 4);
+}
+
+/* 16 段 Goertzel（0~8kHz 均分），只取左声道 */
+static void calc_spectrum(const int16_t *pcm, int frames)
+{
+    if (frames < 64) return;
+    int n = frames > 512 ? 512 : frames;
+    for (int b = 0; b < SPEC_BINS; b++) {
+        float f = (float)(b + 1) * 8000.0f / (float)SPEC_BINS;
+        float w = 2.0f * 3.14159265f * f / 16000.0f;
+        float coeff = 2.0f * cosf(w);
+        float s1 = 0.0f, s2 = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float x = (float)pcm[i * REC_CH];
+            float s0 = x + coeff * s1 - s2;
+            s2 = s1; s1 = s0;
+        }
+        float mag = sqrtf(s1 * s1 + s2 * s2 - coeff * s1 * s2) / (float)(n / 2);
+        int v = (int)(20.0f * log10f(mag + 1.0f));
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        s_spec[b] = (uint8_t)v;
+    }
+}
+
+static void rec_task(void *arg)
+{
+    (void)arg;
+    int16_t *buf = heap_caps_malloc(512 * REC_CH * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc(512 * REC_CH * sizeof(int16_t));
+    if (!buf) {
+        ESP_LOGE(TAG, "录音缓冲分配失败");
+        if (s_rec_fp) { fclose(s_rec_fp); s_rec_fp = NULL; }
+        s_rec_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    TickType_t t0 = xTaskGetTickCount();
+    uint32_t last_flush = 0, spec_tick = 0;
+
+    while (!s_rec_stop) {
+        int n = audio_player_mic_read(buf, 512, 100);
+        if (n > 0) {
+            size_t w = fwrite(buf, sizeof(int16_t) * REC_CH, (size_t)n, s_rec_fp);
+            if (w != (size_t)n) {
+                ESP_LOGE(TAG, "录音写卡失败 (%u/%d)", (unsigned)w, n);
+                break;
+            }
+            s_rec_bytes += (uint32_t)n * REC_CH * 2u;
+            int pk = s_rec_peak;
+            for (int i = 0; i < n; i++) {
+                int v = buf[i * REC_CH];
+                if (v < 0) v = -v;
+                if (v > pk) pk = v;
+            }
+            s_rec_peak = pk;
+            if ((spec_tick & 3) == 0) calc_spectrum(buf, n);
+            spec_tick++;
+        }
+        s_rec_ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+        if (s_rec_ms - last_flush >= 5000) {
+            last_flush = s_rec_ms;
+            if (s_rec_fp) fflush(s_rec_fp);
+        }
+    }
+    free(buf);
+    if (s_rec_fp) {
+        uint8_t h[44];
+        wav_header(h, s_rec_bytes, s_rec_rate, REC_CH, 16);
+        fseek(s_rec_fp, 0, SEEK_SET);
+        fwrite(h, 1, 44, s_rec_fp);
+        fflush(s_rec_fp);
+        fclose(s_rec_fp);
+        s_rec_fp = NULL;
+    }
+    audio_player_mic_stop();          /* 关麦放任务里，别让调用方等 */
+    ESP_LOGI(TAG, "录音结束: %s  %u B  %u ms  峰值=%d%s", s_rec_path,
+             (unsigned)s_rec_bytes, (unsigned)s_rec_ms, (int)s_rec_peak,
+             (s_rec_peak == 0) ? "  (全程无信号)" : "");
+    s_rec_task = NULL;
+    vTaskDelete(NULL);
+}
+
+int audio_player_rec_start(const char *path, int sample_rate)
+{
+    if (!path || !path[0] || s_rec_task) return -1;
+    if (sample_rate <= 0) sample_rate = REC_RATE_DEF;
+    audio_player_init();
+    if (audio_player_mic_start(sample_rate) != 0) {
+        ESP_LOGE(TAG, "麦克风启动失败");
+        return -2;
+    }
+    s_rec_fp = fopen(path, "wb");
+    if (!s_rec_fp) {
+        audio_player_mic_stop();
+        ESP_LOGE(TAG, "无法创建 %s", path);
+        return -3;
+    }
+    uint8_t h[44];
+    wav_header(h, 0, sample_rate, REC_CH, 16);
+    fwrite(h, 1, 44, s_rec_fp);
+
+    s_rec_rate    = sample_rate;
+    s_rec_bytes   = 0;
+    s_rec_ms      = 0;
+    s_rec_peak    = 0;
+    s_rec_stop    = false;
+    memset((void *)s_spec, 0, sizeof(s_spec));
+    strncpy(s_rec_path, path, sizeof(s_rec_path) - 1);
+    s_rec_path[sizeof(s_rec_path) - 1] = 0;
+
+    if (xTaskCreateWithCaps(rec_task, "rec", REC_STACK, NULL, REC_PRIO,
+                            &s_rec_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+        fclose(s_rec_fp); s_rec_fp = NULL;
+        audio_player_mic_stop();
+        s_rec_task = NULL;
+        return -4;
+    }
+    ESP_LOGI(TAG, "开始录音: %s (%d Hz)", s_rec_path, sample_rate);
+    return 0;
+}
+
+void audio_player_rec_stop(void)
+{
+    if (!s_rec_task) return;
+    /* 只置标志就返回：调用方是 Lua 主循环，等 1 秒会触发 task_wdt 重启 */
+    s_rec_stop = true;
+}
+
+bool audio_player_rec_active(void)   { return s_rec_task != NULL; }
+uint32_t audio_player_rec_ms(void)   { return s_rec_ms; }
+uint32_t audio_player_rec_bytes(void){ return s_rec_bytes; }
+const char *audio_player_rec_path(void) { return s_rec_path; }
+int audio_player_rec_peak(void)      { return (int)s_rec_peak; }
+int audio_player_rec_spec(int bin)   { return (bin < 0 || bin >= SPEC_BINS) ? -1 : (int)s_spec[bin]; }
+int audio_player_rec_spec_bins(void) { return SPEC_BINS; }
+
+/* 板上有麦克风吗（标准扩展板 i2s_din = -1 ⇒ 物理上没有输入脚） */
+bool audio_player_mic_available(void) { return s_din >= 0; }
+
+/* ---------------- WAV 播放 ---------------- */
+static void wav_play_task(void *arg)
+{
+    (void)arg;
+    FILE *fp = fopen(s_wav_path, "rb");
+    if (!fp) { s_wav_task = NULL; vTaskDelete(NULL); return; }
+
+    uint8_t hdr[44];
+    if (fread(hdr, 1, 44, fp) != 44 || memcmp(hdr, "RIFF", 4) != 0) {
+        fclose(fp); s_wav_task = NULL; vTaskDelete(NULL); return;
+    }
+    uint16_t ch, bits; uint32_t rate, data_len;
+    memcpy(&ch, hdr + 22, 2);
+    memcpy(&rate, hdr + 24, 4);
+    memcpy(&bits, hdr + 34, 2);
+    memcpy(&data_len, hdr + 40, 4);
+    if (ch == 0 || ch > 2) ch = 2;
+    if (bits != 16) bits = 16;
+    if (rate < 8000 || rate > 48000) rate = 16000;
+
+    uint32_t frame_bytes = (uint32_t)ch * (uint32_t)bits / 8u;
+    if (frame_bytes == 0) frame_bytes = 4;
+    s_wav_total_ms = (uint32_t)((uint64_t)data_len * 1000ull / ((uint64_t)rate * frame_bytes));
+    s_wav_ms = 0;
+
+    const size_t CHUNK = 2048;
+    uint8_t *buf = heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc(CHUNK);
+
+    uint32_t sent = 0;
+    int stall = 0;
+    TickType_t t0 = xTaskGetTickCount();
+    while (!s_wav_stop && sent < data_len && buf) {
+        size_t want = data_len - sent;
+        if (want > CHUNK) want = CHUNK;
+        size_t got = fread(buf, 1, want, fp);
+        if (got == 0) break;
+        size_t frames = got / frame_bytes, off = 0;
+        while (off < frames && !s_wav_stop) {
+            size_t w = audio_player_feed_pcm((const int16_t *)(buf + off * frame_bytes),
+                                             frames - off, (int)rate);
+            if (w == 0) {
+                if (++stall > 200) { ESP_LOGW(TAG, "PCM 输出 2s 无空间, 停止播放"); goto done; }
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            stall = 0;
+            off += w;
+            sent += (uint32_t)(w * frame_bytes);
+            s_wav_ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+            if (s_wav_ms > s_wav_total_ms) s_wav_ms = s_wav_total_ms;
+        }
+    }
+done:
+    if (buf) free(buf);
+    fclose(fp);
+    s_wav_ms = s_wav_total_ms;
+    s_wav_task = NULL;
+    vTaskDelete(NULL);
+}
+
+int audio_player_play_wav(const char *path)
+{
+    if (!path || !path[0] || s_wav_task) return -1;
+    audio_player_init();
+    if (audio_player_is_muted()) return -4;
+    strncpy(s_wav_path, path, sizeof(s_wav_path) - 1);
+    s_wav_path[sizeof(s_wav_path) - 1] = 0;
+    s_wav_stop = false;
+    s_wav_ms = 0;
+    s_wav_total_ms = 0;
+    if (xTaskCreateWithCaps(wav_play_task, "wavply", 4096, NULL, 7,
+                            &s_wav_task, MALLOC_CAP_SPIRAM) != pdPASS) {
+        s_wav_task = NULL;
+        return -2;
+    }
+    ESP_LOGI(TAG, "WAV 播放: %s", s_wav_path);
+    return 0;
+}
+
+void audio_player_wav_stop(void) { s_wav_stop = true; }
+bool audio_player_wav_active(void) { return s_wav_task != NULL; }
+uint32_t audio_player_wav_ms(void) { return s_wav_ms; }
+uint32_t audio_player_wav_total_ms(void) { return s_wav_total_ms; }

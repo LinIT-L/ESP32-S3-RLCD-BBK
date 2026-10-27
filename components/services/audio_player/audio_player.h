@@ -67,6 +67,25 @@ void audio_player_diag(void);
  *   必须在 esp_deep_sleep_start() **之前**调用 (之后没有代码会执行)。 */
 void audio_player_sleep_for_off(void);
 
+
+/* === 录音机（WAV 录制 / 播放） === */
+int      audio_player_rec_start(const char *path, int sample_rate);
+void     audio_player_rec_stop(void);
+bool     audio_player_rec_active(void);
+uint32_t audio_player_rec_ms(void);
+uint32_t audio_player_rec_bytes(void);
+const char *audio_player_rec_path(void);
+int      audio_player_rec_peak(void);
+int      audio_player_rec_spec(int bin);
+int      audio_player_rec_spec_bins(void);
+bool     audio_player_mic_available(void);
+
+int      audio_player_play_wav(const char *path);
+void     audio_player_wav_stop(void);
+bool     audio_player_wav_active(void);
+uint32_t audio_player_wav_ms(void);
+uint32_t audio_player_wav_total_ms(void);
+
 /* 获取当前播放文件名 */
 const char *audio_player_get_filename(void);
 
