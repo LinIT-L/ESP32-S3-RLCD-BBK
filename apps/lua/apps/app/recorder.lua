@@ -38,7 +38,14 @@ local A_BACK  = (type(app.BACK)    == "number") and app.BACK    or 6
 local BK, WH  = 0, 1
 
 local G = {
-  mode = "list",              -- list / rec / play / rename
+  mode = "list",
+  rate = 16000,               -- 采样率（设置页可改）
+  show_spec = true,           -- 录音时是否画频谱
+  saving = false,
+  save_t = 0,
+  set_sel = 1,
+  spec = {},                  -- 频谱缓存（16 段）
+  no_mic = false,             -- 本机没有麦克风输入（标准扩展板）              -- list / rec / play / rename
   files = {}, n = 0, sel = 1, top = 1,
   msg = "", msg_t = 0,
   key = "",
@@ -96,16 +103,52 @@ local function scan()
   if G.top > G.n then G.top = 1 end
 end
 
-local function next_name()
-  local mx = 0
-  for i = 1, G.n do
-    local k = G.files[i].name:match("rec_(%d+)")
-    if k then
-      k = tonumber(k)
-      if k and k > mx then mx = k end
-    end
+-- epoch → 本地日期时间（UTC+8）。Lua 沙箱里没有 os.date，只能手算。
+local function datetime_from_epoch(ep)
+  local t = ep + 8 * 3600
+  local days = t // 86400
+  local sod  = t % 86400
+  local hh, mi, ss = sod // 3600, (sod % 3600) // 60, sod % 60
+  local y = 1970
+  while true do
+    local leap = ((y % 4 == 0 and y % 100 ~= 0) or (y % 400 == 0)) and 366 or 365
+    if days < leap then break end
+    days = days - leap
+    y = y + 1
   end
-  return string.format("rec_%03d.wav", mx + 1)
+  local md = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+  if (y % 4 == 0 and y % 100 ~= 0) or (y % 400 == 0) then md[2] = 29 end
+  local m = 1
+  while m <= 12 and days >= md[m] do
+    days = days - md[m]
+    m = m + 1
+  end
+  return y, m, days + 1, hh, mi, ss
+end
+
+-- 命名规则: YYYYMMDD_HHMMSS_xxxx.wav
+--   前段是录音开始时间（看着就有序）, 后段 4 位十六进制随机（同一秒内也不会撞名）
+local function next_name()
+  local ep = 0
+  if app.util and app.util.epoch then
+    ep = tonumber(app.util.epoch()) or 0
+  end
+  local y, mo, d, hh, mi, ss
+  if ep > 86400 then
+    y, mo, d, hh, mi, ss = datetime_from_epoch(ep)
+  else
+    -- 系统时间没同步（刚开机没联网）：用运行时长凑一个不重名的名字
+    local ms = now_ms()
+    y, mo, d = 1970, 1, 1
+    hh, mi, ss = (ms // 3600000) % 24, (ms // 60000) % 60, (ms // 1000) % 60
+  end
+  for _ = 1, 8 do
+    local r = 0
+    if app.util and app.util.rand then r = app.util.rand(65535) end
+    local nm = string.format("%04d%02d%02d_%02d%02d%02d_%04x.wav", y, mo, d, hh, mi, ss, r)
+    if not (app.fs.exists and app.fs.exists(DIR .. nm)) then return nm end
+  end
+  return string.format("%04d%02d%02d_%02d%02d%02d.wav", y, mo, d, hh, mi, ss)
 end
 
 local function cur() return G.files[G.sel] end
@@ -114,8 +157,9 @@ local function cur() return G.files[G.sel] end
 
 local function start_rec()
   if not app.rec then msg("固件不支持录音") return end
+  if G.no_mic then msg("未检测到麦克风") return end
   local name = next_name()
-  local rc = app.rec.start(DIR .. name, 16000)
+  local rc = app.rec.start(DIR .. name, G.rate)
   if rc == 0 then
     G.mode = "rec"
     G.rec_ms = 0
@@ -127,11 +171,12 @@ end
 
 local function stop_rec()
   if not app.rec then return end
-  local ms = app.rec.stop()
-  G.mode = "list"
-  G.rec_ms = 0
-  scan()
-  msg("已保存 " .. fmt_ms(ms))
+  -- ★ 只发命令就返回：C 侧 stop 已改成非阻塞（以前在这里阻塞 1 秒 → 触发看门狗重启）
+  app.rec.stop()
+  G.mode = "saving"
+  G.save_t = now_ms()
+  G.saving = true
+  app.redraw()
 end
 
 local function toggle_play()
@@ -269,8 +314,14 @@ local function draw_list()
   if G.sel > G.top + rows - 1 then G.top = G.sel - rows + 1 end
 
   if G.n == 0 then
-    app.mixc(W // 2, LIST_Y + 70, "还没有录音", false)
-    app.mixc(W // 2, LIST_Y + 96, "点「录音」开始", false)
+    if G.no_mic then
+      app.mixc(W // 2, LIST_Y + 62, "未检测到麦克风", false)
+      app.mixc(W // 2, LIST_Y + 88, "本机没有音频输入", false)
+      app.mixc(W // 2, LIST_Y + 114, "录音功能不可用", false)
+    else
+      app.mixc(W // 2, LIST_Y + 70, "还没有录音", false)
+      app.mixc(W // 2, LIST_Y + 96, "点「录音」开始", false)
+    end
   else
     for r = 0, rows - 1 do
       local i = G.top + r
@@ -289,46 +340,117 @@ local function draw_list()
     end
   end
 
+  if G.no_mic then
+    app.mixc(W // 2, LIST_B - 18, "未检测到麦克风", false)
+  end
   app.hline(0, W - 1, LIST_B + 2, BK)
-  button(4,   94, (G.mode == "rec") and "停止" or "录音", G.mode == "rec")
-  button(104, 94, app.rec and app.rec.playing() and "停止" or "播放", false)
-  button(204, 94, "改名", false)
-  button(304, 92, G.confirm_del and "确认删" or "删除", G.confirm_del)
+  button(4,   76, (G.mode == "rec") and "停止" or "录音", G.mode == "rec")
+  button(84,  76, (app.rec and app.rec.playing()) and "停止" or "播放", false)
+  button(164, 76, "改名", false)
+  button(244, 76, G.confirm_del and "确认删" or "删除", G.confirm_del)
+  button(324, 76, "设置", false)
 end
 
 local function draw_rec()
-  header("录音中", app.rec and "16kHz WAV" or "")
+  header("录音中", (G.rate // 1000) .. "kHz WAV")
   local ms = app.rec and app.rec.ms() or G.rec_ms
-  app.bigc(W // 2, 74, fmt_ms(ms), 5, false)
+  app.bigc(W // 2, 56, fmt_ms(ms), 5, false)
 
-  -- 音量示意: 用已写字节的增长速率画一根跳动条
-  local bytes = app.rec and app.rec.bytes and app.rec.bytes() or 0
-  local lvl = (bytes // 4096) % 20
-  if lvl > 16 then lvl = 32 - lvl end
-  local bw = 300
-  local x0 = (W - bw) // 2
-  app.rect(x0, 168, x0 + bw, 186, BK)
-  local fw = (bw - 4) * lvl // 16
-  if fw > 0 then app.fill(x0 + 2, 170, x0 + 1 + fw, 184, BK) end
+  local x0, y0, x1, y1 = 16, 132, 384, 212
+  if G.show_spec and app.rec and app.rec.spec then
+    local nb = app.rec.spec_bins and app.rec.spec_bins() or 16
+    if nb < 1 then nb = 16 end
+    local bw = (x1 - x0 + 1) // nb
+    for i = 1, nb do
+      local v = app.rec.spec(i) or 0
+      if v > 100 then v = 100 end
+      local h = (y1 - y0) * v // 100
+      if h < 1 then h = 1 end
+      local bx = x0 + (i - 1) * bw
+      app.fill(bx, y1 - h, bx + bw - 5, y1, BK)
+    end
+    app.hline(x0, x1, y1, BK)
+    app.mix(x0, y0 - 14, "0Hz", false)
+    app.mix(x1 - 34, y0 - 14, "8kHz", false)
+  else
+    app.rect(x0, y0, x1, y1, BK)
+    app.mixc(W // 2, (y0 + y1) // 2 - 8, "频谱已关闭", false)
+  end
 
-  app.mixc(W // 2, 200, "再按「停止」保存", false)
+  -- 输入电平自诊断: 录了 1.5 秒还是 0 = 麦克风没进数据, 直接说出来
+  local pk = app.rec and app.rec.peak and app.rec.peak() or 0
+  if pk > 0 then
+    app.mix(x0, y1 + 8, "电平 " .. tostring(pk), false)
+    app.mixc(W // 2, y1 + 8, "再按「停止」保存", false)
+  elseif ms > 1500 then
+    app.mixc(W // 2, y1 + 8, "! 无输入信号", true)
+  else
+    app.mixc(W // 2, y1 + 8, "正在拾音…", false)
+  end
   button(120, 160, "停止录音", true)
 end
 
+-- 保存中（C 侧任务在回填 WAV 头，通常几十毫秒）
+local function draw_saving()
+  header("保存中", "")
+  app.mixc(W // 2, 120, "正在写入文件…", false)
+  app.bigc(W // 2, 150, fmt_ms(G.rec_ms), 4, false)
+end
+
+-- 设置页：采样率 / 频谱开关
+local function draw_settings()
+  header("设置", "")
+  local items = {
+    { "采样率", (G.rate == 8000) and "8 kHz" or "16 kHz" },
+    { "录音频谱", G.show_spec and "开" or "关" },
+    { "文件数", tostring(G.n) .. " 条" },
+    { "存储位置", "/sdcard/Rec/" },
+  }
+  local y = SB_H + 46
+  for i = 1, #items do
+    local it = items[i]
+    local sel = (i == G.set_sel)
+    if sel then app.fill(6, y - 4, W - 7, y + 20, BK) end
+    app.mix(16, y, it[1], sel)
+    app.mix(W - 16 - app.mixw(it[2]), y, it[2], sel)
+    y = y + 34
+  end
+  app.hline(6, W - 7, H - 44, BK)
+  app.mix(12, H - 38, "左右改值  BACK 返回", false)
+end
+
 local function draw_play()
-  header("播放中", G.play_name)
+  header("播放", G.play_name)
   local ms = app.rec and app.rec.play_ms() or 0
   local tot = app.rec and app.rec.play_total_ms() or 0
-  app.bigc(W // 2, 70, fmt_ms(ms), 5, false)
-  app.mixc(W // 2, 150, "/ " .. fmt_ms(tot), false)
+  app.bigc(W // 2, 52, fmt_ms(ms), 5, false)
+  app.mixc(W // 2, 132, "/ " .. fmt_ms(tot), false)
 
-  local bw = 320
-  local x0 = (W - bw) // 2
-  app.rect(x0, 178, x0 + bw, 194, BK)
-  if tot > 0 then
-    local fw = (bw - 4) * math.min(ms, tot) // tot
-    if fw > 0 then app.fill(x0 + 2, 180, x0 + 1 + fw, 192, BK) end
+  -- 播放时也画频谱（同一个 C 侧频谱，播放任务里算）
+  local x0, y0, x1, y1 = 16, 166, 384, 226
+  if G.show_spec and app.rec and app.rec.spec then
+    local nb = app.rec.spec_bins and app.rec.spec_bins() or 16
+    if nb < 1 then nb = 16 end
+    local bw = (x1 - x0 + 1) // nb
+    for i = 1, nb do
+      local v = app.rec.spec(i) or 0
+      if v > 100 then v = 100 end
+      local h = (y1 - y0) * v // 100
+      if h < 1 then h = 1 end
+      local bx = x0 + (i - 1) * bw
+      app.fill(bx, y1 - h, bx + bw - 3, y1, BK)
+    end
+    app.hline(x0, x1, y1, BK)
   end
+
+  -- 进度条压在底部
+  local py = 234
+  app.rect(x0, py, x1, py + 8, BK)
+  if tot > 0 then
+    local fw = (x1 - x0 - 4) * math.min(ms, tot) // tot
+    if fw > 0 then app.fill(x0 + 2, py + 2, x0 + 1 + fw, py + 6, BK) end
+  end
+
   button(120, 160, "停止", true)
 end
 
@@ -355,6 +477,10 @@ function render()
     draw_rec()
   elseif G.mode == "play" then
     draw_play()
+  elseif G.mode == "saving" then
+    draw_saving()
+  elseif G.mode == "settings" then
+    draw_settings()
   else
     draw_list()
   end
@@ -374,7 +500,13 @@ function on_enter()
   G.mode = "list"
   G.confirm_del = false
   G.msg = ""
+  -- 打开就检测麦克风：标准扩展板 i2s_din = -1，物理上没有输入脚
+  G.no_mic = false
+  if app.rec and app.rec.mic_available then
+    G.no_mic = not app.rec.mic_available()
+  end
   scan()
+  if G.no_mic then msg("未检测到麦克风") end
   app.redraw()
 end
 
@@ -401,10 +533,11 @@ end
 -- 触摸：按钮栏四个按钮 + 列表点名。用"按下沿"判定，按住不会连发。
 local function hit_button(x, y)
   if y < BTN_Y or y > BTN_Y + BTN_H then return nil end
-  if x >= 4   and x <= 98  then return 1 end
-  if x >= 104 and x <= 198 then return 2 end
-  if x >= 204 and x <= 298 then return 3 end
-  if x >= 304 and x <= 396 then return 4 end
+  if x >= 4   and x <= 80  then return 1 end
+  if x >= 84  and x <= 160 then return 2 end
+  if x >= 164 and x <= 240 then return 3 end
+  if x >= 244 and x <= 320 then return 4 end
+  if x >= 324 and x <= 398 then return 5 end
   return nil
 end
 
@@ -432,6 +565,8 @@ local function on_tap(x, y)
     enter_rename(); return
   elseif b == 4 then
     do_delete(); return
+  elseif b == 5 then
+    G.mode = "settings"; G.set_sel = 1; app.redraw(); return
   end
 
   -- 点列表行
@@ -456,6 +591,20 @@ function poll()
       end
     else
       G.tdown = false
+    end
+  end
+
+  if G.mode == "saving" then
+    if not app.rec or not app.rec.active() then
+      G.mode = "list"
+      G.saving = false
+      local ms = G.rec_ms
+      G.rec_ms = 0
+      scan()
+      msg("已保存 " .. fmt_ms(ms))
+    elseif now_ms() - (G.save_t or 0) > 4000 then
+      G.mode = "list"; G.saving = false
+      scan(); msg("停止超时")
     end
   end
 
@@ -494,6 +643,26 @@ function action(a)
     elseif a == A_BACK then G.mode = "list"; app.redraw() end
     return true
   end
+
+  if G.mode == "settings" then
+    if a == A_UP then
+      if G.set_sel > 1 then G.set_sel = G.set_sel - 1 end
+    elseif a == A_DOWN then
+      if G.set_sel < 4 then G.set_sel = G.set_sel + 1 end
+    elseif a == A_LEFT or a == A_RIGHT then
+      if G.set_sel == 1 then
+        G.rate = (G.rate == 8000) and 16000 or 8000
+      elseif G.set_sel == 2 then
+        G.show_spec = not G.show_spec
+      end
+    elseif a == A_BACK then
+      G.mode = "list"
+    end
+    app.redraw()
+    return true
+  end
+
+  if G.mode == "saving" then return true end
 
   if G.mode == "rec" then
     if a == A_OK or a == A_BACK then stop_rec() end

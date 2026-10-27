@@ -671,9 +671,18 @@ class Sim:
         def _playing():
             return self.play_t0 is not None and _play_ms() < self.play_total
 
+        def _rec_spec(b=1):
+            # 假频谱: 录音/播放时按时间起伏, 让 UI 有东西可看
+            if self.rec_t0 is None and self.play_t0 is None:
+                return 0
+            import math as _m
+            v = 40 + 42 * _m.sin(self.ms / 320.0 + int(b) * 1.1) * _m.cos(int(b) * 0.7)
+            return max(0, min(100, int(v)))
+
         a.rec = self.lua.table(
             start=_rec_start, stop=_rec_stop, active=lambda: self.rec_t0 is not None,
             ms=_rec_ms, bytes=lambda: _rec_ms() * 64,
+            spec=_rec_spec, spec_bins=lambda: 16,
             play=_rec_play, stop_play=lambda: setattr(self, 'play_t0', None),
             playing=_playing, play_ms=_play_ms, play_total_ms=lambda: self.play_total)
         # ⚠ 必须与固件一致(page_lua.c): 命名空间是**固定的** "luaapp"，

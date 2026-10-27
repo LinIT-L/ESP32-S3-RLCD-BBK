@@ -2,7 +2,7 @@
 
 > 由 `tools/lua_api_doc.py` 从 `components/apps/lua_bridge/luat_lib_*.c` **自动提取**。
 > 「说明」一列取的是源码里函数上方的注释 —— **改代码就是改文档**，不需要手改本文件。
-> 共 **192** 个 API / 17 个模块。加 API 见技能 `lintos-lua-app-pipeline` §18。「定义」列是源码位置。
+> 共 **182** 个 API / 16 个模块。加 API 见技能 `lintos-lua-app-pipeline` §18。「定义」列是源码位置。
 
 ## `espnow` — ESP-NOW 点对点/广播（≤250 字节/包，不用路由器；双机联机、遥控、信标）
 
@@ -163,21 +163,6 @@
 | `app.net.arp_list` | （源码未写注释） | `luat_lib_net.c:289` |
 | `app.net.ipinfo` | 返回 ip, 掩码, 网关, DNS, 接口名 (未联网 / 无 netif 时返回 0 个值) | `luat_lib_net.c:290` |
 | `app.net.vendor` | 未命中返回 nil (OUI 字典常驻固件, 与 netdect 的厂商显示同源) | `luat_lib_net.c:291` |
-
-## `rec` — 
-
-| API | 说明 | 定义 |
-|---|---|---|
-| `app.rec.start` | （源码未写注释） | `luat_lib_rec.c:87` |
-| `app.rec.stop` | （源码未写注释） | `luat_lib_rec.c:88` |
-| `app.rec.active` | （源码未写注释） | `luat_lib_rec.c:89` |
-| `app.rec.ms` | （源码未写注释） | `luat_lib_rec.c:90` |
-| `app.rec.bytes` | （源码未写注释） | `luat_lib_rec.c:91` |
-| `app.rec.play` | （源码未写注释） | `luat_lib_rec.c:92` |
-| `app.rec.stop_play` | （源码未写注释） | `luat_lib_rec.c:93` |
-| `app.rec.playing` | （源码未写注释） | `luat_lib_rec.c:94` |
-| `app.rec.play_ms` | （源码未写注释） | `luat_lib_rec.c:95` |
-| `app.rec.play_total_ms` | （源码未写注释） | `luat_lib_rec.c:96` |
 
 ## `store` — 持久化（`nvs` 掉电保留、`db` 核心互通库）
 

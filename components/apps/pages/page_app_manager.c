@@ -976,8 +976,18 @@ static void am_col_render_list(void) {
              *     只用 am_col_hline / am_col_fill(已带边界夹取), 不自己算指针。 */
             int dpm = am_store_dl_permille_of(a);
             if (dpm >= 0) {
+                /* ★ 2026-10-27: 百分比原来是"条右端 + 6px 固定偏移", 而右侧按钮宽度随字数变
+                 *   (2 字 48px / 3 字"下载中" 72px) ⇒ 下载中时百分比会压到按钮上。
+                 *   改成**先算百分比实际宽度并右对齐到按钮左侧**, 进度条再贴它左边, 永不重叠。 */
+                char pg[8];
+                int pct = dpm / 10;
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+                snprintf(pg, sizeof(pg), "%d%%", pct);
+                int pw  = (int)strlen(pg) * 8;          /* ASCII 步进 8px */
+                int px  = AM_ROW_BTN_X0 - 6 - pw;       /* 百分比右对齐到按钮左侧 */
                 int bx0 = AM_ROW_TX;
-                int bx1 = AM_ROW_BTN_X0 - 42;   /* ★ 留出右侧 42px 给百分比, 避免重叠 */
+                int bx1 = px - 8;                       /* 进度条到百分比左边 8px */
                 int by0 = y + 29;
                 int by1 = by0 + 6;
                 /* 夹进本行可见范围 (AM_ROW_H 内) 与列缓冲高度 */
@@ -991,11 +1001,8 @@ static void am_col_render_list(void) {
                         am_col_fill(bx0 + 1, by0 + 1,
                                     (bx0 + fw < bx1) ? bx0 + fw : bx1 - 1,
                                     by1 - 1, !sel);
-                    /* 百分比画在**条右侧的空白区**(条已留出 42px) */
-                    char pg[8];
-                    int pct = dpm / 10; if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-                    snprintf(pg, sizeof(pg), "%d%%", pct);   /* 0..100 ⇒ 最多 4 字节 */
-                    am_col_text_l(bx1 + 6, by0 - 1, pg, sel);
+                    /* 百分比右对齐画在按钮左侧（宽度已按实际字数算） */
+                    if (px > bx1) am_col_text_l(px, by0 - 1, pg, sel);
                 }
             } else {
                 const char *ds = am_store_sub_of(a);

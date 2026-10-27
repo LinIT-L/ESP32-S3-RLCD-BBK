@@ -125,7 +125,7 @@ void lua_mod_gps_register(lua_State *L);
 void lua_mod_espnow_register(lua_State *L);
 void lua_mod_wiki_register(lua_State *L);
 void lua_mod_util_register(lua_State *L);
-void lua_mod_rec_register(lua_State *L);   /* 2026-10-24: 定时器/随机/序列化/校验/游戏数学 */
+   /* 2026-10-24: 定时器/随机/序列化/校验/游戏数学 */
 
 /* 定时器驱动: 由 page_lua.c 的 lua_poll() 每帧调用 (定义在 luat_lib_util.c)。
  * 必须是同一个 lua_State —— 单 VM 天然满足, 换 VM 要先把定时器清空。 */
