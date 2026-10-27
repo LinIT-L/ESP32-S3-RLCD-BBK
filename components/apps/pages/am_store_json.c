@@ -204,6 +204,12 @@ int am_store_json_parse(const char *txt,
             if (rk.crc == 0) ok = false;
         }
         if (ok) {
+            /* ★ 2026-10-27: 读版本号 (可选字段, 缺失 = 0 = 未知版本, 不参与"更新"判断) */
+            long vv = 0;
+            v = j_key(ob, "ver");
+            if (v && j_num(v, &vv) && vv > 0) rk.ver = (uint32_t)vv;
+        }
+        if (ok) {
             if (!rk.label[0]) snprintf(rk.label, sizeof(rk.label), "%s", rk.name);
             out[(*out_n)++] = rk;
         } else {

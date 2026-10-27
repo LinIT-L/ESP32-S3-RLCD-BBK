@@ -48,6 +48,12 @@ typedef struct {
     char     fname[48];  /* 文件名 xxx.lua */
     char     desc[96];   /* LAPP 简介 (无打包则空) */
     char     cat_zh[16]; /* ★ 中文分类(游戏/运维/软件...) —— app.cat 指向这里, 不能用局部数组(悬空) */
+    /* ★ 2026-10-27 商店"更新"能力: 本地已装版本 vs 云端索引版本。
+     *   ver  = 从已安装文件的 LAPP 头 `ver=` 读出来的实际版本
+     *   rver = 云端 index.json 里同名包的 ver (0 = 索引里没有/字段缺失 = 不提示更新)
+     *   判定: 已安装 且 rver > ver  ⇒ 按钮显示「更新」 */
+    uint16_t ver;
+    uint16_t rver;
     uint8_t  kind;       /* 0=本地已有包(可安装)  1=云端包(需先下载) —— 2026-10-04 */
     int16_t  ridx;       /* kind=1 时: 对应 am_rstore_get() 的下标 */
 } am_pkg_entry_t;
@@ -213,6 +219,10 @@ static void am_pkg_scan(void) {
                 /* ★★★ 2026-10-17 linit 定: **显示名以文件名(去 .lua)为准** —— 游戏/模拟器习惯用文件名,
                  *   LAPP 里的 name 仅作兜底(文件名为空时)。分类/图标仍读 LAPP 头。 */
                 apppack_parse(spath, &meta);
+                /* ★ 2026-10-27: 读本地已装版本 (LAPP 头 `ver=`) —— 这是"更新"判定的左边。
+                 *   注意 apppack.c 原来只认 "version=", 与文档/store_build 的 "ver=" 对不上,
+                 *   已在 apppack.c 里两个键都收; 这里按整数解析 (非数字 → 0 = 未知)。 */
+                s_pkg[k].ver = (uint16_t)strtoul(meta.version, NULL, 10);
                 snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%.*s", (int)len - 4, nm);
                 if (!s_pkg[k].label[0] && meta.name[0])
                     snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%s", meta.name);
@@ -233,7 +243,11 @@ static void am_pkg_scan(void) {
                     int rn = am_rstore_count();
                     for (int r = 0; r < rn; r++) {
                         const am_rpkg_t *rp = am_rstore_get(r);
-                        if (rp && strcmp(rp->name, bn) == 0 && rp->cat[0]) { snprintf(icat, sizeof(icat), "%s", rp->cat); break; }
+                        if (rp && strcmp(rp->name, bn) == 0) {
+                            /* ★ 2026-10-27: 顺手记下云端版本 —— "更新"按钮靠它比大小 */
+                            s_pkg[k].rver = (uint16_t)rp->ver;
+                            if (rp->cat[0]) { snprintf(icat, sizeof(icat), "%s", rp->cat); break; }
+                        }
                     }
                 }
                 if (!icat[0] && meta.cat[0]) snprintf(icat, sizeof(icat), "%s", meta.cat);
@@ -458,6 +472,36 @@ static void am_store_sync_remote(void) {
     }
     s_rview_synced = want;
 }
+/* ★ 2026-10-27 商店「更新」判定的数据源:
+ *   索引(am_rstore)是异步到达的 —— 扫描包时它可能还没到(rver=0), 之后到了必须补一次。
+ *   渲染路径(am_store_btn_of)每帧都调, 不能每次都遍历索引, 所以用"代次"缓存:
+ *   只在 ①扫描完成(s_pkg 变了) ②索引条数变化 时重算一次。 */
+static int s_rver_gen = -1;
+static void am_sync_rver(void) {
+    int gen = am_rstore_count();
+    for (int k = 0; k < s_pkg_n; k++) {
+        char bn[48];
+        snprintf(bn, sizeof(bn), "%s", s_pkg[k].fname);
+        char *dot = strrchr(bn, '.');
+        if (dot) *dot = 0;
+        uint16_t rv = 0;
+        for (int r = 0; r < gen; r++) {
+            const am_rpkg_t *rp = am_rstore_get(r);
+            if (rp && rp->name[0] && bn[0] && strcmp(rp->name, bn) == 0) { rv = (uint16_t)rp->ver; break; }
+        }
+        s_pkg[k].rver = rv;
+    }
+    s_rver_gen = gen;
+}
+/* 该条目是否有新版可装 = 已安装 且 云端 ver > 本地 ver。
+ * 本地 ver=0 视为第 1 版(老包/无 LAPP 头的包), 否则这些包永远等不到更新。 */
+static bool am_pkg_has_update(int k) {
+    if (k < 0 || k >= s_pkg_n) return false;
+    if (!s_pkg_inst[k]) return false;
+    uint16_t lv = s_pkg[k].ver ? s_pkg[k].ver : 1;
+    return (s_pkg[k].rver > lv);
+}
+
 /* 总条目数 / 取第 k 条: 前 s_pkg_n 条是本地包, 后面接云端视图 */
 /* ★★★ 2026-10-18 linit **必修**: 原来 `(s_pkg_scanned == 0) ? ... : 0`
  *   ⇒ **没插 TF 卡时包扫描永远完不成** ⇒ 列表恒为 0 ⇒ "无法获取应用列表" ✗
@@ -503,19 +547,76 @@ bool am_store_auto_install(const char *fname) {
     char src[192], dst[192], catdir[96];
     snprintf(src, sizeof(src), "/sdcard/store_pkg/%s", fname);
     if (!am_file_exist(src)) snprintf(src, sizeof(src), "%s/%s", AM_STORE_SRC1, fname);
-    snprintf(catdir, sizeof(catdir), "%s/%s", AM_STORE_DST, sub);
+
+    /* ★★★ 2026-10-27 「更新」支持（原来"推了新版本也升不上去"的根因就在这段）：
+     *   ① 目标原来写死成内置 AM_STORE_DST，而商店安装按 pref 可能装在 TF 卡
+     *      ⇒ 更新会在内置再放一份，卡上那份旧版照样被启动。现在目标跟着"已装在哪"走。
+     *   ② 原来 `if (已存在) return true` —— **永不覆盖**。现在按大小判定：
+     *      大小相同 = 同一版本，跳过写卡；不同 = 覆盖。
+     *   ③ 覆盖走 .new + 旧版改 .old 再改名，任何一步失败都回滚到旧版，不会把应用搞丢。 */
+    char path_int[192], path_sd[192];
+    snprintf(path_int, sizeof(path_int), "%s/%s/%s", AM_STORE_DST, sub, fname);
+    snprintf(path_sd,  sizeof(path_sd),  "/sdcard/apps/%s/%s", sub, fname);
+    bool on_sd = am_file_exist(path_sd);
+    if (on_sd) snprintf(catdir, sizeof(catdir), "/sdcard/apps/%s", sub);
+    else       snprintf(catdir, sizeof(catdir), "%s/%s", AM_STORE_DST, sub);
     snprintf(dst, sizeof(dst), "%s/%s", catdir, fname);
     mkdir(AM_STORE_DST, 0755);
     mkdir(catdir, 0755);
-    if (am_file_exist(dst)) { ESP_LOGI("AMSTORE", "自动安装: 已存在 %s", dst); return true; }
-    if (am_copy_file(src, dst)) {
-        ESP_LOGI("AMSTORE", "自动安装完成: %s -> %s", src, dst);
-        am_lua_invalidate();
-        am_store_invalidate();
-        return true;
+
+    struct stat ss, ds;
+    long src_sz = (stat(src, &ss) == 0) ? (long)ss.st_size : -1;
+    if (src_sz <= 0) { ESP_LOGW("AMSTORE", "自动安装: 源文件读不到 %s", src); return false; }
+
+    bool had_old = (stat(dst, &ds) == 0);
+    if (had_old) {
+        if ((long)ds.st_size == src_sz) {
+            ESP_LOGI("AMSTORE", "自动安装: 已是同一版本(%ld B), 跳过 %s", src_sz, dst);
+            return true;
+        }
+        ESP_LOGI("AMSTORE", "自动安装: 覆盖更新 %s (%ld -> %ld B)",
+                 dst, (long)ds.st_size, src_sz);
     }
-    ESP_LOGW("AMSTORE", "自动安装失败: %s -> %s", src, dst);
-    return false;
+
+    char tmp[200], bak[200];
+    snprintf(tmp, sizeof(tmp), "%s.new", dst);
+    snprintf(bak, sizeof(bak), "%s.old", dst);
+    remove(tmp); remove(bak);
+    if (!am_copy_file(src, tmp)) {
+        remove(tmp);
+        ESP_LOGW("AMSTORE", "自动安装失败(复制): %s", src);
+        return false;
+    }
+    struct stat ts;
+    if (stat(tmp, &ts) != 0 || (long)ts.st_size != src_sz) {
+        remove(tmp);
+        ESP_LOGW("AMSTORE", "自动安装失败(校验不通过, 可能是空间不足): %s", tmp);
+        return false;
+    }
+    if (had_old && rename(dst, bak) != 0) {       /* 先把旧版挪开(失败也不丢) */
+        remove(tmp);
+        ESP_LOGW("AMSTORE", "自动安装失败(旧版挪不动): %s", dst);
+        return false;
+    }
+    if (rename(tmp, dst) != 0) {
+        remove(tmp);
+        if (had_old) rename(bak, dst);            /* ← 回滚到旧版 */
+        ESP_LOGW("AMSTORE", "自动安装失败(改名), 已回滚旧版: %s", dst);
+        return false;
+    }
+    if (had_old) remove(bak);
+
+    /* 另一侧还留着旧副本 → 删掉，否则同一个应用两份，启动的是旧的那份 */
+    const char *other = on_sd ? path_int : path_sd;
+    if (am_file_exist(other)) {
+        remove(other);
+        ESP_LOGW("AMSTORE", "自动安装: 已清理另一份旧副本 %s", other);
+    }
+
+    ESP_LOGI("AMSTORE", "自动安装完成: %s -> %s", src, dst);
+    am_lua_invalidate();
+    am_store_invalidate();
+    return true;
 }
 
 /* 安装目标选择回调: result 0=内置固件 1=TF卡 */
@@ -612,6 +713,44 @@ static void am_store_download_ask(ui_ctx_t *ctx, int rk) {
     am_dlg_title16(ctx);
 }
 
+/* ★ 更新: 已装旧版 + 索引里有更高 ver → 走与「下载」完全相同的通道。
+ *   包落到 /sdcard/store_pkg/<name>.lua，下载完成后 am_store_net.c 会调
+ *   am_store_auto_install() 把它覆盖安装掉（那里用 tmp + 改名，失败保留旧版）。
+ *   不再弹二次确认：按钮已经明确写着「更新」，再确认一次只是多一次点击。 */
+static void am_store_update_start(ui_ctx_t *ctx, int k) {
+    if (k < 0 || k >= s_pkg_n) return;
+    if (!wifi_manager_is_connected()) {
+        os_dialog_toast(ctx, "\xe8\xaf\xb7\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c"); /* 请连接网络 */
+        return;
+    }
+    char bn[48];
+    snprintf(bn, sizeof(bn), "%s", s_pkg[k].fname);
+    char *dot = strrchr(bn, '.');
+    if (dot) *dot = 0;
+    int rpos = -1;
+    for (int i = 0; i < am_rstore_count(); i++) {
+        const am_rpkg_t *rp = am_rstore_get(i);
+        if (rp && rp->name[0] && strcmp(rp->name, bn) == 0) { rpos = i; break; }
+    }
+    if (rpos < 0) {
+        os_dialog_toast(ctx, "\xe7\xb4\xa2\xe5\xbc\x95\xe7\xbc\xba\xe5\xa4\xb1");   /* 索引缺失 */
+        return;
+    }
+    /* ★ 先清掉商店源目录里的旧副本 —— auto_install 的"源"就是它，
+     *   留着旧的会"安装成功但还是老版本"，等于没更新。 */
+    char stale[192];
+    snprintf(stale, sizeof(stale), "%s/%s", AM_STORE_SRC2, s_pkg[k].fname);
+    remove(stale);
+    ESP_LOGI("AMSTORE", "更新: %s v%u -> v%u", s_pkg[k].fname,
+             (unsigned)(s_pkg[k].ver ? s_pkg[k].ver : 1), (unsigned)s_pkg[k].rver);
+    if (!am_rstore_dl_start(rpos)) {
+        os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe5\xbc\x80\xe5\xa7\x8b\xe4\xb8\x8b\xe8\xbd\xbd"); /* 无法开始下载 */
+        return;
+    }
+    os_dialog_toast(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe6\x9b\xb4\xe6\x96\xb0...");   /* 正在更新... */
+    am_rebuild_keep();
+}
+
 /* ★ 商店行统一入口 (2026-10-02 linit: "商店只负责安装/卸载, 卸载不负责启动应用"):
  *   已安装 → 弹"卸载 XXX?" ; 未安装 → 弹"安装 XXX?" ; 云端未下载 → 弹"下载 XXX?" 。
  *   **商店里永远不启动应用** —— 要运行请到「应用」分类点它。
@@ -691,6 +830,7 @@ void am_store_toggle(ui_ctx_t *ctx, const os_app_t *a) {
     }
     int k = am_pkg_find(a);
     if (k < 0) return;
+    if (am_pkg_has_update(k)) { am_store_update_start(ctx, k); return; }  /* ★ 有新版本 → 直接更新 */
     if (am_pkg_installed(k)) { am_store_uninstall_ask(ctx, a); return; }
     am_store_activate(ctx, a);          /* 未装时 activate 的本职就是弹"安装?"确认 */
 }
@@ -709,6 +849,7 @@ void am_store_activate(ui_ctx_t *ctx, const os_app_t *a) {
     }
     int k = am_pkg_find(a);
     if (k < 0) return;
+    if (am_pkg_has_update(k)) { am_store_update_start(ctx, k); return; }  /* ★ 有新版本 → 直接更新 */
     if (am_pkg_installed(k)) {
         /* ★★★ 2026-10-18 linit 反复报"点卸载就退出应用中心"的真因:
          *   商店里点**已安装的行**原来会 `am_lua_open_path()` **直接启动应用** ✗
@@ -926,6 +1067,10 @@ const char *am_store_btn_of(const os_app_t *a) {
         return am_asset_installed(a) ? "\xe5\x8d\xb8\xe8\xbd\xbd"        /* 卸载 */
                                      : "\xe4\xb8\x8b\xe8\xbd\xbd";       /* 下载 */
     if (am_rview_find(a) >= 0) return "\xe4\xb8\x8b\xe8\xbd\xbd";        /* 下载 */
+    /* ★★★ 2026-10-27 linit 定：**有新版就把按钮变成「更新」**，否则保持「卸载」。
+     *   只在真推了新版本(rver > ver)时才变，平时语义不变，老用户不会被搞混。
+     *   卸载仍然可用（长按行 → 卸载确认），不会因为变成「更新」就丢了卸载入口。 */
+    { int ku = am_pkg_find(a); if (ku >= 0 && am_pkg_has_update(ku)) return "\xe6\x9b\xb4\xe6\x96\xb0"; /* 更新 */ }
     /* ★ 2026-10-27 linit 定的全局规则: 商店里**只有两种动作** ——
      *   未安装 = "下载"(下载完成自动安装, 本地已有包则直接安装)
      *   已安装 = "卸载"(把 TF 与内置分区一起删干净)
@@ -949,10 +1094,17 @@ bool am_store_tick(void) {
     if (s_pkg_done) {
         s_pkg_done = false;
         am_pkg_cleanup();
+        s_rver_gen = -1;          /* ★ 条目集合变了 → 重新对齐云端版本 */
         changed = true;
     }
     int before = s_rview_n;
     am_store_sync_remote();
     if (s_rview_n != before) changed = true;
+    /* ★ 2026-10-27: 索引是异步到达的(扫描时可能还没有)，到齐后补一次版本对齐，
+     *   否则「更新」按钮要等下次重进商店才出现。条数没变就整段跳过，几乎零开销。 */
+    if (am_rstore_count() != s_rver_gen) {
+        am_sync_rver();
+        changed = true;
+    }
     return changed;
 }

@@ -56,19 +56,47 @@ esp_err_t apppack_parse(const char *path, apppack_meta_t *out)
         if (nl) *nl = 0;
         if (strncmp(line, "--@app ", 7) == 0) {
             found = true;
-            const char *kv = line + 7;
-            const char *eq = strchr(kv, '=');
-            if (eq) {
-                size_t klen = (size_t)(eq - kv);
-                const char *v = eq + 1;
-                /* 去掉行尾 \r */
-                size_t vlen = strlen(v);
+            /* ★★★ 2026-10-27 必修: 一行里可能有**多个** key=value。
+             *   文档(docs/Lua应用开发.md)与 pack_app.py 产物都是这种写法:
+             *     --@app name=QQ堂冒险 cat=游戏 desc=泡泡炸砖块 ver=1 icon=<b64>
+             *   原来只取第 1 个 '=' 到行尾当值 ⇒ name 会变成
+             *   "QQ堂冒险 cat=游戏 desc=..." 一整串(中文名超长/分类全错/版本为空)。
+             *   老包还有"一行一个键"的写法(如 矢量地图), 必须同时兼容。
+             *   做法: 逐个扫 key=value。值 = 等号后到下一个 " key=" 之前 ——
+             *   不能简单按空格切, desc 里本来就有空格。 */
+            char *p = line + 7;
+            while (*p) {
+                while (*p == ' ' || *p == '\t') p++;
+                if (!*p) break;
+                char *ks = p;                       /* key 起点 */
+                char *eq = strchr(ks, '=');
+                if (!eq) break;
+                size_t klen = (size_t)(eq - ks);
+                bool bad = false;                   /* key 中间夹空格 ⇒ 不是键值对, 跳过 */
+                for (size_t i = 0; i < klen; i++)
+                    if (ks[i] == ' ' || ks[i] == '\t') { bad = true; break; }
+                if (bad || klen == 0) { p = eq + 1; continue; }
+
+                char *v = eq + 1;                   /* 值起点 */
+                char *next = NULL;                  /* 下一个 " key=" 的空格位置 */
+                for (char *q = v; *q; q++) {
+                    if (*q != ' ' && *q != '\t') continue;
+                    char *r = q + 1;
+                    while (*r && *r != '=' && *r != ' ' && *r != '\t') r++;
+                    if (*r == '=' && r > q + 1) { next = q; break; }
+                }
+                size_t vlen = next ? (size_t)(next - v) : strlen(v);
                 while (vlen && (v[vlen - 1] == '\r' || v[vlen - 1] == ' ')) vlen--;
-#define KEY_IS(k) (klen == sizeof(k) - 1 && strncmp(kv, k, klen) == 0)
+
+#define KEY_IS(k) (klen == sizeof(k) - 1 && strncmp(ks, k, klen) == 0)
                 if (KEY_IS("name"))         snprintf(out->name, sizeof(out->name), "%.*s", (int)vlen, v);
                 else if (KEY_IS("cat"))     snprintf(out->cat, sizeof(out->cat), "%.*s", (int)vlen, v);
                 else if (KEY_IS("desc"))    snprintf(out->desc, sizeof(out->desc), "%.*s", (int)vlen, v);
-                else if (KEY_IS("version")) snprintf(out->version, sizeof(out->version), "%.*s", (int)vlen, v);
+                /* ★ 2026-10-27 修: 文档与 store_build.py 用的键是 **ver=**, 而这里原来只认
+                 *   "version=" ⇒ 版本号从来没被读出来过(全为零) ⇒ 商店无法判断"有没有新版"。
+                 *   两个键都收, 以 ver 为主(现有包都是 ver=)。 */
+                else if (KEY_IS("ver") || KEY_IS("version"))
+                    snprintf(out->version, sizeof(out->version), "%.*s", (int)vlen, v);
                 else if (KEY_IS("need")) {
                     /* 逗号分隔的能力声明 (目前只有 wifi); 大小写不敏感, 只在 vlen 内找 */
                     for (size_t i = 0; i + 4 <= vlen; i++)
@@ -78,13 +106,20 @@ esp_err_t apppack_parse(const char *path, apppack_meta_t *out)
                         }
                 }
                 else if (KEY_IS("icon")) {
-                    int got = b64decode(v, out->icon, (int)APPPACK_ICON_BYTES);
+                    /* 值后面可能紧跟别的键 ⇒ 必须先截断到 vlen 再解码 */
+                    char ib[800];
+                    size_t il = vlen < sizeof(ib) - 1 ? vlen : sizeof(ib) - 1;
+                    memcpy(ib, v, il);
+                    ib[il] = 0;
+                    int got = b64decode(ib, out->icon, (int)APPPACK_ICON_BYTES);
                     out->has_icon = (got == (int)APPPACK_ICON_BYTES);
                     if (!out->has_icon && got >= 0)
                         ESP_LOGD(TAG, "icon 尺寸异常 %d B (期望 %u), 忽略",
                                  got, (unsigned)APPPACK_ICON_BYTES);
                 }
 #undef KEY_IS
+                if (!next) break;
+                p = next;
             }
         } else if (line[0] != '-' && line[0] != '\n' && line[0] != 0) {
             break;                      /* 头部落结束 → 后面是代码, 不再扫 */

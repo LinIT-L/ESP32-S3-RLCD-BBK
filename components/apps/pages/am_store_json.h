@@ -24,6 +24,10 @@ typedef struct {
     char     desc[96];    /* 商店列表第二行: 应用说明 */
     uint32_t size;        /* 字节数 */
     uint32_t crc;         /* crc32 (zlib/以太网, 由 hex 文本转来) */
+    /* ★ 2026-10-27: 版本号 —— 索引里一直有 "ver"(store_build.py 生成), 但这里没字段、
+     *   解析器也不读 ⇒ 设备端永远不知道远端版本 ⇒ 商店不可能出现"更新"。
+     *   0 = 老索引没这个字段(按"未知"处理, 不提示更新)。 */
+    uint32_t ver;
     char     path[96];    /* 相对路径 pkgs/xxx.lua */
     /* ★ 2026-10-25 资源包类 (仙剑这类"只装游戏数据"的包):
      *   type   = "app"(默认, 装 .lua) / "asset"(下载 zip 解到 target)

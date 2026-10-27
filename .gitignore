@@ -262,3 +262,7 @@ tools/store_deploy.sh
 tools/store_parse_test.c
 tools/theme_preview.py
 tools/wuxia_pack.py
+
+# 应用提交站运行时数据与真实配置（含 SMTP 授权码）
+server/upload/config.php
+server/upload/data/
