@@ -1374,7 +1374,7 @@ PAL_DialogWaitForKeyWithMaximumSeconds(
 --*/
 {
    static void *palette__lz;   /* LINTOS: 懒分配 */
-   SDL_Color *palette = (SDL_Color *)pal_lazy_get(&palette__lz, (size_t)(256));
+   SDL_Color *palette = (SDL_Color *)pal_lazy_get(&palette__lz, (size_t)(256 * sizeof(SDL_Color)));  /* ★ 单位是 SDL_Color(4B), 原来只给 256B 却 memcpy 1024B */
    SDL_Color   *pCurrentPalette, t;
    int         i;
    uint32_t    dwBeginningTicks = SDL_GetTicks();

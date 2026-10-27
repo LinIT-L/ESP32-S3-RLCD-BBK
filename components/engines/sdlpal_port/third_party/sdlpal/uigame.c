@@ -1072,7 +1072,7 @@ PAL_PlayerStatus(
    static void *bufImage__lz;   /* LINTOS: 懒分配 */
    BYTE *bufImage = (BYTE *)pal_lazy_get(&bufImage__lz, (size_t)(PAL_RLEBUFSIZE));
    static void *bufImageBox__lz;   /* LINTOS: 懒分配 */
-   BYTE *bufImageBox = (BYTE *)pal_lazy_get(&bufImageBox__lz, (size_t)(50 * 49));
+   BYTE *bufImageBox = (BYTE *)pal_lazy_get(&bufImageBox__lz, (size_t)(72 * 72))  /* ★ 同一 slot 统一取最大(原 50*49 会不够) */;
    int              labels0[] = {
       STATUS_LABEL_EXP, STATUS_LABEL_LEVEL, STATUS_LABEL_HP,
       STATUS_LABEL_MP
@@ -1311,7 +1311,7 @@ PAL_ItemUseMenu(
 {
    BYTE           bColor, bSelectedColor;
    static void *bufImage__lz;   /* LINTOS: 懒分配 */
-   BYTE *bufImage = (BYTE *)pal_lazy_get(&bufImage__lz, (size_t)(2048));
+   BYTE *bufImage = (BYTE *)pal_lazy_get(&bufImage__lz, (size_t)(PAL_RLEBUFSIZE))  /* ★ 同一 slot 统一取最大, 原来 2048/64000 混用会写穿 */;
    DWORD          dwColorChangeTime;
    static SHORT   sSelectedPlayer = 0;
    SDL_Rect       rect = {110, 2, 200, 180};
@@ -1528,7 +1528,7 @@ PAL_BuyMenu_OnItemChange(
    const SDL_Rect      rect = {20, 8, 300, 175};
    int                 i, j, n, iPlayerID, x, y;
    static void *bufImage__lz;   /* LINTOS: 懒分配 */
-   BYTE *bufImage = (BYTE *)pal_lazy_get(&bufImage__lz, (size_t)(2048));
+   BYTE *bufImage = (BYTE *)pal_lazy_get(&bufImage__lz, (size_t)(PAL_RLEBUFSIZE))  /* ★ 同一 slot 统一取最大, 原来 2048/64000 混用会写穿 */;
 
    //
    // Prepare item bakcground box pos
@@ -1820,7 +1820,7 @@ PAL_EquipItemMenu(
    static void *bufImageBox__lz;   /* LINTOS: 懒分配 */
    BYTE *bufImageBox = (BYTE *)pal_lazy_get(&bufImageBox__lz, (size_t)(72 * 72));
    static void *bufImage__lz;   /* LINTOS: 懒分配 */
-   BYTE *bufImage = (BYTE *)pal_lazy_get(&bufImage__lz, (size_t)(2048));
+   BYTE *bufImage = (BYTE *)pal_lazy_get(&bufImage__lz, (size_t)(PAL_RLEBUFSIZE))  /* ★ 同一 slot 统一取最大, 原来 2048/64000 混用会写穿 */;
    WORD             w;
    int              iCurrentPlayer, i;
    BYTE             bColor, bSelectedColor;

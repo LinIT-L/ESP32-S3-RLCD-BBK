@@ -10,7 +10,10 @@
 set(SDLPAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sdlpal")
 
 # 音乐后端: "opl" = 片上 RIX/OPL 合成(体积 0, 吃 CPU) ; "mp3" = 预渲染曲目(省 CPU, 占 TF)
-set(PAL_MUSIC_MODE "opl" CACHE STRING "pal music backend: opl|mp3")
+# ★ 2026-10-27 linit 定: 音乐走预渲染 MP3（省 CPU1，不跑 OPL 音序器）。
+#   注意：mp3 模式下 SFX 与音乐共用 I2S 是互斥的，pal_music.c 里按
+#   "music 目录是否存在"自动选模式，见 RIX_Init 的注释。
+set(PAL_MUSIC_MODE "mp3" CACHE STRING "pal music backend: opl|mp3")
 
 set(SDLPAL_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/pal_lazy.c"   # LINTOS: 仙剑大缓冲懒分配
@@ -78,6 +81,12 @@ else()
     list(APPEND SDLPAL_SRCS "pal_music.c")
     list(APPEND PAL_MUSIC_DEFS PAL_USE_MP3_MUSIC=1)
     message(STATUS "PAL 音乐后端: 预渲染 MP3")
+endif()
+
+# 诊断开关: -DPAL_DISABLE_AUDIO=ON 时完全不开音频(二分堆损坏来源用)
+option(PAL_DISABLE_AUDIO "disable PAL audio (diagnostic)" OFF)
+if(PAL_DISABLE_AUDIO)
+    add_compile_definitions(PAL_DISABLE_AUDIO=1)
 endif()
 
 idf_component_register(

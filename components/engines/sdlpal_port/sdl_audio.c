@@ -66,10 +66,13 @@ static volatile bool s_run = false;
  *   那行 free(buf) 永远走不到 ⇒ 每次进出漏 4KB(1024帧×2ch×2B)。
  *   现在提到文件级, 由 pal_audio_free_buf() 在"任务确认死亡后"统一释放。 */
 static uint8_t *s_abuf = NULL;
+static size_t   s_abuf_sz = 0;      /* ★ 已分配字节数 —— 规格变大时必须重分, 否则回调写越界 */
+#define ABUF_TAIL    1024
+#define ABUF_CANARY  0xA5
 
 void pal_audio_free_buf(void)
 {
-    if (s_abuf) { free(s_abuf); s_abuf = NULL; }
+    if (s_abuf) { free(s_abuf); s_abuf = NULL; s_abuf_sz = 0; }
 }
 
 static void audio_task(void *arg)
@@ -78,7 +81,19 @@ static void audio_task(void *arg)
     const int ch = s_spec.channels ? s_spec.channels : 2;
     const int frames = s_spec.samples ? s_spec.samples : 1024;
     const int bytes  = frames * ch * 2;             /* S16 */
-    if (!s_abuf) s_abuf = malloc((size_t)bytes);   /* 文件级, 退出由 pal_audio_free_buf 归还 */
+    /* ★★★ 2026-10-27 修堆越界: 原来只在"没分配过"时 malloc 一次。
+     *   如果第二次 SDL_OpenAudio 的 samples/channels 比第一次大(例如 512→1024 帧,
+     *   或 mono→stereo), 回调按新尺寸写进**旧的小缓冲** ⇒ 写穿到相邻堆块,
+     *   之后任意 malloc 在 tlsf 里崩(实测 PAL_GetPalette → f_stat → malloc)。
+     *   现在按尺寸增长重分配。 */
+    if (bytes > 0 && s_abuf_sz < (size_t)bytes) {
+        if (s_abuf) { free(s_abuf); s_abuf = NULL; }
+        /* ★ 2026-10-27 诊断: 尾部留 1KB 哨兵区, 回调后检查是否被写 ——
+         *   能直接抓到"SDLPal 混音写超设备缓冲"这类越界(它会把相邻堆块写坏)。 */
+        s_abuf = malloc((size_t)bytes + ABUF_TAIL);
+        s_abuf_sz = s_abuf ? (size_t)bytes : 0;
+        if (s_abuf) memset(s_abuf + bytes, ABUF_CANARY, ABUF_TAIL);
+    }
     uint8_t *buf = s_abuf;
     if (!buf) { ESP_LOGE(TAG, "no mem for audio buf"); s_run = false; s_task = NULL; vTaskDeleteWithCaps(NULL); return; }
 
@@ -94,6 +109,18 @@ static void audio_task(void *arg)
         memset(buf, s_spec.silence, (size_t)bytes);
         const int64_t cb_t0 = esp_timer_get_time();
         if (s_spec.callback) s_spec.callback(s_spec.userdata, buf, bytes);
+
+        /* ★ 越界哨兵检查: 回调若写超设备缓冲, 这里立刻报出越界了多少字节 */
+        if (s_abuf && s_abuf_sz) {
+            for (int k = 0; k < ABUF_TAIL; k++) {
+                if (s_abuf[s_abuf_sz + k] != ABUF_CANARY) {
+                    ESP_LOGE(TAG, "[AUDIO-OVERFLOW] 回调写超设备缓冲: 越界 %d 字节 (buf=%d)",
+                             ABUF_TAIL - k, (int)s_abuf_sz);
+                    memset(s_abuf + s_abuf_sz, ABUF_CANARY, ABUF_TAIL);   /* 复原, 避免刷屏 */
+                    break;
+                }
+            }
+        }
         /* ★ 2026-10-25 诊断: 只在第一块打一次，确认"调用时"callback 是否还有效 */
         {
             static int s_cb_logged = 0;
@@ -321,6 +348,15 @@ int SDL_OpenAudio(SDL_AudioSpec *desired, SDL_AudioSpec *obtained)
              desired ? (int)desired->channels : -1,
              desired ? (int)desired->samples : -1);
     if (!desired || !desired->callback) return -1;
+#ifdef PAL_DISABLE_AUDIO
+    /* 诊断开关: 完全不开音频, 用来二分"堆被写坏"是否来自音效混音 */
+    ESP_LOGW(TAG, "PAL_DISABLE_AUDIO: SDL_OpenAudio 直接失败(诊断模式)");
+    return -1;
+#endif
+
+    /* ★ 2026-10-27: 先停旧任务再换规格 —— 否则旧任务正拿 s_abuf 回调,
+     *   这里换 s_spec 会让它按新尺寸写旧缓冲。 */
+    if (s_run) pal_audio_stop();
 
     s_spec = *desired;
     /* 只接受 S16（audio_player 走 int16 环形缓冲） */

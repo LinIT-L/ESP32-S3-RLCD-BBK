@@ -185,6 +185,31 @@ bool pal_stop_and_wait(int timeout_ms)
     return self;
 }
 
+/* ★ 2026-10-27 诊断: 仙剑跑一段后堆元数据被写坏(StoreProhibited in TLSF)。
+ *   每 2 秒校验一次两个堆区，能在"刚被写坏"的窗口内报出来，
+ *   配合堆 canary(CONFIG_HEAP_POISONING_COMPREHENSIVE)定位越界写的来源。 */
+static void pal_heap_guard_task(void *arg)
+{
+    (void)arg;
+    int n = 0;
+    while (s_running) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!s_running) break;
+        n++;
+        ESP_LOGD(TAG, "[HEAP-GUARD] #%d 检查内部堆…", n);
+        bool ok_int  = heap_caps_check_integrity(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, true);
+        ESP_LOGD(TAG, "[HEAP-GUARD] #%d 检查 PSRAM…", n);
+        bool ok_psr  = heap_caps_check_integrity(MALLOC_CAP_SPIRAM, true);
+        if (!ok_int || !ok_psr) {
+            ESP_LOGE(TAG, "[HEAP-GUARD] 第%d次检查失败: 内部=%s PSRAM=%s  (内部=%u PSRAM=%u)",
+                     n, ok_int ? "OK" : "损坏", ok_psr ? "OK" : "损坏",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        }
+    }
+    vTaskDelete(NULL);
+}
+
 bool pal_launch(void)
 {
     /* ★★★ 2026-10-25 修「第二次进游戏没有加载进度条 / 也没声音」:
@@ -213,10 +238,17 @@ bool pal_launch(void)
 
     /* 栈必须内部 RAM？不：SDLPal 不碰 flash 写/cache 关断路径，放 PSRAM 省内部 RAM。
      * 但栈上有大量局部变量（PAL_LARGE=static 已经把大数组挪走了），16KB 够。 */
-    ESP_LOGI(TAG, "启动前 内部RAM free=%u largest=%u | PSRAM free=%u",
+    /* ★ 2026-10-27: 加 DMA 可用的内部内存 —— SD 读卡必须从这里分配 DMA 缓冲,
+     *   分配失败会直接让 SDLPal 读资源失败退出(实测 rc=255 闪退)。 */
+    ESP_LOGI(TAG, "启动前 内部RAM free=%u largest=%u | DMA可用 free=%u largest=%u | PSRAM free=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    /* 2026-10-27: 堆校验任务暂时停用 —— 它在堆已损坏时会崩在遍历内部并重启, 冲掉现场。 */
+    (void)pal_heap_guard_task;
+
     if (xTaskCreateWithCaps(pal_task, "sdlpal", 16 * 1024, NULL, 5, &s_task,
                             MALLOC_CAP_SPIRAM) != pdPASS) {
         s_running = false;

@@ -183,14 +183,20 @@ int SDL_FillRect(SDL_Surface *dst, SDL_Rect *r, Uint32 color)
 {
     if (!dst || !dst->pixels) return -1;
     SDL_Rect a = { 0, 0, (Uint16)dst->w, (Uint16)dst->h };
+    /* ★ 2026-10-27 修堆越界: 原来只 clamp 右下, 负数 x/y 会变成"从 0 开始按原宽填",
+     *   右侧一超界就写穿缓冲 → 破坏相邻堆块元数据 → 之后任意 malloc 崩在 tlsf。
+     *   现在按矩形交集合成 (x0,y0)-(x1,y1), 四个方向都裁。 */
     if (r) {
-        if (r->x > 0) { a.x = r->x; }
-        if (r->y > 0) { a.y = r->y; }
-        if (r->w > 0) a.w = r->w;
-        if (r->h > 0) a.h = r->h;
+        int x0 = r->x, y0 = r->y;
+        int x1 = r->x + r->w, y1 = r->y + r->h;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > dst->w) x1 = dst->w;
+        if (y1 > dst->h) y1 = dst->h;
+        if (x1 <= x0 || y1 <= y0) return 0;          /* 完全在屏外 */
+        a.x = (Uint16)x0; a.y = (Uint16)y0;
+        a.w = (Uint16)(x1 - x0); a.h = (Uint16)(y1 - y0);
     }
-    if (a.x + a.w > dst->w) a.w = (Uint16)(dst->w - a.x);
-    if (a.y + a.h > dst->h) a.h = (Uint16)(dst->h - a.y);
     for (int y = 0; y < a.h; y++)
         memset((uint8_t *)dst->pixels + (size_t)(a.y + y) * dst->pitch + a.x,
                (int)color, a.w);
@@ -205,11 +211,20 @@ int SDL_BlitSurface(SDL_Surface *src, SDL_Rect *sr, SDL_Surface *dst, SDL_Rect *
     int sw = sr && sr->w ? sr->w : src->w;
     int sh = sr && sr->h ? sr->h : src->h;
     int dx = dr ? dr->x : 0, dy = dr ? dr->y : 0;
+    /* ★ 2026-10-27 修堆越界(仙剑崩溃根因):
+     *   原来只裁右/下边, **dx/dy 为负时直接把第一行 memcpy 到 pixels 之前** ——
+     *   s_pixels 是 640x480 的 PSRAM 块, 精灵在屏幕左/上边缘露出一半时
+     *   (仙剑走到地图边界极常见) 就写坏相邻堆块头 → 之后 malloc 在 tlsf 里崩。
+     *   标准做法: 先按源矩形裁, 再按目标矩形裁, 两侧同步偏移。 */
+    if (sx < 0) { dx -= sx; sw += sx; sx = 0; }
+    if (sy < 0) { dy -= sy; sh += sy; sy = 0; }
     if (sx + sw > src->w) sw = src->w - sx;
     if (sy + sh > src->h) sh = src->h - sy;
+    if (dx < 0) { sx -= dx; sw += dx; dx = 0; }
+    if (dy < 0) { sy -= dy; sh += dy; dy = 0; }
     if (dx + sw > dst->w) sw = dst->w - dx;
     if (dy + sh > dst->h) sh = dst->h - dy;
-    if (sw <= 0 || sh <= 0) return 0;
+    if (sw <= 0 || sh <= 0 || sx < 0 || sy < 0) return 0;
     for (int y = 0; y < sh; y++)
         memcpy((uint8_t *)dst->pixels + (size_t)(dy + y) * dst->pitch + dx,
                (uint8_t *)src->pixels + (size_t)(sy + y) * src->pitch + sx, sw);
