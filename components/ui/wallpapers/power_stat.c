@@ -63,6 +63,17 @@ static void ps_log_ensure(void)
         memset(&s_log, 0, sizeof(s_log));
         s_log.magic = PS_LOG_MAGIC;
     }
+    /* ★★ 2026-10-27 修「刷完整片开机就 panic、无限重启」(实测 StoreProhibited @ ps_log_put):
+     *   s_log 放在 RTC_NOINIT 内存里, **跨固件版本保留**(刷 flash 不会清 RTC RAM)。
+     *   换版本后若本结构/PS_LOG_N 变过, 旧数据的 magic 可能仍然匹配, 但 head 是旧布局的
+     *   错位值(或上电乱码) ⇒ &s_log.ev[head] 写到非法地址 ⇒ 开机就 panic。
+     *   magic 只能证明"这块内存被本模块写过", 证明不了"布局和现在一致",
+     *   所以 head 必须再校验一次范围 —— 纠正成 0 远好于崩溃。 */
+    if (s_log.head >= (uint32_t)PS_LOG_N) {
+        s_log.head  = 0;
+        s_log.total = 0;
+        memset(s_log.ev, 0, sizeof(s_log.ev));
+    }
 }
 
 static void ps_log_put(uint8_t kind, uint32_t dur_s, uint8_t cause)
