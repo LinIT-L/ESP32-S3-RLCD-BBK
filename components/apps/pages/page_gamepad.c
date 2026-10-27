@@ -295,10 +295,9 @@ static void conn_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         os_dialog_toast(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xb6\x85\xe6\x97\xb6"); /* 连接超时 */
         return;
     }
-    /* 仍在连接: 刷新显示并保持"正在连接"; 等久了给一句可操作提示 */
+    /* 仍在连接: 刷新显示并保持"正在连接", 直到超时。
+     * ★ 2026-10-27 linit: 删掉原来"按一下手柄键唤醒"那句提示 —— 用户不需要被教怎么按手柄。 */
     const char *txt = "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5"; /* 正在连接... */
-    if (elapsed > 8000000LL)
-        txt = "\xe6\x8c\x89\xe4\xb8\x80\xe4\xb8\x8b\xe6\x89\x8b\xe6\x9f\x84\xe9\x94\xae\xe5\x94\xa4\xe9\x86\x92"; /* 按一下手柄键唤醒 */
     snprintf(d->items[0], sizeof(d->items[0]), "%s", txt);
     ctx->needs_redraw = true;
 }
@@ -501,13 +500,7 @@ static int64_t s_map_ignore_until = 0;  /* 屏蔽"进入映射界面"那次确�
 static int64_t s_map_hold_wait = 0;     /* ★ 等待"手里按着的键"松开的起始时刻 (0=没在等) */
 static volatile bool s_map_cancel_req = false;  /* ★ 触摸"取消映射"请求 (由 map_touch 置位, map_poll 处理) */
 
-/* 是否有任意物理键正被按住 —— 进向导时若还按着键，上升沿会把它当成新按下，
- * 导致第一个功能被误配。等它松开再开始捕获。 */
-static bool any_phys_pressed(void) {
-    for (int p = 0; p < (int)PHYS_MAX; p++)
-        if (bt_manager_is_phys_pressed((phys_t)p)) return true;
-    return false;
-}
+/* (any_phys_pressed 已删除: 用它做"等按键松开"的门闸会把映射界面卡死 —— 见 map_poll 注释) */
 static int64_t s_map_done_ms = 0;       /* 映射结束(完成/超时)时刻: 兜底收敛残留弹窗/提示 */
 /* ★ 2026-10-02 "每个按键只映射一次": 本轮已经捕获过的物理键(32 位位图, 覆盖 PHYS_MAX=24)。
  *   向导要依次映射 10 个功能, 但没有 Start/Select 的手柄凑不出 10 个键 →
@@ -581,22 +574,13 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     if (s_map_func < 0 || s_map_func >= FUNC_MAX) return;
     /* 屏蔽"进入映射界面"那次确认键: 短时间(400ms)内不捕获任何按键, 防误映射 */
     if (esp_timer_get_time() < s_map_ignore_until) return;
-    /* ★★ 2026-10-27 兼容修复: 手里还按着键就先别捕获(仅限"尚未捕获"阶段)。
-     *   连上/配对时用户往往还按着某个键(如 home)，而 bt_map 是**上升沿**上报，
-     *   400ms 屏蔽只是延后读取、并不清"已按住"状态 ⇒ 屏蔽一结束就把它当成一次新按下，
-     *   第一个功能(上)被误配成那个键，之后整个方向都是错的。
-     *   ⚠ 必须排除 s_capture_armed 阶段 —— 那时"s_capture_phys 还按着"正是预期状态,
-     *   由下面 597 行那段负责等松开推进, 否则这里的等待会和它重叠。
-     *   最多等 5s(防某个键卡住导致永远进不去)。 */
-    if (!s_capture_armed && any_phys_pressed()) {
-        if (s_map_hold_wait == 0) s_map_hold_wait = esp_timer_get_time();
-        if (esp_timer_get_time() - s_map_hold_wait < 5000000LL) {
-            s_map_last_progress = esp_timer_get_time();   /* 等待期不算超时 */
-            return;
-        }
-        ESP_LOGD(TAG, "按键映射: 有键持续按住 >5s, 放弃等待直接开始");
-    }
-    s_map_hold_wait = 0;
+    /* ★★★ 2026-10-27 撤回上一版的"等手里键松开再捕获"(linit 实测: 映射界面完全按不动,
+     *   而不做映射时按键一切正常)。
+     *   原因: 那段用 any_phys_pressed() 当门闸, 假设"没有键按下"是常态 —— 但手柄静止时
+     *   hat/摇杆状态未必是"中位"(4 向编码、零点漂移都会让它恒为某个方向) ⇒ 门闸恒真
+     *   ⇒ map_poll 每帧直接 return, 永远走不到捕获, 按键全被吞掉。
+     *   根治"进映射时还按着键被误配"靠下面的 400ms 屏蔽就够了, 不再加全局等待。
+     *   (教训: 别用"当前无输入"做前置条件 —— 输入设备可能永远有状态。) */
 
     /* 映射无操作 40s 超时: 自动取消, 恢复手柄导航, 避免卡死在映射界面 */
     if ((esp_timer_get_time() - s_map_last_progress) > 40000000LL) {

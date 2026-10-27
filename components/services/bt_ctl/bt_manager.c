@@ -163,7 +163,12 @@ static bool bt_connect_async(const esp_hid_scan_result_t *r);
  * 处理：每次尝试记下 bda + 截止时间；失败或超时统一走 bt_conn_failed()
  *   → 清"连接中" → 主动断掉那条链路 → 记连败次数 → 连败 N 次由回连任务重建蓝牙栈。
  * ==========================================================================*/
-#define BT_CONNECT_TIMEOUT_MS   12000   /* open 可能无限阻塞 ⇒ 外部兜底 */
+/* ★ 2026-10-27 linit 反馈"连接失败": 实测日志里直连一发出去就被 L2CAP 拒
+ *   (cannot start new connection at conn st: 1 = 旧链路还占着), 但这里要**干等满
+ *   12s 超时**才判定失败、才去按名字重连 ⇒ 用户看到的是"连接失败", 实际 20 秒后才连上。
+ *   BLE 正常连接 1~2s, L2CAP 拒绝是瞬时的 —— 12s 纯属白等。
+ *   压到 4s: 正常手柄够连上, 连不上就快速切"按名字重解析"那条路(见 bt_reconnect_task)。*/
+#define BT_CONNECT_TIMEOUT_MS   4000    /* open 可能无限阻塞 ⇒ 外部兜底 */
 #define BT_CONN_FAILS_TO_RESET  2       /* 连败几次就整栈重建 */
 static int64_t  s_conn_deadline_ms = 0;      /* 0 = 无进行中的尝试 */
 static uint8_t  s_conn_try_bda[6];

@@ -132,7 +132,7 @@ static void scan_task(void *arg)
         s_scan_count = results_len;
         ESP_LOGI(TAG, "scan done: %u results", (unsigned)results_len);
     } else {
-        ESP_LOGD(TAG, "scan failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));   /* ★ 提到 W: 扫不到设备时必须能看到原因 */
         if (results) {
             esp_hid_scan_results_free(results);
         }
@@ -165,12 +165,12 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
         /* 兜底: 若上层异常路径残留了 esp_hid_gap 静态状态(信号量未清),
          * esp_hid_gap_init 会报 "Already initialised"。复位后重试一次即可恢复,
          * 避免蓝牙永久卡"初始化中"(实测 bug, 见 bt_core_deinit 注释)。 */
-        ESP_LOGD(TAG, "esp_hid_gap_init failed (%s), 复位残留状态后重试", esp_err_to_name(err));
+        ESP_LOGW(TAG, "esp_hid_gap_init failed (%s), 复位残留状态后重试", esp_err_to_name(err));
         esp_hid_gap_deinit();
         err = esp_hid_gap_init(HIDH_BLE_MODE);
     }
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "esp_hid_gap_init failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "esp_hid_gap_init failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -179,7 +179,7 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
      * esp_hidh_init 内部会注册 BLE GATT 事件, 需 gattc 回调先就绪. */
     err = esp_ble_gattc_register_callback(esp_hidh_gattc_event_handler);
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "gattc register failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "gattc register failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -191,12 +191,12 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
     err = esp_hidh_init(&config);
     if (err != ESP_OK) {
         /* 兜底: 若 esp_hidh 静态状态残留(异常路径未走 deinit), 复位后重试一次。 */
-        ESP_LOGD(TAG, "esp_hidh_init failed (%s), 复位残留状态后重试", esp_err_to_name(err));
+        ESP_LOGW(TAG, "esp_hidh_init failed (%s), 复位残留状态后重试", esp_err_to_name(err));
         esp_hidh_deinit();
         err = esp_hidh_init(&config);
     }
     if (err != ESP_OK) {
-        ESP_LOGD(TAG, "esp_hidh_init failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "esp_hidh_init failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -208,11 +208,11 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
     {
         const uint8_t *oa = esp_bt_dev_get_address();
         if (oa) {
-            ESP_LOGD(TAG, "本机BLE地址: %02x:%02x:%02x:%02x:%02x:%02x (手柄据此识别主机)",
+            ESP_LOGW(TAG, "本机BLE地址: %02x:%02x:%02x:%02x:%02x:%02x (手柄据此识别主机)",
                      oa[0], oa[1], oa[2], oa[3], oa[4], oa[5]);
         }
         int bn = esp_ble_get_bond_device_num();
-        ESP_LOGD(TAG, "本地已保存绑定数: %d", bn);
+        ESP_LOGW(TAG, "本地已保存绑定数: %d", bn);
     }
     ESP_LOGI(TAG, "HID host init done (ready)");
     return true;
