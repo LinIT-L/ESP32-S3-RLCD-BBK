@@ -193,6 +193,7 @@ static bool  s_saw_connecting = false;
 static bt_device_t s_conn_dev;        /* 待连接设备缓存 (供后台连接任务读取) */
 
 static void start_key_mapping(ui_ctx_t *ctx);   /* 前向声明: 连接成功后直接衔接按键映射 */
+static void p_gamepad_menu(ui_ctx_t *ctx);      /* 前向声明: 映射结束后回到菜单 */
 
 /* 后台连接任务: esp_hidh_dev_open 同步阻塞约 2s, 放独立任务以免卡住 UI/延迟弹窗 */
 /* ⚠ 先等 300ms: 点选连接前刚 bt_manager_stop_scan(), BLE 控制器还在退出扫描态,
@@ -543,6 +544,10 @@ static void map_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
             s_map_done_ms = 0;
             os_dialog_clear_all(ctx);                                /* 关全部弹窗层 + 清 toast */
             if (ctx->current_page == OS_PAGE_DIALOG) os_pop(ctx);    /* 清掉独立 toast 残留的弹窗页 */
+            /* ★ 2026-10-27: clear_all 会把垫在向导下面的"手柄配置"菜单一起清掉，
+             *   而手柄页本体不画任何东西（没注册 render）⇒ 映射结束后是一片空白。
+             *   连上就自动进映射之后这条路每次都会走到，所以这里补回菜单当落点。 */
+            if (ctx->current_page == OS_PAGE_GAMEPAD) p_gamepad_menu(ctx);
             ctx->needs_redraw = true;
         }
         return;
@@ -749,7 +754,8 @@ static void on_gamepad_select(ui_ctx_t *ctx, int result, void *ud) {
 static bool s_want_map;
 void page_gamepad_request_map_on_enter(void) { s_want_map = true; }
 
-static void p_gamepad_enter(ui_ctx_t *ctx) {
+/* 手柄配置菜单 —— 进入本页时、以及映射向导结束后都用它当落点 (复用, 别写两份) */
+static void p_gamepad_menu(ui_ctx_t *ctx) {
     bool conn = bt_manager_is_connected();
     int count = 0;
     for (int src = 0; src < 7; src++) {
@@ -761,7 +767,13 @@ static void p_gamepad_enter(ui_ctx_t *ctx) {
     }
     os_dialog_list(ctx, "\xe6\x89\x8b\xe6\x9f\x84\xe9\x85\x8d\xe7\xbd\xae", s_gp_items_dyn, count, 0,
                    on_gamepad_select, NULL);
-    /* ★ 被"连接后自动映射"点名进来的 → 直接在菜单之上打开按键映射向导 */
+}
+
+static void p_gamepad_enter(ui_ctx_t *ctx) {
+    p_gamepad_menu(ctx);
+    /* ★ 被"连接后自动映射"点名进来的 → 直接在菜单之上打开按键映射向导。
+     *   弹窗栈只渲染栈顶 ⇒ 用户看到的直接就是「请按下 X 按键」，
+     *   关掉/做完向导后回到下面这层菜单 (linit 2026-10-27: 连上就提示按键，不要先弹提示框)。 */
     if (s_want_map) {
         s_want_map = false;
         ESP_LOGD(TAG, "[EV] 自动进入按键映射 (连接后自动映射)");

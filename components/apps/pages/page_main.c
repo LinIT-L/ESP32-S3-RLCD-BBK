@@ -78,7 +78,10 @@ static void p_main_poll(ui_ctx_t *ctx) {
         static char nm[33];
         if (bt_manager_take_map_pending(nm, sizeof nm)) {
             ESP_LOGI("MAIN", "[EV] 桌面收到待映射: '%s' → 跳手柄页开映射", nm);
-            os_dialog_toast(ctx, "\xe6\xa3\x80\xe6\xb5\x8b\xe5\x88\xb0\xe6\x96\xb0\xe6\x89\x8b\xe6\x9f\x84\xef\xbc\x8c\xe6\x89\x93\xe5\xbc\x80\xe6\x8c\x89\xe9\x94\xae\xe6\x98\xa0\xe5\xb0\x84"); /* 检测到新手柄, 打开按键映射 */
+            /* ★ 2026-10-27 linit: **不再弹「检测到新手柄，打开按键映射」的提示**。
+             *   连上就该直接看到「请按下 X 按键」，少一次无意义的弹窗。
+             *   手柄页 enter 时会按 s_want_map 自动把映射向导叠在菜单之上
+             *   （弹窗栈只渲染栈顶 ⇒ 用户看到的就是向导本身），这里只负责跳页。 */
             page_gamepad_request_map_on_enter();
             os_push(ctx, OS_PAGE_GAMEPAD);
             ctx->needs_redraw = true;
