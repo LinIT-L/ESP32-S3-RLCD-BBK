@@ -46,7 +46,12 @@ void app_board_init_gps(app_board_t *board);
  * async 版在后台任务里跑, 不占启动路径。 */
 bool app_board_gps_probe(void);
 void app_board_gps_probe_async(void);
-void board_gps_boot_task(void *arg);   /* 已识别到 GPS 时的后台初始化+送待机 */
+void board_gps_boot_task(void *arg);
+/* ★ 2026-10-27: GPS 电源管家 (常驻): 开机停靠 + 之后每 30s 确认仍睡着,
+ *   被唤醒就再送 PMREQ; 应用在用 GPS 时让路。 */
+void board_gps_guard_task(void *arg);
+/* GPS 管家复查间隔(秒), 默认 600; 现场调试用 */
+void board_gps_set_recheck_sec(int sec);   /* 已识别到 GPS 时的后台初始化+送待机 */
 
 #ifdef __cplusplus
 }

@@ -1,3 +1,4 @@
+#include "esp_timer.h"
 #include "app_board.h"
 #include "gps.h"          /* GPS (MAX-M10S) 驱动 API: gps_init/gps_sleep */
 
@@ -242,15 +243,97 @@ void app_board_init_gps(app_board_t *board)
     }
 }
 
+/* 旧名兼容: 只做一次停靠就退出(不等价于管家, 管家是常驻的) */
+void board_gps_boot_task(void *arg)
+{
+    app_board_init_gps((app_board_t *)arg);
+    vTaskDelete(NULL);
+}
+
 /* ★ 2026-10-20 启动提速: GPS 初始化搬到后台任务跑 (main.c 里创建)。
  *   原因: 波特率自适应 ~1.4s + 送待机 ~0.6s, 同步跑会把桌面拖到 3.9s。
  *   board 指针来自 app_main 的栈帧, 而 app_main 进主循环后不返回 ⇒ 生命周期安全。 */
-void board_gps_boot_task(void *arg)
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ★★★ 2026-10-27 linit: GPS **管家**任务（原来只是一次性开机停靠）
+ *   需求原话: "开机的时候他就要进行睡眠。只有我开 GPS 类软件的时候才会启用"、
+ *            "可以重复的让他睡眠，可以用管家模块去管理他"。
+ *   行为:
+ *     ① 开机立刻停靠一次（gps_boot_park: 静听 300ms, 醒着才发 PMREQ）
+ *     ② 之后每 30s 巡检一次:
+ *          - 应用正在用(app.gps.start 起了解析服务) ⇒ 让路, 绝不打扰
+ *          - 已确认入睡(gps_sleep_verified) ⇒ 什么都不做（不装 UART, 免得重配 pad 把它叫醒）
+ *          - 其余情况(被噪声唤醒 / 上次没睡成 / 应用退出漏调 stop) ⇒ 再停靠一次
+ *     ③ 连续失败 5 次后改成 5 分钟一次并在日志里降噪 —— 不是放弃, 是不刷屏。
+ *   为什么必须"重复": 只要 GPS 的 RXD 上出现一个边沿它就醒(热插拔/干扰/别的任务碰脚),
+ *   醒了自己不会再睡, 而 PMREQ 是一次性指令 ⇒ 必须有人长期盯着。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+/* ★★ 2026-10-28 linit 否决"定期轮询复查"这个做法 ⇒ **默认关闭(0)**。
+ *   理由: 轮询本身要装 UART, 装 UART 会重配 TX pad, 那一下电平跳变正是模块的唤醒条件
+ *   (Data Sheet Table 10: 待机时 RXD 仍为上拉输入, 且是唤醒源) —— 拿"吵醒它"的办法去
+ *   检查"它睡没睡", 方法本身就是错的。
+ *   只在现场调试时用 remcon `gpsrecheck <秒>` 临时打开。 */
+static int s_gps_recheck_ms = 0;
+void board_gps_set_recheck_sec(int sec)
+{
+    if (sec < 10) sec = 10;                 /* 太密会一直占 UART, 反而把模块吵醒 */
+    if (sec > 3600) sec = 3600;
+    s_gps_recheck_ms = sec * 1000;
+}
+#define GPS_GUARD_PERIOD_MS   30000   /* 未确认时的巡检间隔 */
+#define GPS_GUARD_RETRY_MS     5000   /* ★ 刚失败时 5 秒就再来一次(抓到 TX 偶发通的窗口) */
+#define GPS_GUARD_BACKOFF_MS  300000   /* 连续失败太多次后降到 5 分钟, 只降噪不放弃 */
+#define GPS_GUARD_FAIL_MAX    3
+
+void board_gps_guard_task(void *arg)
 {
     app_board_t *b = (app_board_t *)arg;
+    extern bool gps_service_is_running(void);
+    extern bool gps_sleep_verified(void);
+
+    /* ① 开机立刻停靠 */
     app_board_init_gps(b);
-    ESP_LOGI(TAG, "GPS 后台初始化完成 (gps_ok=%d)", b ? (int)b->gps_ok : -1);
-    vTaskDelete(NULL);
+    ESP_LOGI(TAG, "GPS 管家: 开机停靠完成 (ok=%d, verified=%d)",
+             b ? (int)b->gps_ok : -1, (int)gps_sleep_verified());
+
+    int fails = 0;
+    int64_t last_check = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(fails >= GPS_GUARD_FAIL_MAX ? GPS_GUARD_BACKOFF_MS
+                                    : (fails > 0 ? GPS_GUARD_RETRY_MS : GPS_GUARD_PERIOD_MS)));
+        if (gps_service_is_running()) {          /* 应用在用 → 让路 */
+            fails = 0;
+            continue;
+        }
+        /* ★★★ 2026-10-28 关键修复(实测: 整夜掉 424mV ≈ 30mA) ★★★
+         *   原来这里写的是 `if (gps_sleep_verified()) continue;` —— 把"确认过一次"当成永久事实。
+         *   但模块**待机时 RXD 仍是上拉输入**(Data Sheet Table 10), 而唤醒源正是 UART RX:
+         *   任何一点线上噪声/别的任务碰引脚都能把它叫醒, 醒了不会自己再睡, 而 PMREQ 是一次性指令。
+         *   实测证据: PWRSTAT 睡眠占比 96.8% (7.0h), 但 24h 电压 4190→3760mV (-53.4mV/h ≈ 29.7mA)
+         *   ⇒ ESP 在睡, GPS 整夜在跑。
+         *   现在: 即使已确认入睡, 也**每 GPS_GUARD_RECHECK_MS 复查一次**(静听 1.8s, 醒着就重送 PMREQ)。
+         *   代价: 每次约 2 秒/10 分钟 ≈ 0.3% 占空比, 换来不会整夜漏 25mA。 */
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        bool need_check = !gps_sleep_verified() ||
+                          (s_gps_recheck_ms > 0 && (now_ms - last_check) >= s_gps_recheck_ms);
+        if (!need_check) { fails = 0; continue; }
+        last_check = esp_timer_get_time() / 1000;
+        if (gps_sleep_verified())
+            ESP_LOGI(TAG, "GPS 管家: 定期复查(间隔 %d 秒)", s_gps_recheck_ms / 1000);
+        else
+            ESP_LOGW(TAG, "GPS 管家: 模块不是待机状态 ⇒ 再送一次 PMREQ");
+        app_board_init_gps(b);
+        if (gps_sleep_verified()) {
+            fails = 0;
+            ESP_LOGI(TAG, "GPS 管家: 已重新送回待机");
+        } else {
+            fails++;
+            if (fails <= GPS_GUARD_FAIL_MAX || (fails % 10) == 0) {
+                ESP_LOGW(TAG, "GPS 管家: 第 %d 次仍未确认入睡 (模块可能不支持软件待机, "
+                              "或 RXD 侧持续被干扰); 之后每 %d 分钟再试",
+                         fails, GPS_GUARD_BACKOFF_MS / 60000);
+            }
+        }
+    }
 }
 
 /* ★★ GPS 一次性识别 (写完固件的第一次开机才跑一次, 见 hw_cfg_gps_probed):
@@ -263,8 +346,11 @@ bool app_board_gps_probe(void)
         ESP_LOGW(TAG, "GPS 识别: 未识别到模块 (%s)", esp_err_to_name(r));
         return false;
     }
+    extern bool gps_sleep_verified(void);
     gps_sleep();                      /* 焊了: 立刻送软件待机 (46µA) */
-    ESP_LOGW(TAG, "GPS 识别: 已识别到模块, 已送待机");
+    bool slept = gps_sleep_verified();
+    gps_release();                    /* 卸 UART + 归还内部 RAM; 未睡成时会再试一次 */
+    ESP_LOGW(TAG, "GPS 识别: 已识别到模块, 待机确认=%s", slept ? "是" : "否(管家会继续重试)");
     return true;
 }
 

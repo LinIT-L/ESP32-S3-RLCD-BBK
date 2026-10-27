@@ -80,6 +80,23 @@ esp_err_t gps_release(void);
  *   结束后 UART 已卸载, 内部 RAM 归零。 */
 esp_err_t gps_boot_park(void);
 
+/* ★ 2026-10-27: 把 GPS 的 RXD 侧(TX脚)钉成输出高并 hold。
+ *   软件待机的唤醒源是 UART RX, pad 浮空的噪声就能把它叫醒 ⇒ 睡前必须调用。*/
+void gps_tx_hold_high(void);
+
+/* ★ 2026-10-27: 是否"已确认入睡"(实测静默 1.2s)。管家任务据此决定要不要补一次，
+ *   已确认就不再去装 UART(装 UART 会重配 TX pad, 电平跳变会把模块叫醒)。 */
+bool gps_sleep_verified(void);
+
+/* ★ 是否正在停靠/初始化(装 UART 期间)。兜底/管家看到它就别插手，
+ *   否则两个任务同时发 PMREQ、同时删驱动 ⇒ 日志串味、甚至撞 spinlock。 */
+bool gps_is_busy(void);
+
+/* ★ 2026-10-27 接线诊断: 逐档波特率试听 + MON-VER 验回程, 只读不改配置。
+ *   安全: s_ready/s_initing/解析服务占用时直接拒绝, 不会抢 UART 驱动。 */
+void gps_diag(void);
+void gps_probe_bauds(void);
+
 #ifdef __cplusplus
 }
 #endif

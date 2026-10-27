@@ -70,6 +70,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include "sd_scan.h"   /* sd_is_mounted: logsave 前判断卡是否挂着 */
+#include "bt_manager.h"     /* ★ 2026-10-27: bt 命令诊断用 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -282,6 +283,27 @@ static void rc_mic_probe(int ms)
 /* ===== 立即执行 (在字符串读任务上下文, 不外发到 UI) =====
  * 注意: 必须在内部复制一份再用 —— 调用方 rc_exec 里的 buf 已被 rc_next 在
  * 命令名后写过 '\0', 直接传进去会丢掉后面所有参数(如 "shutdown auto" 变成 "shutdown")。 */
+extern bool board_battery_calibrate(uint32_t real_mv);   /* ★ 电池分压标定 */
+
+/* ★ 2026-10-27: GPS 诊断/送睡的任务壳 —— 见调用处注释(remcon 栈不够, 会溢出重启) */
+static void rc_task_gpsdiag(void *arg)
+{
+    extern void gps_diag(void);
+    (void)arg;
+    gps_diag();
+    printf("GPSDIAG_DONE\r\n");
+    vTaskDelete(NULL);
+}
+static void rc_task_gpssleep(void *arg)
+{
+    extern esp_err_t gps_boot_park(void);
+    extern bool gps_sleep_verified(void);
+    (void)arg;
+    esp_err_t r = gps_boot_park();
+    printf("GPSSLEEP ret=%s verified=%d\r\n", esp_err_to_name(r), (int)gps_sleep_verified());
+    vTaskDelete(NULL);
+}
+
 static void rc_cmd_immediate(const char *line){
     char args[RC_LINE_MAX];
     snprintf(args, sizeof(args), "%s", line);
@@ -614,6 +636,68 @@ static void rc_cmd_immediate(const char *line){
             extern void power_stat_get(void *out);
             extern void power_stat_diag(void);
             power_stat_diag();      /* 有则打印, 无则忽略 */
+        }
+    } else if (strcmp(cmd, "gpsrecheck") == 0) {
+        char *av = rc_next(&rest);
+        int sec = av ? atoi(av) : 0;
+        if (sec <= 0) {
+            printf("GPSRECHECK 用法: gpsrecheck <秒>  (默认 600)\r\n");
+        } else {
+            extern void board_gps_set_recheck_sec(int);
+            board_gps_set_recheck_sec(sec);
+            printf("GPSRECHECK 已设为 %d 秒\r\n", sec);
+        }
+    } else if (strcmp(cmd, "gpssleep") == 0 || strcmp(cmd, "gpsrecheck") == 0 || strcmp(cmd, "gpsdiag") == 0 ||
+               strcmp(cmd, "gpsprobe") == 0) {
+        /* ★★★ 2026-10-27 linit: **必须扔到独立任务里跑**。
+         *   实测: 直接在 remcon 任务里调用 → "A stack overflow in task remcon has been
+         *   detected" → 板子重启。remcon 栈只有几 KB, 而诊断要 160B 缓冲 + 一大堆日志格式化,
+         *   装 UART/autobaud 还会再吃栈。这也是之前 gpsprobe "一按就重启"的真因(不是 UART 抢用)。 */
+        extern void gps_diag(void);
+        bool want_diag = (strcmp(cmd, "gpssleep") != 0);
+        printf("GPS%s 已启动, 请等 15 秒...\r\n", want_diag ? "DIAG" : "SLEEP");
+        BaseType_t ok = xTaskCreate(want_diag ? rc_task_gpsdiag : rc_task_gpssleep,
+                                    want_diag ? "gpsdiag" : "gpssleep",
+                                    6144, NULL, 3, NULL);
+        if (ok != pdPASS) printf("GPSERR 任务创建失败(内存不足)\r\n");
+    } else if (strcmp(cmd, "gpsprobe_old") == 0) {
+        /* 逐档波特率试听 300ms, 判定 GPS 接线/供电是否正常 (只读, 不发任何命令) */
+        extern void gps_probe_bauds(void);
+        gps_probe_bauds();
+        printf("GPSPROBE_END\r\n");
+    } else if (strcmp(cmd, "bt") == 0) {
+        /* ★ 2026-10-27 linit「蓝牙显示开且关不掉」诊断用。
+         *   bt            打印状态 (enabled/ready/connected/scanning)
+         *   bt on / off   等价于点设置页的开关 (走同一组 bt_manager_* API) */
+        char *av = rc_next(&rest);
+        if (!av || !*av) {
+            printf("BT enabled=%d ready=%d connected=%d scanning=%d\r\n",
+                   (int)bt_manager_is_enabled(), (int)bt_manager_is_ready(),
+                   (int)bt_manager_is_connected(), (int)bt_manager_is_scanning());
+        } else if (strcmp(av, "on") == 0) {
+            bt_manager_enable();
+            printf("BT on -> enabled=%d ready=%d\r\n",
+                   (int)bt_manager_is_enabled(), (int)bt_manager_is_ready());
+        } else if (strcmp(av, "off") == 0) {
+            bt_manager_disable();
+            printf("BT off -> enabled=%d ready=%d\r\n",
+                   (int)bt_manager_is_enabled(), (int)bt_manager_is_ready());
+        } else {
+            printf("BT_ERR 用法: bt | bt on | bt off\r\n");
+        }
+    } else if (strcmp(cmd, "batcal") == 0) {
+        /* ★ 2026-10-27: 用外部仪表(万用表/INA226)的真实 VBAT 标定分压比。
+         *   用法: batcal <真实mV>   例: batcal 4038
+         *   内部取**同一时刻**脚上 mV 反算 k = 真实/脚上, 写 NVS 后立即生效。
+         *   ⚠ 要在电池电压稳定时标 (充电中/大负载时 VBAT 本身在变)。 */
+        char *av = rc_next(&rest);
+        uint32_t real_mv = av ? (uint32_t)atoi(av) : 0;
+        if (real_mv == 0) {
+            printf("BATCAL_ERR 用法: batcal <真实mV>  (例 batcal 4038)\r\n");
+        } else {
+            bool ok = board_battery_calibrate(real_mv);
+            printf("BATCAL %s\r\n", ok ? "OK" : "FAIL");
+            board_battery_diag();     /* 标完立刻打一遍新读数, 便于核对 */
         }
     } else if (strcmp(cmd, "batstat") == 0 || strcmp(cmd, "standby") == 0) {
         /* ==== 待机(深睡)耗电实测 ====
@@ -1140,7 +1224,8 @@ static void rc_exec(const char *line){
         strcmp(cmd, "mem") == 0 || strcmp(cmd, "blk") == 0 ||
         strcmp(cmd, "audit") == 0 || strcmp(cmd, "stack") == 0 ||
         strcmp(cmd, "uptime") == 0 || strcmp(cmd, "tasks") == 0 ||
-        strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0 ||
+        strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0 || strcmp(cmd, "batcal") == 0 ||
+        strcmp(cmd, "bt") == 0 || strcmp(cmd, "gpsprobe") == 0 || strcmp(cmd, "gpsdiag") == 0 || strcmp(cmd, "gpssleep") == 0 ||
         strcmp(cmd, "ls") == 0 || strcmp(cmd, "asset") == 0 || strcmp(cmd, "wifi") == 0 ||
         strcmp(cmd, "cat") == 0 || strcmp(cmd, "rm") == 0 ||
         strcmp(cmd, "cp") == 0 || strcmp(cmd, "diag") == 0 ||

@@ -454,9 +454,15 @@ static void os_shell_loop(ui_ctx_t *ctx) {
              *   并卸掉 UART(内部 RAM 归还)。最多多耗 1 秒电, 绝不会整晚 ~10mA。 */
             {
                 extern bool gps_service_is_running(void);
+                extern bool gps_sleep_verified(void);
                 extern gps_power_state_t gps_power_state(void);
                 extern esp_err_t gps_release(void);
-                if (!gps_service_is_running() && gps_power_state() == GPS_POWER_ACTIVE) {
+                /* ★ 2026-10-27: 判据加上 gps_sleep_verified() —— gps_sleep() 现在只在
+                 *   **实测静默 1.2s** 后才把状态置 SLEEP, 所以这个 1s 兜底能真正触发;
+                 *   而 verified 之后就别再折腾(每装一次 UART 都会重配 TX pad, 可能把模块叫醒)。 */
+                extern bool gps_is_busy(void);
+                if (!gps_service_is_running() && gps_power_state() == GPS_POWER_ACTIVE &&
+                    !gps_sleep_verified() && !gps_is_busy()) {
                     gps_release();
                     ESP_LOGW(TAG, "GPS 无人使用 → 已送回待机 (兜底休眠)");
                 }
@@ -683,7 +689,9 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
          *   冷上电 / 复位重启时模块一定是醒的, 必须由开机路径兜底送睡。
          *   gps_boot_park() 先静听 300ms: 已在睡(≤46µA)就不碰它, 醒着才发 PMREQ,
          *   结束即卸 UART(内部 RAM 归零) —— 全程后台, 不占启动路径、不常驻。 */
-        if (xTaskCreate(board_gps_boot_task, "gps_boot", 4096, board, 2, NULL) != pdPASS)
+        /* ★ 2026-10-27: 由一次性"开机停靠"改成**常驻管家** —— 模块被噪声唤醒/上次没睡成时
+         *   会自动再送 PMREQ; 应用在用(app.gps.start)时让路。见 board_gps_guard_task 注释。 */
+        if (xTaskCreate(board_gps_guard_task, "gps_guard", 4096, board, 2, NULL) != pdPASS)
             app_board_init_gps(board);   /* 建任务失败就退回同步(至少功能不丢) */
     }
 #endif

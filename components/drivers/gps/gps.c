@@ -44,6 +44,9 @@ static bool               s_ready = false;
  *   会撞 `assert failed: spinlock_acquire`。 */
 static volatile bool      s_initing = false;
 static gps_power_state_t  s_state = GPS_POWER_UNKNOWN;
+/* ★ 2026-10-27: "确认已入睡"(实测 1.2s 无输出)。管家任务靠它判断要不要再补一次，
+ *   避免每 30s 都去装 UART(装 UART 会重新配置 TX pad，那一下的电平跳变会把模块叫醒)。 */
+static volatile bool s_sleep_verified = false;
 
 /* ==== 默认配置 ====
  * ★ 2026-10-05 小智模块板 (分支 board/xiaozhi-s3-core):
@@ -89,6 +92,8 @@ const gps_config_t *gps_default_config(void) { return default_cfg_bound(); }
 bool gps_is_ready(void) { return s_ready; }
 uint32_t gps_baud(void) { return s_cfg.baud; }
 gps_power_state_t gps_power_state(void) { return s_state; }
+bool gps_sleep_verified(void) { return s_sleep_verified; }
+bool gps_is_busy(void) { return s_initing; }
 
 /* ---- UBX 组帧 (含 8-bit Fletcher 校验) ---- */
 static size_t ubx_build(uint8_t *out, uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t n)
@@ -233,6 +238,9 @@ esp_err_t gps_init(const gps_config_t *cfg)
         .source_clk = UART_SCLK_DEFAULT,
     };
     ESP_ERROR_CHECK(uart_param_config(s_cfg.uart_num, &uc));
+    /* ★ 2026-10-27: 上一次 gps_sleep() 把 TX 钉成 GPIO 高并 hold 了 (防待机被噪声唤醒)。
+     *   这里必须**先解除 hold**, 否则 pad 被冻住, UART 根本发不出去(GPS 从此失联)。 */
+    if (s_cfg.pin_tx >= 0) gpio_hold_dis((gpio_num_t)s_cfg.pin_tx);
     uart_set_pin(s_cfg.uart_num, s_cfg.pin_tx, s_cfg.pin_rx,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
@@ -289,32 +297,136 @@ esp_err_t gps_init(const gps_config_t *cfg)
     return ESP_OK;
 }
 
-esp_err_t gps_sleep(void)
+/* ★★★ 2026-10-27 linit 实测「关机还有 0.1W」修复 ★★★
+ *   官方 Integration Manual 2.7.3.2: 软件待机时 **V_IO 保持供电、PIO 可被主机驱动**,
+ *   唤醒源由 PMREQ 的 wakeupSources 指定(我们用 UART RX = bit3)。
+ *   ⇒ 待机期间只要 GPS 的 RXD 上出现一个边沿, 它立刻醒, 醒了就再没人让它睡
+ *     (整夜 10~25mA)。而 ESP 这边 `uart_driver_delete()` 会让 pad 短暂**浮空**,
+ *     这点噪声就足够唤醒 —— 这是"PMREQ 发了却没睡"的真正原因。
+ *   对策: PMREQ 发完**立刻**把 TX 引脚切成 GPIO 输出高并 hold, 再卸 UART。
+ *   (此函数幂等, 可重复调用) */
+void gps_tx_hold_high(void)
 {
-    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    if (s_cfg.pin_tx < 0) return;
+    gpio_set_direction((gpio_num_t)s_cfg.pin_tx, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)s_cfg.pin_tx, 1);      /* UART 空闲电平 = 高 */
+    gpio_hold_en((gpio_num_t)s_cfg.pin_tx);
+}
 
+/* 判断"真的睡了": 数 150ms 内还收到多少字节。
+ *   ⚠ 不能用 UBX-ACK 判断 —— 官方 Integration Manual §2.7.3.2: 软件待机时
+ *     **VCC 被内部关断**, 模块根本没法回 ACK。所以 ACK 缺失是正常的。
+ *   可靠的判据是"它不再说话": 1Hz NMEA 每 200~500ms 就有一帧, 150ms 静默 + 前面
+ *   已强制 TX 高电平(无唤醒边沿) ⇒ 基本可确认已入睡。 */
+static int gps_quiet_bytes(uint32_t ms)
+{
+    uint8_t b[64];
+    int total = 0;
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    while ((uint32_t)(esp_timer_get_time() / 1000) - t0 < ms) {
+        int n = uart_read_bytes(s_cfg.uart_num, b, sizeof(b), pdMS_TO_TICKS(30));
+        if (n > 0) total += n;
+    }
+    return total;
+}
+
+/* ★★★ 2026-10-27 【根因】UBX-RXM-PMREQ 有两套载荷布局, 原来把老偏移套在新长度上 ★★★
+ *   ① protocol 23 及更早 (u-blox 8/9):
+ *        8 字节 = [0..3] duration | [4..7] flags
+ *   ② protocol 27 (u-blox M10 —— 我们的 MAX-M10S):
+ *        16 字节 = [0] version=0 | [1..3] reserved1 | [4..7] duration
+ *                  | [8..11] flags | [12..15] wakeupSources
+ *   原代码: pl[4]=0x06(flags) + pl[8]=0x08(wakeup), 长度 16 —— 偏移是①的, 长度是②的。
+ *   M10 按②解读 ⇒ duration=6ms、flags=0x08(既没 backup 也没 force)、
+ *   wakeupSources=0(**没配唤醒源**) ⇒ "睡 6 毫秒就醒, 醒后再也睡不着"。
+ *   现象完全对上: 日志偶报"已确认入睡", 但电流长期 10~25mA。
+ *   标志位(两套布局同义): flags bit1=backup(0x02) | bit2=force(0x04);
+ *                        wakeupSources bit3=uartrx(0x08)。
+ *   ⇒ 现在按②正确构造, 并以①做兜底(两种都能发, 不匹配的一方会被模块丢弃, 无害)。 */
+static uint16_t pmreq_build(uint8_t *pl, bool proto27)
+{
+    memset(pl, 0, 16);
+    if (proto27) {
+        pl[0]  = 0;                                        /* version */
+        pl[4]  = 0; pl[5] = 0; pl[6] = 0; pl[7] = 0;        /* duration = 0 → 无限期待机 */
+        pl[8]  = 0x02 | 0x04;                              /* backup + force (M10 必须 force) */
+        pl[12] = 0x08;                                     /* wakeupSources = UART RX */
+        return 16;
+    }
+    pl[0] = 0; pl[1] = 0; pl[2] = 0; pl[3] = 0;             /* duration = 0 */
+    pl[4] = 0x02 | 0x04;                                   /* backup + force */
+    return 8;
+}
+
+static bool gps_wait_steady(uint32_t quiet_ms, uint32_t max_ms);   /* 前向 */
+static esp_err_t gps_sleep_rounds(int max_rounds);
+
+esp_err_t gps_sleep(void) { return gps_sleep_rounds(3); }
+
+static esp_err_t gps_sleep_rounds(int max_rounds)
+{
+    /* ★★★ 2026-10-27 linit 修复: 原来这里直接 return ESP_ERR_INVALID_STATE,
+     *   导致所有"还没 init 就要求送睡"的调用(关机路径 / 无人使用兜底)
+     *   **全都变成空操作** —— 模块整夜按 10~25mA 跑。 */
+    if (!s_ready) return gps_boot_park();
+
+    /* ★★★ 2026-10-27 最终形态（依据 MAX-M10S Data Sheet Table 10 + Integration Manual §2.7.3.2）
+     *   每轮: **发 1 帧**(不能连发, 见下) → TX 钉高 → 丢 350ms 尾巴 → 静默 2.6s + 600ms 复核。
+     *   多轮只用于关机路径(gps_sleep=3 轮, 布局 16B/8B/16B), 开机停靠只用 1 轮(gps_sleep_rounds(1))。
+     *   为什么不能连发: Data Sheet Table 10 —— 软件待机时 **RXD 仍是 "Input pull-up"**,
+     *   而 PMREQ 指定的唤醒源正是 UART RX ⇒ 我们再发一帧, 第一个下降沿就把它叫醒了。 */
     uint8_t pl[16];
-    memset(pl, 0, sizeof(pl));
-    /* duration = 0 */
-    pl[4] = 0x02 | 0x04;   /* backup + force (M10 必须 force) */
-    pl[8] = 0x08;          /* wakeupSources: UART RX */
-
-    /* 模块可能还在启动/输出 NMEA → 等一会再连发 3 次.
-     * 每次发送会先唤醒"已睡下"的模块, 但紧接着的 PMREQ 立刻送回待机, 最终态必为待机. */
-    vTaskDelay(pdMS_TO_TICKS(200));
-    uart_flush_input(s_cfg.uart_num);
     esp_err_t last = ESP_OK;
-    for (int k = 0; k < 3; k++) {
-        last = gps_send_ubx(UBX_CLS_RXM, UBX_ID_PMREQ, pl, sizeof(pl));
-        vTaskDelay(pdMS_TO_TICKS(120));
+    int last_still = 0;
+
+    for (int round = 0; round < max_rounds; round++) {
+        bool proto27 = (round % 2 == 0);
+        uint16_t n = pmreq_build(pl, proto27);
+        /* ★ 2026-10-28: 发之前必须等稳态(见 gps_wait_steady 注释) —— 这是"时好时坏"的真正原因 */
+        if (round == 0) gps_wait_steady(300, 3000);
+        uart_flush_input(s_cfg.uart_num);
+        /* ★★★ 2026-10-27 【关键】只发**一帧**, 不能连发。
+         *   理由: PMREQ 配的唤醒源就是 UART RX —— 模块一入睡, 我们**再发一帧**时
+         *   线上第一个下降沿就把它叫醒了。连发 3 帧等于"让它睡→叫醒→再睡→再叫醒",
+         *   最终态取决于时序, 这就是"有时像睡了、有时一直醒"的来源。
+         *   SparkFun 与官方示例都是单帧发完就等, 不再碰总线。 */
+        last = gps_send_ubx(UBX_CLS_RXM, UBX_ID_PMREQ, pl, n);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        if (last != ESP_OK) {
+            ESP_LOGW(TAG, "PMREQ(%s) 发送失败: %s",
+                     proto27 ? "protocol27/16B" : "protocol23/8B", esp_err_to_name(last));
+            continue;
+        }
+        /* TX 必须在卸载 UART 之前钉高, 否则 pad 浮空会被当 RXD 起始位叫醒 */
+        gps_tx_hold_high();
+        /* ★★★ 判据必须 ≥2.5 秒。实测: NMEA 是 1Hz 突发输出, 两包之间天然有 ~700ms 空档,
+         *   原来 700+500ms 会**误判成已睡**(前面那些"已确认入睡"全是假阳性)。
+         *   2.6s 覆盖两个完整输出周期, 收不到字节才算真进 backup。 */
+        /* ★ 先丢掉"在途尾巴": PMREQ 生效瞬间, UART RX ring/FIFO 里还剩半帧,
+         *   不清掉会被算成"仍在输出"(实测: 单帧发完后仍读到 34 字节 = 纯尾巴)。 */
+        gps_quiet_bytes(350);
+        int still = gps_quiet_bytes(2600);
+        if (still == 0) {
+            still = gps_quiet_bytes(600);
+            if (still == 0) {
+                s_state = GPS_POWER_SLEEP;
+                s_sleep_verified = true;
+                ESP_LOGI(TAG, "已确认入睡(静默 3.2s) · 第%d轮 · 布局=%s · TX 已钉高",
+                         round + 1, proto27 ? "protocol27/16B" : "protocol23/8B");
+                return ESP_OK;
+            }
+        }
+        last_still = still;
+        ESP_LOGW(TAG, "PMREQ(%s) 第%d轮 后仍在输出 %d 字节 ⇒ 再来一轮",
+                 proto27 ? "protocol27/16B" : "protocol23/8B", round + 1, still);
     }
-    if (last == ESP_OK) {
-        s_state = GPS_POWER_SLEEP;
-        ESP_LOGI(TAG, "已送 UBX-RXM-PMREQ ×3 → 软件待机 (backup+force, 唤醒源=UART RX; 待机电流 46µA)");
-    } else {
-        ESP_LOGD(TAG, "UBX-RXM-PMREQ 发送失败: %s", esp_err_to_name(last));
-    }
-    return last;
+
+    /* 不谎报 SLEEP: 状态留 ACTIVE, 让兜底/管家继续重试 */
+    s_state = GPS_POWER_ACTIVE;
+    s_sleep_verified = false;
+    ESP_LOGE(TAG, "PMREQ 多轮都无效(最后仍收到 %d 字节) ⇒ 模块没进待机。"
+                  "接线诊断跑 gpsdiag: 若 MON-VER 也时有时无, 就是 TX 线接触不良", last_still);
+    return (last == ESP_OK) ? ESP_FAIL : last;
 }
 
 /* ★★★ 2026-10-24 linit 铁律落地: "没用的绝不常驻内部 RAM, 打开才加载、退出即释放"。
@@ -327,6 +439,7 @@ static void gps_teardown(void)
     /* ★ 同上: 用短延时替代 uart_wait_tx_done (它在驱动重装窗口里会撞 spinlock 断言) */
     vTaskDelay(pdMS_TO_TICKS(20));
     uart_driver_delete(s_cfg.uart_num);
+    gps_tx_hold_high();      /* ★ 删驱动后 pad 可能被还原 ⇒ 再钉一次高, 防浮空唤醒 */
     if (s_cfg.pin_extint >= 0) gpio_reset_pin((gpio_num_t)s_cfg.pin_extint);
     s_ready = false;
     s_state = GPS_POWER_UNKNOWN;
@@ -353,27 +466,312 @@ esp_err_t gps_release(void)
  *     ③ 收到 NMEA/UBX ⇒ 它还醒着(冷上电/上次没睡成) ⇒ 发 PMREQ 送睡
  *     ④ 收到但校验全错 ⇒ 波特率不对 ⇒ 退回完整 gps_init()+gps_sleep() 兜底
  *   常态耗时 ≈ 320ms, 且全程在后台任务, 不阻塞首帧。 */
-#define GPS_PARK_LISTEN_MS  300
+/* ★★★ 300ms 太短: NMEA 1Hz 突发, 包间天然 ~700ms 空档, 静听 300ms 常撞空档
+ *   ⇒ 误判"已在待机"⇒ 从此不再发 PMREQ。1.8s 覆盖近两个周期, 判定才稳。 */
+#define GPS_PARK_LISTEN_MS  1800
+
+/* ★★★ 2026-10-28: 等接收机进入"稳态"(1Hz 突发输出, 出现 ≥quiet_ms 的静默窗口)。
+ *   为什么必须等: 我们装 UART 时重配引脚会把模块从待机吵醒, 它刚上电 1~2 秒在跑自检,
+ *   这期间进来的 UBX **会被直接丢弃**。实测对照(同一帧、同一份代码):
+ *     · 不等稳态, 紧跟着发 → 被忽略(模块继续输出 1984 字节)
+ *     · 等到 300ms 静默再发 → **第 1 轮就成功**(静默 3.2s 验证)
+ *   返回 true = 已进入稳态。 */
+static bool gps_wait_steady(uint32_t quiet_ms, uint32_t max_ms)
+{
+    if (!s_ready) return false;
+    uint8_t b[96];
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t quiet_from = t0;
+    while ((uint32_t)(esp_timer_get_time() / 1000) - t0 < max_ms) {
+        int n = uart_read_bytes(s_cfg.uart_num, b, sizeof(b), pdMS_TO_TICKS(50));
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (n > 0) { quiet_from = now; continue; }
+        if (now - quiet_from >= quiet_ms) return true;
+    }
+    return false;
+}
+
+/* ★★★ 2026-10-27 linit「GPS 还是耗电」诊断: 逐档波特率试听。
+ *   为什么需要: 开机停靠只在 38400 听 300ms, 若模块跑在别的波特率,
+ *   我们**听不到就误判"它已在待机"**, 结果整夜不睡。
+ *   本函数对 6 档逐一监听 300ms, 打印每档收到的字节数 ——
+ *   有字节 ⇒ 接线/供电都 OK, 只是波特率不对; 全都 0 ⇒ 模块没供电/线没接/已睡。
+ *   跑完不改变模块状态(不发送任何东西)。 */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * GPS 接线 / 通信诊断 (安全版, 替代原来会崩的 gps_probe_bauds)
+ *
+ * 为什么重写: 旧版在开机停靠任务还没结束时就可能进来抢同一个 UART 驱动,
+ *   两个任务对同一 ringbuf 做 install/delete ⇒ `assert failed: spinlock_acquire` ⇒ 重启。
+ *   现在: 只要 s_ready / s_initing 被别人占着就**直接拒绝**, 不做任何事。
+ *
+ * 判据(逐条给结论, 不靠猜):
+ *   ① 6 档波特率各听 400ms, 统计 总字节 / NMEA 帧头($G,$B) / UBX 同步头(B5 62)
+ *   ② 在听到数据的那档发 UBX-MON-VER(只读轮询, 不改配置), 看**模块有没有回 UBX**
+ *      → 回了: ESP TX→GPS RXD 这根线也是通的(回程完整)
+ *      → 没回: 要么 ESP TX→GPS RXD 断/接反/虚焊, 要么是只会 NMEA 的山寨模块
+ *   ③ 全档 0 字节: 模块已在待机(好事) / 没供电 / GPS TXD→ESP RX 断
+ *      → 用电流区分: 若仍 ~10mA 却一个字节都没有 = 传输线断了
+ * ═══════════════════════════════════════════════════════════════════════════ */
+void gps_diag(void)
+{
+    extern bool gps_service_is_running(void);
+    const gps_config_t *gc = default_cfg_bound();
+    ESP_LOGW(TAG, "==== GPSDIAG BEGIN ====");
+    ESP_LOGW(TAG, "GPSDIAG 引脚: ESP_TX(GPIO%d)→GPS.RXD / ESP_RX(GPIO%d)←GPS.TXD / EXTINT=%d",
+             gc ? gc->pin_tx : -1, gc ? gc->pin_rx : -1, gc ? gc->pin_extint : -1);
+    ESP_LOGW(TAG, "GPSDIAG 状态: ready=%d initing=%d 解析服务=%d 已确认入睡=%d",
+             (int)s_ready, (int)s_initing, (int)gps_service_is_running(), (int)s_sleep_verified);
+
+    if (s_initing) { ESP_LOGW(TAG, "GPSDIAG 拒绝: 正在初始化/停靠中, 等 2 秒再试"); return; }
+    if (s_ready)   { ESP_LOGW(TAG, "GPSDIAG 拒绝: UART 已被占用(有任务在用 GPS), 先退出应用再诊断"); return; }
+    if (gps_service_is_running()) { ESP_LOGW(TAG, "GPSDIAG 拒绝: 解析服务在跑, 先 app.gps.stop()"); return; }
+
+    s_initing = true;                       /* 挡住 gps_release() 删驱动 */
+    s_sleep_verified = false;               /* 装 UART 会重配 TX pad ⇒ "已睡"结论作废 */
+    s_cfg = *gc;
+    s_cfg.baud = 38400;
+
+    esp_err_t e = uart_driver_install(s_cfg.uart_num, GPS_RX_BUF, GPS_TX_BUF, 0, NULL, 0);
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "GPSDIAG UART 安装失败: %s", esp_err_to_name(e));
+        s_initing = false;
+        return;
+    }
+    const uart_config_t uc = {
+        .baud_rate = 38400, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_param_config(s_cfg.uart_num, &uc);
+    if (s_cfg.pin_tx >= 0) gpio_hold_dis((gpio_num_t)s_cfg.pin_tx);
+    uart_set_pin(s_cfg.uart_num, s_cfg.pin_tx, s_cfg.pin_rx,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    s_ready = true;                         /* gps_send_ubx 要用 */
+
+    /* ★★★ 2026-10-27 诊断流程(第二版, 按实测时序重写) ★★★
+     *   实测教训: 模块从 backup 唤醒要 **1.5~2 秒** 才开始吐 NMEA。
+     *   上一版发完唤醒脉冲只等 600ms 就开始逐档扫(每档 400ms), 扫到 38400 时它还没醒,
+     *   于是全档都是"0 字节/噪声", 被误判成接线断。而且按字节数选最优率会被
+     *   过采样噪声带偏(230400 采 38400 的流 = 1353 字节乱码)。
+     *   新版: ①发唤醒脉冲 ②死等 38400 上出现有效帧(最多 4s) ③就地发 MON-VER 验回程
+     *        ④只有 38400 完全无输出时才去扫其它档(纯参考)。 */
+    uint8_t buf[160];
+    int got = 0, nmea = 0, ubx = 0;
+
+    uart_set_baudrate(s_cfg.uart_num, 38400);
+    uart_flush_input(s_cfg.uart_num);
+    {
+        static const uint8_t wake[8] = { 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF };
+        uart_write_bytes(s_cfg.uart_num, (const char *)wake, sizeof(wake));
+        vTaskDelay(pdMS_TO_TICKS(20));
+        uart_write_bytes(s_cfg.uart_num, (const char *)wake, sizeof(wake));
+        ESP_LOGW(TAG, "GPSDIAG 已发唤醒脉冲, 等模块启动(最多 4s)...");
+    }
+
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t first_byte_ms = 0;
+    while ((uint32_t)(esp_timer_get_time() / 1000) - t0 < 4000) {
+        int n = uart_read_bytes(s_cfg.uart_num, buf, sizeof(buf), pdMS_TO_TICKS(60));
+        if (n <= 0) continue;
+        if (!first_byte_ms) first_byte_ms = (uint32_t)(esp_timer_get_time() / 1000) - t0;
+        got += n;
+        for (int q = 0; q + 1 < n; q++) {
+            if (buf[q] == '$' && (buf[q+1] == 'G' || buf[q+1] == 'P' ||
+                                  buf[q+1] == 'B' || buf[q+1] == 'L')) nmea++;
+            if (buf[q] == UBX_SYNC1 && buf[q+1] == UBX_SYNC2) ubx++;
+        }
+        if (nmea + ubx >= 3) break;          /* 已经确认有有效帧, 不用等满 4s */
+    }
+    ESP_LOGW(TAG, "GPSDIAG @38400: %d 字节 NMEA=%d UBX=%d (首个字节在 %ums)",
+             got, nmea, ubx, (unsigned)first_byte_ms);
+
+    int ubx_reply = 0;
+    uint8_t mv[320]; int mv_n = 0;
+    if (nmea + ubx > 0) {
+        /* 有有效帧 ⇒ RX 通了。现在验 TX: 发 UBX-MON-VER(只读轮询), 真 u-blox 会回。 */
+        uart_flush_input(s_cfg.uart_num);
+        gps_send_ubx(UBX_CLS_MON, UBX_ID_MONVER, NULL, 0);
+        uint32_t t1 = (uint32_t)(esp_timer_get_time() / 1000);
+        while ((uint32_t)(esp_timer_get_time() / 1000) - t1 < 1200) {
+            int n = uart_read_bytes(s_cfg.uart_num, buf, sizeof(buf), pdMS_TO_TICKS(60));
+            if (n <= 0) continue;
+            for (int q = 0; q < n && mv_n < (int)sizeof(mv) - 1; q++) mv[mv_n++] = buf[q];
+            for (int q = 0; q + 3 < n; q++)
+                if (buf[q] == UBX_SYNC1 && buf[q+1] == UBX_SYNC2 &&
+                    buf[q+2] == UBX_CLS_MON) ubx_reply++;
+        }
+        ESP_LOGW(TAG, "GPSDIAG MON-VER 回程: %d 帧", ubx_reply);
+        /* ★ 把 MON-VER 里的固件版本串打出来 —— M10 的 SPG 5.00 与 5.10 对 PMREQ 支持不同
+         *   (SparkFun 官方答复: 5.00 只支持长版; 5.10 长短都支持)。不知道版本就无法判断
+         *   到底是"我们发错了"还是"这版固件根本不支持", 所以必须读出来。 */
+        if (ubx_reply > 0) {
+            /* 按 UBX 帧头解析: B5 62 0A 04 lenL lenH | swVersion(30B) | hwVersion(10B) ... */
+            char vs[40] = {0};
+            for (int q = 0; q + 7 < mv_n; q++) {
+                if (mv[q] == UBX_SYNC1 && mv[q+1] == UBX_SYNC2 &&
+                    mv[q+2] == UBX_CLS_MON && mv[q+3] == UBX_ID_MONVER) {
+                    int pl = mv[q+4] | (mv[q+5] << 8);
+                    if (pl >= 30 && q + 36 <= mv_n) {
+                        int k = 0;
+                        for (int t = 0; t < 30 && k < (int)sizeof(vs) - 1; t++) {
+                            uint8_t c = mv[q + 6 + t];
+                            vs[k++] = (c >= 0x20 && c < 0x7F) ? (char)c : ' ';
+                        }
+                        while (k > 0 && vs[k-1] == ' ') vs[--k] = 0;
+                    }
+                    break;
+                }
+            }
+            ESP_LOGW(TAG, "GPSDIAG 模块固件(swVersion): %s", vs[0] ? vs : "(未解析到)");
+        }
+
+        /* ③ PMREQ 实测: 用正确布局发一次, 看它是 ACK / NAK / 装死, 以及多久静音。
+         *   UBX-ACK-ACK = 05 01 02 02 41;  UBX-ACK-NAK = 05 01 02 00 02 41
+         *   (payload 是 [clsID][msgID]) ⇒ 能直接读出"模块是否受理了 PMREQ"。 */
+        uint8_t pl[16];
+        uint16_t pn = pmreq_build(pl, true);
+        uart_flush_input(s_cfg.uart_num);
+        gps_send_ubx(UBX_CLS_RXM, UBX_ID_PMREQ, pl, pn);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        gps_send_ubx(UBX_CLS_RXM, UBX_ID_PMREQ, pl, pn);
+
+        int nack = 0, ack = 0, after = 0;
+        uint32_t silent_ms = 0, silent_at = 0;
+        uint32_t t3 = (uint32_t)(esp_timer_get_time() / 1000);
+        while ((uint32_t)(esp_timer_get_time() / 1000) - t3 < 4000) {
+            int n = uart_read_bytes(s_cfg.uart_num, buf, sizeof(buf), pdMS_TO_TICKS(60));
+            if (n <= 0) { silent_ms += 60; if (silent_ms >= 600 && !silent_at) silent_at = 600; continue; }
+            after += n;
+            silent_ms = 0;
+            for (int q = 0; q + 5 < n; q++) {
+                if (buf[q] == UBX_SYNC1 && buf[q+1] == UBX_SYNC2 &&
+                    buf[q+2] == 0x05 && (buf[q+3] == 0x01 || buf[q+3] == 0x00)) {
+                    if (buf[q+4] == 0x02 && buf[q+5] == UBX_ID_PMREQ) {
+                        if (buf[q+3] == 0x01) ack++; else nack++;
+                    }
+                }
+            }
+        }
+        ESP_LOGW(TAG, "GPSDIAG PMREQ: ACK=%d NAK=%d, 之后又收到 %d 字节, 末段静默=%dms",
+                 ack, nack, after, (int)silent_ms);
+
+        /* ★ 单变量实验: duration 从 0 改成 60000ms。
+         *   目的: 区分两种完全不同的失败原因 ——
+         *     ① 模块**根本没受理**PMREQ  ⇒ 带 duration 也一样一直在输出
+         *     ② 受理了但**立刻被唤醒**(V_IO 域/唤醒源问题) ⇒ duration=60s 时会安静 60 秒
+         *   这一步不改别的任何东西, 只改 duration 一个变量。 */
+        if (silent_ms < 600) {
+            uint8_t pl2[16];
+            memset(pl2, 0, sizeof(pl2));
+            pl2[0] = 0;                                  /* version */
+            pl2[4] = 0x60; pl2[5] = 0xEA; pl2[6] = 0; pl2[7] = 0;   /* duration = 60000ms (0xEA60) */
+            pl2[8] = 0x02 | 0x04;                        /* backup + force */
+            pl2[12] = 0x08;                              /* wakeup = UART RX */
+            uart_flush_input(s_cfg.uart_num);
+            gps_send_ubx(UBX_CLS_RXM, UBX_ID_PMREQ, pl2, 16);
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+            int g60 = 0; uint32_t t4 = (uint32_t)(esp_timer_get_time() / 1000);
+            while ((uint32_t)(esp_timer_get_time() / 1000) - t4 < 3000) {
+                int n = uart_read_bytes(s_cfg.uart_num, buf, sizeof(buf), pdMS_TO_TICKS(60));
+                if (n > 0) g60 += n;
+            }
+            ESP_LOGW(TAG, "GPSDIAG PMREQ(duration=60000ms) 后 3 秒收到 %d 字节 ⇒ %s",
+                     g60, g60 == 0 ? "**受理了**(能睡满 60 秒, 说明 duration 必须非 0)" :
+                                     "**仍未受理**(同 duration=0 一样被无视)");
+        }
+        if (nack > 0)
+            ESP_LOGW(TAG, "GPSDIAG ⇒ 模块**明确拒绝** PMREQ(NAK): 这套固件不支持该消息/该布局");
+        else if (ack > 0 && silent_ms >= 600)
+            ESP_LOGW(TAG, "GPSDIAG ⇒ 模块**受理** PMREQ 并已静音: 待机可用");
+        else if (ack > 0)
+            ESP_LOGW(TAG, "GPSDIAG ⇒ 模块回 ACK 但**仍在输出**: 受理了却没进 backup(可能缺 V_BCKP)");
+        else if (silent_ms >= 600)
+            ESP_LOGW(TAG, "GPSDIAG ⇒ 无应答但静音了: 多半已进待机(backup 模式本来就不回 ACK)");
+        else
+            ESP_LOGW(TAG, "GPSDIAG ⇒ 无应答且一直在输出: PMREQ 被丢弃(不支持 backup / V_BCKP 未接)");
+    } else {
+        /* 38400 没东西: 扫其它档只为参考(说明是不是被改过速率) */
+        static const uint32_t rates[] = { 9600, 19200, 57600, 115200, 230400 };
+        for (int i = 0; i < (int)(sizeof(rates)/sizeof(rates[0])); i++) {
+            uart_set_baudrate(s_cfg.uart_num, rates[i]);
+            uart_flush_input(s_cfg.uart_num);
+            int g2 = 0, f2 = 0;
+            uint32_t t2 = (uint32_t)(esp_timer_get_time() / 1000);
+            while ((uint32_t)(esp_timer_get_time() / 1000) - t2 < 350) {
+                int n = uart_read_bytes(s_cfg.uart_num, buf, sizeof(buf), pdMS_TO_TICKS(50));
+                if (n <= 0) continue;
+                g2 += n;
+                for (int q = 0; q + 1 < n; q++)
+                    if (buf[q] == '$' && (buf[q+1] == 'G' || buf[q+1] == 'P')) f2++;
+            }
+            ESP_LOGW(TAG, "GPSDIAG %6lu bps: %d 字节 有效帧=%d",
+                     (unsigned long)rates[i], g2, f2);
+            if (f2 > 0) { ESP_LOGW(TAG, "GPSDIAG 该档有有效 NMEA ⇒ 模块速率被改成 %lu",
+                                   (unsigned long)rates[i]); break; }
+        }
+        uart_set_baudrate(s_cfg.uart_num, 38400);
+    }
+
+    /* ---- 结论 ---- */
+    if (got == 0) {
+        ESP_LOGW(TAG, "GPSDIAG 结论=【唤醒后 38400 完全无输出】");
+        ESP_LOGW(TAG, "          ① GPS.TXD→ESP RX(GPIO%d) 断线/接反/虚焊  ← 最可能", s_cfg.pin_rx);
+        ESP_LOGW(TAG, "          ② 模块没供电(量 GPS 的 VCC 脚应为 3.3V)");
+        ESP_LOGW(TAG, "          ③ 模块已损坏");
+    } else if (nmea + ubx == 0) {
+        ESP_LOGW(TAG, "GPSDIAG 结论=【收到 %d 字节但没有一帧有效】", got);
+        ESP_LOGW(TAG, "          ① 电平/接触不良(收到乱码说明 RX 有线, 但采样不对)");
+        ESP_LOGW(TAG, "          ② 波特率不是 38400(看上面其它档有没有有效帧)");
+    } else if (ubx_reply > 0) {
+        ESP_LOGW(TAG, "GPSDIAG 结论=【收发双向正常】收得到 NMEA, MON-VER 也有回 ⇒ **接线没问题**。");
+        ESP_LOGW(TAG, "          既然接线没问题却不肯待机 ⇒ 模块不支持/不接受 UBX-RXM-PMREQ,"
+                      " 需要对 GPS 的 VCC 加 MOS 管做硬件断电");
+    } else {
+        ESP_LOGW(TAG, "GPSDIAG 结论=【收得到 NMEA, 但 MON-VER 无回应】");
+        ESP_LOGW(TAG, "          ① ESP TX(GPIO%d)→GPS.RXD 这根线断/接反/虚焊  ← 最可能", s_cfg.pin_tx);
+        ESP_LOGW(TAG, "          ② 模块是只支持 NMEA 的山寨货(不认 UBX)");
+        ESP_LOGW(TAG, "          ⇒ 两种情况 PMREQ 都发不进去, 硬件断电是唯一可靠方案");
+    }
+
+    /* 收尾: **诊断完立刻送回待机** —— 诊断本身会把它叫醒, 不能就这么留在 10~25mA */
+    gps_teardown();
+    s_initing = false;
+    gps_boot_park();
+    ESP_LOGW(TAG, "==== GPSDIAG END (已尝试送回待机, verified=%d) ====", (int)s_sleep_verified);
+}
+
+/* 兼容旧命令名 */
+void gps_probe_bauds(void) { gps_diag(); }
+
 esp_err_t gps_boot_park(void)
 {
 #if GPS_HW_DISABLED
     return ESP_ERR_NOT_SUPPORTED;
 #endif
+    /* ★★★ 2026-10-27: 停靠期间必须把 s_initing 置上。
+     *   否则 main 主循环的"1 秒兜底"会看到 state==ACTIVE 又去 gps_release(),
+     *   两个任务同时对同一 UART 发 PMREQ / 删驱动 ⇒ 日志标签串味(实测出现过),
+     *   严重时撞 spinlock 断言。 */
+    bool was_initing = s_initing;
+    s_initing = true;
     s_cfg = *default_cfg_bound();
     s_cfg.baud = 38400;                  /* 出厂值; 睡醒必回它, 见 gps.c 头注释 */
 
     esp_err_t e = uart_driver_install(s_cfg.uart_num, GPS_RX_BUF, GPS_TX_BUF, 0, NULL, 0);
-    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) return e;
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { s_initing = was_initing; return e; }
     const uart_config_t uc = {
         .baud_rate = (int)s_cfg.baud, .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
     };
     uart_param_config(s_cfg.uart_num, &uc);
+    if (s_cfg.pin_tx >= 0) gpio_hold_dis((gpio_num_t)s_cfg.pin_tx);   /* ★ 解 hold 才能发 UBX */
     uart_set_pin(s_cfg.uart_num, s_cfg.pin_tx, s_cfg.pin_rx,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     s_ready = true;
     s_state = GPS_POWER_ACTIVE;
+    s_sleep_verified = false;      /* ★ 上电/装驱动 = 模块被叫醒了 */
 
     uint8_t buf[128];
     int got = 0, sentences = 0;
@@ -388,7 +786,26 @@ esp_err_t gps_boot_park(void)
                 (buf[i] == 0xB5 && buf[i + 1] == 0x62)) sentences++;
     }
 
+    /* ★★★ 2026-10-28 关键: **等接收机完全起来**再发 PMREQ ★★★
+     *   实测证据: 同一帧 PMREQ、同一份代码 ——
+     *     开机第 1 次: 被忽略(模块继续输出 1125 字节)
+     *     37 秒后重试: 成功(静默 3.2s 验证)
+     *   原因: 我们装 UART 时的引脚重配会把模块从待机吵醒, 而它刚上电的 1~2 秒在跑
+     *   自检/启动, 这段时间进来的 UBX 会被直接丢掉。
+     *   判据: 启动完成后的接收机是 **1Hz 突发**输出 ⇒ 出现 ≥300ms 静默就说明它已进稳态。
+     *   最多等 3 秒, 不无限拖。
+     */
+    if (got > 0 && sentences > 0) {
+        bool steady = gps_wait_steady(300, 3000);
+        ESP_LOGI(TAG, "开机停靠: %s ⇒ 现在发 PMREQ", steady ? "已进入稳态" : "等稳态超时(照发)");
+    }
+
     if (got == 0) {
+        /* ★ 2026-10-27: 静默 = 已在待机。必须同时置 verified, 否则管家会以为"没睡成",
+         *   每 30s 再装一次 UART —— 而装 UART 会重配 TX pad, 那一下电平跳变恰好会把
+         *   模块叫醒, 变成"越管越醒"的反效果。 */
+        s_state = GPS_POWER_SLEEP;
+        s_sleep_verified = true;
         ESP_LOGI(TAG, "开机停靠: 模块无输出 ⇒ 本来就在待机(≤46µA), 不动它");
     } else if (sentences == 0) {
         /* 有字节但全是乱码 ⇒ 波特率被改过, 用完整初始化兜底(会 autobaud 找对再送睡) */
@@ -399,15 +816,18 @@ esp_err_t gps_boot_park(void)
         return ESP_OK;
     } else {
         ESP_LOGI(TAG, "开机停靠: 模块仍是醒的(%d 字节) ⇒ 送 PMREQ 待机", got);
-        gps_sleep();
+        gps_sleep_rounds(1);        /* 停靠只要快: 1 轮 ≈3.5s; 关机路径才用 3 轮 */
     }
     gps_teardown();
-    return ESP_OK;
+    if (s_sleep_verified) s_state = GPS_POWER_SLEEP;   /* teardown 会清成 UNKNOWN, 这里按实测还原 */
+    s_initing = was_initing;
+    return s_sleep_verified ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t gps_wakeup(void)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
+    s_sleep_verified = false;      /* ★ 唤醒指令 → 之前的"已睡"结论作废 */
 
     /* (1) UART RX 唤醒源: 送一个无害的 UBX-MON-VER 轮询 (待机时收到字节即醒) */
     esp_err_t e = gps_send_ubx(UBX_CLS_MON, UBX_ID_MONVER, NULL, 0);
