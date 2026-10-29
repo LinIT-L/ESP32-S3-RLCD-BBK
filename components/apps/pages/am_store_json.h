@@ -35,6 +35,15 @@ typedef struct {
      * 老索引没有这两个字段 ⇒ type 为空, 行为与以前完全一致 (向后兼容)。 */
     char     type[12];
     char     target[80];
+    /* ★ 2026-10-27 linit: 统一元信息 —— 作者 / 上架日期。
+     *   资源包(type=asset)没有 LAPP 头，只有这里能带这两个字段。 */
+    char     author[32];
+    char     date[12];
+    /* ★ 2026-10-30 linit 发版规则: 更新判定改按**构建时间**。
+     *   build = YYYYMMDDHHMM (12 位定长数字), 与 LAPP 头里的 build= 同源。
+     *   定长数字串字典序 == 时间先后, 设备端 strcmp 即可。
+     *   空 = 老索引没有这个字段 → 退回按 ver 比较 (向后兼容)。 */
+    char     build[16];
 } am_rpkg_t;
 
 /* 解析 index.json。成功返回 0 (且 out_n/mir_n 均 > 0), 失败返回负数:

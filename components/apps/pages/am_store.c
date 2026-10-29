@@ -54,6 +54,14 @@ typedef struct {
      *   判定: 已安装 且 rver > ver  ⇒ 按钮显示「更新」 */
     uint16_t ver;
     uint16_t rver;
+    /* ★ 2026-10-30 linit 发版规则: 更新判定**以构建时间为准**。
+     *   lbuild = 已安装文件 LAPP 头里的 build=YYYYMMDDHHMM
+     *   rbuild = 云端 index.json 里同名包的 build
+     *   两者都非空 → 用 strcmp 比时间(定长数字, 字典序==时间序);
+     *   任一为空(老包/老索引) → 退回 rver > ver 的旧规则。
+     *   这样"忘了改版本号"不会再导致推不出更新, 版本号只用来给人看。 */
+    char     lbuild[16];
+    char     rbuild[16];
     uint8_t  kind;       /* 0=本地已有包(可安装)  1=云端包(需先下载) —— 2026-10-04 */
     int16_t  ridx;       /* kind=1 时: 对应 am_rstore_get() 的下标 */
 } am_pkg_entry_t;
@@ -223,6 +231,8 @@ static void am_pkg_scan(void) {
                  *   注意 apppack.c 原来只认 "version=", 与文档/store_build 的 "ver=" 对不上,
                  *   已在 apppack.c 里两个键都收; 这里按整数解析 (非数字 → 0 = 未知)。 */
                 s_pkg[k].ver = (uint16_t)strtoul(meta.version, NULL, 10);
+                /* ★ 2026-10-30: 本地构建时间 —— "更新"判定的主依据(优先于版本号) */
+                snprintf(s_pkg[k].lbuild, sizeof(s_pkg[k].lbuild), "%s", meta.build);
                 snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%.*s", (int)len - 4, nm);
                 if (!s_pkg[k].label[0] && meta.name[0])
                     snprintf(s_pkg[k].label, sizeof(s_pkg[k].label), "%s", meta.name);
@@ -246,6 +256,9 @@ static void am_pkg_scan(void) {
                         if (rp && strcmp(rp->name, bn) == 0) {
                             /* ★ 2026-10-27: 顺手记下云端版本 —— "更新"按钮靠它比大小 */
                             s_pkg[k].rver = (uint16_t)rp->ver;
+                            /* ★ 2026-10-30: 云端构建时间 (更新判定的主依据) */
+                            snprintf(s_pkg[k].rbuild, sizeof(s_pkg[k].rbuild),
+                                     "%s", rp->build);
                             if (rp->cat[0]) { snprintf(icat, sizeof(icat), "%s", rp->cat); break; }
                         }
                     }
@@ -485,19 +498,37 @@ static void am_sync_rver(void) {
         char *dot = strrchr(bn, '.');
         if (dot) *dot = 0;
         uint16_t rv = 0;
+        char rb[16] = "";
         for (int r = 0; r < gen; r++) {
             const am_rpkg_t *rp = am_rstore_get(r);
-            if (rp && rp->name[0] && bn[0] && strcmp(rp->name, bn) == 0) { rv = (uint16_t)rp->ver; break; }
+            if (rp && rp->name[0] && bn[0] && strcmp(rp->name, bn) == 0) {
+                rv = (uint16_t)rp->ver;
+                snprintf(rb, sizeof(rb), "%s", rp->build);
+                break;
+            }
         }
         s_pkg[k].rver = rv;
+        snprintf(s_pkg[k].rbuild, sizeof(s_pkg[k].rbuild), "%s", rb);
     }
     s_rver_gen = gen;
 }
-/* 该条目是否有新版可装 = 已安装 且 云端 ver > 本地 ver。
- * 本地 ver=0 视为第 1 版(老包/无 LAPP 头的包), 否则这些包永远等不到更新。 */
+/* 该条目是否有新版可装。
+ * ★ 2026-10-30 linit 发版规则变更: **以构建时间为准**, 版本号只用于展示。
+ *   判定顺序:
+ *   ① 云端有 build + 本地有 build → strcmp(rbuild, lbuild) > 0
+ *      build 是 12 位定长数字(YYYYMMDDHHMM), 字典序 == 时间先后, 不用转数值。
+ *   ② 云端有 build 但**本地没有**(2026-10-30 之前发布的包 LAPP 头里没这个字段)
+ *      → 视为"老体系", 提示一次更新, 让用户升级到带 build 的新包。
+ *        ⚠ 这是刻意的迁移行为: 统一版本号后 ver 会变(如 矢量地图 4→1),
+ *          若退回 ver 比较, 老用户就永远收不到更新了。
+ *   ③ 云端没有 build(老索引) → 退回旧规则 rver > ver, 保证完全向后兼容。 */
 static bool am_pkg_has_update(int k) {
     if (k < 0 || k >= s_pkg_n) return false;
     if (!s_pkg_inst[k]) return false;
+    if (s_pkg[k].rbuild[0]) {
+        if (!s_pkg[k].lbuild[0]) return true;      /* 老包 → 迁移一次 */
+        return (strcmp(s_pkg[k].rbuild, s_pkg[k].lbuild) > 0);
+    }
     uint16_t lv = s_pkg[k].ver ? s_pkg[k].ver : 1;
     return (s_pkg[k].rver > lv);
 }
@@ -811,8 +842,16 @@ static bool am_asset_installed(const os_app_t *a)
 {
     char dir[96];
     if (!am_asset_target_of(a, dir, sizeof(dir))) return false;
-    struct stat st;
-    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+    /* ★★★ 2026-10-27 linit: **不许只看目录存在**。
+     *   目录在、但里面是空的/半截的(解压失败)时, 原来会显示"可卸载",
+     *   用户点应用却提示"资源未安装" —— 就是这次的坑。
+     *   现在只认解包器在**全部条目都成功**后写的 `.installed` 标记。 */
+    char mark[128];
+    snprintf(mark, sizeof(mark), "%s/.installed", dir);
+    FILE *f = fopen(mark, "r");
+    if (!f) return false;
+    fclose(f);
+    return true;
 }
 
 void am_store_toggle(ui_ctx_t *ctx, const os_app_t *a) {

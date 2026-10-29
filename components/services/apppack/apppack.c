@@ -97,6 +97,20 @@ esp_err_t apppack_parse(const char *path, apppack_meta_t *out)
                  *   两个键都收, 以 ver 为主(现有包都是 ver=)。 */
                 else if (KEY_IS("ver") || KEY_IS("version"))
                     snprintf(out->version, sizeof(out->version), "%.*s", (int)vlen, v);
+                /* ★ 2026-10-27: 统一元信息 —— 作者 / 日期 */
+                else if (KEY_IS("author"))
+                    snprintf(out->author, sizeof(out->author), "%.*s", (int)vlen, v);
+                else if (KEY_IS("date"))
+                    snprintf(out->date, sizeof(out->date), "%.*s", (int)vlen, v);
+                /* ★ 2026-10-30: 构建时间 YYYYMMDDHHMM —— 商店按它判"有没有新版"。
+                 *   只收纯数字(带分隔符的写法会让定长字典序比较失效), 非数字直接忽略。 */
+                else if (KEY_IS("build")) {
+                    bool digits = (vlen > 0);
+                    for (size_t i = 0; i < vlen; i++)
+                        if (v[i] < '0' || v[i] > '9') { digits = false; break; }
+                    if (digits)
+                        snprintf(out->build, sizeof(out->build), "%.*s", (int)vlen, v);
+                }
                 else if (KEY_IS("need")) {
                     /* 逗号分隔的能力声明 (目前只有 wifi); 大小写不敏感, 只在 vlen 内找 */
                     for (size_t i = 0; i + 4 <= vlen; i++)

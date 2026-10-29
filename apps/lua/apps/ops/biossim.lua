@@ -2,7 +2,8 @@
 --@app name=BIOS模拟器
 --@app cat=运维
 --@app desc=7 家品牌 BIOS 装机模拟: 装 Win11/Linux 要改哪几项, 先在掌机上练
---@app version=1.0
+--@app version=1
+--@app build=202610300638
 --@app icon=AAAAAAAAAAAP////////4B/////////wMAAAAAAAABhgAAAAAAAADGP///////+MZ////////8xn////////zGf////////MZwB+PwD+A8xnAD4/APwBzGc/Pj48fPnMZz8+Pn58/8xnPz4+fnz/zGcAfj5+fAPMZwB+Pn5+AcxnAH4+fn/5zGc/Pj5+f/nMZz8+Pn58+cxnPz4+PHz5zGcAPj8A/AHMZwB+PwD+A8xn////////zGf////////MZ////////8xnjC7/////zGd1rv/////MZ3wu/////8xnfe7/////zGd17v/////MZ43x/////8xn////////zGf////////MZ////////8xnJCT/////zGdV6v/////MZ1Qq/////8xnde7/////zGd0Lv/////MZ////////8xn////////zGYAAAAAAADMZuGGOAAAAMxmkkkQAAAAzGbiSRAAAADMZpJJEAAAAMxm4YYQAAAAzGYAAAAAAADMZ////////8xn////////zGf////////MZ////wAAAMxn////f///zGf///9////MZ////wAAAMxn////////zGf////////MY////////4xgAAAAAAAADDAAAAAAAAAYH/////////AP////////4AAAAAAAAAAAAAAAAAAAAAA=
 -- 图标自绘: blit_app_icon(x, y[, inv=true])
 -- ── LAPP 图标自绘前奏 (打包器注入; 读内嵌 base64, 不碰文件系统) ──

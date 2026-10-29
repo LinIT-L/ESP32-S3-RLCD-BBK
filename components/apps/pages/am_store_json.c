@@ -208,6 +208,15 @@ int am_store_json_parse(const char *txt,
             long vv = 0;
             v = j_key(ob, "ver");
             if (v && j_num(v, &vv) && vv > 0) rk.ver = (uint32_t)vv;
+            /* ★ 2026-10-27 linit "统一添加更详细信息": 作者 / 日期。
+             *   资源包(zip)没有 LAPP 头，它们的这两个字段**只在这里有**。 */
+            v = j_key(ob, "author");
+            if (v) j_str(v, rk.author, sizeof(rk.author));
+            v = j_key(ob, "date");
+            if (v) j_str(v, rk.date, sizeof(rk.date));
+            /* ★ 2026-10-30: 构建时间 (更新判定依据)。缺失 = 空 = 退回按 ver 比较。 */
+            v = j_key(ob, "build");
+            if (v) j_str(v, rk.build, sizeof(rk.build));
         }
         if (ok) {
             if (!rk.label[0]) snprintf(rk.label, sizeof(rk.label), "%s", rk.name);

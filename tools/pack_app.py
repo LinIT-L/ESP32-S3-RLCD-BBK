@@ -37,6 +37,7 @@ import base64
 import os
 import re
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ICONS_INC = os.path.join(ROOT, "components", "ui", "ui_common", "icons_main.inc")
@@ -186,19 +187,26 @@ def do_pack(a):
     cat  = a.cat  or old.get("cat")
     desc = a.desc or old.get("desc")
     need = a.need if a.need is not None else old.get("need")
+    # ★ 2026-10-30 linit 发版规则: 打包时自动写入构建时间 YYYYMMDDHHMM。
+    #   商店"有没有新版"以它为准 (12 位定长数字, strcmp 即时间序), 版本号只给人看。
+    build = a.build or time.strftime("%Y%m%d%H%M")
+    if not (len(build) == 12 and build.isdigit()):
+        raise SystemExit("--build 必须是 12 位数字 YYYYMMDDHHMM, 收到: %r" % build)
     head = [MARK]
     if name: head.append("--@app name=%s" % name)
     if cat:  head.append("--@app cat=%s" % cat)
     if desc: head.append("--@app desc=%s" % desc)
     if need: head.append("--@app need=%s" % need)
-    head.append("--@app version=%s" % (a.version or old.get("version") or "1.0"))
+    head.append("--@app version=%s" % (a.version or old.get("version") or "1"))
+    head.append("--@app build=%s" % build)
     head.append("--@app icon=%s" % b64(bits))
     out = "\n".join(head) + "\n" + "-- 图标自绘: blit_app_icon(x, y[, inv=true])\n" \
           + (PRELUDE % b64(bits)) + body + "\n"
     open(a.file, "w", encoding="utf-8").write(out)
     print("  ✓ 已打包 %s" % os.path.relpath(a.file, ROOT))
-    print("     名称: %s   分类: %s   图标: %d B(b64 %d 字符)%s"
-          % (name, cat, ICON_BYTES, len(b64(bits)), "   need=%s" % need if need else ""))
+    print("     名称: %s   分类: %s   版本: %s   构建: %s   图标: %d B(b64 %d 字符)%s"
+          % (name, cat, a.version or old.get("version") or "1", build,
+             ICON_BYTES, len(b64(bits)), "   need=%s" % need if need else ""))
     do_verify(a)
 
 
@@ -209,7 +217,7 @@ def do_verify(a):
     print("  文件: %s  (%d 行, %d 字节)" % (os.path.basename(a.file),
                                           text.count("\n") + 1, len(text)))
     print("  LAPP: %s" % ("是" if packed else "否 (普通 .lua, 仍可直接运行)"))
-    for k in ("name", "cat", "desc", "version", "need"):
+    for k in ("name", "cat", "desc", "version", "build", "need"):
         if k in meta: print("  %-8s %s" % (k + ":", meta[k]))
     if "icon" in meta:
         try:
@@ -236,7 +244,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("pack"); p.add_argument("file")
     p.add_argument("--name"); p.add_argument("--cat"); p.add_argument("--desc")
-    p.add_argument("--version", default="1.0")
+    p.add_argument("--version", default="1")
+    p.add_argument("--build", help="构建时间 YYYYMMDDHHMM; 默认取当前时间")
     p.add_argument("--need", help="能力声明, 逗号分隔; 目前支持 wifi (启动前门禁: 未联网则先弹窗连网)")
     p.add_argument("--icon"); p.add_argument("--icon-from-main")
     v = sub.add_parser("verify"); v.add_argument("file")
