@@ -170,7 +170,7 @@ void tud_network_init_cb(void)
 bool tud_network_recv_cb(const uint8_t *src, uint16_t size)
 {
     if (size && wifi_manager_is_connected()) {
-        esp_wifi_internal_tx(ESP_IF_WIFI_STA, (void *)src, size);
+        esp_wifi_internal_tx(WIFI_IF_STA, (void *)src, size);
     }
     tud_network_recv_renew();
     return true;

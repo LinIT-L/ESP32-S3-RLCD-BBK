@@ -4,5 +4,5 @@
 idf_component_register(
     SRCS "st7305.c"
     INCLUDE_DIRS "."
-    REQUIRES board_pins driver esp_timer
+    REQUIRES board_pins driver esp_timer esp_driver_gpio esp_driver_spi
 )

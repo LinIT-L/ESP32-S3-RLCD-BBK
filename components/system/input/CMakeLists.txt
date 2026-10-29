@@ -4,7 +4,7 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
     hw_cfg board_pins
-        driver
+        driver esp_driver_gpio
         st7305
         touch_panel
         web_gamepad
@@ -12,4 +12,5 @@ idf_component_register(
         bt_ctl
         vibrator
         tone_player
+        power_mgr
 )

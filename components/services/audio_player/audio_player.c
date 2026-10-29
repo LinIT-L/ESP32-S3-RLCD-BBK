@@ -1477,6 +1477,30 @@ void audio_player_deinit(void) {
 
 /* ★ 进深睡前的一条龙关断 (2026-10-09) —— 见 audio_player.h 的说明。
  * 顺序: 先给 codec 下电(I2C 此刻还活着), 再关功放并 hold 低电平。 */
+/* ★★★ 2026-10-28 linit「睡眠时候提前睡眠功放 / 麦克风 / 音频芯片」★★★
+ *   动机: 关机流程里 gps_boot_park() 要 4~15 秒(GPS 停靠: 装UART+等稳态+PMREQ+PSMOO 窗口),
+ *   而音频关断原来排在它**后面** ⇒ 这十几秒 ES8311(5~10mA)/ES7210(20~30mA)/功放 还挂着。
+ *   所以拆成两步:
+ *     · 本函数(early): 立刻关 codec + I2S + 功放拉低；
+ *       **故意不调 gpio_deep_sleep_hold_en()** —— 那是全局冻结所有 pad，
+ *       紧接着要发的 GPS PMREQ(UBX) 会发不出去(TX pad 被锁)。
+ *       单脚 gpio_hold_en(pa) 是安全的，GPS 驱动那边会自己 gpio_hold_dis(TX) 再发。
+ *     · audio_player_sleep_for_off(): GPS 之后再调一次(幂等)，补 global hold/深睡锁存。 */
+void audio_player_sleep_for_off_early(void)
+{
+    if (s_hw_initialized && s_mutex) audio_player_stop();
+    es8311_shutdown();          /* 喇叭 codec: 0x32=0 静音 + 0x00=0 掉电 */
+    es7210_deinit();            /* 麦克风 ADC: 探到就会跑, 不关就是 20~30mA */
+    i2s_deinit();               /* 通道禁用的话 MCLK/BCLK 还在跑, codec 会"有钟无数据"耗电 */
+    audio_pa_init();
+    if (s_pa >= 0) {
+        gpio_set_level(s_pa, 0);
+        gpio_hold_en(s_pa);
+        s_pa_on = false;
+    }
+    ESP_LOGI(TAG, "[early] 音频已提前关断: ES8311/ES7210/I2S/功放(未做全局 pad 冻结)");
+}
+
 void audio_player_sleep_for_off(void)
 {
     /* 先把播放/输出任务收干净, 再动通道 —— 否则任务可能正卡在 i2s_channel_write

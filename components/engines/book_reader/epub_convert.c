@@ -8,7 +8,7 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include "miniz.h"
+#include "lmz.h"
 
 #define EP_MAX_ENTRY (4u * 1024 * 1024)   /* 单章上限 4MB */
 

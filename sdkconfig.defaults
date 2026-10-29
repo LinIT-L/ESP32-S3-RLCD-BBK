@@ -47,8 +47,12 @@ CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 # CONFIG_ESP_WIFI_IRAM_OPT is not set
 # CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
 # V2.x 内存精简: 非 ISR 的 FreeRTOS 函数从 IRAM 挪到 Flash (官方称最多省 8KB IRAM).
-# ISR 上下文调用的函数仍留 IRAM (FREERTOS_PLACE_ISR_FUNCTIONS_INTO_FLASH 保持 n), 不违反禁 cache 约束。
-CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+# ISR 上下文调用的函数仍留 IRAM, 不违反禁 cache 约束。
+# ★ 2026-10-29 ESP-IDF 6.0 迁移: CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH 已被官方删除
+#   (6.0 默认就把 FreeRTOS 函数放 Flash)。6.0 新增的 CONFIG_FREERTOS_IN_IRAM 反而会把
+#   整个 FreeRTOS 拉进 IRAM —— 与本节意图相反, 本机内部 RAM 极紧, 必须显式保持 n。
+#   实测: 该保持 y 时 .iram0.text 115,415 B; 置 n 后 102,359 B (比 5.5.5 的 103,263 还少 904 B)。
+# CONFIG_FREERTOS_IN_IRAM is not set
 
 # === V1.6.x: 浅睡(light sleep)稳定性 ===
 # Octal PSRAM+Flash 共享总线: 浅睡时若 flash 断电, 唤醒瞬间 cache 访问会 panic
@@ -262,7 +266,8 @@ CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
 
 # ★★★ 2026-10-16 官方省内部 RAM 开关(实测 .iram0.text 119K→103K, 内部堆 +17.8KB)
 #   S3 上 IRAM(代码) 与 DRAM 共用 512KB SRAM ⇒ 把这些非关键函数放进 flash 即等于还内存
-CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+# ★ 2026-10-29 6.0: FREERTOS_PLACE_FUNCTIONS_INTO_FLASH 已删除; 等价手段是保持
+#   CONFIG_FREERTOS_IN_IRAM=n (见文件上方 "V2.x 内存精简" 一节)
 CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
 CONFIG_ESP_WIFI_IRAM_OPT=y
 CONFIG_ESP_WIFI_RX_IRAM_OPT=y
@@ -289,6 +294,14 @@ CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 CONFIG_COMPILER_SAVE_RESTORE_LIBCALLS=y
+
+# ★ 2026-10-29 ESP-IDF 6.0.3 迁移: 6.0 默认给的是**裸 -Werror**(任何警告都算错误)。
+#   本工程有 140+ 条历史警告(多为模拟器/第三方代码), 换台机器重新生成 sdkconfig 后
+#   必然在第一条 -Wtype-limits 处编译失败(已实测: 缺此项时 st7305.c 直接报错)。
+#   官方 6.0 根 Kconfig 对此项的说明正是"升级 IDF 期间不把默认警告当错误"的过渡开关;
+#   开启后等价于 -Werror=all(只有 -Wall 组算错误), 警告**仍照常打印**, 只是不中断构建。
+#   ⚠ 这是过渡手段 —— 官方帮助写明"修代码才是首选", 后续应逐条清警告后再关掉。
+CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
 
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y   # ★无线手柄 begin_ap 需要 SoftAP, 不能关
 

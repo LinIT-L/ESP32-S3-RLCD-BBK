@@ -39,8 +39,9 @@ int keyvault_verify_pin(const char *pin);
 uint32_t keyvault_lock_remaining_sec(void);
 uint32_t keyvault_fail_count(void);
 
-/* 验证通过后, 用 PIN 派生解密钥 (UI 每次输入/增删前调用并保存) */
-void keyvault_unlock_secret(const char *pin, uint8_t key[KEYVAULT_KEY_LEN]);
+/* 验证通过后, 用 PIN 派生解密钥 (UI 每次输入/增删前调用并保存)。
+ * 返回 ESP_OK 才可把 key 用于加解密; 失败时 key 已清零, 调用方必须放弃本次操作。 */
+esp_err_t keyvault_unlock_secret(const char *pin, uint8_t key[KEYVAULT_KEY_LEN]);
 
 /* ---- 分类管理 ---- */
 int         keyvault_cat_count(void);              /* 当前分类数 (含内置) */

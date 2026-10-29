@@ -239,7 +239,6 @@ static void wifi_restore_task(void *arg)
 }
 static st7305_handle_t *s_ss_lcd = NULL;
 
-#include "sleep.h"   /* 电源模块: wp_power_init(绑定 LCD + 注册深睡唤醒源) */
 #include "usb_hid.h" /* usb_hid_host_mounted(): USB 插着就不自动休眠 (2026-10-02) */
 #include "power_stat.h" /* power_stat_tick(): USB 插入边沿 → 电源统计清零 (电池信息页) */
 
@@ -417,7 +416,6 @@ void wp_screensaver_supervisor_start(st7305_handle_t *lcd) {
     xTaskCreateStatic(ss_supervisor_task, "sse", SS_SUPER_STACK, NULL, tskIDLE_PRIORITY + 2,
                       s_ss_stack, &s_ss_tcb);
     s_ss_task_h = (TaskHandle_t)&s_ss_tcb;
-    wp_power_init(s_ss_lcd);   /* 电源模块: 绑定 LCD(关机清屏用) + 注册深睡唤醒源 */
     ESP_LOGI(WP_TAG, "屏保独立监视任务已启动 (PSRAM 栈 %u words)", (unsigned)SS_SUPER_STACK);
 }
 

@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+#include "lmz.h"   /* ★ 2026-10-27: zip 解压(stored+deflate) */
 
 #define TAG "AM_ASSET"
 
@@ -88,84 +89,82 @@ static bool copy_range(FILE *fi, long off, uint32_t len, const char *dst)
     return ok;
 }
 
+/* miniz 的解压回调: 逐块写文件 —— 流式, 内存不随包体增长(11MB 的 GOP.MKF 也扛得住) */
+static size_t asset_write_cb(void *opaque, mz_uint64 file_ofs, const void *buf, size_t n)
+{
+    (void)file_ofs;
+    return fwrite(buf, 1, n, (FILE *)opaque);
+}
+
 bool am_asset_install_cb(const char *zip_path, const char *target_dir,
                          am_asset_prog_cb_t cb)
 {
     if (!zip_path || !target_dir || !target_dir[0]) return false;
 
-    FILE *fi = fopen(zip_path, "rb");
-    if (!fi) {
-        ESP_LOGE(TAG, "打不开资源包: %s", zip_path);
+    /* ★★★ 2026-10-27 linit: 改用 miniz 的 zip 读取器, **同时支持 stored(0) 与 deflate(8)**。
+     *   原来手写的解析只认 method=0 ⇒ 常规压缩的 pal.zip 里 109 个文件全部被"跳过",
+     *   解出来是空目录 ⇒ 仙剑提示"资源未安装"; 而商店只看目录存在又显示"可卸载"。
+     *   mz_zip_reader_extract_to_callback 是流式的, 内存不随包体增长。 */
+    mz_zip_archive z;
+    memset(&z, 0, sizeof(z));
+    if (!mz_zip_reader_init_file(&z, zip_path, 0)) {
+        ESP_LOGE(TAG, "打不开资源包(zip): %s", zip_path);
         return false;
     }
-    fseek(fi, 0, SEEK_END);
-    long fsz = ftell(fi);
-    if (fsz < 22) { fclose(fi); ESP_LOGE(TAG, "文件太小, 不是 zip"); return false; }
-
-    /* ---- 找 EOCD (从尾部往前扫) ---- */
-    long scan = fsz < EOCD_SCAN_MAX ? fsz : EOCD_SCAN_MAX;
-    uint8_t hdr[22];
-    long eocd = -1;
-    for (long i = fsz - 22; i >= fsz - scan; i--) {
-        if (fseek(fi, i, SEEK_SET) != 0) break;
-        if (fread(hdr, 1, 4, fi) != 4) break;
-        if (rd32(hdr) == ZIP_EOCD_SIG) { eocd = i; break; }
-    }
-    if (eocd < 0) { fclose(fi); ESP_LOGE(TAG, "找不到 EOCD (不是 zip?)"); return false; }
-    if (fseek(fi, eocd, SEEK_SET) != 0 || fread(hdr, 1, 22, fi) != 22) { fclose(fi); return false; }
-    uint16_t total   = rd16(hdr + 10);
-    uint32_t cd_off  = rd32(hdr + 16);
-    ESP_LOGI(TAG, "资源包 %s: %ld 字节, %u 个条目", zip_path, fsz, (unsigned)total);
+    int total = (int)mz_zip_reader_get_num_files(&z);
+    ESP_LOGI(TAG, "资源包 %s: %d 个条目", zip_path, total);
+    if (total <= 0) { mz_zip_reader_end(&z); return false; }
 
     mkdirs(target_dir);
 
     char dst[320];
     int done = 0, skipped = 0, failed = 0;
-    long cd_pos = (long)cd_off;
-    for (uint16_t k = 0; k < total; k++) {
-        uint8_t ce[46];
-        if (fseek(fi, cd_pos, SEEK_SET) != 0 || fread(ce, 1, 46, fi) != 46) { failed++; break; }
-        if (rd32(ce) != ZIP_CD_SIG) { failed++; break; }
-        uint16_t method  = rd16(ce + 10);
-        uint32_t csize   = rd32(ce + 20);
-        uint16_t nlen    = rd16(ce + 28);
-        uint16_t elen    = rd16(ce + 30);
-        uint16_t clen    = rd16(ce + 32);
-        uint32_t loff    = rd32(ce + 42);
-
-        char name[220];
-        uint16_t nl = nlen < sizeof(name) - 1 ? nlen : (uint16_t)(sizeof(name) - 1);
-        if (fseek(fi, cd_pos + 46, SEEK_SET) != 0 || fread(name, 1, nl, fi) != nl) { failed++; break; }
-        name[nl] = 0;
-        cd_pos += 46 + nlen + elen + clen;
-
-        if (!name[0] || name[nl - 1] == '/') { skipped++; continue; }   /* 目录条目 */
-        if (name[0] == '/' || strstr(name, "..")) {                     /* 路径穿越 */
+    for (int i = 0; i < total; i++) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&z, i, &st)) { failed++; continue; }
+        const char *name = st.m_filename;
+        if (!name || !name[0] || st.m_is_directory) { skipped++; continue; }
+        /* 安全: 拒绝绝对路径与 ".." (防 zip slip 写出 target 之外) */
+        if (name[0] == '/' || strstr(name, "..")) {
             ESP_LOGW(TAG, "拒绝可疑路径: %s", name);
             skipped++;
             continue;
         }
-        if (method != 0) {
-            ESP_LOGW(TAG, "只支持不压缩包, 跳过 method=%u: %s", (unsigned)method, name);
-            skipped++;
+        snprintf(dst, sizeof(dst), "%s/%s", target_dir, name);
+        char pdir[256];
+        parent_of(dst, pdir, sizeof(pdir));
+        if (pdir[0]) mkdirs(pdir);
+
+        FILE *fo = fopen(dst, "wb");
+        if (!fo) { ESP_LOGE(TAG, "写文件失败: %s", dst); failed++; continue; }
+        bool ok = mz_zip_reader_extract_to_callback(&z, (mz_uint)i, asset_write_cb, fo, 0);
+        fclose(fo);
+        if (!ok) {
+            ESP_LOGE(TAG, "解压失败: %s", dst);
+            remove(dst);
+            failed++;
             continue;
         }
-
-        /* local header → 数据偏移 */
-        uint8_t lh[30];
-        if (fseek(fi, (long)loff, SEEK_SET) != 0 || fread(lh, 1, 30, fi) != 30) { failed++; continue; }
-        if (rd32(lh) != ZIP_LOC_SIG) { failed++; continue; }
-        long data_off = (long)loff + 30 + rd16(lh + 26) + rd16(lh + 28);
-
-        snprintf(dst, sizeof(dst), "%s/%s", target_dir, name);
-        if (!copy_range(fi, data_off, csize, dst)) { failed++; continue; }
         done++;
-        if (cb) cb((int)((long)(k + 1) * 1000 / (long)(total ? total : 1)));
+        if (cb) cb((int)((long)(i + 1) * 1000 / (long)total));
     }
-    fclose(fi);
+    mz_zip_reader_end(&z);
 
     ESP_LOGI(TAG, "解包完成: 成功 %d / 跳过 %d / 失败 %d → %s", done, skipped, failed, target_dir);
-    return (failed == 0 && done > 0);
+    bool all_ok = (failed == 0 && done > 0);
+    /* ★★★ 2026-10-27 linit: **全部成功才写 .installed 标记**。
+     *   "是否已安装"改成验证这个标记, 不再只看目录存在 —— 否则解压失败/空目录
+     *   也会显示"可卸载", 用户点进应用却提示"资源未安装"(就是这次的坑)。 */
+    if (all_ok) {
+        char mark[320];
+        snprintf(mark, sizeof(mark), "%s/.installed", target_dir);
+        FILE *mf = fopen(mark, "w");
+        if (mf) { fprintf(mf, "%d\n", done); fclose(mf); }
+        else ESP_LOGW(TAG, "写安装标记失败: %s", mark);
+    } else {
+        ESP_LOGW(TAG, "解包未全部成功 (成功 %d/失败 %d), 不写安装标记", done, failed);
+    }
+    return all_ok;
 }
 
 /* 递归删除目录 */

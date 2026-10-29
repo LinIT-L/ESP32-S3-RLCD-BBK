@@ -10,7 +10,7 @@
 #define BTN_GPIO_RIGHT  (board_pins_get()->btn_right)
 /* V1.0.68: 软关机键 GPIO1: 短按=确认, 长按0.5s=返回主菜单, 长按2s=软关机 */
 #define BTN_GPIO_PWR    (board_pins_get()->btn_pwr)
-extern void wp_power_pin_init(void);   /* [电源收拢] 电源模块(sleep.c): 开机键唤醒引脚初始化(唯一唤醒源) */
+#include "power_mgr.h"   /* [电源收拢] 电源管理(power_mgr): 开机键唤醒引脚初始化(唯一唤醒源) */
 #define POWER_HOLD_MS   2000
 #define PWR_SHORT_MS    500    /* V1.5.x: 开关键短按判定阈值 — 按住<0.5s 松手=锁屏(短按);
                                 * 达到 2s(POWER_HOLD_MS) 由 input_power_should_sleep 弹关机确认 */
@@ -291,7 +291,7 @@ void input_init(void) {
     /* [电源收拢] 唤醒/睡眠引脚(RTC域上拉 + EXT1唤醒掩码)统一由电源模块 sleep.c 负责
      * (wp_power_pin_init: 仅开机键 PWR(GPIO1) 为唯一唤醒源). input.c 在此只负责
      * 普通 GPIO 读键(短按/长按/关机计时均读数字电平), 不参与电源/唤醒配置. */
-    wp_power_pin_init();
+    power_mgr_pin_init();
 }
 
 static menu_action_t tick(btn_ctx_t *b) {

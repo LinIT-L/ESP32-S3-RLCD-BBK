@@ -13,5 +13,5 @@ idf_component_register(
         bt_ctl
         usb_bt
         usb_net
-        driver
+        driver esp_driver_gpio
 )

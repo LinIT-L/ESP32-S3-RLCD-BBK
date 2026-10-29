@@ -14,7 +14,9 @@ idf_component_register(
         os
         apps
         wallpapers
+        power_mgr
         driver
+        esp_driver_gpio esp_driver_i2c
         esp_timer
         nvs_flash svc_time svc_log svc_nvs
         esp_event

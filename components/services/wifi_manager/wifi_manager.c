@@ -424,7 +424,7 @@ bool wifi_manager_scan_start(void) {
     esp_wifi_set_ps(WIFI_PS_NONE);
     /* ★ 2026-10-20: 强制 20MHz。本机 AP 报的是 40U, 窄带在穿墙/干扰下重传少、握手更快;
      *   我们只跑网页小包, 带宽上限降低无感。 */
-    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);   /* 保险: 扫描期间禁用省电, 联网速度优先 */
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20);   /* 保险: 扫描期间禁用省电, 联网速度优先 */
     wifi_scan_config_t cfg = {
         .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = false,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,

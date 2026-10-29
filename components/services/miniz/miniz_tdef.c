@@ -24,7 +24,7 @@
  *
  **************************************************************************/
 
-#include "miniz.h"
+#include "lmz.h"
 
 #ifndef MINIZ_NO_DEFLATE_APIS
 

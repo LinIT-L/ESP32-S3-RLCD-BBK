@@ -10,6 +10,8 @@
 #include "vibrator.h"   /* V1.2.x: UI 震动 (菜单导航/确认) */
 #include "wallpapers.h"
 #include "favorites.h"
+#include "power_mgr.h"    /* 电源管理: 唤醒源注册 + 深睡前钩子 (2026-10-28 从 wallpapers 拆出) */
+#include "power_stat.h"   /* power_stat_on_deep_sleep(): 睡前一笔记账, 挂在 power_mgr 钩子上 */
 #include "input.h"         /* input_touch_hold_ms: 屏保触摸长按1秒唤醒 */
 #include "gesture_back.h"  /* 底部上滑=返回 的开关: gesture_back_enable (!m->swipe_back_disabled) */
 #include "ui_common.h"     /* fill_rect: 底部上滑"跟手"指示条绘制 */
@@ -68,6 +70,12 @@ void os_init(ui_ctx_t *ctx, st7305_handle_t *lcd)
     favorites_init();
     /* V1.5.x: 独立屏保监视任务 — 休眠最高优先级, 不随页面/游戏阻塞 */
     wp_screensaver_supervisor_start(ctx->lcd);
+    /* ★ 2026-10-28 (第 5 阶段 Step 3): 电源模块由 os 内核在此初始化。
+     *   原来这一步藏在 wallpapers 的屏保监督任务里(wp_power_init), 属 ui→system 倒置;
+     *   现在 ui 不再认识 power_mgr —— 关机画面在调用方(main), 硬件顺序在 power_mgr。
+     *   钩子位置与原 power_stat_on_deep_sleep() 调用点一致(屏 deinit 之后、深睡之前)。 */
+    power_mgr_init(ctx->lcd);
+    power_mgr_set_pre_sleep_hook(power_stat_on_deep_sleep);
 }
 
 void os_register(const os_module_t *mod)

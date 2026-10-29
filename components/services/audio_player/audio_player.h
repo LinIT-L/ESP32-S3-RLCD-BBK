@@ -66,6 +66,10 @@ void audio_player_diag(void);
  *   ② audio_pa_force_off(): 关功放 + hold 低电平 (深睡时 GPIO 变高阻, 不 hold 会被上拉拉高)。
  *   必须在 esp_deep_sleep_start() **之前**调用 (之后没有代码会执行)。 */
 void audio_player_sleep_for_off(void);
+/* 关机流程的**提前**版本 (2026-10-28): 立刻关 ES8311/ES7210/I2S/功放,
+ * 但**不做** gpio_deep_sleep_hold_en(全局冻结 pad 会让随后的 GPS UBX 发不出去)。
+ * 用法: wp_power_off 开头调它, GPS 停靠完成后调 audio_player_sleep_for_off() 补 hold。 */
+void audio_player_sleep_for_off_early(void);
 
 
 /* === 录音机（WAV 录制 / 播放） === */

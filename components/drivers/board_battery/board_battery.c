@@ -56,8 +56,48 @@ void board_battery_set_channel(int chan) { if (chan >= 0) s_bat_chan = chan; }
  *        ⇒ 采样电容充不满 ⇒ **ADC 系统性欠读**几个百分点。
  *   ⚠ 改板/改电阻后必须重新标定: 串口 `bat` 打印"脚上 mV", 拿万用表量同时刻 VBAT,
  *     k = 真实VBAT / 脚上mV, 把 NUM/DEN 写成 k 的整数比即可 (k 约 3.10 现板)。 */
-#define BOARD_BATTERY_DIVIDER_NUM     3100    /* 标定后等效分压比 ×3.10 (原理论值 3.000) */
+#define BOARD_BATTERY_DIVIDER_NUM     3100    /* 旧板标定值; 现板用 `batcal <真实mV>` 现场实测覆盖 (存 NVS) */
 #define BOARD_BATTERY_DIVIDER_DEN     1000
+
+/* ★★ 2026-10-27 linit: 分压比改成**运行期可标定 + NVS 持久化** ★★
+ *   原来写死宏 ⇒ 换板/换电阻/模块内部分压不同就得重编固件。
+ *   现在串口一条命令即可标定:
+ *       bat                      看 raw / 脚上 mV / 当前系数 / 换算 VBAT
+ *       batcal 4255              拿外部仪表(如 INA226)读到的**真实 VBAT(mV)** 标定
+ *                                内部用**同一时刻**的脚上 mV 反算 k = 真实mV / 脚上mV,
+ *                                写 NVS 后立即生效, 重启不丢。
+ *   ⚠ 必须在"电池电压稳定"时标 (充电中/大负载时 VBAT 本身在变, 标出来会偏)。 */
+#define BAT_DIV_NVS_NS   "batcal"
+#define BAT_DIV_NVS_KEY  "div"
+#define BAT_DIV_MAGIC    0xBD1Fu
+
+typedef struct { uint16_t num, den, magic; } bat_div_nvs_t;
+
+static int s_div_num = BOARD_BATTERY_DIVIDER_NUM;
+static int s_div_den = BOARD_BATTERY_DIVIDER_DEN;
+
+static void bat_div_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(BAT_DIV_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    bat_div_nvs_t v = { (uint16_t)s_div_num, (uint16_t)s_div_den, BAT_DIV_MAGIC };
+    if (nvs_set_blob(h, BAT_DIV_NVS_KEY, &v, sizeof(v)) == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+}
+
+static void bat_div_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(BAT_DIV_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    bat_div_nvs_t v;
+    size_t len = sizeof(v);
+    if (nvs_get_blob(h, BAT_DIV_NVS_KEY, &v, &len) == ESP_OK && len == sizeof(v) &&
+        v.magic == BAT_DIV_MAGIC && v.num >= 1000 && v.num <= 9000 && v.den > 0) {
+        s_div_num = v.num; s_div_den = v.den;
+        ESP_LOGI(TAG, "分压比已用 NVS 标定值: x%d/%d", s_div_num, s_div_den);
+    }
+    nvs_close(h);
+}
 
 /*
  * 单节锂电池的粗略电量映射 (线性)。不是"电量计"级别，只给用户一个大概剩余量。
@@ -323,13 +363,14 @@ esp_err_t board_battery_init(void)
                         "config battery adc channel failed");
 
     board_battery_init_calibration();
+    bat_div_load();        /* ★ NVS 里若有标定过的分压比, 覆盖默认值 */
     bat_days_load();       /* 恢复一个月日档 (NVS, 断电不丢) */
     bat_hist_meta_load();  /* 电压历史元数据 (数组懒加载, 不拖慢开机) */
 
     s_initialized = true;
     ESP_LOGI(TAG, "Battery ADC initialized: %s ADC1_CH%d, divider x%d/%d, 满电压 %u mV",
              BOARD_BATTERY_ADC_GPIO_NAME, BOARD_BATTERY_ADC_CH,
-             BOARD_BATTERY_DIVIDER_NUM, BOARD_BATTERY_DIVIDER_DEN,
+             s_div_num, s_div_den,
              (unsigned)battery_full_mv());
 
     /* ★ 2026-10-05 一次性自检打印 —— 用来**校准分压比**。
@@ -347,8 +388,8 @@ esp_err_t board_battery_init(void)
             ESP_LOGI(TAG, "电池自检: raw=%d 脚上=%d mV  ⇒ 按现系数(%d/%d)算出 VBAT≈%d mV"
                           "   [拿万用表量真实 VBAT 对比即可校准]",
                      raw0, pin_mv,
-                     BOARD_BATTERY_DIVIDER_NUM, BOARD_BATTERY_DIVIDER_DEN,
-                     pin_mv > 0 ? pin_mv * BOARD_BATTERY_DIVIDER_NUM / BOARD_BATTERY_DIVIDER_DEN : -1);
+                     s_div_num, s_div_den,
+                     pin_mv > 0 ? pin_mv * s_div_num / s_div_den : -1);
         }
     }
     return ESP_OK;
@@ -379,7 +420,7 @@ esp_err_t board_battery_read(board_battery_status_t *status)
         adc_mv = (raw_avg * 3300) / 4095;
     }
 
-    uint32_t battery_mv = ((uint32_t)adc_mv * BOARD_BATTERY_DIVIDER_NUM) / BOARD_BATTERY_DIVIDER_DEN;
+    uint32_t battery_mv = ((uint32_t)adc_mv * (uint32_t)s_div_num) / (uint32_t)s_div_den;
     status->voltage_mv = battery_mv;
     status->percent = board_battery_voltage_to_percent(battery_mv);
 
@@ -581,6 +622,46 @@ int board_battery_wave(bat_sample_t *out, int max, uint32_t window_s)
  * 一次性打印: raw / 脚上 mV / 分压系数 / 换算 VBAT / 百分比。
  * 用途: 拿万用表同时量 BAT_ADC 脚 与 VBAT, 和这里的数字对照即可判定
  *   ① 分压系数对不对 (k = 真实 VBAT / 脚上 mV)  ② 满量程基准要不要调。 */
+/* ★ 2026-10-27: 用外部仪表的真实 VBAT 标定分压比 (命令行 batcal <mV>) */
+bool board_battery_calibrate(uint32_t real_mv)
+{
+    if (real_mv < 2000 || real_mv > 5000) {
+        ESP_LOGW(TAG, "BATCAL 拒绝: 真实电压 %u mV 不在 2000~5000 范围", (unsigned)real_mv);
+        return false;
+    }
+    if (board_battery_init() != ESP_OK) return false;
+
+    int raw_sum = 0;
+    for (int i = 0; i < BOARD_BATTERY_SAMPLE_COUNT; i++) {
+        int raw = 0;
+        if (adc_oneshot_read(s_adc_handle, s_bat_chan, &raw) != ESP_OK) return false;
+        raw_sum += raw;
+    }
+    int raw_avg = raw_sum / BOARD_BATTERY_SAMPLE_COUNT;
+    int pin_mv = 0;
+    if (s_calibrated && s_cali_handle) adc_cali_raw_to_voltage(s_cali_handle, raw_avg, &pin_mv);
+    else pin_mv = (raw_avg * 3300) / 4095;
+    if (pin_mv < 200) {
+        ESP_LOGW(TAG, "BATCAL 拒绝: 脚上仅 %d mV, 读数不可信", pin_mv);
+        return false;
+    }
+
+    /* k = 真实VBAT / 脚上mV, 以 1/1000 精度存 */
+    uint32_t num = (uint32_t)(((uint64_t)real_mv * 1000u) / (uint32_t)pin_mv);
+    if (num < 1000 || num > 9000) {
+        ESP_LOGW(TAG, "BATCAL 拒绝: 算出的分压比 x%d/1000 越界", (int)num);
+        return false;
+    }
+    int old_num = s_div_num, old_den = s_div_den, old_vbat = pin_mv * s_div_num / s_div_den;
+    s_div_num = (int)num;
+    s_div_den = 1000;
+    bat_div_save();
+    ESP_LOGI(TAG, "BATCAL 完成: raw=%d 脚上=%d mV 真实=%u mV ⇒ 分压比 x%d/%d (原 x%d/%d, 原读数 %d mV) 已存 NVS",
+             raw_avg, pin_mv, (unsigned)real_mv, s_div_num, s_div_den,
+             old_num, old_den, old_vbat);
+    return true;
+}
+
 void board_battery_diag(void)
 {
     if (board_battery_init() != ESP_OK) {
@@ -597,7 +678,7 @@ void board_battery_diag(void)
     int pin_mv = -1;
     if (s_calibrated && s_cali_handle) adc_cali_raw_to_voltage(s_cali_handle, raw_avg, &pin_mv);
     uint32_t vbat = (pin_mv > 0)
-        ? (uint32_t)pin_mv * BOARD_BATTERY_DIVIDER_NUM / BOARD_BATTERY_DIVIDER_DEN : 0;
+        ? (uint32_t)pin_mv * s_div_num / s_div_den : 0;
     {   /* 一个月日档: 有效天数 + 今日 min/max */
         bat_day_t db[BOARD_BATTERY_DAYS];
         int dn = board_battery_days_get(db, BOARD_BATTERY_DAYS);
@@ -616,7 +697,7 @@ void board_battery_diag(void)
     ESP_LOGI(TAG, "BATDIAG %s raw=%d/%d 脚上=%d mV 系数=%d/%d => VBAT=%u mV (%u%%) "
                   "[满=%u(30天峰值%s) 空=%d mV]",
              BOARD_BATTERY_ADC_GPIO_NAME, raw_avg, 4095, pin_mv,
-             BOARD_BATTERY_DIVIDER_NUM, BOARD_BATTERY_DIVIDER_DEN,
+             s_div_num, s_div_den,
              (unsigned)vbat, (unsigned)board_battery_voltage_to_percent(vbat),
              (unsigned)battery_full_mv(), bat_win_full_mv() ? "命中" : "默认",
              BOARD_BATTERY_EMPTY_MV);

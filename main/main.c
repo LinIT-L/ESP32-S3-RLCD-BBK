@@ -107,7 +107,7 @@ static uint32_t s_bat_check_ms = 0;   /* 电量评估节流时间戳 (每 10 秒
 #include "os_hw.h"
 #include "os_mgr.h"
 #include "wallpapers.h"
-#include "sleep.h"
+#include "power_mgr.h"   /* 唤醒门控/来源/开机诊断 (2026-10-28 从 sleep.h 迁出) */
 #include "power_stat.h"   /* power_stat_init(): 电源统计 (设置→休眠与电源→电池信息) */
 #include "bt_manager.h"
 #include "wifi_manager.h"
@@ -149,14 +149,23 @@ static const os_platform_ops_t s_os_platform = {
  *   AUTO   自动(休眠时间到点)      : 任意键唤醒, 短按即开机
  * 两者的深睡前动作相同: 先挂起屏保监督任务(PSRAM 栈持续刷屏, 深睡禁缓存瞬间会撞断言),
  * 再交给电源模块停射频 → 清屏 → esp_deep_sleep_start()。 */
+/* ★ 2026-10-28 (第 5 阶段 Step 3): 「刷白」这一步留在调用方(main), 硬件收尾全交 power_mgr。
+ *   原来刷白与"关射频/音频/GPS/SD/触摸/屏/引脚"一起写在 wallpapers/sleep.c 里 ——
+ *   等于让 ui 层直接编排七八个外设的关闭顺序。现在 ui 只提出请求, 顺序由 power_mgr 负责。
+ *   ⚠ 刷白必须仍在所有耗时动作之前(GPS 停靠 4~15 秒), 否则用户按了关机像"没反应"。 */
+static void power_off_ui(int origin) {
+    st7305_clear(&g_lcd, ST7305_COLOR_WHITE);
+    st7305_flush_override(&g_lcd);
+    power_mgr_off(origin);   /* 不返回 */
+}
 static void do_manual_shutdown(ui_ctx_t *ctx) {
     (void)ctx;
     wp_screensaver_halt();
-    wp_power_off(WP_OFF_MANUAL);   /* 不返回 */
+    power_off_ui(POWER_OFF_MANUAL);
 }
 static void do_auto_shutdown(void) {
     wp_screensaver_halt();
-    wp_power_off(WP_OFF_AUTO);     /* 不返回 */
+    power_off_ui(POWER_OFF_AUTO);
 }
 /* 远程关机 (remcon 命令 shutdown [auto|manual]): 便于实测两条唤醒策略。
  * auto_mode=1 走"休眠到点自动关机"(任意键唤醒, 不显示 Logo); 0 走手动路径。 */
@@ -615,7 +624,7 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
     os_init(&ctx, lcd);
     apps_register_all();     /* V1.2 模块化: 注册全部内置应用页 + 应用表 (原 os_init 内部调用) */
     boot_ts("os_init + 页面注册");
-    wp_sleep_boot_diag();   /* 复位/唤醒诊断: 此处 USB 已重新枚举, 日志不会丢 */
+    power_mgr_boot_diag();   /* 复位/唤醒诊断: 此处 USB 已重新枚举, 日志不会丢 */
     remcon_init();           /* 串口远程控制台 (USB Serial/JTAG 收命令, 远程自动化测试) */
     board_shim_set_lcd(lcd);   /* 绑定主屏到 board_shim: NES/GBC/文曲星/ArduBoy 引擎前置 (board_rlcd_is_initialized) */
     os_platform_set(&s_os_platform);
@@ -727,7 +736,7 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
      * es8311_start/set_sample_rate 的 I2C 深链路爆栈 panic, 导致开机无限重启.
      * (tone_mel/tone_cont 栈已 2048→4096 words 加固, 开机音仍可随时手动触发) */
     /* 关机唤醒已在按键瞬间震过, 进桌面不再重复震; 冷启动在此震一次 */
-    if (!wp_power_woke_from_off()) vibrator_tap(80, 120);
+    if (!power_mgr_woke_from_off()) vibrator_tap(80, 120);
     os_shell_loop(&ctx);
 }
 #endif /* CONFIG_OS */
@@ -759,7 +768,7 @@ void app_main(void)
     boot_ts("app_main 入口");
     /* 关机唤醒门控 —— 必须最先执行: 手动关机唤醒时要求 PWR 键保持按住 ≥0.5s,
      * 不足(碰一下)判为误触, 直接回深睡(不返回); 自动关机 / 上电启动直接放行。 */
-    wp_power_wake_gate();
+    power_mgr_wake_gate();
 
     /* 电源统计: 结算上次深睡时长, 起新的"醒着段" (设置→休眠与电源→电池信息)。
      * 必须早调: 放在门控之后、其它初始化之前, 免得把初始化耗时也算进上一段睡眠。 */
@@ -788,7 +797,7 @@ void app_main(void)
     /* ★ 2026-10-27 linit「自动关机和长按电源键效果一模一样」:
      *   原来自动关机唤醒走"快速开机"(不显示 Logo, 直接进桌面) —— 和手动唤醒观感不同。
      *   现在统一: 两种唤醒**都显示 Logo**、都要按住 PWR ≥0.5s(门控在 sleep.c)。
-     *   保留 wp_power_wake_origin() 的调用只为日志/诊断, 不再影响开机观感。 */
+     *   保留 power_mgr_wake_origin() 的调用只为日志/诊断, 不再影响开机观感。 */
     s_soft_boot = false;
 
     /* Lua 集成冒烟测试: 挂载 SPIFFS + 加载执行 /store/test.lua。
@@ -906,7 +915,7 @@ void app_main(void)
     /* V1.0.76: 震动马达 LEDC 初始化 (幂等, 无硬件也不影响运行) */
     vibrator_init();
     /* 关机唤醒(由按键触发) → 立即震动反馈; 冷启动则由进桌面流程震动。 */
-    if (wp_power_woke_from_off()) vibrator_tap(80, 120);
+    if (power_mgr_woke_from_off()) vibrator_tap(80, 120);
 
     /* V1.0.70: 音调播放器全局初始化 (PCM→I2S, 两板通用).
      * 声音是固件全局功能, 不绑定任何引擎; 开机音/按键音/闹铃随时可播. */

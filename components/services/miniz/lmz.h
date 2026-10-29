@@ -1,3 +1,6 @@
+/* ★ 2026-10-27 LinTOS: 由 miniz.h 改名而来 —— ESP-IDF 的 esp_rom/include 里也有一份
+ *   miniz.h(只声明 ROM 的 tinfl, 且定义了 MINIZ_NO_ARCHIVE_APIS), `#include "miniz.h"`
+ *   会优先命中它 ⇒ 我们的 zip API 整体消失。改成唯一名字后不再互相遮挡。 */
 /* miniz.c 3.1.2 - public domain deflate/inflate, zlib-subset, ZIP reading/writing/appending, PNG writing
    See "unlicense" statement at the end of this file.
    Rich Geldreich <richgel99@gmail.com>, last updated Oct. 13, 2013
@@ -159,8 +162,20 @@
    functions (such as tdefl_compress_mem_to_heap() and tinfl_decompress_mem_to_heap()) won't work. */
 /*#define MINIZ_NO_MALLOC */
 
+/* ★ 2026-10-27 LinTOS: 本工程必须要有 zip archive API —— 商店资源包解压(pal.zip)和
+ *   EPUB 阅读器都要用它。miniz 在 163 行会把 MINIZ_NO_INFLATE_APIS 级联成
+ *   MINIZ_NO_ARCHIVE_APIS(于是 mz_zip_* 类型整体消失), 这里显式撤销, 保证依赖方
+ *   无论以何种顺序 include 都能拿到 zip API。 */
+#undef MINIZ_NO_INFLATE_APIS
+#undef MINIZ_NO_ARCHIVE_APIS
+
+/* ★ 2026-10-27 LinTOS: 原来这里把 MINIZ_NO_INFLATE_APIS 级联成 MINIZ_NO_ARCHIVE_APIS。
+ *   但我们**必须**要有 zip archive API(商店资源包 pal.zip / EPUB 都要解 zip),
+ *   所以这级联在本工程直接禁用 —— 宁可多几 KB flash, 不能没有 mz_zip_*。 */
+#if 0
 #ifdef MINIZ_NO_INFLATE_APIS
 #define MINIZ_NO_ARCHIVE_APIS
+#endif
 #endif
 
 #ifdef MINIZ_NO_DEFLATE_APIS

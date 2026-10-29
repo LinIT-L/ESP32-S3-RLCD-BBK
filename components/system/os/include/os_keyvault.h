@@ -38,8 +38,9 @@ const char  *os_keyvault_pin_msg(int r, char *buf, size_t n);
 /* 距下次可重试的秒数 (0=可立即试) */
 uint32_t     os_keyvault_lock_remaining_sec(void);
 uint32_t     os_keyvault_fail_count(void);
-/* 验证通过后, 用 PIN 派生解密钥 (UI 每次输入/增删前调用并保存) */
-void         os_keyvault_unlock_secret(const char *pin, uint8_t key[KEYVAULT_KEY_LEN]);
+/* 验证通过后, 用 PIN 派生解密钥 (UI 每次输入/增删前调用并保存)。
+ * 返回 ESP_OK 才可用 key; 失败时 key 已清零。 */
+esp_err_t    os_keyvault_unlock_secret(const char *pin, uint8_t key[KEYVAULT_KEY_LEN]);
 
 /* 通用加密 (AES-256-GCM): out 容量 ≥ n+28; 解密返回明文长度, 0=失败/被篡改 */
 size_t       os_keyvault_blob_encrypt(const uint8_t key[KEYVAULT_KEY_LEN], const uint8_t *in, size_t n, uint8_t *out);

@@ -9,5 +9,5 @@
 idf_component_register(
     SRCS "board_pins.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver log
+    REQUIRES driver log esp_driver_gpio
 )

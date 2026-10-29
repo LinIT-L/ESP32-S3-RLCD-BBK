@@ -794,7 +794,13 @@ static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb) 
      *   ⚠ 绝不在这里 vTaskDelay —— 会阻塞调用方(主循环/游戏任务), 手感发滞。 */
     if (FLUSH_MIN_MS > 0) {
         uint32_t now = lcd_now_ms();
-        if (s_last_flush_ms && (uint32_t)(now - s_last_flush_ms) < FLUSH_MIN_MS)
+        /* ★ 2026-10-29: 差值按**有符号**比较。FLUSH_MIN_MS 是普通 int 宏(默认 0),
+         *   左侧若留成 uint32_t, 宏展开就是 "(uint32_t)x < 0" —— 无符号与 0 比恒假,
+         *   GCC 直接报 -Wtype-limits("comparison of unsigned expression in '< 0'
+         *   is always false")。6.0 默认把这类警告当错误, 会让新克隆直接编译失败。
+         *   两个时间点之差必然远小于 2^31 ms(约 24.8 天), 转 int32_t 不丢任何语义;
+         *   FLUSH_MIN_MS=0 时外层的 if 本来就恒假, 行为与改前完全一致。 */
+        if (s_last_flush_ms && (int32_t)(now - s_last_flush_ms) < (int32_t)FLUSH_MIN_MS)
             return ESP_OK;
         s_last_flush_ms = now;
     }

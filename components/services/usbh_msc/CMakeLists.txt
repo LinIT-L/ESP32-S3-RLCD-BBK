@@ -2,5 +2,5 @@ idf_component_register(
     SRCS "usbh_msc_sdspi.c"
     INCLUDE_DIRS "include"
     REQUIRES tinyusb sdmmc svc_log driver usb_hid
-    PRIV_REQUIRES esp_tinyusb usb
+    PRIV_REQUIRES esp_tinyusb
 )

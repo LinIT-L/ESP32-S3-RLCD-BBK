@@ -15,7 +15,7 @@ int          os_keyvault_set_pin(const char *pin)           { return keyvault_se
 int          os_keyvault_verify_pin(const char *pin)        { return keyvault_verify_pin(pin); }
 uint32_t     os_keyvault_lock_remaining_sec(void)           { return keyvault_lock_remaining_sec(); }
 uint32_t     os_keyvault_fail_count(void)                   { return keyvault_fail_count(); }
-void         os_keyvault_unlock_secret(const char *pin, uint8_t key[KEYVAULT_KEY_LEN]) { keyvault_unlock_secret(pin, key); }
+esp_err_t    os_keyvault_unlock_secret(const char *pin, uint8_t key[KEYVAULT_KEY_LEN]) { return keyvault_unlock_secret(pin, key); }
 
 /* ★★ 2026-10-18: **统一 PIN 失败文案** —— 所有需要 PIN 的页面都调这一个,
  *   保证"错了还剩几次 / 锁到什么时候"说法一致, 不再各自写死一句"PIN 错误"。 */
