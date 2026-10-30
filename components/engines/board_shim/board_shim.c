@@ -16,6 +16,8 @@
 #include "virtual_keys.h"
 #include "cheat_float.h"
 #include "vid_tune.h"        /* 画面优化器 (shade→黑点数 可调) */
+#include "gray_quant.h"      /* ★ 2026-10-30 灰阶量化统一入口 (GB/GBC/NES 共用, 支持 Bayer 实验) */
+#include "input.h"           /* engine_overlay_quickbar: 游戏内下拉快捷栏 */
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -40,9 +42,10 @@ esp_err_t board_rlcd_draw_gb_line_to(uint8_t *fb, int x, int y,
 
 /* V1.0.46+: GB/GBC 灰度模式三档开关:
  *   0 = 纯黑白 (简单 2x 放大, shade>=2 为黑)
- *   1 = 4档点聚灰度 (shade 0/1/2/3 -> 黑点数 0/1/2/4)
- *   2 = 散点抖动 (Bayer 2x2, shade 0/1/2/3 -> 黑点数 0/1/2/3, 对角分布)
- * 点聚(clustered): 黑点聚成实心块, 静态不发抖, 避免 1bit 屏幕低刷新率下抖动闪烁. */
+ *   1 = 4档点聚灰度 (黑点聚成实心块, 静态不发抖, 避免 1bit 屏低刷下抖动闪烁)
+ *   2 = 散点抖动 (黑点对角散开, 层次更细腻)
+ * 黑点数(每档 2x2 里画几个黑点)**不在这里定**, 由 vid_tune 曲线决定; 本开关只决定
+ * 黑点落哪几个象限 + 是否走曲线 (0 档直接用 s_cluster_bw). */
 static int g_gb_gray = 1;
 
 /* NES 全屏缩放: 2bit 打包帧 (每字节 4 像素) + 内部 RAM 显示缓冲.
@@ -51,7 +54,7 @@ static int g_gb_gray = 1;
  * 定义放在抖动表之后, 这里只做前向声明. */
 #define NES_FB_BYTES       (ST7305_WIDTH * ST7305_HEIGHT / 8)   /* 15000 */
 #define NES_PACKED_256x224 (256 * 224 / 4)                       /* 14336 */
-static uint8_t s_rowbits[4][2][16];
+static uint8_t s_rowbits[4][2][16][2];   /* ★ 末维 = x 相位(cp&1), Bayer 需要; cluster 两相位相同 */
 static void board_shim_rebuild_nes_rowbits(void);
 static void board_shim_apply_tune(void);
 
@@ -219,7 +222,7 @@ static void board_video_flush_task(void *arg)
                 /* 1=全屏 / 2=拉伸: 均走 scaled 拉伸到全屏 (400 宽) 归一处理 */
                 board_rlcd_draw_nes_scaled(s_nes_disp, s_nes_shade_w, s_nes_shade_h);
             } else {
-                memcpy(s_fb_stage, s_lcd->fb, ST7305_WIDTH * ST7305_HEIGHT / 8);
+                memset(s_fb_stage, 0xFF, ST7305_WIDTH * ST7305_HEIGHT / 8);   /* ★ 每帧重建底(白): 透明手柄残影必须被清掉 */
                 int x = (ST7305_WIDTH - s_nes_shade_w) / 2;
                 int y = (ST7305_HEIGHT - s_nes_shade_h) / 2;
                 for (int yy = 0; yy < s_nes_shade_h; yy++) {
@@ -232,6 +235,7 @@ static void board_video_flush_task(void *arg)
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
             if (!takeover) vid_tune_overlay_tick(s_lcd);
+        if (!takeover) engine_overlay_quickbar(s_lcd);   /* ★ 游戏内下拉快捷栏 */
             board_rlcd_fb_unlock();
             if (!takeover) st7305_flush_from(s_lcd, s_lcd->fb);
         } else if (s_gbc_src && s_gbc_w > 0 && s_gbc_h > 0) {
@@ -247,7 +251,7 @@ static void board_video_flush_task(void *arg)
                 if (s_fb_stage) {
                     /* 内部 RAM 暂存构建 2x 帧, 一次 memcpy 写回 PSRAM,
                      * 避免 9 万次逐像素 PSRAM 读改写把 core0 拖到看门狗重启 */
-                    memcpy(s_fb_stage, s_lcd->fb, NES_FB_BYTES);
+                    memset(s_fb_stage, 0xFF, NES_FB_BYTES);   /* ★ 每帧重建底(白): 同上 */
                     for (int yy = 0; yy < s_gbc_h; yy++) {
                         const uint16_t *row = s_gbc_src + yy * s_gbc_w;
                         for (int xx = 0; xx < s_gbc_w; xx++)
@@ -271,7 +275,7 @@ static void board_video_flush_task(void *arg)
                 int gy = (ST7305_HEIGHT - s_gbc_h) / 2;
                 uint8_t shade_row[160];
                 if (s_fb_stage) {
-                    memcpy(s_fb_stage, s_lcd->fb, NES_FB_BYTES);
+                    memset(s_fb_stage, 0xFF, NES_FB_BYTES);   /* ★ 每帧重建底(白): 同上 */
                     for (int yy = 0; yy < s_gbc_h; yy++) {
                         const uint16_t *row = s_gbc_src + yy * s_gbc_w;
                         for (int xx = 0; xx < s_gbc_w; xx++) {
@@ -296,6 +300,7 @@ static void board_video_flush_task(void *arg)
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
             if (!takeover) vid_tune_overlay_tick(s_lcd);
+        if (!takeover) engine_overlay_quickbar(s_lcd);   /* ★ 游戏内下拉快捷栏 */
             board_rlcd_fb_unlock();
             s_gbc_conv_us = esp_timer_get_time() - c0;
             int64_t s0 = esp_timer_get_time();
@@ -307,6 +312,7 @@ static void board_video_flush_task(void *arg)
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
             if (!takeover) vid_tune_overlay_tick(s_lcd);
+        if (!takeover) engine_overlay_quickbar(s_lcd);   /* ★ 游戏内下拉快捷栏 */
             if (!takeover)
                 memcpy(s_flush_snapshot, s_lcd->fb, ST7305_WIDTH * ST7305_HEIGHT / 8);
             board_rlcd_fb_unlock();
@@ -501,9 +507,14 @@ static const uint8_t s_cluster_bw[4][4] = {
  *   "点聚/散点" 只决定**黑点落哪几个象限**, 黑点个数(0..4)来自 vid_tune 的曲线。
  *   这样 GB/GBC/NES/MD/SMS 全部走同一张表, 一处可调处处生效。 */
 static uint8_t s_tune_pat[4][4];
+/* 档间门限 (灰阶 0..6368), 由**当前抖动图案的实际白点占比**反算, 见 apply_tune.
+ * 不能写死: 黑点数由 vid_tune 曲线决定, 曲线一变档位亮度就变, 门限必须跟着变.
+ * 初值 = dots{0,1,2,3} 对应的一组, 仅在 apply_tune 跑之前有效 (正常不会用到). */
+static uint16_t s_shade_thr[3] = { 5572, 3980, 2388 };
 static void board_shim_apply_tune(void)
 {
     uint8_t dots[4] = { 0, 1, 2, 3 };
+    vid_tune_init();   /* 幂等: 保证 set_gb_gray 早于 set_lcd 时也能拿到默认曲线 */
     vid_tune_get_dots(dots);
     static const uint8_t ord_cluster[4] = { 0, 1, 2, 3 };   /* 左上 右上 左下 右下 (聚成块) */
     static const uint8_t ord_scatter[4] = { 0, 3, 1, 2 };   /* 左上 右下 右上 左下 (对角散开) */
@@ -513,31 +524,90 @@ static void board_shim_apply_tune(void)
         for (int k = 0; k < dots[sh] && k < 4; k++)
             s_tune_pat[sh][ord[k]] = ST7305_COLOR_BLACK;
     }
+
+    /* 档位实际亮度 = 6368 * 白点数 / 4 (白点 4-dots 个), 6368/4 = 1592 整除.
+     * 门限取相邻两档中点 ⇒ "离哪一档最近就归哪一档".
+     * 纯黑白档不吃曲线, 等效黑点数 0,0,4,4 ⇒ 门限 6368/3184/0 (= 原来的 3184 分界). */
+    uint8_t eff[4];
+    if (g_gb_gray == 0) {
+        eff[0] = 0; eff[1] = 0; eff[2] = 4; eff[3] = 4;
+    } else {
+        for (int sh = 0; sh < 4; sh++) eff[sh] = (uint8_t)(dots[sh] > 4 ? 4 : dots[sh]);
+    }
+    uint16_t lum[4];
+    for (int sh = 0; sh < 4; sh++) lum[sh] = (uint16_t)(1592U * (4U - eff[sh]));
+    for (int sh = 0; sh < 3; sh++)
+        s_shade_thr[sh] = (uint16_t)((lum[sh] + lum[sh + 1]) / 2U);
+    /* 防御: 曲线理论上单调 (vid_tune 已夹住), 真出现反向也不能让档位乱序 */
+    for (int sh = 1; sh < 3; sh++)
+        if (s_shade_thr[sh] > s_shade_thr[sh - 1]) s_shade_thr[sh] = s_shade_thr[sh - 1];
+
+    /* ★ 2026-10-30: 把同一条 dots 曲线交给 gray_quant，Bayer 的填充率也算成
+     *   dots*4/16（= dots/4），与 2x2 点聚**完全等价** ⇒ 换算法不改整体亮度，
+     *   A/B 对比才是公平的（不会"因为亮了所以觉得好看"）。 */
+    gray_quant_set_density(dots);
+    gray_quant_rebuild();
+
     board_shim_rebuild_nes_rowbits();
 }
 
-/* 按当前灰度模式取 shade 对应的 2x2 图案: 0=纯黑白, 1=点聚灰度, 2=散点抖动 */
-static const uint8_t *board_shim_cluster_get(uint8_t shade)
+/* 按当前灰度模式取 shade 对应的 2x2 图案:
+ *   0 = 纯黑白 → s_cluster_bw (不吃曲线)
+ *   1/2 = 点聚/散点 → s_tune_pat (位置无关)
+ *   Bayer 算法 → gray_quant_pat (位置相关, 见上)
+ * sx/sy 是**源像素的绝对屏幕坐标**, 不是"本行第几个"。 */
+static const uint8_t *board_shim_pat_get(uint8_t shade, int sx, int sy)
 {
     shade &= 0x03;
-    if (g_gb_gray == 0) return s_cluster_bw[shade];   /* 纯黑白档不走调曲线 */
+    if (g_gb_gray == 0) return s_cluster_bw[shade];
+    if (gray_quant_alg() == GRAY_ALG_BAYER_4X4) return gray_quant_pat(shade, sx, sy);
     return s_tune_pat[shade];
+}
+
+/* 按当前灰度模式取 shade 对应的 2x2 图案: 0=纯黑白, 1=点聚灰度, 2=散点抖动 */
+/* (2026-10-30: 旧的 board_shim_cluster_get 已并入 board_shim_pat_get —— 全部绘制路径
+ *  都改成带位置参数的版本, 只留一个入口, 免得再出现"某条路径没跟上算法切换"。) */
+
+/* ★ 2026-10-30 灰阶算法切换 (remcon `gray 0|1`)。切完必须重建表 + 强制整屏重画,
+ *   否则屏上是旧算法的残留, 而指纹会判定"内容没变"直接跳过刷新。 */
+void board_shim_set_gray_alg(int alg)
+{
+    gray_quant_set_alg(alg == 1 ? GRAY_ALG_BAYER_4X4 : GRAY_ALG_CLUSTER_2X2);
+    gray_quant_rebuild();
+    board_shim_rebuild_nes_rowbits();
+    st7305_invalidate_frame();     /* 作废整帧/竖屏指纹 ⇒ 下一帧强制整屏发 */
+}
+
+int board_shim_get_gray_alg(void)
+{
+    return gray_quant_alg() == GRAY_ALG_BAYER_4X4 ? 1 : 0;
 }
 
 static void board_shim_rebuild_nes_rowbits(void)
 {
-    const uint8_t (*pat)[4] = (g_gb_gray == 0) ? s_cluster_bw : s_tune_pat;
+    /* ★ 2026-10-30: 加一维 x 相位, 让 NES 也能用位置相关的 Bayer 图案。
+     *   cluster 模式两相位填同样的值 ⇒ 行为与改前逐字节一致(见 tests/gray_quant 的对照用例)。
+     *
+     * 相位换算(与两处热循环保持一致, 别单独改一边):
+     *   local_y = inv & 3 = (ST7305_HEIGHT-1-yy) & 3 = (3-yy)&3  ⇒  yy&3 = (3-local_y)&3
+     *   块内行偏移 dy = yy&1；块行奇偶 yph = (yy&3)>>1
+     *   字节覆盖物理列 2cp、2cp+1 ⇒ 同一块 sx=cp, xph = cp&1 */
     for (int ly = 0; ly < 4; ly++) {
+        const int yph = ((3 - ly) & 3) >> 1;
         for (int par = 0; par < 2; par++) {
             for (int pair = 0; pair < 16; pair++) {
                 uint8_t s0 = (uint8_t)(pair >> 2);
                 uint8_t s1 = (uint8_t)(pair & 3);
-                uint8_t b = 0;
                 uint8_t bit0 = (uint8_t)(7U - (ly << 1));
                 uint8_t bit1 = (uint8_t)(7U - ((ly << 1) | 1U));
-                if (pat[s0][(par << 1) | 0] == ST7305_COLOR_WHITE) b |= (uint8_t)(1U << bit0);
-                if (pat[s1][(par << 1) | 1] == ST7305_COLOR_WHITE) b |= (uint8_t)(1U << bit1);
-                s_rowbits[ly][par][pair] = b;
+                for (int xph = 0; xph < 2; xph++) {
+                    const uint8_t *p0 = board_shim_pat_get(s0, xph, yph);
+                    const uint8_t *p1 = board_shim_pat_get(s1, xph, yph);
+                    uint8_t b = 0;
+                    if (p0[(par << 1) | 0] == ST7305_COLOR_WHITE) b |= (uint8_t)(1U << bit0);
+                    if (p1[(par << 1) | 1] == ST7305_COLOR_WHITE) b |= (uint8_t)(1U << bit1);
+                    s_rowbits[ly][par][pair][xph] = b;
+                }
             }
         }
     }
@@ -570,7 +640,9 @@ esp_err_t board_rlcd_draw_gb_line_2x(int x, int y, const uint8_t *pixels, int wi
         uint32_t index1 = (uint32_t)(start_byte_x + dx) * FB_HEIGHT_DIV_4 + block_y1;
 
         uint8_t shade = pixels[dx] & 0x03;
-        const uint8_t *d = board_shim_cluster_get(shade);
+        /* 位置用**源像素绝对屏幕坐标**: x 方向 = start_byte_x+dx, y 方向 = 块行 y>>1。
+         * CLUSTER 模式忽略这两个参数(图案与位置无关), 行为与改前一致。 */
+        const uint8_t *d = board_shim_pat_get(shade, start_byte_x + dx, y >> 1);
 
         /* top-left, top-right */
         write_masked_pixel(fb, index0, left_mask0, d[0]);
@@ -598,15 +670,15 @@ static inline uint8_t board_rlcd_rgb565_be_to_gbc_shade(uint16_t rgb565_be)
     uint8_t b5 = (uint8_t)(rgb & 0x1FU);
     uint16_t gray = (uint16_t)(r5 * 38U + g6 * 75U + b5 * 15U);
 
-    /* ★★★ 2026-10-17 修正 (依据社区反馈 andjiang0083 的分析, 同一个原理):
-     *   4 档的实际等效亮度(2x2 抖动, 白点数 4/3/2/1) = 6368 / 4776 / 3184 / 1592;
-     *   要让"离哪一档最近就归哪一档", 分界必须取相邻两档的中点:
-     *     (6368+4776)/2=5572 · (4776+3184)/2=3980 · (3184+1592)/2=2388
-     *   原来用等分 4800/3200/1600 ⇒ 暗端门限被抬高(1600 vs 2388),
-     *   暗色元素(如暗绿文字/图标)被判成全黑而消失。 */
-    if (gray >= 5572U) return 0;
-    if (gray >= 3980U) return 1;
-    if (gray >= 2388U) return 2;
+    /* 分界取"相邻两档实际显示亮度"的中点, 而不是把量程四等分.
+     * 每档 2x2 图案的白点占比决定其实际亮度 (量程满分 6368 = 31*38+63*75+31*15).
+     * 2026-10-28: 黑点数已由 vid_tune 曲线决定, 档位亮度随之变化, 故门限改为
+     *   board_shim_apply_tune() 里按当前 dots 反算的 s_shade_thr[3], 不再写死.
+     *   (原写死值 5572/3980/2388 对应 dots{0,1,2,3}; 默认曲线是 {0,1,3,4},
+     *    真实亮度 6368/4776/1592/0 ⇒ 门限应为 5572/3184/796, 写死会整体偏暗一档.) */
+    if (gray >= s_shade_thr[0]) return 0;
+    if (gray >= s_shade_thr[1]) return 1;
+    if (gray >= s_shade_thr[2]) return 2;
     return 3;
 }
 
@@ -637,7 +709,7 @@ esp_err_t board_rlcd_draw_gbc_line_2x_rgb565_be_to(uint8_t *fb, int x, int y,
     uint32_t index1 = (uint32_t)start_byte_x * FB_HEIGHT_DIV_4 + block_y1;
     for (int dx = 0; dx < width; dx++) {
         uint8_t shade = board_rlcd_rgb565_be_to_gbc_shade(pixels[dx]);
-        const uint8_t *d = board_shim_cluster_get(shade);
+        const uint8_t *d = board_shim_pat_get(shade, start_byte_x + dx, y >> 1);
         write_masked_pixel(fb, index0, left_mask0, d[0]);
         write_masked_pixel(fb, index0, right_mask0, d[1]);
         write_masked_pixel(fb, index1, left_mask1, d[2]);
@@ -715,12 +787,12 @@ esp_err_t board_rlcd_draw_gbc_stretch(const uint16_t *buf_le, int src_w, int src
             uint32_t inv = ST7305_HEIGHT - 1 - (uint32_t)yy;
             uint32_t block_y = inv >> 2;
             uint8_t local_y = inv & 3U;
-            const uint8_t *rbt = s_rowbits[local_y][yy & 1];
+            const uint8_t (*rbt)[2] = s_rowbits[local_y][yy & 1];   /* [pair][xph] */
             uint32_t idx = block_y;   /* 增量索引, 避免每字节乘 75 */
             for (int cp = 0; cp < ST7305_WIDTH / 2; cp++) {
                 uint8_t pair = (uint8_t)((s_scaled_row[cp << 1] << 2) |
                                          s_scaled_row[(cp << 1) | 1]);
-                fb[idx] |= rbt[pair];
+                fb[idx] |= rbt[pair][cp & 1];   /* xph = cp&1 (同一字节两列属同一块) */
                 idx += FB_HEIGHT_DIV_4;
             }
         }
@@ -804,11 +876,11 @@ esp_err_t board_rlcd_draw_nes_scaled(const uint8_t *shade, int src_w, int src_h)
             uint32_t inv = ST7305_HEIGHT - 1 - (uint32_t)yy;
             uint32_t block_y = inv >> 2;
             uint8_t local_y = inv & 3U;
-            const uint8_t *rbt = s_rowbits[local_y][yy & 1];
+            const uint8_t (*rbt)[2] = s_rowbits[local_y][yy & 1];   /* [pair][xph] */
             for (int cp = 0; cp < ST7305_WIDTH / 2; cp++) {
                 uint8_t pair = (uint8_t)((s_scaled_row[cp << 1] << 2) |
                                          s_scaled_row[(cp << 1) | 1]);
-                fb[(uint32_t)cp * FB_HEIGHT_DIV_4 + block_y] |= rbt[pair];
+                fb[(uint32_t)cp * FB_HEIGHT_DIV_4 + block_y] |= rbt[pair][cp & 1];
             }
         }
     }
@@ -834,7 +906,9 @@ esp_err_t board_rlcd_draw_nes_line_1x_to(uint8_t *fb, int x, int y,
         uint8_t bit = (uint8_t)(7U - ((local_y << 1) | (x_abs & 1)));
         uint8_t mask = (uint8_t)(1U << bit);
         uint8_t shade = (uint8_t)((row_packed[dx >> 2] >> ((dx & 3) << 1)) & 3);
-        const uint8_t *d = board_shim_cluster_get(shade);
+        /* 1x 点对点: 每个物理像素取 2x2 图案里与自己位置相符的那一格。
+         * 用绝对坐标 (x_abs>>1, y>>1) 定位块 ⇒ Bayer 模式下阈值随屏幕位置走。 */
+        const uint8_t *d = board_shim_pat_get(shade, x_abs >> 1, y >> 1);
         uint8_t pos = (uint8_t)(((y & 1) << 1) | (x_abs & 1));
         write_masked_pixel(fb, index, mask, d[pos]);
     }

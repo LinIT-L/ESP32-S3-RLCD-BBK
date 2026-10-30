@@ -52,6 +52,8 @@ const char *am_store_sub_of(const os_app_t *a);
 const char *am_store_btn_of(const os_app_t *a);
 void  am_store_activate(ui_ctx_t *ctx, const os_app_t *a);      /* 已装→运行 / 未装→弹安装确认 */
 void  am_store_toggle(ui_ctx_t *ctx, const os_app_t *a);        /* 商店行: 只装/卸, 不启动应用 */
+/* 商店行「详情」弹窗: 点行(右侧按钮以外)时显示分类/版本/作者/大小/状态/说明 */
+void  am_store_detail(ui_ctx_t *ctx, const os_app_t *a);
 void  am_store_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a); /* 长按 → 弹卸载确认 */
 void  am_store_invalidate(void);          /* 目录变化 → 下次重扫 */
 
@@ -77,6 +79,22 @@ void am_rstore_clear_cache(void);
 int  am_store_dl_permille_of(const os_app_t *a);   /* ★ 该条目下载进度(无则 -1) */
 bool am_store_auto_install(const char *fname);
 bool am_store_take_uninst_done(void);
+
+/* 2026-10-30: 云端索引刚被替换成新的一份（取一次即清）。
+ * 页面 poll 拿到后重建列表并置脏 —— 否则新上架的资源要重进商店才看得见。 */
+bool am_store_take_idx_updated(void);
+
+/* ★ 2026-10-31: 应用在 TF 卡 ↔ 内置 之间移动。
+ *   app_where: 0=未安装 1=内置 2=TF卡
+ *   move_to_internal / move_to_sd: 成功 true；失败 err 给中文原因（空间不足/源丢失/校验不符）。
+ *   都是「复制 → 校验大小 → 删源」，任何一步失败都不会丢原文件。 */
+int  am_store_app_where(const os_app_t *a);
+uint32_t am_store_internal_free(void);
+bool am_store_move_to_internal(const os_app_t *a, char *err, size_t errlen);
+bool am_store_move_to_sd(const os_app_t *a, char *err, size_t errlen);
+
+/* 长按确认框：问"移动到内置空间?"，确认后执行移动。 */
+void am_move_internal_ask(ui_ctx_t *ctx, const os_app_t *a);
 void am_store_refresh_index_if_due(void);   /* ★ 进商店时按需刷新索引 */
 void am_rstore_refresh_force(void);
 bool am_rstore_refresh_due(void);   /* ★ 卸载刚完成(取一次即清) */   /* ★ 下载完自动安装 */   /* ★ 清商店缓存(长按分类图标 3s) */

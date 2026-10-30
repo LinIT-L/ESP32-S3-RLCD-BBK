@@ -45,6 +45,12 @@ void vid_tune_set_enabled(bool on);             /* 写 NVS */
 void vid_tune_attach(const char *engine_id);    /* 进游戏: 载入该引擎档 (NULL=通用档) */
 void vid_tune_detach(void);
 bool vid_tune_is_panel_open(void);
+void vid_tune_open_panel(void);   /* 外部入口(快捷栏)打开调节面板 */
+int  vid_tune_get_pct(int i);          /* 参数归一化值 0..100 */
+void vid_tune_set_pct(int i, int pct); /* 0..100, 立即生效 */
+void vid_tune_save(void);              /* 存 NVS */
+void vid_tune_restore(void);           /* 还原到展开前 */
+void vid_tune_begin_edit(void);        /* 展开前备份 */
 
 /* 关键输出: 4 档 shade → 黑点数(0..4)。引擎侧据此重建抖动表 */
 void vid_tune_get_dots(uint8_t dots[4]);

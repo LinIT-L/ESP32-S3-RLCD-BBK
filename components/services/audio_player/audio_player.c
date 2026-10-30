@@ -143,6 +143,13 @@ static bool s_mic_active = false;
  *   实测游戏内出现过 avail=256 / underruns=142872 / play=705Hz 的严重欠载,
  *   64KB 在 SD 读取/换曲/场景加载这类几百 ms 的抖动面前不够厚, 一掏空就断音。
  *   缓冲全在 PSRAM(见 s_pcm_ring 分配), 不占内部 RAM。 */
+/* ★ 诊断探针 (统一命名 LIN_DIAG_<模块>, 登记于 docs/diagnostics/probes.md)
+ *   LIN_DIAG_AUDIO: 环形缓冲水位探针 —— 每 400 轮打印
+ *     "PCM ring: avail=.. underruns=.. want=..Hz i2s=..Hz play=..Hz"。
+ *     用途: 排查游戏音频断续/欠载/采样率不符。
+ *     默认关: 游戏中约每数秒一行, 长期占用串口; 关闭后连统计变量一起省掉。 */
+#define LIN_DIAG_AUDIO 0
+
 #define PCM_RING_SIZE 131072
 /* 首次播放前先让环形缓冲攒够 ~186ms 音频再开始掏空,
  * 吸收模拟器帧抖动, 避免声音一卡一卡 (生产/消耗速率几乎相等时尤其重要).
@@ -243,7 +250,12 @@ static void audio_out_task(void *arg) {
         if (head >= tail) {
             avail = (head - tail) / 2;  /* 每帧 2 个 sample */
         } else {
-            avail = (PCM_RING_SIZE / 2 - tail + head) / 2;
+            /* ★ 2026-10-29 修: 这里原来写的是 `PCM_RING_SIZE / 2 - tail + head`,
+             *   比写端 feed_pcm 的 `PCM_RING_SIZE - tail + head` 少算一半 —— 
+             *   一旦 head 回绕到 tail 之前, 读端就只认为有一半数据可读,
+             *   实际可读量被腰斩 ⇒ 频繁欠载/断音 (MP3 不走这条环形缓冲, 故不受影响).
+             *   两端口径必须完全一致, 都按样本(int16)计、以 PCM_RING_SIZE 为模. */
+            avail = (PCM_RING_SIZE - tail + head) / 2;
         }
 
         if (avail == 0) {
@@ -295,6 +307,7 @@ static void audio_out_task(void *arg) {
         }
 
         if ((++iter % 400) == 0) {
+#if LIN_DIAG_AUDIO
             uint32_t now_ms = esp_log_timestamp();
             uint32_t delta_ms = now_ms - last_log_ms;
             uint32_t play_hz = (delta_ms > 0) ? ((frames_total - last_frames) * 1000u / delta_ms) : 0;
@@ -304,6 +317,7 @@ static void audio_out_task(void *arg) {
                      (unsigned)play_hz);
             last_frames = frames_total;
             last_log_ms = now_ms;
+#endif
             underruns = 0;
         }
 
@@ -348,9 +362,31 @@ static void audio_out_task(void *arg) {
         /* V1.0.71: 喂振幅表 (游戏/音效 PCM 路径) */
         audio_meter_feed(local_buf, sample_count);
         
+        /* ★★★ 2026-10-30 修「录音回放快约 2 倍 / 语音被快进」：
+         *   原来这里是**一次** i2s_channel_write(…, 20ms) 且**完全不看返回值**。
+         *   DMA 只有 3×576 = 1728 帧，而一次要写 1024 帧：稳态下经常写不满，
+         *   超时后只接受了 written 字节，**剩下的被直接丢弃**，但 tail 已经前移 ⇒
+         *   音频被静默快进，总时长明显短于文件长度（实测 2016ms 只跑了 1151ms）。
+         *   正确做法：分段把剩余字节写完，写不动才放弃这一块（并记警告）。 */
         size_t bytes = sample_count * sizeof(int16_t);
-        size_t written = 0;
-        i2s_channel_write(s_tx_chan, local_buf, bytes, &written, pdMS_TO_TICKS(20));
+        size_t sent_bytes = 0;
+        int guard = 0;
+        while (sent_bytes < bytes && guard++ < 12) {
+            size_t written = 0;
+            esp_err_t wr = i2s_channel_write(s_tx_chan, (const uint8_t *)local_buf + sent_bytes,
+                                             bytes - sent_bytes, &written, pdMS_TO_TICKS(100));
+            sent_bytes += written;
+            if (wr != ESP_OK && written == 0) break;   /* 真写不动了 */
+        }
+        if (sent_bytes < bytes) {
+            static uint32_t drop_log_ms = 0;
+            uint32_t nowm = esp_log_timestamp();
+            if (nowm - drop_log_ms > 1000) {           /* 限流, 避免刷屏 */
+                drop_log_ms = nowm;
+                ESP_LOGW(TAG, "I2S 写入不完整: 丢弃 %u/%u 字节",
+                         (unsigned)(bytes - sent_bytes), (unsigned)bytes);
+            }
+        }
     }
     
     s_audio_out_task = NULL;
@@ -419,6 +455,16 @@ static void audio_out_start(void) {
     if (!s_pcm_out_stack) {
         s_pcm_out_stack = heap_caps_malloc(sizeof(StackType_t) * PCM_OUT_STACK_WORDS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_pcm_out_stack) s_pcm_out_stack = heap_caps_malloc(sizeof(StackType_t) * PCM_OUT_STACK_WORDS, MALLOC_CAP_8BIT);
+    }
+    /* ★ 2026-10-28: 补判空 —— 原来两块分配都失败时把 NULL 栈直接交给
+     *   xTaskCreateStaticPinnedToCore, 会在初始化任务时访问空指针。 */
+    if (!s_pcm_out_stack) {
+        ESP_LOGE(TAG, "audio_out 任务栈分配失败(24KB) ⇒ 本局无游戏音频");
+        pa_enable(false);            /* 上面已经开过功放, 没有任务喂数据就关回, 否则白耗电+底噪 */
+        s_amp_on = false;
+        s_audio_out_running = false;
+        ao_unlock();
+        return;
     }
     s_audio_out_task = xTaskCreateStaticPinnedToCore(audio_out_task, "audio_out",
                                                      PCM_OUT_STACK_WORDS, NULL, 8,
@@ -837,6 +883,12 @@ static int64_t estimate_total_samples(FILE *f, int64_t file_size) {
 static StackType_t *s_audio_stack;
 static StaticTask_t s_audio_tcb;
 static uint32_t s_task_stack_words = AUDIO_TASK_STACK_WORDS; /* 用于日志 */
+/* ★ 2026-10-28: MP3 解码用的两块帧缓冲(pcm/pcm_out)在任务里是**局部指针**。
+ *   任务被 vTaskDelete 强制结束时(见 audio_reap_task), 指针随栈消失 ⇒ 这两块 PSRAM
+ *   再也找不回来(每次 4.6KB + 9.2KB 永久泄漏)。这里留一份文件作用域的备份,
+ *   只用于"兜底回收", 正常路径仍由任务自己的 cleanup 释放并清空。 */
+static mp3d_sample_t *s_dec_pcm = NULL;
+static int16_t       *s_dec_pcm_out = NULL;
 
 static void audio_play_task(void *arg) {
     ESP_LOGI(TAG, ">>> \u97F3\u9891\u4EFB\u52A1\u5DF2\u542F\u52A8 (\u6808 %u \u5B57\u8282) <<<",
@@ -884,6 +936,9 @@ static void audio_play_task(void *arg) {
         ESP_LOGD(TAG, "PSRAM \u5206\u914D\u5931\u8D25");
         goto cleanup;
     }
+    /* ★ 备份到文件作用域: 本任务若被强杀, 由 audio_reap_task() 负责释放这两块 */
+    s_dec_pcm = pcm;
+    s_dec_pcm_out = pcm_out;
 
     ESP_LOGI(TAG, "[6/6] \u8FDB\u5165\u89E3\u7801\u5FAA\u73AF...");
     while (!s_stop_requested) {
@@ -1048,7 +1103,11 @@ static void audio_play_task(void *arg) {
 
 cleanup:
     pa_enable(false);
-    if (s_mp3dec) { free(s_mp3dec); s_mp3dec = NULL; }   /* ★ 解码器退回, 不常驻内部 RAM */
+    /* ★ 2026-10-28: 顺序必须是"先清指针再 free" —— 万一在本任务执行到这里时被
+     *   audio_reap_task 强行删除, 指针已清 NULL, 兜底回收不会重复 free 同一块。 */
+    s_dec_pcm = NULL;
+    s_dec_pcm_out = NULL;
+    {   mp3dec_t *d = s_mp3dec; s_mp3dec = NULL; if (d) free(d); }   /* ★ 解码器退回, 不常驻内部 RAM */
     if (pcm) free(pcm);
     if (pcm_out) free(pcm_out);
     s_state = AUDIO_STATE_STOPPED;
@@ -1062,6 +1121,31 @@ cleanup:
              (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)s_task_stack_words);
     s_task_handle = NULL;
     vTaskDelete(NULL);
+}
+
+/* ★★★ 2026-10-28 【强制结束任务的兜底回收】★★★
+ *   play / stop / feed_pcm 三处都在"等 500ms 还没退"时 vTaskDelete(s_task_handle)。
+ *   那条路径**跳过了 audio_play_task 末尾的 cleanup 段**, 于是每次强杀泄漏:
+ *     · esp_task_wdt_delete(NULL) 没执行 → TWDT 列表里留着已删除任务的句柄
+ *       (cleanup 里那句注释自己写着"不注销会误报警告", 强杀路径正好绕过它)
+ *     · s_mp3_file 不 fclose → FATFS fd + libc 缓冲泄漏
+ *     · s_mp3dec 不释放 → 6.5KB 内部 RAM 泄漏 (play 路径有兜底, stop/feed_pcm 没有)
+ *     · pcm / pcm_out 两块 PSRAM (4.6KB + 9.2KB) 随任务栈一起丢失
+ *     · pa_enable(false) 没执行 → 强杀后功放一直通电(耗电 + 底噪)
+ *   这里统一收干净。调用方必须先确认该任务已超时未退(句柄非 NULL)。
+ * ⚠ 只在"任务已经不会再运行"的前提下调用; 删任务后不再访问其栈/局部变量。 */
+static void audio_reap_task(TaskHandle_t h)
+{
+    if (!h) return;
+    esp_task_wdt_delete(h);      /* ★ 必须在删任务**之前**注销 */
+    vTaskDelete(h);
+    s_task_handle = NULL;
+    if (s_mp3dec)      { free(s_mp3dec);      s_mp3dec = NULL; }
+    if (s_dec_pcm)     { free(s_dec_pcm);     s_dec_pcm = NULL; }
+    if (s_dec_pcm_out) { free(s_dec_pcm_out); s_dec_pcm_out = NULL; }
+    if (s_mp3_file)    { fclose(s_mp3_file);  s_mp3_file = NULL; }
+    pa_enable(false);
+    s_state = AUDIO_STATE_STOPPED;
 }
 
 /* ============ \u516C\u5171 API ============ */
@@ -1138,7 +1222,11 @@ int audio_player_init(void) {
     if (!s_i2s_mutex) {
         s_i2s_mutex = xSemaphoreCreateMutex();
     }
-    s_mutex = xSemaphoreCreateMutex();
+    /* ★ 2026-10-28: 补幂等判断 —— 下面 i2s_init 失败会 return -1 且不清 s_hw_initialized,
+     *   重试时又会 xSemaphoreCreateMutex() 一次 ⇒ 上一个 mutex 句柄永久丢失(泄漏)。 */
+    if (!s_mutex) {
+        s_mutex = xSemaphoreCreateMutex();
+    }
 
     /* MP3 缓冲区延迟到 audio_player_play() 分配, 节省 PSRAM */
 
@@ -1200,8 +1288,7 @@ int audio_player_play(const char *filepath) {
         for (int w = 0; w < 50 && s_task_handle; w++) vTaskDelay(pdMS_TO_TICKS(10));
         if (s_task_handle) {
             ESP_LOGW(TAG, "MP3 任务 500ms 未退 ⇒ 强制结束(播放新文件前)");
-            vTaskDelete(s_task_handle);
-            s_task_handle = NULL;
+            audio_reap_task(s_task_handle);   /* ★ 统一回收: TWDT/文件/解码器/帧缓冲/功放 */
         }
         xSemaphoreTake(s_mutex, portMAX_DELAY);
     }
@@ -1252,15 +1339,22 @@ int audio_player_play(const char *filepath) {
     /* 创建播放任务: 静态栈缓冲在 PSRAM (EXT_RAM_BSS_ATTR),
      * 开 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM 后通过栈内存断言, 不会重启。 */
     s_task_stack_words = AUDIO_TASK_STACK_WORDS;
-    /* ★ LINTOS: 解码任务栈(64KB)首次播放才分配, 不播放不占 PSRAM */
+    /* ★ LINTOS: 解码任务栈(64KB)首次播放才分配, 不播放不占 PSRAM
+     * ★ 2026-10-28: 删掉这里**逐字重复**的第二份分配块(原来连着写了两遍, 完全无效);
+     *   并补上"分配失败"检查 —— 原来不判空就直接把 NULL 交给 xTaskCreateStatic,
+     *   那会在 prvInitialiseNewTask 里访问空栈指针。 */
     if (!s_audio_stack) {
         s_audio_stack = heap_caps_malloc(sizeof(StackType_t) * AUDIO_TASK_STACK_WORDS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_audio_stack) s_audio_stack = heap_caps_malloc(sizeof(StackType_t) * AUDIO_TASK_STACK_WORDS, MALLOC_CAP_8BIT);
     }
-    /* ★ LINTOS: 解码任务栈(64KB)首次播放才分配, 不播放不占 PSRAM */
     if (!s_audio_stack) {
-        s_audio_stack = heap_caps_malloc(sizeof(StackType_t) * AUDIO_TASK_STACK_WORDS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_audio_stack) s_audio_stack = heap_caps_malloc(sizeof(StackType_t) * AUDIO_TASK_STACK_WORDS, MALLOC_CAP_8BIT);
+        ESP_LOGE(TAG, "解码任务栈分配失败(64KB) ⇒ 无法播放");
+        if (s_mp3_buf) { free(s_mp3_buf); s_mp3_buf = NULL; }
+        fclose(s_mp3_file);
+        s_mp3_file = NULL;
+        s_state = AUDIO_STATE_STOPPED;
+        xSemaphoreGive(s_mutex);
+        return -1;
     }
     s_task_handle = xTaskCreateStaticPinnedToCore(audio_play_task, "audio_play",
                                                    AUDIO_TASK_STACK_WORDS, NULL, 2,
@@ -1314,8 +1408,7 @@ void audio_player_stop(void) {
     for (int w = 0; w < 50 && s_task_handle; w++) vTaskDelay(pdMS_TO_TICKS(10));
     if (s_task_handle) {
         ESP_LOGW(TAG, "MP3 任务 500ms 未退 ⇒ 强制结束(停止播放)");
-        vTaskDelete(s_task_handle);
-        s_task_handle = NULL;
+        audio_reap_task(s_task_handle);   /* ★ 统一回收(原来这里连 s_mp3dec 都没回收) */
     }
     s_state = AUDIO_STATE_STOPPED;
     audio_out_stop();   /* 解耦: 一并停掉游戏 PCM 输出任务 */
@@ -1469,6 +1562,11 @@ bool audio_player_is_running(void) {
 
 void audio_player_deinit(void) {
     audio_player_stop();
+    /* ★ 2026-10-28: 补关麦克风。原来 deinit 只停播放, 若此刻正在录音/频谱仪开着麦:
+     *   s_mic_active 仍为 true、ES7210 继续供电(20~30mA), 而下一行 i2s_deinit() 已经把
+     *   rx 通道拆掉 ⇒ 状态与实际硬件不一致, 之后 mic_read 全是空转。
+     *   mic_stop 内部按 s_mic_active 判空, 未开麦时是空操作。 */
+    audio_player_mic_stop();
     i2s_deinit();
     es8311_shutdown();
     pa_enable(false);
@@ -1542,8 +1640,7 @@ size_t audio_player_feed_pcm(const int16_t *data, size_t frames, int sample_rate
         for (int w = 0; w < 50 && s_task_handle; w++) vTaskDelay(pdMS_TO_TICKS(10));
         if (s_task_handle) {
             ESP_LOGW(TAG, "MP3 任务 500ms 未退 ⇒ 强制结束并清句柄(否则音频链路会锁死)");
-            vTaskDelete(s_task_handle);
-            s_task_handle = NULL;
+            audio_reap_task(s_task_handle);   /* ★ 统一回收: 否则每次泄漏文件句柄+解码器+帧缓冲 */
         }
         s_state = AUDIO_STATE_STOPPED;
     }
@@ -1682,6 +1779,53 @@ static volatile uint32_t s_rec_bytes = 0;
 static int s_rec_rate = REC_RATE_DEF;
 static volatile uint32_t s_rec_ms = 0;
 static volatile int32_t  s_rec_peak = 0;
+/* ★ 诊断(2026-10-30): 按声道分别统计峰值和 RMS，用来判断"录音声音小"到底是
+ *   ① PGA 增益不够  ② 声道接错(只读了没接麦的那一路)  ③ 真的是麦克风密封/结构问题 */
+static volatile int32_t  s_rec_pk[4] = {0,0,0,0};
+/* ★ 2026-10-30 录音数字自动增益(AGC)。
+ *   为什么要它: 麦克风经 37.5dB PGA 后, 正常说话峰值仍只有满量程的 5~15%,
+ *   而音乐(MP3)是母带级 ~90%FS ⇒ 同一音量下回放录音明显偏小(差 15~25dB)。
+ *   这里在**写入文件前**把电平抬到目标附近, 使录音回放的响度与音乐接近。
+ *   规则刻意保守:
+ *     · 增益范围 1x~12x(+21.6dB), 只放大不压缩动态;
+ *     · 每块再按瞬时峰值限一次, 保证任何情况下不削波;
+ *     · 包络有 200 的底噪门限, 安静时不会把嘶声一起抬起来。 */
+static float s_agc_env = 0.0f;     /* 平滑包络(峰值域) */
+static int   s_agc_q15 = 32768;    /* 当前增益 Q15, 1.0 = 32768 */
+
+static void rec_agc_apply(int16_t *pcm, int frames, int ch)
+{
+    if (!pcm || frames <= 0) return;
+    if (ch < 1) ch = 1;
+    int n = frames * ch;
+    int bpk = 0;
+    for (int i = 0; i < n; i++) { int v = pcm[i]; if (v < 0) v = -v; if (v > bpk) bpk = v; }
+
+    float b = (float)bpk;
+    if (b > s_agc_env) s_agc_env = s_agc_env * 0.5f + b * 0.5f;    /* 起得快 */
+    else               s_agc_env = s_agc_env * 0.98f + b * 0.02f;  /* 落得慢 */
+    if (s_agc_env < 200.0f) s_agc_env = 200.0f;                    /* 底噪门限 */
+
+    const float TARGET = 14000.0f;                                  /* ≈ -7.4 dBFS */
+    float g = TARGET / s_agc_env;
+    if (g < 1.0f)  g = 1.0f;
+    if (g > 12.0f) g = 12.0f;
+
+    int gq = (int)(g * 32768.0f);
+    s_agc_q15 = (s_agc_q15 * 3 + gq) / 4;                           /* 平滑, 防"呼吸" */
+    int gq_lim = (bpk > 0) ? (int)(30000.0f * 32768.0f / (float)bpk) : 262144;
+    int use = (s_agc_q15 < gq_lim) ? s_agc_q15 : gq_lim;            /* 本块硬限幅 */
+    if (use < 16384) use = 16384;                                   /* 最多衰减到 0.5x */
+
+    for (int i = 0; i < n; i++) {
+        int32_t v = ((int32_t)pcm[i] * use) >> 15;
+        if (v > 32767) v = 32767;
+        else if (v < -32768) v = -32768;
+        pcm[i] = (int16_t)v;
+    }
+}
+static uint64_t s_rec_sq[4] = {0,0,0,0};
+static uint32_t s_rec_nsamp = 0;
 static volatile uint8_t  s_spec[SPEC_BINS];
 static char s_rec_path[192] = "";
 
@@ -1747,10 +1891,12 @@ static void rec_task(void *arg)
     }
     TickType_t t0 = xTaskGetTickCount();
     uint32_t last_flush = 0, spec_tick = 0;
+    s_agc_env = 0.0f; s_agc_q15 = 32768;     /* 每条录音从 1x 起步 */
 
     while (!s_rec_stop) {
         int n = audio_player_mic_read(buf, 512, 100);
         if (n > 0) {
+            rec_agc_apply(buf, n, REC_CH);      /* ★ 写文件前先做电平归一 */
             size_t w = fwrite(buf, sizeof(int16_t) * REC_CH, (size_t)n, s_rec_fp);
             if (w != (size_t)n) {
                 ESP_LOGE(TAG, "录音写卡失败 (%u/%d)", (unsigned)w, n);
@@ -1762,6 +1908,13 @@ static void rec_task(void *arg)
                 int v = buf[i * REC_CH];
                 if (v < 0) v = -v;
                 if (v > pk) pk = v;
+                for (int c = 0; c < REC_CH && c < 4; c++) {
+                    int x = buf[i * REC_CH + c];
+                    int ax = (x < 0) ? -x : x;
+                    if (ax > s_rec_pk[c]) s_rec_pk[c] = ax;
+                    s_rec_sq[c] += (uint64_t)((int32_t)x * (int32_t)x);
+                }
+                s_rec_nsamp++;
             }
             s_rec_peak = pk;
             if ((spec_tick & 3) == 0) calc_spectrum(buf, n);
@@ -1784,9 +1937,28 @@ static void rec_task(void *arg)
         s_rec_fp = NULL;
     }
     audio_player_mic_stop();          /* 关麦放任务里，别让调用方等 */
-    ESP_LOGI(TAG, "录音结束: %s  %u B  %u ms  峰值=%d%s", s_rec_path,
-             (unsigned)s_rec_bytes, (unsigned)s_rec_ms, (int)s_rec_peak,
-             (s_rec_peak == 0) ? "  (全程无信号)" : "");
+    {   /* ★ 诊断(2026-10-30): 用实测 B/s 反推采集速率。
+         *   16000Hz × REC_CH × 16bit 的期望值 = 64000 B/s。
+         *   明显偏高 ⇒ 麦克风实际跑在更高采样率, 但文件头写的是 16k ⇒ 播放必然变快。 */
+        unsigned exp_bps = (unsigned)s_rec_rate * REC_CH * 2u;
+        unsigned act_bps = (s_rec_ms > 0) ? (unsigned)((uint64_t)s_rec_bytes * 1000ull / s_rec_ms) : 0;
+        ESP_LOGI(TAG, "录音结束: %s  %u B  %u ms  峰值=%d%s",
+                 s_rec_path, (unsigned)s_rec_bytes, (unsigned)s_rec_ms, (int)s_rec_peak,
+                 (s_rec_peak == 0) ? "  (全程无信号)" : "");
+        ESP_LOGI(TAG, "录音速率: 实测 %u B/s, 文件头声称 %u Hz → 期望 %u B/s %s",
+                 act_bps, (unsigned)s_rec_rate, exp_bps,
+                 (exp_bps && act_bps > exp_bps + exp_bps / 10) ? "  ⚠ 采集比声称快" : "");
+        {   /* 按声道电平: 峰值 %FS 与 RMS dBFS —— 直接判断"收得小"还是"声道没接" */
+            uint32_t ns = s_rec_nsamp ? s_rec_nsamp : 1;
+            for (int c = 0; c < REC_CH && c < 4; c++) {
+                double ms = (double)s_rec_sq[c] / (double)ns;
+                double rms = sqrt(ms);
+                int db = (rms > 0.5) ? (int)(20.0 * log10(rms / 32768.0)) : -99;
+                ESP_LOGI(TAG, "  声道%d: 峰值 %d (%d%%FS)  RMS %d dBFS",
+                         c, (int)s_rec_pk[c], (int)s_rec_pk[c] * 100 / 32768, db);
+            }
+        }
+    }
     s_rec_task = NULL;
     vTaskDelete(NULL);
 }
@@ -1848,6 +2020,15 @@ int audio_player_rec_spec_bins(void) { return SPEC_BINS; }
 /* 板上有麦克风吗（标准扩展板 i2s_din = -1 ⇒ 物理上没有输入脚） */
 bool audio_player_mic_available(void) { return s_din >= 0; }
 
+/* 环形缓冲里还有多少帧没播（快照；单写多读，够用） */
+static uint32_t wav_ring_frames(void)
+{
+    uint32_t h = s_ring_head, t = s_ring_tail;
+    if (h == t) return 0;
+    uint32_t used = (h >= t) ? (h - t) : (PCM_RING_SIZE - t + h);
+    return used / 2;
+}
+
 /* ---------------- WAV 播放 ---------------- */
 static void wav_play_task(void *arg)
 {
@@ -1872,6 +2053,9 @@ static void wav_play_task(void *arg)
     if (frame_bytes == 0) frame_bytes = 4;
     s_wav_total_ms = (uint32_t)((uint64_t)data_len * 1000ull / ((uint64_t)rate * frame_bytes));
     s_wav_ms = 0;
+    ESP_LOGI(TAG, "WAV 播放: %u Hz  %u ch  %u bit  data=%u B  → 预计 %u ms",
+             (unsigned)rate, (unsigned)ch, (unsigned)bits,
+             (unsigned)data_len, (unsigned)s_wav_total_ms);
 
     const size_t CHUNK = 2048;
     uint8_t *buf = heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1904,6 +2088,30 @@ static void wav_play_task(void *arg)
 done:
     if (buf) free(buf);
     fclose(fp);
+
+    /* ★★★ 2026-10-30 修「录音播放快 5-6 倍」：
+     *   PCM 环形缓冲有 131072 样本 = 65536 帧 ≈ **4 秒**。
+     *   录音机回放时把整段(<4s)一次性推进缓冲只要几百毫秒 ⇒ 这里立刻收尾、
+     *   s_wav_task 置 NULL ⇒ 上层 playing() 变 false ⇒ 播放页直接切走、
+     *   甚至把缓冲冲掉。用户听到的就是"一小段就没了"，听起来像 5~6 倍速。
+     *   正确做法：数据进队列 ≠ 播完，必须等缓冲真正排空再收尾。
+     *   超时上限给 total+3s，防止下游异常时卡在这里退不出去。 */
+    uint32_t guard_ms = 0, cap_ms = s_wav_total_ms + 3000u;
+    while (!s_wav_stop && wav_ring_frames() > 0 && guard_ms < cap_ms) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        guard_ms += 20;
+        s_wav_ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+        if (s_wav_ms > s_wav_total_ms) s_wav_ms = s_wav_total_ms;
+    }
+    {
+        uint32_t elapsed = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+        ESP_LOGI(TAG, "WAV 播放结束: 预计 %u ms, 实际 %u ms, 剩余未播 %u 帧", 
+                 (unsigned)s_wav_total_ms, (unsigned)elapsed, (unsigned)wav_ring_frames());
+        ESP_LOGI(TAG, "  ⓘ i2s=%dHz desired=%dHz  文件帧数=%u  实测播放率=%uHz",
+                 audio_player_get_i2s_rate(), (int)s_desired_sample_rate,
+                 (unsigned)(data_len / frame_bytes),
+                 (unsigned)(elapsed ? ((uint64_t)(data_len / frame_bytes) * 1000ull / elapsed) : 0));
+    }
     s_wav_ms = s_wav_total_ms;
     s_wav_task = NULL;
     vTaskDelete(NULL);

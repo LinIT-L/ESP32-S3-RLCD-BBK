@@ -8,7 +8,7 @@
      ① 注册行  `lua_pushcfunction(L, l_xxx); lua_setfield(L, -2, "name");`   → 有哪些 API
      ② 子表    `lua_newtable(L)` … `lua_setfield(L, -2, "tab")`              → 挂在哪一层
      ③ 函数上方的注释块                                                       → 说明文字
-`scan` 生成 docs/Lua桥API参考.md; `--check` 与源码对账, 不一致就非零退出(可挂进构建/CI)。
+`scan` 生成 docs/手册/API完整参考手册.md; `--check` 与源码对账, 不一致就非零退出(可挂进构建/CI)。
 
 用法
 ----
@@ -23,7 +23,11 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BD = os.path.join(ROOT, "components", "apps", "lua_bridge")
-OUT_DEFAULT = os.path.join(ROOT, "docs", "Lua桥API参考.md")
+OUT_DEFAULT = os.path.join(ROOT, "docs", "手册", "API完整参考手册.md")
+
+# 区间标记: 目标文件里若有这一对标记, 只替换区间内容, 保留手写的 C facade 部分
+BLK_BEGIN = "<!-- LUA-API-BEGIN 本节由 tools/lua_api_doc.py 生成，勿手改 -->"
+BLK_END = "<!-- LUA-API-END -->"
 
 MODULE_DESC = {
     "consts": "常量（`W/H/BLACK/WHITE` 与动作码 `UP/DOWN/LEFT/RIGHT/OK/CONFIRM/BACK/HOME`）",
@@ -45,6 +49,66 @@ REG = re.compile(r'lua_pushcfunction\(L,\s*(l_\w+)\);\s*lua_setfield\(L,\s*-2,\s
 NEWTAB = re.compile(r'lua_newtable\(L\)')
 SETTAB = re.compile(r'^\s*lua_setfield\(L,\s*-2,\s*"([^"]+)"\);')
 FUNC = re.compile(r'^static\s+int\s+(l_\w+)\s*\(lua_State\s*\*\s*L\)')
+
+
+def code_only(lines):
+    """剥掉注释, 保留行号: 返回与 lines 等长的"只有代码"的行。
+
+    ⚠ 必须有这一步: `luat_lib_sys.c` 的头注释里写了一句
+    「需要子表时自己 lua_newtable(L) → 填 → lua_setfield(...)」,
+    裸正则会把**注释**当成真的建表, 于是从第 4 行到 `setfield "sys"` 之间的
+    所有注册行都被归到 `app.sys.*` —— 而它们其实挂在 **app 顶层**
+    (app.log / app.tone / app.exit_confirm …)。2026-10-30 修。
+
+    字符串/字符字面量里的 `//` `/*` `*/` **不是注释**, 必须原样保留:
+    否则 `"http://..."` 之后的内容会被整段吞掉, 同行若有注册语句就会漏检。
+    状态机三态: 正常 / 块注释 / 引号内(记录 ' 或 ")。
+    """
+    out = []
+    in_block = False
+    quote = ""                     # "" / '"' / "'"
+    for l in lines:
+        buf, i, n = [], 0, len(l)
+        while i < n:
+            ch = l[i]
+            if in_block:                       # ---- 块注释内 ----
+                if ch == "*" and i + 1 < n and l[i + 1] == "/":
+                    in_block = False
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if quote:                          # ---- 字符串/字符字面量内 ----
+                buf.append(ch)
+                if ch == "\\" and i + 1 < n:   # 转义: \" \' \\ 等, 连吃掉下一个字符
+                    buf.append(l[i + 1])
+                    i += 2
+                    continue
+                if ch == quote:
+                    quote = ""
+                i += 1
+                continue
+            # ---- 正常代码 ----
+            if ch == '"' or ch == "'":
+                quote = ch
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == "/" and i + 1 < n:
+                if l[i + 1] == "/":            # 行注释: 吃到这里
+                    break
+                if l[i + 1] == "*":            # 块注释开始
+                    in_block = True
+                    i += 2
+                    continue
+            buf.append(ch)
+            i += 1
+        # 行尾仍在引号内: C 里只有反斜杠续行才合法, 这里按"未闭合"容错重开,
+        # 免得一个坏引号把后面整个文件都吞进字符串状态。
+        if quote:
+            quote = ""
+        out.append("".join(buf))
+    return out
 
 
 def trim_desc(txt, limit=120):
@@ -94,21 +158,22 @@ def parse_module(path):
     再把落在这个范围里的注册行归到该子表。
     """
     lines = open(path, encoding="utf-8").read().split("\n")
+    code = code_only(lines)          # ← 所有结构匹配只看这一份（注释里的示例不算数）
     funcs = {}
-    for i, l in enumerate(lines):
+    for i, l in enumerate(code):
         m = FUNC.match(l)
         if m:
             funcs[m.group(1)] = (i, trim_desc(strip_comment(lines[:i])))
 
     # ---- 第一遍: 找出 子表 的名字 + 行范围 ----
     tables = []          # (first_line, last_line, name)
-    for i, l in enumerate(lines):
+    for i, l in enumerate(code):
         if not NEWTAB.search(l):
             continue
-        for j in range(i + 1, len(lines)):
-            if REG.search(lines[j]):        # 带 pushcfunction 的不是收尾
+        for j in range(i + 1, len(code)):
+            if REG.search(code[j]):        # 带 pushcfunction 的不是收尾
                 continue
-            m2 = SETTAB.match(lines[j])
+            m2 = SETTAB.match(code[j])
             if m2:
                 tables.append((i, j, m2.group(1)))
                 break
@@ -121,7 +186,7 @@ def parse_module(path):
 
     # ---- 第二遍: 归一化注册行 ----
     apis, errors, seen = [], [], {}
-    for i, l in enumerate(lines):
+    for i, l in enumerate(code):
         m = REG.search(l)
         if not m:
             continue
@@ -149,18 +214,18 @@ def collect():
     return mods, all_apis, errors
 
 
-def render(mods, all_apis):
+def render_body(mods, all_apis):
+    """只生成"Lua API 表格"这一段(含通用约定), 供插入标记区间。"""
     total = sum(len(v) for v in all_apis.values())
-    out = ["# Lua 桥 API 参考（自动生成，勿手改）", "",
-           "> 由 `tools/lua_api_doc.py` 从 `components/apps/lua_bridge/luat_lib_*.c` **自动提取**。",
-           "> 「说明」一列取的是源码里函数上方的注释 —— **改代码就是改文档**，不需要手改本文件。",
-           "> 共 **%d** 个 API / %d 个模块。加 API 见技能 `lintos-lua-app-pipeline` §18。「定义」列是源码位置。" % (total, len(mods)),
+    out = ["> 由 `tools/lua_api_doc.py` 从 `components/apps/lua_bridge/luat_lib_*.c` **自动提取**。",
+           "> 「说明」一列取的是源码里函数上方的注释 —— **改代码就是改文档**，不要手改本节。",
+           "> 共 **%d** 个 API / %d 个模块。「定义」列是源码位置。" % (total, len(mods)),
            ""]
     for mod in mods:
         apis = all_apis.get(mod) or []
         if not apis:
             continue
-        out += ["## `%s` — %s" % (mod, MODULE_DESC.get(mod, "")), "",
+        out += ["### `%s` — %s" % (mod, MODULE_DESC.get(mod, "")), "",
                 "| API | 说明 | 定义 |", "|---|---|---|"]
         for full, fn, desc, ln in apis:
             d = desc if desc else "（源码未写注释）"
@@ -168,32 +233,77 @@ def render(mods, all_apis):
             out.append("| `%s` | %s | `luat_lib_%s.c:%d` |" % (full, d, mod, ln))
         out.append("")
     out += ["---", "",
-            "## 约定（所有 API 通用）", "",
+            "## 通用约定", "",
             "- 动作码：`1=UP 2=DOWN 3=LEFT 4=RIGHT 5=CONFIRM(OK) 6=BACK 7=HOME`；",
             "  `app.UP..app.HOME` 与此一一对应，`consts` 模块用 `_Static_assert` 与 `os_action_t` 钉死。",
             "- 颜色：仅黑白两色，`app.BLACK=0` / `app.WHITE=1`（反射式 1bpp 屏，白纸黑字）。",
             "- 屏幕：`400×300`；16px 中文请用 **`app.zh`**（`font_zh16` 真 16×16，与系统 UI 同款），",
-            "  ⛔ 不要用 `app.zhsb`（那是 24×24 降采样，会糊）。ASCII 用 `app.textsb`（8×16）。",
-            "- 回调契约：`on_enter / render / poll / action(a) / on_exit`；按键**只走 `action(a)`** 一条路。",
+            "  ⛔ 不要用 `app.zhsb`（16×16 由 22/24 采样降下来，会糊）。ASCII 用 `app.textsb`（8×16）。",
+            "- 回调契约：`on_enter / render / poll / action(a) / on_exit`；按键主路径是 `action(a)`，",
+            "  桥同时把键压进按键状态，所以 `app.key()` / `app.key_down()` 也能读到同一批键。",
             ""]
     return "\n".join(out)
+
+
+def render(mods, all_apis):
+    """无标记区间的目标文件时用: 整份生成(不含 C 部分)。"""
+    return "# Lua 桥 API 参考（自动生成，勿手改）\n\n" + render_body(mods, all_apis)
+
+
+def selftest():
+    """code_only() 的注释/字符串用例自检 (python3 tools/lua_api_doc.py --selftest)。"""
+    cases = [
+        # (说明, 输入行列表, 期望: 该行剥注释后是否还含 marker)
+        ("字符串含 http://",        ['u = "http://a.b/c"; reg();'],                 "reg();"),
+        ("字符串含 /*",             ['u = "a/*b"; reg();'],                          "reg();"),
+        ("字符串含 */",             ['u = "a*/b"; reg();'],                          "reg();"),
+        ("字符串含转义双引号",       ['u = "say \\"hi\\" // not comment"; reg();'],   "reg();"),
+        ("字符常量含转义",           ["c = '\\\\'; reg();"],                          "reg();"),
+        ("真正的单行注释",           ['// lua_newtable(L)', 'reg();'],                "reg();"),
+        ("真正的多行注释",           ['/* lua_newtable(L)', '   still */ reg();'],    "reg();"),
+        ("注释后同行有注册",         ['/* c */ lua_newtable(L);'],                    "lua_newtable(L);"),
+        ("注册后跟 URL 串",          ['lua_setfield(L,-2,"x"); /* see http://a */'],  'lua_setfield(L,-2,"x");'),
+    ]
+    ok = True
+    for name, src, want in cases:
+        out = code_only(src)
+        got = out[-1] if out else ""
+        hit = want in got
+        # 正向用例: marker 必须保留; 反向用例(真注释): lua_newtable 必须被剥掉
+        if name.startswith("真正的"):
+            hit = ("lua_newtable" not in "".join(out)) or (want in got)
+        print(("  ✅ " if hit else "  ✗ ") + name + ("" if hit else "  → got=%r" % got))
+        ok = ok and hit
+    return ok
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="只对账不写文件; 不一致则 exit 1")
+    ap.add_argument("--selftest", action="store_true", help="跑 code_only 的注释/字符串用例")
     ap.add_argument("-o", "--out", default=OUT_DEFAULT)
     args = ap.parse_args()
+
+    if args.selftest:
+        print("code_only 自检:")
+        sys.exit(0 if selftest() else 1)
 
     mods, all_apis, errors = collect()
     total = sum(len(v) for v in all_apis.values())
     if not total:
         sys.exit("✗ 一个 API 都没扫到 —— lua_bridge/ 目录或生成的文件不对")
 
-    text = render(mods, all_apis)
+    body = render_body(mods, all_apis)
 
-    # ---- 对账: 已生成的文档 vs 源码 ----
+    # ---- 对账 + 组装: 目标文件有区间标记就只换区间(保留手写 C 部分) ----
     old = open(args.out, encoding="utf-8").read() if os.path.exists(args.out) else ""
+    if BLK_BEGIN in old and BLK_END in old:
+        i = old.index(BLK_BEGIN)
+        j = old.index(BLK_END) + len(BLK_END)
+        text = old[:i] + BLK_BEGIN + "\n\n" + body + "\n" + BLK_END + old[j:]
+    else:
+        text = render(mods, all_apis)
+
     names_new = set(re.findall(r"^\| `(app\.[\w.]+)` \|", text, re.M))
     names_old = set(re.findall(r"^\| `(app\.[\w.]+)` \|", old, re.M))
     missing = sorted(names_new - names_old)

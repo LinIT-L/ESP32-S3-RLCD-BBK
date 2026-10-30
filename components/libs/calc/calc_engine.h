@@ -13,6 +13,10 @@
 extern "C" {
 #endif
 
+/* 角度制开关: deg=true 时 sin/cos/tan 的入参按角度解释, asin/acos/atan 的结果按角度返回.
+ * 默认 false = 弧度 (与 C 库一致). 计算器页的 Rad/Deg 键只调这一个开关. */
+void calc_set_deg(bool deg);
+
 /* 求值数学表达式.
  * expr: 表达式字符串; ans: 上一结果(供 Ans); 
  * 返回 0=成功(结果写 *out); -1=语法错误; -2=域/数学错误(非数字/求值时). */

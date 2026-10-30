@@ -193,6 +193,11 @@ void os_pane_reset(os_pane_t *p) {
 }
 
 void os_pane_build_right(os_pane_t *p) {
+    /* ★ 2026-10-30 修 panic: 这里下面会 snprintf("%s", p->root)，root 为 NULL 时
+     *   直接 LoadProhibited 崩机。os_pane_reset() 里已经判过 !p->root，这里漏了。
+     *   触发路径（实测）: Lua 页面上再 push 一个页面 → lua_on_exit → lua_stop →
+     *   无条件 os_pane_build_right(&s_pane)，而该脚本从没用过文件面板 ⇒ root 一直是 NULL。 */
+    if (!p || !p->root) return;
     /* 同一分类反复点击/确认不重扫 (触摸左栏每次点击都会调用) */
     if (p->built_folder == p->sel_folder) return;
     p->built_folder = p->sel_folder;

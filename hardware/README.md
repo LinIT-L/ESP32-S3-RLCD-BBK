@@ -6,6 +6,7 @@
 |---|---|
 | `LinTOS_2026-10-19.epro` | **嘉立创 EDA 专业版工程文件**（原理图 + PCB） |
 | `images/pcb-xiaozhi.png` | **小智集成板** 3D 渲染图 |
+| `ESP32-S3-RLCD-DIY说明.docx` | **对外 DIY 说明**：三方案对比、配件清单与购买链接、打板说明（给做硬件的人看，不是开发文档）|
 | `images/pcb-standard.png` | **标准扩展板** 3D 渲染图 |
 | `schematic.pdf` | **两版完整原理图**（PDF，可直接看/打印/对照维修）|
 

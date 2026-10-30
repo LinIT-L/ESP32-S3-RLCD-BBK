@@ -1,5 +1,6 @@
 /* net_client.c — LinTOS 唯一 HTTP(S) 客户端实现 (见 net_client.h 的设计说明) */
 #include "net_client.h"
+#include "netc_fs_replace.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -11,6 +12,7 @@
 #include "lwip/errno.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define TAG "NETC"
 
@@ -59,6 +61,63 @@ static uint32_t crc32_upd(uint32_t crc, const uint8_t *p, size_t n) {
 
 static const char *DEFAULT_UA = "LinTOS/1.0 (ESP32-S3)";
 
+/* ============ 落盘替换 / 恢复 (2026-10-30) ============
+ * 核心实现在 **netc_fs_replace.c**（不依赖 ESP-IDF，主机测试直接编译同一份源码，
+ * 不再有"测试副本与生产代码漂移"的问题）。这里只做三件事：
+ *   ① 构造 `.bak` 路径（本模块单请求槽，一个静态缓冲就够）；
+ *   ② 打日志（结果码 → ESP_LOG）；
+ *   ③ 对外暴露 netc_recover_path()，让应用中心扫描复用同一套恢复逻辑。
+ *
+ * 事实依据（不是 POSIX 直觉）:
+ *   - 落盘目标是 /sdcard/... ⇒ FATFS(VFS) ⇒ vfs_fat_rename() 直接调 f_rename()
+ *     (esp-idf-v60/components/fatfs/vfs/vfs_fat.c:959-966);
+ *   - f_rename() 对 FAT/FAT32 **目标已存在时返回 FR_EXIST, 不覆盖** (ff.c:5244);
+ *   - IDF 6.0.3 **没有** CONFIG_FATFS_VFS_RENAME_REPLACES_DESTINATION 这个选项。
+ */
+static char s_bak_path[sizeof(s_path) + 8];
+
+/* 下载路径专用（单请求槽，无并发） */
+static void netc_recover_file(const char *final_path)
+{
+    if (!final_path || !final_path[0]) return;
+    snprintf(s_bak_path, sizeof(s_bak_path), "%s.bak", final_path);
+    switch (netc_fs_recover(final_path, s_bak_path)) {
+    case NETC_REC_RESTORED:
+        ESP_LOGW(TAG, "掉电恢复: %s 已从 .bak 复位", final_path);
+        break;
+    case NETC_REC_CLEANED:
+        ESP_LOGI(TAG, "清理陈旧 .bak: %s", final_path);
+        break;
+    case NETC_REC_FAILED:
+        ESP_LOGE(TAG, "掉电恢复失败: %s (.bak 保留)", final_path);
+        break;
+    default:
+        break;
+    }
+}
+
+int netc_recover_path(const char *final_path)
+{
+    if (!final_path || !final_path[0]) return (int)NETC_REC_NONE;
+    /* 自带栈缓冲(≈204B)：不碰 s_bak_path ⇒ 与正在进行的下载**零共享状态**,
+     * 调用方(应用中心扫描任务 8KB 栈)即使与 netc 任务并发也无竞争。 */
+    char bak[NETC_PATH_MAX + 8];
+    snprintf(bak, sizeof(bak), "%s.bak", final_path);
+    netc_rec_t r = netc_fs_recover(final_path, bak);
+    switch (r) {
+    case NETC_REC_RESTORED: ESP_LOGW(TAG, "掉电恢复(扫描触发): %s 已复位", final_path); break;
+    case NETC_REC_CLEANED:  ESP_LOGI(TAG, "清理陈旧 .bak(扫描触发): %s", final_path);   break;
+    case NETC_REC_FAILED:   ESP_LOGE(TAG, "掉电恢复(扫描触发)失败: %s", final_path);     break;
+    default: break;
+    }
+    return (int)r;
+}
+
+/* 完整性闸门: 期望值非 0 才校验 */
+static uint32_t s_expect_crc;
+static uint32_t s_expect_size;
+
+
 static void netc_task(void *arg) {
     (void)arg;
     ESP_LOGI(TAG, "请求: 内部 free=%u largest=%u psram=%u url=%s%s",
@@ -79,14 +138,43 @@ static void netc_task(void *arg) {
     esp_err_t e = ESP_OK;
     /* 落盘才需要 8KB 搬运缓冲 —— 按需分配内部 RAM, 用完即释放 (不下载就不占) */
     char *chunk = NULL;
+    int chunk_sz = NETC_CHUNK;
     if (s_path[0]) {
+        /* ★ 2026-10-30 修「下载立刻失败/进度 0」的一个高概率来源:
+         *   本任务已占 8KB 栈, 若再硬要 8KB 连续内部 RAM (合计 16KB), 在 ESP32-S3
+         *   内存紧张时(带 WiFi + 音乐 + 商店列表) heap_caps_malloc 常直接 NULL,
+         *   于是 e=ESP_FAIL → 状态 ERR → 上层看到"下载失败、进度一动不动"。
+         *   这里改为**降级分配**: 8KB → 2KB → 1KB, 只要拿到一块就能继续;
+         *   全拿不到才算真失败 (此时日志会明确指出是内部 RAM 不足)。 */
         chunk = heap_caps_malloc(NETC_CHUNK, MALLOC_CAP_INTERNAL);
-        if (!chunk) { ESP_LOGW(TAG, "内部RAM不足, 无法分配 %dKB 落盘缓冲", NETC_CHUNK / 1024); e = ESP_FAIL; }
+        if (!chunk) {
+            chunk_sz = 2048;
+            chunk = heap_caps_malloc(chunk_sz, MALLOC_CAP_INTERNAL);
+            if (chunk) ESP_LOGW(TAG, "内部RAM紧张: 落盘缓冲降级为 %d 字节", chunk_sz);
+        }
+        if (!chunk) {
+            chunk_sz = 1024;
+            chunk = heap_caps_malloc(chunk_sz, MALLOC_CAP_INTERNAL);
+            if (chunk) ESP_LOGW(TAG, "内部RAM很紧张: 落盘缓冲降级为 %d 字节", chunk_sz);
+        }
+        if (!chunk) { ESP_LOGE(TAG, "内部RAM耗尽: 连 1KB 落盘缓冲都分配不到"); e = ESP_FAIL; }
     }
     FILE *fp = NULL;
+    /* ★ 2026-10-30: 落盘改**临时文件 + 成功后原子改名**。
+     *   原实现直接 fopen(最终路径,"wb"): 下到一半掉电/硬复位, 就会在商店源目录里
+     *   留一个半截文件 —— 上层按"文件已存在"当待安装, 体积/CRC 全错且不会自愈。
+     *   改法: 先写 `<最终路径>.part`, 只有 状态码 200 + 长度相符 才 rename 到最终路径;
+     *   任何失败都只删 .part, **不动**可能已存在的旧文件(以前失败会 remove 最终路径,
+     *   把上一版好文件一起删掉)。对调用方完全透明: 入参/出参路径语义不变。 */
+    /* 静态单槽: 与 s_path 同生命周期(本模块本就只有"单请求槽"),
+     * **不放任务栈** —— netc 任务只有 8KB 栈且要跑 mbedtls, 这里再占数百字节会挤 TLS。 */
+    static char part_path[sizeof(s_path) + 8];
+    part_path[0] = 0;
     if (e == ESP_OK && s_path[0]) {
-        fp = fopen(s_path, "wb");
-        if (!fp) { ESP_LOGW(TAG, "打不开落盘文件 %s", s_path); e = ESP_FAIL; }
+        netc_recover_file(s_path);        /* 上次掉电遗留的 .bak 先复位 */
+        snprintf(part_path, sizeof(part_path), "%s.part", s_path);
+        fp = fopen(part_path, "wb");
+        if (!fp) { ESP_LOGW(TAG, "打不开落盘文件 %s", part_path); e = ESP_FAIL; }
     }
     esp_http_client_handle_t cl = NULL;
     if (e == ESP_OK) cl = esp_http_client_init(&cfg);
@@ -101,7 +189,7 @@ static void netc_task(void *arg) {
             for (;;) {
                 if (s_cancel) { e = ESP_ERR_INVALID_STATE; break; }
                 if (fp) {
-                    int n = esp_http_client_read(cl, chunk, NETC_CHUNK);
+                    int n = esp_http_client_read(cl, chunk, chunk_sz);
                     if (n <= 0) break;
                     if (fwrite(chunk, 1, (size_t)n, fp) != (size_t)n) {
                         ESP_LOGW(TAG, "写文件失败 %s (卡满?)", s_path);
@@ -130,13 +218,47 @@ static void netc_task(void *arg) {
                 ESP_LOGW(TAG, "长度不符 收 %d / 应 %d (被截断?) url=%s", total, clen, s_url);
                 e = ESP_FAIL;
             }
+            /* ★★★ 2026-10-30 完整性闸门 —— **必须**在替换阶段之前:
+             *   期望体积/CRC 非 0 才校验; 不通过 ⇒ e=FAIL ⇒ 下面只删 .part,
+             *   目标位置(可能是上一版完好的文件)**一个字节都不动**。
+             *   调用方 am_store_net 收完还会再比一次, 这里是刻意双保险:
+             *   一处是"替换前"的硬闸门(保证旧文件不被坏数据顶掉),
+             *   一处是"调用方"的验收(保证 UI/安装逻辑拿到的是对的字节数)。 */
+            if (e == ESP_OK && s_expect_size && (uint32_t)total != s_expect_size) {
+                ESP_LOGW(TAG, "校验失败: 体积 %d != 期望 %u (不替换, 旧文件保留) url=%s",
+                         total, (unsigned)s_expect_size, s_url);
+                e = ESP_FAIL;
+            }
+            if (e == ESP_OK && s_expect_crc && s_crc != s_expect_crc) {
+                ESP_LOGW(TAG, "校验失败: crc %08x != 期望 %08x (不替换, 旧文件保留) url=%s",
+                         (unsigned)s_crc, (unsigned)s_expect_crc, s_url);
+                e = ESP_FAIL;
+            }
         }
         esp_http_client_close(cl);
         esp_http_client_cleanup(cl);
     }
     if (fp) {
         fclose(fp);
-        if (e != ESP_OK) remove(s_path);      /* 半截文件一定删, 别让上层拿到假数据 */
+        if (e == ESP_OK) {
+            /* ★ 2026-10-30: 替换阶段不再直接 rename(part, final)。
+             *   **FatFs 的 f_rename 在目标已存在时返回 FR_EXIST, 不会覆盖**
+             *   (esp-idf-v60/components/fatfs/src/ff.c:5243-5245:
+             *    `res = (djn.obj.sclust==djo.obj.sclust && djn.dptr==djo.dptr) ? FR_NO_FILE : FR_EXIST;`)
+             *   ⇒ 重下已存在的包时, 直接 rename 会失败。这里改成"旧文件先挪成 .bak,
+             *   新文件就位后再删 .bak", 任何一步失败都回滚, **全过程中不删除旧版本**。
+             *   诚实说明: 这**不是** POSIX 原子替换, 而是"可恢复的非原子替换";
+             *   掉电最坏结果是 final 暂时缺失(.bak 里有完整旧版), 由下次访问恢复。 */
+            if (part_path[0]) {
+                snprintf(s_bak_path, sizeof(s_bak_path), "%s.bak", s_path);
+                if (!netc_fs_replace(part_path, s_path, s_bak_path)) {
+                    ESP_LOGW(TAG, "替换失败 %s → %s (旧版本已保留/回滚)", part_path, s_path);
+                    e = ESP_FAIL;
+                }
+            }
+        } else {
+            remove(part_path);    /* 半截文件只删临时件, 保留可能存在的旧文件 */
+        }
     } else if (s_body && s_cap > 0) {
         s_body[total < s_cap ? total : s_cap - 1] = 0;
     }
@@ -166,9 +288,13 @@ bool netc_start(const netc_req_t *req) {
     s_cap      = to_mem ? req->body_cap : 0;
     s_timeout  = req->timeout_ms > 0 ? req->timeout_ms : 10000;
     s_no_redirect = req->no_redirect;
+    s_expect_crc  = req->expect_crc;      /* 0 = 不校验 (向后兼容) */
+    s_expect_size = req->expect_size;
+    /* ★ 有期望 crc 就必须边收边算: 否则 s_crc 恒为 0, 闸门必然误判失败。
+     *   (原来只看 want_crc, 两者由不同调用方字段控制, 容易配错) */
+    s_want_crc = req->want_crc || (req->expect_crc != 0);
     s_http = 0; s_len = 0; s_err = 0; s_got = 0;
     s_cancel = false;
-    s_want_crc = req->want_crc;
     s_crc = 0;
     __sync_synchronize();
     s_state = NETC_RUN;

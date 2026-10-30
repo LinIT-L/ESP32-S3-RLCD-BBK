@@ -201,7 +201,12 @@ static void pin_submit(ui_ctx_t *ctx) {
             return;
         }
         ESP_LOGI(TAG, "PIN 已保存 (%d 位)", (int)strlen(s_pin2));
-        os_keyvault_unlock_secret(s_pin2, s_key);
+        if (os_keyvault_unlock_secret(s_pin2, s_key) != ESP_OK) {   /* 派生失败: 绝不带全零密钥继续 */
+            os_dialog_toast(ctx, "\xe5\xaf\x86\xe9\x92\xa5\xe6\xb4\xbe\xe7\x94\x9f\xe5\xa4\xb1\xe8\xb4\xa5");  /* 密钥派生失败 */
+            s_pin[0] = 0; s_pin_len = 0; s_pin2[0] = 0; s_step = 0;
+            ctx->needs_redraw = true;
+            return;
+        }
         s_have_key = true;
         os_dialog_toast(ctx, "PIN \xe5\xb7\xb2\xe8\xae\xbe\xe7\xbd\xae");  /* PIN 已设置 */
         s_pin[0] = 0; s_pin_len = 0; s_pin2[0] = 0;
@@ -211,7 +216,12 @@ static void pin_submit(ui_ctx_t *ctx) {
     }
     int r = os_keyvault_verify_pin(s_pin);
     if (r == 0) {
-        os_keyvault_unlock_secret(s_pin, s_key);   /* ★ 派生数据密钥, 供本页加密/解密 */
+        if (os_keyvault_unlock_secret(s_pin, s_key) != ESP_OK) {   /* ★ 派生数据密钥, 供本页加密/解密 */
+            os_dialog_toast(ctx, "\xe5\xaf\x86\xe9\x92\xa5\xe6\xb4\xbe\xe7\x94\x9f\xe5\xa4\xb1\xe8\xb4\xa5");  /* 密钥派生失败 */
+            s_pin[0] = 0; s_pin_len = 0;
+            ctx->needs_redraw = true;
+            return;
+        }
         s_have_key = true;
         s_active = false;
         s_pin[0] = 0; s_pin_len = 0;

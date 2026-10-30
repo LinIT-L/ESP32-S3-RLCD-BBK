@@ -45,6 +45,10 @@ typedef enum {
 #define UI_SCROLL_F_NO_BOUNCE  0x02u   /* 无越界回弹（硬边界） */
 #define UI_SCROLL_F_HORIZ      0x04u   /* 横向（主轴 = x） */
 #define UI_SCROLL_F_LOOP       0x08u   /* 循环（到头接尾） */
+/* 吸附瞬跳（不缓动）。凡把 off 反算成"行下标 + 行内像素"两段来做渲染/命中的调用方
+ * （典型: 弹窗列表 os_dialog）**必须**开它 —— 整除反算遇到缓动中间态会让行下标
+ * 在两行之间反复跳，表现为"拖动一直闪、松手又卡回去"。2026-10-28 */
+#define UI_SCROLL_F_SNAP_INSTANT 0x10u
 
 typedef struct {
     int      row_px;      /* 行高（LIST 模式的吸附步长） */
@@ -52,6 +56,8 @@ typedef struct {
     int      content_px;  /* 内容总长度 */
     int      off;         /* 偏移（0..max），恒在合法范围内 */
     int      sub;         /* 越界余量: <0 过头, >0 过尾；渲染用 off+sub */
+    int      snap_to;     /* 吸附目标（仅 snapping=true 时有效） */
+    bool     snapping;    /* 正在缓动到 snap_to（2026-10-28: 吸附改成缓动） */
     float    fling;       /* 松手后的速度 px/帧（带符号） */
     int      anchor;      /* 拖动起点主轴坐标 */
     int      base_off;    /* 拖动起点时的偏移 */

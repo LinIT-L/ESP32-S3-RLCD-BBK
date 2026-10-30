@@ -49,7 +49,6 @@
 #define ANY_KEY_MASK   (PWR_MASK | (1ULL << KEY_LEFT))
 #define WAKE_LEVEL     ESP_EXT1_WAKEUP_ANY_LOW
 
-#define MANUAL_HOLD_MS       500    /* 手动关机后, PWR 需保持按住多久才放行开机 */
 #define KEY_RELEASE_WAIT_MS  3000   /* 等按键松开的最长时间(防卡死) */
 
 /* 关机来源: 高 24 位 magic(掉电后 RTC 内存乱码 → 校验不通过), 低 8 位存来源。 */
@@ -353,7 +352,7 @@ void power_mgr_off(int origin)
     wake_src_set(mask);
     wake_pins_hold(mask);   /* ★ 锁住唤醒键的上拉配置, 否则深睡数字域掉电→浮空→秒醒 */
 
-    ESP_LOGI(TAG, "关机: 进入深睡 (来源=%s, 唤醒=PWR 键按住 0.5s, 掩码=0x%llX)",
+    ESP_LOGI(TAG, "关机: 进入深睡 (来源=%s, 唤醒=PWR 键单击, 掩码=0x%llX)",
              (origin == POWER_OFF_AUTO) ? "休眠到点" : "手动",
              (unsigned long long)mask);
     if (s_pre_sleep_hook) s_pre_sleep_hook();   /* 结账"醒着段", 记下入睡时刻 (电池信息页用) */
@@ -607,62 +606,74 @@ void power_mgr_off(int origin)
 }
 
 /* ---- 开机最早期门控 ----
- * ★ 2026-10-27 linit「自动关机和长按电源键效果一模一样」:
- *   原来两条路径行为不同 —— MANUAL 要求 PWR 按住 ≥0.5s(不足判误触立即回深睡),
- *   而 AUTO 直接放行(碰一下就开机)。现在**统一按 MANUAL 的规矩办**:
- *   不管哪种关机, 唤醒都必须按住 PWR ≥0.5s, 不足一律判误触 → 立即回深睡。
- *   非关机唤醒(上电/复位) 本来就不带 s_off_origin 标记, 仍然直接放行。 */
+ * ★ 2026-10-30 linit「单击开机」: **按一下 PWR 即开, 不再要求长按**。
+ *   历史: 2026-10-27 曾把两条路径统一成"必须按住 ≥0.5s", 因为当时用
+ *   `gpio_get_level` 读**当前电平**判断, 单击在醒来时往往已松手 → 会被误判成误触。
+ *   现在改用 EXT1 唤醒状态(记录是哪个脚把芯片叫醒), 与松手与否无关。
+ *   MANUAL / AUTO 两条路径行为一致: 按一下即开。
+ *   非关机唤醒(上电/复位) 不带 s_off_origin 标记, 仍然直接放行。
+ *
+ *   ⚠ 硬件前提: 只有 PWR 是 GPIO 的板子(小智一体版 GPIO1 / 标准扩展版 GPIO1)
+ *     才适用。微雪原版的 PWR 走电源锁存 IC U3/ECJ23001, **不是 GPIO**,
+ *     长按断电由硬件完成, 固件侧只能影响"从深睡唤醒后是否放行"这一段。 */
 void power_mgr_wake_gate(void)
 {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return;
     if ((s_off_origin & ORIGIN_MASK) != ORIGIN_MAGIC) return;      /* 非本模块记录 → 放行 */
 
     keys_config(PWR_MASK);
-    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
-    while ((uint32_t)(esp_timer_get_time() / 1000) - t0 < MANUAL_HOLD_MS) {
-        if (gpio_get_level(PWR_KEY) != 0) {
-            /* 松手了 / 按住不足 0.5s → 误触: 直接回深睡(保持手动语义) */
-            wait_keys_released(PWR_MASK);
-            s_off_origin = ORIGIN_MAGIC | (s_off_origin & 0xFFu);   /* 保留原来源(自动/手动), 只重写 magic */
-            wake_src_set(PWR_MASK);
-            /* 进深睡前的统一不变量: 功放必须关断并 hold 低电平
-             * (这条路径在 app_board_init 之前, 但同样不能漏 —— 睡眠期间功放耗电是
-             *  "关机了还在掉电" 的典型来源)。 */
-            /* ★ 2026-10-09: GPS (MAX-M10S) 也必须显式送进"软件待机", 并把 ESP 侧 TX 钉住。
-     *   为什么必须在这里做:
-     *   ① 深睡期间**没有任何代码会执行** ⇒ 若此刻 GPS 还在连续跟踪, 它会整夜保持
-     *      ~10mA(峰值 25mA); 而待机只要 46µA —— 差 200 倍。这是"关机还在掉电"的
-     *      另一大来源 (此前只治了功放 GPIO46 那一路)。
-     *   ② GPS 的唤醒源是 **UART RX**。深睡时 GPIO 变高阻, TX 浮空/拾噪会被 GPS 当成
-     *      起始位把它唤醒 —— 醒后再没人让它睡回去。`gpio_hold_en` 把 TX 冻在 UART
-     *      的空闲高电平上, 从根上不给它边沿。
-     *   ⚠ 顺序: 先 gps_sleep() (要发 UBX, 需要 UART 还能工作) 再 hold。 */
-    gps_sleep();
-    /* ★ 2026-10-20: GPS 是选装件(默认关) ⇒ 没开启就一个脚都别碰,
-     *   免得去 hold 一个可能已被别的东西占用的引脚。 */
-    if (gps_is_ready()) {
-        const gps_config_t *gc = gps_default_config();
-        if (gc && gc->pin_tx >= 0) {
-            gpio_hold_en((gpio_num_t)gc->pin_tx);   /* 冻住当前电平 (UART 空闲 = 高) */
-            ESP_LOGI(TAG, "GPS 已送待机, TX(GPIO%d) 已 hold 在高电平", gc->pin_tx);
-        }
-    }
 
-    /* ⚠ 必须放在 GPS 之后调用: 这行内部会 gpio_deep_sleep_hold_en() + hold 功放脚,
-     *   把 pad 冻住。放在前面会把 UART TX 也冻上, 上面那条 UBX 就发不出去
-     *   —— "GPS 送待机" 会静默失败, 深睡期间 GPS 继续 ~10mA。(2026-10-09 修顺序) */
-    audio_player_sleep_for_off();
-            wake_pins_hold(PWR_MASK);   /* 同样要锁住 PWR 上拉, 否则浮空秒醒 */
-            if (s_pre_sleep_hook) s_pre_sleep_hook();   /* 误触回睡也要结账 (醒着段不能白算) */
-            esp_deep_sleep_start();   /* 不返回 */
-            /* 同上: noreturn, 真返回了就走软重启, 而不是带着已关的外设继续开机 */
-            ESP_LOGE(TAG, "误触回睡: esp_deep_sleep_start() 异常返回 ⇒ 软重启恢复");
-            esp_restart();
-            /* 不返回 */
+    /* ★★★ 2026-10-30 linit「单击开机」: 原来要求 PWR 按住 ≥500ms 才放行。
+     *   为什么不能只把 500 改小 —— 唤醒本身要几十毫秒, 而单击(约 100ms)在醒来时
+     *   往往已经松手; 旧逻辑用 gpio_get_level 读**当前电平**, 会把它判成误触打回深睡。
+     *   改用 **EXT1 唤醒状态**判定: 它记录"哪个脚把芯片叫醒", 与当前电平无关 ——
+     *   按一下就满足, 松没松手都算数。
+     *   防误触三层照旧:
+     *     ① 唤醒源只挂 PWR, 且带 RTC 上拉(wake_src_set / keys_config), 浮空不会触发;
+     *     ② 仍是 EXT1 且仍是本模块记录的关机(magic 校验, 见上面两行 return);
+     *     ③ 放行前 wait_keys_released, 避免残余按下在进系统后触发锁屏。
+     *   MANUAL 与 AUTO(休眠到点) 至此行为一致: 按一下即开。 */
+    if ((esp_sleep_get_ext1_wakeup_status() & PWR_MASK) == 0) {
+        /* 唤醒源不是 PWR(浮空/别的脚) → 误触: 直接回深睡 */
+        wait_keys_released(PWR_MASK);
+        s_off_origin = ORIGIN_MAGIC | (s_off_origin & 0xFFu);   /* 保留原来源(自动/手动), 只重写 magic */
+        wake_src_set(PWR_MASK);
+        /* 进深睡前的统一不变量: 功放必须关断并 hold 低电平
+         * (这条路径在 app_board_init 之前, 但同样不能漏 —— 睡眠期间功放耗电是
+         *  "关机了还在掉电" 的典型来源)。 */
+        /* ★ 2026-10-09: GPS (MAX-M10S) 也必须显式送进"软件待机", 并把 ESP 侧 TX 钉住。
+         *   为什么必须在这里做:
+         *   ① 深睡期间**没有任何代码会执行** ⇒ 若此刻 GPS 还在连续跟踪, 它会整夜保持
+         *      ~10mA(峰值 25mA); 而待机只要 46µA —— 差 200 倍。这是"关机还在掉电"的
+         *      另一大来源 (此前只治了功放 GPIO46 那一路)。
+         *   ② GPS 的唤醒源是 **UART RX**。深睡时 GPIO 变高阻, TX 浮空/拾噪会被 GPS 当成
+         *      起始位把它唤醒 —— 醒后再没人让它睡回去。`gpio_hold_en` 把 TX 冻在 UART
+         *      的空闲高电平上, 从根上不给它边沿。
+         *   ⚠ 顺序: 先 gps_sleep() (要发 UBX, 需要 UART 还能工作) 再 hold。 */
+        gps_sleep();
+        /* ★ 2026-10-20: GPS 是选装件(默认关) ⇒ 没开启就一个脚都别碰,
+         *   免得去 hold 一个可能已被别的东西占用的引脚。 */
+        if (gps_is_ready()) {
+            const gps_config_t *gc = gps_default_config();
+            if (gc && gc->pin_tx >= 0) {
+                gpio_hold_en((gpio_num_t)gc->pin_tx);   /* 冻住当前电平 (UART 空闲 = 高) */
+                ESP_LOGI(TAG, "GPS 已送待机, TX(GPIO%d) 已 hold 在高电平", gc->pin_tx);
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        /* ⚠ 必须放在 GPS 之后调用: 这行内部会 gpio_deep_sleep_hold_en() + hold 功放脚,
+         *   把 pad 冻住。放在前面会把 UART TX 也冻上, 上面那条 UBX 就发不出去
+         *   —— "GPS 送待机" 会静默失败, 深睡期间 GPS 继续 ~10mA。(2026-10-09 修顺序) */
+        audio_player_sleep_for_off();
+        wake_pins_hold(PWR_MASK);   /* 同样要锁住 PWR 上拉, 否则浮空秒醒 */
+        if (s_pre_sleep_hook) s_pre_sleep_hook();   /* 误触回睡也要结账 (醒着段不能白算) */
+        esp_deep_sleep_start();   /* 不返回 */
+        /* 同上: noreturn, 真返回了就走软重启, 而不是带着已关的外设继续开机 */
+        ESP_LOGE(TAG, "误触回睡: esp_deep_sleep_start() 异常返回 ⇒ 软重启恢复");
+        esp_restart();
+        /* 不返回 */
     }
-    /* 按住满 0.5s → 放行开机; 等松手, 避免残余按键事件连发 */
+    /* 放行开机; 等松手, 避免残余按键事件连发 */
     wait_keys_released(PWR_MASK);
 }
 

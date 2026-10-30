@@ -75,7 +75,7 @@ MANIFEST = {
     # 单文件小游戏示例: 精灵生成 / 按住移动 / 帧计时 / 存档 / 音效 全走桥 API。
     # 放商店 = 验证"下载安装就能跑"这条链路; 同时双写预装副本便于直接启动。
     # ★ QQ堂·冒险 (掌机版): 泡泡手感 + 无限分块地图 + 背包/技能成长。
-    # 计划书见 docs/QQ堂冒险-计划书.md (3 遍修订定稿)。参考 qqtang-web 的瓦片码/泡泡/Server 门面。
+    # 玩法与瓦片码参考 qqtang-web（计划书已并入代码注释，不再单独存文档）。
     # ★ 《英雄坛说》掌机版 (对标 gmud.online): 全屏 400×300, 原版整图地图 + 原版精灵 + 原版数据。
     #   数据由 tools/wuxia_gen_data.py 从该站 4 个 JSON 生成 → /store/wuxia_data.lua
     #   素材由 tools/wuxia_pack.py / wuxia_world_gen.py 打包 → /store/wuxia/

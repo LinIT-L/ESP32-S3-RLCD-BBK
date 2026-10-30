@@ -50,8 +50,30 @@ static char    s_line[NMEA_LINE_MAX];
 static int     s_line_len;
 
 static bool    s_demo;
-static bool    s_task_running;
-static volatile bool s_stop_req;   /* 2026-10-09: 让服务任务优雅退出 (Lua 应用退出时用) */
+/* ★ 2026-10-28 【生命周期修复】这组状态被**多个任务**读写, 必须明确每个变量的语义:
+ *   · start 调用方 : Lua 运行时任务 (luat_lib_gps.c) / 开机自测任务 (main.c)
+ *   · stop  调用方 : 同上 + 主循环 (page_lua.c 退出 Lua 页)
+ *   · 读方         : GPS 管家 (app_board.c) / gps_boot_park() / 主循环兜底
+ *   ⇒ 跨越至少 3 个任务, 原来 s_task_running 是**普通 bool**, 编译器可缓存到寄存器,
+ *     跨任务可见性没有保证 —— 这是本次修的第一处。 */
+static volatile bool s_task_running;   /* 服务任务活着(含"正在退出"期间仍为真) */
+static volatile bool s_stop_req;       /* 请求任务退出 (2026-10-09) */
+
+/* ★ 2026-10-28 【新增】"停止已请求、但任务尚未确认退出"。
+ *   解决: stop() 等 600ms 超时后返回, 上层立刻 start() 时会看到 s_task_running 仍为真,
+ *   原实现直接 `return ESP_OK` 当成"已启动", 而旧任务随后退出把 running 清掉
+ *   ⇒ 上层以为在跑, 实际服务已经没了(界面显示已开启但永远没有数据)。
+ *   语义: true = 收到停止请求, 任务的"我已退出"确认还没到。
+ *   清点: ① 任务收尾(且只有当代任务有权清) ② start 的 3 秒僵尸兜底。 */
+static volatile bool     s_stopping;
+static volatile uint32_t s_stopping_ms;   /* 发出停止请求的时刻, 供僵尸兜底计时 */
+
+/* ★ 2026-10-28 【新增】代次号: 每次 start 自增, 并作为参数传给任务。
+ *   作用: start 的僵尸兜底会强制把旧任务状态清掉并新建任务; 旧任务**随后才真正退出**时,
+ *   若它照旧执行"清 s_task_running", 就会把**新任务**的运行标志误清 ⇒ 服务再次消失。
+ *   有了代次, 旧任务退场时发现 my_gen != s_gen 就知道"自己已被顶掉", 一个共享变量都不碰。
+ *   这是"不允许旧任务退出时误清除新任务状态"的落地方式。 */
+static volatile uint32_t s_gen;
 
 /* ---- 逐颗卫星 (2026-10-24 卫星信息页) ----
  * GSV 是"多句分片"的: 每个星座每轮 1~4 句, 每句 4 组 (PRN/仰角/方位/SNR)。
@@ -542,11 +564,15 @@ static void demo_step(void)
 /* ================= 后台任务 ================= */
 static void gps_service_task(void *arg)
 {
-    (void)arg;
+    /* ★ 2026-10-28: 代次从 start 传进来。0 不用作有效代次(见 start 里的 ++ 兜底)。 */
+    uint32_t my_gen = (uint32_t)(uintptr_t)arg;
     uint8_t buf[FEED_CHUNK];
-    ESP_LOGI(TAG, "服务任务启动 (%s)", s_demo ? "演示模式" : "读 UART");
+    ESP_LOGI(TAG, "服务任务启动 (%s, gen=%u)", s_demo ? "演示模式" : "读 UART", my_gen);
 
-    while (!s_stop_req) {              /* ★ 2026-10-09: 可被 gps_service_stop() 叫停 */
+    /* 退出条件有两条:
+     *   ① s_stop_req —— 正常的停止请求
+     *   ② my_gen != s_gen —— 自己是"被新 start 顶掉的旧代"(僵尸兜底路径), 立即退场 */
+    while (!s_stop_req && my_gen == s_gen) {
         if (s_demo) {
             demo_step();
             vTaskDelay(pdMS_TO_TICKS(DEMO_TICK_MS));
@@ -559,20 +585,36 @@ static void gps_service_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(200));        /* 驱动未就绪 → 退避, 别忙等 */
         }
     }
-    s_task_running = false;
-    s_stop_req = false;
-    ESP_LOGI(TAG, "服务任务已停止");
+
+    /* ★★★ 2026-10-28 【只有当代任务有权收尾】★★★
+     *   被顶掉的旧任务退出时, 新任务可能已经在跑 —— 它若照旧清 s_task_running / s_stop_req,
+     *   就会把新任务的状态抹掉(表现为"GPS 刚起来又没了")。所以这里先验代次。 */
+    if (my_gen == s_gen) {
+        s_task_running = false;
+        s_stop_req     = false;
+        s_stopping     = false;
+        ESP_LOGI(TAG, "服务任务已停止 (gen=%u)", my_gen);
+    } else {
+        ESP_LOGW(TAG, "旧代任务退场 (gen=%u < 当前 %u) ⇒ 不改任何共享状态", my_gen, s_gen);
+    }
     vTaskDelete(NULL);
 }
 
-/* ★ 2026-10-09: 停服务 (供 Lua 应用退出时调用)。最多等 ~600ms 让任务自己退出。 */
+/* ★ 2026-10-28: 停服务 (供 Lua 应用退出时调用)。最多等 ~600ms 让任务自己退出。
+ *   超时**不改 s_task_running** —— 它表示"任务还活着", 一旦改成 false,
+ *   gps_service_is_running() 会对 GPS 管家报"没人用", 管家随即装 UART 发 PMREQ,
+ *   而旧任务还在读同一个 UART ⇒ 抢总线。超时只留下 s_stopping 让 start 知道"还没准备好"。 */
 bool gps_service_is_running(void) { return s_task_running; }
 
 void gps_service_stop(void)
 {
     if (!s_task_running) return;
-    s_stop_req = true;
+    s_stopping    = true;
+    s_stopping_ms = now_ms();
+    s_stop_req    = true;
     for (int i = 0; i < 60 && s_task_running; i++) vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_task_running)
+        ESP_LOGW(TAG, "stop 超时(600ms): 任务仍在退出中 ⇒ 保留 running, start 会返回未就绪");
 }
 
 esp_err_t gps_service_start(void)
@@ -581,11 +623,45 @@ esp_err_t gps_service_start(void)
         ESP_LOGD(TAG, "gps_init() 尚未成功, 不能起服务");
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_task_running) return ESP_OK;
+
+    /* ★★★ 2026-10-28 【启动前的状态裁决】★★★
+     *   三种情况必须分开, 原来只有一句 `if (s_task_running) return ESP_OK`, 把
+     *   "正在跑"和"正在停"混为一谈 ⇒ stop 超时后 start 谎报成功。 */
+    if (s_task_running || s_stopping) {
+        if (s_stopping && (uint32_t)(now_ms() - s_stopping_ms) >= 3000u) {
+            /* 停止请求发出 3 秒还没收到任务退场确认 ⇒ 判旧任务已卡死。
+             * 强制回收状态, 允许新建(s_gen 自增后旧任务即便复活也只会静默退场)。 */
+            ESP_LOGE(TAG, "停止请求 3s 未完成 ⇒ 强制回收旧任务状态, 允许重新启动");
+            s_stopping     = false;
+            s_task_running = false;
+            s_stop_req     = false;
+        } else if (s_task_running) {
+            /* 正在停止 ⇒ 明确回"未就绪", 让上层(如 app.gps.start())知道现在不能读数据;
+             * 未在停止 ⇒ 真正的幂等成功。 */
+            return s_stopping ? ESP_ERR_INVALID_STATE : ESP_OK;
+        } else {
+            /* s_task_running=false 但 s_stopping 残留: 只有"被顶掉的旧代任务"才会留下它。
+             * 这里只清标记, 不碰别的 —— 下面就会正常新建。 */
+            s_stopping = false;
+        }
+    }
+
+    /* 到这里: 没有活任务, 也没有停在半路。
+     * ★ 必须清掉上次遗留的 s_stop_req: 任务循环第一件事就是检查它,
+     *   残留 true 会让新任务**一启动就退出**, 而 start 已经返回了成功。 */
+    s_stop_req = false;
+    /* 代次: 供任务判断"我是不是已被新 start 顶掉"。0 不参与(理论上 2^32 次才回绕一次)。 */
+    uint32_t my_gen = ++s_gen;
+    if (my_gen == 0) my_gen = ++s_gen;
 
     if (gps_nmea_is_demo()) {
+        /* ★ 2026-10-28: 创建成功才置 s_task_running, 失败返回明确错误让上层可重试。 */
+        if (xTaskCreate(gps_service_task, "gps_svc", 3072,
+                        (void *)(uintptr_t)my_gen, 4, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "gps_svc 任务创建失败(demo 分支) ⇒ GPS 解析不可用");
+            return ESP_ERR_NO_MEM;
+        }
         s_task_running = true;
-        xTaskCreate(gps_service_task, "gps_svc", 3072, NULL, 4, NULL);
         return ESP_OK;
     }
 
@@ -609,7 +685,12 @@ esp_err_t gps_service_start(void)
         ESP_LOGI(TAG, "线路探测 OK: 收到 %d 字节", got);
     }
 
+    /* ★ 2026-10-28: 同上 —— 创建成功才置 s_task_running, 失败返回明确错误让上层可重试。 */
+    if (xTaskCreate(gps_service_task, "gps_svc", 3072,
+                    (void *)(uintptr_t)my_gen, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "gps_svc 任务创建失败 ⇒ GPS 解析不可用(内部 RAM 不足?)");
+        return ESP_ERR_NO_MEM;
+    }
     s_task_running = true;
-    xTaskCreate(gps_service_task, "gps_svc", 3072, NULL, 4, NULL);
     return ESP_OK;
 }

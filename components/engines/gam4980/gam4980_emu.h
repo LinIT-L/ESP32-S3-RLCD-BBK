@@ -48,6 +48,9 @@ display_mode_t gam4980_get_display_mode(void);
 void gam4980_set_fullscreen(int mode);   /* 0=点对点, 1=全屏, 2=拉伸 */
 /* V1.1.1: 引擎优化 (os 传入, 独立于旧 menu g_menu): 虚拟按键三态 / 游戏内状态栏 */
 void gam4980_set_vkey(int vkey);         /* 0=关 1=开 2=自动(无手柄时开) */
+/* 游戏声音开关: 只影响引擎自身音频, 与按键音互相独立 */
+void gam4980_set_game_audio(int on);
+int  gam4980_get_game_audio(void);
 void gam4980_set_status_bar(bool on);     /* 游戏内状态栏 显示/隐藏 */
 /* 引擎优化"按键声音 / 触摸震动" (2026-09-29 接入 UI):
  * BBK 不走 input.c 的 joypad 边沿通路 → 按键音与震动必须由引擎自己发。 */

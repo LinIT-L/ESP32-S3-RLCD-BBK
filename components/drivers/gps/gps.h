@@ -88,6 +88,30 @@ void gps_tx_hold_high(void);
  *   已确认就不再去装 UART(装 UART 会重配 TX pad, 电平跳变会把模块叫醒)。 */
 bool gps_sleep_verified(void);
 
+/* ★ 2026-10-28: 本次上电是否**真的收到过有效帧**(NMEA `$G` / UBX `B5 62`)。
+ *   用途: gps_boot_park() 在"模块没插"和"模块在睡"两种情况下都是 got==0 且返回 OK,
+ *   上层无法区分。开机探测用它判断"这块板到底有没有 GPS":
+ *     收到过帧 = 有模块; 一次没收到 = 多半没插。 */
+bool gps_seen_valid_frame(void);
+
+/* ==== 睡眠状态机 (2026-10-28) ====
+ * 目的: 把"命令发了 / UART 静默 / 真进低功耗"三件不同的事分开表达,
+ *       禁止用"串口安静了"直接代表"已进入低功耗"。
+ *   VERIFIED 仍只是**软件推测**(TX 已确认完成 + 全程无接收活动);
+ *   要变成硬件确认, 必须有独立的 GPS 支路电流测量。 */
+typedef enum {
+    GPS_SM_IDLE = 0,      /* 未开始 / 未初始化 */
+    GPS_SM_ACTIVE,        /* 连续跟踪 */
+    GPS_SM_PREPARING,     /* 准备睡眠 */
+    GPS_SM_WAIT_IDLE,     /* 等 UART 稳态窗口 */
+    GPS_SM_PMREQ_SENT,    /* 命令已发出 (≠ 模块受理) */
+    GPS_SM_WAIT_SLEEP,    /* 观察接收活动 */
+    GPS_SM_VERIFIED,      /* 走完全流程且无接收活动 (软件推测) */
+    GPS_SM_UNCERTAIN,     /* 仅 UART 静默 / 或 PSMOO 周期模式 */
+    GPS_SM_FAILED,        /* 明确失败 (含 BUSY) */
+} gps_sm_t;
+gps_sm_t gps_sleep_state(void);
+
 /* ★ 是否正在停靠/初始化(装 UART 期间)。兜底/管家看到它就别插手，
  *   否则两个任务同时发 PMREQ、同时删驱动 ⇒ 日志串味、甚至撞 spinlock。 */
 bool gps_is_busy(void);

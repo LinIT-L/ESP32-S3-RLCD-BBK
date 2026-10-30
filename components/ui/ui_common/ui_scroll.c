@@ -25,6 +25,11 @@
 #define FLING_MAX      60.0f   /* 单帧最大速度（防止一甩到底） */
 #define BOUNCE_DECAY   0.8f    /* 越界余量每帧衰减 */
 #define BOUNCE_MIN     2       /* 余量 <2px 归零 */
+/* ★ 2026-10-28: 吸附从"一帧瞬跳"改成"每帧逼近"。参考 OLED_UI 的缓动思路，
+ *   但不抄它的 PID —— 列表吸附**不能过冲**（吸过去再弹回来很难看），
+ *   所以只要纯比例逼近：每帧走剩余距离的 1/SNAP_DIV，约 3~4 帧(50~66ms@60FPS)停稳。 */
+#define SNAP_DIV       3       /* 每帧走 1/3 剩余距离（越大越慢：3≈3帧, 4≈4帧） */
+#define SNAP_MIN       2       /* 剩余 <=2px 直接归位，避免 1px 慢移 */
 
 /* 主轴取值: 横向模式读 x，否则读 y */
 static inline int axis_of(const ui_scroll_t *s, int x, int y)
@@ -46,6 +51,7 @@ void ui_scroll_config(ui_scroll_t *s, ui_scroll_mode_t mode, uint8_t flags)
     s->mode  = (uint8_t)mode;
     s->flags = flags;
     s->sub   = 0;
+    s->snapping = false;
     s->fling = 0.0f;
     int m = ui_scroll_max(s);
     if (s->off > m) s->off = m;
@@ -70,6 +76,7 @@ void ui_scroll_init(ui_scroll_t *s, int row_px, int view_px, int content_px)
     s->dragging   = false;
     s->pressed    = false;
     s->sub        = 0;
+    s->snapping   = false;
     s->fling      = 0.0f;
     s->last_axis  = 0;
     if (s->off < 0) s->off = 0;
@@ -92,6 +99,7 @@ void ui_scroll_to_top(ui_scroll_t *s)
     s->off = 0;
     s->sub = 0;
     s->fling = 0.0f;
+    s->snapping = false;
     s->dragging = false;
     s->pressed = false;
     s->anchor = s->last_axis = 0;
@@ -102,6 +110,7 @@ void ui_scroll_cancel(ui_scroll_t *s)
     if (!s) return;
     s->fling = 0.0f;
     s->sub = 0;
+    s->snapping = false;
     s->dragging = false;
     s->pressed = false;
     s->anchor = s->last_axis = 0;
@@ -112,7 +121,7 @@ bool ui_scroll_dragging(const ui_scroll_t *s) { return s && s->dragging; }
 bool ui_scroll_busy(const ui_scroll_t *s)
 {
     if (!s) return false;
-    return s->dragging || s->sub != 0 ||
+    return s->dragging || s->sub != 0 || s->snapping ||
            (s->fling > FLING_MIN || s->fling < -FLING_MIN);
 }
 
@@ -149,6 +158,7 @@ bool ui_scroll_ensure_visible(ui_scroll_t *s, int item_y, int item_h)
     s->off = want;
     s->sub = 0;
     s->fling = 0.0f;
+    s->snapping = false;     /* 直接改 off ⇒ 丢弃未完成的吸附 */
     return true;
 }
 
@@ -194,6 +204,7 @@ bool ui_scroll_touch_xy(ui_scroll_t *s, int x, int y, bool down)
         s->base_off  = s->off;      /* 从越过阈值这一刻重新起算, 避免前 12px 跳一下 */
         s->anchor    = a;
         s->last_axis = a;
+        s->snapping  = false;       /* 用户接手 ⇒ 丢弃未完成的吸附 */
     }
     if (!s->dragging) return false;
 
@@ -285,15 +296,48 @@ bool ui_scroll_poll(ui_scroll_t *s)
         changed = true;
     }
 
-    /* ---- 3) 吸附（LIST 行 / PAGE 页；PIXEL 不吸附）---- */
+    /* ---- 3) 吸附（LIST 行 / PAGE 页；PIXEL 不吸附）----
+     * ★ 2026-10-28 改成缓动: 原来一帧就 off=snap(瞬跳)，现在是每帧走剩余
+     *   距离的 1/SNAP_DIV，约 3~4 帧停稳。惯性/回弹期间(fling!=0 或 sub!=0)
+     *   不吸附，等它俩归零后才开始贴行 —— 否则会被惯性拽着反复改目标。 */
     int step_snap = snap_step(s);
     if (s->fling == 0.0f && s->sub == 0 && step_snap > 1) {
-        int half = step_snap / 2;
-        int snap = ((s->off + half) / step_snap) * step_snap;
-        int m = ui_scroll_max(s);
-        if (snap > m) snap = m;
-        if (snap < 0) snap = 0;
-        if (snap != s->off) { s->off = snap; changed = true; }
+        if (s->flags & UI_SCROLL_F_SNAP_INSTANT) {
+            /* ★★★ 2026-10-28 linit「硬件管理上下拖动一直闪、卡回去」根因修复 ★★★
+             *   弹窗列表把偏移反算成 sel = off / 行高(整除) + scroll_px 再做渲染.
+             *   吸附一旦改成逐帧缓动, off 在中途会跨过行高整数倍 ⇒ sel 在两行之间
+             *   反复跳 ⇒ 高亮块跟着闪; 松手后缓动目标又被下一帧的重算覆盖 ⇒ "卡回去".
+             *   所以**带镜像反算的调用方(弹窗列表)必须用瞬跳**, 让 off 一次落到行边界,
+             *   sel 只变一次。其它 7 个页面没有镜像反算, 继续用缓动。 */
+            int half = step_snap / 2;
+            int snap = ((s->off + half) / step_snap) * step_snap;
+            int m = ui_scroll_max(s);
+            if (snap > m) snap = m;
+            if (snap < 0) snap = 0;
+            s->snapping = false;
+            if (snap != s->off) { s->off = snap; changed = true; }
+        } else {
+            if (!s->snapping) {
+                int half = step_snap / 2;
+                int snap = ((s->off + half) / step_snap) * step_snap;
+                int m = ui_scroll_max(s);
+                if (snap > m) snap = m;
+                if (snap < 0) snap = 0;
+                if (snap != s->off) { s->snap_to = snap; s->snapping = true; }
+            }
+            if (s->snapping) {
+                int d = s->snap_to - s->off;
+                if (d >= -SNAP_MIN && d <= SNAP_MIN) {
+                    s->off      = s->snap_to;    /* 收敛 */
+                    s->snapping = false;
+                } else {
+                    int step = d / SNAP_DIV;
+                    if (step == 0) step = (d > 0) ? 1 : -1;
+                    s->off += step;
+                }
+                changed = true;
+            }
+        }
     }
     return changed;
 }

@@ -75,6 +75,16 @@ void st7305_set_portrait(st7305_handle_t *dev, uint8_t *pfb, int rot);
  * 书架与阅读器共用, 触摸由 input_set_screen_rotation(同值) 同步. */
 void st7305_set_rotation(st7305_handle_t *dev, int rot, uint8_t *buf);
 
+/* ★ 2026-10-30: 强制回到**系统默认横屏**, 连控制器 MADCTL/窗口一起复位.
+ * 与 set_rotation(dev,0,NULL) 的区别: 后者只解绑缓冲, 本函数还把面板扫描方向、
+ * 地址窗口重设回横屏, 并失效局刷基线.
+ *
+ * 必须调用它的场合: 任何"必须脱离阅读器/书架方向"的全局画面 ——
+ * 目前是**系统休眠屏保**(os_screensaver_force_enter)。不调的话屏保内容会全部
+ * 画进竖屏缓冲 pt_pfb (300 宽), 而送屏发的是 dev->fb ⇒ 屏幕停在阅读器最后一帧,
+ * 表现为方向错、残影、图标缺半边。 */
+void st7305_reset_rotation(st7305_handle_t *dev);
+
 void st7305_draw_bitmap_1bit(st7305_handle_t *dev,
                               int x, int y, int w, int h,
                               const uint8_t *bitmap);
@@ -159,6 +169,15 @@ int     st7305_get_lpm_force(void);
 void st7305_idle_tick(st7305_handle_t *dev, bool drew, uint32_t now_ms);
 /* 让局刷基线作废 (旋转变化/整帧重画后) */
 void st7305_partial_invalidate_pub(void);
+
+/* ---- Flush 分段计时 (2026-10-30) ----
+ * 编译期开关 ST7305_PERF_STATS 默认 0(关闭): 关闭时所有累加代码被条件编译剔除,
+ * 静态 RAM 占用 0, 这两个接口退化为空壳(仍可安全调用)。
+ * 打开后每个 flush 记录 命令阶段/数据阶段/总耗时 的 n·sum·min·max 与成功/失败次数,
+ * 运行中调 st7305_perf_dump() 输出 (remcon 命令: `lcdperf`)。
+ * ⚠ 只测真实耗时; 不要用 33MHz/15KB≈4.5ms 的理论值替代。 */
+void st7305_perf_dump(void);
+void st7305_perf_reset(void);
 /* 局刷(只送变化的 12 行带)开关, **默认关** —— 整帧更稳, 面板 16Hz 下省字节无收益 */
 /* 作废"已送帧"指纹: 面板内容被旁路刷过(屏保壁纸)之后必须调, 否则下次重绘会被
  * "内容没变"判据跳过, 屏幕停在旧画面上。 */

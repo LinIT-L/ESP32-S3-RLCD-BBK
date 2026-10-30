@@ -26,6 +26,8 @@ static const os_platform_ops_t *s_ops = NULL;
 void os_platform_set(const os_platform_ops_t *ops)
 {
     s_ops = ops;
+    /* 快捷栏(音量/蓝牙/Wi-Fi)复用同一份挂钩 —— 外壳只注入一次, 两处服务共用 */
+    os_quickbar_set_platform(ops);
 }
 
 /* ============ 状态栏绘制 ============ */
@@ -53,30 +55,38 @@ static void svc_blit_inv(st7305_handle_t *lcd, int x, int y, int w, int h,
 }
 
 /* 电池位图 (7档: 电池0=空 .. 电池满=100%). 255=未检测到 -> 空心框+"?" */
+/* 缩放绘制 (定义在本函数之后, 这里前置声明) */
+static void svc_draw_status_icon(st7305_handle_t *lcd, int x, int y,
+                                 int srcW, int srcH, int bytes_per_row,
+                                 int tw, int th, const uint8_t *bitmap);
+
+/* 电池图标绘制尺寸: 原图 32x16, 实际画 24x12 (缩到 3/4, linit 2026-10-30) */
+#define BAT_DW 24
+#define BAT_DH 12
+
 static void svc_draw_battery(st7305_handle_t *lcd, int x, int y, uint8_t percent) {
-    if (percent == 255) {
-        if (s_inv) {
-            draw_rect_outline(lcd, x, y, x + BAT_ICON_W - 1, y + BAT_ICON_H - 1, ST7305_COLOR_WHITE);
-            fill_rect(lcd, x + 2, y + 2, x + BAT_ICON_W - 3, y + BAT_ICON_H - 3, ST7305_COLOR_BLACK);
-            draw_ascii_sb(lcd, x + (BAT_ICON_W - 8) / 2, y + 1, '?', true);
-        } else {
-            draw_rect_outline(lcd, x, y, x + BAT_ICON_W - 1, y + BAT_ICON_H - 1, ST7305_COLOR_BLACK);
-            fill_rect(lcd, x + 2, y + 2, x + BAT_ICON_W - 3, y + BAT_ICON_H - 3, ST7305_COLOR_WHITE);
-            draw_ascii_sb(lcd, x + (BAT_ICON_W - 8) / 2, y, '?', false);
-        }
+    st7305_color_t c = s_inv ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
+    /* 24x12 手绘: 21x12 电池身 + 右侧 3x6 正极.
+     * ⚠ 不能把 32x16 位图直接降采样 —— 原图边框只有 1px, 缩到 3/4 后
+     *   采样点跳过边框, 满电档整块变纯黑, 认不出是电池 (实测)。 */
+    draw_rect_outline(lcd, x, y, x + 20, y + 11, c);     /* 外壳 x 0..20 */
+    fill_rect(lcd, x + 21, y + 3, x + 23, y + 8, c);     /* 正极 x 21..23 */
+
+    if (percent == 255) {                                 /* 未检测到: 中间问号 */
+        draw_ascii_sb(lcd, x + 7, y + 1, '?', s_inv);
         return;
     }
-    /* 显示规则 (linit 2026-10-13 定案): ≥70% 一律满格, ≤10% 一律空格,
-     * 10%~70% 之间 -> 剩余 5 档 (idx 1..5) 平均分布, 每档跨 12 个百分点:
-     *   11-21 → 1 格 · 22-33 → 2 格 · 34-45 → 3 格 · 46-57 → 4 格 · 58-69 → 5 格
-     * 解决"满电静置回落到 ~4.05V → 少一格"的观感问题. */
+    /* 电量档位沿用原规则: >=70% 满格, <=10% 空格, 中间 5 档均分 */
     int idx;
-    if (percent >= 70)      idx = BAT_ICON_N - 1;   /* ≥70% 一律满格 */
-    else if (percent <= 10) idx = 0;                /* ≤10% 一律空格 */
+    if (percent >= 70)      idx = BAT_ICON_N - 1;
+    else if (percent <= 10) idx = 0;
     else                    idx = 1 + (int)(((int)percent - 10) * (BAT_ICON_N - 2) / 60);
     if (idx >= BAT_ICON_N) idx = BAT_ICON_N - 1;
-    if (s_inv) svc_blit_inv(lcd, x, y, BAT_ICON_W, BAT_ICON_H, (BAT_ICON_W + 7) / 8, status_icon_bat_32x16[idx]);
-    else       st7305_draw_bitmap_1bit(lcd, x, y, BAT_ICON_W, BAT_ICON_H, status_icon_bat_32x16[idx]);
+
+    const int inner = 17;                                 /* 内腔 x 2..18 */
+    int w = idx * inner / (BAT_ICON_N - 1);
+    if (idx > 0 && w < 2) w = 2;
+    if (w > 0) fill_rect(lcd, x + 2, y + 2, x + 1 + w, y + 9, c);
 }
 
 /* 1bpp 位图反白最近邻放大 (见 s_inv: 白图或黑图) */
@@ -191,8 +201,8 @@ static void svc_draw_common_right(st7305_handle_t *lcd, int text_y, int SCREEN_W
     const int M = 4;
     const int GAP = 4;
     int right_x = SCREEN_W - M;
-    svc_draw_battery(lcd, right_x - BAT_ICON_W, text_y, bat);
-    right_x -= BAT_ICON_W + GAP;
+    svc_draw_battery(lcd, right_x - BAT_DW, text_y + 2, bat);
+    right_x -= BAT_DW + GAP;
     if (pad_connected) {
         svc_draw_status_icon(lcd, right_x - STATUS_ICON_W, text_y,
                              PAD_ICON_W, PAD_ICON_H, (PAD_ICON_W + 7) / 8,

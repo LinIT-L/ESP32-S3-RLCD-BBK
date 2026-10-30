@@ -42,6 +42,30 @@ static bool s_gap_inited = false;
 static bool s_scanning = false;
 static bool s_connected = false;
 static esp_hidh_dev_t *s_conn_dev = NULL;   /* 当前连接设备句柄 */
+static bool s_radio_on = false;              /* ★ 射频在跑=蓝牙真的开着 */
+
+/* ★★★ 2026-10-27 linit「蓝牙显示开且关不掉」根因修复 ★★★
+ *   esp_hidh 内部维护一个设备链表, `esp_hidh_deinit()` 要求它**为空**
+ *   (ESP-IDF: "Please disconnect all devices first!")。
+ *   但设备对象是在 OPEN 事件里创建的 —— 包括 **OPEN 失败** 的那些(连到一半失败/超时),
+ *   它们既不会进 s_conn_dev, 也没有 CLOSE 回调来回收 ⇒ 残留在链表里,
+ *   此后每一次 deinit 都失败 ⇒ 设置页永远显示「开」, 用户点了关也没用(实测日志):
+ *     E ESP_HIDH: esp_hidh_deinit(173): Please disconnect all devices first!  ×6
+ *   这里把**见过的所有 dev** 记下来, 拆栈前逐个 close/free 掉。 */
+#define BT_DEV_SLOTS 4
+static esp_hidh_dev_t *s_devs[BT_DEV_SLOTS];
+
+static void dev_track(esp_hidh_dev_t *d)
+{
+    if (!d) return;
+    for (int i = 0; i < BT_DEV_SLOTS; i++) if (s_devs[i] == d) return;
+    for (int i = 0; i < BT_DEV_SLOTS; i++) if (!s_devs[i]) { s_devs[i] = d; return; }
+}
+
+static void dev_untrack(esp_hidh_dev_t *d)
+{
+    for (int i = 0; i < BT_DEV_SLOTS; i++) if (s_devs[i] == d) s_devs[i] = NULL;
+}
 
 static TaskHandle_t s_scan_task = NULL;
 
@@ -53,6 +77,7 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
 
     switch (event) {
     case ESP_HIDH_OPEN_EVENT: {
+        dev_track(param->open.dev);      /* ★ 失败的对象也要登记, 否则拆栈时清不掉 */
         if (param->open.status == ESP_OK) {
             s_connected = true;
             s_conn_dev = param->open.dev;
@@ -61,7 +86,9 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
                 s_cbs.on_connected(true, param->open.dev);
             }
         } else {
-            ESP_LOGD(TAG, "OPEN failed!");
+            /* ⛔ 不能在这里 esp_hidh_dev_close(): OPEN 失败时对象尚未完全建立,
+             *   实测直接 LoadProhibited panic(2026-10-27)。残留对象由拆栈前的清理遍历处理。 */
+            ESP_LOGW(TAG, "OPEN failed (status=%d)", (int)param->open.status);
             if (s_cbs.on_connected) {
                 s_cbs.on_connected(false, param->open.dev);
             }
@@ -97,6 +124,7 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
         break;
     }
     case ESP_HIDH_CLOSE_EVENT: {
+        dev_untrack(param->close.dev);
         s_connected = false;
         s_conn_dev = NULL;
         ESP_LOGI(TAG, "CLOSE: %s", param->close.dev ? esp_hidh_dev_name_get(param->close.dev) : "");
@@ -156,6 +184,7 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
     if (s_gap_inited) {
         s_hidh_init = true;
         ESP_LOGI(TAG, "bt_core already initialised (idempotent), reuse bottom layer");
+        bt_core_radio_on();     /* ★ 上电: 上一次"关"只是把射频 disable 掉 */
         return true;
     }
     ESP_LOGI(TAG, "bt_core_init enter");
@@ -214,16 +243,77 @@ bool bt_core_init(const bt_core_cbs_t *cbs)
         int bn = esp_ble_get_bond_device_num();
         ESP_LOGW(TAG, "本地已保存绑定数: %d", bn);
     }
-    ESP_LOGI(TAG, "HID host init done (ready)");
+    s_radio_on = true;      /* ★ 栈建好 = 射频在跑 */
+    ESP_LOGI(TAG, "HID host init done (radio on, ready)");
     return true;
 }
 
+/* ★★★ 2026-10-27 linit「蓝牙一直显示开、关不掉」最终修复 ★★★
+ *   原来 is_ready 只看 s_hidh_init(栈结构是否建过)。可这个栈**永远拆不干净**:
+ *   ESP-IDF 的 esp_hidh_deinit 要求设备链表为空, 而"OPEN 失败"的对象会残留;
+ *   即便绕开, esp_ble_hidh_deinit 还会报 "App Unregister Failed"。
+ *   ⇒ 每次点"关"都失败, is_ready 一直 true, 界面永远显示「开」。
+ *
+ *   现在的语义改成**【射频是否在跑】**: 关 = 停扫描 + 断开 + controller/bluedroid disable,
+ *   栈结构保留(下次 enable 毫秒级复用), 界面/耗电都真·关闭。
+ *
+ *   ★ 2026-10-30 linit「蓝牙没启用就不要占内存」: 上面这条"保留栈结构"的代价是
+ *     **控制器/Bluedroid/esp_hidh 的约 67KB 内部 RAM 一旦分配就永不归还**
+ *     (实测开机初始化前后 193,411 → 120,463 B, 差 72,948 B, 之后一直是这个数)。
+ *     现在把 bt_core_full_deinit() 重新接回**唯一出口** bt_core_deinit_deep():
+ *       · 只在"最后一个使用者退出"(os_hw 引用计数归零)时调用 → 游戏/手柄页退出即还内存;
+ *       · 失败仍按原兜底退回"只关射频"(栈保留、功能不坏), 不会再出现关不掉;
+ *       · 设置页手动关 / 睡眠流程仍走轻量 bt_core_deinit()(只关射频, 快)。 */
+void bt_core_radio_on(void);    /* 前向: init 的幂等分支要用 */
+void bt_core_radio_off(void);
+
 bool bt_core_is_ready(void)
 {
-    return s_hidh_init;
+    return s_radio_on;
 }
 
+static void bt_core_full_deinit(void);   /* 前向: 深度拆栈 (2026-10-30 起由"最后使用者退出"路径调用) */
+
+/* ---- 射频开/关 (bt_manager 关蓝牙走这里) ---- */
+void bt_core_radio_off(void)
+{
+    if (!s_radio_on) return;
+    bt_core_stop_scan();
+    if (s_connected && s_conn_dev) bt_core_disconnect();   /* ★ 防 s_conn_dev 悬空 */
+    for (int i = 0; i < 10 && s_connected; i++) vTaskDelay(pdMS_TO_TICKS(40));
+    esp_err_t e1 = esp_bluedroid_disable();
+    esp_err_t e2 = esp_bt_controller_disable();
+    s_radio_on = false;
+    s_connected = false;
+    ESP_LOGI(TAG, "射频已关闭 (bluedroid=%s controller=%s) ⇒ 界面显示「关」, 无线电不再收发",
+             esp_err_to_name(e1), esp_err_to_name(e2));
+}
+
+void bt_core_radio_on(void)
+{
+    if (s_radio_on) return;
+    if (!s_gap_inited) return;             /* 栈还没建过: 由 bt_core_init 负责 */
+    esp_err_t e1 = esp_bt_controller_enable(HIDH_BLE_MODE);
+    esp_err_t e2 = esp_bluedroid_enable();
+    if (e1 == ESP_OK && e2 == ESP_OK) {
+        s_radio_on = true;
+        ESP_LOGI(TAG, "射频已开启");
+    } else {
+        ESP_LOGW(TAG, "射频开启失败 (controller=%s bluedroid=%s)",
+                 esp_err_to_name(e1), esp_err_to_name(e2));
+    }
+}
+
+/* 对外: 关蓝牙 = 关射频 (不再拆栈, 见上面注释) */
 void bt_core_deinit(void)
+{
+    bt_core_radio_off();
+}
+
+/* ---- 深度拆栈: 保留但**不在正常路径调用** ----
+ *   它需要满足 esp_hidh 设备链表为空, 且 esp_ble_hidh_deinit 能成功 unregister app;
+ *   实测这两条在本机经常不成立, 一旦失败就会留下"半拆"状态(比不拆更糟)。 */
+static void bt_core_full_deinit(void)
 {
     /* ★ 2026-10-18: 扫描标志必须复位 —— 若拆栈时正好有个扫描任务卡在 esp_hid_scan 里，
      *   s_scanning 会一直保持 true ⇒ 之后 bt_core_scan() 直接 return，永不再扫，
@@ -256,6 +346,21 @@ void bt_core_deinit(void)
         }
     }
 
+    /* ★ 清掉"我们没见过 CLOSE 的"残留设备对象 (OPEN 失败的、超时没回 CLOSE 的)。
+     *   不清它们, esp_hidh_deinit() 一定报 "Please disconnect all devices first!",
+     *   于是蓝牙永远关不掉。 */
+    for (int i = 0; i < BT_DEV_SLOTS; i++) {
+        esp_hidh_dev_t *d = s_devs[i];
+        if (!d) continue;
+        if (esp_hidh_dev_exists(d)) {
+            ESP_LOGW(TAG, "拆栈前清理残留设备对象 %p (close+free)", (void *)d);
+            esp_hidh_dev_close(d);
+            vTaskDelay(pdMS_TO_TICKS(60));
+            if (esp_hidh_dev_exists(d)) esp_hidh_dev_free(d);
+        }
+        s_devs[i] = NULL;
+    }
+
     /* 第二步: 关 esp_hidh 层(带重试)。**它失败就绝不能继续拆 Bluedroid** ——
      * 否则会留下"hidh 已废、底层已拆"的不可恢复状态(只能重启)。此时放弃本次拆栈,
      * 保留 BT 栈以保功能(代价: 蓝牙关着也占约 67KB 内部 RAM), 下次 enable 走幂等复用。 */
@@ -265,7 +370,16 @@ void bt_core_deinit(void)
         hidh_ret = esp_hidh_deinit();
     }
     if (hidh_ret != ESP_OK) {
-        ESP_LOGD(TAG, "esp_hidh_deinit 未成功(%s), 放弃本次拆栈以保蓝牙可用", esp_err_to_name(hidh_ret));
+        /* ★★★ 2026-10-27 linit「蓝牙显示开且关不掉」修复 ★★★
+         *   原来这里只打一条 LOGD(默认看不见) 就 return —— 但**射频根本没关**:
+         *   controller/Bluedroid 还在跑, bt_core_is_ready()(返回 s_hidh_init) 仍是 true,
+         *   于是设置页 bt_is_on() 一直显示「开」, 用户点关掉了状态也变不回去。
+         *   现在: 至少把射频停掉(省电+可观测), 并打 W 级日志 —— 关不掉时能一眼看到原因。 */
+        ESP_LOGW(TAG, "esp_hidh_deinit 未成功(%s) ⇒ 退回只关射频(保留栈结构, 下次 enable 复用)",
+                 esp_err_to_name(hidh_ret));
+        esp_bluedroid_disable();
+        esp_bt_controller_disable();
+        ESP_LOGW(TAG, "已强制关闭射频 (controller/bluedroid disable), RAM 不归还但不再耗电/被扫到");
         s_conn_dev  = NULL;
         s_connected = false;
         return;   /* s_gap_inited/s_hidh_init 保持 true → 下次 enable 幂等复用, 不会废掉底层 */
@@ -288,6 +402,22 @@ void bt_core_deinit(void)
     s_gap_inited = false;   /* 下次 bt_core_init 从全新状态完整初始化 */
     s_hidh_init = false;
     ESP_LOGI(TAG, "bt_core deinit: bluetooth stack released");
+}
+
+/* ============================================================================
+ *  对外: 深度拆栈 —— 真正归还内部 RAM
+ *  调用者: bt_manager 的"最后使用者退出"路径 (bt_manager_disable_release)。
+ *  语义与兜底:
+ *    · 成功 → controller/Bluedroid/esp_hidh 全拆, s_gap_inited/s_hidh_init 归零,
+ *             下次 enable 走 bt_core_init 完整重建 (bt_manager_init 已处理这条路径);
+ *    · 失败 → bt_core_full_deinit 内部已退回"只关射频"并保留栈结构,
+ *             此时 RAM 不归还但功能不坏, 下一次 enable 幂等复用 (与改造前一致)。
+ *  ⛔ 不要在"射频还在被扫描任务/连接任务使用"时调用 (看门狗/扫描会 UAF),
+ *     bt_manager_disable_release 已保证先置 s_power_off 并断开。
+ * ========================================================================== */
+void bt_core_deinit_deep(void)
+{
+    bt_core_full_deinit();
 }
 
 void bt_core_scan(int duration_sec)

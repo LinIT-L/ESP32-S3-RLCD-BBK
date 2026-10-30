@@ -47,6 +47,7 @@
 #include <sys/stat.h>
 #include <strings.h>
 #include "str_trunc.h"   /* str_trunc(): 短字段的有意截断拷贝 */
+#include "psa/crypto.h"  /* ★ C1: 备份整包加密 (PBKDF2-HMAC-SHA256 + AES-256-GCM) */
 
 #define S_W 400
 #define S_H 300
@@ -136,7 +137,7 @@ static int  s_open  = -1;      /* ★ 展开抽屉的条目 (全局 index), -1=�
 static bool s_need_clear = true;     /* 内容/分类变化时才整屏清 (滚动时不清, 否则每帧 12 万像素) */
 static ui_col_t s_fcol;              /* 右栏整列缓冲 (滚动只抄窗) */
 static bool s_fcol_dirty = true;     /* 内容变化 → 重建整列 */
-static int  s_r_anchor, s_r_base;   /* 右栏拖动: 起点 y / 起始滚动量 */
+static int  s_r_anchor, s_r_base __attribute__((unused));   /* 右栏拖动: 起点 y / 起始滚动量 */
 static bool s_r_drag;                /* 已判定为拖动 (12px) — 保留仅作兼容 */
 static ui_scroll_t s_fav_sc;         /* ★ 2026-10-24 统一滚动控制器（右栏列表）*/
 static bool s_fav_sc_rdy = false;
@@ -176,6 +177,8 @@ static bool fav_hid_ensure(void);   /* 前向: 按需起 HID */
 static void pane_set_sel(int idx) { s_cat = (idx <= 0) ? -1 : idx - 1; fav_idle_hold_sync(); }
 
 static bool  s_authed = false;
+/* ★ C4: 会话内首次推送时提示一次"按 US 布局发送"（HID Usage 是物理键位） */
+static bool  s_us_hint_shown = false;
 static void  fav_hid_sync(void);      /* 前向: 分类页开键鼠 / 设置页还串口 */
 static void  fav_json_esc(char *d, size_t cap, const char *src);   /* 前向: list 里转义 */
 
@@ -188,6 +191,8 @@ static void  fav_json_esc(char *d, size_t cap, const char *src);   /* 前向: li
 #define FAV_BAK_MAX     16
 #define FAV_BACKUP_PATH FAV_BAK_DIR "/fav_01.bak"   /* 仅用于默认路径常量 */
 #define FAV_AP_SSID     "LinTOS-FAV"
+/* ★ C1: 本次会话的备份口令（独立于设备 PIN，不写入任何文件） */
+static char s_bk_pw[33] = {0};
 static httpd_handle_t s_fav_httpd = NULL;
 static void          *s_fav_dns   = NULL;
 static bool           s_web_on    = false;   /* 网页服务启动标志 */
@@ -243,10 +248,32 @@ static void cats_load(void){
 #define FAV_ENC_MAXB (24u * 1024u)   /* ⛔ 别按 FAV_MAX*CR_MAX 算: 256 条会变 142KB 静态 */
 static uint8_t s_encbuf[FAV_ENC_MAXB];   /* 密码段共用缓冲(必须在内部 RAM: NVS 写时关 cache) */
 
+/* ★ R4 (2026-10-30) 一致性/安全标记 —— 修 P0"导入后密码被清空覆盖"与"blob/enc 版本错配":
+ *   s_enc_loaded : 密码段已成功解到内存(或确认本来就是空)。为 false 时**禁止**改写 NVS_ENC,
+ *                  否则会把"内存里的空密码"当成真相写回去, 密码永久丢。
+ *   s_blob_v5    : 当前 NVS_DATA 是不是带 seq 的新格式
+ *   s_blob_seq   : blob 里记录的版本序号, 与 enc 头部的 seq 必须一致, 否则拒绝解密(不让密码串号)
+ *   s_enc_mismatch: 检测到不一致 → 界面提示"密码段与条目不同步" */
+static void wr_u32le(uint8_t *p, uint32_t v);   /* fwd: 实现在备份加密段 */
+
+static bool     s_enc_loaded   = false;
+/* ★ 收尾核查: 导入过程中 s_fav 处于"清空 → 逐条填"的中间态, 此刻任何一次 fav_save()
+ *   (比如并发的网页写操作)都会把这个半成品落盘。用标志把保存挡在外面, 几行代码挡住真丢数据。 */
+static volatile bool s_importing = false;
+static bool     s_blob_v5      = false;
+static volatile bool s_enc_mismatch = false;
+/* 前向: 这些编解码函数定义在文件后部, 前面先用 */
+static void     wr_u32le(uint8_t *p, uint32_t v);
+static uint32_t rd_u32le(const uint8_t *p);
+
+static uint32_t s_blob_seq     = 0;
+
 /* 把 s_fav 里的密码加密成 blob; 成功返回长度, 失败 0 */
-static size_t fav_build_enc(uint8_t *out, size_t cap){
+static size_t fav_build_enc(uint8_t *out, size_t cap, uint32_t seq){
     if(!applock_key()) return 0;          /* 未解锁不写, 防止把明文换成空 */
-    size_t o = 0;
+    if (cap < 5) return 0;
+    wr_u32le(out, seq);                   /* ★ R4: 前 4 字节 = 版本序号, 与 blob 里的 seq 对齐 */
+    size_t o = 4;
     for(int i=0;i<s_n;i++){
         for(int c=0;c<s_fav[i].nc && c<CR_MAX;c++){
             const char *pw = s_fav[i].cr[c].pass;
@@ -263,72 +290,167 @@ static size_t fav_build_enc(uint8_t *out, size_t cap){
     return o;
 }
 
-static void fav_save(void){
-    nvs_handle_t h; if(svc_nvs_open(NVS_NS,NVS_READWRITE,&h)==ESP_OK){
-        /* ★★ 2026-10-20 变长序列化 (V4):
-         *   定长 fav_t 635B/条 里 520B 是 10 组账号空槽 ⇒ 256 条 162KB 装不下 NVS。
-         *   这里只写**实际内容**: 每条 = icon/cat/nc + 三个"长度+字节"串 + 每个账号的 user。
-         *   密码不在这里(仍走 NVS_ENC 单独加密存)。典型 45B/条 ⇒ 256 条约 12KB。
-         * ⚠ 缓冲必须在**内部 RAM**: NVS 写 flash 会关 cache, 源在 PSRAM 会 panic。 */
-        size_t need = 3 + 2;                       /* magic + n(u16) */
-        for(int i=0;i<s_n;i++){
-            fav_t *f=&s_fav[i];
-            need += 3 + 1+strlen(f->name) + 1+strlen(f->desc) + 1+strlen(f->url);
-            for(int c=0;c<f->nc && c<CR_MAX;c++) need += 1+strlen(f->cr[c].user);
-        }
-        uint8_t *blob = heap_caps_malloc(need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if(!blob){ svc_nvs_close(h); return; }
-        size_t o=0;
-        blob[o++]=0xFA; blob[o++]=0x56; blob[o++]=0x04;      /* magic "FV4" */
-        blob[o++]=(uint8_t)(s_n & 0xFF); blob[o++]=(uint8_t)((s_n>>8)&0xFF);
-        for(int i=0;i<s_n;i++){
-            fav_t *f=&s_fav[i];
-            blob[o++]=f->icon; blob[o++]=f->cat; blob[o++]=f->nc;
-            #define PUTS(field) do{ size_t l=strlen(f->field); if(l>255)l=255; \
-                blob[o++]=(uint8_t)l; memcpy(blob+o,f->field,l); o+=l; }while(0)
-            PUTS(name); PUTS(desc); PUTS(url);
-            for(int c=0;c<f->nc && c<CR_MAX;c++){
-                size_t l=strlen(f->cr[c].user); if(l>255)l=255;
-                blob[o++]=(uint8_t)l; memcpy(blob+o,f->cr[c].user,l); o+=l;
-            }
-            #undef PUTS
-        }
-        svc_nvs_set_blob(h,NVS_DATA,blob,o);
-        free(blob);
-
-        uint8_t *enc = s_encbuf;
-        size_t el = fav_build_enc(enc, sizeof(enc));
-        if(el > 0) svc_nvs_set_blob(h,NVS_ENC,enc,el);
-        else if(el == 0 && s_n == 0) svc_nvs_set_blob(h,NVS_ENC,enc,0);
-        svc_nvs_commit(h); svc_nvs_close(h);
+/* 保存收藏。★ R4: 返回 bool, 任何关键写入失败都如实返回 false（以前 void + 忽略返回值 ⇒
+ *   NVS 满了也当成功, UI 显示"已保存", 用户下次开机发现数据没了）。 */
+static bool fav_save(void){
+    if (s_importing) {                    /* 导入进行中: 内存是半成品, 不许落盘 */
+        ESP_LOGW("FAV", "导入进行中, 本次保存跳过");
+        return false;
     }
+    /* ① 密码段没载入内存 ⇒ 一个字节都不写。写了就是拿空密码覆盖真密文(P0-1)。 */
+    if (s_n > 0 && !s_enc_loaded) {
+        ESP_LOGW("FAV", "密码未载入内存, 拒绝保存(防止用空密码覆盖旧密文)");
+        return false;
+    }
+
+    uint32_t seq = s_blob_seq + 1;
+    /* ② 先算密文: 超限/失败就整次放弃, 绝不出现"blob 新、enc 旧" */
+    size_t el0 = 0;
+    if (s_n > 0) {
+        el0 = fav_build_enc(s_encbuf, sizeof(s_encbuf), seq);
+        if (el0 == 0) {
+            ESP_LOGE("FAV", "密码密文构建失败/超限(%u KB), 本次不保存", (unsigned)(sizeof(s_encbuf)/1024));
+            return false;
+        }
+    } else if (applock_key()) {
+        wr_u32le(s_encbuf, seq);          /* 空收藏: 也写 4 字节头, 保持格式一致 */
+        el0 = 4;
+    }
+
+    nvs_handle_t h;
+    if (svc_nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE("FAV", "NVS 打不开, 保存失败");
+        return false;
+    }
+
+    /* ③ blob: V5 = magic(3) + seq(4) + n(u16) + 条目 */
+    size_t need = 9;
+    for(int i=0;i<s_n;i++){
+        fav_t *f=&s_fav[i];
+        need += 3 + 1+strlen(f->name) + 1+strlen(f->desc) + 1+strlen(f->url);
+        for(int c=0;c<f->nc && c<CR_MAX;c++) need += 1+strlen(f->cr[c].user);
+    }
+    uint8_t *blob = heap_caps_malloc(need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if(!blob){ svc_nvs_close(h); ESP_LOGE("FAV","内部RAM不足, 保存失败"); return false; }
+    size_t o=0;
+    blob[o++]=0xFA; blob[o++]=0x56; blob[o++]=0x05;      /* magic "FV5" */
+    wr_u32le(blob+o, seq); o += 4;
+    blob[o++]=(uint8_t)(s_n & 0xFF); blob[o++]=(uint8_t)((s_n>>8)&0xFF);
+    for(int i=0;i<s_n;i++){
+        fav_t *f=&s_fav[i];
+        blob[o++]=f->icon; blob[o++]=f->cat; blob[o++]=f->nc;
+        #define PUTS(field) do{ size_t l=strlen(f->field); if(l>255)l=255; \
+            blob[o++]=(uint8_t)l; memcpy(blob+o,f->field,l); o+=l; }while(0)
+        PUTS(name); PUTS(desc); PUTS(url);
+        for(int c=0;c<f->nc && c<CR_MAX;c++){
+            size_t l=strlen(f->cr[c].user); if(l>255)l=255;
+            blob[o++]=(uint8_t)l; memcpy(blob+o,f->cr[c].user,l); o+=l;
+        }
+        #undef PUTS
+    }
+    esp_err_t e1 = svc_nvs_set_blob(h, NVS_DATA, blob, o);
+    free(blob);
+    esp_err_t e2 = (s_n == 0)
+                 ? svc_nvs_set_blob(h, NVS_ENC, s_encbuf, 0)
+                 : svc_nvs_set_blob(h, NVS_ENC, s_encbuf, el0);
+    svc_nvs_commit(h);
+    svc_nvs_close(h);
+
+    if (e1 != ESP_OK || e2 != ESP_OK) {
+        ESP_LOGE("FAV", "NVS 写入失败(blob=%s enc=%s) —— 可能是空间不足",
+                 esp_err_to_name(e1), esp_err_to_name(e2));
+        return false;
+    }
+    s_blob_v5 = true; s_blob_seq = seq; s_enc_mismatch = false;
+    return true;
+}
+
+/* ★ R4: 设备端保存的统一出口 —— 失败必须让用户看到, 不能静默 */
+static void fav_save_ui(ui_ctx_t *ctx) {
+    if (!fav_save() && ctx) os_dialog_toast(ctx, "\xE4\xBF\x9D\xE5\xAD\x98\xE5\xA4\xB1\xE8\xB4\xA5\x28\xE7\xA9\xBA\xE9\x97\xB4\xE4\xB8\x8D\xE8\xB6\xB3\x3F\x29");
 }
 
 /* 载入后把密码解密回内存 (需要已解锁; 未解锁时留空, 解锁后再调一次) */
+/* 载入后把密码解密回内存。★ R4 修两处:
+ *   ① 缓冲长度原来写成 sizeof(enc)(指针=4) ⇒ 只要存过密码就 INVALID_LENGTH, 密码从没解出来过;
+ *   ② 校验 enc 头部 seq 与 blob 的 seq 一致, 不一致就**拒绝解密**, 不许把密码解到别的账号上。 */
+/* 载入后把密码解密回内存。
+ *   ★ 收尾核查(2026-10-30): 只有"结构完整 + 每一项都解密成功"才置 s_enc_loaded = true。
+ *   以前三条路径会把"部分成功"当成功:
+ *     ① 长度不够(o+2>el / o+cn>el) 直接 s_enc_loaded=true 返回;
+ *     ② applock_decrypt 返回 0 时静默跳过(密码留空), 最后照样置 true;
+ *     ③ 密文比条目少时循环提前结束, 没人发现。
+ *   一旦被当成 true, 下一次 fav_save() 就会用"空密码"覆盖真密文 —— 密码永久丢。
+ *   现在任何异常都保持 false + s_enc_mismatch, 让上层拒绝保存并提示重新导入备份。 */
 static bool fav_load_enc(void){
+    s_enc_loaded = false;
     if(!applock_key()) return false;
     nvs_handle_t h;
     if(svc_nvs_open(NVS_NS,NVS_READONLY,&h)!=ESP_OK) return false;
     uint8_t *enc = s_encbuf;
-    size_t el = sizeof(enc);
-    bool ok = (svc_nvs_get_blob(h,NVS_ENC,enc,&el)==ESP_OK);
+    size_t el = sizeof(s_encbuf);
+    esp_err_t er = svc_nvs_get_blob(h,NVS_ENC,enc,&el);
     svc_nvs_close(h);
-    if(!ok) return false;
+
+    /* 首次使用: 确认 NVS_ENC 确实不存在 → 允许空密码初始化 */
+    if (er == ESP_ERR_NVS_NOT_FOUND || (er == ESP_OK && el == 0)) {
+        s_enc_loaded = true;
+        return true;
+    }
+    if (er != ESP_OK) {
+        ESP_LOGE("FAV", "密码段读取失败: %s", esp_err_to_name(er));
+        return false;
+    }
+    if (s_n == 0) {                       /* 没有条目 = 没有密码要保护: 直接放行,
+                                           * 否则残留密文会让"删空后再新增"被永久卡住 */
+        memset(enc, 0, el);
+        s_enc_loaded = true;
+        return true;
+    }
+
     size_t o = 0;
-    for(int i=0;i<s_n && o<el;i++){
-        for(int c=0;c<s_fav[i].nc && c<CR_MAX && o<el;c++){
+    if (s_blob_v5) {
+        if (el < 4) { s_enc_mismatch = true; ESP_LOGE("FAV", "密码段格式异常(太短)"); return false; }
+        uint32_t es = rd_u32le(enc);
+        if (es != s_blob_seq) {
+            s_enc_mismatch = true;
+            ESP_LOGE("FAV", "密码段与条目版本不一致(enc=%u blob=%u), 拒绝解密",
+                     (unsigned)es, (unsigned)s_blob_seq);
+            return false;
+        }
+        o = 4;
+    }
+
+    bool ok = true;
+    size_t slots = 0;
+    for (int i = 0; i < s_n && ok; i++) {
+        for (int c = 0; c < s_fav[i].nc && c < CR_MAX && ok; c++) {
+            slots++;
+            if (o >= el) { ok = false; break; }           /* 条目比密文多 ⇒ 截断 */
             uint8_t present = enc[o++];
-            if(!present) continue;
-            if(o+2>el) return true;
-            size_t cn = (size_t)enc[o] | ((size_t)enc[o+1] << 8); o += 2;
-            if(o+cn>el) return true;
+            if (!present) continue;
+            if (o + 2 > el) { ok = false; break; }
+            size_t cn = (size_t)enc[o] | ((size_t)enc[o+1] << 8);
+            o += 2;
+            if (cn == 0 || o + cn > el) { ok = false; break; }
             char tmp[64];
-            size_t pl = applock_decrypt(enc+o, cn, tmp);
+            size_t pl = applock_decrypt(enc + o, cn, tmp);
             o += cn;
-            if(pl && pl < sizeof(tmp)){ tmp[pl]=0; str_trunc(s_fav[i].cr[c].pass, sizeof(s_fav[i].cr[c].pass), tmp); }
+            if (pl == 0 || pl >= sizeof(tmp)) { ok = false; break; }   /* 解不开 ⇒ 整体失败 */
+            tmp[pl] = 0;
+            str_trunc(s_fav[i].cr[c].pass, sizeof(s_fav[i].cr[c].pass), tmp);
         }
     }
-    return true;
+    if (ok && o != el) ok = false;      /* 尾部多余字节 ⇒ 结构不对 */
+
+    if (!ok) {
+        s_enc_mismatch = true;
+        ESP_LOGE("FAV", "密码段结构异常/解密失败(用 %u/%u B, %u 槽), 拒绝标记为已载入",
+                 (unsigned)o, (unsigned)el, (unsigned)slots);
+    }
+    memset(enc, 0, el);                 /* 密文缓冲用完即清 */
+    s_enc_loaded = ok;
+    return ok;
 }
 static int fav_hexv(char c){
     if (c >= '0' && c <= '9') return c - '0';
@@ -356,6 +478,7 @@ static void fav_pct_fix(char *s, size_t cap)
 static void fav_load(void){
     if (!fav_ensure()) return;                 /* 按需分配 (见 fav_ensure) */
     nvs_handle_t h; memset(s_fav, 0, (size_t)FAV_MAX * sizeof(fav_t)); s_n=0;
+    s_enc_loaded = false; s_enc_mismatch = false;   /* ★ R4: 密码已在内存里清空, 必须重新载入才算数 */
     /* ★★ 2026-10-20 必须**先**载分类: 下面解析每条时要用 s_cat_n 判断 cat 是否越界,
      *   放在后面时 s_cat_n 还是初值 4 ⇒ 4/5/6 号分类的网站全被当成越界清成 0
      *   ⇒ "把网站拖到新分类, 重启后又回原分类"。 */
@@ -372,11 +495,17 @@ static void fav_load(void){
     if(p){
         if(svc_nvs_open(NVS_NS,NVS_READONLY,&h)==ESP_OK){
             if(svc_nvs_get_blob(h,NVS_DATA,p,&sz)==ESP_OK&&sz>=5 &&
-               p[0]==0xFA && p[1]==0x56 && p[2]==0x04){
-                /* ---------- V4 变长 ---------- */
-                int n = p[3] | (p[4]<<8);
+               p[0]==0xFA && p[1]==0x56 && (p[2]==0x04 || p[2]==0x05)){
+                /* ---------- V4/V5 变长 (V5 多 4 字节 seq, 与密码段对齐) ---------- */
+                int n = 0; size_t o = 5;
+                if (p[2] == 0x05 && sz >= 9) {
+                    s_blob_v5 = true; s_blob_seq = rd_u32le(p + 3);
+                    n = p[7] | (p[8] << 8); o = 9;
+                } else {
+                    s_blob_v5 = false; s_blob_seq = 0;
+                    if (sz >= 5) n = p[3] | (p[4]<<8);
+                }
                 if(n > FAV_MAX) n = FAV_MAX;
-                size_t o = 5;
                 for(int i=0;i<n && o+3<=sz;i++){
                     fav_t *f=&s_fav[i];
                     f->icon=p[o++]; f->cat=p[o++]; f->nc=p[o++];
@@ -478,13 +607,96 @@ static void fav_load(void){
 #define FAV_ICON_BYTES 128
 #endif
 static bool fav_icon_get(int gi, uint8_t *out);
-static void fav_icon_set(int gi, const uint8_t *bmp);
+static bool fav_icon_set(int gi, const uint8_t *bmp);
 static void fav_icon_del(int gi);
+static void fav_icons_migrate(void);
 
 /* 备份列表 (弹窗选择用) */
 static char        s_bak_path[FAV_BAK_MAX][56];
 static char        s_bak_label[FAV_BAK_MAX][40];
 static const char *s_bak_items[FAV_BAK_MAX];
+
+/* ==================== C1: 备份整包加密 ====================
+ * 设计（2026-10-30）:
+ *   文件 = "FAVENCC1"(8) | ver(1) | kdf(1) | iters(u32 LE) | salt(16) | nonce(12)
+ *          | ctlen(u32 LE) | ciphertext | tag(16)
+ *   - 密钥 = PBKDF2-HMAC-SHA256(口令, salt, iters=20000, 32B)
+ *   - 加密 = AES-256-GCM（认证加密，tag 校验失败即拒绝，绝不返回部分数据）
+ *   - 口令**独立于设备 PIN**，不写入文件；跨设备恢复只需"文件 + 口令"
+ *   - 明文段内部仍是原 FAVEXP2 结构 ⇒ 旧明文备份仍可识别并导入（带警告）
+ * 缓冲用 PSRAM：文件 IO 不关 cache，可以安全从 PSRAM 读；NVS 那边才必须内部 RAM。 */
+#define FAVBK_MAGIC   "FAVENCC1"
+#define FAVBK_VER     2        /* ★ 收尾核查: v2 起文件头参与 AAD 认证 */
+#define FAVBK_VER_NOAAD 1     /* v1(第三轮产物): 头未参与 AAD —— **只读兼容, 绝不写出** */
+#define FAVBK_KDF     1        /* 1 = PBKDF2-HMAC-SHA256 */
+#define FAVBK_ITERS   20000u
+#define FAVBK_SALT    16
+#define FAVBK_NONCE   12
+#define FAVBK_TAG     16
+#define FAVBK_HDR     (8 + 1 + 1 + 4 + FAVBK_SALT + FAVBK_NONCE + 4)
+
+/* 简单内存写入器（替代 open_memstream，行为可控） */
+typedef struct { uint8_t *p; size_t len, cap; bool ok; } bwr_t;
+static void bw(bwr_t *w, const void *d, size_t n) {
+    if (!w->ok) return;
+    if (w->len + n > w->cap) { w->ok = false; return; }
+    if (d) memcpy(w->p + w->len, d, n);
+    else   memset(w->p + w->len, 0, n);
+    w->len += n;
+}
+static void bw_u8(bwr_t *w, uint8_t v)  { bw(w, &v, 1); }
+
+static void wr_u32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static uint32_t rd_u32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* 口令 → 32B 密钥。★ R4: 迭代数改用**文件头里的值**（以前写死常量 ⇒ 头里的 iters 形同虚设,
+ *   将来调参数旧备份立刻解不开） */
+static bool favbk_kdf(const char *pw, const uint8_t *salt, uint32_t iters, uint8_t out[32]) {
+    if (!pw || !pw[0] || iters < 1000) return false;
+    psa_crypto_init();
+    psa_key_derivation_operation_t op = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_status_t st = psa_key_derivation_setup(&op, PSA_ALG_PBKDF2_HMAC(PSA_ALG_SHA_256));
+    if (st == PSA_SUCCESS)
+        st = psa_key_derivation_input_integer(&op, PSA_KEY_DERIVATION_INPUT_COST, iters);
+    if (st == PSA_SUCCESS)
+        st = psa_key_derivation_input_bytes(&op, PSA_KEY_DERIVATION_INPUT_SALT, salt, FAVBK_SALT);
+    if (st == PSA_SUCCESS)
+        st = psa_key_derivation_input_bytes(&op, PSA_KEY_DERIVATION_INPUT_PASSWORD,
+                                            (const uint8_t *)pw, strlen(pw));
+    if (st == PSA_SUCCESS)
+        st = psa_key_derivation_output_bytes(&op, out, 32);
+    psa_key_derivation_abort(&op);
+    return st == PSA_SUCCESS;
+}
+
+/* 用派生密钥做 AES-256-GCM；返回密文+tag 长度，失败 0。
+ * ★ R4: 增加 AAD 参数 —— 文件头(魔数/版本/KDF/迭代数/salt/nonce/密文长度)全部纳入认证,
+ *   任何一位被改都会让 tag 校验失败。 */
+static size_t favbk_gcm(int enc, const uint8_t key[32], const uint8_t *nonce,
+                        const uint8_t *aad, size_t aad_len,
+                        const uint8_t *in, size_t n, uint8_t *out) {
+    psa_key_attributes_t at = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&at, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&at, 256);
+    psa_set_key_usage_flags(&at, enc ? PSA_KEY_USAGE_ENCRYPT : PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&at, PSA_ALG_GCM);
+    psa_key_id_t k = 0;
+    if (psa_import_key(&at, key, 32, &k) != PSA_SUCCESS) return 0;
+    size_t olen = 0;
+    psa_status_t st;
+    if (enc)
+        st = psa_aead_encrypt(k, PSA_ALG_GCM, nonce, FAVBK_NONCE, aad, aad_len,
+                              in, n, out, n + FAVBK_TAG, &olen);
+    else
+        st = psa_aead_decrypt(k, PSA_ALG_GCM, nonce, FAVBK_NONCE, aad, aad_len,
+                              in, n, out, n, &olen);
+    psa_destroy_key(k);
+    return (st == PSA_SUCCESS) ? olen : 0;
+}
 
 static void fav_bak_mkdir(void) { mkdir(FAV_BAK_DIR, 0777); }
 
@@ -522,58 +734,188 @@ static int fav_bak_scan(void)
 }
 
 /* 生成下一个不重名的备份路径: fav_01.bak, fav_02.bak ... */
-static void fav_bak_new_path(char *out, size_t cap)
+/* ★ R4: 返回 false = 目录不可读, 调用方必须**拒绝导出**（以前会瞎猜一个号去覆盖） */
+static bool fav_bak_new_path(char *out, size_t cap)
 {
     fav_bak_mkdir();
-    for (int i = 1; i <= 99; i++) {
-        snprintf(out, cap, "%s/fav_%02d.bak", FAV_BAK_DIR, i);
-        FILE *f = fopen(out, "rb");
-        if (!f) return;
+    char p[96];
+    /* ★ 修复(2026-10-30): 原来一直找到 99 号 —— 但产品设定是**最多 16 个**,
+     *   于是第 17 个起就超出 fav_bak_scan 的可见范围(用户看不到也导不回来)。
+     *   现在严格限制在 FAV_BAK_MAX 内。 */
+    for (int i = 1; i <= (int)FAV_BAK_MAX; i++) {
+        snprintf(p, sizeof(p), "%s/fav_%02d.bak", FAV_BAK_DIR, i);
+        FILE *f = fopen(p, "rb");
+        if (!f) { snprintf(out, cap, "%s", p); return true; }
         fclose(f);
     }
-    snprintf(out, cap, "%s/fav_99.bak", FAV_BAK_DIR);
+    /* 16 个都满: 覆盖**最旧**的那个（按 mtime，不按文件名猜，避免误删最新备份） */
+    int oldest = -1; long long ot = 0;
+    for (int i = 1; i <= (int)FAV_BAK_MAX; i++) {
+        snprintf(p, sizeof(p), "%s/fav_%02d.bak", FAV_BAK_DIR, i);
+        struct stat st;
+        if (stat(p, &st) != 0) continue;
+        if (oldest < 0 || (long long)st.st_mtime < ot) { ot = (long long)st.st_mtime; oldest = i; }
+    }
+    if (oldest < 0) {                       /* 16 个都"存在"却全都 stat 不出来 ⇒ 目录坏了 */
+        ESP_LOGE("FAV", "备份目录不可读(stat 全部失败), 拒绝导出");
+        out[0] = 0;
+        return false;
+    }
+    snprintf(out, cap, "%s/fav_%02d.bak", FAV_BAK_DIR, oldest);
+    ESP_LOGW("FAV", "备份已满 %d 个, 覆盖最旧的 fav_%02d.bak", (int)FAV_BAK_MAX, oldest);
+    return true;
 }
 
-static int fav_export_file(const char *path){
-    FILE *f = fopen(path, "wb");
-    if (!f) { ESP_LOGW("FAV", "导出失败: 打不开 %s (TF 卡未插?)", path); return -1; }
-    int rc = -1;
-    /* ★ 2026-10-20: 升级到 FAVEXP2 —— **图标一起打包**, 单文件即可整体搬到别的机器恢复。
-     *   旧 FAVEXP1 仍然能导入 (没有图标)。 */
-    if (fwrite("FAVEXP2", 1, 7, f) == 7) {
-        uint8_t cn = (uint8_t)s_cat_n;
-        if (fwrite(&cn, 1, 1, f) == 1) {
-            int ok = 1;
-            for (int i = 0; i < cn; i++)
-                if (fwrite(s_cats[i], 1, CAT_SZ, f) != CAT_SZ) { ok = 0; break; }
-            if (ok) {
-                uint8_t fn = (uint8_t)(s_n > 255 ? 255 : s_n);   /* 格式里条数是 u8: 256 会写成 0 */
-                if (fwrite(&fn, 1, 1, f) == 1 &&
-                    (fn == 0 || fwrite(s_fav, sizeof(fav_t), fn, f) == (size_t)fn)) {
-                    /* 图标段: 每条 1 字节"有/无" + (有则) 128 字节位图 */
-                    uint8_t bmp[FAV_ICON_BYTES];
-                    for (int i = 0; i < fn && ok; i++) {
-                        uint8_t has = fav_icon_get(i, bmp) ? 1 : 0;
-                        if (fwrite(&has, 1, 1, f) != 1) { ok = 0; break; }
-                        if (has && fwrite(bmp, 1, FAV_ICON_BYTES, f) != FAV_ICON_BYTES) { ok = 0; break; }
-                    }
-                    uint8_t pb = 0, pl = 0, pinblob[20] = {0}; /* PIN 归系统 keyvault, 不随备份迁移 */
-                    if (ok && fwrite(&pb, 1, 1, f) == 1 && fwrite(&pl, 1, 1, f) == 1 &&
-                        fwrite(pinblob, 1, 20, f) == 20) rc = 0;
-                }
-            }
-        }
+/* 把当前收藏序列化成 FAVEXP2 明文到内存（成功返回 true） */
+static bool fav_export_plain(uint8_t *buf, size_t cap, size_t *out_len) {
+    bwr_t w = { buf, 0, cap, true };
+    bw(&w, "FAVEXP2", 7);
+    bw_u8(&w, (uint8_t)s_cat_n);
+    for (int i = 0; i < s_cat_n && i < CAT_MAX; i++) bw(&w, s_cats[i], CAT_SZ);
+    uint8_t fn = (uint8_t)(s_n > 255 ? 255 : s_n);
+    bw_u8(&w, fn);
+    if (fn) bw(&w, s_fav, (size_t)fn * sizeof(fav_t));
+    uint8_t bmp[FAV_ICON_BYTES];
+    for (int i = 0; i < (int)fn; i++) {
+        uint8_t has = fav_icon_get(i, bmp) ? 1 : 0;
+        bw_u8(&w, has);
+        if (has) bw(&w, bmp, FAV_ICON_BYTES);
     }
-    fclose(f);
-    if (rc != 0) { remove(path); ESP_LOGW("FAV", "导出失败: 写入不完整"); }
-    else ESP_LOGI("FAV", "已导出 %d 条(含图标)到 %s", s_n, path);
-    return rc;
+    uint8_t zb[22] = {0};          /* PIN 段: 归系统 keyvault, 不随备份迁移 */
+    bw(&w, zb, sizeof(zb));
+    if (!w.ok) return false;
+    *out_len = w.len;
+    return true;
 }
-static int fav_import_file(const char *path){
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;                       /* -1 = 没有备份文件 */
-    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (fsz <= 0) { fclose(f); return -1; }
+
+/* ★ R4: 导出为整包加密。头先拼好，**头本身作为 AAD** 参与认证。
+ *   口令独立于设备 PIN，不落盘、不进日志。 */
+static int fav_export_file(const char *path){
+    if (!s_bk_pw[0]) { ESP_LOGW("FAV", "未设置备份口令, 拒绝导出"); return -3; }
+
+    /* 1) 明文（PSRAM: 文件 IO 不关 cache，可安全使用） */
+    size_t pcap = 7 + 1 + (size_t)s_cat_n * CAT_SZ + 1
+                + (size_t)s_n * sizeof(fav_t)
+                + (size_t)s_n * (1 + FAV_ICON_BYTES) + 22;
+    uint8_t *pt = heap_caps_malloc(pcap, MALLOC_CAP_SPIRAM);
+    if (!pt) return -1;
+    size_t plen = 0;
+    if (!fav_export_plain(pt, pcap, &plen)) { heap_caps_free(pt); return -1; }
+
+    /* 2) salt / nonce / 密钥 */
+    uint8_t salt[FAVBK_SALT], nonce[FAVBK_NONCE], key[32];
+    for (int i = 0; i < FAVBK_SALT; i++)  salt[i]  = (uint8_t)(esp_random() & 0xFF);
+    for (int i = 0; i < FAVBK_NONCE; i++) nonce[i] = (uint8_t)(esp_random() & 0xFF);
+    if (!favbk_kdf(s_bk_pw, salt, FAVBK_ITERS, key)) { heap_caps_free(pt); return -1; }
+
+    /* 3) 先拼文件头（ctlen 已知 = plen + tag） */
+    uint8_t hdr[FAVBK_HDR];
+    memcpy(hdr, FAVBK_MAGIC, 8);
+    hdr[8] = FAVBK_VER; hdr[9] = FAVBK_KDF;
+    wr_u32le(hdr + 10, FAVBK_ITERS);
+    memcpy(hdr + 14, salt, FAVBK_SALT);
+    memcpy(hdr + 14 + FAVBK_SALT, nonce, FAVBK_NONCE);
+    wr_u32le(hdr + 14 + FAVBK_SALT + FAVBK_NONCE, (uint32_t)(plen + FAVBK_TAG));
+
+    /* 4) 加密（AAD = 文件头） */
+    uint8_t *ct = heap_caps_malloc(plen + FAVBK_TAG, MALLOC_CAP_SPIRAM);
+    if (!ct) { heap_caps_free(pt); return -1; }
+    size_t ctlen = favbk_gcm(1, key, nonce, hdr, FAVBK_HDR, pt, plen, ct);
+    memset(pt, 0, plen); heap_caps_free(pt);     /* 明文不在堆里久留 */
+    if (ctlen == 0) { heap_caps_free(ct); return -1; }
+
+    /* 5) 原子写：tmp → 校验长度 → 换名（**不先删旧文件**） */
+    char tmp[96];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { heap_caps_free(ct); return -1; }
+    bool ok = (fwrite(hdr, 1, FAVBK_HDR, f) == FAVBK_HDR) &&
+              (fwrite(ct, 1, ctlen, f) == ctlen);
+    if (ok) ok = (fflush(f) == 0);
+    int cerr = fclose(f);
+    heap_caps_free(ct);
+    if (ok && cerr != 0) ok = false;
+    if (ok) {
+        struct stat st;
+        if (stat(tmp, &st) != 0 || (size_t)st.st_size != (size_t)FAVBK_HDR + ctlen) ok = false;
+    }
+    if (!ok) { remove(tmp); ESP_LOGW("FAV", "导出失败: 写入不完整"); return -1; }
+    /* ★ R4: 不再 remove(path)。FatFs 的 f_rename 目标存在时会覆盖,
+     *   原来那行 remove 是"rename 失败 ⇒ 旧备份已删"的唯一来源。 */
+    if (rename(tmp, path) != 0) { remove(tmp); ESP_LOGW("FAV", "导出换名失败, 旧备份保留"); return -1; }
+    ESP_LOGI("FAV", "已加密导出 %d 条到 %s (明文 %u B → 密文 %u B)",
+             s_n, path, (unsigned)plen, (unsigned)ctlen);
+    return 0;
+}
+
+/* ★ R4: 解密到**内存**（PSRAM），不再写 <备份>.dec.tmp 明文文件。
+ *   返回 0=成功 / -2=口令错或数据被改 / -4=格式或 IO 错 */
+static int favbk_decrypt_mem(const char *in_path, uint8_t **out_buf, size_t *out_len) {
+    *out_buf = NULL; *out_len = 0;
+    FILE *f = fopen(in_path, "rb");
+    if (!f) return -4;
+    uint8_t hdr[FAVBK_HDR];
+    if (fread(hdr, 1, FAVBK_HDR, f) != FAVBK_HDR) { fclose(f); return -4; }
+    if (memcmp(hdr, FAVBK_MAGIC, 8) != 0) { fclose(f); return -4; }
+    /* ★ 兼容: 三个版本可能同时存在于用户的卡上 ——
+     *     v1-a  第三轮产物: 头不参与 AAD
+     *     v1-b  第四轮中间构建: 版本号仍写 1, 但**头已经参与 AAD**（这是个坑：
+     *           只看版本号会把它当成 v1-a，用 AAD=NULL 去解必然失败）
+     *     v2    本次起: 头参与 AAD
+     *   所以 v1 一律"两种 AAD 各试一次" —— GCM 靠 tag 自己判定用哪种，
+     *   试错的那次只是多算一遍，不会误解出垃圾（tag 不过就不给数据）。
+     *   v2 不走回退：新格式必须严格带头认证，不接受任何降级。 */
+    if ((hdr[8] != FAVBK_VER && hdr[8] != FAVBK_VER_NOAAD) || hdr[9] != FAVBK_KDF) {
+        fclose(f); return -4;
+    }
+    uint32_t iters = rd_u32le(hdr + 10);
+    if (iters < 1000 || iters > 500000) { fclose(f); return -4; }   /* 防恶意参数把设备拖死 */
+    const uint8_t *salt  = hdr + 14;
+    const uint8_t *nonce = hdr + 14 + FAVBK_SALT;
+    uint32_t ctlen = rd_u32le(hdr + 14 + FAVBK_SALT + FAVBK_NONCE);
+    if (ctlen < FAVBK_TAG || ctlen > (8u << 20)) { fclose(f); return -4; }
+    uint8_t *ct = heap_caps_malloc(ctlen, MALLOC_CAP_SPIRAM);
+    if (!ct) { fclose(f); return -4; }
+    if (fread(ct, 1, ctlen, f) != ctlen) { heap_caps_free(ct); fclose(f); return -4; }
+    fclose(f);
+
+    uint8_t key[32];
+    if (!favbk_kdf(s_bk_pw, salt, iters, key)) { heap_caps_free(ct); return -2; }
+    size_t plen = (size_t)ctlen - FAVBK_TAG;
+    uint8_t *pt = heap_caps_malloc(plen ? plen : 1, MALLOC_CAP_SPIRAM);
+    if (!pt) { heap_caps_free(ct); return -4; }
+    size_t got;
+    if (hdr[8] == FAVBK_VER) {
+        got = favbk_gcm(0, key, nonce, hdr, FAVBK_HDR, ct, ctlen, pt);
+    } else {
+        /* v1：先按"带头 AAD"（第四轮中间构建），失败再按"无 AAD"（第三轮） */
+        got = favbk_gcm(0, key, nonce, hdr, FAVBK_HDR, ct, ctlen, pt);
+        if (got == 0) got = favbk_gcm(0, key, nonce, NULL, 0, ct, ctlen, pt);
+        if (got) ESP_LOGW("FAV", "已按 v1 兼容格式解出备份(旧版 FAVENCC1)");
+    }
+    heap_caps_free(ct);
+    if (got == 0) { heap_caps_free(pt); return -2; }        /* 口令错 / 数据被篡改 */
+    *out_buf = pt; *out_len = got;
+    return 0;
+}
+
+/* ★ R4: 导入读取适配层 —— 文件 或 内存。加密备份解出的明文直接在 PSRAM 里读,
+ *   所以不再需要明文临时文件(旧路径遗留的 .dec.tmp 由 fav_enter 清)。 */
+typedef struct { FILE *f; const uint8_t *m; long len, pos; } fav_rd_t;
+static size_t frd_read(fav_rd_t *r, void *d, size_t n) {
+    if (!r) return 0;
+    if (r->f) return fread(d, 1, n, r->f);
+    long avail = r->len - r->pos;
+    if (avail <= 0) return 0;
+    if ((long)n > avail) n = (size_t)avail;
+    if (n) memcpy(d, r->m + r->pos, n);
+    r->pos += (long)n;
+    return n;
+}
+static long frd_tell(const fav_rd_t *r) { return r->f ? ftell(r->f) : r->pos; }
+
+/* 真正的解析主体: 从 r 里读, total = 总长度(用于回推旧格式的记录长度) */
+static int fav_import_stream_inner(fav_rd_t *r, long total) {
 
     char magic[8] = {0};
     uint8_t cn = 0, fn = 0, pb = 0, pl = 0, pinblob[20] = {0};
@@ -581,16 +923,16 @@ static int fav_import_file(const char *path){
     memset(cats, 0, sizeof(cats));
 
     int rc = -1, v2 = 0;
-    if (fread(magic, 1, 7, f) != 7) { fclose(f); return -3; }
+    if (frd_read(r, magic, 7) != 7) { return -3; }
     if (memcmp(magic, "FAVEXP2", 7) == 0)      v2 = 1;
-    else if (memcmp(magic, "FAVEXP1", 7) != 0) { fclose(f); return -3; }
+    else if (memcmp(magic, "FAVEXP1", 7) != 0) { return -3; }
 
-    if (fread(&cn, 1, 1, f) != 1 || cn > CAT_MAX) { fclose(f); return -3; }
-    if (cn && fread(cats, 1, (size_t)cn * CAT_SZ, f) != (size_t)cn * CAT_SZ) { fclose(f); return -3; }
-    if (fread(&fn, 1, 1, f) != 1) { fclose(f); return -3; }   /* u8 ⇒ 最大 255, 越不过 FAV_MAX */
+    if (frd_read(r, &cn, 1) != 1 || cn > CAT_MAX) { return -3; }
+    if (cn && frd_read(r, cats, (size_t)cn * CAT_SZ) != (size_t)cn * CAT_SZ) { return -3; }
+    if (frd_read(r, &fn, 1) != 1) { return -3; }   /* u8 ⇒ 最大 255, 越不过 FAV_MAX */
 
     /* ★ 记录长度: v2 固定 sizeof(fav_t); v1 按"剩余字节 = fn*rec + 22"反推 (3 种历史布局) */
-    long rest = fsz - ftell(f);
+    long rest = total - frd_tell(r);
     size_t rec = 0;
     if (v2) rec = sizeof(fav_t);
     else {
@@ -600,12 +942,12 @@ static int fav_import_file(const char *path){
         else if (payload == (long)fn * (long)sizeof(fav_v2_t))  rec = sizeof(fav_v2_t);
         else if (payload == (long)fn * (long)sizeof(fav_old_t)) rec = sizeof(fav_old_t);
     }
-    if (!rec) { fclose(f); return -3; }
+    if (!rec) { return -3; }
 
     memset(s_fav, 0, sizeof(fav_t) * FAV_MAX);
     for (int i = 0; i < (int)fn; i++) {
         uint8_t buf[sizeof(fav_t)];
-        if (fread(buf, 1, rec, f) != rec) { fclose(f); return -3; }
+        if (frd_read(r, buf, rec) != rec) { return -3; }
         memset(&s_fav[i], 0, sizeof(fav_t));
         if (rec == sizeof(fav_t)) {
             memcpy(&s_fav[i], buf, sizeof(fav_t));
@@ -630,14 +972,15 @@ static int fav_import_file(const char *path){
     s_n = fn;
 
     /* v2: 逐条读图标段 */
+    int icon_fail = 0;
     if (v2) {
         uint8_t bmp[FAV_ICON_BYTES];
         for (int i = 0; i < (int)fn; i++) {
             uint8_t has = 0;
-            if (fread(&has, 1, 1, f) != 1) { fclose(f); return -3; }
+            if (frd_read(r, &has, 1) != 1) { return -3; }
             if (has) {
-                if (fread(bmp, 1, FAV_ICON_BYTES, f) != FAV_ICON_BYTES) { fclose(f); return -3; }
-                fav_icon_set(i, bmp);
+                if (frd_read(r, bmp, FAV_ICON_BYTES) != FAV_ICON_BYTES) { return -3; }
+                if (!fav_icon_set(i, bmp)) icon_fail++;
             } else {
                 fav_icon_del(i);
             }
@@ -646,16 +989,58 @@ static int fav_import_file(const char *path){
         for (int i = (int)fn; i < FAV_MAX; i++) fav_icon_del(i);
     }
 
-    if (fread(&pb, 1, 1, f) == 1 && fread(&pl, 1, 1, f) == 1 && pl <= 20 &&
-        fread(pinblob, 1, 20, f) == 20) {
+    if (frd_read(r, &pb, 1) == 1 && frd_read(r, &pl, 1) == 1 && pl <= 20 &&
+        frd_read(r, pinblob, 20) == 20) {
         memcpy(s_cats, cats, sizeof(cats)); s_cat_n = cn;
         if (s_cat_n <= 0) s_cat_n = 1;
         for (int i = 0; i < s_n; i++) if (s_fav[i].cat >= s_cat_n) s_fav[i].cat = 0;
         /* PIN 归系统 keyvault(统一配置), 备份仅恢复收藏与分类, 不恢复 PIN */
-        fav_save(); cats_save();
-        s_fcol_dirty = true;
-        rc = 0;
+        /* ★ 收尾核查: 导入是**整体替换**, 密码全部来自备份文件本身 ⇒ 此刻内存里的密码
+         *   就是用户要的那一份。若旧密文已损坏(s_enc_loaded=false), 不松开这一位的话
+         *   fav_save() 会一直拒绝, 用户就永远修不回来了。 */
+        s_enc_loaded = true;
+        s_importing = false;         /* ★ 数据已完整, 这一次保存必须放行(否则导入永远失败) */
+        if (!fav_save()) {
+            rc = -7;                 /* ★ R4: NVS 写入失败绝不能报"导入成功" */
+        } else {
+            cats_save();
+            s_fcol_dirty = true;
+            rc = 0;
+            if (icon_fail) { ESP_LOGW("FAV", "%d 个图标未能写入 TF", icon_fail); rc = -6; }
+        }
     }
+    return rc;
+}
+
+/* ★ 导入期间置 s_importing, 结束后无论成败都复位 */
+static int fav_import_stream(fav_rd_t *r, long total) {
+    s_importing = true;
+    int rc = fav_import_stream_inner(r, total);
+    s_importing = false;
+    return rc;
+}
+
+/* 导入入口: 文件 → 判魔数(加密?) → 内存解密 或 直接读文件 */
+static int fav_import_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;                       /* -1 = 没有备份文件 */
+    char mg[8] = {0};
+    size_t g = fread(mg, 1, sizeof(mg), f);
+    if (g == 8 && memcmp(mg, FAVBK_MAGIC, 8) == 0) {     /* 加密备份 */
+        fclose(f);
+        if (!s_bk_pw[0]) { ESP_LOGW("FAV", "加密备份需要口令"); return -3; }
+        uint8_t *pt = NULL; size_t plen = 0;
+        int dr = favbk_decrypt_mem(path, &pt, &plen);
+        if (dr != 0) { ESP_LOGW("FAV", "解密失败 rc=%d", dr); return dr; }
+        fav_rd_t rd = { NULL, pt, (long)plen, 0 };
+        int rc = fav_import_stream(&rd, (long)plen);
+        memset(pt, 0, plen); heap_caps_free(pt);   /* 明文不在堆里久留 */
+        return rc;
+    }
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (fsz <= 0) { fclose(f); return -1; }
+    fav_rd_t rd = { f, NULL, fsz, 0 };
+    int rc = fav_import_stream(&rd, fsz);
     fclose(f);
     return rc;
 }
@@ -667,9 +1052,93 @@ static int fav_import_file(const char *path){
  * 设备不解码图片: 浏览器把图转成 32×32 黑白位图(128B)后上传, 这里只存取。 */
 #define FAV_ICON_BYTES 128
 
+/* ================= R4: 收藏夹图标改存 TF 卡 =================
+ * 文件: /sdcard/fav_icons/iNNN.bin  (128 B, 32×32 1bpp) —— 索引 000~255 一一对应。
+ * 旧 NVS("imgNNN" / "imgNN") 只在新目录**还没迁移**时读一次；迁移完成后永不回读，
+ * 因此"删条目后旧图标复活到新条目"的问题从根上消失。
+ * NVS 里的旧图标本轮**不删除**，留作兼容备份（迁移失败还能回退）。 */
+#define FAV_ICON_DIR   "/sdcard/fav_icons"
+#define FAV_ICON_MARK  FAV_ICON_DIR "/.migrated"
+
+static int s_ic_tf  = -1;      /* -1 未探测 / 0 不可用 / 1 可用 */
+static int s_ic_mig = -1;      /* -1 未探测 / 0 未迁移 / 1 已迁移 */
+
+static bool fav_icon_path(int gi, char *out, size_t cap) {
+    if (gi < 0 || gi >= FAV_MAX) return false;
+    snprintf(out, cap, FAV_ICON_DIR "/i%03d.bin", gi);
+    return true;
+}
+/* TF 是否可用（每次进页面探测一次，避免"没卡还反复 fopen"） */
+static bool fav_tf_ok(void) {
+    if (s_ic_tf >= 0) return s_ic_tf == 1;
+    struct stat st;
+    s_ic_tf = 0;
+    if (stat("/sdcard", &st) == 0) {
+        mkdir(FAV_ICON_DIR, 0777);                    /* 已存在返回 EEXIST, 忽略 */
+        if (stat(FAV_ICON_DIR, &st) == 0) s_ic_tf = 1; /* 目录建不出来(只读/无卡) → 判不可用 */
+    }
+    return s_ic_tf == 1;
+}
+/* 迁移完成标记: 文件标记 + NVS 标记双保险。
+ *   ⚠ 只认文件标记是不够的 —— 卡拔掉后 stat 失败会被判成"没迁移过", 于是又回读旧 NVS,
+ *   被删掉的旧图标就"复活"了。所以完成时同时写一个 NVS 标记, 之后永远只认 TF。 */
+static bool fav_ic_migrated(void) {
+    if (s_ic_mig < 0) {
+        struct stat st;
+        bool by_file = (fav_tf_ok() && stat(FAV_ICON_MARK, &st) == 0);
+        bool by_nvs  = false;
+        nvs_handle_t h; uint8_t v = 0;
+        if (svc_nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+            if (svc_nvs_get_u8(h, "imgmig", &v) == ESP_OK && v == 1) by_nvs = true;
+            svc_nvs_close(h);
+        }
+        s_ic_mig = (by_file || by_nvs) ? 1 : 0;
+    }
+    return s_ic_mig == 1;
+}
+
+/* ---- TF 读写：写后校验长度，失败不留半截文件 ---- */
+static bool fav_icon_tf_get(int gi, uint8_t *out) {
+    char p[48];
+    if (!out || !fav_icon_path(gi, p, sizeof(p))) return false;
+    FILE *f = fopen(p, "rb");
+    if (!f) return false;
+    size_t n = fread(out, 1, FAV_ICON_BYTES, f);
+    fclose(f);
+    return n == FAV_ICON_BYTES;
+}
+static bool fav_icon_tf_set(int gi, const uint8_t *bmp) {
+    char p[48];
+    if (!bmp || !fav_icon_path(gi, p, sizeof(p))) return false;
+    FILE *f = fopen(p, "wb");
+    if (!f) return false;
+    size_t n = fwrite(bmp, 1, FAV_ICON_BYTES, f);
+    if (n == FAV_ICON_BYTES) fflush(f);
+    fclose(f);
+    struct stat st;
+    if (n != FAV_ICON_BYTES || stat(p, &st) != 0 || (size_t)st.st_size != FAV_ICON_BYTES) {
+        remove(p);
+        ESP_LOGW("FAV", "图标写入失败: %s", p);
+        return false;
+    }
+    return true;
+}
+static void fav_icon_tf_del(int gi) {
+    char p[48];
+    if (fav_icon_path(gi, p, sizeof(p))) remove(p);
+}
+
+/* ---- 旧 NVS 键（仅迁移/未迁移时读） ---- */
 static void fav_img_key(int gi, char *k, size_t n) {
-    /* "img" + 两位十进制. ⛔ 别用 snprintf("%02d"): GCC 无法证明位数 ⇒ 告警,
-     * 而且历史调用方只给了 5 字节缓冲。gi 有效范围 0..FAV_MAX-1 (<100)。 */
+    if (!k || n < 8) return;
+    unsigned v = (gi < 0) ? 0u : ((unsigned)gi > (FAV_MAX - 1) ? (FAV_MAX - 1) : (unsigned)gi);
+    k[0]='i'; k[1]='m'; k[2]='g';
+    k[3]=(char)('0' + (v / 100u));
+    k[4]=(char)('0' + ((v / 10u) % 10u));
+    k[5]=(char)('0' + (v % 10u));
+    k[6]='\0';
+}
+static void fav_img_key_legacy(int gi, char *k, size_t n) {   /* 老版本 img00~img99 */
     if (!k || n < 6) return;
     unsigned v = (gi < 0) ? 0u : ((unsigned)gi > 99u ? 99u : (unsigned)gi);
     k[0]='i'; k[1]='m'; k[2]='g';
@@ -677,26 +1146,85 @@ static void fav_img_key(int gi, char *k, size_t n) {
     k[4]=(char)('0' + (v % 10u));
     k[5]='\0';
 }
-
-static bool fav_icon_get(int gi, uint8_t *out) {
-    nvs_handle_t h; char k[8]; fav_img_key(gi, k, sizeof(k));
+static bool fav_icon_nvs_get(int gi, uint8_t *out) {
+    nvs_handle_t h; char k[10]; fav_img_key(gi, k, sizeof(k));
     if (!out || svc_nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
     size_t sz = FAV_ICON_BYTES;
     bool ok = (svc_nvs_get_blob(h, k, out, &sz) == ESP_OK && sz == FAV_ICON_BYTES);
     svc_nvs_close(h);
+    if (ok) return true;
+    char lk[6]; fav_img_key_legacy(gi, lk, sizeof(lk));
+    nvs_handle_t h2;
+    if (svc_nvs_open(NVS_NS, NVS_READONLY, &h2) != ESP_OK) return false;
+    sz = FAV_ICON_BYTES;
+    ok = (svc_nvs_get_blob(h2, lk, out, &sz) == ESP_OK && sz == FAV_ICON_BYTES);
+    svc_nvs_close(h2);
     return ok;
 }
-static void fav_icon_set(int gi, const uint8_t *bmp) {
-    nvs_handle_t h; char k[8]; fav_img_key(gi, k, sizeof(k));
-    if (svc_nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    svc_nvs_set_blob(h, k, bmp, FAV_ICON_BYTES);
-    svc_nvs_commit(h); svc_nvs_close(h);
-}
-static void fav_icon_del(int gi) {
-    nvs_handle_t h; char k[8]; fav_img_key(gi, k, sizeof(k));
+static void fav_icon_nvs_erase(int gi) {
+    char k[10], lk[6];
+    fav_img_key(gi, k, sizeof(k));
+    fav_img_key_legacy(gi, lk, sizeof(lk));
+    nvs_handle_t h;
     if (svc_nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     svc_nvs_erase_key(h, k);
+    svc_nvs_erase_key(h, lk);
     svc_nvs_commit(h); svc_nvs_close(h);
+}
+
+/* ---- 对外接口 ---- */
+static bool fav_icon_get(int gi, uint8_t *out) {
+    if (!out) return false;
+    if (fav_tf_ok() && fav_icon_tf_get(gi, out)) return true;
+    if (fav_ic_migrated()) return false;      /* 迁移过 ⇒ 只认 TF, 绝不回读 NVS */
+    return fav_icon_nvs_get(gi, out);         /* 还没迁移过 ⇒ 用旧 NVS */
+}
+static bool fav_icon_set(int gi, const uint8_t *bmp) {
+    if (!bmp) return false;
+    if (!fav_tf_ok()) {                       /* 无卡: 明确失败, 不静默当成功 */
+        ESP_LOGW("FAV", "TF 卡不可用, 图标未保存 (item %d)", gi);
+        return false;
+    }
+    return fav_icon_tf_set(gi, bmp);
+}
+static void fav_icon_del(int gi) {
+    fav_icon_tf_del(gi);
+    if (!fav_ic_migrated()) fav_icon_nvs_erase(gi);   /* 迁移前顺手清旧键, 免得之后读回来 */
+}
+
+/* ---- 一次性迁移: NVS → TF。全部成功才写标记；失败保留旧数据下次重试 ---- */
+static void fav_icons_migrate(void) {
+    if (!fav_tf_ok() || fav_ic_migrated()) return;
+    uint8_t b[FAV_ICON_BYTES];
+    int moved = 0, fail = 0;
+    for (int i = 0; i < FAV_MAX; i++) {
+        if (!fav_icon_nvs_get(i, b)) continue;
+        if (fav_icon_tf_set(i, b)) moved++;
+        else if (++fail >= 4) break;          /* 明显写不进去就停手, 别把 256 次全试一遍 */
+    }
+    if (fail) { ESP_LOGW("FAV", "图标迁移中断(已迁 %d, 失败 %d), 下次重试", moved, fail); return; }
+
+    /* ★ 收尾核查: 两个标记都写, 且**先写 NVS 那个** —— 卡拔掉后只有 NVS 标记还认得,
+     *   文件标记在没卡时 stat 不到。任一写失败都记日志：
+     *   真正危险的是"NVS 标记没写成功", 那下次无卡启动会回退读旧 NVS 图标(复活)。
+     *   写失败不影响本次会话(s_ic_mig=1), 但下次开机可能退化 —— 所以必须留痕。 */
+    esp_err_t me = ESP_FAIL;
+    {
+        nvs_handle_t h; uint8_t v = 1;
+        if (svc_nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+            me = svc_nvs_set_u8(h, "imgmig", v);
+            svc_nvs_commit(h); svc_nvs_close(h);
+        }
+    }
+    bool fok = false;
+    FILE *m = fopen(FAV_ICON_MARK, "wb");
+    if (m) { fok = (fputs("1", m) >= 0); if (fclose(m) != 0) fok = false; }
+    if (me != ESP_OK || !fok)
+        ESP_LOGW("FAV", "图标迁移标记写入不全(NVS=%s 文件=%d)：拔卡后可能回退读旧图标",
+                 esp_err_to_name(me), (int)fok);
+
+    s_ic_mig = 1;
+    if (moved) ESP_LOGI("FAV", "图标已迁移到 TF: %d 个", moved);
 }
 
 /* 32×32 → 任意尺寸 (最近邻), cx/cy 为中心 */
@@ -740,25 +1268,56 @@ static esp_err_t fav_web_index_handler(httpd_req_t *req)
 static char    s_web_tok[17];
 static int64_t s_web_tok_us;
 
+/* ★ R4: 只接受 `Authorization: Bearer <token>`。
+ *   URL query 里的 t= 兼容分支已**整段删除** —— token 放 URL 会进浏览器历史/Referer/代理日志。
+ *   前端(fav_web_page.h)已全部走请求头, 删除后没有遗留依赖。 */
 static bool fav_web_authed(httpd_req_t *req)
 {
     if (!s_web_tok[0]) return false;
     if (esp_timer_get_time() - s_web_tok_us > 30LL * 60 * 1000000) return false;
-    /* ★★ 2026-10-20: 不能再用 httpd_query_key_value + 固定小缓冲 —— 参数一长
-     *   (比如"介绍"塞满中文, URL 编码后上百字节) 查询串被截断, 末尾的 t= 就丢了
-     *   ⇒ 401 ⇒ 网页跳回 PIN 输入。直接在完整 uri 里扫 t= 才稳。 */
-    /* ⛔ 不能直接 strstr(uri,"t="): `cat=` 里就含子串 "t=" ⇒ 每次都匹配到 cat 的值,
-     *   校验必然失败 ⇒ 加网站/改分类全变 401 跳 PIN。必须只认 **独立的** t= 键。 */
-    const char *p = NULL;
-    for (const char *q = req->uri; (q = strstr(q, "t=")) != NULL; q += 2) {
-        if (q == req->uri || q[-1] == '?' || q[-1] == '&') { p = q; break; }
+    char hv[64];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hv, sizeof(hv)) != ESP_OK) return false;
+    const char *b = hv;
+    if (strncmp(b, "Bearer ", 7) == 0) b += 7;
+    else if (strncmp(b, "bearer ", 7) == 0) b += 7;      /* 头名大小写不敏感, 值这里宽容一点 */
+    return strcmp(b, s_web_tok) == 0;
+}
+
+/* 严格整数解析: 只接受可选负号 + 纯数字, 其余一律失败。
+ * ★ R4: 以前到处 atoi(), 传 "abc" 会静默变 0 → 命中第 0 条, 删错/改错东西。 */
+static bool fav_atoi(const char *s0, int *out) {
+    if (!s0 || !*s0) return false;
+    const char *p = s0;
+    int sign = 1;
+    if (*p == '-') { sign = -1; p++; }
+    if (*p < '0' || *p > '9') return false;
+    long v = 0; int n = 0;
+    while (*p >= '0' && *p <= '9') {
+        if (++n > 6) return false;                       /* 6 位足够(索引/分类号), 超了当非法 */
+        v = v * 10 + (*p - '0');
+        p++;
     }
-    if (!p) return false;
-    p += 2;
-    char v[24]; int k = 0;
-    while (*p && *p != '&' && k < (int)sizeof(v) - 1) v[k++] = *p++;
-    v[k] = 0;
-    return strcmp(v, s_web_tok) == 0;
+    if (*p) return false;
+    *out = (int)(sign * v);
+    return true;
+}
+/* 拿不到就给默认值(调用方传 -1 当"非法", 现有的 i>=0 判断自然拒掉) */
+static int fav_atoi_or(const char *s, int def) { int v; return fav_atoi(s, &v) ? v : def; }
+
+/* 取 query 里的整数参数, 缺省/非法都返回 false(不动 *out) */
+static bool fav_qint(const char *qs, const char *key, int *out) {
+    char v[12];
+    if (!qs || httpd_query_key_value(qs, key, v, sizeof(v)) != ESP_OK) return false;
+    return fav_atoi(v, out);
+}
+/* 读 POST body 到 buf（返回实际长度, 失败 -1） */
+static int fav_read_body(httpd_req_t *req, char *buf, size_t cap) {
+    if (!req || !buf || cap < 2) return -1;
+    if (req->content_len <= 0 || req->content_len >= (int)cap) return -1;
+    int got = httpd_req_recv(req, buf, cap - 1);
+    if (got <= 0) return -1;
+    buf[got] = 0;
+    return got;
 }
 
 static esp_err_t fav_web_deny(httpd_req_t *req)
@@ -771,9 +1330,12 @@ static esp_err_t fav_web_deny(httpd_req_t *req)
 /* GET /api/login?pin=xxxx → {"ok":true,"t":"<16hex>"} */
 static esp_err_t fav_web_login_handler(httpd_req_t *req)
 {
-    char q[160], pin[24] = {0};
-    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK)
-        httpd_query_key_value(q, "pin", pin, sizeof(pin));
+    char pin[24] = {0};
+    /* ★ R4: PIN **只**从 POST body 读。URL query 分支已删（PIN 进 URL = 进历史/日志）。 */
+    if (fav_read_body(req, pin, sizeof(pin)) <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return fav_web_send_json(req, "{\"ok\":false,\"err\":\"body\"}");
+    }
     os_keyvault_init();
     if (os_keyvault_verify_pin(pin) != 0) return fav_web_deny(req);
     uint64_t r = ((uint64_t)esp_random() << 32) | esp_random();
@@ -793,13 +1355,17 @@ static esp_err_t fav_web_list_handler(httpd_req_t *req)
      *   后面的内容连同 Content-Length 全乱, 浏览器拿到空 body ⇒ 页面不显示任何分类/条目。 */
     httpd_resp_sendstr_chunk(req, "{\"cats\":[");
     for (int i = 0; i < s_cat_n; i++) {
-        char cb[64];
-        snprintf(cb, sizeof(cb), "%s\"%.*s\"", i ? "," : "", CAT_SZ, s_cats[i]);
-        httpd_resp_sendstr_chunk(req, cb);
+        char ce[80], cb[96];
+        fav_json_esc(ce, sizeof(ce), s_cats[i]);     /* ★ R4: 分类名必须转义(以前直出 ⇒ 带 " 就把 JSON 打断) */
+        snprintf(cb, sizeof(cb), "%s\"%s\"", i ? "," : "", ce);
+        if (httpd_resp_sendstr_chunk(req, cb) != ESP_OK) return ESP_FAIL;
     }
     httpd_resp_sendstr_chunk(req, "],\"items\":[");
     for (int i = 0; i < s_n; i++) {
-        char b[768];
+        /* ★ C12 (2026-10-30): 原来把整条(含 10 组账号)拼进 768B 缓冲,
+         *   10 组时约 1400B ⇒ 被 snprintf 截断 ⇒ 前端收到半截 JSON 解析失败。
+         *   现在**逐段 chunked 发送**, 每段都很小, 结构上不可能截断。 */
+        char b[512];
         char en[80], ed[160], ew[200];
         fav_json_esc(en, sizeof(en), s_fav[i].name);
         fav_json_esc(ed, sizeof(ed), s_fav[i].desc);
@@ -807,17 +1373,19 @@ static esp_err_t fav_web_list_handler(httpd_req_t *req)
         int off = snprintf(b, sizeof(b),
                  "%s{\"id\":%d,\"cat\":%d,\"name\":\"%s\",\"desc\":\"%s\",\"url\":\"%s\",\"creds\":[",
                  i ? "," : "", i, s_fav[i].cat, en, ed, ew);
-        for (int c = 0; c < s_fav[i].nc && c < CR_MAX && off < (int)sizeof(b) - 120; c++) {
-            char eu[80], ep[80];
+        (void)off;
+        if (httpd_resp_sendstr_chunk(req, b) != ESP_OK) return ESP_FAIL;
+        for (int c = 0; c < s_fav[i].nc && c < CR_MAX; c++) {
+            char eu[96], one[160];
             fav_json_esc(eu, sizeof(eu), s_fav[i].cr[c].user);
-            fav_json_esc(ep, sizeof(ep), s_fav[i].cr[c].pass);
-            off += snprintf(b + off, sizeof(b) - off, "%s{\"u\":\"%s\",\"p\":\"%s\"}",
-                            c ? "," : "", eu, ep);
+            /* ★ C11: **不再下发密码**，只给"密码是否非空"位；真密码走 /api/credget */
+            snprintf(one, sizeof(one), "%s{\"u\":\"%s\",\"hp\":%d}",
+                     c ? "," : "", eu, (s_fav[i].cr[c].pass[0] ? 1 : 0));
+            if (httpd_resp_sendstr_chunk(req, one) != ESP_OK) return ESP_FAIL;
         }
-        snprintf(b + off, sizeof(b) - off, "]}");
-        httpd_resp_sendstr_chunk(req, b);
+        if (httpd_resp_sendstr_chunk(req, "]}") != ESP_OK) return ESP_FAIL;
     }
-    httpd_resp_sendstr_chunk(req, "]}");
+    if (httpd_resp_sendstr_chunk(req, "]}") != ESP_OK) return ESP_FAIL;
     httpd_resp_sendstr_chunk(req, NULL);   /* 结束 chunked */
     return ESP_OK;
 }
@@ -864,7 +1432,7 @@ static esp_err_t fav_web_add_handler(httpd_req_t *req)
     fav_qdec(qs, "p", p, sizeof(p));
     int ok = 0, new_id = -1;
     if (n[0] && s_n < FAV_MAX) {
-        int c = atoi(cat); if (c < 0 || c >= s_cat_n) c = 0;
+        int c = fav_atoi_or(cat, 0); if (c < 0 || c >= s_cat_n) c = 0;
         fav_t *f = &s_fav[s_n];
         memset(f, 0, sizeof(fav_t));
         f->cat = (uint8_t)c;
@@ -877,9 +1445,8 @@ static esp_err_t fav_web_add_handler(httpd_req_t *req)
             f->nc = 1;
         }
         s_n++;
-        fav_save();
-        s_fcol_dirty = true;
-        ok = 1;
+        if (!fav_save()) { ESP_LOGE("FAV", "保存失败, 本次改动未落盘"); }
+        else { s_fcol_dirty = true; ok = 1; }
         new_id = s_n - 1;
     }
     char out[64];
@@ -893,20 +1460,19 @@ static esp_err_t fav_web_del_handler(httpd_req_t *req)
     char qs[64], id[8] = "0";
     if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK)
         httpd_query_key_value(qs, "id", id, sizeof(id));
-    int i = atoi(id), ok = 0;
+    int i = fav_atoi_or(id, -1), ok = 0;
     if (i >= 0 && i < s_n) {
         /* ★ 自定义图标按"条目序号"存 NVS(imgNN)，删条目必须同步左移，否则图标错位 */
         uint8_t tmp[FAV_ICON_BYTES];
         for (int k = i; k < s_n - 1; k++) {
-            if (fav_icon_get(k + 1, tmp)) fav_icon_set(k, tmp);
+            if (fav_icon_get(k + 1, tmp)) { if (!fav_icon_set(k, tmp)) ESP_LOGW("FAV","图标搬移失败 %d", k); }
             else                          fav_icon_del(k);
         }
         fav_icon_del(s_n - 1);
         for (int k = i; k < s_n - 1; k++) s_fav[k] = s_fav[k + 1];
         s_n--;
-        fav_save();
-        s_fcol_dirty = true;
-        ok = 1;
+        if (!fav_save()) { ESP_LOGE("FAV", "保存失败, 本次改动未落盘"); }
+        else { s_fcol_dirty = true; ok = 1; }
     }
     char out[32]; snprintf(out, sizeof(out), "{\"ok\":%s}", ok ? "true" : "false");
     return fav_web_send_json(req, out);
@@ -925,7 +1491,7 @@ static esp_err_t fav_web_cat_handler(httpd_req_t *req)
     if (strcmp(op, "add") == 0) {
         if (s_cat_n < CAT_MAX && n[0]) { fav_u8cpy(s_cats[s_cat_n], CAT_SZ, n); s_cat_n++; cats_save(); rc = 0; }
     } else if (strcmp(op, "del") == 0) {
-        int c = atoi(id);
+        int c = fav_atoi_or(id, -1);
         if (c >= 0 && c < s_cat_n) {
             for (int k = c; k < s_cat_n - 1; k++) memcpy(s_cats[k], s_cats[k + 1], CAT_SZ);
             s_cat_n--;
@@ -933,12 +1499,13 @@ static esp_err_t fav_web_cat_handler(httpd_req_t *req)
                 if (s_fav[i].cat == (uint8_t)c) s_fav[i].cat = 0;
                 else if (s_fav[i].cat > (uint8_t)c) s_fav[i].cat--;
             }
-            cats_save(); fav_save();
+            cats_save();
+            if (!fav_save()) ESP_LOGE("FAV", "分类变更保存失败");
             rc = 0;
         }
     } else if (strcmp(op, "mov") == 0) {
         /* ★ 2026-10-20: 网页里拖动分类排序 —— 数组移动 + 每条记录的 cat 索引跟着重映射 */
-        int a = atoi(id), b = atoi(to);
+        int a = fav_atoi_or(id, -1), b = fav_atoi_or(to, -1);
         if (a >= 0 && a < s_cat_n && b >= 0 && b < s_cat_n && a != b) {
             char tmp[CAT_SZ];
             memcpy(tmp, s_cats[a], CAT_SZ);
@@ -952,12 +1519,13 @@ static esp_err_t fav_web_cat_handler(httpd_req_t *req)
                 else if (a > b && c >= b && c < a) c++;
                 s_fav[i].cat = (uint8_t)c;
             }
-            cats_save(); fav_save();
+            cats_save();
+            if (!fav_save()) ESP_LOGE("FAV", "分类变更保存失败");
             s_fcol_dirty = true;
             rc = 0;
         }
     } else if (strcmp(op, "ren") == 0) {
-        int c = atoi(id);
+        int c = fav_atoi_or(id, -1);
         if (c >= 0 && c < s_cat_n && n[0]) { fav_u8cpy(s_cats[c], CAT_SZ, n); cats_save(); rc = 0; }
     }
     char out[32]; snprintf(out, sizeof(out), "{\"ok\":%s}", rc == 0 ? "true" : "false");
@@ -999,7 +1567,7 @@ static esp_err_t fav_web_edit_handler(httpd_req_t *req)
     fav_qdec(q, "w", w, sizeof(w));
     fav_qdec(q, "u", u, sizeof(u));
     fav_qdec(q, "p", p, sizeof(p));
-    int i = atoi(id);
+    int i = fav_atoi_or(id, -1);
     bool ok = (i >= 0 && i < s_n);
     if (ok) {
         if (n[0]) fav_u8cpy(s_fav[i].name, sizeof(s_fav[i].name), n);
@@ -1111,7 +1679,7 @@ static esp_err_t fav_web_iconhex_handler(httpd_req_t *req)
     char q[64], id[8] = {0};
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK)
         httpd_query_key_value(q, "id", id, sizeof(id));
-    int i = atoi(id);
+    int i = fav_atoi_or(id, -1);
     uint8_t bmp[FAV_ICON_BYTES];
     if (i < 0 || i >= s_n || !fav_icon_get(i, bmp)) return fav_web_send_json(req, "{\"ok\":false}");
     char hex[FAV_ICON_BYTES * 2 + 1], out[FAV_ICON_BYTES * 2 + 40];
@@ -1203,12 +1771,11 @@ static esp_err_t fav_web_move_handler(httpd_req_t *req)
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) return fav_web_send_json(req, "{\"ok\":false}");
     httpd_query_key_value(q, "id", id, sizeof(id));
     httpd_query_key_value(q, "cat", cat, sizeof(cat));
-    int i = atoi(id), c = atoi(cat), ok = 0;
+    int i = fav_atoi_or(id, -1), c = fav_atoi_or(cat, 0), ok = 0;
     if (i >= 0 && i < s_n && c >= 0 && c < s_cat_n) {
         s_fav[i].cat = (uint8_t)c;
-        fav_save();
-        s_fcol_dirty = true;
-        ok = 1;
+        if (!fav_save()) { ESP_LOGE("FAV", "保存失败, 本次改动未落盘"); }
+        else { s_fcol_dirty = true; ok = 1; }
     }
     return fav_web_send_json(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
@@ -1217,14 +1784,22 @@ static esp_err_t fav_web_move_handler(httpd_req_t *req)
 static esp_err_t fav_web_cred_handler(httpd_req_t *req)
 {
     if (!fav_web_authed(req)) return fav_web_deny(req);
-    char q[512], op[8]={0}, id[8]={0}, c[8]={0}, u[48]={0}, p[48]={0};
+    char q[512], op[8]={0}, u[48]={0}, p[48]={0};
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) return fav_web_send_json(req, "{\"ok\":false}");
     httpd_query_key_value(q, "op", op, sizeof(op));
-    httpd_query_key_value(q, "id", id, sizeof(id));
-    httpd_query_key_value(q, "c",  c,  sizeof(c));
-    fav_qdec(q, "u", u, sizeof(u));
-    fav_qdec(q, "p", p, sizeof(p));
-    int i = atoi(id), ci = atoi(c);
+    int i = -1, ci = -1;
+    fav_qint(q, "id", &i);
+    fav_qint(q, "c",  &ci);
+    /* ★ R4: 账号/密码**只**从 POST body 取（body 形如 u=..&p=..，URL 编码）。
+     *   以前把密码拼在 query 里 ⇒ 明文密码进浏览器历史/代理日志。 */
+    char body[320];
+    int bl = fav_read_body(req, body, sizeof(body));
+    if (bl > 0) {
+        fav_qdec(body, "u", u, sizeof(u));
+        fav_qdec(body, "p", p, sizeof(p));
+    }
+    if ((!strcmp(op, "add") || !strcmp(op, "upd")) && bl <= 0)
+        return fav_web_send_json(req, "{\"ok\":false,\"err\":\"body\"}");
     int rc = -1;
     if (i >= 0 && i < s_n) {
         fav_t *f = &s_fav[i];
@@ -1247,7 +1822,7 @@ static esp_err_t fav_web_cred_handler(httpd_req_t *req)
                 f->nc--; rc = 0;
             }
         }
-        if (rc == 0) { fav_save(); s_fcol_dirty = true; }
+        if (rc == 0) { if (fav_save()) s_fcol_dirty = true; else { ESP_LOGE("FAV", "账号保存失败"); rc = -1; } }
     }
     char out[32]; snprintf(out, sizeof(out), "{\"ok\":%s}", rc == 0 ? "true" : "false");
     return fav_web_send_json(req, out);
@@ -1262,7 +1837,7 @@ static esp_err_t fav_web_icon_handler(httpd_req_t *req)
         httpd_query_key_value(q, "id", id, sizeof(id));
         httpd_query_key_value(q, "del", del, sizeof(del));
     }
-    int i = atoi(id);
+    int i = fav_atoi_or(id, -1);
     if (i < 0 || i >= s_n) return fav_web_send_json(req, "{\"ok\":false}");
     if (del[0] == '1') { fav_icon_del(i); return fav_web_send_json(req, "{\"ok\":true}"); }
 
@@ -1272,11 +1847,30 @@ static esp_err_t fav_web_icon_handler(httpd_req_t *req)
     uint8_t bmp[FAV_ICON_BYTES];
     int n = b64_decode(body, bmp, sizeof(bmp));
     if (n != FAV_ICON_BYTES) return fav_web_send_json(req, "{\"ok\":false,\"err\":\"len\"}");
-    fav_icon_set(i, bmp);
+    if (!fav_icon_set(i, bmp)) return fav_web_send_json(req, "{\"ok\":false,\"err\":\"sd\"}");
     return fav_web_send_json(req, "{\"ok\":true}");
 }
 
 /* 通配分发: 只注册 首页 + api 通配 两个 handler (摆脱 max_uri_handlers 限制) */
+/* ★ C11 (2026-10-30): 单条密码按需读取（必须已登录）。
+ *   /api/credget?i=<item>&c=<cred>  → {"ok":true,"p":"..."}
+ *   前端只有在用户点"显示/编辑"时才调它，列表接口永远不批量下发密码。 */
+static esp_err_t fav_web_credget_handler(httpd_req_t *req) {
+    if (!fav_web_authed(req)) return fav_web_deny(req);
+    char q[96];
+    int i = -1, c = -1;
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        fav_qint(q, "i", &i);
+        fav_qint(q, "c", &c);
+    }
+    if (i < 0 || i >= s_n || c < 0 || c >= CR_MAX || c >= (int)s_fav[i].nc)
+        return fav_web_send_json(req, "{\"ok\":false}");
+    char eb[160], out[224];
+    fav_json_esc(eb, sizeof(eb), s_fav[i].cr[c].pass);
+    snprintf(out, sizeof(out), "{\"ok\":true,\"p\":\"%s\"}", eb);
+    return fav_web_send_json(req, out);
+}
+
 static esp_err_t fav_web_api_dispatch(httpd_req_t *req)
 {
     /* ★ 通配匹配时 req->uri 可能带查询串(?pin=...), 必须先截断再比较 */
@@ -1292,6 +1886,7 @@ static esp_err_t fav_web_api_dispatch(httpd_req_t *req)
     if (!strcmp(u, "/api/cat"))   return fav_web_cat_handler(req);
     if (!strcmp(u, "/api/edit"))  return fav_web_edit_handler(req);
     if (!strcmp(u, "/api/cred"))  return fav_web_cred_handler(req);
+    if (!strcmp(u, "/api/credget")) return fav_web_credget_handler(req);
     if (!strcmp(u, "/api/move"))  return fav_web_move_handler(req);
     if (!strcmp(u, "/api/meta"))  return fav_web_meta_handler(req);
     if (!strcmp(u, "/api/iconraw")) return fav_web_iconraw_handler(req);
@@ -1410,7 +2005,14 @@ static void fav_web_start_ap(ui_ctx_t *ctx)
     if (s_web_on || s_web_phase == 1) return;
     s_web_mode = 0;                      /* 热点配置 = AP 模式 */
     s_web_phase = 1;
-    xTaskCreate(fav_web_task, "favweb", 8192, NULL, 5, NULL);
+    /* ★ 2026-10-28: 补返回值检查。建任务失败必须回滚 s_web_phase,
+     *   否则它会永远停在 1 —— 该状态在 fav_web_start_* 里是"已在启动中"的判据,
+     *   于是这个功能再也起不来(本文件 1549 行已踩过同类坑: phase==1 永久卡死)。 */
+    if (xTaskCreate(fav_web_task, "favweb", 8192, NULL, 5, NULL) != pdPASS) {
+        s_web_phase = 0;
+        ESP_LOGE("FAV", "favweb 任务创建失败(AP 模式) ⇒ 收藏夹热点未启动");
+        return;
+    }
     os_housekeeper_add(&fav_web_house_stop);   /* 回主菜单/软件管家时自动关停 */
 }
 void fav_web_debug_start(void);   /* remcon 调试入口: 只起服务, 不开放 */
@@ -1538,7 +2140,11 @@ void fav_web_debug_start(void)
     fav_load();                       /* ★ 调试入口: 先把数据装进内存, 否则列表为空没法测编辑 */
     s_web_mode = 1; s_web_phase = 1;
     ESP_LOGI("FAV", "debug: 启动 LAN 任务");
-    xTaskCreate(fav_web_task_lan, "favweb", 8192, NULL, 5, NULL);
+    /* ★ 2026-10-28: 同上, 失败回滚 phase, 避免"已在启动中"永久卡死。 */
+    if (xTaskCreate(fav_web_task_lan, "favweb", 8192, NULL, 5, NULL) != pdPASS) {
+        s_web_phase = 0;
+        ESP_LOGE("FAV", "favweb 任务创建失败(debug/LAN) ⇒ 收藏夹服务未启动");
+    }
 }
 static void fav_web_start_lan_ex(ui_ctx_t *ctx, bool toast);
 static void fav_web_start_lan(ui_ctx_t *ctx) { fav_web_start_lan_ex(ctx, true); }
@@ -1552,7 +2158,16 @@ static void fav_web_start_lan_ex(ui_ctx_t *ctx, bool toast)
     s_lan_pending = false;
     s_lan_toast_pending = toast;     /* ★ 预启动静默, 不弹提示 */
     s_web_phase = 1;
-    xTaskCreate(fav_web_task_lan, "favweb", 8192, NULL, 5, NULL);
+    /* ★ 2026-10-28: 补返回值检查 + 完整回滚。
+     *   失败时不但要清 phase(否则"已在启动中"永久卡死), 还要清 s_lan_toast_pending
+     *   —— 那个标志由任务内部消费, 任务没起来就永远 pending。并且**提前 return**,
+     *   不执行下面的 esp_wifi_set_ps(WIFI_PS_NONE): 服务没起就没必要把省电关掉。 */
+    if (xTaskCreate(fav_web_task_lan, "favweb", 8192, NULL, 5, NULL) != pdPASS) {
+        s_web_phase = 0;
+        s_lan_toast_pending = false;
+        ESP_LOGE("FAV", "favweb 任务创建失败(LAN) ⇒ 收藏夹服务未启动");
+        return;
+    }
     /* ★ 2026-10-19: 网页服务期间关掉 WiFi 省电(PS) —— 否则每个请求要多等 ~100-300ms 唤起,
      *   页面点击明显发滞。服务停止时恢复默认省电。 */
     esp_wifi_set_ps(WIFI_PS_NONE);
@@ -1579,6 +2194,9 @@ static void fav_web_stop(ui_ctx_t *ctx)
     s_web_on = false;
     s_web_phase = 0;
     s_web_allow = false;
+    /* ★ C11: 服务停下即销毁会话，重新开放后旧 token 一律失效 */
+    s_web_tok[0] = 0;
+    s_web_tok_us = 0;
     s_web_open_req = false;
     s_lan_pending = false;
     s_lan_toast_pending = false;
@@ -1587,32 +2205,99 @@ static void fav_web_stop(ui_ctx_t *ctx)
 }
 
 /* ================= HID ================= */
-static void send_char(char c){
-    uint8_t mod=0,code=0;
-    if(c>='a'&&c<='z'){ code=(uint8_t)(0x04+(c-'a')); }
-    else if(c>='A'&&c<='Z'){ code=(uint8_t)(0x04+(c-'A')); mod=FAV_LSHIFT; }
-    else if(c>='0'&&c<='9'){ code=(uint8_t)(30 + (c-'0')); }   /* HID 0x1E */
-    else switch(c){
-        case '.':code=0x37;break; case ',':code=0x36;break; case '/':code=0x38;break;
-        case '-':code=0x2d;break; case ' ':code=0x2c;break;
-        case '_':mod=FAV_LSHIFT;code=0x2d;break; case '@':mod=FAV_LSHIFT;code=0x1f;break;
-        case ':':mod=FAV_LSHIFT;code=0x33;break; case '+':mod=FAV_LSHIFT;code=0x2e;break;
-        default:return;
+/* ★★★ C4 (2026-10-30): 完整的 US 布局 ASCII → HID Usage 映射。
+ *
+ * 同时修掉一个**比"缺字符"更严重的老 bug**：
+ *   原实现 `c>='0'&&c<='9'` 用 `30 + (c-'0')`，而 HID 里 '1' 才是 0x1E。
+ *   ⇒ '0' 打成 '1'、'1' 打成 '2' … '9' 打成 '0'，**所有数字整体错一位**。
+ *   密码里只要含数字就必然输错，且用户完全看不出来。
+ *
+ * 布局假设：**US 布局**（物理键位 → 字符的对应关系固定，主机侧若为 UK/DE/FR
+ *   等布局，Shift 组合会打出别的字符）。这一点在界面上会提示用户。
+ *
+ * 返回 false = 该字符无法用键盘发送（调用方必须**先整串检查**，不能打到一半才发现）。 */
+static bool hid_char_map(char c, uint8_t *mod, uint8_t *code) {
+    uint8_t m = 0, k = 0;
+    if (c >= 'a' && c <= 'z')      { k = (uint8_t)(0x04 + (c - 'a')); }
+    else if (c >= 'A' && c <= 'Z') { k = (uint8_t)(0x04 + (c - 'A')); m = FAV_LSHIFT; }
+    else if (c >= '1' && c <= '9') { k = (uint8_t)(0x1E + (c - '1')); }   /* 0x1E..0x26 */
+    else if (c == '0')             { k = 0x27; }                          /* 0x27 = '0' */
+    else switch (c) {
+        case ' ':  k = 0x2C; break;
+        case '\t': k = 0x2B; break;
+        case '\n': k = 0x28; break;
+        case '.':  k = 0x37; break;
+        case ',':  k = 0x36; break;
+        case '/':  k = 0x38; break;
+        case '-':  k = 0x2D; break;
+        case '=':  k = 0x2E; break;
+        case ';':  k = 0x33; break;
+        case '\'': k = 0x34; break;
+        case '[':  k = 0x2F; break;
+        case ']':  k = 0x30; break;
+        case '\\': k = 0x31; break;
+        case '`':  k = 0x35; break;
+        /* ---- 以下为 Shift 组合（US 布局）---- */
+        case '_':  k = 0x2D; m = FAV_LSHIFT; break;
+        case '+':  k = 0x2E; m = FAV_LSHIFT; break;
+        case '{':  k = 0x2F; m = FAV_LSHIFT; break;
+        case '}':  k = 0x30; m = FAV_LSHIFT; break;
+        case '|':  k = 0x31; m = FAV_LSHIFT; break;
+        case ':':  k = 0x33; m = FAV_LSHIFT; break;
+        case '"':  k = 0x34; m = FAV_LSHIFT; break;
+        case '<':  k = 0x36; m = FAV_LSHIFT; break;
+        case '>':  k = 0x37; m = FAV_LSHIFT; break;
+        case '?':  k = 0x38; m = FAV_LSHIFT; break;
+        case '!':  k = 0x1E; m = FAV_LSHIFT; break;
+        case '@':  k = 0x1F; m = FAV_LSHIFT; break;
+        case '#':  k = 0x20; m = FAV_LSHIFT; break;
+        case '$':  k = 0x21; m = FAV_LSHIFT; break;
+        case '%':  k = 0x22; m = FAV_LSHIFT; break;
+        case '^':  k = 0x23; m = FAV_LSHIFT; break;
+        case '&':  k = 0x24; m = FAV_LSHIFT; break;
+        case '*':  k = 0x25; m = FAV_LSHIFT; break;
+        case '(':  k = 0x26; m = FAV_LSHIFT; break;
+        case ')':  k = 0x27; m = FAV_LSHIFT; break;
+        case '~':  k = 0x35; m = FAV_LSHIFT; break;
+        default: return false;
     }
-    os_hid_key_tap(mod,code); vTaskDelay(3);
+    *mod = m; *code = k;
+    return true;
+}
+/* 整串可输入性检查：有一个字符发不出去就返回 false（绝不"打到一半才发现"） */
+static bool hid_can_type(const char *s) {
+    if (!s) return false;
+    for (const char *p = s; *p; p++) { uint8_t m, k; if (!hid_char_map(*p, &m, &k)) return false; }
+    return true;
+}
+static void send_char(char c){
+    uint8_t mod = 0, code = 0;
+    if (!hid_char_map(c, &mod, &code)) return;    /* 调用方已整串检查过, 这里只是兜底 */
+    os_hid_key_tap(mod, code); vTaskDelay(3);
 }
 static void type_text(const char*s){ for(;s&&*s;s++){ send_char(*s); vTaskDelay(2);} }
-/* ★ 2026-10-20: 只输入不回车 —— 账号后打一个 Tab 跳到密码框, 密码打完停手,
- *   由用户自己按回车提交 (以前自动回车会直接把表单提交掉). */
+/* ★ 2026-10-20 / 修正 2026-10-30: **只输入文本, 不发送 Tab、不发送 Enter**。
+ *   旧注释写的"账号后打一个 Tab 跳密码框"从来没有实现过, 已删除, 以免误导。
+ *   用户点"推账号"→ 自己 Tab 到密码框 → 再点"推密码"。 */
 /* which: 0=只推账号 1=只推密码 */
 static void do_input_part(ui_ctx_t*ctx,int gi,int ci,int pass){
     if(gi<0||gi>=s_n||ci<0||ci>=s_fav[gi].nc) return;
+    const char *txt = pass ? s_fav[gi].cr[ci].pass : s_fav[gi].cr[ci].user;
+    if (!hid_can_type(txt)) {                    /* ★ C4: 先整串检查, 不静默丢掉字符 */
+        os_dialog_toast(ctx, "\xE5\x90\xAB\xE6\x97\xA0\xE6\xB3\x95\xE8\xBE\x93\xE5\x85\xA5\xE7\x9A\x84\xE5\xAD\x97\xE7\xAC\xA6\x28\xE4\xBB\x85\xE6\x94\xAF\xE6\x8C\x81\x41\x53\x43\x49\x49\x29");              /* 含无法输入的字符 */
+        return;
+    }
     if(!fav_hid_ensure()){ os_dialog_toast(ctx, "USB \xe9\x94\xae\xe9\xbc\xa0\xe6\x9c\xaa\xe5\xb0\xb1\xe7\xbb\xaa"); return; }
-    type_text(pass ? s_fav[gi].cr[ci].pass : s_fav[gi].cr[ci].user);
+    if (!s_us_hint_shown) { s_us_hint_shown = true; os_dialog_toast(ctx, "\xE9\x94\xAE\xE7\x9B\x98\xE6\x8C\x89\x55\x53\xE5\xB8\x83\xE5\xB1\x80\xE8\xBE\x93\xE5\x85\xA5"); }
+    type_text(txt);
 }
 /* 推送网址 (不回车) */
 static void do_input_url(ui_ctx_t*ctx,int gi){
     if(gi<0||gi>=s_n) return;
+    if (!hid_can_type(s_fav[gi].url)) {
+        os_dialog_toast(ctx, "\xE5\x90\xAB\xE6\x97\xA0\xE6\xB3\x95\xE8\xBE\x93\xE5\x85\xA5\xE7\x9A\x84\xE5\xAD\x97\xE7\xAC\xA6\x28\xE4\xBB\x85\xE6\x94\xAF\xE6\x8C\x81\x41\x53\x43\x49\x49\x29");
+        return;
+    }
     if(!fav_hid_ensure()){ os_dialog_toast(ctx, "USB \xe9\x94\xae\xe9\xbc\xa0\xe6\x9c\xaa\xe5\xb0\xb1\xe7\xbb\xaa"); return; }
     type_text(s_fav[gi].url);
 }
@@ -2033,7 +2718,91 @@ static void icon_picker_render(st7305_handle_t*l){
     }
 }
 
+/* ==================== C1: 备份口令输入模态 ====================
+ * 复用系统 52 键虚拟键盘（kbd_std）。口令与设备 PIN 完全独立，只在本会话内存里，
+ * 进页面/退出都会清零，绝不落盘。 */
+static int   s_pw_mode = 0;        /* 0=关 1=导出 2=导入 */
+static char  s_pw_tmp[33];
+static int   s_pw_len = 0;
+static char  s_pw_pend[96];        /* 导入时要处理的文件 */
+static int   s_pw_press = -1;
+
+static void pw_open(int mode, const char *pend) {
+    s_pw_mode = mode; s_pw_len = 0; s_pw_tmp[0] = 0; s_pw_press = -1;
+    if (pend) snprintf(s_pw_pend, sizeof(s_pw_pend), "%s", pend);
+    else      s_pw_pend[0] = 0;
+}
+
+static void pw_render(st7305_handle_t *l) {
+    st7305_clear(l, ST7305_COLOR_WHITE);
+    int base = S_H - KBD_H;
+    draw_text(l, 8, 6,  (s_pw_mode == 1) ? "\xE8\xAE\xBE\xE7\xBD\xAE\xE5\xA4\x87\xE4\xBB\xBD\xE5\x8F\xA3\xE4\xBB\xA4\x28\xE5\xAF\xBC\xE5\x87\xBA\x29" : "\xE8\xBE\x93\xE5\x85\xA5\xE5\xA4\x87\xE4\xBB\xBD\xE5\x8F\xA3\xE4\xBB\xA4\x28\xE5\xAF\xBC\xE5\x85\xA5\x29", false);
+    char mask[40];
+    int n = s_pw_len > 32 ? 32 : s_pw_len;
+    for (int i = 0; i < n; i++) mask[i] = '*';
+    mask[n] = 0;
+    if (n == 0) snprintf(mask, sizeof(mask), "%s", "\xE8\x87\xB3\xE5\xB0\x91\x34\xE4\xBD\x8D\xEF\xBC\x8C\xE4\xB8\x8E\xE8\xAE\xBE\xE5\xA4\x87\x50\x49\x4E\xE6\x97\xA0\xE5\x85\xB3");
+    draw_text(l, 8, 40, mask, false);
+    draw_text(l, 8, 72, "\xE5\x9B\x9E\xE8\xBD\xA6\xE7\xA1\xAE\xE8\xAE\xA4\x20\x2F\x20\x45\x53\x43\xE5\x8F\x96\xE6\xB6\x88", false);
+    kbd_draw(l, base, &kbd_std, s_pw_press);
+}
+
+static bool pw_touch(ui_ctx_t *ctx, int x, int y) {
+    int base = S_H - KBD_H;
+    int idx = kbd_hit(&kbd_std, base, x, y);
+    if (idx < 0) return true;
+    s_pw_press = idx;
+    int act = kbd_press(&kbd_std, idx);
+    if (act == KBD_ACT_CHAR) {
+        char c = kbd_char(&kbd_std, idx);
+        if (c && s_pw_len < 32) { s_pw_tmp[s_pw_len++] = c; s_pw_tmp[s_pw_len] = 0; }
+    } else if (act == KBD_ACT_BKSP) {
+        if (s_pw_len > 0) s_pw_tmp[--s_pw_len] = 0;
+    } else if (act == KBD_ACT_ESC) {
+        s_pw_mode = 0; s_pw_len = 0; s_pw_tmp[0] = 0;
+        redraw(ctx); return true;
+    } else if (act == KBD_ACT_ENTER) {
+        if (s_pw_len < 4) { os_dialog_toast(ctx, "\xE5\x8F\xA3\xE4\xBB\xA4\xE8\x87\xB3\xE5\xB0\x91\x34\xE4\xBD\x8D"); redraw(ctx); return true; }
+        snprintf(s_bk_pw, sizeof(s_bk_pw), "%s", s_pw_tmp);
+        int mode = s_pw_mode;
+        s_pw_mode = 0; s_pw_len = 0; s_pw_tmp[0] = 0;
+        if (mode == 1) {
+            char path[96];
+            if (!fav_bak_new_path(path, sizeof(path))) {
+                os_dialog_toast(ctx, "\xE5\xA4\x87\xE4\xBB\xBD\xE7\x9B\xAE\xE5\xBD\x95\xE4\xB8\x8D\xE5\x8F\xAF\xE8\xAF\xBB");
+                redraw(ctx); return true;
+            }
+            int r = fav_export_file(path);
+            if (r == 0) {
+                const char *nm = strrchr(path, '/');
+                char msg[160];
+                snprintf(msg, sizeof(msg), "%s %s", "\xE5\xB7\xB2\xE5\x8A\xA0\xE5\xAF\x86\xE5\xA4\x87\xE4\xBB\xBD\xE5\x88\xB0", nm ? nm + 1 : path);
+                os_dialog_toast(ctx, msg);
+            } else {
+                os_dialog_toast(ctx, "\xE5\xAF\xBC\xE5\x87\xBA\xE5\xA4\xB1\xE8\xB4\xA5");
+            }
+        } else if (mode == 2) {
+            int r = fav_import_file(s_pw_pend);
+            fav_load();
+            fav_load_enc();          /* ★ R4 P0-1: 必须立刻把密码也载回来, 否则下一次保存就是空密码覆盖 */
+            if (s_enc_mismatch) os_dialog_toast(ctx, "\xE5\xAF\x86\xE7\xA0\x81\xE6\xAE\xB5\xE5\xBC\x82\xE5\xB8\xB8\x2C\xE5\xB7\xB2\xE6\x81\xA2\xE5\xA4\x8D\xE6\x9D\xA1\xE7\x9B\xAE\xE4\xBD\x86\xE5\xAF\x86\xE7\xA0\x81\xE9\x9C\x80\xE9\x87\x8D\xE6\x96\xB0\xE5\xAF\xBC\xE5\x85\xA5");
+            s_cat = 0; s_scroll = 0; s_open = -1; s_drawer = -1;
+            s_fcol_dirty = true; s_need_clear = true;
+            if (r == 0)                   os_dialog_toast(ctx, "\xE5\xB7\xB2\xE6\x81\xA2\xE5\xA4\x8D\x28\xE5\x8A\xA0\xE5\xAF\x86\xE5\xA4\x87\xE4\xBB\xBD\x29");
+            else if (r == -2 || r == -5)  os_dialog_toast(ctx, "\xE5\x8F\xA3\xE4\xBB\xA4\xE9\x94\x99\xE8\xAF\xAF\xE6\x88\x96\xE6\x96\x87\xE4\xBB\xB6\xE6\x8D\x9F\xE5\x9D\x8F");
+            else if (r == -7)             os_dialog_toast(ctx, "\xE4\xBF\x9D\xE5\xAD\x98\xE5\xA4\xB1\xE8\xB4\xA5\x28NVS\xE7\xA9\xBA\xE9\x97\xB4\x3F\x29");
+            else if (r == -6)             os_dialog_toast(ctx, "\xE5\xB7\xB2\xE6\x81\xA2\xE5\xA4\x8D\x28\xE9\x83\xA8\xE5\x88\x86\xE5\x9B\xBE\xE6\xA0\x87\xE6\x9C\xAA\xE5\x86\x99\xE5\x85\xA5\x29");
+            else                          os_dialog_toast(ctx, "\xE5\xAF\xBC\xE5\x85\xA5\xE5\xA4\xB1\xE8\xB4\xA5");
+        }
+        redraw(ctx);
+        return true;
+    }
+    redraw(ctx);
+    return true;
+}
+
 static void render(ui_ctx_t*ctx){ st7305_handle_t*l=ctx->lcd; if(!l)return;
+    if (s_pw_mode) { pw_render(l); return; }
     s_dbg_lcd = l;
     if(!s_authed){
         if(s_drawer>=0){ drawer_render(l); if(s_show_cats) icon_picker_render(l); }
@@ -2105,6 +2874,8 @@ static void fav_pick_import_cb(ui_ctx_t *ctx, int result, void *ud)
     if (result < 0 || result >= FAV_BAK_MAX || !s_bak_path[result][0]) return;
     int r = fav_import_file(s_bak_path[result]);
     fav_load();
+    fav_load_enc();              /* ★ R4 P0-1: 同上 */
+    if (s_enc_mismatch) os_dialog_toast(ctx, "\xE5\xAF\x86\xE7\xA0\x81\xE6\xAE\xB5\xE5\xBC\x82\xE5\xB8\xB8\x2C\xE5\xB7\xB2\xE6\x81\xA2\xE5\xA4\x8D\xE6\x9D\xA1\xE7\x9B\xAE\xE4\xBD\x86\xE5\xAF\x86\xE7\xA0\x81\xE9\x9C\x80\xE9\x87\x8D\xE6\x96\xB0\xE5\xAF\xBC\xE5\x85\xA5");
     s_cat = 0; s_scroll = 0; s_open = -1; s_drawer = -1;
     s_fcol_dirty = true; s_need_clear = true;
     if (r == 0)        os_dialog_toast(ctx, "已恢复备份");
@@ -2168,20 +2939,9 @@ static void fav_setting_run(ui_ctx_t*ctx,int idx){
     case 2:   /* 修改PIN: 统一在密钥管理器里改 */
         os_dialog_toast(ctx, "\xe8\xaf\xb7\xe5\x9c\xa8\xe5\xaf\x86\xe9\x92\xa5\xe7\xae\xa1\xe7\x90\x86\xe5\x99\xa8\xe9\x87\x8c\xe4\xbf\xae\xe6\x94\xb9 PIN");
         break;
-    case 0: { /* 导出备份: 放进 /sdcard/backup/, 文件名自动编号 fav_NN.bak */
-        char path[64];
-        fav_bak_new_path(path, sizeof(path));
-        int r = fav_export_file(path);
-        if (r == 0) {
-            const char *nm = strrchr(path, '/');
-            char msg[96];   /* "已备份到 " + 最长 64 字节路径 ⇒ 96 够, 不再截断 */
-            snprintf(msg, sizeof(msg), "\xe5\xb7\xb2\xe5\xa4\x87\xe4\xbb\xbd\xe5\x88\xb0 %s", nm ? nm + 1 : path); /* 已备份到 xxx */
-            os_dialog_toast(ctx, msg);
-        } else {
-            os_dialog_toast(ctx, "\xe5\xaf\xbc\xe5\x87\xba\xe5\xa4\xb1\xe8\xb4\xa5");  /* 导出失败 */
-        }
+    case 0:   /* ★ C1: 导出前先设**独立备份口令**（不复用设备 PIN） */
+        pw_open(1, NULL);
         break;
-    }
     case 1: { /* 导入备份: 列出 /sdcard/backup/ 里的备份让用户选 */
         if (s_fav_import_dlg) break;
         int n = fav_bak_scan();
@@ -2345,7 +3105,7 @@ static void ed_save_back_cb(ui_ctx_t *ctx, int result, void *ud){
     s_drawer=-1; s_ed_scroll=0; s_url_scroll=0;
     s_ed_snap_ok=false; s_ed_track=-1;
     s_fcol_dirty=true; s_need_clear=true;
-    fav_save(); redraw(ctx);
+    fav_save_ui(ctx); redraw(ctx);
 }
 
 /* ---- 「不保存返回」: 用进入时的快照还原, 不落盘 ---- */
@@ -2371,6 +3131,16 @@ static void ed_del_site_cb(ui_ctx_t *ctx, int result, void *ud){
     (void)ud;
     if(result != 0) return;
     if(s_drawer < 0 || s_drawer >= s_n) return;
+    /* ★ C2 (2026-10-30): 删条目必须同步图标 —— 原来只移数据不移图标,
+     *   被删位置之后的条目图标集体错位一格（Web 端删除早已这么做了, 这里补齐）。 */
+    {
+        uint8_t tbmp[FAV_ICON_BYTES];
+        for (int i = s_drawer; i < s_n - 1; i++) {
+            if (fav_icon_get(i + 1, tbmp)) { if (!fav_icon_set(i, tbmp)) ESP_LOGW("FAV","图标搬移失败 %d", i); }
+            else                           fav_icon_del(i);
+        }
+        fav_icon_del(s_n - 1);      /* 最后一个槽清掉 */
+    }
     for(int i=s_drawer;i<s_n-1;i++) s_fav[i]=s_fav[i+1];
     memset(&s_fav[s_n-1],0,sizeof(fav_t));
     s_n--;
@@ -2379,7 +3149,7 @@ static void ed_del_site_cb(ui_ctx_t *ctx, int result, void *ud){
     int m = fav_max();
     if(s_sel >= m) s_sel = m > 0 ? m-1 : 0;
     s_fcol_dirty=true; s_need_clear=true;
-    fav_save(); redraw(ctx);
+    fav_save_ui(ctx); redraw(ctx);
 }
 
 static void ed_activate(int field){
@@ -2466,14 +3236,16 @@ static void icon_touch(ui_ctx_t*ctx,int x,int y){
     int idx = col*2 + row;
     if(col < 0 || col >= cols || idx < 0 || idx >= MAIN_ICON_COUNT) return;
     s_fav[s_drawer].icon = (uint8_t)idx;
-    fav_save();
+    fav_save_ui(ctx);
     s_show_cats = false;
     redraw(ctx);
 }
 
 static bool fav_touch(ui_ctx_t*ctx,int x,int y){
+    if (s_pw_mode) return pw_touch(ctx, x, y);
     if(!s_authed){
-        applock_touch(ctx,x,y); if(!applock_active()){ s_authed=true; fav_load_enc(); }
+        applock_touch(ctx,x,y); if(!applock_active()){ s_authed=true; fav_load_enc();
+            if (s_enc_mismatch) os_dialog_toast(ctx, "\xE5\xAF\x86\xE7\xA0\x81\xE6\xAE\xB5\xE4\xB8\x8E\xE6\x9D\xA1\xE7\x9B\xAE\xE4\xB8\x8D\xE5\x90\x8C\xE6\xAD\xA5\x2C\xE8\xAF\xB7\xE9\x87\x8D\xE6\x96\xB0\xE5\xAF\xBC\xE5\x85\xA5\xE5\xA4\x87\xE4\xBB\xBD"); }
         redraw(ctx); return true;
     }
     if(s_drawer>=0){ if(s_show_cats) icon_touch(ctx,x,y); else drawer_touch(ctx,x,y); return true; }
@@ -2482,10 +3254,17 @@ static bool fav_touch(ui_ctx_t*ctx,int x,int y){
 
 /* ===== 按键 ===== */
 static void fav_action(ui_ctx_t*ctx,os_action_t a){
+    if (s_pw_mode) {                       /* ★ C1: 口令模态独占按键 */
+        if (a == OS_ACTION_BACK || a == OS_ACTION_HOME) {
+            s_pw_mode = 0; s_pw_len = 0; s_pw_tmp[0] = 0; redraw(ctx);
+        }
+        return;
+    }
     if(!s_authed){
         /* ★ 通用应用锁: PIN 弹窗交给 applock 模块 (BACK=取消回上一级) */
         applock_action(ctx,a);
-        if(!applock_active()){ s_authed=true; fav_load_enc(); }
+        if(!applock_active()){ s_authed=true; fav_load_enc();
+            if (s_enc_mismatch) os_dialog_toast(ctx, "\xE5\xAF\x86\xE7\xA0\x81\xE6\xAE\xB5\xE4\xB8\x8E\xE6\x9D\xA1\xE7\x9B\xAE\xE4\xB8\x8D\xE5\x90\x8C\xE6\xAD\xA5\x2C\xE8\xAF\xB7\xE9\x87\x8D\xE6\x96\xB0\xE5\xAF\xBC\xE5\x85\xA5\xE5\xA4\x87\xE4\xBB\xBD"); }
         redraw(ctx); return;
     }
     if(s_drawer>=0){
@@ -2519,6 +3298,7 @@ static void fav_action(ui_ctx_t*ctx,os_action_t a){
 
 /* ===== poll 拖动 ===== */
 static void fav_poll(ui_ctx_t*ctx){
+    if (s_pw_mode) return;                 /* ★ C1: 口令模态不跑列表拖动 */
     if(s_dbg_redraw){ s_dbg_redraw = false; ctx->needs_redraw = true; }
 
     /* ★★★ 2026-10-24 统一滚动: 右栏列表由 ui_scroll 推进（惯性×0.86 + 回弹 + 行吸附）。
@@ -2731,7 +3511,8 @@ static void fav_poll(ui_ctx_t*ctx){
 }
 
 /* ===== 进/出 ===== */
-static bool s_hid_auto = false;     /* 本次进页面由我们拉起的 USB 键鼠 (退出时关掉) */
+static bool s_hid_auto = false;
+     /* 本次进页面由我们拉起的 USB 键鼠 (退出时关掉) */
 static volatile bool s_hid_want = false;   /* 当前视图"要不要 HID": 退出/切设置管理时为 false */
 
 static void fav_hid_task(void *arg)
@@ -2763,7 +3544,14 @@ static bool fav_hid_ensure(void)
 {
     s_hid_want = true;
     if (os_hid_is_running()) return true;
-    xTaskCreate(fav_hid_task, "favhid", 4096, NULL, 4, NULL);
+    /* ★ 2026-10-28: 补返回值检查。本函数**本来就返回 bool**, 调用方靠它判断能否推送;
+     *   创建失败就让 s_hid_want 回 false(fav_hid_task 首行也会检查这个标志),
+     *   直接返回 false, 不再白等 1 秒轮询。 */
+    if (xTaskCreate(fav_hid_task, "favhid", 4096, NULL, 4, NULL) != pdPASS) {
+        s_hid_want = false;
+        ESP_LOGE("FAV", "favhid 任务创建失败 ⇒ USB 键鼠推送不可用");
+        return false;
+    }
     for (int i = 0; i < 20 && !os_hid_is_running(); i++) vTaskDelay(pdMS_TO_TICKS(50));
     return os_hid_is_running() && os_hid_connected();
 }
@@ -2781,13 +3569,41 @@ static void fav_hid_sync(void)
     if (!s_hid_want) {
         if (s_hid_auto || os_hid_is_running()) { os_hid_stop(); s_hid_auto = false; }
     } else if (FAV_HID_AUTO_START && !os_hid_is_running()) {
-        xTaskCreate(fav_hid_task, "favhid", 4096, NULL, 4, NULL);
+        /* ★ 2026-10-28: 补返回值检查。本分支当前由 FAV_HID_AUTO_START=0 关闭(死代码),
+         *   但保留正确的失败处理: 失败清 s_hid_want, 让 fav_hid_ensure 下次还能再试。 */
+        if (xTaskCreate(fav_hid_task, "favhid", 4096, NULL, 4, NULL) != pdPASS) {
+            s_hid_want = false;
+            ESP_LOGW("FAV", "favhid 任务创建失败(自动启动分支) ⇒ 本次未起 USB 键鼠");
+        }
     }
 }
 
 static void fav_enter(ui_ctx_t*ctx){
     s_lan_pending = false; s_lan_toast_pending = false; s_fav_import_dlg = false;
+    s_bk_pw[0] = 0;                        /* 每次进页面清空备份口令（不跨会话留存） */
+    s_pw_mode = 0; s_pw_tmp[0] = 0; s_pw_len = 0; s_pw_press = -1;   /* ★ R4: 口令模态状态不跨会话 */
+    {   /* ★ R4: 清理历史遗留的明文临时文件(<备份>.dec.tmp)。
+         *   新版已改成内存解密, 不再产生; 这里只扫旧残留。
+         *   两个目录都扫: 备份目录 + /sdcard 根(老位置 fav.bak 的临时文件在根下)。 */
+        const char *dirs[2] = { FAV_BAK_DIR, "/sdcard" };
+        for (int di = 0; di < 2; di++) {
+            DIR *d = opendir(dirs[di]);
+            if (!d) continue;
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                size_t l = strlen(e->d_name);
+                if (l > 8 && strcmp(e->d_name + l - 8, ".dec.tmp") == 0) {
+                    char p[96]; snprintf(p, sizeof(p), "%s/%s", dirs[di], e->d_name);
+                    if (remove(p) == 0) ESP_LOGW("FAV", "已清理遗留明文临时文件 %s", p);
+                }
+            }
+            closedir(d);
+        }
+    }
+    s_ic_tf = -1; s_ic_mig = -1;      /* ★ R4: 每次进页面重新探测 TF/迁移状态 */
     fav_load(); if(applock_key()) fav_load_enc();   /* 已解锁才解出密码 */
+    fav_icons_migrate();              /* ★ R4: 旧 NVS 图标 → TF（已迁移则直接返回） */
+    if (s_enc_mismatch) os_dialog_toast(ctx, "\xE5\xAF\x86\xE7\xA0\x81\xE6\xAE\xB5\xE4\xB8\x8E\xE6\x9D\xA1\xE7\x9B\xAE\xE4\xB8\x8D\xE5\x90\x8C\xE6\xAD\xA5\x2C\xE8\xAF\xB7\xE9\x87\x8D\xE6\x96\xB0\xE5\xAF\xBC\xE5\x85\xA5\xE5\xA4\x87\xE4\xBB\xBD");
     s_drawer=-1; s_scroll=0; s_sel=0; s_field=0; s_edit_focus=false; s_show_cats=false; s_need_clear = true; s_fcol_dirty = true;
     s_cat=0;
     /* 左栏: 一比一阅读器 os_pane 模板 (内存数据源, 宽 110 容纳 4 字分类) */
@@ -2816,7 +3632,12 @@ static void fav_exit(ui_ctx_t*ctx){
     fav_web_stop(ctx);   /* ★ 退出收藏夹就关闭网页服务 (AP 与 IP 模式都关; 不再按手柄那样留后台) */
     /* ★ 退出一律把 USB 还给串口: 不管是不是我们拉起的, 收藏夹的规则就是"退出即还" */
     if (s_hid_auto || os_hid_is_running()) { os_hid_stop(); s_hid_auto = false; }
-    if(s_n>0)fav_save();
+    if(s_n>0 && !fav_save()) ESP_LOGE("FAV", "退出时保存失败");
+    /* ★ R4: 退出即清口令相关状态(含半截输入), 不留给下次进页面 */
+    s_bk_pw[0] = 0; s_pw_tmp[0] = 0; s_pw_len = 0; s_pw_pend[0] = 0;
+    s_pw_mode = 0; s_pw_press = -1;
+    memset(s_encbuf, 0, sizeof(s_encbuf));
+    s_enc_loaded = false;
 }
 
 static os_module_t s_mod_fav={

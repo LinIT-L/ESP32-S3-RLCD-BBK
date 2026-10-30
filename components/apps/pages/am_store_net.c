@@ -61,6 +61,7 @@
 static volatile int s_state    = ARS_IDLE;
 static volatile int s_permille = -1;     /* 0..1000; -1 = 总长未知 */
 static volatile int s_dl_err   = 0;      /* ARS_DLFAIL 时的原因码, 供日志/文案 */
+static volatile bool s_dl_unknown_len = false;  /* 服务器未给长度 */
 static char s_dl_name[32];               /* 正在下载的包名 */
 static char s_dl_label[48];              /* 正在下载的中文名 */
 
@@ -69,6 +70,10 @@ static char s_mir[AM_MIRROR_MAX][AM_MIRROR_LEN];
 static int  s_mir_n = 0;
 static EXT_RAM_BSS_ATTR am_rpkg_t s_rpkg[AM_RPKG_MAX];
 static int  s_rpkg_n = 0;
+/* ★ 2026-10-30: 索引"这一轮确实换过了"的事件位。
+ *   商店界面是脏帧渲染，索引在后台换成新的以后没人置 dirty ⇒ 用户要切一次分类
+ *   （或退出重进）才看到新上架的资源。页面 poll 里 take 一次即可。 */
+static volatile bool s_idx_updated;
 static volatile bool s_fetched = false;  /* 拉过至少一次 (成功或失败), 防重入 */
 #define RETRY_MS      10000              /* 索引拉取失败后的重试退避 */
 static volatile bool     s_retry_wait;   /* true = 上次失败, 等退避到点 */
@@ -164,11 +169,25 @@ static void am_idx_task(void *arg) {
                  *   ⇒ 下次开机/离线时优先读它 ⇒ 不用联网也能看到"上次联网的列表" ✓
                  *   (以前只有编译进固件的内置索引 ⇒ 云端加了新应用, 离线就永远看不到) */
                 {
-                    FILE *fc = fopen("/store/index.json", "wb");
+                    /* ★★★ 2026-10-30: 改成「先写 .tmp 再替换」。
+                     *   原来 fopen(...,"wb") 直接截断旧缓存再写 —— 写到一半掉电/SPIFFS 满，
+                     *   上一份完整的索引就没了，下次冷启动只能退回固件内置那份（老包）。
+                     *   这里保证：只有新内容**完整写出**才替换，失败时旧缓存分毫不动。 */
+                    FILE *fc = fopen("/store/index.json.tmp", "wb");
                     if (fc) {
                         size_t w = fwrite(s_idx, 1, (size_t)total, fc);
                         fclose(fc);
-                        ESP_LOGI(TAG, "索引已缓存到 /store/index.json (%u B)", (unsigned)w);
+                        if (w == (size_t)total) {
+                            remove("/store/index.json");     /* FATFS/SPIFFS 的 rename 不覆盖 */
+                            if (rename("/store/index.json.tmp", "/store/index.json") == 0)
+                                ESP_LOGI(TAG, "索引已缓存到 /store/index.json (%u B)", (unsigned)w);
+                            else
+                                ESP_LOGW(TAG, "索引缓存替换失败(rename), 保留旧缓存");
+                        } else {
+                            remove("/store/index.json.tmp");
+                            ESP_LOGW(TAG, "索引缓存写入不完整(%u/%d) ⇒ 丢弃, 旧缓存保留",
+                                     (unsigned)w, total);
+                        }
                     } else {
                         ESP_LOGW(TAG, "索引缓存写入失败(SPIFFS 满? 无所谓, 用内置索引)");
                     }
@@ -202,6 +221,7 @@ static void am_idx_task(void *arg) {
                 }
                 ESP_LOGI(TAG, "索引 OK: %d 个包, %d 个镜像源, 跳过 %d 条",
                          s_rpkg_n, s_mir_n, am_store_json_skipped());
+                s_idx_updated = true;      /* 通知 UI: 列表该重建了 */
                 rc = 0;
                 break;
             }
@@ -317,6 +337,7 @@ int am_rstore_dl_permille(void) { return s_permille; }
 const char *am_rstore_dl_name(void) { return s_dl_name; }
 const char *am_rstore_dl_label(void) { return s_dl_label; }
 int am_rstore_dl_err(void) { return s_dl_err; }
+bool am_rstore_dl_unknown_len(void) { return s_dl_unknown_len; }
 
 /* 状态机推进: 由商店页每帧调, 返回 true = 列表该重建了。
  * ★ 必须**边沿触发**: 早先写成"状态是 READY 就返回 true" → 上层每帧重建列表, 白烧 CPU。 */
@@ -371,6 +392,7 @@ static void am_dl_task(void *arg) {
     snprintf(s_dl_label, sizeof(s_dl_label), "%s", pk->label);
     s_permille = -1;
     s_dl_err = 0;
+    s_dl_unknown_len = false;
 
     /* 目标目录: 优先 TF 卡 (不占宝贵的 4MB SPIFFS; 且写卡不受"禁 flash cache"影响),
      * 没插卡才退回 SPIFFS 根 —— 与 am_store.c 的两个扫描源一一对应。 */
@@ -411,6 +433,12 @@ static void am_dl_task(void *arg) {
         r.url = url; r.timeout_ms = 15000;
         r.sink_path = dst;
         r.want_crc = true;                       /* 边收边算 crc32, 收完直接比 */
+        /* ★ 2026-10-30: 把"期望体积/CRC"下推给 net_client —— 让它**先校验再替换**。
+         *   原来是"先替换, 再在调用方比 crc", 一旦 crc 不匹配, 目标位置已被新文件占住,
+         *   只能靠 remove(dst) 补救(把旧版本也删了)。现在校验不通过只删 .part,
+         *   目标文件(可能是可用的旧版本)原样保留。 */
+        r.expect_size = pk->size;
+        r.expect_crc  = pk->crc;
         status = 0;
         if (!netc_start(&r)) { rc = 2; break; }  /* 客户端忙 → 当连接失败 */
         s_permille = 0;
@@ -426,6 +454,16 @@ static void am_dl_task(void *arg) {
             if (pk->size > 0) {
                 int span = is_asset ? 700 : 1000;
                 s_permille = (int)((int64_t)g * span / (int64_t)pk->size);
+            } else {
+                /* ⚠ 2026-10-30 更正: 上一轮注释写"JSON 没有 size/crc"是**错的** ——
+                 *   am_store_json.c:196-204 确实解析了 size(j_num) 和 crc32(strtoul hex)。
+                 *   这里保留 else 分支只是**兜底**: 旧索引/畸形条目缺 size 时不至于卡在 0。
+                 *   真正的"进度不动"根因尚未定位 (怀疑 netc_start 失败或镜像不可达), 见报告。 */
+                s_dl_unknown_len = true;
+                int cap = is_asset ? 690 : 990;
+                int grow = (int)(g / 2048);            /* 每 2KB 涨 1‰, 封顶 */
+                if (grow > cap) grow = cap;
+                if (grow > s_permille) s_permille = grow;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
@@ -433,17 +471,37 @@ static void am_dl_task(void *arg) {
         if (netc_state() == NETC_DONE)             rc = 0;
         else if (status != 0 && status != 200)     rc = 1;    /* HTTP 非 200 */
         else                                       rc = 2;    /* 连接/超时/截断 */
+
+        /* ★ 2026-10-30 下载诊断日志: 一次下载只打 1 行, 明确区分失败阶段。
+         *   排查"点下载没反应/进度不动"时看这一行就够:
+         *     status=0        → 根本没拿到 HTTP 响应 (DNS/TLS/连接失败/超时)
+         *     status=200 但 total=0 → 连上了但没数据
+         *     total>0 但 != size    → 传了一半就断 (截断)
+         *     state!=DONE     → netc 侧异常中断
+         *   ⚠ 不含任何 token/密码; 只在单次下载结束时打一行。 */
+        /* err = esp_err_t 原始码 (net_client.c:148 记录): 区分 DNS(-1/超时)、
+         * TLS(0x6xxx)、连接拒绝、文件写入失败等 —— 光看 http=0 分不出来。 */
+        ESP_LOGW(TAG, "DL[%d/%d] %s: state=%d http=%d got=%d/%u crc=%08x/%08x rc=%d err=0x%x",
+                 i + 1, s_mir_n, pk->name,
+                 (int)netc_state(), status, total, (unsigned)pk->size,
+                 crc, pk->crc, rc, (unsigned)netc_err());
         netc_reset();
         /* ★ 必须同时比 size 和 crc32: 只比 size 挡不住"截断成等长的错误内容",
          *   只比 crc 又不够直观 (长度变了 crc 也会变, 但 size 一眼看出差多少) */
-        if (rc == 0 && (total != (int)pk->size || crc != pk->crc)) {
+        /* ⚠ 2026-10-30 更正: 上一轮说"JSON 无 size/crc ⇒ 必然失败"是错的。
+         *   am_store_json.c 已完整解析两者, 且 crc==0 的条目会被直接判非法而不进列表
+         *   (见 :204 `if (rk.crc == 0) ok = false`)。这里的条件只是"无期望值时不误判"的兜底。 */
+        if (rc == 0 && ((pk->size > 0 && total != (int)pk->size) ||
+                        (pk->crc != 0 && crc != pk->crc))) {
             ESP_LOGD(TAG, "校验失败: 收到 %d B crc=%08x / 期望 %u B crc=%08x",
                      total, (unsigned)crc, (unsigned)pk->size, (unsigned)pk->crc);
             rc = 4;
         }
     }
     if (rc != 0) {
-        remove(dst);      /* 不许留半个包在商店源目录里 (会被当成"待安装") */
+        /* ★ 2026-10-30: 这里**不再 remove(dst)**。
+         *   现在的契约是: net_client 失败时只删 .part, 目标位置要么不存在(首次下载),
+         *   要么是上一份**完好的旧版本** —— 在这里 remove 反而会把好文件删掉。 */
         s_dl_err = rc;
         s_permille = -1;
         ESP_LOGW(TAG, "下载失败 rc=%d (%s)", rc, dst);
@@ -500,10 +558,34 @@ bool am_rstore_dl_start(int i) {
     }
     s_permille = -1;
     s_state = ARS_DOWNLOADING;
-    if (xTaskCreatePinnedToCore(am_dl_task, "am_dl", 8192, (void *)(intptr_t)i, 4, NULL, 0) != pdPASS) {
+    /* ★★★ 2026-10-30 修「下载字体后设备立即重启」的根因 ★★★
+     *   本任务下载完**就地解包**：am_dl_task → am_asset_install_cb → mz_zip_reader_extract_to_callback。
+     *   反汇编实测各层栈帧（xtensa-esp32s3-elf-objdump，entry a1, N）：
+     *       am_dl_task                          0x470 =  1136 B
+     *       am_asset_install_cb                 0xa40 =  2624 B
+     *       mz_zip_reader_extract_to_callback   0x25c0 = 9664 B   ← 大头
+     *                                        合计 ≈ 13424 B
+     *   原来这里给 8192 B ⇒ **溢出 5.2KB**，踩坏相邻 TCB/heap 后 panic 复位。
+     *   真机现场完全吻合：SD 根目录留下完整的 font_wqy14.zip / font_fusion12.zip
+     *   （那是另一个任务 netc 写好并 rename 的），但 /sdcard/fonts 目录没建出来
+     *   （mkdirs 在解包前，崩溃时 FAT 目录项还在 cache 里，复位即丢），
+     *   设备 uptime 只有十分钟级 —— 就是崩溃重启，不是主动重启。
+     *
+     *   给 20480：13424 之外还留 ~7KB 给 miniz 深层调用（iter_read / 中央目录解析）
+     *   和编译器的余量。任务只在下载期间存在（结束即 vTaskDelete），非常驻。
+     *   内部 RAM 余量：下载时 netc(8192)+am_dl(20480) 共 28KB，实测 internal free 185KB，够。 */
+    if (xTaskCreatePinnedToCore(am_dl_task, "am_dl", 20480, (void *)(intptr_t)i, 4, NULL, 0) != pdPASS) {
         ESP_LOGD(TAG, "下载任务创建失败(内存不足)");
         s_state = ARS_READY;
         return false;
     }
+    return true;
+}
+
+/* 取"索引刚更新过"事件(取一次即清)。页面 poll 拿到就重建列表 + 置脏。 */
+bool am_store_take_idx_updated(void)
+{
+    if (!s_idx_updated) return false;
+    s_idx_updated = false;
     return true;
 }

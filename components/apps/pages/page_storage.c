@@ -378,6 +378,12 @@ static void open_sd_mount(ui_ctx_t *ctx) {
 #define FB_BW 350     /* 弹窗宽 (与存储菜单一致) */
 #define FB_BH 250     /* 弹窗高 */
 #define FB_RH 30      /* 行高 */
+/* ★ 列表行的纵向基准 —— 绘制/命中/滚动跟随/拖动判定**必须**全用这两个,
+ *   不许各处再写 by+4 / by+30 / by+32. 之前三个值并存, 行高正好 30,
+ *   差值 28px ≈ 一行, 导致"点哪都选中上面一项". */
+#define FB_ROW_TOP (FB_BY + 4)
+#define FB_ROW_BOT (FB_BY + FB_BH - 30)
+
 static EXT_RAM_BSS_ATTR char  s_fb_path[160] = "";          /* 相对根目录, ""= /sdcard */
 static EXT_RAM_BSS_ATTR char  s_fb_names[FB_MAX][30];       /* 条目名 (不含分隔符) */
 static EXT_RAM_BSS_ATTR bool  s_fb_isdir[FB_MAX];
@@ -656,7 +662,7 @@ static const char *fb_fit_name(const char *s, int maxw) {
 }
 /* 让选中行跟随滚动: 框在可视窗内移动, 越界才滚动 */
 static void fb_follow(void) {
-    const int rtop = FB_BY + 30, rh = FB_RH, rbot = FB_BY + FB_BH - 32;
+    const int rtop = FB_ROW_TOP, rh = FB_RH, rbot = FB_ROW_BOT;
     int maxvis = (rbot - rtop) / rh; if (maxvis < 1) maxvis = 1;
     int first = s_fb_off / rh;
     if (s_fb_sel < first) first = s_fb_sel;
@@ -684,7 +690,7 @@ static bool fb_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     if (s_fb_count == 0) {
         draw_text(lcd, bx + 12, by + 8, "\xe7\xa9\xba\xe7\x9b\xae\xe5\xbd\x95", false); /* 空目录 */
     }
-    int rtop = by + 4, rbot = by + bh - 30, rh = FB_RH;
+    int rtop = FB_ROW_TOP, rbot = FB_ROW_BOT, rh = FB_RH;
     int view = rbot - rtop;
     int off = s_fb_off; if (off < 0) off = 0;
     int first = off / rh, mod = off % rh;
@@ -693,7 +699,7 @@ static bool fb_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         int idx = first + i;
         if (idx >= s_fb_count) break;
         int y = rtop + i * rh - mod;
-        if (y + rh - 2 < by + 30) continue;
+        if (y < rtop) continue;          /* 顶部半行不画, 与命中同源 */
         bool sel = (idx == s_fb_sel);
         if (sel) fill_rect(lcd, bx + 3, y, bx + bw - 4, y + rh - 2, ST7305_COLOR_BLACK);
         int ty = y + (rh - 24) / 2;
@@ -770,7 +776,10 @@ static bool fb_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
         return true;
     }
     int rh = FB_RH;
-    int idx = (s_fb_off + (y - (by + 32))) / rh;
+    /* 命中反解必须与 fb_render 的 y = rtop + i*rh - mod 严格互逆:
+     *   idx = (s_fb_off + (y - FB_ROW_TOP)) / rh  */
+    if (y < FB_ROW_TOP) return true;
+    int idx = (s_fb_off + (y - FB_ROW_TOP)) / rh;
     if (idx < 0 || idx >= s_fb_count) return true;
     s_fb_sel = idx;
     ctx->needs_redraw = true;
@@ -782,7 +791,7 @@ static void fb_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)d; (void)ud;
     int tx, ty;
     bool down = input_get_touch_pos(&tx, &ty);
-    int rtop = FB_BY + 32, rbot = FB_BY + FB_BH - 32;
+    int rtop = FB_ROW_TOP, rbot = FB_ROW_BOT;
     int maxoff = s_fb_count * FB_RH - (rbot - rtop); if (maxoff < 0) maxoff = 0;
     if (down) {
         if (tx < FB_BX || ty < rtop || ty >= rbot) { if (s_fb_drag == -1) s_fb_drag = -999; return; }

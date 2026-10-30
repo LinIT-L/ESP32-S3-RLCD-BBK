@@ -1164,6 +1164,22 @@ static bool core_ensure_init(void)
 /* ========================================================================
  *  生命周期 / 扫描 / 连接 / 状态
  * ======================================================================== */
+/* 常驻自动回连任务 (低优先级, 省电直连上次手柄). 栈须够大: 回连会走 esp_hid/Bluedroid
+ * 连接与错误处理, 2048 过小会在 HID open 失败/重连时爆栈重启 (实测 bt_rec stack overflow)。
+ * ★ 2026-10-28: 补返回值检查 —— 原来直接忽略 xTaskCreate 的结果, 建任务失败时
+ *   s_reconnect_task 为 NULL ⇒ bt_manager_wake_reconnect() 变成静默空操作,
+ *   自动回连永久失效且日志里一个字都看不到。现在失败会打 E, 并允许下次 enable 重试。 */
+static bool bt_ensure_reconnect_task(void)
+{
+    if (s_reconnect_task) return true;
+    if (xTaskCreate(bt_reconnect_task, "bt_rec", 8192, NULL, 2, &s_reconnect_task) != pdPASS) {
+        s_reconnect_task = NULL;
+        ESP_LOGE(TAG, "bt_rec 任务创建失败(内部 RAM 不足?) ⇒ 自动回连不可用, 下次启用重试");
+        return false;
+    }
+    return true;
+}
+
 /* ========================================================================
  *  完整初始化 (V1.5.x 拆出, 供 bt_manager_init 任务入口 与 enable 惰性触发共用)
  *  幂等: 只执行一次; disable 后再次 enable 由 core_ensure_init 重新初始化核心.
@@ -1219,9 +1235,7 @@ static void bt_full_init(void)
     nvs_init_handle();
     (void)core_ensure_init();
 
-    /* 常驻自动回连任务 (低优先级, 省电直连上次手柄). 栈须够大: 回连会走 esp_hid/Bluedroid
-     * 连接与错误处理, 2048 过小会在 HID open 失败/重连时爆栈重启 (实测 bt_rec stack overflow). */
-    xTaskCreate(bt_reconnect_task, "bt_rec", 8192, NULL, 2, &s_reconnect_task);
+    (void)bt_ensure_reconnect_task();   /* 常驻回连任务: 失败打 E, 由 bt_manager_init 再试 */
 }
 
 /* 立即唤醒重连任务: 断连/需要即时重连时调用 (任务正按退避睡眠也能打断).
@@ -1243,6 +1257,9 @@ void bt_manager_init(void)
      * 内部 RAM, 是唯一安全位置; 放到调用者线程(如屏保监督任务的 PSRAM 栈)会
      * 触发 esp_task_stack_is_sane_cache_disabled() 断言 → 卡死重启. */
     if (s_full_init_done && !s_inited) (void)core_ensure_init();
+    /* ★ 2026-10-28: 上次因内存不足没建成回连任务时, 在这里补建 (本任务栈在内部 RAM,
+     *   是唯一安全位置; 建失败只会打 E, 不影响本次启用)。 */
+    if (s_full_init_done && !s_reconnect_task) (void)bt_ensure_reconnect_task();
     s_init_task_running = false;
     if (s_init_done_sem) xSemaphoreGive(s_init_done_sem);   /* 通知 enable 等待方 */
 
@@ -1442,7 +1459,10 @@ typedef struct { esp_hid_scan_result_t r; } bt_conn_arg_t;
 static void bt_connect_task(void *arg)
 {
     bt_conn_arg_t *a = (bt_conn_arg_t *)arg;
-    s_conn_task_alive++;
+    /* ★ 2026-10-28: 计数已由 bt_connect_async() 在创建任务**之前**占位, 这里只负责减。
+     *   原来在本函数第一行 ++: xTaskCreate 返回后到本任务真正被调度之间有一个窗口,
+     *   此窗口内 bt_conn_failed()/bt_reconnect_task 看到的 s_conn_task_alive 仍是 0
+     *   ⇒ 误判"没有连接任务卡在 open 里" ⇒ 拆栈把刚起来的任务踩掉(UAF)。 */
     if (a) {
         if (!bt_core_connect(&a->r)) {
             ESP_LOGD(TAG, "异步连接失败(超时/不在范围)");
@@ -1463,7 +1483,11 @@ static bool bt_connect_async(const esp_hid_scan_result_t *r)
     memset(a, 0, sizeof(*a));
     a->r = *r;   /* 浅拷贝: bt_core_connect 只用 bda/transport/ble.addr_type, 不用 name */
     bt_conn_begin(r->bda);   /* ★ 记下本次目标 + 截止时间 (超时/失败靠它收尾) */
+    /* ★ 2026-10-28: 先占位, 再创建 (与 bt_connect_task 里"只减不加"配对)。
+     *   见 bt_connect_task 顶部注释: 不占位就有"任务还没跑起来, 别人以为没有连接任务"的窗口。 */
+    s_conn_task_alive++;
     if (xTaskCreate(bt_connect_task, "bt_conn", 4096, a, 2, NULL) != pdPASS) {
+        s_conn_task_alive--;
         free(a);
         s_connecting = false;
         bt_conn_end();
@@ -1572,7 +1596,8 @@ bool bt_manager_is_enabled(void) { return s_bt_on; }   /* V1.6.x: 蓝牙当前�
 
 void bt_manager_enable(void)
 {
-    s_bt_on = true;
+    s_bt_on    = true;     /* 先记"用户想开": 初始化要 1~2s, 这期间若直接息屏, 睡眠流程
+                            * 仍会依此把蓝牙关掉; 失败路径会把它回滚成 false (见下)。 */
     s_power_off = false;   /* 显式开蓝牙: 允许自动回连 */
     s_suspended = false;
     /* 核心健在 → 无需任何初始化, 直接返回 (幂等快路径). */
@@ -1584,11 +1609,20 @@ void bt_manager_enable(void)
      * esp_task_stack_is_sane_cache_disabled() 断言 → 卡死后重启.
      * V1.5.x 省电: 蓝牙按需开启 — 完整初始化 (映射/NVS/核心/回连任务) 统一由
      * 内部 RAM 静态栈的 bt_init 任务执行, 本函数只同步等待完成 (约 1~2 秒).
-     * 首次初始化 与 "disable 后二次启用(bt_core_deinit 已拆核心)" 走同一条安全路径. */
+     * 首次初始化 与 "disable 后二次启用(bt_core_deinit 已拆核心)" 走同一条安全路径.
+     *
+     * ★ 2026-10-28: 失败路径必须把 s_bt_on 回滚成 false。原来置 true 后不管结果,
+     *   "信号量创建失败/静态任务创建失败/20s 超时"都会留下 s_bt_on=true 而射频没起来
+     *   ⇒ 设置页显示「开」、睡眠流程还会去 disable 一个不存在的射频。 */
     if (!s_init_done_sem) s_init_done_sem = xSemaphoreCreateBinary();
-    if (!s_init_done_sem) return;
+    if (!s_init_done_sem) {
+        s_bt_on = false;
+        ESP_LOGE(TAG, "初始化信号量创建失败(内部 RAM 不足) ⇒ 蓝牙不可用");
+        return;
+    }
     if (s_init_task_running) {   /* 已有初始化在跑: 等它, 不重复创建静态任务 */
         xSemaphoreTake(s_init_done_sem, pdMS_TO_TICKS(20000));
+        if (!s_inited) s_bt_on = false;
         return;
     }
     int words = 0;
@@ -1599,14 +1633,22 @@ void bt_manager_enable(void)
     if (!stack || !xTaskCreateStatic((TaskFunction_t)bt_manager_init, "bt_init",
                                      words, NULL, 1, stack, &bt_task_buf)) {
         s_init_task_running = false;
-        ESP_LOGD(TAG, "bt_init 任务创建失败, 蓝牙不可用");
+        s_bt_on = false;
+        ESP_LOGE(TAG, "bt_init 任务创建失败 ⇒ 蓝牙不可用");
         return;
     }
     xSemaphoreTake(s_init_done_sem, pdMS_TO_TICKS(20000));
-    if (!s_inited) ESP_LOGD(TAG, "蓝牙核心未就绪 (超时/失败), 下次 enable 重试");
+    if (!s_inited) {
+        s_bt_on = false;
+        ESP_LOGE(TAG, "蓝牙核心未就绪 (超时/失败), 下次 enable 重试");
+    }
 }
 
-void bt_manager_disable(void)
+/* 关蓝牙的公共实现.
+ *   deep=false: 只关射频, 栈结构保留 (下次 enable 毫秒级复用). 设置页手动关 / 睡眠流程走这里.
+ *   deep=true : 真拆栈, 归还 controller/Bluedroid/esp_hidh 占的内部 RAM.
+ *               只在"最后一个使用者退出"(os_hw 引用计数归零)时用, 见 bt_manager_disable_release. */
+static void bt_shutdown(bool deep)
 {
     s_bt_on = false;
     s_power_off = true;    /* 彻底关蓝牙: 自动回连任务停手, 不再偷偷初始化 */
@@ -1619,8 +1661,49 @@ void bt_manager_disable(void)
     s_suspended = false;
     s_conn_addr_valid = false;
     s_conn_info.available = false;
+    /* ★★★ 2026-10-28 【"关了又自己开"的复现路径】★★★
+     *   下面这些是**跨会话**的一次性状态, 原来一个都没清:
+     *     s_need_stack_reset → bt_reconnect_task 下一轮(≤1.5s)看到它就走
+     *                          `bt_manager_disable(); bt_manager_enable();` 重建栈,
+     *                          而那个分支**不看 s_power_off** ⇒ 用户刚关掉的蓝牙又亮了。
+     *     s_conn_fail_streak → 重新开启后继承连败计数, 第 2 次失败就直接拆栈。
+     *     s_conn_try_valid / s_conn_deadline_ms → 残留的"进行中连接", 让看门狗拿旧目标收尾。
+     *     s_auto_reconnect_pending / s_rc_target_valid → 重新开启后立刻去连旧目标。
+     *   关蓝牙 = 本次会话结束, 这些必须归零; 其余运行态已在上面清过。 */
+    s_need_stack_reset       = false;
+    s_conn_fail_streak       = 0;
+    s_conn_try_valid         = false;
+    s_conn_deadline_ms       = 0;
+    s_auto_reconnect_pending = false;
+    s_rc_target_valid        = false;
     s_inited = false;
-    bt_core_deinit();
+    if (!deep) {
+        bt_core_deinit();          /* 只关射频: 快, 栈保留 */
+        return;
+    }
+    /* ★ 2026-10-30 深度拆栈前的安全闸 (防"异步任务访问已释放资源"):
+     *   ① s_power_off 已置 true → bt_rec 下一轮直接 continue, 不再碰 bt_core_*;
+     *   ② 主动 notify 让它立刻从 ulTaskNotifyTake 醒来走一遍上面那条 continue;
+     *   ③ 再等 80ms, 确保它已经从"可能在途"的一次 bt_core_connect/scan 调用里退出。
+     *   扫描任务同理: bt_core_stop_scan() 已置标志, 这里再等它自然收尾。 */
+    if (s_reconnect_task) {
+        xTaskNotifyGive(s_reconnect_task);
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+    bt_core_deinit_deep();
+}
+
+void bt_manager_disable(void)
+{
+    bt_shutdown(false);
+}
+
+/* ★ 2026-10-30 linit「蓝牙没启用就不要占内存」: 最后使用者退出时真拆栈.
+ * 由 os_hw 的引用计数归零路径调用 (bt_stop), 因此"多个模块同时用蓝牙"时
+ * 只有最后一个 release 才会拆, 不会被先退出的那个误关。 */
+void bt_manager_disable_release(void)
+{
+    bt_shutdown(true);
 }
 
 /* ========================================================================
@@ -1664,7 +1747,13 @@ static void bt_reconnect_task(void *arg)
         }
         /* 连败达阈值 ⇒ 整栈重建。必须有任务还卡在 open 里就不做(会 UAF) */
         if (s_need_stack_reset) {
-            if (s_conn_task_alive > 0) {
+            if (s_power_off || s_suspended) {
+                /* ★ 2026-10-28: 用户已主动关蓝牙/已挂起 ⇒ **不能**走下面的 disable+enable。
+                 *   那段重建是"为了继续重连", 而此刻用户要的正是别连; 原来这里不看 s_power_off,
+                 *   于是关蓝牙后 1.5s 内蓝牙自己被重新打开(与 bt_manager_disable 清标志互为双保险)。 */
+                s_need_stack_reset = false;
+                s_conn_fail_streak = 0;
+            } else if (s_conn_task_alive > 0) {
                 ESP_LOGW(TAG, "需重建蓝牙栈, 但仍有连接任务未退出 ⇒ 稍后重试");
             } else if (s_scanning || bt_core_is_scanning() || s_scan_cb || s_cont_cb) {
                 /* ★★ 不能在有扫描任务时拆栈：scan_task 正卡在 esp_hid_scan 里，
@@ -1748,6 +1837,30 @@ static void bt_reconnect_task(void *arg)
     }
 }
 
+/* 轻量预检: NVS 里的配对手柄历史条数. **只读 NVS, 不碰蓝牙核心/协议栈**,
+ * 因此可以在"还没初始化蓝牙"的时候安全调用 (bt_manager_start_boot_reconnect
+ * 与 bt_manager_has_saved_pad 共用). */
+static int bt_nvs_history_count(void)
+{
+    int hcnt = 0;
+    size_t len = sizeof(hcnt);
+    nvs_init_handle();
+    if (s_nvs_open && svc_nvs_get_blob(s_nvs, NVS_KEY_HCNT, &hcnt, &len) == ESP_OK) {
+        if (hcnt < 0) hcnt = 0;
+        if (hcnt > BT_HISTORY_MAX) hcnt = BT_HISTORY_MAX;
+    }
+    return hcnt;
+}
+
+/* ★ 2026-10-30: "有没有配对过手柄" —— 给游戏/手柄入口判断要不要拉起蓝牙栈.
+ *   true  → 值得为手柄初始化 (约 1~2s, 换 71KB 内部 RAM);
+ *   false → 从没配对过, 一个字节都不占 (绝大多数只用物理键的用户走这条)。
+ *   ⚠ 只读 NVS, 不初始化核心, 每次进游戏调一次 (~ms 级)。 */
+bool bt_manager_has_saved_pad(void)
+{
+    return bt_nvs_history_count() > 0;
+}
+
 /* V1.5.x: 开机自动回连窗口 — 启动入口 (main.c 开机时调用).
  * 先轻量预检 NVS 历史 (不初始化蓝牙核心): 无已配对手柄 → 完全不拉起蓝牙栈 (省电).
  * 有历史 → 惰性完整初始化, 在 window_ms 窗口内低占空比直连上次手柄;
@@ -1756,15 +1869,7 @@ static void bt_reconnect_task(void *arg)
 void bt_manager_start_boot_reconnect(uint32_t window_ms)
 {
     /* 轻量预检: NVS 历史条数 (hcnt 是 svc_nvs_set_blob 保存的 4 字节, 用 blob 读) */
-    int hcnt = 0;
-    {
-        size_t len = sizeof(hcnt);
-        nvs_init_handle();
-        if (s_nvs_open && svc_nvs_get_blob(s_nvs, NVS_KEY_HCNT, &hcnt, &len) == ESP_OK) {
-            if (hcnt < 0) hcnt = 0;
-            if (hcnt > BT_HISTORY_MAX) hcnt = BT_HISTORY_MAX;
-        }
-    }
+    int hcnt = bt_nvs_history_count();
     if (hcnt <= 0) {
         ESP_LOGI(TAG, "开机回连: 无已配对手柄历史, 蓝牙不启动 (按需开启)");
         return;

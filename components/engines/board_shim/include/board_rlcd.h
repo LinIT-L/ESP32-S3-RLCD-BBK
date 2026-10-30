@@ -35,6 +35,14 @@ st7305_handle_t *board_shim_get_lcd(void);
 /* V1.0.46+: GB/GBC 灰度模式三档 (0=纯黑白, 1=4档点聚, 2=5档点聚) */
 void board_shim_set_gb_gray(int mode);
 
+/* ★ 2026-10-30 灰阶算法 (与上面的"灰度模式"正交):
+ *   0 = CLUSTER_2X2 (默认, 原实现: 点聚/散点, 黑点位置与屏幕位置无关)
+ *   1 = BAYER_4X4  (实验: 4x4 有序 Bayer, 黑点按屏幕绝对坐标分散)
+ * 两者填充率相同(dots/4), 只有空间分布不同 ⇒ 整体亮度不变, 可直接 A/B。
+ * 切换会重建 GB/GBC/NES 三张表并作废帧指纹(下一次 flush 强制整屏重画)。 */
+void board_shim_set_gray_alg(int alg);
+int  board_shim_get_gray_alg(void);
+
 /* GB (Peanut-GB) 2x 绘制暂存: board_rlcd_draw_gb_line_2x 画到 s_fb_stage (内部 RAM).
  * 进入 GB 引擎时调用 alloc, 退出时调用 free (须等视频任务停止后). */
 esp_err_t board_shim_gb_stage_alloc(void);

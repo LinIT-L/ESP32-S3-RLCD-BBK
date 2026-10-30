@@ -24,6 +24,7 @@ enum {
     T_ADD  = -1, T_SUB = -2, T_MUL = -3, T_DIV = -4,
     T_MOD  = -5, T_POW = -6, T_FACT = -7, T_UNEG = -8,
     T_LP   = -9, T_RP   = -10,
+    T_PCT  = -12,          /* 一元后缀百分比: x% = x/100 (参考开源科学计算器的做法) */
     F_SIN=1,F_COS,F_TAN,F_ASIN,F_ACOS,F_ATAN,F_SINH,F_COSH,F_TANH,
     F_LN,F_LOG,F_LOG2,F_SQRT,F_EXP,F_ABS,F_FLOOR,F_CEIL
 };
@@ -52,20 +53,27 @@ static int prec(int t) {
     case T_ADD: case T_SUB: return 1;
     case T_MUL: case T_DIV: case T_MOD: return 2;
     case T_POW: return 3;
-    case T_FACT: case T_UNEG: return 4;
+    case T_FACT: case T_PCT: case T_UNEG: return 4;
     default: return is_unary(t) ? 5 : 0;
     }
 }
 static bool right_assoc(int t) { return t == T_POW; }
 
+/* 角度制: 三角函数的入参/反三角函数的结果按角度换算.
+ * 只影响 sin/cos/tan 与 asin/acos/atan, 其它函数与角度无关. */
+static bool s_deg = false;
+void calc_set_deg(bool deg) { s_deg = deg; }
+#define DEG2RAD(x) ((x) * M_PI / 180.0)
+#define RAD2DEG(x) ((x) * 180.0 / M_PI)
+
 static double apply_fn(int f, double x) {
     switch (f) {
-    case F_SIN: return sin(x);
-    case F_COS: return cos(x);
-    case F_TAN: return tan(x);
-    case F_ASIN: return asin(x);
-    case F_ACOS: return acos(x);
-    case F_ATAN: return atan(x);
+    case F_SIN: return sin(s_deg ? DEG2RAD(x) : x);
+    case F_COS: return cos(s_deg ? DEG2RAD(x) : x);
+    case F_TAN: return tan(s_deg ? DEG2RAD(x) : x);
+    case F_ASIN: { double r = asin(x); return s_deg ? RAD2DEG(r) : r; }
+    case F_ACOS: { double r = acos(x); return s_deg ? RAD2DEG(r) : r; }
+    case F_ATAN: { double r = atan(x); return s_deg ? RAD2DEG(r) : r; }
     case F_SINH: return sinh(x);
     case F_COSH: return cosh(x);
     case F_TANH: return tanh(x);
@@ -98,7 +106,7 @@ int calc_eval(const char *expr, double ans, double *out) {
         /* 隐式乘法: 数字/常量/函数/左括号 之前是 数字/右括号/阶乘 */
         if (is_literal_start && tkn > 0) {
             int prev = tk[tkn - 1].t;
-            if (prev == T_NUM || prev == T_FACT || prev == T_RP) {
+            if (prev == T_NUM || prev == T_FACT || prev == T_PCT || prev == T_RP) {
                 if (tkn >= MAX_TOK) return -1;
                 tk[tkn++].t = T_MUL;
             }
@@ -124,7 +132,7 @@ int calc_eval(const char *expr, double ans, double *out) {
             int t;
             if (c == '+') t = T_ADD; else if (c == '-') t = T_SUB;
             else if (c == '*') t = T_MUL; else if (c == '/') t = T_DIV;
-            else if (c == '%') t = T_MOD; else if (c == '^') t = T_POW;
+            else if (c == '%') t = T_PCT; else if (c == '^') t = T_POW;
             else if (c == '!') t = T_FACT;
             else if (c == '(') t = T_LP; else if (c == ')') t = T_RP;
             else return -1;
@@ -175,7 +183,7 @@ int calc_eval(const char *expr, double ans, double *out) {
                 postt[pn] = f; postv[pn] = 0; pn++;
             }
         } else {                             /* 运算/一元负/阶乘 */
-            if (t == T_FACT) {
+            if (t == T_FACT || t == T_PCT) {
                 if (pn >= MAX_TOK) return -1;
                 postt[pn] = t; postv[pn] = 0; pn++;
                 continue;
@@ -221,6 +229,9 @@ int calc_eval(const char *expr, double ans, double *out) {
             if (x < 0 || floor(x) != x || x > 170) return -2;
             double r = 1; for (int k = 2; k <= (int)x; k++) r *= k;
             st[sn++] = r;
+        } else if (t == T_PCT) {
+            if (sn < 1) return -1;
+            st[sn-1] = st[sn-1] / 100.0;
         } else if (t == T_UNEG) {
             if (sn < 1) return -1;
             st[sn-1] = -st[sn-1];

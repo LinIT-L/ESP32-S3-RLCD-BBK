@@ -35,6 +35,15 @@ extern "C" {
 #define FONT_SLOT_16_LEN   0x40000UL
 #define FONT_SLOT_LAV_LEN  0x80000UL
 
+/* 临时试用槽位 (2026-10-30): appdata 末尾空闲区, 供设置里字体切换用.
+ *   ALT16: appdata+0x5C0000  256KB — 16px 候选字库 (ZH1FNT01)
+ *   ALT24: appdata+0x600000  512KB — 24px 候选字库 (ZH1FNT01)
+ * 不改变原有槽位与分区表; 空槽内容为 0xFF, 绑定失败时调用方回退默认. */
+#define FONT_SLOT_ALT16_OFF (FONT_REGION_OFF + 0x1C0000UL)
+#define FONT_SLOT_ALT16_LEN 0x40000UL
+#define FONT_SLOT_ALT24_OFF (FONT_REGION_OFF + 0x200000UL)
+#define FONT_SLOT_ALT24_LEN 0x80000UL
+
 /* 映射 appdata 分区内 [off, off+len) 区域为内存指针 (只读).
  * 相同 off+len 的重复调用返回已映射指针 (不重复 mmap).
  * 失败返回 NULL (未找到分区/映射失败). 生命周期为整个系统运行期. */

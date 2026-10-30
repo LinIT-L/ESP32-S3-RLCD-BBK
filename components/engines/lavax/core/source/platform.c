@@ -389,6 +389,7 @@ void lavax_platform_poll(void)
                 bool takeover = cheat_float_overlay_tick(g_lcd); /* 浮标+检测呼出 */
                 if (!takeover) vid_tune_overlay_tick(g_lcd);     /* 画面优化器浮标/面板 */
                 lavax_draw_exit_confirm(g_lcd);  /* V1.0.9x: 叠加退出确认浮层 */
+                if (!takeover) engine_overlay_quickbar(g_lcd);   /* ★ 游戏内下拉快捷栏 */
                 if (!takeover) st7305_flush(g_lcd);   /* 触发接管则本帧不再送屏 */
                 int64_t r1 = esp_timer_get_time();
                 if (r1 - r0 > 20000) /* >20ms 才打, 避免刷屏 */

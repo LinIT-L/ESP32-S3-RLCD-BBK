@@ -601,7 +601,13 @@ static void sdr_enable_cb(ui_ctx_t *ctx, int result, void *ud) {
         vTaskDelay(pdMS_TO_TICKS(600));      /* 让提示可见 */
         esp_restart();                       /* 不返回 */
     }
-    if (ctx) ctx->needs_redraw = true;
+    /* ★ 2026-10-28 linit: **取消 = 不启用 ⇒ 直接退出频谱仪**。
+     *   原来只置脏, 页面停在"射频未就绪 / 返回 菜单"的空页上, 用户点了取消
+     *   看着就像"没反应", 还得再按一次返回才能走。
+     *   走 os_request_pop: 弹窗回调里不能直接 os_pop(那只弹掉弹窗层, 页面原地不动),
+     *   由 os_tick 在弹窗真正关闭后的下一帧执行。 */
+    ESP_LOGI(TAG, "频谱仪: 取消启用 ⇒ 退出本页");
+    if (ctx) { ctx->needs_redraw = true; os_request_pop(ctx); }
 }
 static void sdr_release_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
@@ -1300,6 +1306,8 @@ static void sdr_poll(ui_ctx_t *ctx)
     if (s_notouch_msg) {
         s_notouch_msg = false;
         os_dialog_toast(ctx, "本机无触摸屏, 频谱仪不可用");
+        /* ★ 2026-10-28: 提示完直接退出 —— 不能用的功能没必要把用户留在空页上 */
+        os_request_pop(ctx);
         return;
     }
     if (s_need_enable) {

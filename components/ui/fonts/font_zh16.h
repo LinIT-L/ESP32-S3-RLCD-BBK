@@ -24,6 +24,10 @@ int font_zh16_find_utf8(const char *str);
 /* 通过字符索引获取位图数据 */
 const uint8_t *font_zh16_get_bitmap_by_index(int idx);
 
+/* 2026-10-30: 重绑定到 appdata 内另一段字库 (设置里切字体).
+ * 成功返回 true; 失败返回 false 且保持原字库不变. */
+bool font_zh16_rebind(uint32_t off, uint32_t len);
+
 #ifdef __cplusplus
 }
 #endif

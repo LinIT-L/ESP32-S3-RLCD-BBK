@@ -26,8 +26,8 @@
 #define EOCD_SCAN_MAX  (64 * 1024)
 #define COPY_BUF       4096
 
-static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t rd32(const uint8_t *p)
+static uint16_t __attribute__((unused)) rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t __attribute__((unused)) rd32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -59,7 +59,7 @@ static void parent_of(const char *path, char *out, size_t cap)
     out[n] = 0;
 }
 
-static bool copy_range(FILE *fi, long off, uint32_t len, const char *dst)
+static bool __attribute__((unused)) copy_range(FILE *fi, long off, uint32_t len, const char *dst)
 {
     char dir[256];
     parent_of(dst, dir, sizeof(dir));
@@ -117,8 +117,25 @@ bool am_asset_install_cb(const char *zip_path, const char *target_dir,
 
     mkdirs(target_dir);
 
+    /* ★★★ 2026-10-30: 记录"本包装了哪些文件"。
+     *   字体包的 target 是**多个包共用**的 /sdcard/fonts，而卸载走的是
+     *   am_asset_rmdir() 递归删目录 —— 删掉一个字体会把用户所有字体一起清掉。
+     *   有了这份清单就能"只删自己装的文件"。清单名带 zip 主干，互不覆盖。 */
+    char lst[336] = {0};
+    char stem[64] = {0};          /* ★ 2026-10-31: 提到块外 —— 安装标记也要带它 */
+    {
+        const char *b = strrchr(zip_path, '/');
+        b = b ? b + 1 : zip_path;
+        size_t k = 0;
+        while (b[k] && b[k] != '.' && k + 1 < sizeof(stem)) { stem[k] = b[k]; k++; }
+        stem[k] = 0;
+        snprintf(lst, sizeof(lst), "%s/.pkg.%s.lst", target_dir, stem);
+    }
+    FILE *fl = fopen(lst, "w");
+
     char dst[320];
     int done = 0, skipped = 0, failed = 0;
+    unsigned long long out_bytes = 0;   /* ★ 2026-10-31: 解出的总字节，写进安装标记供回验 */
     for (int i = 0; i < total; i++) {
         mz_zip_archive_file_stat st;
         if (!mz_zip_reader_file_stat(&z, i, &st)) { failed++; continue; }
@@ -135,20 +152,39 @@ bool am_asset_install_cb(const char *zip_path, const char *target_dir,
         parent_of(dst, pdir, sizeof(pdir));
         if (pdir[0]) mkdirs(pdir);
 
-        FILE *fo = fopen(dst, "wb");
-        if (!fo) { ESP_LOGE(TAG, "写文件失败: %s", dst); failed++; continue; }
+        /* ★★★ 2026-10-30: 改成「先写 .tmp 再 rename」的原子落盘。
+         *   原来是 fopen(dst,"wb") 直接截断目标文件、解压失败再 remove(dst) ——
+         *   对**共享目录** (/sdcard/fonts) 来说等于"装一个坏包把用户原有的好字体毁掉"。
+         *   字体资源包的 target 就是 /sdcard/fonts，必须保证失败时原文件分毫不动。 */
+        char tmp[336];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
+        FILE *fo = fopen(tmp, "wb");
+        if (!fo) { ESP_LOGE(TAG, "写文件失败: %s", tmp); failed++; continue; }
         bool ok = mz_zip_reader_extract_to_callback(&z, (mz_uint)i, asset_write_cb, fo, 0);
         fclose(fo);
         if (!ok) {
             ESP_LOGE(TAG, "解压失败: %s", dst);
-            remove(dst);
+            remove(tmp);                 /* 只删临时文件, 目标位置的旧文件不动 */
+            failed++;
+            continue;
+        }
+        /* FATFS 的 rename 在目标已存在时可能失败 ⇒ 先移除旧文件。
+         * 此刻新内容已完整落在 .tmp，即使下一步掉电，旧文件也只是"没了"而不是"半截"。 */
+        struct stat st_old;
+        if (stat(dst, &st_old) == 0) remove(dst);
+        if (rename(tmp, dst) != 0) {
+            ESP_LOGE(TAG, "落盘失败 (rename): %s", dst);
+            remove(tmp);
             failed++;
             continue;
         }
         done++;
+        out_bytes += (unsigned long long)st.m_uncomp_size;
+        if (fl) fprintf(fl, "%s\n", name);       /* 记进清单, 卸载时按它删, 不整目录删 */
         if (cb) cb((int)((long)(i + 1) * 1000 / (long)total));
     }
     mz_zip_reader_end(&z);
+    if (fl) fclose(fl);
 
     ESP_LOGI(TAG, "解包完成: 成功 %d / 跳过 %d / 失败 %d → %s", done, skipped, failed, target_dir);
     bool all_ok = (failed == 0 && done > 0);
@@ -156,10 +192,18 @@ bool am_asset_install_cb(const char *zip_path, const char *target_dir,
      *   "是否已安装"改成验证这个标记, 不再只看目录存在 —— 否则解压失败/空目录
      *   也会显示"可卸载", 用户点进应用却提示"资源未安装"(就是这次的坑)。 */
     if (all_ok) {
-        char mark[320];
-        snprintf(mark, sizeof(mark), "%s/.installed", target_dir);
+        /* ★★★ 2026-10-31: 标记必须**按包区分**。
+         *   字体包的 target 是 13 个包共用的 /sdcard/fonts，目录级标记
+         *   `<target>/.installed` 会让"装成一个 = 全部显示已安装"，
+         *   其余 12 个点不到下载按钮。改成 `.installed.<zip主干>`。 */
+        char mark[384];
+        if (stem[0]) snprintf(mark, sizeof(mark), "%s/.installed.%s", target_dir, stem);
+        else         snprintf(mark, sizeof(mark), "%s/.installed", target_dir);
         FILE *mf = fopen(mark, "w");
-        if (mf) { fprintf(mf, "%d\n", done); fclose(mf); }
+        /* ★ 2026-10-31: 除了文件数，再记**解出的总字节**。
+         *   商店的"已安装"不能只信这个标记文件 —— 用户可能删了 .lbf 却留着标记，
+         *   或者卡拔了/文件被覆盖。回验时按清单逐个 stat 累加，与这里两数对上才算装了。 */
+        if (mf) { fprintf(mf, "%d %llu\n", done, out_bytes); fclose(mf); }
         else ESP_LOGW(TAG, "写安装标记失败: %s", mark);
     } else {
         ESP_LOGW(TAG, "解包未全部成功 (成功 %d/失败 %d), 不写安装标记", done, failed);
@@ -200,4 +244,93 @@ bool am_asset_rmdir(const char *dir)
 bool am_asset_install(const char *zip_path, const char *target_dir)
 {
     return am_asset_install_cb(zip_path, target_dir, NULL);
+}
+
+/* ===== 2026-10-30: 按清单卸载 (共享目录必需) ================================
+ * 背景: 字体包的 target 是 /sdcard/fonts，多个包共用同一个目录。
+ *   老卸载走 am_asset_rmdir() 递归删目录 ⇒ 删一个字体把所有字体（含用户手动放的）
+ *   全部清掉。这里按安装时写下的 .pkg.<zip主干>.lst 逐个删，
+ *   目录里还有别的东西就保留目录。
+ * 返回 true = 已处理；false = 没有清单（旧包），调用方应回退到 rmdir。 */
+bool am_asset_uninstall(const char *zip_path, const char *target_dir)
+{
+    if (!target_dir || !target_dir[0]) return false;
+
+    const char *b = (zip_path && zip_path[0]) ? strrchr(zip_path, '/') : NULL;
+    b = b ? b + 1 : (zip_path ? zip_path : "");
+    char stem[64];
+    size_t k = 0;
+    while (b[k] && b[k] != '.' && k + 1 < sizeof(stem)) { stem[k] = b[k]; k++; }
+    stem[k] = 0;
+    if (!stem[0]) return false;
+
+    char lst[336];
+    snprintf(lst, sizeof(lst), "%s/.pkg.%s.lst", target_dir, stem);
+
+    FILE *f = fopen(lst, "r");
+    if (!f) return false;                      /* 没有清单 = 旧包, 交给调用方 */
+
+    char line[288];
+    int removed = 0;
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (!n) continue;
+        if (line[0] == '/' || strstr(line, "..")) continue;   /* 防御: 清单被改坏 */
+        char p[336];
+        snprintf(p, sizeof(p), "%s/%s", target_dir, line);
+        if (remove(p) == 0) removed++;
+    }
+    fclose(f);
+    remove(lst);
+
+    /* 目录空了才删；还有别的字体/文件就保持原样 */
+    DIR *d = opendir(target_dir);
+    if (d) {
+        int cnt = 0;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL)
+            if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) cnt++;
+        closedir(d);
+        if (cnt == 0) rmdir(target_dir);
+    }
+    ESP_LOGI(TAG, "按清单卸载 %s: 删除 %d 个文件 (目录保留=%s)",
+             target_dir, removed, "见上");
+    return true;
+}
+
+/* ===== 2026-10-30: 该包是否装了某个具体文件 ==================================
+ * 卸载前用来判断"正在使用的字体是不是这个包带来的"。
+ * 只比对**清单**，不做目录前缀匹配 —— 否则 /sdcard/fonts 下装了 10 个字体，
+ * 卸任何一个都会被"目录里有正在用的字体"误拦。
+ * 返回 false 也可能是"没有清单"(旧包)，调用方自行决定回退策略。 */
+bool am_asset_has_file(const char *zip_path, const char *target_dir, const char *fullpath)
+{
+    if (!zip_path || !zip_path[0] || !target_dir || !target_dir[0] || !fullpath) return false;
+
+    const char *b = strrchr(zip_path, '/');
+    b = b ? b + 1 : zip_path;
+    char stem[64];
+    size_t k = 0;
+    while (b[k] && b[k] != '.' && k + 1 < sizeof(stem)) { stem[k] = b[k]; k++; }
+    stem[k] = 0;
+    if (!stem[0]) return false;
+
+    char lst[336];
+    snprintf(lst, sizeof(lst), "%s/.pkg.%s.lst", target_dir, stem);
+    FILE *f = fopen(lst, "r");
+    if (!f) return false;
+
+    char line[288];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (!n) continue;
+        char p[336];
+        snprintf(p, sizeof(p), "%s/%s", target_dir, line);
+        if (strcmp(p, fullpath) == 0) { found = true; break; }
+    }
+    fclose(f);
+    return found;
 }

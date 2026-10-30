@@ -204,6 +204,13 @@ bool bt_manager_is_connecting(void);
 void bt_manager_cancel_connect(void);
 void bt_manager_enable(void);
 void bt_manager_disable(void);
+/* ★ 2026-10-30 按需加载: 最后使用者退出时调这个 —— 除了关射频, 还会**真拆栈**
+ * 归还 controller/Bluedroid/esp_hidh 占的约 67KB 内部 RAM.
+ * 由 os_hw 引用计数归零路径 (bt_stop) 调用, 多模块共用时不会被先退出者误关。
+ * 失败兜底 = 退回只关射频 (栈保留, 功能不坏), 与改造前行为一致。 */
+void bt_manager_disable_release(void);
+/* 是否配对过手柄 (只读 NVS, 不初始化蓝牙核心) — 入口据此决定要不要拉起蓝牙栈 */
+bool bt_manager_has_saved_pad(void);
 /* V1.5.x: 开机自动回连窗口 — 有已配对手柄时短窗口内低占空比直连上次手柄,
  * 连上即保持; 窗口超时未连上自动关栈回按需省电 (main.c 开机时调用, 0=默认30s). */
 void bt_manager_start_boot_reconnect(uint32_t window_ms);

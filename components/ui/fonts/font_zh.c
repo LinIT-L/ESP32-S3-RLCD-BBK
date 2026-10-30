@@ -27,13 +27,13 @@ static uint16_t *s_zh_order = NULL;
 static uint16_t s_zh_b0_start[256];
 static uint16_t s_zh_b0_cnt[256];   /* 用 uint16_t: b0=229 有 1490 字, uint8_t 会溢出导致桶错位 */
 
-static void font_zh_bind(void) {
+static void font_zh_bind_at(uint32_t off, uint32_t slot_len) {
     const uint8_t *d;
     size_t len;
     /* V1.0.9x 精简: 删除 24px 细宋(font_zh_light), 一律绑粗体 font_zh.bin.
      * font_zh_set_style 变为 no-op(恒粗体), 兼容历史调用. */
-    d = font_part_map(FONT_SLOT_ZH_OFF, FONT_SLOT_ZH_LEN);
-    len = FONT_SLOT_ZH_LEN;
+    d = font_part_map(off, slot_len);
+    len = slot_len;
     if (!d || len < 12 || memcmp(d, "ZH1FNT01", 8) != 0) {
         ESP_LOGD(TAG, "zh 绑定失败: d=%p len=%u", (void *)d, (unsigned)len);
         return;
@@ -49,7 +49,36 @@ static void font_zh_bind(void) {
     zh_font_data = (const uint8_t (*)[72])s_zh_glyphs;
     s_zh_bound = true;
     if (s_zh_order) { heap_caps_free(s_zh_order); s_zh_order = NULL; }  /* 重绑定失效索引 */
-    ESP_LOGI(TAG, "zh 绑定成功 count=%u", (unsigned)n);
+    ESP_LOGI(TAG, "zh 绑定成功 count=%u @0x%X", (unsigned)n, (unsigned)off);
+}
+
+static void font_zh_bind(void) {
+    font_zh_bind_at(FONT_SLOT_ZH_OFF, FONT_SLOT_ZH_LEN);
+}
+
+/* 2026-10-30: 重绑定到备用槽 (设置里切字体). 失败返回 false 且不改变当前字库. */
+bool font_zh_rebind(uint32_t off, uint32_t len) {
+    bool was = s_zh_bound;
+    uint32_t oldc = s_zh_count;
+    const uint8_t *oldc2 = s_zh_chars, *oldg = s_zh_glyphs;
+    s_zh_bound = false;
+    s_zh_count = 0;
+    s_zh_chars = NULL;
+    s_zh_glyphs = NULL;
+    zh_chars = NULL;
+    zh_font_data = NULL;
+    font_zh_bind_at(off, len);
+    if (!s_zh_bound) {
+        s_zh_bound = was;
+        s_zh_count = oldc;
+        s_zh_chars = oldc2;
+        s_zh_glyphs = oldg;
+        zh_chars = (const char *)oldc2;
+        zh_font_data = (const uint8_t (*)[72])oldg;
+        if (s_zh_order) { heap_caps_free(s_zh_order); s_zh_order = NULL; }
+        return false;
+    }
+    return true;
 }
 
 /* V1.0.90: 索引构建 (声明见文件顶部) */
@@ -127,10 +156,35 @@ bool font_zh_is_light(void) {
     return false;
 }
 
-/* V1.0.92: 查找 ASCII 字符索引. 字库中 ASCII 以 "0x00 0x00 <ascii>" 3 字节槽存放. */
+/* V1.0.92: 查找 ASCII 字符索引. 字库中 ASCII 以 "0x00 0x00 <ascii>" 3 字节槽存放.
+ *
+ * 性能修正: 当前 font_zh.bin 实际**不含任何 ASCII 槽**（字符表全是 3 字节 UTF-8），
+ * 旧实现每次画英文字符都要全表线性扫 6818 条、必然失败后才回落 FONT8X12，
+ * 一行 20 个英文就是 13 万次无效比较。这里改为首次调用时用一次全表扫描
+ * 判定"字库到底有没有 ASCII"，之后 O(1) 短路返回。行为与原实现完全一致。 */
+static int8_t s_zh_has_ascii = -1;   /* -1=未探测, 0=无, 1=有 */
+
+static bool zh_probe_ascii(void) {
+    if (s_zh_has_ascii >= 0) return s_zh_has_ascii != 0;
+    s_zh_has_ascii = 0;
+    if (s_zh_bound && s_zh_chars) {
+        for (uint32_t i = 0; i < s_zh_count; i++) {
+            int pos = i * 3;
+            if ((uint8_t)s_zh_chars[pos] == 0x00 &&
+                (uint8_t)s_zh_chars[pos + 1] == 0x00 &&
+                (uint8_t)s_zh_chars[pos + 2] < 0x80) {
+                s_zh_has_ascii = 1;
+                break;
+            }
+        }
+    }
+    return s_zh_has_ascii != 0;
+}
+
 int font_zh_find_ascii(unsigned char c) {
     if (!s_zh_bound) font_zh_bind();
     if (!s_zh_bound || !s_zh_chars) return -1;
+    if (!zh_probe_ascii()) return -1;          /* 字库无 ASCII：直接短路，不再全表扫描 */
     for (uint32_t i = 0; i < s_zh_count; i++) {
         int pos = i * 3;
         if ((uint8_t)s_zh_chars[pos]     == 0x00 &&
@@ -140,15 +194,4 @@ int font_zh_find_ascii(unsigned char c) {
         }
     }
     return -1;
-}
-
-/* 旧接口 - 已废弃, 仅做兼容 */
-int font_zh_find_char(char c) {
-    (void)c;
-    return -1;
-}
-
-const uint8_t *font_zh_get_bitmap(char c) {
-    (void)c;
-    return NULL;
 }

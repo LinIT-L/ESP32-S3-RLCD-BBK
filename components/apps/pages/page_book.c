@@ -54,7 +54,7 @@ static inline void s_bp__free(void) { if (s_bp__p) { heap_caps_free(s_bp__p); s_
 static bool s_reader_open = false;
 
 /* ==== 阅读优化设置 (3.3: 字号/字体/页码/边距/行高/字距/缩进/旋转) ==== */
-static int s_bs_fontsize = 1;   /* 0=20 1=24 2=28 3=32 */
+static int s_bs_fontsize = 1;   /* 0=16 1=24 2=32 3=48 (2026-10-31 四档) */
 static int s_bs_font     = 0;   /* 0=仿宋 1=黑体 2+=TF 字体索引 */
 static char s_bs_tfname[64] = {0};   /* 选中的 TF 字库文件名 */
 static int s_bs_pagenum  = 1;   /* 0=关 1=开 */
@@ -69,8 +69,9 @@ static void bs_load(void) {
     if (svc_nvs_open(BNS, NVS_READONLY, &h) == ESP_OK) {
         int32_t v;
         /* 字号三档: 0=16 1=24 2=32。旧存档 0..3 = 20/24/28/32 → 20→16, 24→24, 28/32→32 */
+        /* 字号 0..3 = 16/24/32/48。旧存档只有 0..2，语义不变，天然兼容。 */
         if (svc_nvs_get_i32(h, "fs", &v) == ESP_OK)
-            s_bs_fontsize = (v <= 0) ? 0 : (v == 1) ? 1 : 2;
+            s_bs_fontsize = (v < 0) ? 1 : (v > 3) ? 3 : (int)v;
         /* 字体: 0=仿宋 1=黑体 ≥2=TF 字库索引 (linit 保留, 以后读 TF 卡字体) */
         if (svc_nvs_get_i32(h, "ft", &v) == ESP_OK && v >= 0) s_bs_font = (int)v;
         if (svc_nvs_get_i32(h, "pn", &v) == ESP_OK && v >= 0 && v <= 1) s_bs_pagenum = (int)v;
@@ -101,8 +102,8 @@ static void bs_save(void) {
 }
 static int  bs_size_reader_idx(void);   /* 前置声明 (定义在下方): 三档字号 → 阅读器内部档位 */
 static void bs_apply(void) {
-    int style = (s_bs_font >= 2) ? 0 : s_bs_font;   /* TF 字库时不传内置 style, 防越界 */
-    if (s_bs_font >= 2 && s_bs_tfname[0]) {
+    int style = 0;                                   /* 内置字体只有一套（宋体），style 不再分仿宋/黑体 */
+    if (s_bs_font >= 1 && s_bs_tfname[0]) {
         char p[128]; snprintf(p, sizeof(p), "/sdcard/fonts/%s", s_bs_tfname);
         font_book_select_file(p);
     }
@@ -173,15 +174,23 @@ static void book_pad(char *buf, size_t len, int target, const char *name, const 
  *   2 = 32px  → font_zh16 的 **2 倍整数放大** (笔画干净; 不用 24→32 的 1.33 倍, 那会断笔)
  * ⛔ 20px / 28px 已去掉 —— 它们是"既非原生、又非整数倍"的两档, 缩放最糊。 */
 static const char *bs_fs_name(void) {
-    static const char *n[3] = { "16", "24", "32" };
-    return n[(s_bs_fontsize < 0) ? 1 : (s_bs_fontsize > 2) ? 2 : s_bs_fontsize];
+    /* 2026-10-30: 四档，从小到大 16 / 24 / 32 / 48。
+     * 48 不是新字体文件，是 24px 字形在绘制阶段做严格 2 倍点阵放大。 */
+    static const char *n[4] = { "16", "24", "32", "48" };
+    return n[(s_bs_fontsize < 0) ? 1 : (s_bs_fontsize > 3) ? 3 : s_bs_fontsize];
 }
-/* → 阅读器内部档位 (其表 {16,20,24,28,32}): 16→0, 24→2, 32→4 */
+/* → 阅读器档位。两边现在是**同一套** 0..3 = 16/24/32/48，直接透传。
+ * ⚠ 旧实现查的是 {0,2,4}，而阅读器把档位夹在 0..3 ⇒ 32px 档(4) 被夹成 3(24px)，
+ *   菜单写 32、实际画 24。现在档位一一对应，不再有夹值。 */
 static int bs_size_reader_idx(void) {
-    static const int t[3] = { 0, 2, 4 };
-    return t[(s_bs_fontsize < 0) ? 1 : (s_bs_fontsize > 2) ? 2 : s_bs_fontsize];
+    return (s_bs_fontsize < 0) ? 1 : (s_bs_fontsize > 3) ? 3 : s_bs_fontsize;
 }
-static const char *bs_font_name(void) { return s_bs_font ? "\xe9\xbb\x91\xe4\xbd\x93" : "\xe4\xbb\xbf\xe5\xae\x8b"; } /* 黑体/仿宋 */
+static const char *bs_font_name(void) {
+    /* 2026-10-31: 也走中文短名, 与滚轮/阅读器菜单保持一致 */
+    static char s_disp[24];
+    if (s_bs_font >= 1 && s_bs_tfname[0]) return font_book_short_name(s_bs_tfname, s_disp, sizeof(s_disp));
+    return "\xe5\x86\x85\xe7\xbd\xae\xe5\xad\x97\xe4\xbd\x93";   /* 内置字体 */
+}
 static const char *bs_on_off(int v) { return v ? "\xe5\xbc\x80" : "\xe5\x85\xb3"; } /* 开/关 */
 static const char *bs_mg_name(void) {
     switch (s_bs_margin) { case 0: return "\xe6\x94\xb6\xe7\xaa\x84"; /*收窄*/ case 2: return "\xe5\x8a\xa0\xe5\xae\xbd"; /*加宽*/ default: return "\xe4\xb8\xad\xe7\xad\x89"; /*中等*/ }
@@ -263,7 +272,7 @@ static void tf_font_scan(void) {
     while ((e = readdir(d)) && s_tf_font_n < 16) {
         if (e->d_name[0] == '.') continue;
         const char *ext = strrchr(e->d_name, '.');
-        if (ext && (strcasecmp(ext, ".fnt") == 0 || strcasecmp(ext, ".bin") == 0))
+        if (ext && strcasecmp(ext, ".lbf") == 0)
             snprintf(s_tf_fonts[s_tf_font_n++], 64, "%.63s", e->d_name);
     }
     closedir(d);
@@ -410,12 +419,12 @@ static void bs_wheel_push(ui_ctx_t *ctx) {
     os_dialog_push(ctx, &dlg);
 }
 
-/* 字号 (3 档: 16/24/32) */
+/* 字号 (4 档: 16/24/32/48，从小到大) */
 static void bs_wheel_commit_size(void) { s_bs_fontsize = s_bs_wheel_idx; bs_save(); bs_apply(); }
 static void bs_size_wheel_open(ui_ctx_t *ctx) {
-    static const char *opts[] = { "16", "24", "32" };
-    for (int i = 0; i < 3; i++) s_bs_wheel_opts[i] = opts[i];
-    s_bs_wheel_n = 3;
+    static const char *opts[] = { "16", "24", "32", "48" };
+    for (int i = 0; i < 4; i++) s_bs_wheel_opts[i] = opts[i];
+    s_bs_wheel_n = 4;
     s_bs_wheel_idx = s_bs_fontsize;
     s_bs_wheel_commit = bs_wheel_commit_size;
     bs_wheel_push(ctx);
@@ -424,11 +433,11 @@ static void bs_size_wheel_open(ui_ctx_t *ctx) {
 /* 字体: 内置仿宋/黑体 + TF 字库 */
 static void bs_wheel_commit_font(void) {
     int idx = s_bs_wheel_idx;
-    if (idx < 2) {
-        s_bs_font = idx;   /* 0=仿宋 1=黑体 */
+    if (idx < 1) {
+        s_bs_font = 0;     /* 0=内置字体 */
         bs_save(); bs_apply();
     } else {
-        int fi = idx - 2;
+        int fi = idx - 1;
         if (fi >= 0 && fi < s_tf_font_n) {
             char path[128];
             snprintf(path, sizeof(path), "/sdcard/fonts/%s", s_tf_fonts[fi]);
@@ -441,15 +450,20 @@ static void bs_wheel_commit_font(void) {
         }
     }
 }
+/* 2026-10-31: 滚轮显示**中文短名**（原来直接列 "fusion8.lbf" 这种文件名）。
+ *   映射与阅读器菜单共用 font_book_short_name(), 两处名字永远一致。
+ *   显示缓冲按条目静态保存 —— 滚轮长期持有 opts 指针, 不能返回临时栈缓冲。 */
+static char s_bs_font_disp[24][24];
 static void bs_font_wheel_open(ui_ctx_t *ctx) {
     tf_font_scan();
     int n = 0;
-    s_bs_wheel_opts[n++] = "\xe4\xbb\xbf\xe5\xae\x8b";  /* 仿宋 */
-    s_bs_wheel_opts[n++] = "\xe9\xbb\x91\xe4\xbd\x93";  /* 黑体 */
-    for (int i = 0; i < s_tf_font_n && n < 24; i++)
-        s_bs_wheel_opts[n++] = s_tf_fonts[i];
+    s_bs_wheel_opts[n++] = "\xe5\x86\x85\xe7\xbd\xae\xe5\xad\x97\xe4\xbd\x93";  /* 内置字体 */
+    for (int i = 0; i < s_tf_font_n && n < 24; i++) {
+        font_book_short_name(s_tf_fonts[i], s_bs_font_disp[i], sizeof(s_bs_font_disp[i]));
+        s_bs_wheel_opts[n++] = s_bs_font_disp[i];
+    }
     s_bs_wheel_n = n;
-    s_bs_wheel_idx = (s_bs_font < 2) ? s_bs_font : 2;
+    s_bs_wheel_idx = (s_bs_font < 1) ? 0 : s_bs_font;
     s_bs_wheel_commit = bs_wheel_commit_font;
     bs_wheel_push(ctx);
 }
@@ -494,7 +508,7 @@ static int book_left_total(void) {
 /* 左栏显示名 */
 
 /* 右栏平滑滚动最大偏移 */
-static int book_max_off(void) {
+static int __attribute__((unused)) book_max_off(void) {
     int list_y = s_bp.list_y > 0 ? s_bp.list_y : 30;
     int total = s_bp.settings_mode ? s_bp.settings_count : s_bp.item_count;
     int mo = total * SL_ROW_H - (ui_screen_h() - 4 - list_y);

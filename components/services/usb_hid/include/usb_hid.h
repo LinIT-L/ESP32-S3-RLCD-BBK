@@ -34,8 +34,10 @@ esp_err_t usb_composite_enter_net(void);
 /* 切换到 HID 键鼠 + CDC 复合设备, 控制台重定向到 CDC. 供键鼠流程调用. */
 esp_err_t usb_composite_enter_hid(void);
 
-/* 退出任意 TinyUSB 模式, 回到正常模式 (恢复 Serial/JTAG 串口控制台). */
-void usb_composite_exit(void);
+/* 退出任意 TinyUSB 模式, 回到正常模式 (恢复 Serial/JTAG 串口控制台).
+ * 返回 ESP_OK = 串口驱动已确认装回; 失败时内部保留失败态(可重试), 状态不会被谎报为正常.
+ * USB-BT / USB-NET 的退出路径紧接着 esp_restart(), 可忽略返回值. */
+esp_err_t usb_composite_exit(void);
 
 /* 当前 USB 设备是否已枚举 (处于 TinyUSB 模式且被主机枚举) */
 bool usb_composite_is_connected(void);

@@ -70,6 +70,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include "sd_scan.h"   /* sd_is_mounted: logsave 前判断卡是否挂着 */
+#include "svc_log.h"   /* svc_log_flush_once(): logsave 要按真实返回值报告 (2026-10-29) */
 #include "bt_manager.h"     /* ★ 2026-10-27: bt 命令诊断用 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -102,6 +103,7 @@ void rc_touch_scan(void);   /* 定义在文件末尾: 触摸 I2C 总线扫描 */
 #include "tone_player.h"   /* beep: 纯音测试 (绕过 MP3/解码/SD, 分离固件 vs 喇叭硬件) */
 #include "gps.h"           /* gps: 查 GPS 电源状态 (待机 46µA / 跟踪 ~10mA) */
 #include "esp_pm.h"        /* pm: 打印 PM 配置 + 锁表 (看 DFS/浅睡是否被驱动锁住) */
+#include "power_mgr.h"     /* sleepstage: 分阶段功耗诊断掩码 (2026-10-28 从 sleep.h 迁出) */
 #include "board_battery.h" /* bat: 电池 raw/脚上mV/分压系数/VBAT 现场核对 (2026-10-14) */
 #include "am_store_json.h"   /* ★ am_rpkg_t (storedl 命令用) */
 
@@ -304,6 +306,20 @@ static void rc_task_gpssleep(void *arg)
     vTaskDelete(NULL);
 }
 
+/* ★★★ 2026-10-28: 关机任务壳 —— 与 gpsdiag 同一个坑。
+ *   实测(2026-10-28): 直接在 remcon 任务里调 os_remote_shutdown → wp_power_off,
+ *   日志打出 "***ERROR*** A stack overflow in task remcon has been detected." 然后复位重启。
+ *   原因: wp_power_off 里要跑 GPS 停靠(装 UART + 听 1.8s + 发 PMREQ + 静默复核)、
+ *   遍历 49 个引脚做 isolate、并且大量日志格式化, remcon 那几 KB 栈根本装不下。
+ *   所以关机必须扔到独立大栈任务里跑(8KB, 深睡路径调用链最深)。 */
+static void rc_task_shutdown(void *arg)
+{
+    int auto_mode = (int)(intptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(200));   /* 先把串口回显送出去, 再开始关外设 */
+    os_remote_shutdown(auto_mode);    /* 不返回 */
+    vTaskDelete(NULL);
+}
+
 static void rc_cmd_immediate(const char *line){
     char args[RC_LINE_MAX];
     snprintf(args, sizeof(args), "%s", line);
@@ -331,6 +347,21 @@ static void rc_cmd_immediate(const char *line){
         printf("REMOCON_READY v1\r\n");
     } else if (strcmp(cmd, "echo") == 0) {
         printf("ECHO %s\r\n", rest ? rest : "");
+    } else if (strcmp(cmd, "sleepstage") == 0) {
+        /* ★ 2026-10-28 分阶段深睡诊断 (任务书第五步):
+         *   sleepstage 0x13   ⇒ 只关 屏(0x01)+音频(0x02)+GPS(0x10), SD/触摸/震动保持原状, 立刻深睡
+         *   sleepstage 0x7F   ⇒ 全关(等同正常关机)
+         *   sleepstage 0      ⇒ 什么都不关, 只让 ESP 深睡 (测"ESP 自己"的底)
+         * 用法: 每档配外接电流表, 逐项对账谁在耗电。位:
+         *   0x01屏 0x02音频 0x04SD 0x08触摸 0x10GPS 0x20震动 0x40引脚隔离 */
+        char *av = rc_next(&rest);
+        uint32_t m = av ? (uint32_t)strtoul(av, NULL, 0) : 0x7Fu;
+        power_mgr_set_stage(m);
+        printf("SLEEPSTAGE mask=0x%02X ⇒ 立即深睡 (01屏 02音频 04SD 08触摸 10GPS 20震动 40隔离)\r\n",
+               (unsigned)(m & 0x7Fu));
+        printf("⚠ 唤醒后 mask 复位 0x7F; 本模式只用于测量, 不要作为正式关机路径\r\n");
+        fflush(stdout);
+        xTaskCreate(rc_task_shutdown, "shutdn", 8192, (void *)(intptr_t)0, 3, NULL);
     } else if (strcmp(cmd, "shutdown") == 0 || strcmp(cmd, "pwr") == 0 ||
                strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "sleep") == 0) {
         /* 关机 = 深度休眠(复位式)。shutdown [auto|manual]:
@@ -339,8 +370,12 @@ static void rc_cmd_immediate(const char *line){
         int auto_mode = (rest && strstr(rest, "auto") != NULL) ? 1 : 0;
         printf("REMOCON_SHUTDOWN %s\r\n", auto_mode ? "auto" : "manual");
         fflush(stdout);
-        vTaskDelay(pdMS_TO_TICKS(300));   /* 给串口回显留时间 */
-        os_remote_shutdown(auto_mode);    /* 深度休眠, 不返回 */
+        /* ★ 2026-10-28: 改到独立 8KB 任务执行。原来在这里直接调 os_remote_shutdown,
+         *   remcon 栈装不下 wp_power_off 的调用链 ⇒ stack overflow ⇒ 复位重启,
+         *   看起来像"发 shutdown 只是重启了一下"。 */
+        BaseType_t ok = xTaskCreate(rc_task_shutdown, "shutdn", 8192,
+                                    (void *)(intptr_t)auto_mode, 3, NULL);
+        if (ok != pdPASS) printf("SHUTDOWNERR 任务创建失败(内存不足)\r\n");
     } else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0) {
         printf("REMOCON_REBOOT\r\n");
         printf("REMOCON_REBOOT\r\n");
@@ -880,6 +915,33 @@ static void rc_cmd_immediate(const char *line){
             printf("PIN %d cfg=%s level=%d\r\n", n, esp_err_to_name(e),
                    e == ESP_OK ? gpio_get_level((gpio_num_t)n) : -1);
         }
+    } else if (strcmp(cmd, "gray") == 0) {
+        /* gray [0|1] → 灰阶算法: 0 = 点聚 2x2 (默认, 原实现) / 1 = 4x4 Bayer (实验)。
+         * 两个模拟器(GB/GBC 与 NES)共用 board_shim 里同一套表 ⇒ 一次切换同时生效;
+         * 切换会重建三张表并作废帧指纹, 下一次 flush 强制整屏重画。
+         * 两者填充率相同(dots/4), 整体亮度不变, 可直接肉眼 A/B。 */
+        extern void board_shim_set_gray_alg(int alg);
+        extern int  board_shim_get_gray_alg(void);
+        char *a = rc_next(&rest);
+        if (!a || !*a) {
+            printf("GRAY %d (0=cluster 1=bayer)\r\n", board_shim_get_gray_alg());
+        } else {
+            board_shim_set_gray_alg((int)strtol(a, NULL, 0) != 0);
+            printf("GRAY %d -> ok (下一次刷屏整屏重画)\r\n", board_shim_get_gray_alg());
+        }
+    } else if (strcmp(cmd, "lcdperf") == 0) {
+        /* lcdperf → ST7305 flush 分段耗时汇总 (命令段/数据段/总耗时 的 avg·min·max)。
+         * 需编译期把 components/drivers/st7305/st7305.c 的 ST7305_PERF_STATS 改成 1;
+         * 关闭时这里只打印"未启用", 不占任何静态 RAM。
+         * `lcdperf reset` 清零后重新采样。 */
+        char *a = rc_next(&rest);
+        if (a && (!strcmp(a, "reset") || !strcmp(a, "0"))) {
+            st7305_perf_reset();
+            printf("LCDPERF reset ok\r\n");
+        } else {
+            st7305_perf_dump();
+            printf("LCDPERF dump (详见日志)\r\n");
+        }
     } else if (strcmp(cmd, "partial") == 0) {
         /* partial [0|1] → 局刷开关(默认 0=整帧)。开之前先确认不会出现"某几行横移"。 */
         char *a = rc_next(&rest);
@@ -908,10 +970,20 @@ static void rc_cmd_immediate(const char *line){
                printf("PACE %s -> ok\r\n", os_ui_get_pace() ? "固定" : "自动(0)"); }
     } else if (strcmp(cmd, "logsave") == 0) {
         /* logsave → 把内存里的日志缓冲**一次性**追加写入 /sdcard/data/log/bbk.log。
-         * 平时不再自动写卡(省电/护卡/保数据), 只有需要备份或排查时手动触发。 */
-        void svc_log_drain(void);
-        if (!sd_is_mounted()) printf("RC_ERR logsave: TF 未挂载\r\n");
-        else { svc_log_drain(); printf("LOGSAVE ok -> /sdcard/data/log/bbk.log\r\n"); }
+         * 平时不再自动写卡(省电/护卡/保数据), 只有需要备份或排查时手动触发。
+         * ★ 2026-10-29: 必须按真实返回值报告 —— 原来无条件打 "LOGSAVE ok",
+         *   即使 fopen 失败 / 文件已到 1MB 也报成功, 排查会被彻底带偏。 */
+        esp_err_t lr = svc_log_flush_once();
+        if (lr == ESP_OK)
+            printf("LOGSAVE ok -> /sdcard/data/log/bbk.log\r\n");
+        else if (lr == ESP_ERR_INVALID_STATE)
+            printf("RC_ERR logsave: TF 未挂载 (缓冲保留)\r\n");
+        else if (lr == ESP_ERR_INVALID_SIZE)
+            printf("RC_ERR logsave: 文件已达 1MB, 先 rm /sdcard/data/log/bbk.log (旧日志未删)\r\n");
+        else if (lr == ESP_ERR_TIMEOUT)
+            printf("RC_ERR logsave: 等锁超时 (缓冲保留, 稍后重试)\r\n");
+        else
+            printf("RC_ERR logsave: %s (缓冲视情况保留, 可重试)\r\n", esp_err_to_name(lr));
     } else if (strcmp(cmd, "ls") == 0) {
         char *d = rc_next(&rest); if (!d || !*d) d = "/sdcard";
         DIR *dd = opendir(d);
@@ -1243,7 +1315,12 @@ static void rc_exec(const char *line){
         strcmp(cmd, "rst") == 0 ||
         strcmp(cmd, "now") == 0 || strcmp(cmd, "espnow") == 0 ||
         strcmp(cmd, "logsave") == 0 || strcmp(cmd, "fps") == 0 ||
-        strcmp(cmd, "pace") == 0 || strcmp(cmd, "chrg") == 0 || strcmp(cmd, "pin") == 0 || strcmp(cmd, "partial") == 0 ||
+        strcmp(cmd, "pace") == 0 || strcmp(cmd, "chrg") == 0 || strcmp(cmd, "pin") == 0 ||         strcmp(cmd, "partial") == 0 ||
+        strcmp(cmd, "lcdperf") == 0 ||   /* ★ 2026-10-30: flush 分段耗时汇总 */
+        strcmp(cmd, "gray") == 0 ||      /* ★ 2026-10-30: 灰阶算法 cluster/bayer 切换 */
+        strcmp(cmd, "sleepstage") == 0 ||   /* ★ 2026-10-29: 原先只加进 rc_cmd_immediate,
+                                             *   但本白名单没放行 ⇒ 一直 "unknown cmd"。
+                                             *   分阶段诊断从上线起就是不可用的, 实测才发现。 */
         strcmp(cmd, "sleep") == 0) {
         rc_cmd_immediate(line);   /* 传原始行(含参数); buf 已被 rc_next 截断 */
         return;
@@ -1526,11 +1603,26 @@ void remcon_tick(ui_ctx_t *ctx){
     }
 }
 
+/* ★ 2026-10-29 修复栈溢出: 原来写 4096 且注释写"16KB/峰值12.2KB", 但 **ESP-IDF 的
+ *   usStackDepth 单位是字节**(task.h: "NUMBER OF BYTES. Note that this differs from
+ *   vanilla FreeRTOS") ⇒ 实际只有 4KB。真机实测 `ls /sdcard` 后 uxTaskGetStackHighWaterMark
+ *   只剩 140B、最低 92B, 下一条命令行即触发 "A stack overflow in task remcon" 整机重启。
+ *   调用链: rc_task(acc[256]) → rc_exec(buf[256]+cmd[32]) → rc_cmd_immediate(args[256]+
+ *   cp 分支 buf[1024]) → printf/vfs/usb_serial_jtag, 叠加后约 4KB。
+ *   改 16KB(4 倍余量), 代价内部 RAM −12KB(桌面基线 205.9KB → 约 193.6KB)。 */
+#define RC_TASK_STACK   16384
+
 void remcon_init(void){
     s_q = xQueueCreate(RC_QUEUE_LEN, sizeof(rc_cmd_t));
     if (!s_q) { ESP_LOGD(RC_TAG, "queue create failed"); return; }
-    BaseType_t ok = xTaskCreatePinnedToCore(rc_task, "remcon", 4096, NULL, 2, NULL, 1);   /* ★ 20KB→16KB: 实测峻值 12.2KB */
-    ESP_LOGI(RC_TAG, "remote console up, task=%s", ok == pdPASS ? "ok" : "fail");
+    BaseType_t ok = xTaskCreatePinnedToCore(rc_task, "remcon", RC_TASK_STACK, NULL, 2, NULL, 1);
+    if (ok != pdPASS) {
+        /* 任务没起来就没人消费队列: 直接把队列还回去, 别留个空壳 + 白占 384B。 */
+        vQueueDelete(s_q); s_q = NULL;
+        ESP_LOGE(RC_TAG, "remote console task create failed (stack=%d B)", RC_TASK_STACK);
+        return;
+    }
+    ESP_LOGI(RC_TAG, "remote console up, stack=%d B, task=ok", RC_TASK_STACK);
 }
 
 /* ===== tpscan: 触摸 I2C 总线诊断 (只读, 不改任何配置) =====

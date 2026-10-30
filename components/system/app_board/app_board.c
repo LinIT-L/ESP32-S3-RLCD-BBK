@@ -230,17 +230,64 @@ void app_board_init_battery(app_board_t *board)
 /* 阶段5: GPS (u-blox MAX-M10S, UART). 见 gps.h 的接线与 API 说明. */
 void app_board_init_gps(app_board_t *board)
 {
-    /* ★★★ 2026-10-24 开机只做"停靠", 不做完整初始化:
-     *   开机唯一目的是别让模块 10mA 空转 —— 不需要 autobaud、不需要 GSV 提频、
-     *   不需要解析服务。gps_boot_park() 静听 300ms: 没输出=本来就在睡(不动),
-     *   有输出=发 PMREQ 送睡, 乱码=完整初始化兜底; 结束时 UART 已卸载、内部 RAM 归零。
-     *   应用要定位时 app.gps.start() 会自己 gps_init()+gps_wakeup() 全套重来。
-     *   实测: 原同步路径 900~4200ms → 现在 ~320ms, 且不占任何常驻资源。 */
+    /* ★★★ 2026-10-28 linit 要求: GPS **前 3 次开机各探测一次**, 之后按结果定终身。
+     *   ① 探测到(收到过有效帧) ⇒ 以后不再"探测", 但每次开机仍要停靠 ——
+     *      GPS 的 VCC 常通、而 backup 模式不保留配置, ESP 重启后它是醒的,
+     *      不送待机就是 10~25mA 空转;
+     *   ② 3 次都没探测到 ⇒ 认为本板没装 GPS, 以后**一个引脚都不碰**
+     *      (否则会去 hold/isolate 一个可能被别的功能占用的脚);
+     *   ③ 计数存 NVS 跨重启保留; 用户重新焊了模块, 可在 设置→硬件 里点 GPS 重新识别
+     *      (那条路径会清掉 gps_probe_n / gps_found 两个 key)。
+     *   为什么要有这个: 每次开机都跑一遍探测 = 1.8s 静听 + 最多 3.2s 静默判据,
+     *   对一块根本没装 GPS 的板子纯属浪费启动时间。 */
+    uint8_t probe_n = 0, found = 0;
+    nvs_handle_t h;
+    if (svc_nvs_open("hwcfg", NVS_READONLY, &h) == ESP_OK) {
+        svc_nvs_get_u8(h, "gps_probe_n", &probe_n);
+        svc_nvs_get_u8(h, "gps_found",   &found);
+        svc_nvs_close(h);
+    }
+
+    if (found) {
+        /* 已知有 GPS: 直接停靠, 不再做"有没有"的判断 */
+        esp_err_t ret = gps_boot_park();
+        board->gps_ok = (ret == ESP_OK);
+        if (ret != ESP_OK) ESP_LOGW(TAG, "GPS 开机停靠失败: %s", esp_err_to_name(ret));
+        return;
+    }
+    if (probe_n >= 3) {
+        /* ★★★ 2026-10-28 重要修正: 探测满 3 次只停止"探测/统计", **绝不能停止停靠**。
+         *   GPS 的 VCC 是常通的, 而 backup 模式不保留配置 ⇒ **每次开机它都是醒的**,
+         *   不送待机就是 10~25mA 空转。这是功耗问题, 不是启动时间问题, 一分都不能省。
+         *   (第一版写成"3 次后一个引脚都不碰", 那会在没探测到模块时把 GPS 丢在醒着状态,
+         *    功耗比"每次多花 2 秒探测"严重得多。) */
+        esp_err_t ret = gps_boot_park();
+        board->gps_ok = (ret == ESP_OK);
+        if (ret != ESP_OK) ESP_LOGW(TAG, "GPS 开机停靠失败: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "GPS: 探测已满 %u 次(未确认存在), 本次只停靠不再统计", (unsigned)probe_n);
+        return;
+    }
+
+    /* 第 N 次探测 */
+    uint8_t n = (uint8_t)(probe_n + 1);
     esp_err_t ret = gps_boot_park();
     board->gps_ok = (ret == ESP_OK);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "GPS 开机停靠失败: %s", esp_err_to_name(ret));
+
+    bool seen = gps_seen_valid_frame();
+    if (seen) {
+        found = 1;
+        ESP_LOGW(TAG, "GPS: 第 %u 次探测**确认存在**(收到有效帧) ⇒ 以后不再探测, 只做停靠",
+                 (unsigned)n);
+    } else {
+        ESP_LOGW(TAG, "GPS: 第 %u/3 次探测未收到有效帧(模块可能在待机, 或本板未安装)", (unsigned)n);
     }
+    if (svc_nvs_open("hwcfg", NVS_READWRITE, &h) == ESP_OK) {
+        svc_nvs_set_u8(h, "gps_probe_n", n);
+        if (found) svc_nvs_set_u8(h, "gps_found", 1);
+        svc_nvs_commit(h);
+        svc_nvs_close(h);
+    }
+    if (ret != ESP_OK) ESP_LOGW(TAG, "GPS 开机停靠失败: %s", esp_err_to_name(ret));
 }
 
 /* 旧名兼容: 只做一次停靠就退出(不等价于管家, 管家是常驻的) */
@@ -363,6 +410,17 @@ static void gps_probe_task(void *arg)
 
 void app_board_gps_probe_async(void)
 {
+    /* ★ 2026-10-28: 用户手动"重新识别 GPS" ⇒ 必须把"前 3 次探测"的账一起清零。
+     *   否则探到过一次之后 gps_found 恒为 1, 以后开机都不再探测,
+     *   用户点了"重新识别"也看不到"重新判断"的效果(只是又停靠了一次)。 */
+    nvs_handle_t h;
+    if (svc_nvs_open("hwcfg", NVS_READWRITE, &h) == ESP_OK) {
+        svc_nvs_erase_key(h, "gps_probe_n");
+        svc_nvs_erase_key(h, "gps_found");
+        svc_nvs_commit(h);
+        svc_nvs_close(h);
+        ESP_LOGW(TAG, "GPS 重新识别: 已清零探测计数/发现标记");
+    }
     if (xTaskCreate(gps_probe_task, "gps_probe", 4096, NULL, 2, NULL) != pdPASS)
         hw_cfg_set_gps_present(app_board_gps_probe());   /* 建任务失败就同步探 */
 }

@@ -51,6 +51,10 @@ static int s_cal_n = 0;
 #define WD_MAX_RECOVER     6        /* 3 分钟内最多恢复次数 */
 #define WD_THROTTLE_MS     180000
 #define WD_RECOVER_WAIT    200      /* 等总线空闲最长 200ms */
+/* 看门狗任务栈 = **字节数**(IDF 的 StackType_t 是 uint8_t, 见 init 里的说明)。
+ * 4096 = 4KB: 覆盖 恢复路径(rm/re-add I2C 设备 + 删/重建总线 + 重探测 + 日志) 的峰值。
+ * 真机 vTaskList 高水位: 峰值约 1.6KB ⇒ 余 ~2.4KB。⛔ 别再往小改(1536 那次就是教训)。 */
+#define TOUCH_WD_STACK_BYTES  4096
 
 static volatile int      s_busy = 0;          /* 读取任务占用计数 */
 static volatile bool     s_recovering = false;/* 恢复中: 读取免阻塞返回 */
@@ -305,10 +309,23 @@ tp_chip_t touch_panel_init(void) {
     }
     /* 启动后台触摸看门狗 (V1.0.68) */
     if (!s_wd_task) {
-        /* ★2026-10-16 内存优化: 栈放 PSRAM(不涉 DMA/cache 关断路径) */
-        xTaskCreateWithCaps(touch_watchdog_task, "touch_wd", 1536, NULL, 2, &s_wd_task,   /* ★ 12KB→6KB: 实测仅用 2.8KB */
-                            MALLOC_CAP_SPIRAM);
-        ESP_LOGI(TAG, "触摸看门狗已启动");
+        /* ★2026-10-16 内存优化: 栈放 PSRAM(不涉 DMA/cache 关断路径)
+         * ⛔ 单位是**字节**, 不是 32bit 字 —— IDF 的 portSTACK_TYPE = uint8_t,
+         *   xTaskCreateWithCaps 内部就是 heap_caps_malloc(depth * sizeof(StackType_t)),
+         *   sizeof = 1 ⇒ 参数值直接等于字节数。
+         * ★2026-10-30: 原值 1536 实为 **1.5KB**(旧注释"12KB→6KB / 实测仅用 2.8KB"
+         *   把它当 4 字节字算, 差了 4 倍)。恢复路径要 rm/re-add I2C 设备、删/重建总线、
+         *   重探测 + ESP_LOG ⇒ 当天先升到 3072(3KB), 再按"稳定性优先"定到 4096(4KB):
+         *   真机高水位峰值约 1.6KB, 4KB 留 ~2.4KB 余量, 不为省 1KB 去压栈。
+         *   注: 双点/高频点击只影响"多久触发一次恢复", 不改变单次恢复的栈深度。 */
+        BaseType_t wd_ok = xTaskCreateWithCaps(touch_watchdog_task, "touch_wd", TOUCH_WD_STACK_BYTES,
+                                              NULL, 2, &s_wd_task, MALLOC_CAP_SPIRAM);
+        if (wd_ok != pdPASS) {
+            s_wd_task = NULL;          /* 保持 NULL, 下次 init 还能再试 */
+            ESP_LOGE(TAG, "触摸看门狗创建失败(PSRAM 不足) ⇒ 触摸异常将无人自动恢复");
+        } else {
+            ESP_LOGI(TAG, "触摸看门狗已启动 (栈 %d 字节)", TOUCH_WD_STACK_BYTES);
+        }
     }
     return s_chip;
 }
@@ -525,6 +542,10 @@ static void touch_watchdog_task(void *arg) {
         if (do_full) touch_panel_recover();
         else         touch_panel_soft_recover();
         s_recovering = false;
+        /* 低频栈水位: 只在**真跑过一次恢复**之后打 (500ms 周期里极少发生),
+         * 正常运行时一条都不打, 不影响实时性。IDF 里返回值单位是字节。 */
+        ESP_LOGW(TAG, "看门狗恢复完成, 栈最低余量 %u 字节 / 共 %d",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL), TOUCH_WD_STACK_BYTES);
     }
 }
 

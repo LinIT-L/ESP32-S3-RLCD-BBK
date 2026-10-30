@@ -2,7 +2,7 @@
 # 适配 gb_emu 到 st7305 + audio_player
 
 idf_component_register(
-    SRCS "board_shim.c"
+    SRCS "board_shim.c" "gray_quant.c"
     INCLUDE_DIRS "include"
     REQUIRES
         st7305

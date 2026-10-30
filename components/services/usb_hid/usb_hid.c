@@ -200,15 +200,59 @@ typedef enum {
     USB_MODE_MSC,          /* 挂载: MSC + CDC */
     USB_MODE_BTH,          /* USB-BT: 蓝牙适配器 HCI */
     USB_MODE_NET,          /* USB 网卡共享: USB-RNDIS 有线网卡 */
+
+    /* ★ 2026-10-29 新增两个"失败态"(不是正常运行态, 只用于如实记录 + 允许重试):
+     *   不加这两个态的话, exit 失败会被一律写成 NORMAL, 而 exit 的第一句就是
+     *   "if (s_mode == NORMAL) return", 于是重试入口自己把自己锁死 —— 只能断电重启。 */
+    USB_MODE_RECOVER_FAIL, /* TinyUSB 已确认卸净(PHY pad 已 disable), 但 Serial/JTAG 没装回来
+                            *   ⇒ 重试动作 = **只装 SJ**(不必再卸 TinyUSB, 否则是重复卸载) */
+    USB_MODE_TINYUSB_STUCK,/* TinyUSB 卸载返回错误(task_stop / usb_del_phy 失败)
+                            *   ⇒ PHY 可能仍归 OTG, 此时直接装 SJ 会两边抢 pad
+                            *   ⇒ 重试动作 = **先卸 TinyUSB, 再装 SJ** */
 } usb_mode_t;
 
 static usb_mode_t s_mode = USB_MODE_NORMAL;
+
+/* 是否处于"TinyUSB 在跑"的四个正常模式 */
+static inline bool mode_is_tinyusb(usb_mode_t m)
+{
+    return m == USB_MODE_HID || m == USB_MODE_MSC || m == USB_MODE_BTH || m == USB_MODE_NET;
+}
 
 /* 切换期间日志接管: 只丢弃输出, 不写任何串口 (切换窗口几 ms, 丢失可忽略) */
 static int usb_log_discard(const char *fmt, va_list arg)
 {
     (void)fmt; (void)arg;
     return 0;
+}
+
+/* ═══ 把 Serial/JTAG 驱动(=USB PHY pad) 装回来 —— 幂等、可重试 ═══
+ * 为什么必须靠 install 才能恢复: tinyusb_driver_uninstall() 内部走 usb_del_phy(),
+ *   而 usb_del_phy() 对内部 PHY 做的是 "Clear pullup and pulldown loads on D+ / D-,
+ *   and disable the pads" (esp-idf components/usb/usb_phy.c:463-466) —— 也就是把 D+/D- 上拉
+ *   清掉、pad 关掉。唯一能重新打开的是 usb_serial_jtag_driver_install() 里的
+ *   usb_serial_jtag_ll_phy_enable_pad(true) (esp_driver_usb_serial_jtag/usb_serial_jtag.c:213-216)。
+ *   ⇒ install 失败 = pad 仍关着 = 主机枚举不到设备(而设备本身一切正常)。
+ * 幂等: IDF 对"已安装"会返回 ESP_ERR_INVALID_STATE 并自己打一条 E 日志(看起来像真故障),
+ *   所以先用官方查询 usb_serial_jtag_is_driver_installed() 短路。
+ * ⚠ is_driver_installed() 只说明"驱动对象在不在", **不能**代表 PHY 状态:
+ *   开机默认态也是"未安装"但 PHY 正常(ROM 配置, console 走 ROM)。所以它只用于幂等,
+ *   不能拿来判断"串口是否健康"—— 健康与否由 s_mode 这段操作历史表达。 */
+static bool usj_restore(void)
+{
+    if (usb_serial_jtag_is_driver_installed()) {
+        ESP_LOGI(TAG, "Serial/JTAG 驱动已在位, 跳过重装(幂等)");
+        return true;
+    }
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();  /* tx/rx 各 256B */
+    esp_err_t r = usb_serial_jtag_driver_install(&cfg);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "Serial/JTAG 重装失败(%s) ⇒ PHY pad 仍关闭, 主机枚举不到串口",
+                 esp_err_to_name(r));
+        return false;
+    }
+    ESP_LOGI(TAG, "Serial/JTAG 已恢复 (PHY pad 已开, 主机将重新枚举)");
+    return true;
 }
 
 /* 进入 TinyUSB 模式: 卸载 Serial/JTAG → 装复合/纯 MSC 设备.
@@ -240,39 +284,118 @@ static esp_err_t usb_mode_enter(const uint8_t *config_desc, const char **strings
 
     esp_err_t ret = tinyusb_driver_install(&cfg);
     if (ret != ESP_OK) {
-        /* 失败: 装回 Serial/JTAG 驱动, 恢复原控制台, 避免串口永久失效 */
-        ESP_LOGD(TAG, "进入 TinyUSB 模式失败: %s", esp_err_to_name(ret));
-        usb_serial_jtag_driver_config_t sj_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-        usb_serial_jtag_driver_install(&sj_cfg);
+        /* 失败: 装回 Serial/JTAG 驱动, 恢复原控制台, 避免串口永久失效。
+         * ★ 2026-10-29: 回滚也必须看返回值 —— 原来这里直接丢掉结果, 回滚失败也没人知道。
+         *   TinyUSB 的 install 失败路径内部会 goto del_phy 调 usb_del_phy() 清理 PHY
+         *   (esp_tinyusb/tinyusb.c:227-232), 所以此刻 PHY 是干净的 ⇒ 归 RECOVER_FAIL
+         *   (重试动作 = 只装 SJ), 不是 TINYUSB_STUCK。 */
+        bool ok = usj_restore();
         esp_log_set_vprintf(prev);
+        if (!ok) {
+            s_mode = USB_MODE_RECOVER_FAIL;
+            ESP_LOGE(TAG, "进入 TinyUSB 失败(%s) 且串口回滚也失败 ⇒ RECOVER_FAIL, 下次退出会重试",
+                     esp_err_to_name(ret));
+        } else {
+            ESP_LOGE(TAG, "进入 TinyUSB 失败(%s), 串口已回滚到正常模式", esp_err_to_name(ret));
+        }
         return ret;
     }
     esp_log_set_vprintf(prev);
+    ESP_LOGI(TAG, "已进入 USB 模式, Serial/JTAG 已让出 PHY");
     return ESP_OK;
 }
 
-/* 退出 TinyUSB 模式: 卸 TinyUSB → 装回 Serial/JTAG 驱动 (恢复串口控制台). */
-static void usb_mode_exit(void)
+/* 退出 TinyUSB 模式: 卸 TinyUSB → 装回 Serial/JTAG 驱动 (恢复串口控制台).
+ * ★★ 2026-10-29 重写(核心修复): 原来返回 void, 且无论成败都无条件 s_mode = NORMAL。
+ *    而本函数第一句就是 "if (s_mode == NORMAL) return" ⇒ 一旦恢复失败, 状态被写成 NORMAL,
+ *    之后任何调用都在第一句早退, 永远不再重试, 只能断电重启。
+ *    现在: 按状态分支 + 失败保留失败态 + 每一步都查返回值并打错误码。 */
+static esp_err_t usb_mode_exit(void)
 {
-    if (s_mode == USB_MODE_NORMAL) return;
+    if (s_mode == USB_MODE_NORMAL) return ESP_OK;   /* 正常态: 没有 TinyUSB 要卸 */
+
+    usb_mode_t from = s_mode;
     vprintf_like_t prev = esp_log_set_vprintf(&usb_log_discard);
 
-    /* v2 的 tinyusb_driver_uninstall 会停任务/释放 OTG PHY */
-    tinyusb_driver_uninstall();
+    /* ① 只在"TinyUSB 可能还在"的态才卸。
+     *    RECOVER_FAIL 表示上次已确认卸净, 再卸一次就是重复卸载。 */
+    if (mode_is_tinyusb(from) || from == USB_MODE_TINYUSB_STUCK) {
+        esp_err_t ur = tinyusb_driver_uninstall();
+        /* ESP_ERR_INVALID_STATE = 任务上下文不存在(即根本没装)。按要求**不能直接当成功**:
+         *   必须再用 TinyUSB 官方栈状态 tusb_inited() 证明"栈确实没初始化", 才允许继续装 SJ;
+         *   否则一律算"卸载状态不确定" → STUCK, 绝不在 PHY 归属不明时去抢 pad。 */
+        bool proven_gone = (ur == ESP_OK) ||
+                           (ur == ESP_ERR_INVALID_STATE && !tusb_inited());
+        if (!proven_gone) {
+            esp_log_set_vprintf(prev);
+            s_mode = USB_MODE_TINYUSB_STUCK;
+            ESP_LOGE(TAG, "tinyusb 卸载失败(%s, tusb_inited=%d) ⇒ PHY 可能仍归 OTG, "
+                          "状态=TINYUSB_STUCK(下次先重试卸载, 不抢 PHY)",
+                     esp_err_to_name(ur), (int)tusb_inited());
+            return ur;
+        }
+        if (ur != ESP_OK)   /* 只有 INVALID_STATE + 栈确实未初始化这一种情况会走到这 */
+            ESP_LOGW(TAG, "tinyusb 卸载返回 %s, 但 tusb_inited()==false 已证明栈未初始化, 继续",
+                     esp_err_to_name(ur));
+    }
 
-    /* 装回 Serial/JTAG 驱动 (自动重挂 /dev/usbserjtag VFS) */
-    usb_serial_jtag_driver_config_t sj_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-    usb_serial_jtag_driver_install(&sj_cfg);
-
+    /* ② 装回 Serial/JTAG (= 打开 PHY pad, 主机才可能重新枚举) */
+    bool ok = usj_restore();
     esp_log_set_vprintf(prev);
+
+    if (!ok) {
+        s_mode = USB_MODE_RECOVER_FAIL;      /* ← 关键: 绝不置 NORMAL */
+        ESP_LOGE(TAG, "退出模式(%d)失败: 串口未恢复, 状态=RECOVER_FAIL(下次可重试)", (int)from);
+        return ESP_FAIL;
+    }
     s_mode = USB_MODE_NORMAL;
+    ESP_LOGI(TAG, "已退出模式(%d), Serial/JTAG 已恢复", (int)from);
+    return ESP_OK;
+}
+
+/* 进入任一新模式前的统一前置: 保证上一模式已退干净、PHY 归属明确。
+ * ★ 2026-10-29: 原来 4 个 enter 都是 "if (s_mode != NORMAL) usb_mode_exit();" 不看结果,
+ *   带着"PHY 可能仍归 OTG"的状态去装 TinyUSB 会两边抢 pad。
+ *   这里失败时**当场重试一次** usj_restore(), 让"用户点一次"最多尝试两次,
+ *   不必等用户下次再点(那样重试入口太被动)。返回非 OK 时调用方必须放弃本次进入。 */
+static esp_err_t mode_prepare_enter(void)
+{
+    if (s_mode == USB_MODE_NORMAL) return ESP_OK;
+
+    esp_err_t er = usb_mode_exit();
+    if (er == ESP_OK) return ESP_OK;
+
+    /* exit 失败必须按"卡在哪一步"分开处理, 不能一律补装 SJ:
+     *   TINYUSB_STUCK —— TinyUSB 还占着 PHY, 此时装 SJ 只会两边抢 pad
+     *                    ⇒ 只能**再试一次卸载**; 还不行就拒绝进入。
+     *   RECOVER_FAIL  —— TinyUSB 已卸净, 只差 install ⇒ 补装一次即可。 */
+    if (s_mode == USB_MODE_TINYUSB_STUCK) {
+        esp_err_t er2 = usb_mode_exit();      /* 再试一次"卸载 + 装回" */
+        if (er2 == ESP_OK) {
+            ESP_LOGW(TAG, "TinyUSB 卸载首次失败(%s), 重试已成功", esp_err_to_name(er));
+            return ESP_OK;
+        }
+        ESP_LOGE(TAG, "TinyUSB 仍无法卸载(%s) ⇒ 拒绝进入新模式(不在 PHY 归属不明时抢 pad)",
+                 esp_err_to_name(er2));
+        return er2;
+    }
+
+    if (usj_restore()) {                       /* RECOVER_FAIL: 当场补装一次 */
+        s_mode = USB_MODE_NORMAL;
+        ESP_LOGW(TAG, "上一模式恢复首次失败(%s), 重试已成功, 继续进入", esp_err_to_name(er));
+        return ESP_OK;
+    }
+    s_mode = USB_MODE_RECOVER_FAIL;
+    ESP_LOGE(TAG, "上一模式恢复失败(%s) 且重试无效, 拒绝进入新模式", esp_err_to_name(er));
+    return er;
 }
 
 /* 切换到键鼠 (HID+CDC) 复合设备 */
 esp_err_t usb_composite_enter_hid(void)
 {
     if (s_mode == USB_MODE_HID) return ESP_OK;
-    if (s_mode != USB_MODE_NORMAL) usb_mode_exit();   /* 防御: 先回正常模式 */
+    esp_err_t pe = mode_prepare_enter();               /* 防御: 先回正常模式(失败即拒绝进入) */
+    if (pe != ESP_OK) return pe;
     esp_err_t ret = usb_mode_enter(hid_config_desc, hid_string_desc_arr, 4);
     if (ret == ESP_OK) s_mode = USB_MODE_HID;
     return ret;
@@ -282,7 +405,8 @@ esp_err_t usb_composite_enter_hid(void)
 esp_err_t usb_composite_enter_msc(void)
 {
     if (s_mode == USB_MODE_MSC) return ESP_OK;
-    if (s_mode != USB_MODE_NORMAL) usb_mode_exit();   /* 防御: 先回正常模式 */
+    esp_err_t pe = mode_prepare_enter();               /* 防御: 先回正常模式(失败即拒绝进入) */
+    if (pe != ESP_OK) return pe;
     esp_err_t ret = usb_mode_enter(msc_config_desc, msc_string_desc_arr, 4);
     if (ret == ESP_OK) s_mode = USB_MODE_MSC;
     return ret;
@@ -292,7 +416,8 @@ esp_err_t usb_composite_enter_msc(void)
 esp_err_t usb_composite_enter_bth(void)
 {
     if (s_mode == USB_MODE_BTH) return ESP_OK;
-    if (s_mode != USB_MODE_NORMAL) usb_mode_exit();   /* 防御: 先回正常模式 */
+    esp_err_t pe = mode_prepare_enter();               /* 防御: 先回正常模式(失败即拒绝进入) */
+    if (pe != ESP_OK) return pe;
     esp_err_t ret = usb_mode_enter(bth_config_desc, bth_string_desc_arr, 4);
     if (ret == ESP_OK) s_mode = USB_MODE_BTH;
     return ret;
@@ -304,22 +429,28 @@ esp_err_t usb_composite_enter_bth(void)
 esp_err_t usb_composite_enter_net(void)
 {
     if (s_mode == USB_MODE_NET) return ESP_OK;
-    if (s_mode != USB_MODE_NORMAL) usb_mode_exit();   /* 防御: 先回正常模式 */
+    esp_err_t pe = mode_prepare_enter();               /* 防御: 先回正常模式(失败即拒绝进入) */
+    if (pe != ESP_OK) return pe;
     esp_err_t ret = usb_mode_enter(net_config_desc, net_string_desc_arr, 4);
     if (ret == ESP_OK) s_mode = USB_MODE_NET;
     return ret;
 }
 
-/* 退出任意 TinyUSB 模式, 回到正常 (Serial/JTAG 控制台) */
-void usb_composite_exit(void)
+/* 退出任意 TinyUSB 模式, 回到正常 (Serial/JTAG 控制台).
+ * ★ 2026-10-29: 由 void 改为返回 esp_err_t。失败时调用方(尤其 HID/MSC 的 stop)必须如实上报,
+ *   不能再无条件打"已恢复控制台"; USB-BT / USB-NET 的退出路径紧接着 esp_restart(),
+ *   可以忽略返回值(重启比任何软件重试都彻底)。 */
+esp_err_t usb_composite_exit(void)
 {
-    usb_mode_exit();
+    return usb_mode_exit();
 }
 
 /* 当前是否处于某个 TinyUSB 模式且已被主机枚举 */
 bool usb_composite_is_connected(void)
 {
-    return s_mode != USB_MODE_NORMAL && tud_mounted();
+    /* ★ 2026-10-29: 用 mode_is_tinyusb 而不是 != NORMAL —— 失败态(RECOVER_FAIL/STUCK)下
+     *   TinyUSB 栈已卸载, 调 tud_mounted() 没有意义且不安全。 */
+    return mode_is_tinyusb(s_mode) && tud_mounted();
 }
 
 /* ---------------- 对外 API (键鼠) ---------------- */
@@ -349,9 +480,14 @@ void usb_hid_stop(void)
     if (!s_running) return;
     usb_hid_key_release();
     usb_hid_mouse_release(MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT | MOUSE_BUTTON_MIDDLE);
-    s_running = false;
-    usb_composite_exit();
-    ESP_LOGI(TAG, "键鼠模式已退出, 已恢复 Serial/JTAG 控制台");
+    s_running = false;      /* 先置 false: 万一下面恢复失败, 下次 start 仍会走 enter → 触发重试 */
+    /* ★ 2026-10-29: 恢复失败时不能再说"已恢复控制台"(那是谎报) —— 如实报错, 并说明怎么重试 */
+    esp_err_t r = usb_composite_exit();
+    if (r == ESP_OK)
+        ESP_LOGI(TAG, "键鼠模式已退出, 已恢复 Serial/JTAG 控制台");
+    else
+        ESP_LOGE(TAG, "键鼠模式已退出, 但串口恢复失败(%s) ⇒ 状态已保留可重试, 请重启或重开一次键鼠",
+                 esp_err_to_name(r));
 }
 
 bool usb_hid_is_running(void) { return s_running; }
@@ -372,7 +508,10 @@ void usb_hid_key_tap(uint8_t modifier, uint8_t keycode)
     buf[0] = keycode;
     tud_hid_n_keyboard_report(HID_ITF_KB, 0, modifier, buf);
     vTaskDelay(pdMS_TO_TICKS(25));
-    if (!kb_ready()) return;
+    /* ★ 2026-10-30: 抬起**必须无条件发一次** —— 原来这里先 `if (!kb_ready()) return;`,
+     *   于是"刚按下、主机就掉线/接口变忙"这一瞬间会直接返回, 抬起报文永远不发。
+     *   主机重新枚举后仍认为那个键是按下的 (按住 Shift/Enter 卡死就是这么来的)。
+     *   tud_hid_n_keyboard_report() 在未就绪时自己会返回 false, 不会误发, 所以无需再判。 */
     uint8_t empty[6] = {0, 0, 0, 0, 0, 0};
     tud_hid_n_keyboard_report(HID_ITF_KB, 0, 0, empty);
     vTaskDelay(pdMS_TO_TICKS(25));
@@ -438,7 +577,7 @@ void usb_hid_mouse_release(uint8_t buttons)
 /* 向 PC CDC 串口发送数据. 返回实际写入字节数; 未运行/未连接返回 0. */
 size_t usb_hid_cdc_write(const uint8_t *data, size_t len)
 {
-    if (s_mode == USB_MODE_NORMAL || !tud_cdc_connected()) return 0;
+    if (!mode_is_tinyusb(s_mode) || !tud_cdc_connected()) return 0;   /* 失败态不碰 TinyUSB API */
     size_t n = tud_cdc_write(data, len);
     tud_cdc_write_flush();
     return n;
@@ -460,7 +599,7 @@ bool usb_hid_host_mounted(void)
 
 bool usb_hid_cdc_connected(void)
 {
-    return s_mode != USB_MODE_NORMAL && tud_cdc_connected();
+    return mode_is_tinyusb(s_mode) && tud_cdc_connected();
 }
 
 /* ---------------- CDC 接收 (信息回传: 目标电脑经串口发日志回设备) ----------------
@@ -470,7 +609,7 @@ bool usb_hid_cdc_connected(void)
 /* 读取 PC 经 CDC 串口发来的数据 (回传). 返回实际读取字节数; 无数据/未连接返回 0. */
 size_t usb_hid_cdc_read(uint8_t *data, size_t len)
 {
-    if (!data || len == 0 || s_mode == USB_MODE_NORMAL || !tud_cdc_connected()) return 0;
+    if (!data || len == 0 || !mode_is_tinyusb(s_mode) || !tud_cdc_connected()) return 0;
     size_t avail = tud_cdc_available();
     if (avail == 0) return 0;
     if (avail > len) avail = len;

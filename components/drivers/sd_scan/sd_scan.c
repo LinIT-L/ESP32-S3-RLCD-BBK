@@ -267,6 +267,13 @@ static void sd_probe_fail_reason(void)
 /* 重新挂载 (换卡/插卡后不用重启: SD Watcher 的自动补挂是禁用状态) */
 esp_err_t sd_remount(void)
 {
+    /* ★ 2026-10-28: 格式化期间绝不能碰 SDMMC host —— 下面的 sdmmc_host_deinit() 会把
+     *   格式化任务正在用的 host 拆掉(整卡擦除中途被拆 ⇒ 卡写坏/认不到)。
+     *   sd_mount() 里也有一道同样的拦, 但这里的 deinit 在它之前, 必须单独挡。 */
+    if (sd_format_is_running()) {
+        ESP_LOGW(TAG, "格式化进行中 ⇒ 拒绝重新挂载");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (s_mounted) sd_unmount();
     sdmmc_host_deinit();
     vTaskDelay(pdMS_TO_TICKS(80));
@@ -287,17 +294,40 @@ static inline void mnt_lazy_init(void)
 {
     if (!s_mnt_mutex) s_mnt_mutex = xSemaphoreCreateMutex();
 }
+/* ★ 2026-10-28: 挂载/卸载统一互斥。原来只有 sd_mount() 持 s_mnt_mutex,
+ *   而 sd_unmount()/sd_full_unmount()/sd_full_remount() 都直接改 s_card/s_mounted
+ *   并操作 SDMMC host —— 与开机异步挂载(或重挂)并发时会出现
+ *   "host already initialized"/VFS 重复注册/在 mount 过程中把 host deinit 掉。 */
+static inline void mnt_lock(void)
+{
+    mnt_lazy_init();
+    if (s_mnt_mutex) xSemaphoreTake(s_mnt_mutex, portMAX_DELAY);
+}
+static inline void mnt_unlock(void)
+{
+    if (s_mnt_mutex) xSemaphoreGive(s_mnt_mutex);
+}
 
 static esp_err_t sd_mount_body(void);
 
 esp_err_t sd_mount(void)
 {
-    mnt_lazy_init();
-    if (s_mnt_mutex) xSemaphoreTake(s_mnt_mutex, portMAX_DELAY);
+    /* ★★★ 2026-10-28 【格式化期间禁止挂载】★★★
+     *   sd_format_and_create_dirs() 会先 sd_full_unmount() 再整卡擦除(数十秒), 擦完才重新
+     *   mkfs+挂载。这段窗口里 s_mounted 是 false, 于是:
+     *     · 用户从格式化页退出 → 进音乐/游戏页 → sd_mount() 直接开始挂载正在被擦除的卡;
+     *     · sd_get_info() → sd_full_unmount + sd_full_remount 同理。
+     *   结果: 擦除被打断/文件系统写上垃圾/卡彻底认不到。这里直接拒绝, 让调用方按
+     *   "未就绪" 处理; 格式化结束后 sd_full_remount() 自己会把卡挂回来。 */
+    if (sd_format_is_running()) {
+        ESP_LOGW(TAG, "格式化进行中 ⇒ 本次挂载请求被拒绝");
+        return ESP_ERR_INVALID_STATE;
+    }
+    mnt_lock();
     esp_err_t r = sd_mount_body();
     s_mounting = false;
     s_mount_tried = true;
-    if (s_mnt_mutex) xSemaphoreGive(s_mnt_mutex);
+    mnt_unlock();
     return r;
 }
 
@@ -513,14 +543,17 @@ static esp_err_t sd_mount_body(void) {
     }
     ESP_LOGI(TAG, "检测到 TF 卡, 开始按速度梯度挂载...");
 
-    /* 1. 快速挂载 (V1.0.61): 优先 25MHz (1-bit 标准最高), 失败依次降速
-     *    2026-09-30: 末尾补一档 **400kHz** —— 这是 SD 规范规定的"识别阶段"频率,
-     *    只要卡和线是通的就一定能挂上。**若只有 400kHz 能挂上 = 信号完整性/走线/电源问题**
-     *    (日志会体现), 而不是卡的问题 → 修板子, 别在这上面继续降速。 */
-    /* 2026-10-20: 实测降到 10MHz 也救不回"认不到"(连 400k 都不应答, 是卡锁死态),
-     *   所以恢复高速梯度。真正救法见 sd_quick_probe() 里的多次强制空闲重试。 */
-    const uint32_t speeds_khz[] = { 25000, 20000, 5000, 400 };
-    const uint32_t delays_ms[]  = {  50,  100,  150, 200 };
+    /* 1. 快速挂载: 从高往低试, 第一个挂上的就是本次会话的实际速度。
+     *    ★ 2026-10-30 提速: 首位加 **40MHz**(SD High Speed 档, 1-bit 同样支持)。
+     *      它不是"强行超频" —— max_freq_khz 只是上限, SDMMC 驱动会在 CMD6 协商,
+     *      卡不支持会自己退回默认档, 不会因此挂不上。
+     *    2026-09-30: 末尾那档 **400kHz** 是 SD 规范规定的"识别阶段"频率, 只要卡和线
+     *      是通的就一定能挂上。**若只有 400kHz 能挂上 = 信号完整性/走线/电源问题**
+     *      (日志会体现), 而不是卡的问题 → 修板子, 别在这上面继续降速。
+     *    2026-10-20: 实测降到 10MHz 也救不回"认不到"(连 400k 都不应答, 是卡锁死态),
+     *      所以保留高速梯度。真正救法见 sd_quick_probe() 里的多次强制空闲重试。 */
+    const uint32_t speeds_khz[] = { 40000, 25000, 20000, 5000, 400 };
+    const uint32_t delays_ms[]  = {  50,   50,   100,   150, 200 };
     const int retry_count = sizeof(speeds_khz) / sizeof(speeds_khz[0]);
 
     for (int attempt = 0; attempt < retry_count; attempt++) {
@@ -650,11 +683,16 @@ static esp_err_t sd_mount_body(void) {
  *       必须额外调用 sdmmc_host_deinit() 彻底释放 host 和 DMA buffer,
  *       否则重挂时 "host already initialized" 跳过初始化, DMA buffer 无法重新分配. */
 void sd_unmount(void) {
-    if (!s_mounted) return;
+    if (!s_mounted) { return; }
+    /* ★ 2026-10-28: 与 sd_mount() 共用挂载锁 —— 否则可能在挂载进行到一半时
+     *   把 SDMMC host deinit 掉(manifest: host already initialized / 卡认不到)。 */
+    mnt_lock();
+    if (!s_mounted) { mnt_unlock(); return; }   /* 等锁期间已被别人卸掉 */
     esp_vfs_fat_sdcard_unmount(s_mount_point, s_card);
     sdmmc_host_deinit();  /* 彻底释放 SDMMC host + DMA buffer */
     s_mounted = false;
     s_card = NULL;
+    mnt_unlock();
     ESP_LOGI(TAG, "SD 卡已卸载 (SDMMC host 已释放)");
 }
 
@@ -1329,6 +1367,7 @@ void sd_watcher_start(void) {
  * 否则重挂时 host 已初始化被跳过, DMA buffer 无法重新分配. */
 static void sd_full_unmount(void) {
     ESP_LOGI(TAG, "[卸载] 开始, s_mounted=%d, s_card=%p", s_mounted, s_card);
+    mnt_lock();   /* ★ 2026-10-28: 与 sd_mount() 互斥, 防止并发改 s_card / deinit host */
 
     /* 1. 卸载 VFS (如果还挂着) */
     if (s_mounted && s_card) {
@@ -1345,6 +1384,7 @@ static void sd_full_unmount(void) {
 
     /* 3. 等待卡稳定 */
     vTaskDelay(pdMS_TO_TICKS(200));
+    mnt_unlock();
 
     ESP_LOGI(TAG, "[卸载] 完成 (host 已释放)");
 }
@@ -1356,6 +1396,14 @@ static int sd_full_remount(uint8_t format_if_needed) {
     ESP_LOGD("SDSCAN", "新载板: SD 暂未启用(旧 SDMMC 脚 13/10/14 与触摸 SCL、LCD MOSI 撞车) ⇒ 已跳过");
     return ESP_ERR_NOT_SUPPORTED;
 #endif
+    mnt_lock();   /* ★ 2026-10-28: 与 sd_mount()/卸载互斥 */
+    /* ★ 已挂载就别再挂: esp_vfs_fat_sdmmc_mount 对同一个 base_path 会返回
+     *   ESP_ERR_INVALID_STATE, 而下面失败分支会把 s_card 置 NULL —— 那样 VFS 还注册着、
+     *   我们却认为"没卡", 后续所有读卡都失败(必须重启才能恢复)。 */
+    if (s_mounted && s_card) {
+        mnt_unlock();
+        return 0;
+    }
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
         .format_if_mount_failed = format_if_needed,
         .max_files = 24,
@@ -1363,7 +1411,10 @@ static int sd_full_remount(uint8_t format_if_needed) {
     };
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = format_if_needed ? 5000 : 20000;
+    /* ★ 2026-10-30: 原来这里固定 20000 —— 只要发生过一次重挂载(拔插/格式化后),
+     *   速度就从主路径的 25MHz 掉到 20MHz, 而且再也不会回去。
+     *   现在与主挂载路径对齐(40MHz), 格式化仍用 5MHz(慢一点但更稳)。 */
+    host.max_freq_khz = format_if_needed ? 5000 : 40000;
     host.flags = SDMMC_HOST_FLAG_1BIT;
 
     sdmmc_slot_config_t slot_cfg = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -1382,9 +1433,11 @@ static int sd_full_remount(uint8_t format_if_needed) {
     if (ret != ESP_OK) {
         ESP_LOGD(TAG, "挂载失败: %s (0x%x)", esp_err_to_name(ret), ret);
         s_card = NULL;
+        mnt_unlock();
         return -2;
     }
     s_mounted = true;
+    mnt_unlock();
     ESP_LOGI(TAG, "挂载成功 @ %s, card=%p (SDMMC 1-bit, 格式化=%d)",
              s_mount_point, s_card, format_if_needed);
     return 0;
@@ -1607,6 +1660,14 @@ int sd_format_and_create_dirs(void) {
 int sd_get_info(uint64_t *total_bytes, uint64_t *free_bytes) {
     ESP_LOGD(TAG, "[卡信息] 进入, s_mounted=%d, s_card=%p, heap_free=%u",
              s_mounted, s_card, (unsigned)esp_get_free_heap_size());
+
+    /* ★ 2026-10-28: 格式化进行中不要去探测/重挂 —— 卡正在被整卡擦除,
+     *   这里的 sd_full_unmount + sd_full_remount 会把擦除打断并让文件系统写坏。
+     *   直接返回"未就绪", UI 显示容量为空, 格式化结束后自然恢复。 */
+    if (sd_format_is_running()) {
+        ESP_LOGW(TAG, "[卡信息] 格式化进行中 ⇒ 跳过容量查询");
+        return -1;
+    }
 
     /* 1. 优先直接读 VFS info (如果已挂载且 card 有效) */
     if (s_mounted && s_card != NULL) {

@@ -34,8 +34,8 @@
 #include "input.h"
 #include "gam4980_emu.h"
 #include "user_config.h"
-#include "sd_scan.h"
 #include "bt_manager.h"
+#include "bt_core.h"      /* bt_core_radio_on/off: 快捷栏蓝牙开关 */
 #include "audio_player.h"
 #include "board_battery.h"
 #include "book_reader.h"
@@ -103,7 +103,6 @@ static uint32_t s_bat_check_ms = 0;   /* 电量评估节流时间戳 (每 10 秒
  * ========================================================================== */
 #include "os.h"
 #include "lintos_version.h"   /* ★ 版本管理: 固件版本/构建信息唯一来源 */
-#include "lintos_version.h"   /* ★ 版本管理: 固件版本/构建信息 */
 #include "os_hw.h"
 #include "os_mgr.h"
 #include "wallpapers.h"
@@ -132,6 +131,25 @@ static bool os_plat_usb_data(void) {
     /* 常驻复合设备 (MSC+CDC / HID+CDC): USB 已枚举即视为数据口在用 */
     return usb_composite_is_connected();
 }
+
+/* ==== 快捷栏用操作类挂钩 (2026-10-29) ====
+ * os 层不直接引用 bt_ctl / wifi_manager / audio_player, 一律经这里注入。
+ * 任一项返回失败时快捷栏如实反映, 不伪装成功。 */
+static void os_plat_set_volume(int percent) { audio_player_set_volume(percent); }
+/* ★ 2026-10-30: 原来直接调 bt_core_radio_on/off —— bt_core_radio_on() 开头有
+ *   `if (!s_gap_inited) return;`, 开机没进过蓝牙页时协议栈尚未创建, 于是"按了没反应",
+ *   而且绕过 os_hw 引用计数, 会和其它模块争抢开关状态。
+ *   改成与设置页完全一致的做法: 开 = os_hw_request(计数+惰性建栈), 关 = release + disable。 */
+static void os_plat_set_bt(bool on) {
+    if (on) {
+        os_hw_request(OS_HW_BT);
+    } else {
+        os_hw_release(OS_HW_BT);
+        bt_manager_disable();
+    }
+}
+static bool os_plat_set_wifi(bool on)       { return on ? wifi_manager_enable() : wifi_manager_disable(); }
+
 static const os_platform_ops_t s_os_platform = {
     .get_battery      = os_plat_battery,
     .get_volume       = os_plat_volume,
@@ -141,6 +159,9 @@ static const os_platform_ops_t s_os_platform = {
     .wifi_enabled     = os_plat_wifi_enabled,
     .wifi_connected   = os_plat_wifi_connected,
     .usb_data_active  = os_plat_usb_data,
+    .set_volume       = os_plat_set_volume,
+    .set_bt_enabled   = os_plat_set_bt,
+    .set_wifi_enabled = os_plat_set_wifi,
 };
 
 
@@ -154,8 +175,31 @@ static const os_platform_ops_t s_os_platform = {
  *   等于让 ui 层直接编排七八个外设的关闭顺序。现在 ui 只提出请求, 顺序由 power_mgr 负责。
  *   ⚠ 刷白必须仍在所有耗时动作之前(GPS 停靠 4~15 秒), 否则用户按了关机像"没反应"。 */
 static void power_off_ui(int origin) {
+    /* ★★★ 2026-10-30 linit「关机不是立马黑屏, 而是屏幕卡住」根因修复 ★★★
+     *   原来只有两行: clear + flush_override, 然后直接进 power_mgr_off。
+     *   这条路径上有两个独立的坑, 单独出现任何一个, 现象都是"白屏没出来":
+     *   ① **刷白可能被静默丢弃**: flush_from_raw 里 `if (!lcd_lock_take()) { fail++; return TIMEOUT; }`
+     *      —— 此刻 UI 主循环正以 16~60fps 刷屏, 锁等 120ms 拿不到就整帧丢掉。
+     *      而这里原来**完全不检查返回值**, 白屏丢了照样往下关机。
+     *   ② **白屏就算送出也会被覆盖**: UI 主循环还在跑, 下一帧把原界面重绘回面板。
+     *      RLCD 断电保持最后画面 ⇒ 关机后屏幕停在"原界面卡住", 正是 linit 看到的样子。
+     *
+     *   修法: 先把普通刷屏门禁拉起来(st7305_set_flush_blocked, 此后
+     *   flush / flush_from / flush_rotated 一律直接返回 OK 丢弃), 再强制刷白;
+     *   刷不出去就重试, 并要求"最后确实是白的"才继续关机。
+     *   ⚠ flush_override 走 flush_from_raw, **不受门禁影响**, 是唯一还能送屏的通路。 */
+    st7305_set_flush_blocked(true);
     st7305_clear(&g_lcd, ST7305_COLOR_WHITE);
-    st7305_flush_override(&g_lcd);
+    int tries = 0;
+    bool white_ok = false;
+    for (; tries < 3 && !white_ok; tries++) {
+        white_ok = (st7305_flush_override(&g_lcd) == ESP_OK);
+        if (!white_ok) vTaskDelay(pdMS_TO_TICKS(20));   /* 让出 CPU, 等渲染任务松锁 */
+    }
+    if (white_ok)
+        ESP_LOGW(TAG, "关机: 白屏已送出 (第 %d 次)", tries);
+    else
+        ESP_LOGE(TAG, "关机: 白屏 3 次都没送出去 ⇒ 屏幕会停在最后一帧");
     power_mgr_off(origin);   /* 不返回 */
 }
 static void do_manual_shutdown(ui_ctx_t *ctx) {
@@ -185,20 +229,23 @@ static void on_power_confirm(ui_ctx_t *ctx, int result, void *ud) {
 /* ★ FPS 诊断计数 (每秒清零打印) */
 static uint32_t g_ui_frames, g_ui_us_sum;
 
-/* ★ FPS 诊断计数 (每秒清零打印) */
-static uint32_t g_ui_frames, g_ui_us_sum;
-
 /* ★★★ 2026-10-26 临时 GPS 自测 (linit: 临时启动确认没问题再休眠)
  *   为什么要存 NVS: 真机 USB 在开机 ~800ms 重新枚举、串口句柄失效,
  *   而 GPS 自测要在 1.3s 才开始、跑 8 秒 —— 直接打印抓不到。
  *   所以: 本次自测结果存 NVS, 下次复位的 ~300ms 打印出来(一定能抓到)。
  *   置 0 即恢复原来的"识别一次 / 开机停靠"逻辑。 */
 #define TASKS_PROBE 0          /* ★ 任务/栈探针: 改 1 可随时打开查看(每秒 13 行日志, 平时关) */
-#define TASKS_PROBE 0          /* ★ 任务/栈探针: 改 1 可随时打开查看(每秒 13 行日志, 平时关) */
+/* ★ 2026-10-28: FPS + STACK 每秒诊断输出。
+ *   默认 0 = 生产态静默。串口 115200 下一行约 8~10ms 阻塞, 每秒 2 行会持续
+ *   挤占主循环时间, 并把 svc_log 的 4KB 环形缓冲冲掉(排查时反而看不到有用日志)。
+ *   与 TASKS_PROBE 分开命名: 那个是"任务栈快照"(13 行/秒), 这个是"性能基线"(2 行/秒),
+ *   粒度不同, 混用一个开关会让人不敢开。
+ *   ⚠ g_ui_frames/g_ui_us_sum 的累加与清零**不受此开关影响**(放在 #if 外), 避免计数器溢出。 */
+#define DIAG_PERF_LOG 0        /* 改 1: 恢复每秒 FPS 与 STACK 诊断行 */
 #define GPS_SELFTEST_ONCE 0   /* ★ 2026-10-26 自测已完成(模块识别OK/NMEA流正常/已送待机): 改 0 恢复正常识别+停靠逻辑。改 1 可重跑自测 */
 #define GSTEST_NS "gstest"
 
-static void gps_selftest_task(void *arg)
+static void __attribute__((unused)) gps_selftest_task(void *arg)
 {
     (void)arg;
     esp_err_t e = gps_init(NULL);
@@ -272,11 +319,25 @@ static void os_shell_loop(ui_ctx_t *ctx) {
             do_auto_shutdown();   /* 不返回 */
         }
         /* 关机键 (PWR) 长按 2 秒 → 手动关机(仅 PWR 键唤醒, 须按住 0.5s 才开机)。
-         * 屏保态下 LCD 被壁纸独占, 确认框画不出来 → 直接关机;
-         * 桌面态弹"关机?"确认框, 确认 / 10 秒超时 → do_manual_shutdown()。 */
+         * ★★★ 2026-10-28 linit「睡眠时候长按, 关机确认弹窗看不到」根因修复 ★★★
+         *   原逻辑: 屏保态直接 do_manual_shutdown(), 注释理由"LCD 被壁纸独占, 确认框画不出来"
+         *   ⇒ 用户长按 2 秒屏幕一黑就关机, 既没有确认, 也没有取消的机会。
+         *   现在: 屏保态**先退出屏保**再弹框。退出动作(os_screensaver_reset) 做三件必需的事:
+         *     ① board_rlcd_screensaver_set(false) —— 解除壁纸对 LCD 的独占
+         *     ② st7305_set_flush_blocked(false)   —— 打开刷屏门禁(屏保期间所有 flush 被丢弃)
+         *     ③ input_set_touch_blocked(false)    —— 恢复触屏, 让弹窗能用手指点
+         *   屏保监督任务由 s_ss_active 门控, 退出后不再抢刷, 弹窗能稳定画在最上层。
+         *   ⚠ 顺序: 必须"先退屏保、后开弹窗", 反了的话弹窗画进 fb 但 flush 被门禁吃掉。 */
         if (input_power_should_sleep()) {
             if (os_screensaver_active()) {
-                do_manual_shutdown(ctx);   /* 不返回 */
+                os_screensaver_reset();       /* 解除独占 + 开刷屏门禁 + 恢复触屏 */
+                /* ★ 背景脏: 屏保是旁路 flush_override 直刷的, fb 里此刻是壁纸画面。
+                 *   不标记的话, dlg_render 只画弹窗自己那块、不清屏 ⇒ 弹窗浮在壁纸上。
+                 *   标记后 os_render 会先整屏清白 + 重绘最底层页面(桌面), 再叠弹窗。 */
+                os_invalidate_bg();
+                ctx->needs_redraw = true;
+                st7305_invalidate_frame();    /* 作废送屏指纹: 弹窗首帧必须整屏送出 */
+                ESP_LOGI(TAG, "屏保态长按键关机: 已退出屏保, 改为弹确认框");
             }
             if (!s_pwr_dlg_open) {
                 s_pwr_dlg_open = true;
@@ -284,6 +345,10 @@ static void os_shell_loop(ui_ctx_t *ctx) {
                                      on_power_confirm, NULL);
             }
         }
+        /* ★ 2026-10-28: 弹窗若被别的路径关掉(clear_all / 上层 pop / 页面被顶掉),
+         *   s_pwr_dlg_open 没人复位 ⇒ 关机框从此再也弹不出来(必须重启才好)。
+         *   每帧对齐一次"标志 vs 实际弹窗深度", 以实际状态为准。 */
+        if (s_pwr_dlg_open && os_dialog_depth() <= 0) s_pwr_dlg_open = false;
         /* 屏保态: 不轮询触摸(碰 I2C/flash)、不跑 os_tick、不写日志、不跑 os_mgr_poll,
          * 屏保画面由独立监督任务渲染。 */
         if (os_screensaver_active()) {
@@ -357,11 +422,17 @@ static void os_shell_loop(ui_ctx_t *ctx) {
         if (wake_force_ms && (uint32_t)(now_ms - wake_force_ms) < 1000u)
             ctx->needs_redraw = true;
         bool want_frame = ctx->needs_redraw;   /* poll/服务 tick 阶段是否已置脏 */
-        /* FPS/渲染耗时统计 (每秒一行 UI: FPS=..) */
+        /* FPS/渲染耗时统计: 唯一用途是喂给下面 #if DIAG_PERF_LOG 那行日志。
+         * 诊断关闭时这两次 esp_timer_get_time() + 两次累加纯属白跑(每帧 62 次/秒),
+         * 所以与日志一起条件编译。want_frame 仍要用(st7305_idle_tick), 留在外面。 */
+#if DIAG_PERF_LOG
         { int64_t _t0 = esp_timer_get_time();
           os_render(ctx);
           g_ui_us_sum += (uint32_t)(esp_timer_get_time() - _t0);
           if (want_frame) g_ui_frames++; }
+#else
+        os_render(ctx);
+#endif
         /* 面板自刷新档位: 有绘制就回 HPM(≈32Hz), 连续 500ms 没画自动掉 LPM(≈1Hz 省电) */
         st7305_idle_tick(&g_lcd, want_frame, xTaskGetTickCount() * portTICK_PERIOD_MS);
         /* 帧节奏（自适应）:
@@ -392,12 +463,14 @@ static void os_shell_loop(ui_ctx_t *ctx) {
             vTaskDelay(pdMS_TO_TICKS(dly));
         }
         if (now_ms - last_ms >= 1000) {
+#if DIAG_PERF_LOG
             extern int font_zh_count(void);   /* 每秒带字体绑定状态 (0=绑定失败) */
             sdmmc_card_t *sd = sd_get_card(); /* SD 卡型号/容量 (确认挂载与卡型) */
             ESP_LOGI("UI", "FPS=%u 平均渲染=%u us/帧 (含送屏)",
                      (unsigned)g_ui_frames,
                      (unsigned)(g_ui_frames ? g_ui_us_sum / g_ui_frames : 0));
-            g_ui_frames = 0; g_ui_us_sum = 0;
+#endif
+            g_ui_frames = 0; g_ui_us_sum = 0;   /* 清零恒执行: 不受诊断开关影响, 防计数溢出 */
 #if TASKS_PROBE
             /* ★ 2026-10-26 临时探针: 运行时任务数 + 每个任务栈余量
              *   (余量多 = 栈给多了; 任务不该在 = 没退干净) */
@@ -415,23 +488,7 @@ static void os_shell_loop(ui_ctx_t *ctx) {
                 }
             }
 #endif
-#if TASKS_PROBE
-            /* ★ 2026-10-26 临时探针: 运行时任务数 + 每个任务栈余量
-             *   (余量多 = 栈给多了; 任务不该在 = 没退干净) */
-            {
-                static TaskStatus_t ts[32];
-                UBaseType_t n = uxTaskGetSystemState(ts, 32, NULL);
-                uint32_t unused = 0;
-                for (UBaseType_t i = 0; i < n; i++) unused += ts[i].usStackHighWaterMark;
-                ESP_LOGI("TASKS", "运行任务=%u 栈未用合计=%lu B", (unsigned)n, (unsigned long)unused * 4);
-                for (UBaseType_t i = 0; i < n; i++) {
-                    if (ts[i].usStackHighWaterMark * 4 >= 1024)
-                        ESP_LOGI("TASKS", "  %-14s prio=%u 栈余=%lu B",
-                                 ts[i].pcTaskName, (unsigned)ts[i].uxCurrentPriority,
-                                 (unsigned long)ts[i].usStackHighWaterMark * 4);
-                }
-            }
-#endif
+#if DIAG_PERF_LOG
             ESP_LOGI(TAG, "STACK main_free=%u 内部=%u PSRAM=%u zh=%d SD=%s %uMB",
                      (unsigned)uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -439,6 +496,7 @@ static void os_shell_loop(ui_ctx_t *ctx) {
                      font_zh_count(),
                      sd ? (const char *)sd->cid.name : "-",
                      sd ? (unsigned)(sd->csd.capacity / 2048) : 0);
+#endif
             /* 电量提示 (用户规则): 低电只提示一次不关机; 未接电量模块(percent==255)仅提示一次不关机.
              * 5% 关机由壁纸监督任务处理, 此处仅负责"提醒". 每 10 秒评估一次省电. */
             if (s_bat_low_remind != 0 && (now_ms - s_bat_check_ms >= 10000)) {
@@ -665,6 +723,35 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
     {
         extern int font_zh_count(void);
         extern int font_zh16_count(void);
+        extern bool font16_apply(int);
+        extern bool font24_apply(int);
+        /* 2026-10-30: 先恢复上次选择的 UI 字体, 再打印自检 (否则日志报的是默认字库).
+         * 16px / 24px 两档独立恢复, 互不影响。
+         * NVS 读写留在应用层, 字体组件只负责绑定, 避免 ui→services 分层倒置。 */
+        {
+            nvs_handle_t fh;
+            uint8_t f16 = 0, f24 = 0;
+            if (svc_nvs_open("os_settings", NVS_READONLY, &fh) == ESP_OK) {
+                if (svc_nvs_get_u8(fh, "uif16", &f16) != ESP_OK) f16 = 0;
+                if (svc_nvs_get_u8(fh, "uif24", &f24) != ESP_OK) f24 = 0;
+                svc_nvs_close(fh);
+            }
+            if (f16 > 0 && !font16_apply((int)f16)) {
+                /* 上次选的字体不可用（槽被擦/没烧进去）→ 清记录，别每次开机都失败 */
+                if (svc_nvs_open("os_settings", NVS_READWRITE, &fh) == ESP_OK) {
+                    svc_nvs_erase_key(fh, "uif16");
+                    svc_nvs_commit(fh);
+                    svc_nvs_close(fh);
+                }
+            }
+            if (f24 > 0 && !font24_apply((int)f24)) {
+                if (svc_nvs_open("os_settings", NVS_READWRITE, &fh) == ESP_OK) {
+                    svc_nvs_erase_key(fh, "uif24");
+                    svc_nvs_commit(fh);
+                    svc_nvs_close(fh);
+                }
+            }
+        }
         ESP_LOGI("FONT", "启动自检: zh_count=%d zh16_count=%d",
                  font_zh_count(), font_zh16_count());
     }
@@ -712,7 +799,12 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
      *   改成延后 2.5s 由独立任务启动 —— 首帧优先, 射频晚一点拉不影响使用。 */
     {
         extern void wifi_boot_deferred_task(void *arg);
-        xTaskCreatePinnedToCore(wifi_boot_deferred_task, "wifi_boot", 4096, NULL, 3, NULL, 0);
+        /* ★ 2026-10-28: 补返回值检查。这是**可选**任务(开机自动联网):
+         *   创建失败不致命 —— 桌面照常可用, 用户仍可从 设置→网络 手动启用。
+         *   所以只报错并说明降级路径, **不重试、不重启**: 建任务失败基本是内部 RAM 耗尽,
+         *   立刻重试只会继续失败(任务书要求"不得无限重试")。 */
+        if (xTaskCreatePinnedToCore(wifi_boot_deferred_task, "wifi_boot", 4096, NULL, 3, NULL, 0) != pdPASS)
+            ESP_LOGE(TAG, "wifi_boot 任务创建失败 ⇒ 开机不自动联网, 请到 设置→网络 手动启用");
     }
     if (usb_bt_is_active()) {
         /* USB-BT 激活 (开机早期进 BTH 模式): 蓝牙控制器供 USB 蓝牙适配器独占,
@@ -726,10 +818,20 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
         usb_net_start();
         ESP_LOGI(TAG, "USB 网卡共享模式已启动");
     } else {
-        /* 开机短暂自动回连: 有配对手柄历史 → 短窗口(30s)低占空比直连上次手柄;
-         * 连上保持; 手柄不在则窗口超时自动关栈释放(省内部RAM). 无历史 → 不开.
-         * 需要时(进蓝牙/手柄页)由 os_hw_request 首次启用. */
-        bt_manager_start_boot_reconnect(30000);
+        /* ★★★ 2026-10-30 linit「蓝牙没有启用不要使用内存」——开机不再初始化蓝牙 ★★★
+         *   原来这里调 bt_manager_start_boot_reconnect(30000): 只要 NVS 里有配对历史,
+         *   它内部就 bt_manager_enable() 完整初始化, 实测内部堆从 193,411 → 120,463
+         *   (-72,948 B ≈ 71KB), 并拉起 bt_init/bt_rec/BTU_TASK/BTC_TASK/btController/
+         *   hciT/esp_hidh_events 共 7 条任务 —— 用户一根手柄都没连, 这 71KB 照样被吃掉,
+         *   而且旧 bt_manager_disable() 只关射频不拆栈, 分配了就永不归还。
+         *   现在改为**纯按需**:
+         *     · 游戏运行期   → page_engine.c / page_select_game.c 用 os_hw_lease 申请
+         *     · 手柄页/设置页 → page_gamepad.c / page_settings.c 原有的 os_hw_request
+         *   只有"配对过手柄"的机器才会在进游戏时拉起 (bt_manager_has_saved_pad 预检),
+         *   从没配对过 → 一个字节都不占。退出即由 os_hw 归零引用计数, 真拆栈还内存。
+         *   代价: 取消"开机 30s 自动回连窗口" —— 首次进游戏时才连上次的手柄
+         *        (enable() 内部 s_power_off=false, 回连任务照常工作)。 */
+        ESP_LOGI(TAG, "蓝牙按需: 开机不初始化 (进游戏/手柄页首次使用时才拉起)");
     }
     /* V1.0.72: 开机不播旋律, 改为震动一下提示.
      * 原因: tone_mel 任务栈(8KB)在首次 feed_pcm → audio_out_start →
@@ -800,16 +902,13 @@ void app_main(void)
      *   保留 power_mgr_wake_origin() 的调用只为日志/诊断, 不再影响开机观感。 */
     s_soft_boot = false;
 
-    /* Lua 集成冒烟测试: 挂载 SPIFFS + 加载执行 /store/test.lua。
-     * ★ 2026-10-20 启动提速: 原来是**每次开机都跑**, 实测独占 **248ms** (SPIFFS 挂载
-     *   + 读脚本), 纯粹是开发自检, 生产没必要。改成按需: 串口发 `luasmoke` 才跑。 */
-    /* ★★★ 2026-10-23 修 (linit: 应用中心看不到《人生指南》, 没图标没名字):
-     *   SPIFFS 挂载原先藏在 lua_smoke_test() 里, 而 smoke_test 因启动提速被注释掉
-     *   ⇒ `/store` 从未挂载 ⇒ apps 分区里的 Lua 应用在应用中心**全部不可见**
-     *   (设备上仅有的那几个 Lua 应用来自 TF 卡 /sdcard/apps)。
-     *   挂载约 40ms, 必须早于应用中心预热扫描(开机 5s 后)。 */
-    { extern bool store_fs_mount(void); store_fs_mount(); }
-    boot_ts("SPIFFS /store 挂载");
+    /* ★★★ 2026-10-30 开机提速: SPIFFS 挂载**挪到 Logo 上屏之后**(见下方 app_board_init 返回处)。
+     *   理由: BOOT 探针实测这一段独占 **253ms** (T+1ms → T+254ms), 而它排在 app_board_init
+     *   **之前** ⇒ 这 253ms 全部落在"屏还是全黑"的窗口里, 用户感知就是"按下电源后
+     *   一秒多没反应"。注释原写"约 40ms", 与实测不符。
+     *   挪走后第一帧 Logo 从 1459ms 提前到约 1206ms。
+     *   安全性: 唯一使用方(人生指南壁纸 / 应用中心 / Lua 启动)全在 os_init 之后,
+     *   app_board_init 不碰 /store; 且 store_fs_mount() 自身幂等(内部 static s_mounted)。 */
 
     /* === 硬件初始化 (app_board 模块化封装, 顺序敏感见 components/app_board) === */
     app_board_t board;
@@ -877,6 +976,11 @@ void app_main(void)
         boot_ts("Logo 上屏完成(提前)");
     }
 
+    /* ★ 2026-10-30: SPIFFS 挂载从 app_main 前段挪到这里 —— 见上方说明。
+     *   此刻第一帧已经显示, 挂载的 253ms 与用户看 Logo 的时间重叠, 不再额外等待。 */
+    { extern bool store_fs_mount(void); store_fs_mount(); }
+    boot_ts("SPIFFS /store 挂载(Logo 之后)");
+
     /* ★ 2026-10-27 linit「第一次检测正常过后就没必要再检测」:
      *   开机已不再用 I2C 探测判触摸(存档即信, 省 ~160ms/次), 这里用**触摸驱动自己的
      *   init 结果**兜底 —— 真没屏/排线断才置 missing, 由后台补探任务恢复。 */
@@ -909,7 +1013,10 @@ void app_main(void)
     }
     /* 板型已定但触摸没探到 ⇒ 后台补探 (不阻塞, 命中即启用) */
     if (hw_cfg_touch_missing()) {
-        xTaskCreate(touch_retry_task, "tp_retry", 3072, NULL, 1, NULL);
+        /* ★ 2026-10-28: 补返回值检查。同样是**可选**任务: 失败只是失去"自动补探",
+         *   触摸仍可从 设置→硬件 手动重新自检。不重试(建任务失败多为内部 RAM 耗尽)。 */
+        if (xTaskCreate(touch_retry_task, "tp_retry", 3072, NULL, 1, NULL) != pdPASS)
+            ESP_LOGW(TAG, "tp_retry 任务创建失败 ⇒ 触摸不再自动补探, 请到 设置→硬件 重新自检");
     }
 
     /* V1.0.76: 震动马达 LEDC 初始化 (幂等, 无硬件也不影响运行) */

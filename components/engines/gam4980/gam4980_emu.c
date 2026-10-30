@@ -56,7 +56,11 @@ static gam4980_statusbar_cb_t    s_statusbar_cb    = NULL;   /* 游戏内系统�
 /* 游戏区在 ST7305 屏幕居中: 160x96 * 2 = 320x192 (2x 缩放全屏) */
 #define SCALE 2
 #define GAME_X ((400 - CORE_W * SCALE) / 2)   /* 40 */
-#define GAME_Y ((300 - CORE_H * SCALE) / 2)   /* 54 */
+#define GAME_Y_CENTER ((300 - CORE_H * SCALE) / 2)   /* 54 = 垂直居中 */
+/* ★ 2026-10-29 linit: 点对点模式的垂直位置改为**运行时决定** ——
+ *   有虚拟手柄时顶到最上(0): 手柄占了下半屏, 画面居中会被方向键/A/B 压住;
+ *   没有虚拟手柄时保持居中(54), 与原来一致。 */
+static int s_game_y = GAME_Y_CENTER;
 
 /* 全屏模式: 保持原比例 160:96 = 5:3, 宽度拉满 400, 高度 240, 上下各留 30 */
 #define FS_SCALED_W 400
@@ -288,6 +292,24 @@ bool gam4980_get_fullscreen(void) { return g_display_mode != DISP_MODE_POINT2POI
 
 /* V1.1.1: 引擎优化设置由 os 传入 (独立于旧 menu g_menu, 旧 g_menu 在 os 构建未初始化) */
 static int  s_vkey       = 2;    /* 0=关 1=开 2=自动(无手柄时开) */
+/* 音频诊断探针开关 —— 与 libretro.c 的同名宏保持一致, 发布版必须为 0。
+ * 置 1 才会打印「首帧喂送」这类一次性观测日志。 */
+#ifndef BBK_AUDIO_PROBE
+#define BBK_AUDIO_PROBE 0   /* 关闭: 与 libretro.c 同步 */
+
+/* ★ 诊断探针 (统一命名 LIN_DIAG_<模块>, 登记于 docs/diagnostics/probes.md)
+ *   LIN_DIAG_RENDER: 渲染/帧耗时探针 —— 每秒打印 "Render time" 与 "Game FPS=.., retro_run=.."。
+ *     用途: 排查"游戏卡顿/帧率低/打开慢"。默认关: 每秒两行串口输出,
+ *     在 60fps 游戏里属于持续高频日志, 平时不需要。
+ *     启用: 改为 1 重新构建即可 (编译期生效, 不支持运行时切换)。 */
+#define LIN_DIAG_RENDER 0
+#endif
+/* ★ 2026-10-29: 游戏声音开关 (1=开 / 0=关)。
+ *   只掐"游戏本身产生的音频", 不影响按键音 —— 两者是独立的开关,
+ *   与「按键声音」互不牵连。默认开。 */
+static int  s_game_audio = 1;
+void gam4980_set_game_audio(int on) { s_game_audio = on ? 1 : 0; }
+int  gam4980_get_game_audio(void)   { return s_game_audio; }
 static bool s_status_bar  = true; /* 游戏内状态栏 显示/隐藏 */
 void gam4980_set_vkey(int vkey)      { if (vkey >= 0 && vkey <= 2) s_vkey = vkey; }
 void gam4980_set_status_bar(bool on)  { s_status_bar = on; }
@@ -619,6 +641,10 @@ static inline int IRAM_ATTR fb_classify_aa(bool u, bool d, bool l, bool r,
 }
 
 static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, size_t pitch) {
+    /* ★ 2026-10-29: 点对点模式的垂直位置随虚拟手柄状态变化 ——
+     *   有手柄 → 顶到最上(0), 避免被下半屏的方向键/A/B 压住;
+     *   无手柄 → 居中(54), 维持原样。全屏/拉伸模式不受影响。 */
+    s_game_y = virtual_keys_is_enabled() ? 0 : GAME_Y_CENTER;
     if (!g_lcd || !data) return;
     const uint16_t *src = (const uint16_t *)data;
     init_lookup_tables();
@@ -696,9 +722,13 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
             if (s_statusbar_cb) s_statusbar_cb(g_lcd, g_status_battery, g_status_pad_connected);
         }
 
-        /* V1.0.68+: 虚拟按键启用时不画底部装饰栏与游戏名称
-         * (会与底部 Select/Start 按键区域重叠碍眼) */
-        if (!virtual_keys_is_enabled() && g_display_mode != 2) {   /* ★ 拉伸铺满时不压装饰栏 */
+        /* ★ 2026-10-29 linit: 底部装饰栏与游戏名称**改为常显**, 只有拉伸模式(2)不画。
+         *   原条件是 `!virtual_keys_is_enabled() && mode != 2` —— 虚拟手柄一启用装饰就整条消失,
+         *   而 s_vkey 默认是 2(自动: 没连蓝牙手柄就开虚拟手柄), 于是绝大多数人根本看不到装饰,
+         *   看起来像"花纹和游戏名丢了"。现在装饰由自己决定显不显示, 与手柄状态解耦。
+         *   ⚠ 代价: 手柄的下键(67,275,r18)与 B 键(312,254,r24)会盖住装饰条的一部分 ——
+         *     装饰先画、手柄后画, 最终压在上面的是手柄; 若要完全避让需挪手柄布局。 */
+        if (g_display_mode != 2) {   /* ★ 拉伸铺满时不压装饰栏 */
             int bottom_y = FS_GAME_Y + FS_SCALED_H;
             /* 左侧装饰三角形 - 直接写 fb 跳过 st7305_draw_pixel */
             {
@@ -754,7 +784,8 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
         }
         virtual_keys_draw(g_lcd);   /* V1.0.68 fix: 补画屏幕虚拟按键 */
         bool takeover = cheat_float_overlay_tick(g_lcd);  /* 独立修改机插件: 浮标+热键/点按呼出 */
-        if (!takeover) vid_tune_overlay_tick(g_lcd);      /* 画面优化器浮标/面板 */
+        if (!takeover) vid_tune_overlay_tick(g_lcd);
+        if (!takeover) engine_overlay_quickbar(g_lcd);   /* ★ 游戏内下拉快捷栏 */      /* 画面优化器浮标/面板 */
         if (!takeover) st7305_flush(g_lcd);               /* 触发接管则本帧不再送屏 */
     } else {
         /* 点对点模式: 清空整个 fb 为白色 */
@@ -796,7 +827,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
                     /* 把 raw(1=白 0=黑) 按 EPX 黑白对称反转成黑=1 写入 fb */
                     const uint8_t pat = (uint8_t)((~raw) & 0x0F);
                     int tx = GAME_X + x * SCALE;
-                    int ty = GAME_Y + y * SCALE;
+                    int ty = s_game_y + y * SCALE;
                     fb_fill_epx_block(g_lcd->fb, tx, ty, pat);
                     (void)E_bit;
                 }
@@ -808,7 +839,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
                 for (int x = 0; x < CORE_W; x++) {
                     if (row[x] != 0) continue;
                     int tx = GAME_X + x * SCALE;
-                    int ty = GAME_Y + y * SCALE;
+                    int ty = s_game_y + y * SCALE;
                     /* 2x2 实心: 直接按 y_sub 组合位 */
                     for (int py = 0; py < SCALE; py++) {
                         int tty = ty + py;
@@ -840,12 +871,14 @@ static void IRAM_ATTR video_cb(const void *data, unsigned w, unsigned h, size_t 
         uint32_t t0 = xTaskGetTickCount() * portTICK_PERIOD_MS;
         render_frame(data, w, h, pitch);
         uint32_t t1 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+#if LIN_DIAG_RENDER
         static uint32_t last_log_ms = 0;
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if (now - last_log_ms >= 1000) {
             ESP_LOGI(TAG, "Render time: %lu ms", (unsigned long)(t1 - t0));
             last_log_ms = now;
         }
+#endif
     }
 }
 
@@ -853,7 +886,19 @@ static void IRAM_ATTR video_cb(const void *data, unsigned w, unsigned h, size_t 
 /* V1.0.55: 恢复步步高 4980 定时器方波音效 (按键/游戏蜂鸣滴声).
  * 之前因 audio_out 任务栈溢出关闭, 现在该任务栈已加大到 24KB;
  * 这里改成按帧批量喂送 (735 样本/帧一次), 避免逐样本 feed_pcm 的互斥开销. */
-#define GAM4980_ENABLE_AUDIO 1
+/* ★★★ 2026-10-29 定案: 步步高引擎音频**不实现** ★★★
+ *   查证结论 (两个开源实现均为空):
+ *     · 上游 gam4980 的 audio_cb 只赋值、从不调用; retro_set_audio_sample_batch 是空函数;
+ *     · BBKEmu 写了 play_tone() 但从未调用过。
+ *   实测数据 (本机真机日志):
+ *     · stcon=0x01 —— 游戏只开 ST1(按键扫描), ST2/3/4 全关;
+ *     · ST1 每帧溢出不足 2 次 => 只能凑出 60Hz 方波 = "爆炸声";
+ *     · PB(0x21b) 全程仅写 1 次, 不是软件 PWM;
+ *     · AUDCON(0x23f) 全程仅写 1 次 (0xC0), 是"一次性使能音频通道", 不是发声入口。
+ *   ⇒ 没有可用音频源, 强行合成只会制造噪音。这里整体关掉:
+ *     不做无用功(每帧 735 次 audio_cb 调用 + 混音), 也不往固件里塞半成品。
+ *   将来要做, 需先反汇编 E.BIN 的音频服务例程拿到调用约定, 再走 HLE 或寄存器级合成。 */
+#define GAM4980_ENABLE_AUDIO 0
 #define GAM4980_FRAME_SAMPLES 735   /* 44100/60 */
 static int g_audio_sample_rate = 44100;
 EXT_RAM_BSS_ATTR static int16_t s_bbk_audio_buf[GAM4980_FRAME_SAMPLES * 2];
@@ -991,7 +1036,7 @@ static void bbk_audio_frame_finalize(void)
     if (want < 256) want = 256;
     if (want > 2048) want = 2048;
 
-    int game_frames = s_bbk_audio_cnt;
+    int game_frames = s_game_audio ? s_bbk_audio_cnt : 0;   /* 游戏声音关闭时不混入引擎音频 */
     if (game_frames > want) game_frames = want;
     static EXT_RAM_BSS_ATTR int16_t s_frame_buf[2048 * 2];
     for (int i = 0; i < game_frames; i++) {
@@ -1016,28 +1061,60 @@ static void bbk_audio_frame_finalize(void)
             s_frame_buf[i * 2 + 1] = (int16_t)m;
         }
     }
-    audio_player_feed_pcm(s_frame_buf, (size_t)want, BBK_KEY_SR);
+    size_t wrote = audio_player_feed_pcm(s_frame_buf, (size_t)want, BBK_KEY_SR);
+    /* ★ 2026-10-29 无声排查 (一次性日志, 之后不再打印):
+     *   把"PCM 到底有没有进到音频输出层"变成可观测的一件事, 免得只能靠耳朵猜:
+     *     wrote=0        → 被 feed_pcm 丢弃 (muted=1 或音频硬件未初始化), 问题在输出层;
+     *     wrote=want     → PCM 已进环形缓冲, 若仍无声则查 I2S/功放 (PA) 侧;
+     *     game=0         → 核心本帧没产生任何音频 (定时器没在翻转), 问题在上游. */
+    static bool s_feed_diag_done = false;
+#if BBK_AUDIO_PROBE
+    if (!s_feed_diag_done) {
+        s_feed_diag_done = true;
+        ESP_LOGI(TAG, "[audio] 首帧喂送: game=%d want=%d wrote=%u muted=%d ks=%d kv=%d",
+                 game_frames, want, (unsigned)wrote,
+                 (int)audio_player_is_muted(), (int)s_key_sound_enabled, (int)s_key_vib_enabled);
+    }
+#else
+    (void)s_feed_diag_done;
+#endif
     s_bbk_audio_cnt = 0;
 #endif
 }
 
-/* 每帧调用 (retro_run 之后): 按键状态机 */
+/* 每帧调用 (retro_run 之后): 按键状态机
+ *
+ * ★★★ 2026-10-29 修「游戏内虚拟手柄点按不震动」:
+ *   原实现把震动写在 `if (!s_key_sound_enabled) { ... return; }` **之后**, 于是:
+ *     ① 用户只要关掉「按键声音」, 游戏震动就一起消失 —— 两个独立开关被耦合死;
+ *     ② 触发条件还要等 `now - s_tone_release_ms >= BBK_KEY_DEBOUNCE_MS(60ms)`,
+ *        而这个时间戳是"上一帧无按键"时一直在刷新的 ⇒ 手指按下后必须**连续按住
+ *        满 60ms** 才触发第一次。虚拟手柄的典型操作是"一按就抬"(<60ms),
+ *        永远等不到这个窗口 ⇒ 一次都不震。按住方向键才偶尔震得到。
+ *   现在震动改成**独立的按键下降沿检测**: 按下当帧立即震一次, 按住不重复,
+ *   松手再按才再震, 且与「按键声音」开关完全无关。按键音本身的逻辑一行未改。 */
+static bool s_prev_any_key = false;   /* 上一帧是否有任意游戏键按下 (震动边沿用) */
+
 static void bbk_key_sound_tick(void)
 {
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    bool any = bbk_any_key_pressed();
+    bool pressed_edge = any && !s_prev_any_key;
+    s_prev_any_key = any;
+
+    /* ① 震动: 只认「触摸震动」开关 (按下沿一次, 30ms/120 与 input.c 游戏通道同参) */
+    if (pressed_edge && s_key_vib_enabled) vibrator_tap_game(30, 120);
+
+    /* ② 按键音: 受「按键声音」开关控制 (原逻辑保持不变) */
     if (!s_key_sound_enabled) {
         if (s_tone_active) { s_tone_active = false; audio_player_flush_pcm(); }
         s_tone_release_ms = now;
         return;
     }
-    bool any = bbk_any_key_pressed();
     if (any) {
         if (!s_tone_active && (uint32_t)(now - s_tone_release_ms) >= BBK_KEY_DEBOUNCE_MS) {
             s_tone_active = true;
             s_tone_start_ms = now;
-            /* 2026-09-29: BBK 不走 input.c 的 joypad 边沿通路 → 游戏震动原本完全不触发,
-             * 这里在"按下沿"补一次游戏震动 (与 input.c 那条路同参: 30ms/120)。 */
-            if (s_key_vib_enabled) vibrator_tap_game(30, 120);
         }
         /* 按住: 持续音由 finalize 每帧混入, 连续无空隙 */
     } else {
@@ -1518,6 +1595,7 @@ game_exit_result_t gam4980_emu_run(void) {
     else virtual_keys_set_enabled(false);
     gam4980_cheat_attach();   /* 登记本局游戏 RAM 给独立修改机插件 (浮动图标+热键呼出) */
     s_home_prev = false;  /* 每次进入游戏重置退出键边沿状态 */
+    s_prev_any_key = false;   /* 震动边沿状态: 上一局若按着键退出, 本局首个按下沿不能丢 */
     game_exit_result_t exit_result = GAME_EXIT_CONFIRMED;
     ESP_LOGI(TAG, "开始运行游戏循环 (长按 BOOT 1秒 或 按 退出到菜单 键 退出, 60fps)");
     int boot_hold_count = 0;
@@ -1641,12 +1719,16 @@ game_exit_result_t gam4980_emu_run(void) {
             else taskYIELD();
         }
 
+#if LIN_DIAG_RENDER
         uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if (now_ms - fps_last_ms >= 1000) {
             ESP_LOGI(TAG, "Game FPS=%lu, retro_run=%lu ms", (unsigned long)frame_count, (unsigned long)(t1 - t0));
             frame_count = 0;
             fps_last_ms = now_ms;
         }
+#else
+        (void)fps_last_ms;
+#endif
     }
     gam4980_emu_stop();
     virtual_keys_set_enabled(false);

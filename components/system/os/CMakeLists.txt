@@ -23,11 +23,26 @@ idf_component_register(
  "kernel/os_keyvault.c"
  "kernel/os_mgr.c"
  "services/svc_statusbar.c"
+ "services/svc_quickbar.c"
  "services/svc_modtool.c"
  INCLUDE_DIRS "include"
  # ★ 2026-10-13: md_emu 默认停用(省 715KB), 恢复见 os.h 的 LINTOS_ENABLE_MD
-    REQUIRES power_mgr sms_emu arduboy_avr st7305 ui_common input touch_panel audio_player tone_player vibrator engine_manager gam4980 gb_emu gbc_emu nes_emu lavax book_reader wallpapers usb_hid usb_bt usb_net wifi_manager fonts kbd_lib sd_scan board_battery espsdr esp_netif lwip spi_flash nvs_flash svc_cfg svc_nvs esp_system bt_ctl web_gamepad usbh_msc vpet virtual_keys board_shim keyvault calc
- esp_http_client favorites esp_timer lua
+ #
+ # ★★ 2026-10-28 【构建依赖瘦身 45 → 27】★★
+ #   逐项核对依据 = 本组件 include/*.h 与 kernel+services 的 .c 实际引用(脚本枚举),
+ #   再叠加"符号级/传递"复核。删掉的 18 项在 os 里没有任何 #include、没有符号引用,
+ #   且下游(apps / ui/wallpapers / system/input)都已自行声明:
+ #     引擎类   gam4980 gb_emu gbc_emu nes_emu lavax book_reader vpet
+ #     UI/工具  kbd_lib virtual_keys board_shim calc lua
+ #     服务/IDF web_gamepad usbh_msc esp_http_client esp_netif lwip spi_flash
+ #   ⚠ 但 sms_emu / arduboy_avr **必须保留**: apps/pages/page_engine.c 直接
+ #     #include "sms_emu.h" / "arduboy_avr.h", 而 apps/CMakeLists 没有声明这两项 ——
+ #     它是靠 os 的 REQUIRES 传递拿到的。删掉会直接让 apps 编译失败。
+ #     (正确的修法是先给 apps 补声明, 再删这里 —— 留给后续步骤)
+ #   ⚠ nvs_flash / esp_system / esp_timer 也不能删: os_mgr.c、os_app.c 用 nvs_handle_t
+ #     与 nvs_get_str, 另有 esp_system.h / esp_timer.h 的直接 include。
+ REQUIRES power_mgr st7305 ui_common input touch_panel audio_player tone_player vibrator engine_manager wallpapers usb_hid usb_bt usb_net wifi_manager fonts sd_scan board_battery espsdr svc_cfg svc_nvs esp_system bt_ctl keyvault favorites esp_timer nvs_flash
+ sms_emu arduboy_avr
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
@@ -92,4 +107,12 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     LINTOS_GIT_ITER="${LINTOS_GIT_ITER}"
     LINTOS_BUILD_STAMP="${LINTOS_BUILD_STAMP}"
 )
-message(STATUS "[LinTOS] 内部 1.3.1+${LINTOS_GIT_ITER} (对外 1.3, 迭代基数: ${LINTOS_ITER_BASE}) / git=${LINTOS_GIT_DESC} / build=${LINTOS_BUILD_STAMP}")
+# 版本号一律从 lintos_version.h 读 —— **不要在这里写死**。
+# 2026-10-31: 这行曾硬编码 "内部 1.3.1 (对外 1.3)", 而实际版本早已是 2.0,
+#   每次编译都在刷假的版本号, 排查"固件到底是哪一版"时误导过一轮。
+file(READ "${CMAKE_CURRENT_LIST_DIR}/include/lintos_version.h" LINTOS_VER_H_TXT)
+string(REGEX MATCH "#define[ \t]+LINTOS_VERSION_PUBLIC[ \t]+\"([^\"]*)\"" _lv_pub "${LINTOS_VER_H_TXT}")
+set(LINTOS_VER_PUBLIC "${CMAKE_MATCH_1}")
+string(REGEX MATCH "#define[ \t]+LINTOS_VERSION_STR[ \t]+\"([^\"]*)\"" _lv_str "${LINTOS_VER_H_TXT}")
+set(LINTOS_VER_STR "${CMAKE_MATCH_1}")
+message(STATUS "[LinTOS] 版本 ${LINTOS_VER_STR} (对外 ${LINTOS_VER_PUBLIC}) +${LINTOS_GIT_ITER} (迭代基数: ${LINTOS_ITER_BASE}) / git=${LINTOS_GIT_DESC} / build=${LINTOS_BUILD_STAMP}")

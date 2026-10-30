@@ -8,6 +8,7 @@ idf_component_register(
          "font_zh16.c"
          "font_ascii.c"
          "font_part.c"
+         "font_switch.c"
     INCLUDE_DIRS "."
     REQUIRES esp_partition heap
 )

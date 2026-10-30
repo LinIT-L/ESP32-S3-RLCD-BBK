@@ -7,6 +7,9 @@
  *   加源 / 换源 / 调顺序 **只改 os_sources.c 一处**, 商店和 Lua 自动同步。
  *
  * ⚠ 顺序 = 设备尝试顺序, 所以国内源在前、境外源在后 (TLS 握手本身 1~3 秒/次)。
+ *
+ * ⚠ 位置: 放 apps/include (组件公共头) 而不是 pages/, 因为消费者跨了 pages 和 lua_bridge
+ *   两个目录 —— 留在 pages/ 会让 lua_bridge 反向依赖 pages, 形成目录级循环。
  */
 #pragma once
 

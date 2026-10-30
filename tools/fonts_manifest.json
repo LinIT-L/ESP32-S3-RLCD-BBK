@@ -1,0 +1,19 @@
+{
+  "_说明": "fontkit.py batch 的输入清单。src 为相对 tools/ 的路径或绝对路径；hzk_cell 仅 HZK 系列需要；size 仅轮廓字体(TTF/OTF)需要，且必须是原生字号。",
+  "fonts": [
+    {"id": "ark12",    "src": "../fontsrc/ark-pixel-12px-monospaced-zh_hans.bdf", "name": "方舟像素12"},
+    {"id": "fusion8",  "src": "../fontsrc/fusion-pixel-8px-monospaced-zh_hans.bdf",  "name": "缝合像素8"},
+    {"id": "fusion10", "src": "../fontsrc/fusion-pixel-10px-monospaced-zh_hans.bdf", "name": "缝合像素10"},
+    {"id": "fusion12", "src": "../fontsrc/fusion-pixel-12px-monospaced-zh_hans.bdf", "name": "缝合像素12"},
+    {"id": "zhengge16","src": "../fontsrc/ZhengGeDianHei-16.bdf", "name": "正格点黑16"},
+    {"id": "changban16","src": "../fontsrc/ChangBanDianSong-SC-16.bdf", "name": "长坂点宋16"},
+    {"id": "qiuye16",  "src": "../fontsrc/QiuYeYuanTi-16.bdf", "name": "秋叶圆体16"},
+    {"id": "unifont16","src": "../fontsrc/unifont-16.0.04.bdf", "name": "GNU Unifont16"},
+    {"id": "wqy12",    "src": "../fontsrc/WenQuanYi-Bitmap-Song-12px.ttf", "size": 12, "name": "文泉驿点阵宋12"},
+    {"id": "wqy14",    "src": "../fontsrc/WenQuanYi-Bitmap-Song-14px.ttf", "size": 14, "name": "文泉驿点阵宋14"},
+    {"id": "wqy16",    "src": "../fontsrc/WenQuanYi-Bitmap-Song-16px.ttf", "size": 16, "name": "文泉驿点阵宋16"},
+    {"id": "hzk24s",   "src": "../fontsrc/HZK24S", "hzk_cell": 24, "name": "HZK24宋体"},
+    {"id": "hzk24k",   "src": "../fontsrc/HZK24K", "hzk_cell": 24, "name": "HZK24楷体"},
+    {"id": "hzk24h",   "src": "../fontsrc/HZK24H", "hzk_cell": 24, "name": "HZK24黑体"}
+  ]
+}

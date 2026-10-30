@@ -18,10 +18,12 @@
 #include "input.h"       /* input_consume_tap / input_get_touch_pos (时间滚轮), esp_util.h */
 #include "esp_attr.h"
 #include "font_zh.h"
+#include "font_switch.h"
 #include "audio_player.h"
 #include "vibrator.h"
 #include "wifi_manager.h"
 #include "bt_manager.h"   /* bt_is_on(): 蓝牙实际开关状态 */
+#include "gps.h"          /* gps_power_state(): 硬件管理里 GPS 显示"休眠"而非"未检测到" */
 #include "keyboard.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -44,12 +46,16 @@
 #define TAG "PSET"
 #define SET_NS "os_settings"
 
-/* 主菜单项 (UTF-8): 显示与时间/声音与反馈/休眠与电源/网络与系统/请作者喝杯饮料 (底部"返回"由 os_dialog 自动加) */
+/* 主菜单 5 项 (2026-10-29 按 linit 目标结构调整):
+ *   显示与声音 / 触摸与反馈 / 电源与休眠 / 系统与连接 / 请作者喝杯饮料
+ * 变化: 原「显示与时间」「声音与反馈」合并为「显示与声音」;
+ *       震动两项从声音里独立出来, 与新增的「触摸校正」组成「触摸与反馈」;
+ *       「休眠与电源」改名「电源与休眠」（功能不变）; 「网络与系统」改名「系统与连接」。 */
 static const char *const s_set_items[5] = {
-    "\xe6\x98\xbe\xe7\xa4\xba\xe4\xb8\x8e\xe6\x97\xb6\xe9\x97\xb4",  /* 显示与时间 */
-    "\xe5\xa3\xb0\xe9\x9f\xb3\xe4\xb8\x8e\xe5\x8f\x8d\xe9\xa6\x88",  /* 声音与反馈 */
-    "\xe4\xbc\x91\xe7\x9c\xa0\xe4\xb8\x8e\xe7\x94\xb5\xe6\xba\x90",  /* 休眠与电源 */
-    "\xe7\xbd\x91\xe7\xbb\x9c\xe4\xb8\x8e\xe7\xb3\xbb\xe7\xbb\x9f",  /* 网络与系统 */
+    "\xe6\x98\xbe\xe7\xa4\xba\xe4\xb8\x8e\xe5\xa3\xb0\xe9\x9f\xb3",              /* 显示与声音 */
+    "\xe8\xa7\xa6\xe6\x91\xb8\xe4\xb8\x8e\xe5\x8f\x8d\xe9\xa6\x88",              /* 触摸与反馈 */
+    "\xe7\x94\xb5\xe6\xba\x90\xe4\xb8\x8e\xe4\xbc\x91\xe7\x9c\xa0",              /* 电源与休眠 */
+    "\xe7\xb3\xbb\xe7\xbb\x9f\xe4\xb8\x8e\xe8\xbf\x9e\xe6\x8e\xa5",              /* 系统与连接 */
     "\xe8\xaf\xb7\xe4\xbd\x9c\xe8\x80\x85\xe5\x96\x9d\xe6\x9d\xaf\xe9\xa5\xae\xe6\x96\x99",  /* 请作者喝杯饮料 */
 };
 
@@ -603,7 +609,9 @@ static void open_dark_dlg(ui_ctx_t *ctx) {
         "\xe6\x9a\x97\xe9\xbb\x91UI\xe6\xa8\xa1\xe5\xbc\x8f",       /* 暗黑UI模式 */
         "\xe5\x85\xa8\xe9\x83\xa8\xe6\x9a\x97\xe9\xbb\x91\xe6\xa8\xa1\xe5\xbc\x8f", /* 全部暗黑模式 */
     };
-    os_dialog_wheel(ctx, ptrs, 3, s_dark, on_dark_wheel);
+    /* 2026-10-29 linit: 只有 3 个选项, 用滚轮会觉得上下留白不均;
+     * 改成列表弹窗 —— 三项平铺、弹窗高度随项数收紧, 视觉上自然居中。 */
+    os_dialog_list(ctx, "", ptrs, 3, s_dark, on_dark_wheel, NULL);
 }
 
 /* 休眠相关子菜单 (V1.5.x): 壁纸时间 / 休眠时间 / 关机时间 / 电池信息 / 触摸唤醒
@@ -899,6 +907,161 @@ static void open_snd_dlg(ui_ctx_t *ctx, int sel) {
     ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2]; ptrs[3] = items[3];
     sel = (sel < 0) ? 0 : (sel > 3 ? 3 : sel);
     os_dialog_list(ctx, "", ptrs, 4, sel, on_snd_select, NULL);
+}
+
+/* ==================== 显示与声音 (2026-10-29) ====================
+ * 合并原「显示与时间」与「声音与反馈」：
+ *   前 3 项 = 目标结构要求的 黑暗模式 / 声音开关 / 音量;
+ *   后 2 项 = 原有的日期更改 / 时间调整（按"暂不删除"要求保留, 只调顺序）。
+ * 深色模式仍是三态 (关/暗黑UI/全部), 复用 s_dark + open_dark_dlg, 未改底层。 */
+static void open_av_dlg(ui_ctx_t *ctx, int sel);
+static void open_font16_dlg(ui_ctx_t *ctx, int sel);
+static void open_font24_dlg(ui_ctx_t *ctx, int sel);
+static void open_touchfb_dlg(ui_ctx_t *ctx, int sel);
+
+static void on_av_select(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    switch (result) {
+    case 0: open_dark_dlg(ctx); return;          /* 黑暗模式: 压三级弹窗, 本层保持 */
+    case 1: {                                    /* 声音开关 */
+        bool m = !audio_player_is_muted();
+        audio_player_set_muted(m);
+        settings_save_u8("snd_on", m ? 0 : 1);
+        break;
+    }
+    case 4: open_font16_dlg(ctx, font16_get()); return;   /* 16px 字体 */
+    case 5: open_font24_dlg(ctx, font24_get()); return;   /* 24px 字体 */
+    case 2: case 3: {                            /* 调整日期 / 修改时间 (原样逻辑) */
+        if (!s_edit_valid) {
+            time_t t = time(NULL); struct tm *ct = localtime(&t);
+            if (ct) s_edit_tm = *ct;
+            s_edit_valid = true;
+        }
+        s_time_mode  = (result == 2) ? 0 : 1;
+        s_time_field = tm_first();
+        open_time_wheel_dlg(ctx);
+        return;
+    }
+    default: return;
+    }
+    os_dialog_pop(ctx);
+    open_av_dlg(ctx, result);
+}
+
+static void open_av_dlg(ui_ctx_t *ctx, int sel) {
+    char items[6][40];
+    const char *ptrs[6];
+    /* 2026-10-29 linit: 标签不再带状态后缀(如":关"), 状态由子弹窗里的选中项表达;
+     * 音量调节项已按要求删除 (全局音量在快捷栏下拉里调, 不在这里重复)。 */
+    snprintf(items[0], sizeof(items[0]), "\xe9\xbb\x91\xe6\x9a\x97\xe6\xa8\xa1\xe5\xbc\x8f");      /* 黑暗模式 */
+    snprintf(items[1], sizeof(items[1]), "\xe5\xa3\xb0\xe9\x9f\xb3:%s",                            /* 声音:%s */
+             audio_player_is_muted() ? "\xe5\x85\xb3" : "\xe5\xbc\x80");
+    snprintf(items[2], sizeof(items[2]), "\xe8\xb0\x83\xe6\x95\xb4\xe6\x97\xa5\xe6\x9c\x9f");      /* 调整日期 */
+    snprintf(items[3], sizeof(items[3]), "\xe4\xbf\xae\xe6\x94\xb9\xe6\x97\xb6\xe9\x97\xb4");      /* 修改时间 */
+    /* 2026-10-30: 字体切换，16px / 24px 两档独立（只换系统 UI 字库;
+     * 阅读器字体在书内菜单，走 LBF，与此无关） */
+    snprintf(items[4], sizeof(items[4]), "16px\xe5\xad\x97\xe4\xbd\x93:%s", font16_name(font16_get()));
+    snprintf(items[5], sizeof(items[5]), "24px\xe5\xad\x97\xe4\xbd\x93:%s", font24_name(font24_get()));
+    for (int i = 0; i < 6; i++) ptrs[i] = items[i];
+    sel = (sel < 0) ? 0 : (sel > 5 ? 5 : sel);
+    os_dialog_list(ctx, "", ptrs, 6, sel, on_av_select, NULL);
+}
+
+/* ---- 字体选择: 16px / 24px 两档独立 ----
+ * 切换后立刻重建「显示与声音」菜单, 让标签与新字形同时刷新;
+ * 失败时弹一条明确提示并自动回退该档默认。 */
+static void on_font_err_ok(ui_ctx_t *ctx, int r, void *ud) {
+    (void)r;
+    int which = (int)(intptr_t)ud;          /* 4 = 16px 档, 5 = 24px 档 */
+    os_dialog_pop(ctx);
+    open_av_dlg(ctx, which);
+}
+
+static void on_font16_select(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result < 0 || result >= F16_COUNT) return;
+    bool ok = font16_apply(result);
+    settings_save_u8("uif16", ok ? (uint8_t)result : 0);
+
+    os_dialog_pop(ctx);          /* 关字体弹窗 */
+    os_dialog_pop(ctx);          /* 关旧的"显示与声音" (旧字形) */
+    ctx->needs_redraw = true;
+
+    if (ok) {
+        open_av_dlg(ctx, 4);
+    } else {
+        static const char *p[1] = { "\xe5\xad\x97\xe4\xbd\x93\xe4\xb8\x8d\xe5\x8f\xaf\xe7\x94\xa8" };  /* 字体不可用 */
+        os_dialog_list(ctx, "", p, 1, 0, on_font_err_ok, (void *)(intptr_t)4);
+    }
+}
+
+static void on_font24_select(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result < 0 || result >= F24_COUNT) return;
+    bool ok = font24_apply(result);
+    settings_save_u8("uif24", ok ? (uint8_t)result : 0);
+
+    os_dialog_pop(ctx);
+    os_dialog_pop(ctx);
+    ctx->needs_redraw = true;
+
+    if (ok) {
+        open_av_dlg(ctx, 5);
+    } else {
+        static const char *p[1] = { "\xe5\xad\x97\xe4\xbd\x93\xe4\xb8\x8d\xe5\x8f\xaf\xe7\x94\xa8" };
+        os_dialog_list(ctx, "", p, 1, 0, on_font_err_ok, (void *)(intptr_t)5);
+    }
+}
+
+static void open_font16_dlg(ui_ctx_t *ctx, int sel) {
+    const char *ptrs[F16_COUNT];
+    for (int i = 0; i < F16_COUNT; i++) ptrs[i] = font16_name(i);
+    sel = (sel < 0) ? 0 : (sel >= F16_COUNT ? F16_COUNT - 1 : sel);
+    os_dialog_list(ctx, "", ptrs, F16_COUNT, sel, on_font16_select, NULL);
+}
+
+static void open_font24_dlg(ui_ctx_t *ctx, int sel) {
+    const char *ptrs[F24_COUNT];
+    for (int i = 0; i < F24_COUNT; i++) ptrs[i] = font24_name(i);
+    sel = (sel < 0) ? 0 : (sel >= F24_COUNT ? F24_COUNT - 1 : sel);
+    os_dialog_list(ctx, "", ptrs, F24_COUNT, sel, on_font24_select, NULL);
+}
+
+/* ==================== 触摸与反馈 (2026-10-29) ====================
+ * 菜单震动 / 游戏震动：**沿用现有两套独立配置**（s_vib_ui / s_vib_game,
+ * vibrator_set_ui_enabled / vibrator_set_game_enabled, NVS 键 vib_ui / vib_game）,
+ * 底层实现一行未改, 只是把入口从"声音与反馈"移到本分类。
+ * 触摸校正: 2026-10-29 linit 决定不做 —— CST816 电容屏出厂 1:1, 无系统性偏差,
+ *   与其加一个没有依据的校正, 不如不做(避免采样误差把坐标搞偏)。 */
+static void open_touchfb_dlg(ui_ctx_t *ctx, int sel);
+
+static void on_touchfb_select(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result == 0) {
+        s_vib_ui = !s_vib_ui;
+        vibrator_set_ui_enabled(s_vib_ui);
+        settings_save_u8("vib_ui", s_vib_ui ? 1 : 0);
+    } else if (result == 1) {
+        s_vib_game = !s_vib_game;
+        vibrator_set_game_enabled(s_vib_game);
+        settings_save_u8("vib_game", s_vib_game ? 1 : 0);
+    } else {
+        return;
+    }
+    os_dialog_pop(ctx);
+    open_touchfb_dlg(ctx, result);
+}
+
+static void open_touchfb_dlg(ui_ctx_t *ctx, int sel) {
+    char items[2][32];
+    const char *ptrs[2];
+    snprintf(items[0], sizeof(items[0]), "\xe8\x8f\x9c\xe5\x8d\x95\xe9\x9c\x87\xe5\x8a\xa8:%s",
+             s_vib_ui ? "\xe5\xbc\x80" : "\xe5\x85\xb3");
+    snprintf(items[1], sizeof(items[1]), "\xe6\xb8\xb8\xe6\x88\x8f\xe9\x9c\x87\xe5\x8a\xa8:%s",
+             s_vib_game ? "\xe5\xbc\x80" : "\xe5\x85\xb3");
+    for (int i = 0; i < 2; i++) ptrs[i] = items[i];
+    sel = (sel < 0) ? 0 : (sel > 1 ? 1 : sel);
+    os_dialog_list(ctx, "", ptrs, 2, sel, on_touchfb_select, NULL);
 }
 
 /* ---- 无线连接弹窗: 蓝牙/WiFi 开关 + 连接WiFi (WiFi 开时显示) ---- */
@@ -1351,10 +1514,10 @@ static void wifi_scan_dlg_cb(ui_ctx_t *ctx, int result, void *ud) {
 
     /* ① 点的就是当前已连的那个 ⇒ 只看信息, **不要重连** */
     if (same && wifi_manager_is_connected()) {
-        char ip[16] = "-";
-        wifi_manager_get_ip(ip, sizeof(ip));
+        /* ★ 2026-10-30 linit: 不再显示 IP, 只提示"已连接 + SSID"。
+         *   用户明确要求"连接成功不用显示 IP"; IP 在"网络检测"页仍可查。 */
         char msg[64];
-        snprintf(msg, sizeof(msg), "%.20s  IP %s", ssid, ip);
+        snprintf(msg, sizeof(msg), "%.20s  \xe5\xb7\xb2\xe8\xbf\x9e\xe6\x8e\xa5", ssid);  /* 已连接 */
         os_dialog_toast(ctx, msg);
         return;
     }
@@ -1553,16 +1716,15 @@ static void hw_opt_start(bool bt)
 }
 
 /* 状态文字: 有在途操作时显示"开···/关···", 否则显示真实状态 */
+/* ★ 2026-10-27 linit: 状态文字**只保留单个"开/关"** —— 原来在途时显示 "开···"/"关···",
+ *   字数变多 ⇒ 这一行(居中/右对齐)整体往左挪一下, 观感像"抖了一下"。
+ *   现在固定两字宽度, 点开关时只有文字本身变, 位置不动。 */
 static const char *bt_state_str(void)
 {
-    if (s_bt_opt == 1) return "开\xc2\xb7\xc2\xb7\xc2\xb7";
-    if (s_bt_opt == 2) return "关\xc2\xb7\xc2\xb7\xc2\xb7";
     return bt_is_on() ? "开" : "关";
 }
 static const char *wifi_state_str(void)
 {
-    if (s_wifi_opt == 1) return "开\xc2\xb7\xc2\xb7\xc2\xb7";
-    if (s_wifi_opt == 2) return "关\xc2\xb7\xc2\xb7\xc2\xb7";
     return wifi_is_on() ? "开" : "关";
 }
 
@@ -1649,10 +1811,24 @@ static int hwsc_build(char lines[][28]) {
     int k = 0;
     /* ★ 2026-10-20: 板型挪到弹窗标题, 列表只剩 6 项硬件 + 重新自检 = 7 行。
      *   原来 8 行超出一屏, 要滚一屏才看到 GPS, 而滚动会回弹 ⇒ 点不到 GPS。 */
-    for (int i = 0; i < HW_COUNT; i++)
-        snprintf(lines[k++], 28, "%s:%s%s", HWCFG_NAMES[i],
-                 hw_cfg_detected((hw_id_t)i) ? "检测到" : "未检测到",
+    for (int i = 0; i < HW_COUNT; i++) {
+        /* ★★★ 2026-10-28 linit: GPS 必须分**三态**。
+         *   原来只有"检测到/未检测到"两态, 而 GPS 开机就被送进软件待机,
+         *   用户看到"未检测到"会以为模块没插/坏了 —— 其实它正好好睡着。
+         *   gps_power_state() 在 gps_boot_park() 末尾会把"已确认入睡"还原成
+         *   GPS_POWER_SLEEP(gps.c 末尾: teardown 清 UNKNOWN 后按实测还原),
+         *   所以拆掉 UART 之后照样读得到。
+         *   ⚠ 只有"确实识别到过 + 处于待机"才显示休眠; 没插模块仍是未检测到。 */
+        const char *st;
+        if ((hw_id_t)i == HW_GPS && hw_cfg_detected(HW_GPS) &&
+            gps_power_state() == GPS_POWER_SLEEP) {
+            st = "休眠";
+        } else {
+            st = hw_cfg_detected((hw_id_t)i) ? "检测到" : "未检测到";
+        }
+        snprintf(lines[k++], 28, "%s:%s%s", HWCFG_NAMES[i], st,
                  hw_cfg_enabled((hw_id_t)i) ? "(开)" : "(关)");
+    }
     snprintf(lines[k++], 28, "重新自检");
     return k;
 }
@@ -1798,10 +1974,10 @@ static bool settings_main_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, v
     case OS_ACTION_CONFIRM:
         if (d->sel >= d->count) return false;   /* 底部"返回"行 → 默认处理 (关闭) */
         switch (d->sel) {
-        case 0: open_disp_dlg(ctx, 0); break;        /* 显示与时间 */
-        case 1: open_snd_dlg(ctx, 0);  break;        /* 声音与反馈 */
-        case 2: open_sleepgrp_dlg(ctx, 0); break;    /* 休眠与电源 */
-        case 3: open_wifi_dlg(ctx, 0); break;        /* 网络与系统 (蓝牙/WiFi/连接WiFi/系统信息) */
+        case 0: open_av_dlg(ctx, 0); break;          /* 显示与声音 (黑暗/声音/音量 + 日期时间) */
+        case 1: open_touchfb_dlg(ctx, 0); break;     /* 触摸与反馈 (菜单震动/游戏震动/触摸校正) */
+        case 2: open_sleepgrp_dlg(ctx, 0); break;    /* 电源与休眠 (原休眠与电源, 功能不变) */
+        case 3: open_wifi_dlg(ctx, 0); break;        /* 系统与连接 (WiFi/蓝牙/固件信息/存储空间) */
         case 4: os_push(ctx, OS_PAGE_SPONSOR); break; /* 请作者喝杯饮料 → 全屏二维码弹窗 */
         default: break;
         }
@@ -1831,6 +2007,8 @@ static const os_module_t s_mod_settings = {
     .on_enter   = p_settings_enter,
     .fullscreen = false,
 };
+
+
 
 /* ---- 暗黑模式游戏态同步 ----
  * 引擎进运行循环时 input_set_gamepad_gamemode(true) (游戏渲染中), 退出后=false.

@@ -299,6 +299,22 @@ static void mp3_blit_1bpp_color(st7305_handle_t *lcd, int x0, int y0,
                                 int w, int h, const uint8_t *src, bool mirror, uint8_t color); /* 前向声明 */
 
 /* 实心圆 (音量滑条圆点用) */
+/* 前向: 定义在下方 */
+static void mp3_fill_circle(st7305_handle_t *lcd, int cx, int cy, int r, st7305_color_t c);
+
+/* 横向胶囊填充 (两端半圆): 中间矩形 + 左右整圆。
+ * 2026-10-29 linit: 进度条要做成"两头圆"的胶囊, 不能只是矩形加一个圆球。 */
+static void mp3_pill_fill(st7305_handle_t *lcd, int x0, int x1, int y0, int y1,
+                          st7305_color_t c)
+{
+    int r = (y1 - y0 + 1) / 2;
+    int cy = (y0 + y1) / 2;
+    if (r <= 0 || x1 - x0 < 2 * r) { fill_rect(lcd, x0, y0, x1, y1, c); return; }
+    fill_rect(lcd, x0 + r, y0, x1 - r, y1, c);
+    mp3_fill_circle(lcd, x0 + r, cy, r, c);
+    mp3_fill_circle(lcd, x1 - r, cy, r, c);
+}
+
 static void mp3_fill_circle(st7305_handle_t *lcd, int cx, int cy, int r, st7305_color_t c) {
     for (int y = -r; y <= r; y++) {
         int yy = cy + y;
@@ -582,12 +598,21 @@ static void p_mp3_render(ui_ctx_t *ctx)
     int bar_x0 = MP3_BAR_X0, bar_x1 = MP3_BAR_X1;
     int bar_w = bar_x1 - bar_x0 + 1;
     int played_w = bar_w * progress / 1000;
-    fill_rect(lcd, bar_x0, bar_y, bar_x0 + played_w - 1, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
-    fill_rect(lcd, bar_x0 + played_w, bar_y, bar_x1, bar_y + bar_h - 1, ST7305_COLOR_WHITE);
-    fill_rect(lcd, bar_x0, bar_y, bar_x1, bar_y, ST7305_COLOR_BLACK);
-    fill_rect(lcd, bar_x0, bar_y + bar_h - 1, bar_x1, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
-    fill_rect(lcd, bar_x0, bar_y, bar_x0, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
-    fill_rect(lcd, bar_x1, bar_y, bar_x1, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
+    int pill_r = bar_h / 2;                       /* 4: 两端半圆半径 */
+    int cy = bar_y + bar_h / 2;
+
+    /* ★ 2026-10-29 linit: 进度条做成**两端圆角的胶囊**, 不是矩形 + 一个圆球。
+     *   顺序: 黑胶囊(整条) → 白胶囊(内缩 1px) → 已播放段(左端圆, 右端平)。 */
+    mp3_pill_fill(lcd, bar_x0, bar_x1, bar_y, bar_y + bar_h - 1, ST7305_COLOR_BLACK);
+    mp3_pill_fill(lcd, bar_x0 + 1, bar_x1 - 1, bar_y + 1, bar_y + bar_h - 2, ST7305_COLOR_WHITE);
+    if (played_w > 0) {
+        int px = bar_x0 + played_w;
+        if (px > bar_x1 - 1) px = bar_x1 - 1;
+        if (px > bar_x0 + pill_r) {
+            fill_rect(lcd, bar_x0 + pill_r, bar_y + 1, px, bar_y + bar_h - 2, ST7305_COLOR_BLACK);
+            mp3_fill_circle(lcd, bar_x0 + pill_r, cy, pill_r - 1, ST7305_COLOR_BLACK);
+        }
+    }
     /* ★ 进度小圆球(linit 2026-10-16): 白圈+黑芯, 标在当前播放位置(比音量球小) */
     {
         int kx = bar_x0 + played_w;

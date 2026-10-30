@@ -34,6 +34,7 @@
 #include "ssd1306_virt.h"
 #include "audio_player.h"
 #include "virtual_keys.h"
+#include "input.h"   /* engine_overlay_quickbar */
 
 #include "cheater.h"
 #include "cheat_ui.h"
@@ -262,6 +263,7 @@ static void arduboy_avr_render(void)
     /* 独立修改机浮标: 画浮标+检测呼出 (触发后交独立修改机任务, 本任务停走) */
     bool takeover = cheat_float_overlay_tick(s_lcd);
     if (!takeover) vid_tune_overlay_tick(s_lcd);   /* 画面优化器浮标/面板 */
+    if (!takeover) engine_overlay_quickbar(s_lcd);  /* ★ 游戏内下拉快捷栏 */
     if (!takeover) st7305_flush(s_lcd);
     ssd1306_set_flag(&s_disp, SSD1306_FLAG_DIRTY, 0);
 }

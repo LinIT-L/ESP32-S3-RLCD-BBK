@@ -356,13 +356,19 @@ static void km_pin_submit(ui_ctx_t *ctx) {
             redraw(ctx); return;
         }
         os_keyvault_set_pin(s_pin_again);
-        os_keyvault_unlock_secret(s_pin_again, s_key);
+        if (os_keyvault_unlock_secret(s_pin_again, s_key) != ESP_OK) {   /* 派生失败: 不带全零密钥继续 */
+            os_dialog_toast(ctx, "\xe5\xaf\x86\xe9\x92\xa5\xe6\xb4\xbe\xe7\x94\x9f\xe5\xa4\xb1\xe8\xb4\xa5");
+            s_pin[0] = 0; s_pin_len = 0; redraw(ctx); return;
+        }
         strncpy(s_pin_plain, s_pin_again, sizeof(s_pin_plain) - 1); s_pin_plain[sizeof(s_pin_plain) - 1] = 0; /* 存明文供 AP 密码 */
     } else {
         if (s_pin_len == 0) return;
         int r = os_keyvault_verify_pin(s_pin);
         if (r == 0) {
-            os_keyvault_unlock_secret(s_pin, s_key);
+            if (os_keyvault_unlock_secret(s_pin, s_key) != ESP_OK) {   /* 派生失败: 不带全零密钥继续 */
+                os_dialog_toast(ctx, "\xe5\xaf\x86\xe9\x92\xa5\xe6\xb4\xbe\xe7\x94\x9f\xe5\xa4\xb1\xe8\xb4\xa5");
+                s_pin[0] = 0; s_pin_len = 0; redraw(ctx); return;
+            }
             strncpy(s_pin_plain, s_pin, sizeof(s_pin_plain) - 1); s_pin_plain[sizeof(s_pin_plain) - 1] = 0; /* 存明文供 AP 密码 */
         } else {
             char m[48];

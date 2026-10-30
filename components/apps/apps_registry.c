@@ -49,7 +49,7 @@ static const os_app_t s_builtin_apps[] = {
     { .id="calc",      .label="计算器",   .icon_idx=ICON_CALC,      .page=OS_PAGE_CALC,      .hidden=true, .cat="程序" }, /* 计算器 程序 */
     { .id="morse",     .label="摩斯电码", .icon_idx=ICON_MORSE,     .page=OS_PAGE_MORSE,     .hidden=true, .cat="程序" }, /* 摩斯电码 程序 */
     { .id="pomodoro",  .label="番茄钟",   .icon_idx=ICON_POMODORO,  .page=OS_PAGE_POMODORO,  .hidden=true, .cat="程序" }, /* 番茄钟 程序 */
-    { .id="wb",        .label="白板",     .icon_idx=ICON_WHITEBOARD,.page=OS_PAGE_WHITEBOARD,.hidden=true, .cat="程序" }, /* 白板 程序 */
+    { .id="wb",        .label="白板",     .icon_idx=ICON_WHITEBOARD,.page=OS_PAGE_WHITEBOARD,.hidden=true, .touch_only=true, .cat="程序" }, /* 白板 程序 (B7: 无触摸屏机型不显示) */
     { .id="wifiprobe", .label="无线探测", .icon_idx=ICON_WIFIPROBE, .page=OS_PAGE_WIFIPROBE, .hidden=true, .cat="运维" }, /* 无线探测 运维 */
     { .id="netdect",   .label="网络检测", .icon_idx=ICON_NETDECT,   .page=OS_PAGE_NETDECT,   .hidden=true, .cat="运维" }, /* 网络检测 运维 */
     { .id="diag",      .label="电脑诊断", .icon_idx=ICON_DIAG,      .page=OS_PAGE_DIAGNOSIS, .hidden=true, .cat="运维" }, /* 电脑诊断 运维 */
@@ -169,4 +169,21 @@ void apps_register_all(void)
 
     /* 注: 全局服务 (状态栏/修改机图标) 属 os 内核侧, 由 os_register_services() 注册,
      * 不在此处 —— 保证 apps 不反向依赖 os 内部服务实现. */
+}
+
+/* ★ 2026-10-30 P0-1: 供应用商店判断"某个 lua 文件是否已是固件内置应用"。
+ *   背景: 商店 am_pkg_scan() 会扫已安装目录 store/apps/app 下的 (*.lua), 生成 id="pkg:calc.lua";
+ *   而固件表里同一个应用的 id 是 "calc" —— 两套 id 无法互相匹配 ⇒ 商店里出现
+ *   "中文(固件表) + 英文(文件名)"两条。这里提供按 id 的只读查询, 由商店调用方决定跳过。
+ *   只读, 不改注册表, 不影响启动/卸载。 */
+#include <string.h>
+bool apps_builtin_has_id(const char *id)
+{
+    if (!id || !id[0]) return false;
+    const int n = (int)(sizeof(s_builtin_apps) / sizeof(s_builtin_apps[0]));
+    for (int i = 0; i < n; i++) {
+        const char *bid = s_builtin_apps[i].id;
+        if (bid && strcmp(bid, id) == 0) return true;
+    }
+    return false;
 }

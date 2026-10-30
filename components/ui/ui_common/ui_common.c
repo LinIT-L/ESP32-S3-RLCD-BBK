@@ -428,7 +428,12 @@ void draw_label(st7305_handle_t *lcd, int x, int y, const char *str, bool invert
             char ch = c;
             st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
             st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
-            fill_rect(lcd, cursor_x, y, cursor_x + ascii_w - 1, y + ascii_w - 1, bg);
+            /* ★ 2026-10-30 修复「24px 英文之间夹着很多横线」：
+             *   原来高度用的是 ascii_w（=16），只清了 y..y+15；而下面的字形循环
+             *   是 12 行 × 2 倍 = 24 行，画到 y..y+23 —— 底下 8 行没被清背景，
+             *   上一帧的内容原样留在那里，每个字符下面都露一条，连起来就是横线。
+             *   清屏高度必须跟字形实际占用的行数一致，即 zh_w（=24×scale）。 */
+            fill_rect(lcd, cursor_x, y, cursor_x + ascii_w - 1, y + zh_w - 1, bg);
             int aidx = font_zh_find_ascii((uint8_t)ch);
             const uint8_t *zbmp = (aidx >= 0) ? font_zh_get_bitmap_by_index(aidx) : NULL;
             if (zbmp) {

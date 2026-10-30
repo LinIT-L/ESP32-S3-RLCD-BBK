@@ -45,6 +45,10 @@ int font_zh_find_ascii(unsigned char c);
 int font_zh_find_char(char c);
 const uint8_t *font_zh_get_bitmap(char c);
 
+/* 2026-10-30: 重绑定到 appdata 内另一段字库 (设置里切字体).
+ * 成功返回 true; 失败返回 false 且保持原字库不变. */
+bool font_zh_rebind(uint32_t off, uint32_t len);
+
 #ifdef __cplusplus
 }
 #endif

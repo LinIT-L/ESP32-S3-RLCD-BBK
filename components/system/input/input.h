@@ -88,6 +88,26 @@ bool input_is_held(int idx);
  * 返回 true 表示有未消费的点击 (坐标写入 x 和 y, 可为 NULL), 取走后清零. */
 bool input_consume_tap(int *x, int *y);
 
+/* ==== 覆盖层触摸独占 (2026-10-29, 下拉快捷栏用) ====
+ * 快捷栏在「识别下拉手势中」或「已展开」时置位本锁:
+ *   所有普通调用者 (页面 poll / os_pane_poll / tap 分发 / 拖动分支) 一律拿不到触摸,
+ *   于是从顶部下拉时下方主菜单和列表不会跟着滚动。
+ *   覆盖层自己用 input_get_touch_pos_raw() 读真实坐标 (不受本锁影响)。
+ * 解索时机: 手指抬起且抽屉已收起 —— 由快捷栏自己维护。 */
+void input_set_overlay_lock(bool on);
+bool input_get_touch_pos_raw(int *x, int *y);
+
+/* ==== 引擎内 overlay 钩子 (2026-10-29) ====
+ * 问题: 阻塞式引擎 (自己跑 while 循环: board_shim / gam4980 / lavax / vpet / arduboy / sdlpal)
+ *       里 os_tick 不会执行, 全局服务 (快捷栏) 的 tick/render 一次都跑不到,
+ *       于是全屏游戏里从顶部下拉毫无反应。
+ * 做法: 引擎每帧调用 engine_overlay_quickbar(lcd) —— 实现由 os 层注入,
+ *       引擎**不需要依赖 os 组件** (保持分层单向), 未注入时为空操作。
+ * 注意: 睡眠/屏保/动态壁纸状态下不要调用 (那时不该响应下拉)。 */
+typedef void (*engine_overlay_fn)(void *lcd);   /* void* 避免 input 层依赖 st7305 类型 */
+void engine_overlay_set_quickbar(engine_overlay_fn fn);
+void engine_overlay_quickbar(void *lcd);
+
 /* V1.0.66: 返回当前触摸的实时屏幕坐标 (400x300), 供主菜单跟手拖动.
  * 返回 false 表示当前无手指按下. */
 bool input_get_touch_pos(int *x, int *y);
@@ -106,6 +126,12 @@ void input_get_touch_multi(tp_point_t pts[TP_MAX_POINTS], int *count);
  *   避免系统 UI 被第二点(幽灵点/跨中线跳点)干扰。默认关。 */
 void input_set_dual_touch(bool on);
 bool input_dual_touch(void);
+
+/* ★ 2026-10-30: "底部拖动屏蔽带"页面级开关 (默认 true = 保持既有行为)。
+ * 关闭后, 底部 50px 带内起手拖动**不再隐藏坐标** —— 全屏绘图页 (白板) 必需,
+ * 否则画布下沿 (x∈[125,275], y≥250) 起手的笔迹会在位移 40px 时被凭空截断。
+ * 由 os_push/os_pop 按 `os_module_t::no_bottom_shield` 统一设置, 页面不要自己调。 */
+void input_set_bottom_shield(bool on);
 
 /* V1.0.9x: 返回本次手势按下的起点屏幕坐标 (供主菜单拖动排序判定"是否已移动").
  * 未按住或无手势时返回 false. 必须与 input_get_touch_pos 同帧/之后调用. */

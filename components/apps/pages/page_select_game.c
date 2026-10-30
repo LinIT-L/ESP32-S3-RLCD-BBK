@@ -20,6 +20,8 @@
 
 #include "svc_nvs.h"
 #include "svc_cfg.h"
+#include "os_hw.h"        /* ★ 2026-10-30 按需蓝牙: os_hw_lease_acquire/release */
+#include "bt_manager.h"   /* bt_manager_has_saved_pad (只读 NVS, 不初始化蓝牙) */
 #include <string.h>
 #include <stdio.h>
 #include <dirent.h>
@@ -39,6 +41,9 @@ typedef struct {
     uint8_t key_vib;        /* 0=关 1=开  触摸震动 (2026-09-29 新增) */
 } gs_t;
 static gs_t s_gs;
+
+/* ★ 2026-10-30 按需蓝牙的租约 (幂等位图); 没配对过手柄时永远为空 → 不占内存 */
+static os_hw_lease_t s_bt_lease;
 
 static bool is_gam(const char *name) {
     size_t len = strlen(name);
@@ -120,7 +125,12 @@ static void on_game_select(ui_ctx_t *ctx, os_pane_t *p,
     gam4980_set_statusbar_cb(svc_statusbar_draw_game);
     input_set_gamepad_nav_enabled(false);
     input_set_gamepad_gamemode(true);   /* V1.3.x: 步步高也是"游戏" — 暗黑UI模式(除游戏外反色)进入时恢复不反色 */
+    /* ★ 2026-10-30 linit「蓝牙没启用就不要占内存」: 步步高是自驱动阻塞运行
+     *   (gam4980_emu_run), 不走 eng_task_run_loop, 故在这里单独按需申请蓝牙。
+     *   只读 NVS 预检: 从没配对过手柄 → 不申请, 全程 0 占用; 退出即 release 真拆栈。 */
+    if (bt_manager_has_saved_pad()) os_hw_lease_acquire(&s_bt_lease, OS_HW_BT);
     gam4980_emu_run();
+    os_hw_lease_release(&s_bt_lease, OS_HW_BT);   /* 退出游戏即还蓝牙内存 (~71KB) */
     input_set_gamepad_gamemode(false);  /* V1.3.x: 退出步步高, 结束游戏模式标志 (暗黑UI恢复反色) */
     input_set_gamepad_nav_enabled(true);
     input_mark_activity();   /* V1.5.x: 同 eng_task_run_loop — 刷新主循环输入时钟, 防退出即进壁纸 */

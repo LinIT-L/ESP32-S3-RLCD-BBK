@@ -22,7 +22,7 @@ typedef struct {
 #define VT_NVS_KEY "vidtune"
 
 static vt_nvs_t s_store;
-static const vt_prof_t *s_cur = NULL;   /* 当前引擎档 (指向 s_store.e[i]) */
+static vt_prof_t *s_cur = NULL;   /* 当前引擎档 (指向 s_store.e[i]); 非 const: 保存时要写回 */
 static char     s_cur_id[8];
 static uint8_t  s_p[VT_PARAM_N];        /* 工作副本 (取消要还原) */
 static uint8_t  s_dots[4];              /* shade → 黑点数 */
@@ -137,7 +137,7 @@ static void frame(st7305_handle_t *lcd, int x, int y, int w, int h)
 }
 
 /* ---------------- 面板几何 ---------------- */
-#define VT_ICON_SZ   14
+#define VT_ICON_SZ   28                     /* 2026-10-29 linit: 14→28, 宽高各放大一倍 */
 #define VT_ICON_X    (ST7305_WIDTH - VT_ICON_SZ - 3)
 #define VT_ICON_Y    3
 
@@ -157,6 +157,59 @@ static bool s_press_in_icon = false;
 static uint8_t s_backup[VT_PARAM_N];
 
 bool vid_tune_is_panel_open(void) { return s_panel_open; }
+
+/* 由快捷栏等外部入口调用: 打开调节面板 (面板仍由引擎帧内的 overlay_tick 绘制) */
+void vid_tune_open_panel(void) { if (vid_tune_enabled()) s_panel_open = true; }
+
+/* ===== 2026-10-29: 给快捷栏的展开态提供参数读写 =====
+ * 语义: pct 统一 0..100, 内部按各参数实际范围线性映射
+ *   GAIN 60..140 / CON 100..200 / WHITE,BLACK 0..255 */
+static float param_norm(int i);          /* 定义在后 */
+static void  param_set_norm(int i, float t);
+
+int vid_tune_get_pct(int i)
+{
+    if (i < 0 || i >= VT_PARAM_N) return 0;
+    float t = param_norm(i);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    return (int)(t * 100.0f + 0.5f);
+}
+
+void vid_tune_set_pct(int i, int pct)
+{
+    if (i < 0 || i >= VT_PARAM_N) return;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    param_set_norm(i, pct / 100.0f);
+    vt_rebuild();                       /* 立即生效: 重建抖动表 */
+}
+
+void vid_tune_save(void)
+{
+    if (!s_cur) {                       /* 首次保存: 建新档 */
+        if (s_store.n < 8) {
+            vt_prof_t *e = &s_store.e[s_store.n++];
+            memset(e, 0, sizeof(*e));
+            snprintf(e->id, sizeof(e->id), "%s", s_cur_id);
+            s_cur = e;
+        }
+    }
+    if (s_cur) memcpy(s_cur->p, s_p, sizeof(s_p));
+    store_flush();
+    ESP_LOGI(TAG, "保存 %s: 亮%d 对%d 白%d 黑%d", s_cur_id, s_p[0], s_p[1], s_p[2], s_p[3]);
+}
+
+void vid_tune_restore(void)
+{
+    memcpy(s_p, s_backup, sizeof(s_p));
+    vt_rebuild();
+    ESP_LOGI(TAG, "取消 (还原)");
+}
+
+/* 展开调节前先备份当前参数, 供"取消"还原 */
+void vid_tune_begin_edit(void) { memcpy(s_backup, s_p, sizeof(s_p)); }
+
 
 static int slot_x(int i) { return VT_SLOT_X0 + i * VT_SLOT_DX; }
 
@@ -206,13 +259,13 @@ static void draw_panel(st7305_handle_t *lcd)
 
 static void draw_icon(st7305_handle_t *lcd)
 {
-    /* 临时图标: 白底黑框 + 三根滑条 (画出来的, 不占资源) */
+    /* 白底黑框 + 三根滑条 (画出来的, 不占资源); 尺寸随 VT_ICON_SZ 等比放大 */
     fill(lcd, VT_ICON_X, VT_ICON_Y, VT_ICON_SZ, VT_ICON_SZ, 0);
     frame(lcd, VT_ICON_X, VT_ICON_Y, VT_ICON_SZ, VT_ICON_SZ);
     for (int k = 0; k < 3; k++) {
-        int x = VT_ICON_X + 3 + k * 4;
-        fill(lcd, x, VT_ICON_Y + 3, 1, VT_ICON_SZ - 6, 1);
-        fill(lcd, x - 1, VT_ICON_Y + 4 + k * 3, 3, 2, 1);   /* 滑柄 */
+        int x = VT_ICON_X + 6 + k * 8;
+        fill(lcd, x, VT_ICON_Y + 6, 2, VT_ICON_SZ - 12, 1);      /* 轨道 */
+        fill(lcd, x - 2, VT_ICON_Y + 8 + k * 6, 6, 4, 1);        /* 滑柄 */
     }
 }
 
@@ -229,7 +282,8 @@ bool vid_tune_overlay_tick(st7305_handle_t *lcd)
     s_prev_down = down;
 
     if (!s_panel_open) {
-        draw_icon(lcd);
+        /* ★ 2026-10-29 linit: 入口已移到快捷栏 (Wi-Fi 右侧), 这里不再画右上角浮标,
+         *   否则会出现两个入口。面板仍然由快捷栏调用 vid_tune_open_panel() 打开。 */
         if (press) {
             s_press_in_icon = (x >= VT_ICON_X && x < VT_ICON_X + VT_ICON_SZ &&
                                y >= VT_ICON_Y && y < VT_ICON_Y + VT_ICON_SZ);

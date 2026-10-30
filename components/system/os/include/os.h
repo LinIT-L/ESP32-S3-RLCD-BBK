@@ -158,6 +158,11 @@ struct os_module {
      * 统一设置 gesture_back_enable(!swipe_back_disabled), 不依赖各页自行开关,
      * 避免某页 exit 被跳过导致全局上滑返回卡死. (V1.1.0: 开关已迁到 gesture_back 模块) */
     bool swipe_back_disabled;
+    /* ★ 2026-10-30 (A6): 是否关闭"底部拖动屏蔽带"。
+     * 该屏蔽带在 input_get_touch_pos 内: 底部 50px 带 (x∈[125,275]) 起手 + 位移≥40px
+     * 就**不再给下层坐标**(防菜单/列表底部误拖)。全屏绘图页(白板)需要整面可用, 否则
+     * 画布下沿的笔迹会被凭空截断 —— 置 true, 由内核 push/pop 统一关闭/恢复。 */
+    bool no_bottom_shield;
     /* ★ 2026-10-14 linit 全局规范: **应用页按硬件返回键要先弹"退出程序?"确认, 确认才退**。
      * true = 内核统一拦 BACK 弹确认 (应用页默认应设 true)。
      * 不设 (=false, 排除项) 的三类:
@@ -185,6 +190,15 @@ struct os_service {
     /* V1.5.x: 可选"常驻热区触摸". 当前模块无 touch 且非全屏/非弹窗时兜底分发,
      * 供状态栏图标等常驻控件响应点击 (命中=返回 true). 旧服务不设则为 NULL. */
     bool (*touch)(ui_ctx_t *ctx, int x, int y);
+    /* ★ 2026-10-29: true = 本服务是"全局顶层覆盖"(如下拉快捷栏)。
+     *   普通服务的 render/touch 在内核里被 fullscreen / 滚动 状态挡掉 ——
+     *   那对状态栏是对的(全屏页不该画条), 但快捷栏必须**全屏游戏里也能用**。
+     *   置 true 后:
+     *     · render 在 fullscreen / 滚动 时照常画 (仍排在模块 render 之后);
+     *     · touch 在模块 touch **之前**被询问, 命中即消费 (可挡住下方游戏);
+     *     · 本服务自行决定"只在展开时拦截", 收起时只认顶部手势区。
+     *   默认 false, 不影响既有两个服务。 */
+    bool overlay_top;
 };
 
 /* ==== 内核公共状态（薄） ==== */
@@ -250,6 +264,12 @@ void os_tick(ui_ctx_t *ctx);
 
 /* 渲染: 非模态模块 render (全屏页隐藏状态栏), 再叠加所有 service render, flush. */
 void os_render(ui_ctx_t *ctx);
+
+/* 作废"已送屏背景"(2026-10-28): 下一帧先整屏清白 + 重绘最底层非模态页, 再叠弹窗.
+ * 用于背景被旁路刷屏盖过的场景 —— 屏保壁纸独占、全屏模态页返回、引擎直刷.
+ * 不调用的后果: 弹窗叠上去时底下还是上一幅壁纸/全屏页的残影.
+ * 副作用(正面): 整屏清白+重绘=全屏刷新, 满足"弹窗首次出现必须整屏刷". */
+void os_invalidate_bg(void);
 
 /* 查询当前是否停在桌面 (供蓝牙自动重连/屏保等后台逻辑判断). */
 bool os_is_main(const ui_ctx_t *ctx);
@@ -319,6 +339,11 @@ bool os_confirm_exit_blocking(st7305_handle_t *lcd);
  * 各页只在"真要退出"那一处调本函数 (页内 BACK 的其它语义不受影响);
  * 真正 os_pop 延迟到下一帧由 os_tick 执行 (弹窗回调里直接弹栈会只弹掉弹窗层)。 */
 void os_request_exit_confirm(ui_ctx_t *ctx);
+
+/* 延迟退出一页 (2026-10-28): 在**弹窗回调**里调用 —— 弹窗真正关闭后的下一帧才执行 os_pop。
+ * 为什么不能直接 os_pop: 回调执行时弹窗页还在栈顶, 直接 pop 只会弹掉弹窗层, 页面原地不动。
+ * 用途: "点取消就不该继续留在这个页面" —— 如频谱仪未启用时的"占用64KB, 是否启用?"。 */
+void os_request_pop(ui_ctx_t *ctx);
 
 void os_dialog_toast(ui_ctx_t *ctx, const char *msg);   /* 0.5s 自动关闭 (2026-09-22 规范) */
 void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms); /* 自定义时长 toast (0=默认 0.5s) */
@@ -431,10 +456,20 @@ typedef struct os_platform_ops {
     bool    (*wifi_enabled)(void);
     bool    (*wifi_connected)(void);
     bool    (*usb_data_active)(void);
+    /* ==== 操作类 (2026-10-29 快捷栏用) ====
+     * 只给 getter 的话, 快捷栏要么拿不到真实开关, 要么得让 os 反向依赖 bt_ctl /
+     * wifi_manager / audio_player —— 与本结构"解耦"的初衷相悖。
+     * 这里补三个 setter, 由外壳(main.c)注入; 任一为 NULL 表示该功能不可用,
+     * UI 侧显示为不可操作, 绝不假装成功。 */
+    void    (*set_volume)(int percent);      /* 0..100 */
+    void    (*set_bt_enabled)(bool on);      /* 失败无返回: bt_core_radio_on/off 本身幂等 */
+    bool    (*set_wifi_enabled)(bool on);    /* 返回是否成功 (开热点失败要能告诉用户) */
 } os_platform_ops_t;
 
 /* 注入平台状态挂钩 (可多次调用, 覆盖生效). */
 void os_platform_set(const os_platform_ops_t *ops);
+/* 由 os_platform_set() 内部转发: 快捷栏与状态栏共用同一份挂钩, 外壳只需注入一次. */
+void os_quickbar_set_platform(const os_platform_ops_t *ops);
 
 /* ==== CPU 双核静态亲和性工具 (内核 os_core, 独立于资源管家裁剪) ====
  * 与资源管理无关, 属系统范围工具, 从旧 os_mgr 迁出归位. */
@@ -449,6 +484,21 @@ void os_svc_statusbar_register(void);
 void os_statusbar_set_invert(bool v);
 /* 修改机状态栏常驻服务 (mini 图标 + 二级菜单) */
 void os_svc_modtool_register(void);
+
+/* ==== 全局下拉快捷栏 (音量/蓝牙/Wi-Fi, 2026-10-29) ====
+ * 顶部中央 200×10 手势区下滑展开, 展开高度 40px; 上滑收起。
+ * 全屏页(游戏/应用)同样可用。 */
+void os_svc_quickbar_register(void);
+/* 快捷栏是否处于展开状态 —— 内核据此强制 flush (游戏态下引擎自己刷屏,
+ * 不强制 flush 的话快捷栏画进 fb 却送不上屏)。 */
+bool os_quickbar_is_open(void);
+/* 立刻收起快捷栏并归还触摸 (返回键优先调用) */
+void os_quickbar_close(void);
+
+/* 游戏/全屏应用**帧循环**里调用: 收下拉手势并把快捷栏画在当前帧上。
+ * 必须在引擎自己的 while 循环里每帧调 —— 那时 os_tick 不跑, 服务收不到 tick。
+ * lcd 为当前帧缓冲; 内部只在展开/手势中才绘制。 */
+void os_quickbar_game_frame(st7305_handle_t *lcd);
 
 #ifdef __cplusplus
 }

@@ -28,8 +28,20 @@ bool am_asset_install(const char *zip_path, const char *target_dir);
 bool am_asset_install_cb(const char *zip_path, const char *target_dir,
                          am_asset_prog_cb_t cb);
 
-/* 递归删除一个目录及其内容 (卸载资源包用). 返回 true = 目录已不存在。 */
+/* 递归删除一个目录及其内容 (卸载资源包用). 返回 true = 目录已不存在。
+ * ⚠ 只适用于**该包独占**的目录 (如 /sdcard/apps/app/pal)。
+ *   共享目录 (/sdcard/fonts) 请用 am_asset_uninstall()。 */
 bool am_asset_rmdir(const char *dir);
+
+/* 2026-10-30: 按安装时写下的清单卸载，只删本包装进去的文件。
+ * 共享目录(多包共存)必须用它 —— 否则删一个字体就把别人全删了。
+ * 返回 false = 没有清单(旧包), 调用方可回退到 am_asset_rmdir()。 */
+bool am_asset_uninstall(const char *zip_path, const char *target_dir);
+
+/* 2026-10-30: 该包是否装了 fullpath 这个文件（按安装清单核对）。
+ * 卸载前判断"正在使用的字体是否属于本包" —— 只比清单，不用目录前缀，
+ * 否则同目录下装多个字体时会互相误拦。返回 false 也可能是旧包无清单。 */
+bool am_asset_has_file(const char *zip_path, const char *target_dir, const char *fullpath);
 
 #ifdef __cplusplus
 }

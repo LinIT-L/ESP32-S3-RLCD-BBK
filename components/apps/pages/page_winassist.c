@@ -90,36 +90,90 @@ static const wa_item_t cat_items[CAT_N][WA_ITEMS_MAX] = {
 };
 static int g_cat = CAT_SYS;
 
-static uint8_t wa_char_hid(char c) {
+/* 字符 → HID (美式布局)。mod 由本函数一并给出, 调用方不要再自己判大小写。
+ * ★ 2026-10-30: 补齐标点。原来只映射 字母/数字/空格/./-/:/ , 其余字符被**静默丢弃**
+ *   —— 命令里只要出现一个 `\` 或 `%` 或 `"`, 打出去的就是另一条命令 (而且没人知道)。
+ *   现有 40 条快捷命令恰好只用到了旧映射里的字符, 所以一直没暴露; 但这是定时炸弹:
+ *   以后加一条 `cmd /k ipconfig /all | findstr IPv4` 就会打错。
+ *   映射表与 page_logdiag.c 的 ld_char_hid() 保持同一口径 (两份表, 改动要同步)。 */
+#define HIDK_1      0x1E
+#define HIDK_0      0x27
+#define HIDK_EQUAL  0x2E
+#define HIDK_LBRACK 0x2F
+#define HIDK_RBRACK 0x30
+#define HIDK_BSLASH 0x31
+#define HIDK_SEMI   0x33
+#define HIDK_QUOTE  0x34
+#define HIDK_TICK   0x35
+#define HIDK_COMMA  0x36
+#define HIDK_SLASH  0x38
+
+static uint8_t wa_char_hid(char c, uint8_t *mod) {
+    *mod = 0;
     if (c >= 'a' && c <= 'z') return (uint8_t)(HIDK_A + (c - 'a'));
-    if (c >= 'A' && c <= 'Z') return (uint8_t)(HIDK_A + (c - 'A'));
-    if (c >= '0' && c <= '9') return (uint8_t)(0x1E + (c - '0'));
+    if (c >= 'A' && c <= 'Z') { *mod = MOD_LSHIFT; return (uint8_t)(HIDK_A + (c - 'A')); }
+    if (c >= '1' && c <= '9') return (uint8_t)(HIDK_1 + (c - '1'));
+    if (c == '0')             return HIDK_0;
     switch (c) {
-        case ' ': return HIDK_SPACE;
-        case '.': return HIDK_DOT;
-        case '-': return HIDK_MINUS;
-        case ':': return 0x33;
-        case '/': return 0x38;
-        default: return 0;
+        case ' ':  return HIDK_SPACE;
+        case '.':  return HIDK_DOT;
+        case '-':  return HIDK_MINUS;
+        case '=':  return HIDK_EQUAL;
+        case '[':  return HIDK_LBRACK;
+        case ']':  return HIDK_RBRACK;
+        case '\\': return HIDK_BSLASH;
+        case ';':  return HIDK_SEMI;
+        case '\'': return HIDK_QUOTE;
+        case '`':  return HIDK_TICK;
+        case ',':  return HIDK_COMMA;
+        case '/':  return HIDK_SLASH;
+        /* 上档符号 */
+        case '!':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 0);
+        case '@':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 1);
+        case '#':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 2);
+        case '$':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 3);
+        case '%':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 4);
+        case '^':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 5);
+        case '&':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 6);
+        case '*':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 7);
+        case '(':  *mod = MOD_LSHIFT; return (uint8_t)(HIDK_1 + 8);
+        case ')':  *mod = MOD_LSHIFT; return HIDK_0;
+        case '_':  *mod = MOD_LSHIFT; return HIDK_MINUS;
+        case '+':  *mod = MOD_LSHIFT; return HIDK_EQUAL;
+        case '{':  *mod = MOD_LSHIFT; return HIDK_LBRACK;
+        case '}':  *mod = MOD_LSHIFT; return HIDK_RBRACK;
+        case '|':  *mod = MOD_LSHIFT; return HIDK_BSLASH;
+        case ':':  *mod = MOD_LSHIFT; return HIDK_SEMI;
+        case '"':  *mod = MOD_LSHIFT; return HIDK_QUOTE;
+        case '~':  *mod = MOD_LSHIFT; return HIDK_TICK;
+        case '<':  *mod = MOD_LSHIFT; return HIDK_COMMA;
+        case '>':  *mod = MOD_LSHIFT; return HIDK_DOT;
+        case '?':  *mod = MOD_LSHIFT; return HIDK_SLASH;
+        default:   return 0;
     }
 }
 static void wa_send_str(const char *s) {
     for (; *s; s++) {
-        char c = *s;
-        uint8_t mod = 0, k = wa_char_hid(c);
-        if (k == 0) continue;
-        if (c >= 'A' && c <= 'Z') mod |= MOD_LSHIFT;
+        uint8_t mod = 0;
+        uint8_t k = wa_char_hid(*s, &mod);
+        if (k == 0) continue;                       /* 表外字符: 仍然丢弃, 但表已覆盖 ASCII 可见字符 */
         os_hid_key_tap(mod, k);
     }
 }
 static void wa_win_cmd(const char *cmd) {
     os_hid_key_tap(MOD_LGUI, HIDK_R);
-    vTaskDelay(pdMS_TO_TICKS(60));
+    /* ★ 2026-10-30: 60ms → 350ms。60ms 连"运行"对话框都还没画出来 (explorer 冷启动更慢),
+     *   之后的字符就打到**当前前台窗口**里了 —— 打到文档/浏览器/邮件正文里都可能。
+     *   HID 是单向的, 读不回"对话框是否已就绪", 只能按经验给足余量。 */
+    vTaskDelay(pdMS_TO_TICKS(350));
     wa_send_str(cmd);
-    vTaskDelay(pdMS_TO_TICKS(40));
+    vTaskDelay(pdMS_TO_TICKS(80));
     os_hid_key_tap(0, HIDK_ENTER);
 }
-static void wa_item_exec(const wa_item_t *it) {
+static void wa_item_exec(ui_ctx_t *ctx, const wa_item_t *it) {
+    /* ★ 2026-10-30: 先把"电脑到底连没连上"说清楚。
+     *   usb_hid_key_tap() 在主机未枚举时是**静默返回**, 原来点按钮毫无反应也没提示。 */
+    if (!os_hid_connected()) { os_dialog_toast(ctx, "\xe7\x94\xb5\xe8\x84\x91\xe6\x9c\xaa\xe8\xbf\x9e\xe6\x8e\xa5"); return; }
     if (it->kind == KT_TASK) os_hid_key_tap(MOD_LCTRL | MOD_LSHIFT, HIDK_ESC);
     else if (it->cmd) wa_win_cmd(it->cmd);
 }
@@ -271,7 +325,7 @@ static bool ws_touch(ui_ctx_t *ctx, int x, int y) {
         int col = x / WA_BTN_W;
         int idx = row * WA_BTN_COLS + col;
         if (row < WA_BTN_ROWS && col < WA_BTN_COLS && idx < WA_ITEMS_MAX)
-            wa_item_exec(&cat_items[g_cat][idx]);
+            wa_item_exec(ctx, &cat_items[g_cat][idx]);
         return true;
     }
     if (y >= WA_MB_Y && y < WA_MB_Y + WA_MB_H) {

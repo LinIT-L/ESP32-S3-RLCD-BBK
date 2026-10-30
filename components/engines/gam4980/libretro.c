@@ -90,8 +90,37 @@ static retro_audio_sample_t     audio_cb;
 #define BBK_AUDIO_SR          44100
 #define BBK_SAMPLES_PER_FRAME (BBK_AUDIO_SR / 60)   /* 735 */
 #define BBK_SPK_AMP           12000                  /* 方波幅度, 避免全幅刺耳 */
+/* ★★★ 音频诊断探针总开关 (2026-10-29) ★★★
+ *   排查「步步高无声」时加的观测代码全部收在这里, 发布版必须为 0。
+ *   置 1 才会:
+ *     · 统计 PB(0x21b) 与音频寄存器区 0x23A..0x240 的写入次数/末值;
+ *     · 每秒打一行 [bbkaud] 诊断 (引擎有没有产生波形、卡在哪一环)。
+ *   这些只读不改行为, 但会每秒写串口 + 每次 ram_write 多两次自增,
+ *   常态下没必要开着 —— 关掉后下面的变量与分支会被预处理器整体剔除。 */
+#define BBK_AUDIO_PROBE 0   /* 关闭: 音频走不通, 见下 */
+
+/* ★ 2026-10-29 定案: 步步高引擎音频整体不编译进固件。
+ *   依据见 gam4980_emu.c 里 GAM4980_ENABLE_AUDIO 上方的完整结论:
+ *   上游两个开源实现都没做音频, 本机实测也没有可用音频源 (ST1 只有 60Hz,
+ *   PB 全程写 1 次, AUDCON 只写 1 次做使能)。强行合成只会是噪音。
+ *   置 1 可恢复下面整段方波合成代码 (仅供将来接对音频源后重做)。 */
+#define BBK_AUDIO_ENABLE 0
+
 static volatile int s_spk_overflow[4];   /* 本帧各定时器溢出次数 */
 static volatile int s_spk_level[4];      /* 本帧各定时器方波电平 */
+#if BBK_AUDIO_PROBE
+static volatile uint32_t g_pb_writes;    /* 扬声器端口 PB 写入累计 (音频溯源用) */
+/* ★ 2026-10-29 音频溯源: 0x23A..0x240 是页2 的中断/音频寄存器区
+ *   (IER 0x23A, TIER 0x23B, AUDCON 0x23F —— 见 BBKEmu memory.rs 的 registers 表)。
+ *   上游 gam4980 与 BBKEmu 都**没有**处理 AUDCON, 但都定义了它。
+ *   这里先只统计"有没有人写、写成什么", 用于判断能否在写入处拦截并合成音频。
+ *   ⚠ 只记录, 不改行为。 */
+#define AREG_LO 0x23Au
+#define AREG_HI 0x240u
+#define AREG_N  (AREG_HI - AREG_LO + 1u)
+static volatile uint32_t g_areg_writes[AREG_N];
+static volatile uint8_t  g_areg_last[AREG_N];
+#endif /* BBK_AUDIO_PROBE */
 static int          s_spk_phase[4];      /* 相位累加 (跨帧保持) */
 
 /* V1.0.44: fa/fb 从 .dram1.data 移到 PSRAM, 释放约 30KB 内部 DRAM.
@@ -110,7 +139,9 @@ static uint16_t mem_read16(uint16_t addr);
 static uint16_t mem_readx16(uint16_t addr);
 static uint16_t mem_read16_wrapped(uint16_t addr);
 static void IRAM_ATTR mem_write(uint16_t addr, uint8_t val);
+#if BBK_AUDIO_ENABLE
 static void bbk_audio_flush_frame(void);
+#endif
 
 #define READ8(addr)       mem_read(addr)
 #define READX8(addr)      mem_readx(addr)
@@ -329,9 +360,26 @@ static void ram_write(uint16_t addr, uint8_t val)
 {
     s_ram[addr] = val;
 
+    /* 音频寄存器区写入统计 (只记录, 不改行为) */
+#if BBK_AUDIO_PROBE
+    if (addr >= AREG_LO && addr <= AREG_HI) {
+        g_areg_writes[addr - AREG_LO]++;
+        g_areg_last[addr - AREG_LO] = val;
+    }
+#endif
+
     // XXX: Disable ROM (0x400000-0x7fffff) channels and audio.
-    if (addr == _PB)
+    if (addr == _PB) {
+        /* ★ 2026-10-29 音频溯源: 老式 8 位机常用"端口软件 PWM"发声, PB(0x21b) 就是
+         *   扬声器口。原模拟器这里**无条件清零**, 等于把这类音频直接掐掉。
+         *   先只统计写入频率 (不动行为), 用于判定本机游戏是否走这条路:
+         *     每秒数百次以上 ⇒ 几乎肯定是软件 PWM, 应解禁并按写入值采样;
+         *     几乎为 0        ⇒ 音频另有所在, 不要动这行。 */
+#if BBK_AUDIO_PROBE
+        g_pb_writes++;
+#endif
         s_ram[addr] = 0;
+    }
 
     // Never return 0 for AutoPowerOffCount to prevent poweroff.
     if (addr == 0x2028)
@@ -540,7 +588,7 @@ static void mem_bs(uint8_t sel)
     }
 }
 
-static uint8_t IRAM_ATTR mem_readx(uint16_t addr)
+static uint8_t mem_readx(uint16_t addr)
 {
     uint8_t page = addr >> 8;
     if (s_mem_r[page])
@@ -548,7 +596,7 @@ static uint8_t IRAM_ATTR mem_readx(uint16_t addr)
     return s_mem_ir[page](addr);
 }
 
-static uint8_t IRAM_ATTR mem_read(uint16_t addr)
+static uint8_t mem_read(uint16_t addr)
 {
     uint8_t page = addr >> 8;
     if (s_mem_r[page])
@@ -572,7 +620,7 @@ static uint16_t mem_read16_wrapped(uint16_t addr)
     return mem_read(addr) | (mem_read((addr + 1) & 0xff) << 8);
 }
 
-static void IRAM_ATTR mem_write(uint16_t addr, uint8_t val)
+static void mem_write(uint16_t addr, uint8_t val)
 {
     uint8_t page = addr >> 8;
     if (s_mem_iw[page])
@@ -1109,11 +1157,13 @@ static void IRAM_ATTR sys_timer(uint32_t n)
             t[i] += n;
             if (t[i] >= 0x100) {
                 t[i] = s_ram[_ST1LD + i];
-                /* BBK 音频: 定时器溢出翻转方波电平 (ST1 除外, 它用于按键扫描) */
-                if (i >= 1 && i <= 3) {
-                    s_spk_overflow[i]++;
-                    s_spk_level[i] ^= 1;
-                }
+                /* ★ 2026-10-29 实测修正: 原来这里只统计 i=1..3 (ST2/ST3/ST4), 把 ST1 排除,
+                 *   理由是"ST1 被固件用作按键扫描"。但串口实测 stcon=0x01 —— 游戏**只开了 ST1**,
+                 *   ST2/3/4 全关 ⇒ 音频源恒为空 ⇒ 每帧输出全零静音 (用户听到的就是"完全没声音")。
+                 *   现在 4 路全记; 选源时 ST2/3/4 优先, ST1 仅作兜底 (见 bbk_audio_flush_frame),
+                 *   这样"ST1 兼作按键扫描"的场合仍不会被它的溢出抢占音频通道。 */
+                s_spk_overflow[i]++;
+                s_spk_level[i] ^= 1;
                 if (s_ram[_TIER] & (1 << i)) {
                     s_ram[_TISR] |= (1 << i);
                     s_ram[_SYSCON] &= 0xf7;
@@ -1312,7 +1362,9 @@ void retro_set_environment(retro_environment_t cb)
     unsigned opts_ver = 0;
     environ_cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &opts_ver);
     if (opts_ver >= 1) {
-        environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS, &opts);
+        /* libretro 的 environ_cb 回调第二参数是 void*, 而 opts 是 const 数组;
+         * 宿主只读不写, 这里显式去 const 以满足接口签名 (语义未变)。 */
+        environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS, (void *)&opts);
     }
 }
 
@@ -1636,9 +1688,12 @@ void IRAM_ATTR retro_run(void)
         blend_frame();
     video_cb(fb, LCD_WIDTH, LCD_HEIGHT, 2 * (LCD_WIDTH + 1));
 
+#if BBK_AUDIO_ENABLE
     bbk_audio_flush_frame();
+#endif
 }
 
+#if BBK_AUDIO_ENABLE
 /* 每帧生成定时器方波音效 (60fps, 44100Hz). 取最活跃音频定时器 (溢出次数最多),
  * 按实际溢出率还原方波频率, 输出到 audio_cb. */
 static void bbk_audio_flush_frame(void)
@@ -1649,30 +1704,100 @@ static void bbk_audio_flush_frame(void)
         return;
     }
 
-    /* 选择最活跃的音频定时器 */
+    /* ★ 2026-10-29 修「步步高引擎整体无声」—— 原判定 `s_spk_overflow[i] >= 2`
+     *   要求**单个 16.6ms 帧内**溢出 2 次以上才认作音频源。可实际速率算下来:
+     *     tstep = 400 * cpu_rate(1.0) / timer_rate(1.0) = 400 CPU周期/tick
+     *     每帧 cycles = 1.0 * 4,000,000 / 60 = 66,666  → 每帧 166 tick
+     *     8 位定时器一次溢出需 0x100 = 256 tick     → 每帧仅 0.65 次溢出
+     *   ⇒ `>= 2` 永远不成立 ⇒ best 恒为 -1 ⇒ 每帧写满 735 个 0 ⇒ 全程静音。
+     *   (该计数器能表达的最高溢出率也只有 39Hz, 根本够不到 120Hz 的门槛。)
+     *
+     *   现在改为三条:
+     *     ① 跨帧累积溢出次数 —— 低频方波单帧可能一次都不溢出, 不能因此丢音;
+     *     ② 只要定时器在跑 (_STCON 对应位=1) 就视为音频源, 不再要求单帧 ≥2;
+     *     ③ 累积不足 2 次时沿用上次算出的周期, 保持相位连续, 不出现断续。
+     *   注意: 本函数每帧被调用一次, 是这些静态变量的唯一读者, 无需额外加锁。 */
+    static int s_ovf_acc[4];   /* 跨帧累积溢出次数 */
+    static int s_period[4];    /* 上次合成的周期(样本/周期), 0=尚无 */
+
     int best = -1;
     int best_ovf = 0;
+    /* 第一轮: ST2/ST3/ST4 —— 保持原设计的优先顺序 */
     for (i = 1; i < 4; i++) {
-        if (s_spk_overflow[i] >= 2 && s_spk_overflow[i] > best_ovf) {
-            best_ovf = s_spk_overflow[i];
+        if (!(s_ram[_STCON] & (1 << i))) {   /* 定时器停 → 清状态, 不再算音频 */
+            s_ovf_acc[i] = 0;
+            s_period[i] = 0;
+            s_spk_overflow[i] = 0;
+            continue;
+        }
+        s_ovf_acc[i] += s_spk_overflow[i];
+        s_spk_overflow[i] = 0;               /* 读走即清, 由累积量代替单帧量 */
+        if (s_ovf_acc[i] > best_ovf) {
+            best_ovf = s_ovf_acc[i];
             best = i;
         }
     }
+    /* ★ 2026-10-29 实测结论: **ST1 不能当音频源**。
+     *   串口数据 stcon=0x01 / ovf=0/0/0 / period=735 —— ST1 每帧溢出不足 2 次,
+     *   按 735 样本凑一个周期 = 60Hz 方波, 在喇叭上就是"爆炸/噗噗"声, 比没声音更糟。
+     *   原因是本核心的 timer tick = cpu_rate*4MHz/400 (tstep=400, 自首版未变),
+     *   8 位定时器最高溢出率约 39Hz, 根本到不了可闻音域。
+     *   因此 ST1 只保留计数(便于继续排查), 不参与选源。 */
+    s_spk_overflow[0] = 0;
 
     if (best < 0) {
-        /* 无音频: 输出静音 */
+        /* 所有音频定时器都停了: 输出静音 */
         for (i = 0; i < BBK_SAMPLES_PER_FRAME; i++)
             audio_cb(0, 0);
-        for (i = 0; i < 4; i++) s_spk_overflow[i] = 0;
+        /* ★ 无声定位: 走到这里说明"本帧没有任何可用音频源"。每秒最多 1 行,
+         *   stcon=0x00 ⇒ 游戏压根没使能 ST2/3/4 —— 那本引擎的方波方案就不适用,
+         *   得换音频源(例如 PB 端口软件 PWM), 而不是继续在混音层调参。 */
+#if BBK_AUDIO_PROBE
+        {
+            static int64_t  s_silent_us = 0;
+            static uint32_t s_pb_last = 0;
+            int64_t nowu = esp_timer_get_time();
+            if (nowu - s_silent_us >= 1000000) {
+                s_silent_us = nowu;
+                uint32_t pb = g_pb_writes;
+                ESP_LOGW("bbkaud", "[diag] 静音: stcon=0x%02X cb=%d PB=%u/s (total %u)",
+                         s_ram[_STCON], (audio_cb != NULL) ? 1 : 0,
+                         (unsigned)(pb - s_pb_last), (unsigned)pb);
+                s_pb_last = pb;
+                /* 音频寄存器区写入次数/最后值 —— 判定"能不能在写入处合成音频"。
+                 * 全 0 ⇒ 游戏压根不碰 AUDCON, 这条路走不通。 */
+                ESP_LOGW("bbkaud", "[areg] IER=%u/0x%02X TIER=%u/0x%02X "
+                                   "C=%u/0x%02X D=%u/0x%02X E=%u/0x%02X "
+                                   "AUDCON=%u/0x%02X R240=%u/0x%02X",
+                         (unsigned)g_areg_writes[0], g_areg_last[0],
+                         (unsigned)g_areg_writes[1], g_areg_last[1],
+                         (unsigned)g_areg_writes[2], g_areg_last[2],
+                         (unsigned)g_areg_writes[3], g_areg_last[3],
+                         (unsigned)g_areg_writes[4], g_areg_last[4],
+                         (unsigned)g_areg_writes[5], g_areg_last[5],
+                         (unsigned)g_areg_writes[6], g_areg_last[6]);
+            }
+        }
+#endif /* BBK_AUDIO_PROBE */
         return;
     }
 
-    /* 方波频率: overflow/2 周期每帧, 帧率 60 */
-    int cycles_f = best_ovf / 2;
-    if (cycles_f < 1) cycles_f = 1;
-    int period = BBK_SAMPLES_PER_FRAME / cycles_f;
-    if (period < 2) period = 2;
+    /* 方波频率: 累积溢出/2 = 每帧完整周期数, 帧率 60 */
+    int period = s_period[best];
+    if (best_ovf >= 2) {
+        int cycles_f = best_ovf / 2;
+        if (cycles_f < 1) cycles_f = 1;
+        period = BBK_SAMPLES_PER_FRAME / cycles_f;
+        if (period < 2) period = 2;
+        s_period[best] = period;
+        s_ovf_acc[best] = 0;                 /* 已消费, 重新累积 */
+    } else if (period < 2) {
+        /* 首次还没攒够一个完整周期: 按 60Hz 兜底, 避免整帧静音占位 */
+        period = BBK_SAMPLES_PER_FRAME;
+    }
+
     int half = period / 2;
+    if (half < 1) half = 1;
     int phase = s_spk_phase[best];
     for (i = 0; i < BBK_SAMPLES_PER_FRAME; i++) {
         int16_t v = (phase < half) ? BBK_SPK_AMP : -BBK_SPK_AMP;
@@ -1682,8 +1807,38 @@ static void bbk_audio_flush_frame(void)
     }
     s_spk_phase[best] = phase;
 
-    for (i = 0; i < 4; i++) s_spk_overflow[i] = 0;
+    /* ★ 2026-10-29 无声定位用的常驻诊断 (每秒 1 行, 只在有变化时打):
+     *   stcon   = 0x00  → **没有任何定时器被使能** ⇒ 音频源根本不存在(选错了源),
+     *                     这种情况改判定门槛/混音都没有意义;
+     *   ovf=0/0/0       → 定时器使能了但从不溢出 ⇒ tstep/重载值换算不对;
+     *   cb=0            → retro_set_audio_sample 没生效, PCM 根本没送出去;
+     *   period 正常      → 说明本层在正常产波, 若仍无声则查下游(feed_pcm/I2S/PA). */
+#if BBK_AUDIO_PROBE
+    {
+        static int64_t s_diag_us = 0;
+        static int     s_diag_last[5] = { -1, -1, -1, -1, -1 };
+        int64_t now = esp_timer_get_time();
+        if (now - s_diag_us >= 1000000) {
+            s_diag_us = now;
+            int stcon = s_ram[_STCON];
+            if (stcon != s_diag_last[0] || best_ovf != s_diag_last[1] ||
+                period != s_diag_last[2] || best != s_diag_last[3] ||
+                (audio_cb != NULL) != (s_diag_last[4] != 0)) {
+                s_diag_last[0] = stcon;
+                s_diag_last[1] = best_ovf;
+                s_diag_last[2] = period;
+                s_diag_last[3] = best;
+                s_diag_last[4] = (audio_cb != NULL) ? 1 : 0;
+                ESP_LOGI("bbkaud", "[diag] stcon=0x%02X ovf=%d/%d/%d best=%d period=%d cb=%d",
+                         stcon,
+                         s_spk_overflow[1], s_spk_overflow[2], s_spk_overflow[3],
+                         best, period, (audio_cb != NULL) ? 1 : 0);
+            }
+        }
+    }
+#endif /* BBK_AUDIO_PROBE */
 }
+#endif /* BBK_AUDIO_ENABLE */
 
 struct __attribute__((packed)) sys_state {
     uint8_t ram[0x8000];

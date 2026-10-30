@@ -33,6 +33,8 @@
 #include "audio_player.h"        /* 统一音量档位与 volume 接口 */
 #include "svc_nvs.h"
 #include "svc_cfg.h"
+#include "os_hw.h"        /* ★ 2026-10-30 按需蓝牙: os_hw_lease_acquire/release */
+#include "bt_manager.h"   /* bt_manager_has_saved_pad (只读 NVS, 不初始化蓝牙) */
 #include "esp_log.h"
 #include "esp_attr.h"
 #include <dirent.h>
@@ -199,11 +201,12 @@ static int wqx_resolve_lav(const char *gdir, char *out, size_t out_size) {
     return -1;
 }
 /* 带路径过滤: 文曲星右栏把"含 .lav 的游戏文件夹"当作一项 (也接受直接 .lav 文件) */
+static bool wqx_is_res_dir(const char *name);   /* 定义在后: 引擎资源目录判定 */
 static bool wqx_is_game_dir(const char *path, const char *name) {
     if (wqx_ends_lav(name)) return true;   /* 直接 .lav 文件 */
     if (name[0] == '.') return false;
-    /* 顶层 "Lava" 是数据目录 (非游戏): 既不显示在左栏(见 exclude_dir), 也不当右栏游戏项 */
-    if (strcasecmp(name, "Lava") == 0) return false;
+    /* 引擎资源目录 (Lava / LavaData): 不是游戏, 右栏也不显示 */
+    if (wqx_is_res_dir(name)) return false;
     char full[160];
     snprintf(full, sizeof(full), "%s/%.63s", path, name);
     char lav[160];
@@ -274,11 +277,10 @@ static void eng_settings_render(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1,
         case 1: eng_pad_label(buf, sizeof(buf), 5, "\xe8\x99\x9a\xe6\x8b\x9f\xe6\x8c\x89\xe9\x94\xae", evk_name()); break; /*虚拟按键*/
         case 2: eng_pad_label(buf, sizeof(buf), 5, "\xe6\x8a\x97\xe9\x94\xaf\xe9\xbd\xbf", aaf_name()); break; /*抗锯齿*/
         case 3: eng_pad_label(buf, sizeof(buf), 5, "\xe7\x81\xb0\xe5\xba\xa6", gray_name()); break; /*灰度*/
-        case 4: { char vbuf[8]; snprintf(vbuf, sizeof(vbuf), "%d", s_evo);
-                   eng_pad_label(buf, sizeof(buf), 5, "\xe9\x9f\xb3\xe9\x87\x8f", vbuf); break; } /*音量*/
-        case 5: eng_pad_label(buf, sizeof(buf), 5, "\xe6\x8c\x89\xe9\x94\xae\xe5\xa3\xb0\xe9\x9f\xb3", esnd_name()); break; /*按键声音*/
-        case 6: eng_pad_label(buf, sizeof(buf), 5, "\xe8\xa7\xa6\xe6\x91\xb8\xe9\x9c\x87\xe5\x8a\xa8", evib_name()); break; /*触摸震动*/
-        case 7: eng_pad_label(buf, sizeof(buf), 5, "\xe7\x94\xbb\xe9\x9d\xa2\xe4\xbc\x98\xe5\x8c\x96\xe5\x99\xa8",
+        /* 原「音量」项已删除: 全局音量统一由下拉快捷栏调, 这里重复一份只会造成两处状态不一致 */
+        case 4: eng_pad_label(buf, sizeof(buf), 5, "\xe6\x8c\x89\xe9\x94\xae\xe5\xa3\xb0\xe9\x9f\xb3", esnd_name()); break; /*按键声音*/
+        case 5: eng_pad_label(buf, sizeof(buf), 5, "\xe8\xa7\xa6\xe6\x91\xb8\xe9\x9c\x87\xe5\x8a\xa8", evib_name()); break; /*触摸震动*/
+        case 6: eng_pad_label(buf, sizeof(buf), 5, "\xe7\x94\xbb\xe9\x9d\xa2\xe4\xbc\x98\xe5\x8c\x96\xe5\x99\xa8",
                               vid_tune_enabled() ? "\xe5\xbc\x80" : "\xe5\x85\xb3"); break; /*画面优化器 开/关*/
         }
         int ry = list_y + i * 32 - off_mod; bool sel = (p->focus == 1 && idx == p->sel_item);
@@ -292,20 +294,27 @@ static void eng_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
     else if (item == 1) s_evk = (uint8_t)((s_evk + 1) % 3);
     else if (item == 2) s_aaf ^= 1;       /* 抗锯齿 */
     else if (item == 3) s_gray ^= 1;      /* 灰度 */
-    else if (item == 4) {   /* 音量档位 0-9 循环 → 调全局音量 (统一入口自己落盘) */
-        s_evo = (uint8_t)((s_evo + 1) % AUDIO_VOL_STEPS);
-        audio_player_set_volume(audio_player_vol_to_percent((int)s_evo));
-    }
-    else if (item == 5) { s_esnd ^= 1;  input_set_engine_sound(s_esnd != 0); }   /* 按键声音 */
-    else if (item == 6) { s_evib ^= 1;  input_set_engine_vib(s_evib != 0); }     /* 触摸震动 */
-    else if (item == 7) { vid_tune_set_enabled(!vid_tune_enabled()); }           /* 画面优化器 */
+    else if (item == 4) { s_esnd ^= 1;  input_set_engine_sound(s_esnd != 0); }   /* 按键声音 */
+    else if (item == 5) { s_evib ^= 1;  input_set_engine_vib(s_evib != 0); }     /* 触摸震动 */
+    else if (item == 6) { vid_tune_set_enabled(!vid_tune_enabled()); }           /* 画面优化器 */
     egs_save(); ctx->needs_redraw = true;
+}
+
+/* 文曲星引擎资源目录: 精确名单, **不做 contains 匹配** ——
+ * 避免把名字里恰好含 "lava" 的合法游戏 (如 "LavaBattle") 一起屏蔽掉。
+ *   Lava     : 游戏内/根目录的 .lav 程序目录 (wqx_resolve_lav 会进去找)
+ *   LavaData : 游戏存档/资源目录
+ * 大小写不敏感 (strcasecmp): 实机上出现过 lava/Lava 混用。 */
+static bool wqx_is_res_dir(const char *name) {
+    if (!name) return false;
+    return (strcasecmp(name, "Lava") == 0) ||
+           (strcasecmp(name, "LavaData") == 0);
 }
 
 /* 文曲星: 根目录下的 "Lava" 是数据存放目录 (不是游戏分类), 左栏不显示为类别.
  * (注意: 游戏目录/自身内部也有 Lava 子目录, 由 wqx_resolve_lav 处理, 与这里无关.) */
 static bool wqx_exclude_lava(const char *name) {
-    return (name && strcasecmp(name, "Lava") == 0);
+    return wqx_is_res_dir(name);
 }
 
 /* ==== 双栏页面通用辅助 (设置并重建一个 os_pane) ==== */
@@ -321,7 +330,7 @@ static void pane_setup(os_pane_t *p, ui_ctx_t *ctx, const char *root,
         p->all_label = NULL;
         /* 左栏最上方"引擎优化", 右栏内联设置 (3.3) */
         p->settings_label = "\xe5\xbc\x95\xe6\x93\x8e\xe4\xbc\x98\xe5\x8c\x96"; /* 引擎优化 */
-        p->settings_count = 8;   /* …/ 触震 / 画面优化器 */
+        p->settings_count = 7;   /* 2026-10-30: 删除「音量」项 (统一由快捷栏调, 引擎内不再重复) */
         p->settings_render = eng_settings_render;
         p->on_settings_select = eng_settings_select;
         p->list_y = 30;   /* 状态栏(24)下方 */
@@ -372,8 +381,22 @@ static bool eng_exit_confirm(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
  * 游戏运行阻塞主循环, 但"进入屏保/渲染/软关机"统一由独立监视任务
  * (wp_screensaver_supervisor_start) 负责, 不受本阻塞循环影响: 空闲超时
  * 监视任务强制进入壁纸并冻结画面(board_rlcd 独占), 壁纸恒在最上层. */
+/* ★ 2026-10-30 按需蓝牙的租约 (位图, 幂等):
+ *   只在游戏运行期持有; 没配对过手柄时永远为空 → 不占任何内存。 */
+static os_hw_lease_t s_bt_lease;
+
 static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
     input_mark_activity();   /* V1.5.x: 进入游戏即刷新主循环输入时钟 → 任何操作重置壁纸计时 */
+    /* ★★★ 2026-10-30 linit「蓝牙没启用就不要占内存」—— 游戏运行期才占用蓝牙 ★★★
+     *   这里就是"真正在玩游戏"的唯一入口 (GB/GBC/NES/MD/SMS/暴龙机/ArduBoy 全走本函数)。
+     *   · 只读 NVS 预检是否配对过手柄; 从没配对过 → 根本不申请, 开机/游戏全程 0 占用;
+     *   · 配对过 → os_hw_lease_acquire 走引用计数拉起 (约 1~2s, 此时加载屏还在);
+     *   · 原本就已开 (用户在手柄页开着) → lease 不重复计数, 退出也不误关;
+     *   · 退出游戏 → release, 引用计数归零由 os_hw 调 bt_manager_disable_release() 真拆栈,
+     *     把 controller/Bluedroid/esp_hidh 的约 71KB 内部 RAM 还回来
+     *     (旧实现只关射频, 内存永不回收, 这就是"内存不足"的主因之一)。
+     *   ⛔ 不要改成无条件 os_hw_request: 没配对过的手柄用户会白付 71KB。 */
+    if (bt_manager_has_saved_pad()) os_hw_lease_acquire(&s_bt_lease, OS_HW_BT);
     input_set_gamepad_nav_enabled(false);
     input_set_gamepad_gamemode(true);   /* V1.2.x: 标记真正进入游戏, 允许手柄返回/退出键退出 */
     /* 屏幕虚拟按键: 引擎优化"虚拟按键"设置 (0=关 1/2=开) */
@@ -430,6 +453,9 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
     input_mark_activity();
     st7305_clear(ctx->lcd, ST7305_COLOR_WHITE);
     ctx->needs_redraw = true;
+    /* ★ 2026-10-30: 退出游戏 → 归还蓝牙 (引用计数归零则真拆栈, 还 ~71KB 内部 RAM)。
+     *   放在最后: 此时引擎任务已停, 不会再有人读手柄。 */
+    os_hw_lease_release(&s_bt_lease, OS_HW_BT);
 }
 
 /* ==== 右栏确认: 各引擎运行 (阻塞) ==== */
@@ -551,7 +577,10 @@ static void lavax_select(ui_ctx_t *ctx, os_pane_t *p, const char *path, const ch
     }
     lavax_set_display_mode((int)s_edm);      /* 显示模式: 0点对点/1全屏/2拉伸 */
     lavax_set_exit_check(lavax_host_exit_check);   /* 返回键 -> 请求退出(确认浮层后续按 os_dialog 标准接入) */
+    /* ★ 2026-10-30: 文曲星是自驱动阻塞运行(不走 eng_task_run_loop), 这里单独按需申请蓝牙 */
+    if (bt_manager_has_saved_pad()) os_hw_lease_acquire(&s_bt_lease, OS_HW_BT);
     lavax_emu_load_and_run(run);   /* 阻塞直到退出 */
+    os_hw_lease_release(&s_bt_lease, OS_HW_BT);   /* 退出即还蓝牙内存 */
     input_set_gamepad_nav_enabled(true);
     input_set_gamepad_gamemode(false);  /* V1.2.x: 文曲星退出, 结束游戏模式标志 */
     input_mark_activity();   /* V1.5.x: 同 eng_task_run_loop — 刷新主循环输入时钟, 防退出即进壁纸 */
@@ -596,6 +625,9 @@ static os_pane_t *panes_get(int i) {
 /* 页面退出: 释放该页的列表 pane (on_exit 里调用) */
 static void eng_page_exit(ui_ctx_t *ctx) {
     (void)ctx;
+    /* ★ 2026-10-30 兜底: 游戏异常退出/中途返回时也要还蓝牙
+     *   (正常路径已在 eng_task_run_loop 末尾 release; lease 幂等, 重复调用安全) */
+    os_hw_lease_release(&s_bt_lease, OS_HW_BT);
     if (s_panes) { heap_caps_free(s_panes); s_panes = NULL; s_pane_idx = -1; }
 }
 #define s_gb_p   (*panes_get(PANE_GB))
@@ -770,10 +802,14 @@ static const os_module_t s_mod_sms = {
 static void lavax_enter(ui_ctx_t *ctx) {
     engine_manager_load(ENGINE_LAVAX, ctx->lcd);
     s_lav_p.fav_enabled = true; s_lav_p.fav_engine = FAV_ENGINE_WQX;
-    s_lav_p.exclude_dir = wqx_exclude_lava;   /* 左栏不显示 Lava 数据目录 (首次 reset 前设置) */
+    /* ★ 2026-10-29 修「Lava 文件夹出现在收藏栏下方」:
+     *   s_panes 是**共享单例** (换引擎 heap_caps_free + calloc 重建),
+     *   而 pane_setup() 内部就会调 os_pane_build_right() —— 原来 is_item_d
+     *   是在 pane_setup **之后**才赋值, 于是 build_right 用的是 is_item (只认 .lav 后缀),
+     *   目录过滤形同虚设。必须在 pane_setup 之前全部就位。 */
+    s_lav_p.exclude_dir = wqx_exclude_lava;   /* 左栏: 不显示 Lava / LavaData 资源目录 */
+    s_lav_p.is_item_d   = wqx_is_game_dir;    /* 右栏: 只认"含 .lav 的游戏文件夹" */
     pane_setup(&s_lav_p, ctx, LAVAX_ROOT, is_lav, lavax_select);
-    /* 文曲星: 游戏是目录 (内含 Lava 子目录与 LavaData 数据), 用带路径过滤把"游戏文件夹"当右栏一项 */
-    s_lav_p.is_item_d = wqx_is_game_dir;
 }
 static void lavax_render(ui_ctx_t *ctx)   { pane_render(ctx, &s_lav_p); }
 static void lavax_action(ui_ctx_t *ctx, os_action_t a) { pane_action(ctx, &s_lav_p, a); }

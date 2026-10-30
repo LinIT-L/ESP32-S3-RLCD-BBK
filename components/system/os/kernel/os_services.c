@@ -12,4 +12,5 @@ void os_register_services(void)
 {
     os_svc_statusbar_register();   /* 状态栏: 日期/时间/电池/蓝牙/音量/NET 常驻图标 */
     os_svc_modtool_register();     /* 修改机常驻图标 (热区) */
+    os_svc_quickbar_register();    /* 顶部下拉快捷栏: 音量/蓝牙/Wi-Fi (全屏页也可用) */
 }

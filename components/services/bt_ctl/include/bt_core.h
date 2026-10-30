@@ -40,6 +40,15 @@ bool bt_core_init(const bt_core_cbs_t *cbs);
 bool bt_core_is_ready(void);
 void bt_core_deinit(void);
 
+/* ★ 2026-10-27: 只关/开射频(不拆栈) —— 关蓝牙走这里, 保证界面与耗电都真·关闭 */
+void bt_core_radio_off(void);
+void bt_core_radio_on(void);
+
+/* ★ 2026-10-30: 深度拆栈 —— 真正归还 ~67KB 内部 RAM (controller/Bluedroid/esp_hidh 全拆).
+ * 只允许在"最后一个使用者退出"时调用 (bt_manager_disable_release);
+ * 内部失败兜底会退回"只关射频", 不会出现关不掉。 */
+void bt_core_deinit_deep(void);
+
 /* 扫描: 阻塞 duration_sec 秒, 收集 HID 设备到内部缓存, 完成后调 on_scan_done.
  * 需在普通任务中调用 (esp_hid_scan 是同步阻塞函数). */
 void bt_core_scan(int duration_sec);

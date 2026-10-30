@@ -16,6 +16,7 @@
 #include "esp_attr.h"
 #include "font_zh16.h"
 #include "input.h"
+#include "diag_core.h"   /* 纯逻辑: 归一化/排序/解析 (与主机测试共用同一实现) */
 #include "esp_timer.h"
 #include "diag_dev_icons.inc"   /* 桌面「电脑诊断」6 器件 64x64 位图 (diag_dev_icons[]) */
 #include <string.h>
@@ -186,7 +187,7 @@ typedef struct {
     int         subdev[DMAXOPT];
     int         nsub;
 } diag_cat_t;
-static const diag_cat_t DCAT[6] = {
+static const diag_cat_t DCAT[7] = {
     { "不通电", {
         "电源指示灯不亮", "按下开机键无反应", "机内有焦糊味",
         "指示灯闪烁不稳定", "能通电但瞬间关机", "不确定"
@@ -211,6 +212,14 @@ static const diag_cat_t DCAT[6] = {
         "卡在品牌标志界面", "提示修复恢复界面", "无限重启进不去",
         "黑屏停住不动", "能进但频繁卡死", "不确定"
       }, { 26, 24, 18, 18, 20, 5 }, { 1, 5, 4, 0, 1, -1 }, 6 },
+    /* ★ 2026-10-30 新增: 过热/散热。原来只有"风扇狂转且过热"一条, 塞在"卡顿闪退"里,
+     *   无法区分"卡顿是性能不足"还是"卡顿是热降频", 是知识库最大的覆盖空洞。
+     *   映射理由: 散热失效的直接执行者是主板(风扇控制/温度管理/供电),
+     *   高温后重启常见于电源过热保护, 所以第 3 条指向电源。 */
+    { "过热异响", {
+        "风扇声音突然变大", "机身明显发烫", "高温后卡顿或自动重启",
+        "风扇完全不转", "清灰后明显好转", "不确定"
+      }, { 20, 18, 22, 16, 20, 5 }, { 3, 3, 4, 3, 3, -1 }, 6 },
 };
 static const char *DDEVTYPE[DMAXOPT] = {
     "台式机", "笔记本", "一体机", "工控机", "服务器", "不确定"
@@ -281,8 +290,8 @@ static void dRecompute(void) {
     if (g_ans_sub) {
         int nsub = DCAT[g_cat].nsub;
         for (int i = 0; i < nsub; i++)
-            if (g_sub_ans[i] && g_sub_wt[i] > 0)
-                devpplus(DCAT[g_cat].subdev[i], g_sub_wt[i]);
+            if (g_sub_ans[i] && g_sub_wt[i] != 0)
+                devpplus(DCAT[g_cat].subdev[i], g_sub_wt[i]);   /* 负值 = 反对证据 */
     }
     if (g_ans_devtype) {
         switch (g_devtype) {
@@ -297,6 +306,14 @@ static void dRecompute(void) {
     if (g_ans_cfg) {
         if (g_cfg == 0) { devprob[2] += 6; devprob[4] += 4; }
         else            { devprob[3] += 4; devprob[0] += 2; }
+    }
+    /* ★ 2026-10-30 边界处理:
+     *   ① 反对证据可能把某部件压成负数 → 归零, 否则归一化时被当成"0 分但仍在榜"很怪;
+     *   ② 单部件封顶 45: 防止同一部件的多条同义症状线性叠加后独占全部百分比
+     *      (例如"花屏"类 5 条都指向显卡, 会堆到 100+ 让其他可能性彻底看不见)。 */
+    for (int i = 0; i < DMAXDEV; i++) {
+        if (devprob[i] < 0) devprob[i] = 0;
+        if (devprob[i] > 45) devprob[i] = 45;
     }
 }
 static int  s_pix_off = 0;            /* 右栏整体像素偏移 (0..RBAR_MAX_PX), 跟手滚动 */
@@ -320,7 +337,7 @@ static void DReset(void) {
 static int dStageOptCount(diag_stage_t st) {
     switch (st) {
         case D_ST_DEV: return 6;               /* 设备类型 */
-        case D_ST_CAT: return 6;               /* 故障大类 */
+        case D_ST_CAT: return 7;               /* 故障大类 (2026-10-30: 6→7, 加热过异响) */
         case D_ST_SUB: return 3;               /* 符合/不符合/结束 */
         case D_ST_CFG: return 2;
         case D_ST_RESULT: return DMAXDEV;
@@ -340,6 +357,17 @@ static const char *dStageOptLabel(diag_stage_t st, int i) {
         default: return "";
     }
 }
+/* ★ 2026-10-29 修: 原来直接把 devprob[] 当百分比显示。
+ *   devprob 是**累加固件权重**(多个症状相加可轻松超过 100), 于是进度条恒满格、
+ *   百分比出现 130% 这种值。这里统一换算成"相对可能性":
+ *     pct = score[i] * 100 / sum(score)   —— 全部部件加起来恰好 100%。
+ *   注意语义: 这是**相对可能性评分**, 不是真实故障概率(没有校准数据支撑)。 */
+static int dPctRel(int i, int *out_total)
+{
+    /* 实现在 diag_core.c, 与 tools/test_diag_core.c 跑的是同一份代码 */
+    return dc_pct_at(devprob, DMAXDEV, i, out_total);
+}
+
 static int dSortedIdx[DMAXDEV];
 static void dSortDev(void) {
     for (int i = 0; i < DMAXDEV; i++) dSortedIdx[i] = i;
@@ -451,7 +479,8 @@ static void dDrawRightBar(st7305_handle_t *l) {
         int di = dSortedIdx[i];
         int CY = iy + RICON_S / 2;     /* 图标垂直中心 */
         char buf[8];
-        snprintf(buf, sizeof(buf), "%d", devprob[di]);
+        int pct = dPctRel(di, NULL);       /* 归一化后的相对可能性 (0..100) */
+        snprintf(buf, sizeof(buf), "%d", pct);
         int dlen = (int)strlen(buf);
         /* 进度条: 贴最右, 高12, 相对图标垂直中心下移 10px */
         int bar_right = DW - 4;
@@ -459,7 +488,7 @@ static void dDrawRightBar(st7305_handle_t *l) {
         int bar_y = CY - 6 + 10;   /* 名称+进度条整体下移 10px (图标不动) */
         drect(l, bar_x0, bar_y, bar_right, bar_y + 11, ST7305_COLOR_WHITE);
         doutline(l, bar_x0, bar_y, bar_right, bar_y + 11);
-        int fill_w = (int)((int64_t)(64) * devprob[di]) / 100;
+        int fill_w = (int)((int64_t)(64) * pct) / 100;   /* 进度条同样按归一化值 */
         if (fill_w > 64) fill_w = 64;
         if (fill_w > 2) drect(l, bar_x0 + 1, bar_y + 1, bar_x0 + fill_w - 1, bar_y + 10, 0);
         /* 图标: 桌面「电脑诊断」对应器件位图, 紧靠进度条左边, 无框, 垂直居中 */
@@ -523,9 +552,13 @@ static void dConfirmSelect(void) {
                    break;
     case D_ST_SUB: {
         int i = g_sub_idx, nsub = DCAT[g_cat].nsub;
-        /* 符合=原权, 不符合=0 */
-        if (g_cur_opt == 0)      { g_sub_ans[i] = true; g_sub_wt[i] = DCAT[g_cat].subwt[i]; }
-        else if (g_cur_opt == 1) { g_sub_ans[i] = true; g_sub_wt[i] = 0; }
+        /* ★ 2026-10-30 证据方向:
+         *   符合   → 支持该部件 (+原权)
+         *   不符合 → **反对该部件** (-原权/2)。原来这里写 0, 等于"用户明确说不是这个症状,
+         *            系统却当没听见", 排第一的部件不会因反证而下降。
+         *            减半是为了避免一条"不符合"抹掉多条支持证据 (反对证据本身更弱)。 */
+        if (g_cur_opt == 0)      { g_sub_ans[i] = true; g_sub_wt[i] =  DCAT[g_cat].subwt[i]; }
+        else if (g_cur_opt == 1) { g_sub_ans[i] = true; g_sub_wt[i] = -(DCAT[g_cat].subwt[i] / 2); }
         /* 选了"结束排查" 或 已问完最后一条 → 进入配置 */
         if (g_cur_opt == 2 || i >= nsub - 1) {
             g_ans_sub = true; dRecompute(); g_cur_opt = 0; g_sub_idx = 0; g_stage = D_ST_CFG;

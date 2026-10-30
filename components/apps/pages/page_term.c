@@ -24,6 +24,12 @@
 #include "esp_heap_caps.h"
 #include "esp_chip_info.h"
 #include "esp_system.h"
+#include "esp_mac.h"      /* whoami: 真实 MAC */
+/* ★ 2026-10-30: ps 需要 FreeRTOS 任务快照 API。
+ *   configUSE_TRACE_FACILITY 由 FreeRTOSConfig.h 从 CONFIG_FREERTOS_USE_TRACE_FACILITY 映射而来,
+ *   不 include 这个头的话宏是**未定义**(按 0 求值), 即使 sdkconfig 开了也会走降级分支。 */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"      /* whoami: 真实 MAC */
 #include "esp_flash.h"
 #include "esp_netif.h"
 #include "lwip/ip4_addr.h"
@@ -149,8 +155,16 @@ static int line_h(const char*s){ return line_has_cn(s)?ZH16_FONT_H:GB_H; }
 
 /* ============ 输出行缓冲 ============ */
 static void line_set(int idx,const char*s){ if(!s_ready||idx<0||idx>=TM_MAXLINES)return; strncpy(LN(idx),s,TM_LINE_LEN-1); LN(idx)[TM_LINE_LEN-1]=0; }
+/* ★ 2026-10-30: 输出超过 TM_MAXLINES 时**标记溢出**, 供界面提示"上面还有内容被滚掉了",
+ *   不再静默丢行 (原来用户完全不知道早期输出已消失)。 */
+static bool s_line_ovf = false;
+
 static void line_add(const char*s){ if(!s_ready)return;
-    if(s_nlines>=TM_MAXLINES){ for(int r=0;r<TM_MAXLINES-1;r++)memcpy(LN(r),LN(r+1),TM_LINE_LEN); line_set(TM_MAXLINES-1,s); }
+    if(s_nlines>=TM_MAXLINES){
+        s_line_ovf = true;
+        for(int r=0;r<TM_MAXLINES-1;r++)memcpy(LN(r),LN(r+1),TM_LINE_LEN);
+        line_set(TM_MAXLINES-1,s);
+    }
     else { line_set(s_nlines,s); s_nlines++; } }
 
 /* ============ 命令实现 ============ */
@@ -210,7 +224,7 @@ static const help_item s_item_ps[] = {
 #define PS_PAGES ((PS_N+HELP_PER-1)/HELP_PER)
 
 static void cmd_help(void){ s_help_active=true; s_hscroll=0.0f; s_hscrv=0.0f; }
-static void cmd_cls(void){ s_nlines=0; for(int i=0;i<TM_MAXLINES;i++)line_set(i,""); }
+static void cmd_cls(void){ s_nlines=0; s_line_ovf=false; for(int i=0;i<TM_MAXLINES;i++)line_set(i,""); }
 static void cmd_ver(void){ char b[48]; snprintf(b,48," ESP-IDF %s",esp_get_idf_version()); line_add(b); line_add(" LinTOS v1.3 (系统终端)"); }
 static void cmd_date(void){ time_t n=time(NULL); struct tm*t=localtime(&n); char b[48]; snprintf(b,48," %04d-%02d-%02d %02d:%02d:%02d",t->tm_year+1900,t->tm_mon+1,t->tm_mday,t->tm_hour,t->tm_min,t->tm_sec); line_add(b); }
 static void cmd_mem(void){ char b[64];
@@ -295,8 +309,23 @@ static void cmd_ipconfig(void){ char b[64];
     snprintf(b,64," IPv4: %d.%d.%d.%d",(int)(ip.ip.addr&0xff),(int)((ip.ip.addr>>8)&0xff),(int)((ip.ip.addr>>16)&0xff),(int)((ip.ip.addr>>24)&0xff)); line_add(b);
     snprintf(b,64," 掩码: %d.%d.%d.%d",(int)(ip.netmask.addr&0xff),(int)((ip.netmask.addr>>8)&0xff),(int)((ip.netmask.addr>>16)&0xff),(int)((ip.netmask.addr>>24)&0xff)); line_add(b);
     snprintf(b,64," 网关: %d.%d.%d.%d",(int)(ip.gw.addr&0xff),(int)((ip.gw.addr>>8)&0xff),(int)((ip.gw.addr>>16)&0xff),(int)((ip.gw.addr>>24)&0xff)); line_add(b); }
-static void cmd_ping(const char*h){ if(!h||!h[0]){line_add(" ping <地址>");return;} line_add(" ping ... (ICMP 待接入, 当前为练习模拟)"); }
-static void cmd_netstat(void){ line_add(" 连接状态: (TCP 会话待接入)"); line_add("  本机已联网: 见 ipconfig"); }
+static void cmd_ping(const char*h){
+    if(!h||!h[0]){ line_add(" ping <地址>"); return; }
+    /* ★ 2026-10-30: 原实现回一句"ping ... 练习模拟", 会让用户以为发过包 —— 属伪造结果。
+     *   实测本固件**未编入 esp_ping 组件** (components/esp_netif 下无 esp_ping.h,
+     *   也无 esp_ping_new_session 符号), 因此无法发真实 ICMP。
+     *   这里如实说明能力边界, 并给出当前**确实可用**的判网手段。 */
+    line_add(" [不可用] 本固件未编入 ICMP(ping) 组件");
+    line_add(" 可用的联网判据: ipconfig 看本机地址");
+    line_add(" 或访问任意网页/更新, 能通即说明链路正常");
+}
+static void cmd_netstat(void){
+    /* ★ 2026-10-30: lwIP 没有公开的"枚举全部 TCP 连接"API。
+     *   遍历 tcp_active_pcbs / tcp_bound_pcbs 属访问内部链表 (tcp_priv.h),
+     *   跨 lwIP 版本不稳定, 按要求不采用。这里如实说明, 不编造连接表。 */
+    line_add(" [受限] lwIP 未提供公开的 TCP 连接枚举接口");
+    line_add(" 本机地址/网关请用 ipconfig 查看");
+}
 static void cmd_echo(const char*a){ line_add((a&&a[0])?a:" "); }
 static void cmd_uptime(void){
     int64_t us = esp_timer_get_time();
@@ -305,15 +334,48 @@ static void cmd_uptime(void){
                          (long long)(s/86400), (long long)((s%86400)/3600),
                          (long long)((s%3600)/60), (long long)(s%60)); line_add(b);
 }
-static void cmd_whoami(void){ line_add(" root  (LinTOS 系统管理员, 模拟返回)"); }
+static void cmd_whoami(void){
+    /* ★ 2026-10-30: 原来硬写 "root (模拟返回)" —— 编造了一个不存在的账户与权限。
+     *   LinTOS 是单用户嵌入式系统, 没有登录/权限模型, 这里展示**真实设备身份**。 */
+    uint8_t mac[6] = {0};
+    char b[64];
+    line_add(" 设备: LinTOS @ ESP32-S3");
+    /* ★ 复核修复: 必须检查返回值 —— 读失败时不能把全 0 当成有效 MAC 展示 */
+    if (esp_efuse_mac_get_default(mac) == ESP_OK) {
+        snprintf(b, sizeof(b), " MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        line_add(b);
+    } else {
+        line_add(" MAC: 读取失败 (eFuse 不可读)");
+    }
+    line_add(" 账户: 无 (单用户嵌入式, 无登录/权限模型)");
+}
 static void cmd_uname(void){ line_add(" LinTOS v1.3"); line_add(" 内核: FreeRTOS @ ESP32-S3 ESP-IDF"); }
 static void cmd_ps(void){
-    line_add(" PID   名称              占用");
-    line_add(" 1010  bt/wifi 服务      24K");
-    line_add(" 1011  菜单系统          96K");
-    line_add(" 1012  touch 输入        8K");
-    line_add(" 1013  audio 音频        32K");
-    line_add(" (模拟进程表, 仅供练习)");
+    /* ★ 2026-10-30: 原来是硬编码的假任务表 (PID/名称/占用全是编的)。
+     *   改为 FreeRTOS 真实任务快照 (uxTaskGetSystemState), 需要 configUSE_TRACE_FACILITY=1;
+     *   若该选项未开, 如实告知而不回退到假数据。 */
+    #if (configUSE_TRACE_FACILITY == 1)
+    static TaskStatus_t tst[24];
+    UBaseType_t n = uxTaskGetSystemState(tst, 24, NULL);
+    if (n == 0) { line_add(" 任务表读取失败"); return; }
+    char b[64];
+    /* 栈余单位说明: FreeRTOS 的 usStackHighWaterMark 单位是 **字(StackType_t)**,
+     * ESP32-S3 上 1 字 = 4 字节。标成"字节"会小看实际余量 4 倍, 故按字显示。 */
+    snprintf(b, sizeof(b), " 任务(%u) 名          栈余字 优先", (unsigned)n);
+    line_add(b);
+    for (UBaseType_t i = 0; i < n && i < 12; i++) {   /* 只显示前 12 条, 避免刷屏 */
+        snprintf(b, sizeof(b), " %-12.12s %5u %4u",
+                 tst[i].pcTaskName ? tst[i].pcTaskName : "?",
+                 (unsigned)tst[i].usStackHighWaterMark,
+                 (unsigned)tst[i].uxCurrentPriority);
+        line_add(b);
+    }
+    if (n > 12) { snprintf(b, sizeof(b), " ...共 %u 个任务", (unsigned)n); line_add(b); }
+    #else
+    line_add(" [不支持] 固件未开启 configUSE_TRACE_FACILITY");
+    line_add(" 无法读取真实任务表, 不展示虚构数据");
+    #endif
 }
 static void cmd_battery(void){
     board_battery_status_t st = {0};
@@ -830,7 +892,69 @@ static bool exec_one(char*c){
     return true;
 }
 
+/* ★ 2026-10-30 命令历史 (8 条):
+ *   - 连续重复命令不入库 (避免 "dir dir dir" 把历史刷满);
+ *   - 空命令/纯空白不入库;
+ *   - 环形覆盖, 满 8 条后淘汰最旧;
+ *   - 长度受 TM_LINE_LEN 限制 (与命令栏一致)。 */
+#define TM_HIST_N 8
+static char s_hist[TM_HIST_N][TM_LINE_LEN];
+static int  s_hist_n;      /* 已有条数 */
+static int  s_hist_pos;    /* 下一条写入位置 */
+static int  s_hist_view;   /* 0=当前输入, >0=回看第 N 条 */
+
+static void hist_push(const char *c)
+{
+    if (!c) return;
+    while (*c == ' ' || *c == '\t') c++;
+    if (!*c) return;
+    s_hist_view = 0;
+    if (s_hist_n > 0) {                       /* 与上一条相同则跳过 */
+        int last = (s_hist_pos - 1 + TM_HIST_N) % TM_HIST_N;
+        if (strcmp(s_hist[last], c) == 0) return;
+    }
+    snprintf(s_hist[s_hist_pos], TM_LINE_LEN, "%s", c);
+    s_hist_pos = (s_hist_pos + 1) % TM_HIST_N;
+    if (s_hist_n < TM_HIST_N) s_hist_n++;
+}
+
+/* ★ 复核修复: 回看历史前先存"正在输入但还没提交"的草稿。
+ *   否则用户打了一半按 ↑, 内容被历史覆盖, 再按 ↓ 只能回到空行 —— 输入丢失。 */
+static char s_hist_draft[TM_LINE_LEN];
+static bool s_hist_draft_ok = false;
+
+/* 回看上一条; 返回 false 表示没有更早的历史 */
+static bool hist_prev(char *out)
+{
+    if (s_hist_n == 0 || s_hist_view >= s_hist_n) return false;
+    if (s_hist_view == 0) {                       /* 首次上翻: 存草稿 */
+        snprintf(s_hist_draft, sizeof(s_hist_draft), "%s", out);
+        s_hist_draft_ok = true;
+    }
+    s_hist_view++;
+    int idx = (s_hist_pos - s_hist_view + TM_HIST_N) % TM_HIST_N;
+    snprintf(out, TM_LINE_LEN, "%s", s_hist[idx]);
+    return true;
+}
+
+/* 回看下一条; 回到最新时还原草稿 */
+static bool hist_next(char *out)
+{
+    if (s_hist_view <= 0) return false;
+    s_hist_view--;
+    if (s_hist_view == 0) {
+        if (s_hist_draft_ok) { snprintf(out, TM_LINE_LEN, "%s", s_hist_draft); s_hist_draft_ok = false; }
+        else out[0] = 0;
+        return true;
+    }
+    int idx = (s_hist_pos - s_hist_view + TM_HIST_N) % TM_HIST_N;
+    snprintf(out, TM_LINE_LEN, "%s", s_hist[idx]);
+    return true;
+}
+
 static void exec_cmd(char*line){
+    hist_push(line);
+    s_hist_draft_ok = false;      /* 提交后草稿作废, 下次上翻重新记录 */            /* ★ 先入库再执行 (与 shell 行为一致) */
     s_scroll=0.0f; s_scrv=0.0f;
     char d[TM_LINE_LEN]; snprintf(d,TM_LINE_LEN,"> %.*s",TM_LINE_LEN-3,line); line_add(d);
     char*p=line; while(*p==' '||*p=='\t')p++;
@@ -867,8 +991,14 @@ static void key_input(int i){
         case KBD_ACT_SPACE:{ if(s_help_active) s_help_active=false; s_scroll=0.0f; s_scrv=0.0f; if(s_ci<TM_LINE_LEN-2){ memmove(s_cmd+s_cur+1,s_cmd+s_cur,s_ci-s_cur+1); s_cmd[s_cur]=' '; s_ci++; s_cur++; } break; }
         case KBD_ACT_ESC:{ if(s_help_active) s_help_active=false; s_scroll=0.0f; s_scrv=0.0f; s_ci=0; s_cur=0; s_cmd[0]=0; break; }
         case KBD_ACT_TAB:{ if(s_help_active) s_help_active=false; s_scroll=0.0f; s_scrv=0.0f; for(int b=0;b<TM_ALLCMD_N;b++) if(strncmp(s_cmd,s_allcmds[b],s_ci)==0){strcpy(s_cmd,s_allcmds[b]);s_ci=strlen(s_cmd);s_cur=s_ci;break;} break; }
-        case KBD_ACT_UP:  if(s_help_active){ s_hscroll-=HM_ROW; if(s_hscroll<0)s_hscroll=0; s_hscrv=0; } break;
-        case KBD_ACT_DOWN:if(s_help_active){ s_hscroll+=HM_ROW; int mx=help_maxs(); if(s_hscroll>(float)mx)s_hscroll=(float)mx; s_hscrv=0; } break;
+        case KBD_ACT_UP:
+            if(s_help_active){ s_hscroll-=HM_ROW; if(s_hscroll<0)s_hscroll=0; s_hscrv=0; }
+            else if(hist_prev(s_cmd)){ s_ci=(int)strlen(s_cmd); s_cur=s_ci; }   /* 历史回看 */
+            break;
+        case KBD_ACT_DOWN:
+            if(s_help_active){ s_hscroll+=HM_ROW; int mx=help_maxs(); if(s_hscroll>(float)mx)s_hscroll=(float)mx; s_hscrv=0; }
+            else if(hist_next(s_cmd)){ s_ci=(int)strlen(s_cmd); s_cur=s_ci; }   /* 历史前翻 */
+            break;
         case KBD_ACT_LEFT:{ if(s_cur>0)s_cur--; break; }
         case KBD_ACT_RIGHT:{ if(s_cur<s_ci)s_cur++; break; }
         default: break;
@@ -908,13 +1038,13 @@ static int bar_maxofs(void){ int tot=0; for(int i=0;i<TM_BAR_N;i++) tot+=asw(s_b
 static void term_reset(ui_ctx_t *ctx) {
     gesture_back_enable(false);    /* 全屏终端屏蔽上滑退出, 仅返回键触发确认 */
     g_kbd = kbd_std; g_kbd.caps=false; g_kbd.shift=false; g_kbd.fn_mode=0;
-    s_ci=0; s_cur=0; s_press=-1; s_bar_ofs=0; s_nlines=0;
+    s_ci=0; s_cur=0; s_press=-1; s_bar_ofs=0; s_nlines=0; s_line_ovf=false;   /* 重进页面清溢出标记 */
     for(int i=0;i<TM_MAXLINES;i++)line_set(i,"");
     line_add(" 输入 help 查看命令");
     ctx->needs_redraw=true;
 }
 static void term_clear(void){
-    s_ci=0; s_cur=0; s_press=-1; s_bar_ofs=0; s_nlines=0;
+    s_ci=0; s_cur=0; s_press=-1; s_bar_ofs=0; s_nlines=0; s_line_ovf=false;   /* 重进页面清溢出标记 */
     for(int i=0;i<TM_MAXLINES;i++) line_set(i,"");
     g_kbd = kbd_std; g_kbd.caps=false; g_kbd.shift=false; g_kbd.fn_mode=0;
 }
@@ -966,6 +1096,11 @@ static void p_term_render(ui_ctx_t *ctx) {
         return;
     }
     int xH = TM_OUT_H - GB_H;
+    /* ★ 2026-10-30: 输出已滚出可视缓冲时, 右上角画一个 "↑" 提示,
+     *   让用户知道上面还有更早的内容被丢弃 (原来是静默丢失)。 */
+    if (s_line_ovf && s_nlines > 0) {
+        dascii(l, TM_W - 10, 2, "^", 0);
+    }
     int totalpx = s_nlines*HM_ROW;
     int maxS = totalpx > xH ? totalpx - xH : 0;
     if(s_scroll > maxS) s_scroll = maxS;
@@ -1082,14 +1217,22 @@ static void p_term_poll(ui_ctx_t *ctx) {
         if (ui_scroll_poll(&s_sc_help)) ctx->needs_redraw = true;
         if (ui_scroll_poll(&s_sc_bar))  ctx->needs_redraw = true;
 
-        s_scroll  = (float)ui_scroll_offset(&s_sc_out);
+        /* ★ 2026-10-30 修「上下拖动方向反了」:
+         *   ui_scroll 的 offset 语义是**从顶部算** (0=顶, max=底);
+         *   而本文件渲染把 s_scroll 当**从底部算**用 (0=最新一行在底部, 变大=看更早)。
+         *   两者方向相反 → 手指往上滑, 画面却往下走。这里翻转成"从底部算"。
+         *   翻转量 = ui_scroll 内部的 max = content - view = (tot+xH) - xH = tot。 */
+        {
+            int span = s_nlines * HM_ROW;
+            s_scroll = (float)(span - ui_scroll_offset(&s_sc_out));
+        }
         s_hscroll = (float)ui_scroll_offset(&s_sc_help);
         s_bar_ofs = ui_scroll_offset(&s_sc_bar);
         s_scrv = 0.0f; s_hscrv = 0.0f; s_bar_v = 0.0f;
     }
     int tx,ty; bool down=input_get_touch_pos(&tx,&ty);
     static bool d=false, dbar=false, moved=false;
-    static int  dbar_lx=0, dbar_dist=0, dbar_bi=-1;
+    static int  dbar_lx=0, dbar_dist __attribute__((unused))=0, dbar_bi=-1;
     if(!down){
         if(d){
             if(s_dragout){

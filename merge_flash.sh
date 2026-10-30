@@ -24,13 +24,37 @@
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BUILD_DIR="${PROJECT_DIR}/build"
+# ★ 2026-10-30: BUILD_DIR / OUT_FILE 允许被环境变量覆盖 —— 模拟器构建用
+#   BUILD_DIR=build_emu OUT_FILE=build_emu/emu_flash.bin bash merge_flash.sh
+#   不改这两行默认值, 真机构建 (bash merge_flash.sh) 行为完全不变。
+BUILD_DIR="${BUILD_DIR:-${PROJECT_DIR}/build}"
 SYS_IMG_DIR="${PROJECT_DIR}/system_image"
 OUT_DIR="${PROJECT_DIR}/dist"
-OUT_FILE="${OUT_DIR}/merged_16mb.bin"
+OUT_FILE="${OUT_FILE:-${OUT_DIR}/merged_16mb.bin}"
 
-# IDF 独立 python 环境 (避免 macOS /usr/bin/python3 Xcode 垫片)
-PY="/Users/linit/.espressif/python_env/idf5.5_py3.13_env/bin/python3"
+# IDF 独立 python 环境 (避免 macOS /usr/bin/python3 Xcode 垫片)。
+# 2026-10-31: 不再写死作者机器的 idf5.5_py3.13 路径 —— 优先用 build.sh 导出的
+#   IDF_PYTHON_ENV_PATH, 退回 PATH 里的 python3。换机器/换 IDF 版本都能用。
+PY="${IDF_PYTHON_ENV_PATH:-}/bin/python3"
+if [ ! -x "${PY}" ]; then PY="$(command -v python3 || true)"; fi
+if [ ! -x "${PY}" ]; then
+    echo "[错误] 找不到可用的 python3 (请设置 IDF_PYTHON_ENV_PATH 或安装 python3)"
+    exit 1
+fi
+
+# spiffsgen.py 属于 ESP-IDF 自带工具, 按 IDF_PATH 定位; 兼容老路径做兜底。
+SPIFFSGEN="${IDF_PATH:-${HOME}/esp/esp-idf-v60}/components/spiffs/spiffsgen.py"
+if [ ! -f "${SPIFFSGEN}" ]; then
+    for c in "${HOME}/esp/esp-idf-v60/components/spiffs/spiffsgen.py" \
+             "${HOME}/esp/esp-idf-v55/components/spiffs/spiffsgen.py"; do
+        if [ -f "${c}" ]; then SPIFFSGEN="${c}"; break; fi
+    done
+fi
+if [ ! -f "${SPIFFSGEN}" ]; then
+    echo "[错误] 找不到 spiffsgen.py: ${SPIFFSGEN}"
+    echo "       请设置 IDF_PATH 指向 ESP-IDF 安装目录"
+    exit 1
+fi
 
 FLASH_SIZE=$((16 * 1024 * 1024))   # 16MB
 BOOTLOADER_BIN="${BUILD_DIR}/bootloader/bootloader.bin"
@@ -93,6 +117,11 @@ echo ""
 FONT_ZH_ABS=$((APP_BASE + 0x400000))        # appdata+0x400000
 FONT_16_ABS=$((APP_BASE + 0x480000))
 FONT_LAV_ABS=$((APP_BASE + 0x4C0000))       # lav_font (V1.0.9x: 前移回填空档)
+# 2026-10-30: 设置里字体切换的候选字库 (appdata 末尾空闲区, 不改分区表)
+FONT_ALT16_ABS=$((APP_BASE + 0x5C0000))
+FONT_ALT24_ABS=$((APP_BASE + 0x600000))
+FONT_ALT16_BIN="${PROJECT_DIR}/components/ui/fonts/font_alt16.bin"
+FONT_ALT24_BIN="${PROJECT_DIR}/components/ui/fonts/font_alt24.bin"
 
 # [2026-09-16] oui_db 已内嵌进 macoui 组件(EMBED_FILES), 不再进 appdata
 
@@ -161,6 +190,15 @@ if [ -f "${FONT_ZH_BIN}" ] && [ -f "${FONT_16_BIN}" ]; then
         dd if="${LAV_FONT_TMP}" of="${OUT_FILE}" bs=1 seek=${FONT_LAV_ABS} conv=notrunc 2>/dev/null
     fi
 fi
+# 候选 UI 字库 (字体切换用; 缺文件则槽保持 0xFF, 设备端切换会失败并回退默认)
+if [ -f "${FONT_ALT16_BIN}" ]; then
+    dd if="${FONT_ALT16_BIN}" of="${OUT_FILE}" bs=1 seek=${FONT_ALT16_ABS} conv=notrunc 2>/dev/null
+    echo "font_alt16.bin      $(printf '%8d' $(stat -f%z "${FONT_ALT16_BIN}")) B  @ 0x$(printf '%X' ${FONT_ALT16_ABS})"
+fi
+if [ -f "${FONT_ALT24_BIN}" ]; then
+    dd if="${FONT_ALT24_BIN}" of="${OUT_FILE}" bs=1 seek=${FONT_ALT24_ABS} conv=notrunc 2>/dev/null
+    echo "font_alt24.bin      $(printf '%8d' $(stat -f%z "${FONT_ALT24_BIN}")) B  @ 0x$(printf '%X' ${FONT_ALT24_ABS})"
+fi
 # 迁移自固件的常量表槽位 (appdata 分区内, 64KB 对齐, 与 render_bp_lut.c 一致)
 if [ -f "${BP_LUT_BIN}" ]; then
     dd if="${BP_LUT_BIN}" of="${OUT_FILE}" bs=1 seek=$((APP_BASE + 0x540000)) conv=notrunc 2>/dev/null
@@ -188,7 +226,7 @@ else
     APPS_SRC="$(mktemp -d)"
     trap 'rm -rf "${APPS_SRC}"' EXIT
 fi
-${PY} "/Users/linit/esp/esp-idf-v55/components/spiffs/spiffsgen.py" \
+${PY} "${SPIFFSGEN}" \
     --page-size 256 --block-size 4096 --meta-len 4 --obj-name-len 64 --use-magic \
     ${APPS_SIZE} "${APPS_SRC}" "${SPIFFS_BIN}" \
   && echo "apps_l.bin        $(printf '%6d' $(stat -f%z "${SPIFFS_BIN}")) B  (从 $(basename "${APPS_SRC}") 生成)"

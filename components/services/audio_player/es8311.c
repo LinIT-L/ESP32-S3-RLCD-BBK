@@ -336,11 +336,24 @@ int es8311_set_volume(int percent) {
 }
 
 void es8311_shutdown(void) {
-    if (!s_initialized) return;
-    es8311_write_reg(0x32, 0x00);  /* 静音 DAC */
-    es8311_write_reg(0x00, 0x00);  /* Power down */
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "ES8311 跳过掉电: 本次开机未初始化过(芯片处于上电默认态)");
+        return;
+    }
+    /* ★★★ 2026-10-28 linit「深睡还有 9mA」排查: 两个写寄存器的返回值原来**全被丢弃**。
+     *   后果: I2C 写失败(本板 I2C 无外部上拉, 只有模组内部弱上拉)时芯片根本不会掉电,
+     *   ES8311 正常工作电流 5~10mA —— 正好是深睡多出来的那个量级, 而日志一片安静,
+     *   完全看不出"掉电没生效"。现在: 失败必须报错, 成功也必须留一行. */
+    esp_err_t e1 = es8311_write_reg(0x32, 0x00);  /* 静音 DAC */
+    esp_err_t e2 = es8311_write_reg(0x00, 0x00);  /* Power down */
     s_initialized = false;
     s_started = false;
+    if (e1 != ESP_OK || e2 != ESP_OK) {
+        ESP_LOGE(TAG, "ES8311 掉电失败! 0x32=%s 0x00=%s ⇒ I2C 无应答, 芯片仍在工作(5~10mA)",
+                 esp_err_to_name(e1), esp_err_to_name(e2));
+    } else {
+        ESP_LOGI(TAG, "ES8311 已掉电 (0x32=0x00, 0x00=0x00)");
+    }
 }
 
 /* ================= 运行时诊断 API (remcon 串口排查用, 2026-10-09) =================

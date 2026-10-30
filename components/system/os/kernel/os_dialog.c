@@ -199,8 +199,11 @@ static uint32_t s_toast_ms;
 
 static os_dlg_stack_t *top(void) { return (s_top >= 0) ? &s_stack[s_top] : NULL; }
 
-/* 提示弹窗显示时长: 默认 0.5s 自动消失 (用户规范 2026-09-22)。os_dialog_toast_ms 可指定自定义时长. */
-#define TOAST_MS 500
+/* 提示弹窗显示时长。
+ * ★★ 2026-10-27 linit 统一规范: **正常 1 秒自动消失; 按任意键立即消失; 最长不超过 3 秒**。
+ *   (原来是 0.5s —— 太短, 用户还没看清就没了。) */
+#define TOAST_MS      1000
+#define TOAST_MS_MAX  3000   /* 强制上限: 任何自定义时长都不许超过 3 秒 */
 static uint32_t s_toast_dur_ms = TOAST_MS;   /* V1.5.x: 当前 toast 显示时长 (ms) */
 /* 是否需要显示 toast 提示 (有弹窗时也叠在弹窗之上显示, 到时自动消失) */
 static bool toast_active(void) {
@@ -532,6 +535,9 @@ static void dlg_action(ui_ctx_t *ctx, os_action_t a) {
         /* 有 toast: 任何按键/点击先关掉提示; 仅独立 toast (无弹窗) 才弹层 */
         if (s_top < 0) os_pop(ctx);
         s_toast_msg[0] = 0;
+        /* ★ 2026-10-28: 关提示必须置脏。原来只有"独立 toast"那条路(os_pop)会置脏,
+         *   toast 叠在已有弹窗上时只清文案不重绘 ⇒ 提示框留在屏上, 看着像"按键没反应"。 */
+        ctx->needs_redraw = true;
         return;
     }
     os_dlg_stack_t *d = top();
@@ -609,6 +615,8 @@ static bool dlg_touch(ui_ctx_t *ctx, int x, int y) {
     if (toast_active()) {
         if (s_top < 0) os_pop(ctx);
         s_toast_msg[0] = 0;
+        /* ★ 2026-10-28: 同 dlg_action —— 触摸关提示也要置脏, 否则提示残留到下次重绘 */
+        ctx->needs_redraw = true;
         return true;
     }
     os_dlg_stack_t *d = top();
@@ -754,7 +762,10 @@ static void dlg_poll(ui_ctx_t *ctx) {
             s_scroll_busy = false;
         } else {
             if (!s_dlg_sc_rdy) {
-                ui_scroll_config(&s_dlg_sc, UI_SCROLL_LIST, 0);
+                /* ★ 2026-10-28: 必须 SNAP_INSTANT —— 本文件的偏移会反算成
+                 *   sel = off/行高 + scroll_px 再做渲染与点击命中, 吸附缓动的
+                 *   中间态会让 sel 在两行之间反复跨(高亮闪、松手卡回去)。 */
+                ui_scroll_config(&s_dlg_sc, UI_SCROLL_LIST, UI_SCROLL_F_SNAP_INSTANT);
                 s_dlg_sc_rdy = true;
             }
             int view = vis * DLG_LINE_H;
@@ -828,6 +839,17 @@ void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg) {
     if (s_top < 0) os_push(ctx, OS_PAGE_DIALOG);   /* 首层: 打开弹窗页 */
     s_stack[++s_top] = *dlg;                       /* 整体拷贝, 含回调/ud/自定义 */
     s_stack[s_top].open_ms = os_millis();             /* 记录打开时刻 (供超时) */
+    /* ★★★ 2026-10-28 linit「点一个弹窗没有刷新」根因修复 ★★★
+     *   push 有两条路: 首层会走 os_push(OS_PAGE_DIALOG), 而 os_push 内部会置
+     *   ctx->needs_redraw; 但从**第二层起**只在 s_stack 里加一项、完全不碰 needs_redraw
+     *   ⇒ 上级弹窗原地换内容 / 子弹窗弹出时, 主循环判定"画面没变"直接跳过渲染,
+     *   表现就是"点了一下没反应, 再点一次才动一下"。
+     *   这里无条件置脏, 并作废送屏指纹:
+     *   · needs_redraw   —— 保证本帧一定重绘
+     *   · invalidate     —— 弹窗**首次出现一律整屏刷新**(st7305_flush 本来就是全屏
+     *                       15KB 窗口; invalidate 只保证它不被"内容哈希相同"跳过) */
+    if (ctx) ctx->needs_redraw = true;
+    st7305_invalidate_frame();
     ESP_LOGI(TAG, "push: \"%s\" top=%d", s_stack[s_top].title, s_top);
     s_cb_handled = true;   /* cb 内调用=下一步同窗替换, 不自动关闭父层 */
 }
@@ -853,6 +875,14 @@ void os_dialog_pop(ui_ctx_t *ctx) {
      *   os_core 从此不画状态栏 (顶部信息条整块消失)。 */
     dlg_scroll_state_reset();
     s_cb_handled = true;   /* cb 内显式弹栈=已接管, 避免 dlg_finish_top 再自动关 */
+    /* ★★★ 2026-10-28 linit「弹窗关掉后留框/残留」根因修复 ★★★
+     *   dlg_render 的约定是"只画弹窗自己那块, 不清屏、不重绘背景"(见其注释),
+     *   所以 pop 之后谁来擦掉弹窗框? 原逻辑没人擦:
+     *   · 回父弹窗时: 栈顶换成父窗, 子窗比父窗大的那圈边框留在屏上
+     *   · 关到页面时: 页面 render 只重画自己的元素, 弹窗覆盖的空白区留白框/黑边
+     *   这里统一作废背景 —— 下一帧整屏清白 + 重绘最底层页面, 再叠当前(父)弹窗。
+     *   pop 是用户点击才触发的低频动作, 一次整屏刷(≈4.5ms)完全可接受。 */
+    os_invalidate_bg();
     ctx->needs_redraw = true;
 }
 
@@ -1095,7 +1125,10 @@ void os_dialog_toast_tick(ui_ctx_t *ctx) {
 
 /* V1.5.x: 自定义时长 toast — ms 毫秒后自动消失 (0=默认 1s). 用于"回连成功"等短提示. */
 void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms) {
-    s_toast_dur_ms = (ms == 0) ? TOAST_MS : ms;
+    /* ★ 2026-10-27 linit 规范: 未指定 = 1 秒; 指定也不许超过 3 秒(强制上限) */
+    if (ms == 0) ms = TOAST_MS;
+    if (ms > TOAST_MS_MAX) ms = TOAST_MS_MAX;
+    s_toast_dur_ms = ms;
     snprintf(s_toast_msg, sizeof(s_toast_msg), "%s", msg ? msg : "");
     s_toast_ms = os_millis();
     if (s_top < 0) { os_push(ctx, OS_PAGE_DIALOG); s_toast_owns_page = true; }   /* 无弹窗栈时需打开弹窗页 */

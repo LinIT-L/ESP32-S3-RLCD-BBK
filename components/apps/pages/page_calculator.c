@@ -1,13 +1,30 @@
 /**
- * page_calculator.c — 科学计算器 页面模块.
+ * page_calculator.c — 科学计算器 页面模块 (v5, 2026-10-30 UI 重绘).
  *
- * 自绘网格按钮 (6 行 x 5 列, ASCII 全字符集, 屏幕仅显示中英文字库支持的字符):
- *   - 主页面: AC/DEL/括号/运算符/数字/常量(pi,e,Ans)/(!)(=)/sqrt
- *   - 科学页: sin cos tan sqrt ln log log2 exp abs asin acos atan sinh cosh tanh floor ceil
- *   - FUNC 键(FN) 在两页间切换; 触碰可点, 手柄方向键+CONFIRM 可导航.
- * 计算: 按 "=" 或 CONFIRM 调到结果时调用 calc_eval(expr, ans, &res).
- *   ÷->'/' ×->'*' ; π 记为 'p'(引擎单字节常量); 函数插入 "sin(" 等, 由用户补右括号.
- *   calc_eval 返回 -1 显示"语法错", 返回 -2 显示"数学错".
+ * 视觉基准: linit 提供的黑白效果图. 纯黑白: 白底 + 黑边框 + 黑字,
+ * 无灰阶/渐变/阴影/拟物/圆形按钮. 字体沿用本机原有字库 (draw_text / ui_text16),
+ * 不另造字号.
+ *
+ * 布局 (400×300, 本页隐藏系统状态栏 → 整屏可用):
+ *   显示框   x 5..394, y 19..72, 圆角 5, 边框 2px, 数字右对齐, 右侧留 12px
+ *   键盘     7 列 × 5 行, 键 52×34, 横缝 4, 竖缝 7
+ *            行 y = 83 / 124 / 165 / 206 / 247, 末行底 280
+ *
+ * 键盘 (顺序与参考图一致, 不得增删):
+ *   Rad Deg Inv ( ) %  AC
+ *   x!  sin cos 7 8 9  ÷
+ *   π   tan log 4 5 6  ×
+ *   e   ln  √   1 2 3  −
+ *   EXP Ans xʸ  0 . =  +
+ *
+ * 默认状态: 35 个键全部白底黑框黑字, 视觉权重一致; 只有被按住的那一个变黑底白字.
+ * 当前制式 (Rad/Deg) 与 Inv 状态画在显示框左上角, 不靠按键反白.
+ *
+ * 交互补充 (参考图没有退格键, 但输入必须有):
+ *   点 AC → 全清;  长按 AC 600ms → 退一格.
+ *
+ * 计算: calc_eval(); Rad/Deg 用 calc_set_deg() 交给引擎换算;
+ *       Inv 打开时 sin/cos/tan 变 asin/acos/atan, ln→e^x, log→10^x, √→x².
  */
 #include "os.h"
 #include "ui_common.h"
@@ -17,274 +34,415 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#include "esp_timer.h"
 
 #define S_W 400
 #define S_H 300
 
-/* ---- 网格几何 (经典 4 列棋盘, 共线不做每格独立框) ---- */
-#define COLS      4
-#define ROWS      6
-#define COL_W     100
-#define ROW_H     28              /* 压缩行高, 让出底部与键上方空间给显示区 */
-#define GAP       0
-#define GRID_X    0
-#define GRID_Y    130             /* 键盘顶 (显示区分隔线在 GRID_Y-8) */
+/* ---- 显示框 ---- */
+#define DISP_X   5
+#define DISP_Y   19
+#define DISP_W   390
+#define DISP_H   54
+#define DISP_R   5
+#define DISP_PAD 12
+
+/* ---- 键盘网格 ---- */
+#define COLS     7
+#define ROWS     5
+#define KEY_W    52
+#define KEY_H    34
+#define GAP_X    4
+#define GAP_Y    7
+#define KEY_X0   5
+#define KEY_Y0   83
+#define KEY_R    5
+#define BORDER_W 2
 
 typedef enum {
-    KT_PUSH,     /* 追加文本 (ins) */
-    KT_AC,       /* 全清 */
-    KT_DEL,      /* 退格 */
-    KT_EQ,       /* 求值 */
-    KT_FN,       /* 切换科学页 */
+    KT_PUSH,   /* 追加 ins */
+    KT_AC,     /* 全清 (长按退格) */
+    KT_EQ,     /* 求值 */
+    KT_RAD,    /* 弧度制 */
+    KT_DEG,    /* 角度制 */
+    KT_INV,    /* 反函数开关 */
 } ck_kind_t;
 
-typedef struct { const char *face; const char *ins; ck_kind_t kind; } ckey_t;
+/* sym: 0=用字体画 face; p=+ m=− t=× d=÷ r=√ P=π i== */
+typedef struct { const char *face; const char *ins; ck_kind_t kind; char sym; } ckey_t;
 
-/* 主页面按键 (face=中文显示, ins=插入引擎表达式, 均为 ASCII).
- * 经典布局: 左上清空, 右上括号, 右侧运算符 ÷ × - +, 数字 9→0 递减, 底行功能键. */
-static const ckey_t s_main[ROWS][COLS] = {
-    {{"\xe6\xb8\x85\xe7\xa9\xba","",KT_AC},{"(","(",KT_PUSH},{")",")",KT_PUSH},{"\xc3\xb7","/",KT_PUSH}},                 /* 清空 ( ) ÷ */
-    {{"7","7",KT_PUSH},{"8","8",KT_PUSH},{"9","9",KT_PUSH},{"\xc3\x97","*",KT_PUSH}},                 /* 7 8 9 × */
-    {{"4","4",KT_PUSH},{"5","5",KT_PUSH},{"6","6",KT_PUSH},{"\xe2\x88\x92","-",KT_PUSH}},             /* 4 5 6 − */
-    {{"1","1",KT_PUSH},{"2","2",KT_PUSH},{"3","3",KT_PUSH},{"+","+",KT_PUSH}},                        /* 1 2 3 + */
-    {{"0","0",KT_PUSH},{".",".",KT_PUSH},{"pi","p",KT_PUSH},{"e","e",KT_PUSH}},                        /* 0 . π e */
-    {{"\xe5\x87\xbd\xe6\x95\xb0","",KT_FN},{"\xe9\x80\x80\xe6\xa0\xbc","",KT_DEL},{"Ans","Ans",KT_PUSH},{"=","",KT_EQ}}, /* 函数 退格 Ans = */
-};
-
-/* 科学页按键 (中文 face, ASCII ins) */
-static const ckey_t s_sci[ROWS][COLS] = {
-    {{"\xe5\x87\xbd\xe6\x95\xb0","",KT_FN},{"\xe6\xad\xa3\xe5\xbc\xa6","sin(",KT_PUSH},{"\xe4\xbd\x99\xe5\xbc\xa6","cos(",KT_PUSH},{"\xe6\xad\xa3\xe5\x88\x87","tan(",KT_PUSH}}, /* 函数/正弦/余弦/正切 */
-    {{"\xe5\x8f\x8d\xe6\xad\xa3\xe5\xbc\xa6","asin(",KT_PUSH},{"\xe5\x8f\x8d\xe4\xbd\x99\xe5\xbc\xa6","acos(",KT_PUSH},{"\xe5\x8f\x8d\xe6\xad\xa3\xe5\x88\x87","atan(",KT_PUSH},{"\xe5\xbc\x80\xe6\x96\xb9","sqrt(",KT_PUSH}}, /* 反正弦/反余弦/反正切/开方 */
-    {{"\xe5\x8f\x8c\xe6\xad\xa3","sinh(",KT_PUSH},{"\xe5\x8f\x8c\xe4\xbd\x99","cosh(",KT_PUSH},{"\xe5\x8f\x8c\xe6\xad\xa3\xe5\x88\x87","tanh(",KT_PUSH},{"\xe6\x8c\x87\xe6\x95\xb0","exp(",KT_PUSH}}, /* 双正/双余/双切/指数 */
-    {{"\xe8\x87\xaa\xe7\x84\xb6\xe5\xaf\xb9\xe6\x95\xb0","ln(",KT_PUSH},{"\xe5\xb8\xb8\xe7\x94\xa8\xe5\xaf\xb9\xe6\x95\xb0","log(",KT_PUSH},{"\xe5\xba\x95\xe6\x95\xb0" "2","log2(",KT_PUSH},{"\xe7\xbb\x9d\xe5\xaf\xb9\xe5\x80\xbc","abs(",KT_PUSH}}, /* 自然对数/常用对数/底数2/绝对值 */
-    {{"\xe5\x8f\x96\xe6\x95\xb4","floor(",KT_PUSH},{"\xe5\x90\x91\xe4\xb8\x8a\xe5\x8f\x96\xe6\x95\xb4","ceil(",KT_PUSH},{"\xe9\x98\xb6\xe4\xb9\x98","!",KT_PUSH},{"pi","p",KT_PUSH}}, /* 取整/向上取整/阶乘/pi */
-    {{"e","e",KT_PUSH},{"Ans","Ans",KT_PUSH},{"=","",KT_EQ},{"\xe8\xbf\x94\xe5\x9b\x9e","",KT_FN}},     /* 返回主页 */
+static const ckey_t s_keys[ROWS][COLS] = {
+/*  Rad           Deg           Inv           (            )            %            AC   */
+  {{"Rad","",KT_RAD,0},{"Deg","",KT_DEG,0},{"Inv","",KT_INV,0},
+   {"(","(",KT_PUSH,0},{")",")",KT_PUSH,0},{"%","%",KT_PUSH,0},{"AC","",KT_AC,0}},
+/*  x!            sin           cos           7            8            9            ÷    */
+  {{"x!","!",KT_PUSH,0},{"sin","sin(",KT_PUSH,0},{"cos","cos(",KT_PUSH,0},
+   {"7","7",KT_PUSH,0},{"8","8",KT_PUSH,0},{"9","9",KT_PUSH,0},{"","/",KT_PUSH,'d'}},
+/*  π             tan           log           4            5            6            ×    */
+  {{"","p",KT_PUSH,'P'},{"tan","tan(",KT_PUSH,0},{"log","log(",KT_PUSH,0},
+   {"4","4",KT_PUSH,0},{"5","5",KT_PUSH,0},{"6","6",KT_PUSH,0},{"","*",KT_PUSH,'t'}},
+/*  e             ln            √             1            2            3            −    */
+  {{"e","e",KT_PUSH,0},{"ln","ln(",KT_PUSH,0},{"","sqrt(",KT_PUSH,'r'},
+   {"1","1",KT_PUSH,0},{"2","2",KT_PUSH,0},{"3","3",KT_PUSH,0},{"","-",KT_PUSH,'m'}},
+/*  EXP           Ans           xʸ            0            .            =            +    */
+  {{"EXP","*10^(",KT_PUSH,0},{"Ans","Ans",KT_PUSH,0},{"","^",KT_PUSH,0},
+   {"0","0",KT_PUSH,0},{".",".",KT_PUSH,0},{"","",KT_EQ,'i'},{"","+",KT_PUSH,'p'}},
 };
 
 /* ---- 状态 ---- */
-static char   s_expr[96];      /* 当前输入表达式 (引擎语法, ASCII) */
+static char   s_expr[96];
 static int    s_len;
-static double s_ans;           /* 上次结果 */
+static double s_ans;
 static bool   s_has_ans;
-static bool   s_show_res;      /* '='后显示结果 */
-static char   s_res[48];       /* 结果文本 */
-static char   s_last_expr[80]; /* 供 "expr = res" 顶行显示 */
+static bool   s_show_res;
+static char   s_res[48];
+static char   s_last_expr[80];
 static bool   s_show_err;
-static char   s_err[24];
-static bool   s_func_page;     /* false=主页面 true=科学页 */
+static bool   s_deg;
+static bool   s_inv;
 static int    s_cursor_r, s_cursor_c;
 static int    s_press_r = -1, s_press_c = -1;
+static uint32_t s_press_ms;
+static bool   s_long_done;
 
 static void redraw(ui_ctx_t *ctx) { ctx->needs_redraw = true; }
+static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
-static void fmt_num(double v, char *b, int n) {
-    snprintf(b, n, "%.10g", v);
+/* ---------------- 圆角矩形 ---------------- */
+typedef struct { int l, r; bool ok; } rr_span_t;
+
+static rr_span_t rr_span(int y, int x0, int y0, int x1, int y1, int r)
+{
+    rr_span_t sp = { 0, 0, false };
+    if (y < y0 || y > y1 || r < 0) return sp;
+    if (y < y0 + r) {
+        int dy = (y0 + r) - y;
+        int dx = 0, v = r * r - dy * dy;
+        while ((dx + 1) * (dx + 1) <= v) dx++;
+        sp.l = x0 + (r - dx);
+        sp.r = x1 - (r - dx);
+    } else if (y > y1 - r) {
+        int dy = y - (y1 - r);
+        int dx = 0, v = r * r - dy * dy;
+        while ((dx + 1) * (dx + 1) <= v) dx++;
+        sp.l = x0 + (r - dx);
+        sp.r = x1 - (r - dx);
+    } else {
+        sp.l = x0;
+        sp.r = x1;
+    }
+    sp.ok = (sp.l <= sp.r);
+    return sp;
 }
 
-/* 单词级渲染: 单字母 'p'/'P'(pi) -> "pi"; 其它原样. 全程 ASCII, 避免字库缺字. */
-static void render_expr(char *out, int maxw, const char *src) {
+/* 圆角矩形: filled=true 整块填色; 否则画 bw 像素边框.
+ * 边框 = 外轮廓跨度 − 内轮廓跨度, 角与直边同一套算法, 圆弧自然接上. */
+static void round_box(st7305_handle_t *lcd, int x0, int y0, int x1, int y1,
+                      int r, int bw, bool filled, st7305_color_t c)
+{
+    if (r < 1) r = 1;
+    if (bw < 1) bw = 1;
+    for (int y = y0; y <= y1; y++) {
+        rr_span_t o = rr_span(y, x0, y0, x1, y1, r);
+        if (!o.ok) continue;
+        if (filled) { fill_rect(lcd, o.l, y, o.r, y, c); continue; }
+        rr_span_t in = rr_span(y, x0 + bw, y0 + bw, x1 - bw, y1 - bw, r - bw);
+        if (!in.ok) { fill_rect(lcd, o.l, y, o.r, y, c); continue; }
+        if (o.l <= in.l - 1) fill_rect(lcd, o.l, y, in.l - 1, y, c);
+        if (in.r + 1 <= o.r) fill_rect(lcd, in.r + 1, y, o.r, y, c);
+    }
+}
+
+/* ---------------- 手绘符号 ---------------- */
+static void px2(st7305_handle_t *lcd, int x, int y, st7305_color_t c)
+{
+    st7305_draw_pixel(lcd, x, y, c);
+    st7305_draw_pixel(lcd, x + 1, y, c);
+    st7305_draw_pixel(lcd, x, y + 1, c);
+    st7305_draw_pixel(lcd, x + 1, y + 1, c);
+}
+
+static void draw_sym(st7305_handle_t *lcd, int cx, int cy, char sym, st7305_color_t c)
+{
+    const int s = 7;
+    switch (sym) {
+    case 'p':                                   /* + */
+        fill_rect(lcd, cx - s, cy - 1, cx + s, cy, c);
+        fill_rect(lcd, cx - 1, cy - s, cx, cy + s, c);
+        break;
+    case 'm':                                   /* − */
+        fill_rect(lcd, cx - s, cy - 1, cx + s, cy, c);
+        break;
+    case 't':                                   /* × */
+        for (int k = -s; k <= s; k++) {
+            px2(lcd, cx + k, cy + k, c);
+            px2(lcd, cx + k, cy - k, c);
+        }
+        break;
+    case 'd':                                   /* ÷ */
+        fill_rect(lcd, cx - s, cy - 1, cx + s, cy, c);
+        fill_rect(lcd, cx - 2, cy - s - 1, cx + 1, cy - s + 2, c);
+        fill_rect(lcd, cx - 2, cy + s - 2, cx + 1, cy + s + 1, c);
+        break;
+    case 'i':                                   /* = */
+        fill_rect(lcd, cx - 7, cy - 5, cx + 7, cy - 3, c);
+        fill_rect(lcd, cx - 7, cy + 3, cx + 7, cy + 5, c);
+        break;
+    case 'r': {                                 /* √ */
+        int sx = cx - 7, sy = cy + 1;
+        draw_vline(lcd, sx,     sy,     sy + 3, c);
+        draw_vline(lcd, sx + 1, sy + 1, sy + 4, c);
+        for (int i = 0; i <= 5; i++) {
+            st7305_draw_pixel(lcd, sx + 2 + i, sy + 3 - i, c);
+            st7305_draw_pixel(lcd, sx + 3 + i, sy + 3 - i, c);
+        }
+        fill_rect(lcd, cx + 1, cy - 7, cx + 7, cy - 5, c);
+        break;
+    }
+    case 'P':                                   /* π */
+        fill_rect(lcd, cx - 7, cy - 6, cx + 7, cy - 4, c);
+        fill_rect(lcd, cx - 5, cy - 6, cx - 3, cy + 5, c);
+        fill_rect(lcd, cx + 3, cy - 6, cx + 5, cy + 5, c);
+        break;
+    default: break;
+    }
+}
+
+/* ---------------- 表达式美化 ---------------- */
+static void render_expr(char *out, int maxc, const char *src)
+{
     int oi = 0;
     const char *p = src;
-    while (*p && oi < maxw - 1) {
+    while (*p && oi < maxc - 1) {
         if (isalpha((unsigned char)*p)) {
             int l = 0; while (p[l] && isalpha((unsigned char)p[l])) l++;
             if (l == 1 && (p[0] == 'p' || p[0] == 'P')) {
-                if (oi + 2 < maxw) { out[oi++] = 'p'; out[oi++] = 'i'; }
-            } else if (l == 1 && (p[0] == 'e' || p[0] == 'E')) {
-                if (oi + 1 < maxw) out[oi++] = 'e';
+                if (oi + 2 < maxc) { out[oi++] = 'p'; out[oi++] = 'i'; }
             } else {
-                for (int k = 0; k < l && oi < maxw - 1; k++) out[oi++] = p[k];
+                for (int k = 0; k < l && oi < maxc - 1; k++) out[oi++] = p[k];
             }
             p += l;
         } else {
-            if (oi < maxw - 1) out[oi++] = *p;
-            p++;
+            out[oi++] = *p++;
         }
     }
     out[oi] = 0;
 }
 
-static void cell_rect(int r, int c, int *x, int *y, int *w, int *h) {
-    *x = GRID_X + c * COL_W;
-    *y = GRID_Y + r * ROW_H;
-    *w = COL_W;
-    *h = ROW_H;
+static void fmt_num(double v, char *b, int n) { snprintf(b, n, "%.10g", v); }
+
+/* ---------------- 单元格几何 ---------------- */
+static void cell_rect(int r, int c, int *x, int *y)
+{
+    *x = KEY_X0 + c * (KEY_W + GAP_X);
+    *y = KEY_Y0 + r * (KEY_H + GAP_Y);
 }
 
-/* 绘制算符大符号 (÷ × − +), 以格子中心 (cx,cy) 为基准 / 24px 方块内.
- * 字库不含这些符号 (2 字节 UTF-8 在 draw_text 中被跳过), 故手绘像素. */
-static void draw_opsym(st7305_handle_t *lcd, int cx, int cy, char mode, bool white) {
-    st7305_color_t c = white ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
-    const int s = 6;
-    if (mode == 'p') {                            /* + */
-        draw_hline(lcd, cx - s, cx + s, cy, c);
-        draw_vline(lcd, cx, cy - s, cy + s, c);
-    } else if (mode == 'm') {                     /* − */
-        draw_hline(lcd, cx - s, cx + s, cy, c);
-    } else if (mode == 't') {                     /* × (两条斜线, 2px 粗) */
-        for (int k = -s; k <= s; k++) {
-            st7305_draw_pixel(lcd, cx + k,     cy + k, c);
-            st7305_draw_pixel(lcd, cx + k + 1, cy + k, c);
-            st7305_draw_pixel(lcd, cx + k,     cy - k, c);
-            st7305_draw_pixel(lcd, cx + k + 1, cy - k, c);
-        }
-    } else if (mode == 'd') {                     /* ÷ (横线 + 上下点) */
-        draw_hline(lcd, cx - s, cx + s, cy, c);
-        fill_rect(lcd, cx - 1, cy - s - 2, cx + 1, cy - s, c);
-        fill_rect(lcd, cx - 1, cy + s,     cx + 1, cy + s + 2, c);
-    }
+static const char *key_ins(const ckey_t *k)
+{
+    if (!s_inv || k->kind != KT_PUSH) return k->ins;
+    if (!strcmp(k->ins, "sin("))  return "asin(";
+    if (!strcmp(k->ins, "cos("))  return "acos(";
+    if (!strcmp(k->ins, "tan("))  return "atan(";
+    if (!strcmp(k->ins, "ln("))   return "e^(";
+    if (!strcmp(k->ins, "log("))  return "10^(";
+    if (!strcmp(k->ins, "sqrt(")) return "^2";
+    return k->ins;
 }
 
-/* 绘制一格: 不画独立框 (由 render 画棋盘共线), 仅画选中/按下黑底与文字.
- * 文字按 24px 高垂直居中且强制不超出格宽; 算符符号单独手绘居中. */
-static void draw_cell(st7305_handle_t *lcd, int r, int c, bool cur, bool pressed) {
-    const ckey_t *k = (s_func_page ? &s_sci[r][c] : &s_main[r][c]);
-    int x, y, w, h; cell_rect(r, c, &x, &y, &w, &h);
+static const char *key_face(const ckey_t *k)
+{
+    if (!s_inv) return k->face;
+    if (!strcmp(k->ins, "sin("))  return "sin-1";
+    if (!strcmp(k->ins, "cos("))  return "cos-1";
+    if (!strcmp(k->ins, "tan("))  return "tan-1";
+    if (!strcmp(k->ins, "ln("))   return "e^x";
+    if (!strcmp(k->ins, "log("))  return "10^x";
+    if (!strcmp(k->ins, "sqrt(")) return "x^2";
+    return k->face;
+}
+
+/* ---------------- 画一格 ---------------- */
+static void draw_cell(st7305_handle_t *lcd, int r, int c, bool cur, bool pressed)
+{
+    const ckey_t *k = &s_keys[r][c];
+    int x, y; cell_rect(r, c, &x, &y);
+    int x1 = x + KEY_W - 1, y1 = y + KEY_H - 1;
+
     bool touchdev = input_has_touch();
     bool active = touchdev ? pressed : cur;
-    if (active) fill_rect(lcd, x + 1, y + 1, x + w - 2, y + h - 2, ST7305_COLOR_BLACK);
-    /* 识别算符符号 ÷(C3 B7) ×(C3 97) −(E2 88 92) +(2B) */
-    const unsigned char *f = (const unsigned char *)k->face;
-    char mode = 0;
-    if      (f[0] == 0xC3 && f[1] == 0xB7)                    mode = 'd';
-    else if (f[0] == 0xC3 && f[1] == 0x97)                    mode = 't';
-    else if (f[0] == 0xE2 && f[1] == 0x88 && f[2] == 0x92)    mode = 'm';
-    else if (f[0] == '+')                                     mode = 'p';
-    if (mode) { draw_opsym(lcd, x + w / 2, y + h / 2, mode, active); return; }
-    /* draw_text 的 ASCII 与汉字字形高度均为 24px (draw_ascii/draw_zh), 统一按 24 垂直居中 */
-    int fh = 24;
-    int fw = text_width(k->face);
-    if (fw > w - 8) fw = w - 8;               /* 防越框 */
-    int tx = x + (w - fw) / 2;
-    if (tx < x + 4) tx = x + 4;
-    int ty = y + (h - fh) / 2;
-    draw_text(lcd, tx, ty, k->face, active);
+
+    fill_rect(lcd, x, y, x1, y1, ST7305_COLOR_WHITE);
+    round_box(lcd, x, y, x1, y1, KEY_R, BORDER_W, active, ST7305_COLOR_BLACK);
+
+    bool inv_txt = active;
+    int cx = x + KEY_W / 2, cy = y + KEY_H / 2;
+
+    if (k->sym) { draw_sym(lcd, cx, cy, k->sym,
+                           active ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK); return; }
+
+    /* xʸ: x 正文字 + y 小字上标 */
+    if (!strcmp(k->ins, "^")) {
+        /* xʸ: y 用 8×12 小字, 抬高 6px 当上标; 抬太高会把下伸的尾巴裁掉 (变成 u) */
+        ui_text16(lcd, cx - 11, cy - 8, "x", inv_txt);
+        draw_ascii_small(lcd, cx + 1, cy - 9, 'y', inv_txt);
+        return;
+    }
+
+    const char *face = key_face(k);
+    if (!face[0]) return;
+
+    /* 数字与小数点用 24px 正文字 (与原来计算器一致); 功能词用 16px,
+     * 参考图里数字明显比 Rad/sin/log 这些词大一号. */
+    if (isdigit((unsigned char)face[0]) || face[0] == '.') {
+        int dw = text_width(face);
+        draw_text(lcd, cx - dw / 2, cy - 12, face, inv_txt);
+        return;
+    }
+    int w = ui_text16w(face);
+    if (w > KEY_W - 8) {                     /* 反函数标签 (sin-1) 缩成小字 */
+        int n = (int)strlen(face);
+        int tx = cx - n * 4;
+        for (int i = 0; i < n; i++)
+            draw_ascii_small(lcd, tx + i * 8, cy - 6, face[i], inv_txt);
+        return;
+    }
+    ui_text16(lcd, cx - w / 2, cy - 8, face, inv_txt);
 }
 
-/* 按钮动作 */
-static void calc_do(ui_ctx_t *ctx, const ckey_t *k, bool is_operator) {
-    switch (k->kind) {
-    case KT_AC:
-        s_len = 0; s_expr[0] = 0;
-        s_show_res = false; s_show_err = false;
-        s_last_expr[0] = 0;
-        redraw(ctx);
-        break;
-    case KT_DEL:
-        if (s_show_res || s_show_err) { /* 退格当作开始新输入 */
-            s_show_res = false; s_show_err = false;
-            s_len = 0; s_expr[0] = 0;
-        } else if (s_len > 0) {
-            s_expr[--s_len] = 0;
-        }
-        redraw(ctx);
-        break;
-    case KT_EQ: {
-        if (s_len == 0) { redraw(ctx); break; }
-        double res = 0;
-        int rc = calc_eval(s_expr, s_has_ans ? s_ans : 0, &res);
-        if (rc == 0) {
-    snprintf(s_last_expr, sizeof(s_last_expr), "%.*s", (int)sizeof(s_last_expr) - 1, s_expr);
-            s_ans = res; s_has_ans = true;
-            fmt_num(res, s_res, sizeof(s_res));
-            s_show_res = true; s_show_err = false;
-            s_len = 0; s_expr[0] = 0;
+/* ---------------- 显示框 ---------------- */
+static void draw_display(st7305_handle_t *lcd)
+{
+    round_box(lcd, DISP_X, DISP_Y, DISP_X + DISP_W - 1, DISP_Y + DISP_H - 1,
+              DISP_R, BORDER_W, false, ST7305_COLOR_BLACK);
+
+    /* 左上角: 制式 (Rad/Deg) 与 Inv 状态 */
+    char tag[16];
+    snprintf(tag, sizeof(tag), "%s%s", s_deg ? "Deg" : "Rad", s_inv ? " INV" : "");
+    ui_text16(lcd, DISP_X + 8, DISP_Y + 6, tag, false);
+
+    /* 左下角: 求值后显示原式 */
+    if (s_show_res && s_last_expr[0]) {
+        char pretty[80];
+        render_expr(pretty, (int)sizeof(pretty), s_last_expr);
+        char line[96];
+        snprintf(line, sizeof(line), "%s =", pretty);
+        int maxc = (DISP_W - 120) / 8;
+        const char *p = line;
+        if (maxc < 1) maxc = 1;
+        if ((int)strlen(line) > maxc) p = line + strlen(line) - maxc;
+        draw_text(lcd, DISP_X + 8, DISP_Y + DISP_H - 28, p, false);
+    }
+
+    /* 主数字: 右对齐, 右侧留 12px */
+    char big[96];
+    if (s_show_err)      snprintf(big, sizeof(big), "Error");
+    else if (s_show_res) snprintf(big, sizeof(big), "%s", s_res);
+    else if (s_len == 0) snprintf(big, sizeof(big), "0");
+    else {
+        char pretty[110];
+        render_expr(pretty, (int)sizeof(pretty), s_expr);
+        int maxc = (DISP_W - DISP_PAD * 2) / 8;
+        if (maxc < 1) maxc = 1;
+        int n = (int)strlen(pretty);
+        snprintf(big, sizeof(big), "%s", (n > maxc) ? pretty + (n - maxc) : pretty);
+    }
+    int w = text_width(big);
+    int bx = DISP_X + DISP_W - DISP_PAD - w;
+    int by = DISP_Y + (DISP_H - 24) / 2;
+    draw_text(lcd, bx, by, big, false);
+}
+
+/* ---------------- 输入/求值 ---------------- */
+static void push_token(ui_ctx_t *ctx, const ckey_t *k, bool is_op)
+{
+    const char *s = key_ins(k);
+    int ilen = (int)strlen(s);
+    if (ilen == 0 || s_len + ilen >= (int)sizeof(s_expr)) { redraw(ctx); return; }
+
+    if (s_show_res) {
+        if (is_op) {
+            fmt_num(s_ans, s_expr, sizeof(s_expr));
+            s_len = (int)strlen(s_expr);
         } else {
-            s_err[0] = 0;
-            strcpy(s_err, (rc == -1) ? "语法错" : "数学错");
-            s_show_err = true; s_show_res = false;
+            s_len = 0; s_expr[0] = 0;
         }
-        redraw(ctx);
-        break;
+        s_show_res = false;
     }
-    case KT_FN:
-        s_func_page = !s_func_page;
-        s_cursor_r = 0; s_cursor_c = 0;
-        redraw(ctx);
-        break;
+    if (s_show_err) { s_show_err = false; s_len = 0; s_expr[0] = 0; }
+
+    if (s_len == 0 && (!strcmp(s, "*10^(") || !strcmp(s, "^2"))) {
+        memcpy(s_expr, "1", 1); s_len = 1;
+    }
+    memcpy(s_expr + s_len, s, (size_t)ilen);
+    s_len += ilen;
+    s_expr[s_len] = 0;
+    redraw(ctx);
+}
+
+static void do_backspace(ui_ctx_t *ctx)
+{
+    if (s_show_res || s_show_err) {
+        s_show_res = false; s_show_err = false;
+        s_len = 0; s_expr[0] = 0;
+        redraw(ctx); return;
+    }
+    if (s_len == 0) { redraw(ctx); return; }
+    int i = s_len - 1;
+    while (i > 0 && isalpha((unsigned char)s_expr[i - 1])) i--;
+    if (i < s_len - 1 && s_expr[s_len - 1] == '(') s_len = i;
+    else s_len--;
+    s_expr[s_len] = 0;
+    redraw(ctx);
+}
+
+static void do_equals(ui_ctx_t *ctx)
+{
+    if (s_len == 0) { redraw(ctx); return; }
+    double res = 0;
+    int rc = calc_eval(s_expr, s_has_ans ? s_ans : 0, &res);
+    if (rc == 0) {
+        snprintf(s_last_expr, sizeof(s_last_expr), "%.*s",
+                 (int)sizeof(s_last_expr) - 1, s_expr);
+        s_ans = res; s_has_ans = true;
+        fmt_num(res, s_res, sizeof(s_res));
+        s_show_res = true; s_show_err = false;
+        s_len = 0; s_expr[0] = 0;
+    } else {
+        s_show_err = true; s_show_res = false;
+    }
+    redraw(ctx);
+}
+
+static void cell_action(ui_ctx_t *ctx, int r, int c)
+{
+    const ckey_t *k = &s_keys[r][c];
+    switch (k->kind) {
+    case KT_AC:  s_len = 0; s_expr[0] = 0; s_show_res = false; s_show_err = false;
+                 s_last_expr[0] = 0; redraw(ctx); break;
+    case KT_EQ:  do_equals(ctx); break;
+    case KT_RAD: s_deg = false; calc_set_deg(false); redraw(ctx); break;
+    case KT_DEG: s_deg = true;  calc_set_deg(true);  redraw(ctx); break;
+    case KT_INV: s_inv = !s_inv; redraw(ctx); break;
     case KT_PUSH: {
-        const char *s = k->ins;
-        int ilen = (int)strlen(s);
-        if (s_len + ilen >= (int)sizeof(s_expr)) { redraw(ctx); break; }
-        if (s_show_res) {
-            if (is_operator) {            /* 运算符/函数: 用上次结果续算 */
-                s_len = 0; fmt_num(s_ans, s_expr, sizeof(s_expr));
-                s_len = (int)strlen(s_expr);
-            } else {                       /* 数字: 重新开始 */
-                s_len = 0; s_expr[0] = 0;
-            }
-            s_show_res = false;
-        }
-        if (s_show_err) { s_show_err = false; s_len = 0; s_expr[0] = 0; }
-        memcpy(s_expr + s_len, s, (size_t)ilen);
-        s_len += ilen;
-        s_expr[s_len] = 0;
-        redraw(ctx);
+        const char *ins = key_ins(k);
+        bool is_op = ins[0] && (strchr("+-*/^%!()", ins[0]) ||
+                                isalpha((unsigned char)ins[0]));
+        push_token(ctx, k, is_op);
         break;
     }
     }
 }
 
-static void cell_action(ui_ctx_t *ctx, int r, int c) {
-    const ckey_t *k = (s_func_page ? &s_sci[r][c] : &s_main[r][c]);
-    bool is_op = !(k->kind == KT_PUSH) ? false :
-        (*k->ins && (strchr("+-*/^%!()", *k->ins) || isalpha((unsigned char)*k->ins)));
-    calc_do(ctx, k, is_op);
-}
-
-/* ---- 渲染 ---- */
-static void calc_render(ui_ctx_t *ctx) {
+/* ---------------- 渲染 ---------------- */
+static void calc_render(ui_ctx_t *ctx)
+{
     st7305_handle_t *lcd = ctx->lcd;
     if (!lcd) return;
     st7305_clear(lcd, ST7305_COLOR_WHITE);
 
-    /* 顶行: Ans 或 求值式 =  (右对齐) */
-    char line1[100];
-    if (s_show_res) {
-        char pretty[80];
-        render_expr(pretty, (int)sizeof(pretty), s_last_expr);
-        snprintf(line1, sizeof(line1), "%s =", pretty);
-    } else if (s_has_ans) {
-        char av[48];
-        fmt_num(s_ans, av, sizeof(av));
-        snprintf(line1, sizeof(line1), "Ans = %s", av);
-    } else {
-        line1[0] = 0;
-    }
-    if (line1[0]) {
-        int lw = text_width(line1);
-        draw_text(lcd, S_W - 8 - lw, 38, line1, false);
-    }
+    draw_display(lcd);
 
-    /* 第二行: 当前输入 (右对齐, 编辑在末端所以显示尾部) */
-    if (s_show_res) {
-        int lw = text_width(s_res);
-        draw_text(lcd, S_W - 8 - lw, 70, s_res, false);
-    } else if (s_show_err) {
-        int lw = text_width(s_err);
-        draw_text(lcd, S_W - 8 - lw, 70, s_err, false);
-    } else {
-        char pretty[110];
-        render_expr(pretty, (int)sizeof(pretty), s_expr);
-        int len = (int)strlen(pretty);
-        const char *show = pretty;
-        int maxc = 32;
-        if (len > maxc) show = pretty + (len - maxc);
-        int lw = text_width(show);
-        draw_text(lcd, S_W - 8 - lw, 70, show, false);
-    }
-
-    /* 分隔线 (显示区与键盘之间): 与键盘顶 GRID_Y 对齐, 与竖网格线相接 */
-    draw_hline(lcd, 0, S_W - 1, GRID_Y, ST7305_COLOR_BLACK);
-    if (s_func_page) draw_text(lcd, S_W - 32, 28, "FN", true);
-
-    /* 棋盘共线网格: 只画键与键之间的横/竖分割线, 不加外框
-     * (顶部由显示区分隔线担当, 避免"清空上方/函数下方"出现多余框线) */
-    int gx0 = GRID_X, gy0 = GRID_Y, gx1 = GRID_X + COLS * COL_W - 1, gy1 = GRID_Y + ROWS * ROW_H - 1;
-    for (int c = 1; c < COLS; c++) draw_vline(lcd, gx0 + c * COL_W, gy0, gy1, ST7305_COLOR_BLACK);
-    for (int r = 1; r < ROWS; r++) draw_hline(lcd, gx0, gx1, gy0 + r * ROW_H, ST7305_COLOR_BLACK);
-
-    /* 按键只是棋盘上的格子 (文字+选中), 不再各自描框 */
     for (int r = 0; r < ROWS; r++)
         for (int c = 0; c < COLS; c++)
             draw_cell(lcd, r, c,
@@ -292,63 +450,89 @@ static void calc_render(ui_ctx_t *ctx) {
                       (s_press_r == r && s_press_c == c));
 }
 
-/* ---- 触摸 ---- */
-static bool calc_touch(ui_ctx_t *ctx, int x, int y) {
+/* ---------------- 触摸 ---------------- */
+static bool calc_touch(ui_ctx_t *ctx, int x, int y)
+{
     if (x < 0 || y < 0) return false;
-    if (y < GRID_Y || y >= GRID_Y + ROWS * ROW_H) return false;
-    int c = x / COL_W;
-    int r = (y - GRID_Y) / ROW_H;
-    if (c < 0) c = 0;
-    if (c > COLS - 1) c = COLS - 1;
-    if (r < 0) r = 0;
-    if (r > ROWS - 1) r = ROWS - 1;
-    s_press_r = s_cursor_r = r;
-    s_press_c = s_cursor_c = c;
-    cell_action(ctx, r, c);
+    int r = -1, c = -1;
+    /* 命中与绘制共用 cell_rect(): 逐格比较, 间隙不响应, 不会吸到邻格 */
+    for (int rr = 0; rr < ROWS && r < 0; rr++) {
+        for (int cc = 0; cc < COLS; cc++) {
+            int kx, ky; cell_rect(rr, cc, &kx, &ky);
+            if (x >= kx && x <= kx + KEY_W - 1 &&
+                y >= ky && y <= ky + KEY_H - 1) { r = rr; c = cc; break; }
+        }
+    }
+    if (r < 0) return false;
+
+    if (s_press_r != r || s_press_c != c) {
+        s_press_r = r; s_press_c = c;
+        s_press_ms = now_ms();
+        s_long_done = false;
+    }
+    s_cursor_r = r; s_cursor_c = c;
+    ctx->needs_redraw = true;
     return true;
 }
 
-/* 每帧: 松手恢复按键原色 */
-static void calc_poll(ui_ctx_t *ctx) {
-    static bool prev_down = false;
+static void calc_poll(ui_ctx_t *ctx)
+{
     bool down = input_get_touch_pos(NULL, NULL);
-    if (!down && prev_down) {
-        if (s_press_r >= 0 || s_press_c >= 0) { s_press_r = s_press_c = -1; redraw(ctx); }
+    uint32_t now = now_ms();
+
+    if (s_press_r >= 0) {
+        const ckey_t *k = &s_keys[s_press_r][s_press_c];
+        if (down) {
+            if (!s_long_done && k->kind == KT_AC && (now - s_press_ms) >= 600) {
+                s_long_done = true;
+                do_backspace(ctx);
+            }
+        } else {
+            int r = s_press_r, c = s_press_c;
+            bool was_long = s_long_done;
+            s_press_r = s_press_c = -1;
+            s_long_done = false;
+            if (!was_long) cell_action(ctx, r, c);
+            redraw(ctx);
+        }
     }
-    prev_down = down;
 }
 
-/* ---- 按键 ---- */
-static void calc_action(ui_ctx_t *ctx, os_action_t a) {
-    if (a == OS_ACTION_UP)    { if (s_cursor_r > 0) s_cursor_r--; redraw(ctx); return; }
-    if (a == OS_ACTION_DOWN)  { if (s_cursor_r < ROWS - 1) s_cursor_r++; redraw(ctx); return; }
-    if (a == OS_ACTION_LEFT)  { if (s_cursor_c > 0) s_cursor_c--; redraw(ctx); return; }
-    if (a == OS_ACTION_RIGHT) { if (s_cursor_c < COLS - 1) s_cursor_c++; redraw(ctx); return; }
+/* ---------------- 按键 ---------------- */
+static void calc_action(ui_ctx_t *ctx, os_action_t a)
+{
+    if (a == OS_ACTION_UP)      { if (s_cursor_r > 0) s_cursor_r--; redraw(ctx); return; }
+    if (a == OS_ACTION_DOWN)    { if (s_cursor_r < ROWS - 1) s_cursor_r++; redraw(ctx); return; }
+    if (a == OS_ACTION_LEFT)    { if (s_cursor_c > 0) s_cursor_c--; redraw(ctx); return; }
+    if (a == OS_ACTION_RIGHT)   { if (s_cursor_c < COLS - 1) s_cursor_c++; redraw(ctx); return; }
     if (a == OS_ACTION_CONFIRM) { cell_action(ctx, s_cursor_r, s_cursor_c); return; }
     if (a == OS_ACTION_BACK || a == OS_ACTION_HOME) { os_pop(ctx); return; }
 }
 
-/* ---- 进入/退出 ---- */
-static void calc_enter(ui_ctx_t *ctx) {
+/* ---------------- 进入 ---------------- */
+static void calc_enter(ui_ctx_t *ctx)
+{
     s_len = 0; s_expr[0] = 0;
     s_ans = 0; s_has_ans = false;
     s_show_res = false; s_show_err = false;
     s_res[0] = 0; s_last_expr[0] = 0;
-    s_func_page = false;
+    s_deg = false; calc_set_deg(false);
+    s_inv = false;
     s_cursor_r = 0; s_cursor_c = 0;
+    s_press_r = s_press_c = -1;
     ctx->needs_redraw = true;
 }
 
 static const os_module_t s_mod_calc = {
-    .name      = "calc",
-    .page_id   = OS_PAGE_CALC,
-    .on_enter  = calc_enter,
-    .render    = calc_render,
-    .action    = calc_action,
-    .touch     = calc_touch,
-    .poll      = calc_poll,
-    .fullscreen = false,
-    .exit_confirm = true,   /* ★ 2026-10-25 linit: 应用页按返回键先弹"退出程序?" */
+    .name       = "calc",
+    .page_id    = OS_PAGE_CALC,
+    .on_enter   = calc_enter,
+    .render     = calc_render,
+    .action     = calc_action,
+    .touch      = calc_touch,
+    .poll       = calc_poll,
+    .fullscreen = true,        /* 计算器整屏排版, 状态栏让位 */
+    .exit_confirm = true,
 };
 
 void os_page_calculator_register(void) { os_register(&s_mod_calc); }

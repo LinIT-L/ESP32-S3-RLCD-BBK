@@ -1012,8 +1012,44 @@ static bool s_o_zone  = false;  /* 手势起点是否落在底部屏蔽带 */
 static int  s_o_sx = 0, s_o_sy = 0;
 static bool s_o_prev_down = false; /* 上一帧 s_touch_down, 用于上升沿检测 */
 
+/* ★ 2026-10-30 (A6): "底部拖动屏蔽带"页面级开关。
+ * 默认 true = 保持既有行为 (底带内起手 + 位移≥40px 时不给下层坐标, 防菜单/列表被误拖)。
+ * 全屏绘图页 (白板) 需要整面可用 —— 底带在画布下沿, 屏蔽会让笔迹被凭空截断。
+ * 由 os_push/os_pop 按模块的 `no_bottom_shield` 标记统一设置, **不依赖各页自行开关**,
+ * 避免某页 on_exit 被跳过导致全局卡在关闭态。 */
+static bool s_bottom_shield = true;
+
+void input_set_bottom_shield(bool on) { s_bottom_shield = on; }
+
+/* ★ 引擎内 overlay 钩子 (见 input.h): os 层注入实现, 引擎每帧调用。
+ * 用函数指针而不是直接调 os_* —— 引擎组件不依赖 os, 避免破坏分层单向。 */
+static engine_overlay_fn s_engine_quickbar_fn = NULL;
+
+void engine_overlay_set_quickbar(engine_overlay_fn fn) { s_engine_quickbar_fn = fn; }
+
+void engine_overlay_quickbar(void *lcd)
+{
+    if (s_engine_quickbar_fn && lcd) s_engine_quickbar_fn(lcd);
+}
+
+/* ★ 覆盖层触摸独占锁 (2026-10-29, 下拉快捷栏): 置位后普通调用者一律返回"无触摸",
+ *   避免从顶部下拉时下方主菜单/列表跟着滚动。覆盖层自己用 _raw 版本读真实坐标。 */
+static bool s_overlay_lock = false;
+
+void input_set_overlay_lock(bool on) { s_overlay_lock = on; }
+
+bool input_get_touch_pos_raw(int *x, int *y)
+{
+    bool saved = s_overlay_lock;
+    s_overlay_lock = false;              /* 临时放开, 让原逻辑跑完整流程 */
+    bool r = input_get_touch_pos(x, y);
+    s_overlay_lock = saved;
+    return r;
+}
+
 bool input_get_touch_pos(int *x, int *y) {
     if (s_touch_blocked) return false;   /* 休眠禁触屏: 无触摸坐标 */
+    if (s_overlay_lock) return false;    /* 覆盖层独占: 快捷栏手势中/展开中 → 下层拿不到 */
     /* V1.0.xx: 检测 s_touch_down 上升沿 — 新触摸开始, 强制复位状态.
      * 修复场景: 从底部屏蔽带触摸返回后, 若状态机复位不完整导致 s_o_zone
      * 残留为 true, 后续所有滑动(位移≥40px)都被拦截, 菜单无法左右拖动.
@@ -1030,7 +1066,9 @@ bool input_get_touch_pos(int *x, int *y) {
             s_o_armed = false;
             s_o_sx = s_touch_sx;
             s_o_sy = s_touch_sy;
-            s_o_zone = input_in_bottom_zone(s_o_sx, s_o_sy,
+            /* 屏蔽带关闭时 (白板等全屏绘图页) 恒为 false → 永不隐藏坐标 */
+            s_o_zone = s_bottom_shield &&
+                       input_in_bottom_zone(s_o_sx, s_o_sy,
                                             ST7305_HEIGHT - TOUCH_BACK_EDGE_Y);
         }
         if (s_o_zone) {

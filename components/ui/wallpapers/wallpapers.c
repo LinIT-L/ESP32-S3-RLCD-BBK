@@ -69,6 +69,9 @@ int wp_program_render(st7305_handle_t *lcd, int prog, uint32_t now_ms) {
 /* ==== 屏保状态机 (从 os_mgr 迁移归位: 屏保职责归壁纸模块) ==== */
 #define WP_TAG "WPSS"
 static volatile bool s_ss_active = false;   /* volatile: 屏保监督任务(另一核) 与主循环并发读写 */
+/* 屏保所用的 LCD 句柄, 由 wp_screensaver_supervisor_start() 记录。
+ * 提到这里(原在监督任务前)是因为 os_screensaver_force_enter() 也要用它复位方向。 */
+static st7305_handle_t *s_ss_lcd = NULL;
 static volatile bool s_ss_manual = false;  /* 锁屏键点按强制进入, 不自动复位 */
 static volatile uint32_t s_ss_enter_ms = 0;  /* 进入屏保的时刻 (唤醒判定 + 休眠计时起点) */
 static volatile bool s_ss_shutdown = false;  /* 屏保播满"休眠时间", 请求自动关机 */
@@ -119,6 +122,31 @@ void os_screensaver_force_enter(void)
                  (unsigned)(nowg - s_ss_wake_ms));
         return;
     }
+
+    /* ★★★ 2026-10-30 修复「阅读器调方向后进休眠, 方向错/残影/图标缺半边」★★★
+     *
+     * 进入屏保前必须把显示栈整体拉回**系统默认横屏 400×300**, 三层都要动:
+     *
+     *   ① 驱动层 — st7305_reset_rotation(): 清掉 dev->pt_pfb / pt_rot / r_flip1,
+     *      并把控制器 MADCTL 与地址窗口重设回横屏。
+     *      不做的后果: st7305_draw_pixel / st7305_clear 在 pt_pfb 非空时只写 300 宽的
+     *      竖屏缓冲 (x>299 直接被 pt_px 丢弃), 而屏保的 flush_override 发的是 dev->fb
+     *      ⇒ 休眠界面根本没送出去, 屏幕停在阅读器最后一帧的残留 (残影/错位/缺半边)。
+     *
+     *   ② UI 层 — ui_set_portrait(false): 让 ui_screen_w/h() 回到 400×300,
+     *      否则屏保按 300×400 算的居中/行高全错 (图标异常、显示不完整)。
+     *
+     *   ③ 触摸层 — input_set_screen_rotation(0): 休眠期虽屏蔽触屏, 但唤醒后的
+     *      第一次点击仍会用旧映射, 不清会出现"点这里响那里"。
+     *
+     * ⚠ 这是**单向复位**: 阅读器方向不在这里保存, 也不需要保存 ——
+     *   阅读器每帧渲染都会 st7305_set_rotation(lcd, s_rot, s_pfb) 重新绑定,
+     *   唤醒后它重绘一次就自动回到用户选的方向 (见 book_render)。
+     */
+    st7305_reset_rotation(s_ss_lcd);
+    ui_set_portrait(false);
+    input_set_screen_rotation(0);
+
     s_ss_active = true;
     s_ss_manual = true;
     s_ss_enter_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
@@ -230,14 +258,61 @@ static int s_ss_pm_mode = -1;      /* 屏保分档: -1=未定 0=静态省电 1=�
  *   即使 MIN_MODEM 也要按 DTIM 醒来收包; disable() 才真正 stop+deinit 并释放内部 RAM。
  *   短暂息屏也一样关（linit 要求）; 解锁后后台重新初始化，不阻塞界面。 */
 static volatile bool s_ss_wifi_off = false;
+/* ★ 2026-10-28: WiFi 恢复的**重试节流**时间戳。
+ *   背景: 恢复代码位于 ss_supervisor_task 的"非屏保"分支, 那个分支**每 250ms** 循环一次。
+ *   若不加节流, 一旦 xTaskCreate 失败或 wifi_manager_enable() 返回 false, 标志会保持 true,
+ *   于是每 250ms 就新建一个 4096B 栈的任务 —— 内部 RAM 被迅速耗光, 恢复反而永远失败。
+ *   5 秒足够让一次 WiFi 初始化跑完, 又不会让用户等太久。 */
+static uint32_t s_wifi_restore_last_ms = 0;
+/* ★ 2026-10-28 【恢复中标志】防止两个恢复任务并发, 并让任务成为最终状态的唯一裁决者。
+ *   生命周期:
+ *     置 true : ss_supervisor_task 的非屏保分支, 在 **xTaskCreate 之前**占位
+ *               (必须先占位: 见该处注释 —— 同优先级 tick 轮转会让"创建后再置位"永久卡死)。
+ *     置 false: ① 任务结束(成功/失败/又被屏保覆盖, 三条出口全覆盖)
+ *               ② xTaskCreate 失败时立即回滚。
+ *   语义: true = "已经有一个 enable 在跑(或即将跑), 别再创建第二个"。
+ *   为什么需要: wifi_manager_enable() 要 1~2 秒, 这期间用户可能又进出屏保,
+ *   若允许再创建, 会出现两个任务同时操作 esp_wifi。
+ *   volatile: 由恢复任务(可能另一核)写, 监督任务读写。
+ *   ⚠ volatile 只保证"不被编译器优化掉/每次都真的读写", **不提供原子性**:
+ *     它与 s_ss_wifi_off 是两个独立变量, 二者之间不存在原子配对, 可被观察到中间态。
+ *     代价已评估: 最坏结果是多创建一个幂等任务(enable 首行 return true)或晚 5 秒恢复,
+ *     不会出现"永久卡死"或"误关用户 WiFi"。 */
+static volatile bool s_wifi_restoring = false;
 static void wifi_restore_task(void *arg)
 {
     (void)arg;
-    wifi_manager_enable();
-    ESP_LOGI(WP_TAG, "解锁: WiFi 已恢复");
+    /* ★★★ 2026-10-28 【竞态修复】★★★
+     *   原写法: 创建成功即由**调用方**清 s_ss_wifi_off, 任务只管 enable 并打日志。
+     *   问题时序: 退出屏保 → 建任务 → 调用方清标志 → 任务 enable 耗时 1~2s
+     *            → 用户此刻又进屏保(屏保分支看到 s_ss_wifi_off 已 false, 会 disable)
+     *            → 但任务随后 enable 成功 ⇒ **屏保期间 WiFi 又开着**, 白耗 20~30mA。
+     *   现在: 任务结束前重新核对屏保状态, 自己决定 s_ss_wifi_off 的最终值:
+     *     · 仍在屏保 ⇒ 重新关掉 WiFi + 保留标志(等下次退出屏保再恢复)
+     *     · 已退出   ⇒ 保持开启 + 清标志
+     *   ⚠ 绝不能在"不在屏保"时关 WiFi —— 那正是用户要用的网络。
+     *   ⚠ 失败路径也必须清 s_wifi_restoring, 否则外层永远不再重试。 */
+    if (!wifi_manager_enable()) {
+        s_ss_wifi_off  = true;      /* 保留重试条件(5 秒节流由外层控制) */
+        s_wifi_restoring = false;
+        ESP_LOGE(WP_TAG, "解锁: WiFi 恢复失败 ⇒ 保留标志, 5 秒后重试");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (os_screensaver_active()) {
+        /* enable 这 1~2 秒里用户又进屏保了 ⇒ 现在开着的 WiFi 是错的, 收回 */
+        s_ss_wifi_off    = true;    /* 恢复条件仍在: 下次退出屏保要再开一次 */
+        wifi_manager_disable();
+        s_wifi_restoring = false;
+        ESP_LOGW(WP_TAG, "解锁期间又进屏保 ⇒ WiFi 重新关闭, 待下次退出再恢复");
+    } else {
+        s_ss_wifi_off    = false;   /* 真正恢复完成 */
+        s_wifi_restoring = false;
+        ESP_LOGI(WP_TAG, "解锁: WiFi 已恢复");
+    }
     vTaskDelete(NULL);
 }
-static st7305_handle_t *s_ss_lcd = NULL;
 
 #include "usb_hid.h" /* usb_hid_host_mounted(): USB 插着就不自动休眠 (2026-10-02) */
 #include "power_stat.h" /* power_stat_tick(): USB 插入边沿 → 电源统计清零 (电池信息页) */
@@ -332,10 +407,6 @@ static void ss_supervisor_task(void *arg) {
                 if (!s_pm_fast) {
                     s_pm_fast = true;
                     s_ss_pm_mode = -1;   /* 退出屏保: 分档状态复位, 下次进入重新判定 */
-                    if (s_ss_wifi_off) {   /* 屏保期间关过 WiFi ⇒ 后台恢复 (不阻塞解锁) */
-                        s_ss_wifi_off = false;
-                        xTaskCreate(wifi_restore_task, "wifi_rest", 4096, NULL, 2, NULL);
-                    }
                     /* ★★ 2026-10-26 linit「动态调频省电」: min 从 240 改为 80 ——
                      *   原来 min=max=240 把 DFS **锁死**了, CPU 永远满频。
                      *   现在 max=240 (有任务/动画自动跑满, 性能不变),
@@ -344,6 +415,47 @@ static void ss_supervisor_task(void *arg) {
                      *   APB 仍是 80MHz ⇒ SPI 屏/PSRAM 时序不受影响。 */
                     esp_pm_config_t pm = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = false };
                     esp_pm_configure(&pm);
+                }
+                /* ★★★ 2026-10-28 【必须放在 s_pm_fast 之外】★★★
+                 *   s_pm_fast 是 static, 置 true 后**永不复位** —— 第一次退出屏保之后就
+                 *   再也不会进上面那个 if。如果把 WiFi 恢复写在里面, 建任务一旦失败,
+                 *   就是"永远没有第二次机会"(用户表现为: 解锁后一直没网, 只能重启)。
+                 *   放在外面则每次退出屏保都检查一次 s_ss_wifi_off, 失败下次自然重试。
+                 *   s_ss_wifi_off 只在"屏保期间被这套逻辑关过"时才为 true
+                 *   (见上面 `if (!s_ss_wifi_off && wifi_manager_is_enabled())`),
+                 *   用户手动关 WiFi 不会误触发。 */
+                if (s_ss_wifi_off && !s_wifi_restoring) {   /* 屏保期间关过 WiFi ⇒ 后台恢复 */
+                    /* ★ 2026-10-28 【节流】本分支每 250ms 跑一次, 必须限制重试频率:
+                     *   创建失败 / enable 失败时标志会保持 true, 不节流就是每 250ms
+                     *   新建一个 4096B 栈任务 ⇒ 内部 RAM 耗尽 ⇒ 恢复永远失败。
+                     *   首次尝试(s_wifi_restore_last_ms==0)立即执行, 之后至少间隔 5 秒。 */
+                    bool due = (s_wifi_restore_last_ms == 0) ||
+                               ((uint32_t)(now - s_wifi_restore_last_ms) >= 5000u);
+                    if (due) {
+                        s_wifi_restore_last_ms = now;
+                        /* ★★★ 2026-10-28 【必须"先占位、后创建"】★★★
+                         *   ss_supervisor_task 优先级 = tskIDLE_PRIORITY+2 = 2,
+                         *   wifi_rest 也是 2 ⇒ 同优先级按 tick 轮转, **不保证**当前任务
+                         *   连续执行。原写法是"创建成功后再置 s_wifi_restoring = true",
+                         *   中间那条窗口里一旦发生 tick 抢占, 且新任务很快跑完
+                         *   (WiFi 已 enabled 时 wifi_manager_enable() 第一行就 return true),
+                         *   它会把 s_wifi_restoring 清成 false 并自删; 随后本任务又把
+                         *   它置回 **true** ⇒ 永久卡住。
+                         *   后果: 之后 s_ss_wifi_off 再变 true 时, 外层 `!s_wifi_restoring`
+                         *   恒为假 ⇒ **再也不创建恢复任务**, 屏保退出后永远没网,
+                         *   只能重启才恢复。
+                         *   先置位则窗口消失: 任务启动前标志已是 true, 它结束时清掉的就是
+                         *   自己这一次的占位; 创建失败则立即回滚。 */
+                        s_wifi_restoring = true;
+                        if (xTaskCreate(wifi_restore_task, "wifi_rest", 4096, NULL, 2, NULL) != pdPASS) {
+                            s_wifi_restoring = false;   /* 回滚, 5 秒后可重试 */
+                            ESP_LOGE(WP_TAG, "wifi_rest 任务创建失败 ⇒ WiFi 未恢复, 5 秒后重试");
+                        }
+                        /* 注意: **不在这里清 s_ss_wifi_off** ——
+                         *   最终状态由任务自己核对屏保后裁决(见 wifi_restore_task)。
+                         *   调用方抢着清会让"任务 enable 期间又进屏保"这条时序
+                         *   出现"屏保里 WiFi 开着"的漏洞。 */
+                    }
                 }
             }
             /* 空闲检测 (低频省电) —— USB 插着就不进屏保(也就不会连锁到自动关机) */

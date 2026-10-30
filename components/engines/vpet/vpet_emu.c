@@ -27,6 +27,7 @@
 #include "cheat_ui.h"
 #include "cheat_float.h"
 #include "board_rlcd.h"
+#include "input.h"         /* engine_overlay_quickbar: 游戏内下拉快捷栏 */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,7 +151,7 @@ static bool s_aa = false;
 static void vpet_fill_black(int x, int y, int w, int h);   /* 前向声明 (定义在下方) */
 
 /* EPX 2x (scale2x) 平滑: 从 32x16 packed 生成 64x32, 四角判断邻居 */
-static void vpet_epx_expand(const uint16_t *packed, uint8_t e[64][32]) {
+static void __attribute__((unused)) vpet_epx_expand(const uint16_t *packed, uint8_t e[64][32]) {
     const int W = VPET_COLS, H = VPET_ROWS;
     /* 先取按位转 bits[y][x] (x 列, y 行), 便于取邻居 */
     static uint8_t b[16][32];
@@ -184,7 +185,7 @@ static void vpet_epx_expand(const uint16_t *packed, uint8_t e[64][32]) {
  *  - FIT:     当前 224x112 @ (88,60), 每次源格 7x7
  *  - ZOOM:    等比拉到最宽 400 宽, 高=200, 置顶 y=30
  *  - STRETCH: 强制整屏 400x300 */
-static void vpet_fill_cell(int gx, int gy, int GW, int GH) {
+static void __attribute__((unused)) vpet_fill_cell(int gx, int gy, int GW, int GH) {
     int W = ST7305_WIDTH, H = ST7305_HEIGHT, X = 0, Y = 0;
     if (s_disp_mode == VPET_DISP_FIT) { W = VPET_DISP_W; H = VPET_DISP_H; X = VPET_X_OFF; Y = VPET_Y_OFF; }
     else if (s_disp_mode == VPET_DISP_ZOOM) { W = ST7305_WIDTH; H = (ST7305_WIDTH * VPET_ROWS) / VPET_COLS; X = 0; Y = 30; }
@@ -295,7 +296,8 @@ static void vpet_render(void) {
     virtual_keys_draw(s_lcd);
     /* 独立修改机浮标: 画浮标+检测呼出 (触发后交独立修改机任务, 本任务停走) */
     bool takeover = cheat_float_overlay_tick(s_lcd);
-    if (!takeover) vid_tune_overlay_tick(s_lcd);   /* 画面优化器浮标/面板 */
+    if (!takeover) vid_tune_overlay_tick(s_lcd);
+        if (!takeover) engine_overlay_quickbar(s_lcd);   /* ★ 游戏内下拉快捷栏 */   /* 画面优化器浮标/面板 */
     if (!takeover) st7305_flush(s_lcd);
 }
 

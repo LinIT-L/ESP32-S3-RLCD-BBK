@@ -76,6 +76,26 @@ static int l_rec_peak(lua_State *L)
     return 1;
 }
 
+/* ★ 2026-10-30: 让录音机也能播 MP3 —— 目的是**同机 A/B 对比音量**
+ *   (音乐母带级 ~90%FS vs 麦克风录音 ~10%FS, 用同一个 I2S/功放/音量档来听差别)。
+ *   走 audio_player_play()，与音乐播放器是同一条解码链路。 */
+static int l_rec_mplay(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+    lua_pushinteger(L, (lua_Integer)audio_player_play(path));
+    return 1;
+}
+static int l_rec_mplaying(lua_State *L)
+{
+    lua_pushboolean(L, audio_player_is_running());
+    return 1;
+}
+static int l_rec_mstop(lua_State *L)
+{
+    audio_player_stop();
+    return 0;
+}
+
 static int l_rec_play(lua_State *L)
 {
     const char *path = luaL_checkstring(L, 1);
@@ -120,6 +140,9 @@ void lua_mod_rec_register(lua_State *L)
     lua_pushcfunction(L, l_rec_spec);           lua_setfield(L, -2, "spec");
     lua_pushcfunction(L, l_rec_spec_bins);      lua_setfield(L, -2, "spec_bins");
     lua_pushcfunction(L, l_rec_play);           lua_setfield(L, -2, "play");
+    lua_pushcfunction(L, l_rec_mplay);          lua_setfield(L, -2, "mplay");
+    lua_pushcfunction(L, l_rec_mplaying);       lua_setfield(L, -2, "mplaying");
+    lua_pushcfunction(L, l_rec_mstop);          lua_setfield(L, -2, "mstop");
     lua_pushcfunction(L, l_rec_stop_play);      lua_setfield(L, -2, "stop_play");
     lua_pushcfunction(L, l_rec_playing);        lua_setfield(L, -2, "playing");
     lua_pushcfunction(L, l_rec_play_ms);        lua_setfield(L, -2, "play_ms");

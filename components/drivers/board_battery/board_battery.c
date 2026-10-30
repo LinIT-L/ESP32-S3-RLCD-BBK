@@ -398,6 +398,17 @@ esp_err_t board_battery_init(void)
 esp_err_t board_battery_read(board_battery_status_t *status)
 {
     ESP_RETURN_ON_FALSE(status != NULL, ESP_ERR_INVALID_ARG, TAG, "status is null");
+#ifdef LINTOS_EMU_MODE
+    /* ★ 2026-10-30: esp-emu **没有 ADC 模型** —— adc_oneshot_read 会停在
+     *   adc_oneshot_ll_get_event 里死等"转换完成"事件，表现为
+     *   `Guru Meditation: Interrupt wdt timeout on CPU0`（实测 1144ms 崩溃重启，
+     *   无限循环）。ESP_ERR_TIMEOUT 也等不到，因为事件位永远不会置起来。
+     *   模拟器里给一个固定电压：状态栏电量图标/低电量逻辑照常走通。
+     *   ⚠ 只在 -DLINTOS_EMU_MODE=1 时编入，真机固件不受影响。 */
+    status->voltage_mv = 4100;
+    status->percent = 80;
+    return ESP_OK;
+#endif
     ESP_RETURN_ON_ERROR(board_battery_init(), TAG, "init battery adc failed");
 
     int raw_sum = 0;

@@ -62,6 +62,9 @@ end
 
 local W, H, SB_H = 400, 300, 24
 local DIR      = "/sdcard/Rec/"
+-- 临时功能(2026-10-30 linit 要求): 列表里同时列出 mp3，方便在同一台机器、同一音量档下
+-- 直接对比"音乐"和"录音"的响度差。mp3 只在本地解码播放，不属于录音库。
+local MP3_DIRS = { "/sdcard/mp3", "/sdcard/media/mp3" }
 local RATE     = 16000
 local CH       = 2
 local BYTE_RATE = RATE * CH * 2      -- 64000 B/s（16k / 2ch / 16bit）
@@ -87,18 +90,22 @@ local BK, WH  = 0, 1
 -- 布局
 local HDR_Y   = SB_H + 6          -- 标题基线
 local HDR_H   = SB_H + 46         -- 顶栏底边
-local ROW_H   = 44
-local ROWS    = 3
-local LIST_Y  = HDR_H + 22
+local ROW_H   = 40                 -- 行高(只压缩不放大)
+local ROWS    = 5                  -- 5 行: 26 + 40*5 = 226, 填到按钮上方
+local LIST_Y  = 26                 -- 列表顶: 去掉"N 条 xxK"汇总行后直接顶到状态栏下
 local LIST_B  = LIST_Y + ROW_H * ROWS
-local BTN_Y0  = 228
-local BTN_Y1  = 276
+local DRAG_STEP = 30               -- 拖动多少像素翻一行(手指跟随)
+local BTN_Y0  = 238                -- ★ 第5项: 开始录音按钮整体下移 10px (228→238)
+local BTN_Y1  = 286
 local BTN_X0  = 40
 local BTN_X1  = 360
 -- 录音页分区（计时/频谱各自局部重绘，互不整屏刷）
-local T_Y0, T_Y1   = 72, 146      -- 大号计时
-local S_Y0, S_Y1   = 152, 192     -- 16 段实时频谱
-local SHINT_Y      = 200          -- 频谱下方（提示/消息）
+-- ★ 第7项: 计时上移 50px (72→22); 频谱从 40px 高扩到 86px, 吃掉空出来的区域
+--   T_Y0 取 22 而不是 24: 上方 0~23 是系统状态栏, 清屏从 SB_H 起, 所以只清 24 以下,
+--   大号数字本身从 T_Y0+10=32 开始, 不会压到状态栏。
+local T_Y0, T_Y1   = 22, 114      -- 大号计时 (5x 字模 32..112)
+local S_Y0, S_Y1   = 118, 202     -- 16 段实时频谱 (84px 高)
+local SHINT_Y      = 204          -- 频谱下方（提示/消息）
 local RBTN_CY      = 246          -- 圆形停止键中心
 local RBTN_R       = 26
 
@@ -171,10 +178,16 @@ end
 -- 列表行左侧标签：只用 ASCII。
 -- ⚠ 名字不是标准时间戳时（用户改名 / 从电脑拷进来的中文名）一律显示序号 ——
 --   这一列走 app.textsb()（8x16 ASCII 字体），塞中文既画不出来，截断还会越界。
+-- 行标签: 日期-时间-编号（20261030_115651_3f2a.wav → "10-30 11:56 #3f2a"）
 local function row_label(idx, name)
-  if not name:match("^1970") then
-    local hh, mi = name:match("_(%d%d)(%d%d)%d%d_")
-    if hh then return hh .. ":" .. mi end
+  -- 新命名: 20261030_115651_0001.wav → "10-30 11:56 #0001"
+  -- 老文件尾部是十六进制(3f2a)，%x 一起收，照样能显示
+  local y, mo, d, hh, mi, tail = name:match("^(%d%d%d%d)(%d%d)(%d%d)_(%d%d)(%d%d)%d%d_?(%x*)")
+  if y and y ~= "1970" then
+    if tail and tail ~= "" then
+      return string.format("%s-%s %s:%s #%s", mo, d, hh, mi, tail)
+    end
+    return string.format("%s-%s %s:%s", mo, d, hh, mi)
   end
   return string.format("NO.%02d", idx)
 end
@@ -210,6 +223,11 @@ local function fill_rect(x0, y0, x1, y1, c)
   if x1 >= x0 and y1 >= y0 then app.fill(x0, y0, x1, y1, c) end
 end
 
+-- 顶部状态栏。Lua 页面是 fullscreen，系统**不会**画状态栏 ⇒
+-- 0..SB_H-1 这一条会一直留着上一个页面的残影（弹窗、桌面图标、上一次的提示语）。
+-- 每次整屏重绘时补一遍，既保住状态栏，也把残影擦掉。
+
+
 -- 胶囊（iOS 按钮形状）：填充 + 两端半圆
 local function pill(x0, y0, x1, y1, on)
   local c = on and BK or WH
@@ -236,7 +254,7 @@ end
 local function pill_label(x0, y0, x1, y1, text, on)
   local w = app.mixw(text)
   if on then
-    app.fill(x0 + 1, y0 + 1, x1 - 1, y1 - 1, BK)
+    pill(x0, y0, x1, y1, true)        -- ★ 原来这里是 app.fill ⇒ 选中态变成长方形
     app.mix((x0 + x1) // 2 - w // 2, (y0 + y1) // 2 - 8, text, true)
   else
     pill(x0, y0, x1, y1, false)
@@ -327,6 +345,8 @@ local function scan()
       G.files[G.n] = { name = nm, path = p, size = sz, dur = dur, bad = bad }
     end
   end
+  -- ★ 2026-10-30 linit: 录音机列表**只放录音**，不再混入 MP3 试听条目。
+  --   MP3 归音乐播放器，这里列出来既乱又让人以为录音里有它。
   table.sort(G.files, function(a, b) return a.name > b.name end)  -- 新的在上
   if G.sel > G.n then G.sel = G.n end
   if G.sel < 1 and G.n > 0 then G.sel = 1 end
@@ -368,13 +388,24 @@ local function next_name()
     y, mo, d = 1970, 1, 1
     hh, mi, ss = (ms // 3600000) % 24, (ms // 60000) % 60, (ms // 1000) % 60
   end
-  for _ = 1, 16 do
-    local r = 0
-    if app.util and app.util.rand then r = app.util.rand(65535) end
-    local nm = string.format("%04d%02d%02d_%02d%02d%02d_%04x.wav", y, mo, d, hh, mi, ss, r)
+  -- 编号：目录里已有的最大 4 位序号 +1（从 0001 起），不是随机十六进制
+  local seq = 0
+  if app.fs and app.fs.listdir then
+    local ok, t = pcall(app.fs.listdir, DIR)
+    if ok and type(t) == "table" then
+      for _, nm in ipairs(t) do
+        local k = tostring(nm):match("_(%d%d%d%d)%.wav$")
+        if k then k = tonumber(k); if k > seq then seq = k end end
+      end
+    end
+  end
+  for _ = 1, 9999 do
+    seq = seq + 1
+    if seq > 9999 then seq = 1 end
+    local nm = string.format("%04d%02d%02d_%02d%02d%02d_%04d.wav", y, mo, d, hh, mi, ss, seq)
     if not (app.fs.exists and app.fs.exists(DIR .. nm)) then return nm end
   end
-  return string.format("%04d%02d%02d_%02d%02d%02d.wav", y, mo, d, hh, mi, ss)
+  return string.format("%04d%02d%02d_%02d%02d%02d_%04d.wav", y, mo, d, hh, mi, ss, seq)
 end
 
 -- ---------------------------------------------------------------- 动作
@@ -505,6 +536,8 @@ local function commit_rename()
 end
 
 local function stop_play()
+  if G.mp3 and app.rec and app.rec.mstop then app.rec.mstop() end
+  G.mp3 = false
   if app.rec then app.rec.stop_play() end
   G.pending_play = 0
   G.mode = "list"
@@ -515,6 +548,23 @@ local function play(i)
   local f = G.files[i]
   if not f then return end
   if not app.rec then msg("固件不支持播放"); return end
+  if f.mp3 then
+    if not app.rec.mplay then msg("固件不支持MP3试听"); app.redraw(); return end
+    if app.rec.mplaying and app.rec.mplaying() then app.rec.mstop() end
+    local rc = app.rec.mplay(f.path)
+    if rc ~= 0 then
+      if rc == -4 then msg("已静音，先调音量") else msg("MP3 打不开") end
+      app.redraw(); return
+    end
+    G.sel = i
+    G.mp3 = true
+    G.mp3_tick = 0
+    G.play_name = f.name
+    G.play_total = 0
+    G.mode = "play"
+    app.redraw()
+    return
+  end
   if f.bad then
     msg("文件未收尾，无法播放")
     app.redraw()
@@ -525,6 +575,14 @@ local function play(i)
     app.rec.stop_play()
     G.pending_play = i
     G.mode = "list"
+    app.redraw()
+    return
+  end
+  -- ★ 2026-10-30: 音量为 0 时底层照样返回 0（它只判 muted，不判 volume=0）
+  --   ⇒ 界面进入播放页、进度条在走，但一点声音都没有，看着像"播放坏了"。
+  --   这里提前拦一次并给出明确提示，别让人以为文件有问题。
+  if app.volume and (app.volume() or 0) <= 0 then
+    msg("音量为 0，按音量键调大")
     app.redraw()
     return
   end
@@ -557,7 +615,6 @@ local function hit(x, y)
   end
 
   if G.mode == "list" then
-    if y >= 26 and y <= 58 and x >= 306 then return "done" end
     if y >= BTN_Y0 and y <= BTN_Y1 and x >= BTN_X0 and x <= BTN_X1 then return "primary" end
     if y >= LIST_Y and y < LIST_B then
       local r = (y - LIST_Y) // ROW_H
@@ -570,15 +627,13 @@ local function hit(x, y)
   if G.mode == "rec" then
     local d = math.sqrt((x - 200) ^ 2 + (y - RBTN_CY) ^ 2)
     if d <= RBTN_R + 8 then return "stop" end
-    if y >= 26 and y <= 58 and x >= 306 then return "done" end
     return "none"
   end
 
   if G.mode == "play" then
     local d = math.sqrt((x - 200) ^ 2 + (y - RBTN_CY) ^ 2)
     if d <= RBTN_R + 8 then return "stop" end
-    if y >= 26 and y <= 58 and x <= 100 then return "back" end
-    return "none"
+    return "none"                      -- ★ 第6项: 左上角不再有隐藏的返回热区
   end
 
   if G.mode == "rename" then
@@ -595,34 +650,36 @@ local function draw_header(title, left_label, right_label, right_on)
   app.fill(0, SB_H, W - 1, HDR_H, WH)
   if left_label then
     pill_label(12, 26, 96, 58, left_label, false)
-  else
+  elseif title and title ~= "" then
     app.mix(14, HDR_Y + 6, title, false)
   end
   if right_label then
     pill_label(W - 12 - 78, 26, W - 12, 58, right_label, right_on or false)
   end
-  app.hline(0, W - 1, HDR_H, BK)
+  -- ★ 2026-10-30: 顶栏下方那条分割线去掉（用户要求，各页统一）
 end
 
 local function draw_row(i, y, pressed)
   local f = G.files[i]
   if pressed then fill_rect(10, y, W - 11, y + ROW_H - 6, BK) end
-  local c = pressed and WH or BK
+  -- ⚠ textsb 第4参是 **Lua 布尔**（固件里 lua_toboolean），不是颜色常量。
+  --   以前传 `pressed and WH or BK` ⇒ 恒为数字 0，而 Lua 里 0 是真值 ⇒ inv=true
+  --   ⇒ 每一行都是白字黑底。必须显式传布尔。
+  local inv = (pressed == true)
   local label = row_label(G.n - i + 1, f.name)
-  app.textsb(22, y + 14, label, c)
-  local right = f.bad and "--:--" or fmt_ms(f.dur)
-  app.textsb(W - 56 - #right * 8, y + 14, right, c)
+  app.textsb(22, y + 14, label, inv)
+  local right = f.mp3 and "MP3" or (f.bad and "--:--" or fmt_ms(f.dur))
+  app.textsb(W - 56 - #right * 8, y + 14, right, inv)
   if f.bad then
-    app.textsb(W - 26, y + 14, "!", c)              -- 未收尾标记
+    app.textsb(W - 26, y + 14, "!", inv)            -- 未收尾标记
   else
     play_glyph(W - 30, y + 13, pressed)
   end
 end
 
 local function draw_list()
-  local total = 0
-  for i = 1, G.n do total = total + G.files[i].size end
-  draw_header("录音", nil, "完成")
+  -- ★ 第3项: 顶栏已无标题/按钮, 不再用 draw_header(它按 HDR_H=70 清屏, 白留 46px)
+  app.fill(0, SB_H, W - 1, LIST_Y - 1, WH)
 
   if G.n == 0 then
     if G.no_mic then
@@ -633,8 +690,7 @@ local function draw_list()
       app.mixc(W // 2, 146, "点下面按钮开始", false)
     end
   else
-    app.fill(0, HDR_H + 1, W - 1, LIST_B, WH)
-    app.mix(16, HDR_H + 4, string.format("%d 条  %s", G.n, fmt_size(total)), false)
+    app.fill(0, LIST_Y, W - 1, LIST_B, WH)
     for r = 0, ROWS - 1 do
       local i = G.top + r
       if i > G.n then break end
@@ -644,17 +700,19 @@ local function draw_list()
     end
   end
 
-  -- 主按钮
-  local pressed = (P.id == "primary")
-  if pressed then
-    fill_rect(BTN_X0 + 24, BTN_Y0, BTN_X1 - 24, BTN_Y1, BK)
-    local w = app.mixw("开始录音")
-    app.mix((BTN_X0 + BTN_X1) // 2 - w // 2, (BTN_Y0 + BTN_Y1) // 2 - 8, "开始录音", true)
+  -- 主按钮。★ 按下态必须**保持胶囊形状**：
+  --   旧版按下时画的是 fill_rect(BTN_X0+24 … BTN_X1-24) ⇒ 只剩中间那段直角矩形。
+  --   现在外层还是胶囊，按下时内缩 5px 画一个白色胶囊（黑圈 + 白底黑字），形状不变。
+  local txt = (app.rec and app.rec.active()) and "停止录音" or "开始录音"
+  local w = app.mixw(txt)
+  local tx = (BTN_X0 + BTN_X1) // 2 - w // 2
+  local ty = (BTN_Y0 + BTN_Y1) // 2 - 8
+  pill(BTN_X0, BTN_Y0, BTN_X1, BTN_Y1, true)
+  if P.id == "primary" then
+    pill(BTN_X0 + 5, BTN_Y0 + 5, BTN_X1 - 5, BTN_Y1 - 5, false)
+    app.mix(tx, ty, txt, false)
   else
-    pill(BTN_X0, BTN_Y0, BTN_X1, BTN_Y1, true)
-    local txt = (app.rec and app.rec.active()) and "停止录音" or "开始录音"
-    local w = app.mixw(txt)
-    app.mix((BTN_X0 + BTN_X1) // 2 - w // 2, (BTN_Y0 + BTN_Y1) // 2 - 8, txt, true)
+    app.mix(tx, ty, txt, true)
   end
 
   if G.msg ~= "" and now_ms() - G.msg_t < 1800 then
@@ -663,7 +721,9 @@ local function draw_list()
 end
 
 local function draw_rec_time()
-  app.fill(0, T_Y0, W - 1, T_Y1, WH)
+  -- ⚠ 清屏不能越过状态栏: T_Y0=22 时上边 2 行属于系统状态栏, 从 SB_H 起清
+  local fy = (T_Y0 > SB_H) and T_Y0 or SB_H
+  app.fill(0, fy, W - 1, T_Y1, WH)
   app.bigc(W // 2, T_Y0 + 10, fmt_ms(rec_real_ms()), 5, false)
 end
 
@@ -689,11 +749,10 @@ local function draw_rec_spec()
 end
 
 local function draw_rec_full()
-  draw_header("录音中", nil, "完成")
+  draw_header(nil, nil, nil)
   draw_rec_time()
   draw_rec_spec()
   stop_button(200, RBTN_CY, RBTN_R, P.id == "stop")
-  app.mixc(W // 2, BTN_Y1, "轻点方块结束并保存", false)
   if G.msg ~= "" and now_ms() - G.msg_t < 1800 then
     app.mixc(W // 2, SHINT_Y, G.msg, false)
   end
@@ -715,7 +774,15 @@ local function draw_saving()
 end
 
 local function draw_play()
-  draw_header("", "返回", nil)
+  -- ★ 第6项: 播放页不显示左上角"返回"（返回入口统一用中间圆形停止键）
+  draw_header(nil, nil, nil)
+  if G.mp3 then
+    app.mixc(W // 2, 74, pretty_name(G.play_name), false)
+    app.mixc(W // 2, 122, "MP3 试听中", false)
+    app.mixc(W // 2, 150, "音量与音乐一致", false)
+    stop_button(200, RBTN_CY, RBTN_R, P.id == "stop")
+    return
+  end
   local ms  = app.rec and app.rec.play_ms() or 0
   local tot = app.rec and app.rec.play_total_ms() or 0
   if tot > 0 then G.play_total = tot end
@@ -735,7 +802,6 @@ local function draw_play()
   end
 
   stop_button(200, RBTN_CY, RBTN_R, P.id == "stop")
-  app.mixc(W // 2, BTN_Y1, "轻点方块停止", false)
 end
 
 local function draw_sheet()
@@ -812,16 +878,6 @@ local function tap(id, x, y)
     kbd_tap(x, y)
     app.redraw()
     return
-  end
-
-  if id == "done" then
-    if G.mode == "rec" then
-      G.exit_after_save = true
-      stop_rec("正在保存…")
-      return
-    end
-    if app.rec and app.rec.active() then app.rec.stop() end
-    app.exit(); return
   end
 
   if id == "back" then
@@ -954,7 +1010,27 @@ end
 function poll()
   local now = now_ms()
 
-  -- 系统确认框结果（弹窗期间本函数不被调用，关掉后才拿到值）
+  -- ★ 2026-10-30: 提示语只显示 1.8s，到点必须自己触发一次重绘把字擦掉。
+  --   原来只在 msg() 当时 redraw 一次，1.8s 后条件变假但**没人再画**
+  --   ⇒ "已保存 / 上一条还在收尾 / 文件未收尾" 这些字会一直留在屏上，
+  --   看起来就是"界面有残留"。这是整屏只按 dirty 重绘的直接后果。
+  if G.msg ~= "" and now - G.msg_t >= 1800 then
+    G.msg = ""
+    app.redraw()
+  end
+
+  -- MP3 试听结束 → 自动回到列表（前 6 次轮询跳过，防"刚开始就判结束"）
+  if G.mode == "play" and G.mp3 then
+    G.mp3_tick = (G.mp3_tick or 0) + 1
+    if G.mp3_tick > 6 and app.rec and app.rec.mplaying and not app.rec.mplaying() then
+      G.mp3 = false
+      G.mode = "list"
+      app.redraw()
+      return
+    end
+  end
+
+
   if G.await == "del" then
     local r = (app.dlg and app.dlg.result) and app.dlg.result() or nil
     if r ~= nil then
@@ -990,35 +1066,51 @@ function poll()
   if tx then
     if not P.on then
       P.on, P.x, P.y, P.lx, P.ly = true, tx, ty, tx, ty
+      P.pv = ty                        -- 上一帧的 y（拖动增量用，不能先覆盖再算）
       P.t0, P.moved, P.long = now, false, false
       P.id = hit(tx, ty)
+      -- ★ 拖动只在"真的动了"之后才成立。
+      --   之前把"按在列表里"直接当成拖动 ⇒ 手指没动也算拖过，松手走不到 tap()，
+      --   表现就是"点条目播放没反应"。这里只记"候选"，位移超阈值才转正。
+      P.drag_cand = (G.mode == "list" and ty >= LIST_Y and ty < LIST_B)
+      P.drag = false
+      P.acc  = 0
       app.redraw()
     else
-      P.lx, P.ly = tx, ty
       if math.abs(tx - P.x) > 12 or math.abs(ty - P.y) > 12 then P.moved = true end
+      if P.drag_cand and not P.drag and math.abs(ty - P.y) > 8 then P.drag = true end
+      if P.drag then
+        -- 列表内容跟随手指：每累计 DRAG_STEP 像素滚一行，边界处夹住
+        P.acc = P.acc + (ty - P.pv)
+        if math.abs(P.acc) >= DRAG_STEP then
+          local k   = math.floor(math.abs(P.acc) / DRAG_STEP)
+          local dir = (P.acc > 0) and -1 or 1      -- 手指往下 = 看更早的条目
+          local max_top = math.max(1, G.n - ROWS + 1)
+          local nt = G.top + dir * k
+          if nt < 1 then nt = 1 elseif nt > max_top then nt = max_top end
+          P.acc = P.acc - dir * k * DRAG_STEP
+          if nt ~= G.top then G.top = nt; app.redraw() end
+        end
+      end
+      P.pv = ty
+      P.lx, P.ly = tx, ty
       -- 长按用原生按住时长，不自己攒时间
       local hold = (app.touch_hold and app.touch_hold()) or (now - P.t0)
-      if not P.long and not P.moved and hold >= 480 then
+      if not P.long and not P.moved and not P.drag and hold >= 480 then
         P.long = true
         long_press(P.id)
       end
     end
   elseif P.on then
     P.on = false
-    local quick = (now - P.t0) < 900
-    if not P.long then
-      if P.moved then
-        local dy = P.ly - P.y
-        if G.mode == "list" and math.abs(dy) > 40 then
-          local page = (dy > 0) and ROWS or -ROWS
-          local max_top = math.max(1, G.n - ROWS + 1)
-          G.top = math.max(1, math.min(max_top, G.top + page))
-          app.redraw()
-        end
-      elseif quick then
-        tap(P.id, P.x, P.y)
-      end
+    -- ★ 第4项: 拖过就不算点击（原来这里按"翻页"处理，现在滚动在按住时已完成）
+    -- ⚠ 这里原来还有个 `and quick`，quick 在"去掉翻页"那次改动里被一起删了，
+    --   值恒为 nil ⇒ 判据永远假 ⇒ 点条目/点按钮全都没反应。时长已由 P.long 覆盖。
+    if not P.long and not P.drag and not P.moved then
+      tap(P.id, P.x, P.y)
     end
+    P.drag = false
+    P.drag_cand = false
     P.id = nil
     app.redraw()
   end
@@ -1056,7 +1148,12 @@ function action(a)
   if a == A_BACK then
     if G.mode == "list" then
       if app.rec and app.rec.active() then app.rec.stop() end
+      -- ★ 退出确认：**只有固件那一次**。
+      --   app.exit() 内部走 lua_request_exit() → 固件弹"退出程序?"（page_lua.c:593）。
+      --   这里再自己 dlg.confirm 就会变成两个弹窗（12:06 复现）；返回 false 又完全不弹
+      --   （12:0x 复现）。所以：直接 app.exit()，并 return true 表示"本脚本已消费 BACK"。
       app.exit()
+      return true
     elseif G.mode == "rec" then
       stop_rec()
     elseif G.mode == "play" then

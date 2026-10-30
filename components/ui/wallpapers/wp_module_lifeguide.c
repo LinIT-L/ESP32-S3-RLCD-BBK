@@ -78,7 +78,7 @@ static void hline_fade(st7305_handle_t *lcd, int x0, int x1, int y)
 }
 
 /* 按像素宽把一行画到 (x,y)，返回用掉的显示宽度；超宽即止（不折行） */
-static int draw_clip(st7305_handle_t *lcd, int x, int y, const char *s, int maxw)
+static int __attribute__((unused)) draw_clip(st7305_handle_t *lcd, int x, int y, const char *s, int maxw)
 {
     char buf[64];
     int n = 0, w = 0;

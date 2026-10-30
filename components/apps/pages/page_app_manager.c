@@ -92,7 +92,14 @@ static int  s_am_leave_child     = 0;      /* >0 = 本次离开管家是进了�
 /* ★ 商店门禁确认回调: 0=确定(左) 1=取消(右) */
 static void am_wifi_gate_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
-    if (result == 0) settings_wifi_connect_open(ctx);   /* ★ 确定 ⇒ 直接拉起系统联网弹窗(扫描+密码键盘) */
+    if (result != 0) return;
+    /* ★★★ 2026-10-30 修「连完 WiFi 回来又弹一次"是否连接网络更新应用?"」:
+     *   原来这里直接 settings_wifi_connect_open(), 而 p_am_exit 只在 s_am_leave_child>0 时
+     *   才不重置 s_store_wifi_asked —— 但 s_am_leave_child++ 只发生在 am_launch(打开应用)里,
+     *   连 WiFi 这条路径**没打标记** ⇒ 从 WiFi 弹窗返回时 asked 被清成 false
+     *   ⇒ 回到商店 on_enter 又弹一遍。这里补上标记, 连完返回就不再问。 */
+    s_am_leave_child++;
+    settings_wifi_connect_open(ctx);
 }
 static void am_store_wifi_gate(ui_ctx_t *ctx) {
     if (s_store_wifi_asked) return;
@@ -103,7 +110,19 @@ static void am_store_wifi_gate(ui_ctx_t *ctx) {
      *   toast "正在连接网络" 并用联网模块自己连，用户完全没被征求过意见。
      *   现在一律先弹确认框：点"确定"才走 settings_wifi_connect_open(已保存则直连、
      *   未保存则弹扫描+密码)，点"取消"保持离线、只浏览本地已装的包。 */
-    ESP_LOGI(TAG, "商店门禁: 弹确认框询问是否联网 (已保存配置=%d)", (int)wifi_manager_has_saved());
+    /* ★★★ 2026-10-30 linit: **已保存过 WiFi 配置就直接后台连, 不再弹窗**。
+     *   2026-10-25 那次改成了"一律弹确认框", 导致用户每次进商店都被问一遍
+     *   "是否连接网络更新应用?" —— 明明已经连上/有配置, 纯属打扰。
+     *   现在恢复分流:
+     *     · 有保存配置  → 直接 settings_wifi_connect_open(内部走已保存直连), 不弹
+     *     · 没有配置    → 才弹确认框 (否则无从连接, 必须让用户去配)
+     *   两种情况都**只做后台连接/更新索引**, 不退出商店、不打断浏览。 */
+    if (wifi_manager_has_saved()) {
+        ESP_LOGI(TAG, "商店门禁: 已有保存配置, 后台直连(不弹窗)");
+        settings_wifi_connect_open(ctx);
+        return;
+    }
+    ESP_LOGI(TAG, "商店门禁: 无保存配置, 弹确认框询问是否联网");
     os_dialog_confirm_ex(ctx, "\xe6\x98\xaf\xe5\x90\xa6\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c\xe6\x9b\xb4\xe6\x96\xb0\xe5\xba\x94\xe7\x94\xa8\xef\xbc\x9f", 0, -1, am_wifi_gate_cb, NULL); /* 是否连接网络更新应用？ */
 }
 
@@ -149,12 +168,19 @@ static bool  s_gdrag_active = false;
 /* ---- 列表行几何 (2026-10-02 linit 定): 左边图标 + 名称/说明 整体右移 + 右侧 安装/卸载 按钮 ----
  * ⚠ 行高只能从这里改: 下面所有滚动/命中/预渲染都用 AM_ROW_H, 不再有裸 46。
  *   46px 时会"图标 + 两行 16px 文字"塞不下 (说明行紧贴行底) —— linit 实机反馈。 */
-#define AM_ROW_H        54                          /* 列表行高 */
+/* ★ 2026-10-31 linit: 54 → 52。按**实测墨迹**重排后的紧凑值：
+ *   24px 名称墨迹 y+3..y+24、16px 介绍墨迹 y+30..y+45，中间自然留 6px，
+ *   行底再留 5px。名称放大到 24px 后 54px 行高下方会空出 9px（"留白过大"），
+ *   52px 正好收掉，且一屏能多显示半行。 */
+#define AM_ROW_H        52                          /* 列表行高 */
 #define AM_ROW_ICON_SZ  36                          /* 行内图标边长 (缩放到行高内) */
 #define AM_ROW_ICON_X   (6 + AM_ROW_ICON_SZ / 2)    /* 图标中心 x = 24 (左缘留 6px) */
 #define AM_ROW_TX       50                          /* 名称/说明左边界 (图标右缘 + 9) */
-#define AM_ROW_BTN_TW   48                          /* ★ 2026-10-25: 按钮两汉字宽 (24px×2, 原 16px) */
-#define AM_ROW_BTN_X0   (AM_COL_W - 10 - AM_ROW_BTN_TW)   /* 按钮文字左边 = 267 */
+/* ★ 2026-10-27 linit: 按**最宽的按钮**(3 字"下载中" 72px)预留, 而不是 2 字 48px。
+ *   原来百分比/进度条按 2 字宽定位, 下载中时按钮变成 3 字、左边界左移 24px
+ *   ⇒ 百分比正好压在"下载中"上(linit 实机反馈)。预留到 3 字宽后两者永远不重叠。 */
+#define AM_ROW_BTN_TW   72                          /* 按钮区宽度 (3 汉字 × 24px) */
+#define AM_ROW_BTN_X0   (AM_COL_W - 10 - AM_ROW_BTN_TW)   /* 按钮文字左边 */
 #define AM_COL_H_MAX  (64 * AM_ROW_H)               /* 列表最多 64 行的整列缓冲高 */
 static uint8_t *s_col = NULL;                       /* PSRAM 整列缓冲 */
 static int      s_col_h = 0;                        /* 当前列高 (px) */
@@ -285,15 +311,17 @@ static void am_launch(ui_ctx_t *ctx, const os_app_t *a) {
     if (am_lua_open_if_entry(ctx, a)) return;
     os_push(ctx, a->page);
 }
-/* 商店列表行触摸: 命中右侧"安装/卸载"按钮 → 走激活(确认安装/卸载); 命中名称区 →
- * 已装运行 / 未装不弹窗 (安装必须点右边按钮, 避免点名称误弹确认). */
+/* 商店列表行触摸: 分成两个区 —— **右侧按钮**执行下载/安装/卸载/更新,
+ * **名称区(其余部分)** 弹「详情」。 */
 static void am_launch_list(ui_ctx_t *ctx, const os_app_t *a, int x, int ty, int y_row) {
     if (!a || s_cat != AM_CAT_STORE) { am_launch(ctx, a); return; }
-    /* 商店行: 点按钮 或 点名称区 **都一样** —— 已装→弹卸载确认 / 未装→弹安装确认。
-     * **商店里永不启动应用**(要运行去「应用」分类)。
-     * (原先还算了 on_btn 命中框, 但两个分支行为完全相同 → 已删, 免得后人以为有区别) */
-    (void)x; (void)ty; (void)y_row;
-    am_store_toggle(ctx, a);
+    (void)ty; (void)y_row;
+    /* ★ 2026-10-31 linit: 「点每一栏除了下载都要弹详情」。
+     *   命中右侧按钮框 → 走原来的装/卸/下载；否则 → 详情弹窗。
+     *   按钮左边界 AM_ROW_BTN_X0 是按钮**文字**左边, 外框再往外 4px,
+     *   这里再放宽 6px, 让手指点在框边缘也算按钮(触摸误差)。 */
+    if (x >= AM_ROW_BTN_X0 - 6) { am_store_toggle(ctx, a); return; }
+    am_store_detail(ctx, a);
 }
 
 
@@ -511,6 +539,8 @@ static void am_draw_label(st7305_handle_t *lcd, int cx, int y, const char *s, bo
                         if (b[r * 2 + (c >> 3)] & (0x80 >> (c & 7)))
                             st7305_draw_pixel(lcd, x + c, y + r, fg);
             x += ZH16_FONT_W; p += 3;
+        } else if ((*p & 0xe0) == 0xc0) {
+            x += 8; p += 2;            /* 2 字节字符：字库没有，占半角宽后整体跳过 */
         } else {
             if (*p >= 0x20 && *p <= 0x7e) {
                 const uint8_t *b = FONT8X12[*p - 0x20];
@@ -538,6 +568,37 @@ static void am_draw_text_l(st7305_handle_t *lcd, int x, int y, const char *s, bo
                             st7305_draw_pixel(lcd, x + c, y + r, fg);
             x += ZH16_FONT_W; p += 3;
         } else {
+            if (*p >= 0x20 && *p <= 0x7e) {
+                const uint8_t *b = FONT8X12[*p - 0x20];
+                for (int cy = 0; cy < 16; cy++)
+                    for (int cc = 0; cc < 8; cc++)
+                        if (b[cy] & (0x80u >> cc)) st7305_draw_pixel(lcd, x + cc, y + aofs + cy, fg);
+            }
+            x += 8; p++;
+        }
+    }
+}
+
+/* ★ 2026-10-27 linit: 带右边界裁剪的同款绘制。
+ *   列表第二行(应用说明 / "下载中 42%")原来**没有宽度限制** —— 文案长时会一路画到
+ *   右侧"下载/更新/卸载"按钮上, 看起来就是"百分比压住了按钮"。
+ *   超过 x_max 就停止绘制: 宁可少显示几个字, 也绝不压按钮。 */
+static void am_draw_text_l_clip(st7305_handle_t *lcd, int x, int y, const char *s, bool inv, int x_max) {
+    st7305_color_t fg = inv ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
+    int aofs = (ZH16_FONT_H - 16) / 2;
+    for (const unsigned char *p = (const unsigned char *)s; *p;) {
+        if ((*p & 0xe0) == 0xe0) {                 /* 中文: 16px/字 */
+            if (x + ZH16_FONT_W > x_max) break;
+            int idx = font_zh16_find_utf8((const char *)p);
+            const uint8_t *b = (idx >= 0) ? font_zh16_get_bitmap_by_index(idx) : NULL;
+            if (b)
+                for (int r = 0; r < ZH16_FONT_H; r++)
+                    for (int c = 0; c < ZH16_FONT_W; c++)
+                        if (b[r * 2 + (c >> 3)] & (0x80 >> (c & 7)))
+                            st7305_draw_pixel(lcd, x + c, y + r, fg);
+            x += ZH16_FONT_W; p += 3;
+        } else {                                   /* ASCII: 8px/字 */
+            if (x + 8 > x_max) break;
             if (*p >= 0x20 && *p <= 0x7e) {
                 const uint8_t *b = FONT8X12[*p - 0x20];
                 for (int cy = 0; cy < 16; cy++)
@@ -843,8 +904,91 @@ static void am_col_round_outline(int x0, int y0, int x1, int y1, int r, bool bla
         }
     }
 }
+/* ★ 2026-10-30 linit: 商店行「名称放大到 24px」。原 am_col_text_l 固定 16px。
+ *
+ * ★★★ 2026-10-31 linit 反馈「中文正常、英文数字是迷你的，和主菜单不一样」★★★
+ *   上一版把 ASCII 按 **8×16 原尺寸**画进 24px 行 —— 汉字 24 高、英文 16 高，
+ *   横向只有 8px，视觉上就是"迷你"。主菜单（ui_common.c 的 draw_ascii）不是这么画的：
+ *   它把 FONT8X12 做 **2 倍放大 → 16×24**，与汉字同高。
+ *   现在这里与主菜单**完全一致**：汉字 24×24、ASCII 16×24、步进 16。
+ *   （24px 字库 font_zh.bin 实测没有 ASCII，font_zh_find_ascii 恒为 -1，
+ *     所以主菜单实际也是走 FONT8X12 两倍放大这条兜底路径，两边同源。） */
+/* 2026-11-01 linit: 名称**固定 22px**，不再跟随系统菜单字号。
+ *   24px 在 400×300 上偏大、和 16px 简介挤成一块；22px 由 24 原生下采样，
+ *   字面率仍够，下方还能留 6px 间隙。所有分类共用这一套（只有一条列表渲染）。 */
+#define AM_NAME_PX      22
+
+/* ASCII 步进：≥20px 走 FONT8X12 精确 2 倍放大（16 宽），以下按比例缩。
+ *   必须与 am_col_text_sz 实际画出的宽度一致，否则截断算错会压到右侧按钮。 */
+static int am_ascii_adv(int sz) {
+    return (sz >= 20) ? 16 : (sz * 16 + 12) / 24;
+}
+
+static int am_name_px(void) { return AM_NAME_PX; }
+
+static void am_col_text_sz(int x, int y, const char *s, bool inv, int sz) {
+    if (sz < 8) sz = 8;
+    if (sz > 24) sz = 24;
+    const int aw = am_ascii_adv(sz);      /* ASCII 步进，与实际绘制宽度同源 */
+
+    for (const unsigned char *p = (const unsigned char *)s; *p;) {
+        if ((*p & 0xe0) == 0xe0) {                     /* 3 字节 UTF-8 = 汉字 */
+            int idx = font_zh_find_utf8((const char *)p);
+            const uint8_t *b = (idx >= 0) ? font_zh_get_bitmap_by_index(idx) : NULL;
+            if (b) {
+                if (sz == 24) {                        /* 原生尺寸：逐位直出，最清晰 */
+                    for (int r = 0; r < 24; r++)
+                        for (int c = 0; c < 24; c++)
+                            if (b[r * 3 + (c >> 3)] & (0x80 >> (c & 7)))
+                                am_col_px(x + c, y + r, !inv);
+                } else {                               /* 采样缩放（同 ui_draw_zh_sz） */
+                    for (int dy = 0; dy < sz; dy++)
+                        for (int dx = 0; dx < sz; dx++) {
+                            int sr = dy * 24 / sz, sc = dx * 24 / sz;
+                            if (b[sr * 3 + (sc >> 3)] & (0x80 >> (sc & 7)))
+                                am_col_px(x + dx, y + dy, !inv);
+                        }
+                }
+            }
+            x += sz; p += 3;
+        } else {                                           /* ASCII */
+            if (*p >= 0x20 && *p <= 0x7e) {
+                const uint8_t *b = FONT8X12[*p - 0x20];
+                if (aw == 16) {
+                    /* ★ 2026-11-01: 横向**精确 2 倍**（8 → 16，竖笔恒 2px，不再被压成 1px），
+                     *   纵向按 sz 做最近邻（12 → sz），**高度与汉字完全相等** ⇒ 顶底齐平。
+                     *   原来 sz<24 时横竖都按 sz*16/24 小数采样：22px 下宽只有 14、
+                     *   竖笔会被压成 1px，中文却是 2px，英文看着又细又断（linit 反馈）。
+                     *   现在中英同高同基线，步进固定 16（与主菜单 draw_ascii 同口径）。 */
+                    for (int dy = 0; dy < sz; dy++) {
+                        uint8_t bits = b[dy * 12 / sz];
+                        if (!bits) continue;
+                        for (int c = 0; c < 8; c++) {
+                            if (!(bits & (0x80u >> c))) continue;
+                            am_col_px(x + c * 2,     y + dy, !inv);
+                            am_col_px(x + c * 2 + 1, y + dy, !inv);
+                        }
+                    }
+                } else {
+                    for (int dy = 0; dy < sz; dy++)
+                        for (int dx = 0; dx < aw; dx++) {
+                            int sr = dy * 12 / sz, sc = dx * 8 / aw;
+                            if (b[sr] & (0x80 >> (sc))) am_col_px(x + dx, y + dy, !inv);
+                        }
+                }
+            }
+            x += aw; p++;
+        }
+    }
+}
+
 static void am_col_text_l(int x, int y, const char *s, bool inv) {
     int aofs = (ZH16_FONT_H - 16) / 2;
+    /* ★ 2026-10-31: 补 2 字节 UTF-8 分支。
+     *   原来只有"3 字节汉字"和"ASCII"两条路，间隔号 "·"(U+00B7, C2 B7)、
+     *   部分标点都是 2 字节，会掉进 else 被当成两个"非 ASCII 单字节"各占 8px
+     *   ⇒ 一个"·"占掉 16px 空白，把 "8px 原生点阵 · 28405字" 挤出可视区截断。 */
+
     for (const unsigned char *p = (const unsigned char *)s; *p;) {
         if ((*p & 0xe0) == 0xe0) {
             int idx = font_zh16_find_utf8((const char *)p);
@@ -889,16 +1033,68 @@ static void am_col_icon(int cx, int cy, int size, int icon_idx) {
 }
 /* 按像素宽度截断 UTF-8 串 (超宽补 ".."); 16px 汉字 / 8px ASCII, 与 am_col_text_l 同口径。
  * 返回**静态缓冲** —— 只供渲染当场使用, 不要留存指针。 */
+/* 2026-10-30: 带字宽参数的截断。原 am_col_ellipsis 写死 16(汉字)/8(ASCII)，
+ * 名称改成 24px 后那套步进不适用（会把 8 个字算成能放下，实际溢出到按钮上）。 */
+static const char *am_col_ellipsis_w(const char *s, int max_w, int wide_adv, int thin_adv) {
+    static char buf[160];
+    int i = 0, w = 0;
+    if (!s) s = "";
+    {
+        int total = 0;
+        for (const unsigned char *q = (const unsigned char *)s; *q; ) {
+            if ((*q & 0xe0) == 0xe0)      { total += wide_adv; q += 3; }
+            else if ((*q & 0xe0) == 0xc0) { total += thin_adv; q += 2; }
+            else                          { total += thin_adv; q += 1; }
+        }
+        if (total <= max_w) { snprintf(buf, sizeof(buf), "%s", s); return buf; }
+    }
+    const int lim = max_w - thin_adv * 2;       /* 放不下才给尾部 ".." 预留两个半角 */
+    while (s[i] && i < (int)sizeof(buf) - 4) {
+        unsigned char c = (unsigned char)s[i];
+        /* 2026-10-31: 2 字节字符（"·"=C2 B7 等）按半角宽、跳 2 字节；
+         *   原来只分"3 字节汉字"和"其它"，2 字节会被当两个单字节各算一份宽，
+         *   宽度多算一倍 ⇒ 后面的字被误截掉（"28405字" 变 "28405.."）。 */
+        int len, adv;
+        if ((c & 0xe0) == 0xe0)      { len = 3; adv = wide_adv; }   /* 汉字 */
+        else if ((c & 0xe0) == 0xc0) { len = 2; adv = thin_adv; }   /* 2 字节 */
+        else                         { len = 1; adv = thin_adv; }   /* ASCII */
+        if (w + adv > lim) break;
+        for (int k = 0; k < len; k++) buf[i + k] = s[i + k];
+        i += len;
+        w += adv;
+    }
+    if (s[i]) { buf[i++] = '.'; buf[i++] = '.'; }   /* 后面还有内容 → 省略号 */
+    buf[i] = 0;
+    return buf;
+}
+
 static const char *am_col_ellipsis(const char *s, int max_w) {
     static char buf[160];
     int i = 0, w = 0;
-    const int lim = max_w - 16;                 /* 先给尾部 ".." 预留 16px */
     if (!s) s = "";
+    /* ★ 2026-10-31: **先量总宽，放得下就原样返回**。
+     *   原来一律按 max_w-16 截，导致"刚好差一个字"的文本被无谓截成
+     *   "…28405.."（实际总宽 176 ≤ 可用 189，根本不用截）。 */
+    {
+        int total = 0;
+        for (const unsigned char *q = (const unsigned char *)s; *q; ) {
+            if ((*q & 0xe0) == 0xe0)      { total += 16; q += 3; }
+            else if ((*q & 0xe0) == 0xc0) { total += 8;  q += 2; }
+            else                          { total += 8;  q += 1; }
+        }
+        if (total <= max_w) { snprintf(buf, sizeof(buf), "%s", s); return buf; }
+    }
+    const int lim = max_w - 16;                 /* 放不下才给尾部 ".." 预留 16px */
     while (s[i] && i < (int)sizeof(buf) - 4) {
         unsigned char c = (unsigned char)s[i];
-        int wide = ((c & 0xe0) == 0xe0);
-        int adv = wide ? 16 : 8;
-        int len = wide ? 3 : 1;
+        /* 2026-10-31: 三种 UTF-8 长度都要认。
+         *   原来只分"3 字节汉字"和"其它"，2 字节字符（"·"=C2 B7、部分标点）
+         *   会被当成两个单字节、各算 8px ⇒ 宽度多算一倍，把后面的字挤掉。
+         *   渲染侧 am_col_text_l 已同步补了 2 字节分支，两边必须一致。 */
+        int len, adv;
+        if ((c & 0xe0) == 0xe0)      { len = 3; adv = 16; }   /* 汉字 */
+        else if ((c & 0xe0) == 0xc0) { len = 2; adv = 8;  }   /* 2 字节（"·" 等） */
+        else                         { len = 1; adv = 8;  }   /* ASCII */
         if (w + adv > lim) break;
         for (int k = 0; k < len; k++) buf[i + k] = s[i + k];
         i += len;
@@ -966,7 +1162,16 @@ static void am_col_render_list(void) {
         /* 行内统一: 左图标 + 右侧名称/说明 (图标在反白行上用反色画, 否则黑图标看不见) */
         am_col_icon_inv(AM_ROW_ICON_X, y + row_h / 2, AM_ROW_ICON_SZ,
                         a ? a->icon_idx : 0, sel);
-        am_col_text_l(AM_ROW_TX, y + 6, nm, sel);
+        /* ★ 2026-10-30 linit: 名称放大到 24px, 上移到 y+1 让出下方空间。
+         *   24px 汉字宽 24, ASCII 宽 8 —— 截断按同一套步进算, 否则会压到右侧按钮上。 */
+        {
+            const int nsz = am_name_px();
+            /* 步进随字号：汉字 nsz、ASCII 见 am_ascii_adv（≥20px 恒为 16） */
+            const int aw = am_ascii_adv(nsz);
+            am_col_text_sz(AM_ROW_TX, y + 3,
+                           am_col_ellipsis_w(nm, AM_ROW_BTN_X0 - 8 - AM_ROW_TX, nsz, aw),
+                           sel, nsz);
+        }
         if (s_cat == AM_CAT_STORE) {
             /* 第二行 = 文案 (本地包 → LAPP 简介 desc=; 云端包 → "未下载 · NKB"),
              * 不再显示文件路径/文件名 ——
@@ -988,8 +1193,8 @@ static void am_col_render_list(void) {
                 int px  = AM_ROW_BTN_X0 - 6 - pw;       /* 百分比右对齐到按钮左侧 */
                 int bx0 = AM_ROW_TX;
                 int bx1 = px - 8;                       /* 进度条到百分比左边 8px */
-                int by0 = y + 29;
-                int by1 = by0 + 6;
+                int by0 = y + 32;      /* 与介绍同一带（介绍墨迹 30..45 的中段） */
+                int by1 = by0 + 8;
                 /* 夹进本行可见范围 (AM_ROW_H 内) 与列缓冲高度 */
                 if (by1 > y + AM_ROW_H - 3) by1 = y + AM_ROW_H - 3;
                 if (by1 >= s_col_h)          by1 = s_col_h - 1;
@@ -1007,7 +1212,18 @@ static void am_col_render_list(void) {
             } else {
                 const char *ds = am_store_sub_of(a);
                 if (ds && ds[0])
-                    am_col_text_l(AM_ROW_TX, y + 27,
+                    /* ★ 2026-10-30 linit: 介绍下移到**贴行底**。
+                     *   行高 54, 内容区到 y+52 (row_h-2); 16px 字放 y+36 ⇒ 底边正好 y+52。
+                     *   原来 y+27 时下面空 9px, 名称放大到 24px 后再按原位会挤在一起。 */
+                    /* 2026-10-31: 36 → 30。16px 字库实测墨迹是**满格**(0..15)，
+                     *   所以画框位置就是墨迹位置；放在 y+30 时上距名称墨迹 6px、
+                     *   下距行底 5px，两行成为一组而不是上下各贴一边。 */
+                    /* 2026-10-31: 介绍固定 y+31（行高 52 内）。
+                     *   名称从 y+3 起、高 nsz，所以两行之间的空隙 = 28-nsz：
+                     *     24px → 4px ｜ 22px（默认）→ 6px ｜ 16px → 12px
+                     *   字号越大间隙越小，视觉上两组永远是一块，不会一边贴死一边空荡。
+                     *   介绍 16px 墨迹满格（实测 0..15），落 31..46，行底（y+50）再留 4px。 */
+                    am_col_text_l(AM_ROW_TX, y + 31,
                                   am_col_ellipsis(ds, AM_ROW_BTN_X0 - 4 - AM_ROW_TX), sel);
             }
             /* 按钮文案由商店给 (安装 / 卸载 / 下载)
@@ -1194,12 +1410,14 @@ static void p_am_render(ui_ctx_t *ctx) {
                 const char *id = a ? a->id : "";
                 am_draw_text_l(lcd, grid_x0 + 12, y + 6, nm, sel);
                 if (s_cat == AM_CAT_STORE) {
-                    const char *pf = am_store_sub_of(a);
-                    am_draw_text_l(lcd, grid_x0 + 12, y + 27, pf ? pf : id, sel);
                     /* 按钮 = 紧贴两字加边框框 (V1.6.x: 去掉 ➕/空框, 框宽正好容纳两字) */
                     const char *act = am_store_btn_of(a);
                     int txt_w = 32;   /* 两汉字 16px×2 */
                     int bx0 = UI_SCREEN_W - 8 - txt_w;   /* 右缘留 8px 边距 */
+                    /* ★ 2026-10-27 linit: 第二行**必须裁到按钮左边** ——
+                     *   原来不限宽, 长说明/“下载中 42%” 会压到右侧按钮上。 */
+                    const char *pf = am_store_sub_of(a);
+                    am_draw_text_l_clip(lcd, grid_x0 + 12, y + 27, pf ? pf : id, sel, bx0 - 6);
                     am_draw_text_l(lcd, bx0, y + 14, act, sel);
                     draw_rect_outline(lcd, bx0 - 3, y + 12, bx0 + txt_w + 2, y + 26,
                                       sel ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK);
@@ -1513,10 +1731,20 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
     /* 右栏内容 (y < content_top: 顶部状态栏/子分类条区域 → 不触发下方图标) */
     int content_top = am_content_top();
     if (y < content_top) return false;
-    /* 商店后台扫描未完成 / 正在下载: 吞掉内容点击, 避免对半成品列表误操作
-     * (状态栏/分类栏仍可用) */
-    if (s_cat == AM_CAT_STORE &&
-        (!am_store_ready() || am_rstore_state() == ARS_DOWNLOADING)) return true;
+    /* 商店后台扫描未完成: 吞掉内容点击（此时列表还是半成品，点了会错位）。
+     *
+     * ★★★ 2026-10-31 linit 反馈「下载时商店卡住、点不动」★★★
+     *   原来这里还带 `|| am_rstore_state() == ARS_DOWNLOADING`，等于**整个下载期间
+     *   把右栏所有点击全吞掉**，用户看起来就是卡死。下载是独立任务，没理由锁 UI。
+     *   现在只保留"扫描未完成"这一条；"正在下载的那一行"改在下面按行判断。 */
+    /* ★★★ 2026-10-31: **不再吞掉落点**。
+     *   原实现: `if (s_cat == AM_CAT_STORE && !am_store_ready()) return true;`
+     *   —— 只要本地包扫描没收尾, 整个商店右栏**所有点击都无效**, 用户看到的就是
+     *   "商店卡住、点不动、也没弹窗"。而列表此时**云端条目已经全部可见**, 点它完全
+     *   有效 (走下载/详情)。本地条目要等扫描完才进列表, 不存在"点到半成品行"的问题
+     *   (行数据来自 s_list, 有边界检查)。
+     *   现在只挡一种情况: 列表本身就是空的 (点了也没东西)。 */
+    if (s_cat == AM_CAT_STORE && s_list_n == 0) return true;
     if (s_view_grid) {
         int cell_w = (UI_SCREEN_W - AM_CATBAR_W - 8) / AM_GRID_COLS;
         int step_y = (UI_SCREEN_H - content_top - 8) / AM_GRID_ROWS;
@@ -1536,8 +1764,11 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
         int row_h = AM_ROW_H;
         int idx = (int)floorf(s_gcam) + (y - content_top) / row_h;
         if (idx >= 0 && idx < s_list_n) {
-            vibrator_click();
             const os_app_t *a = s_list[idx];
+            /* 正在下载的那一行不响应点击（再点会重复弹下载确认）；
+             * 其他行照常可用 —— 用户可以同时看别的字体/应用。 */
+            if (a && s_cat == AM_CAT_STORE && am_store_dl_permille_of(a) >= 0) return true;
+            vibrator_click();
             int y_row = content_top + (int)(((float)idx - s_gcam) * row_h);
             if (a) am_launch_list(ctx, a, x, y, y_row);
             ctx->needs_redraw = true;
@@ -1619,7 +1850,16 @@ static void p_am_poll(ui_ctx_t *ctx) {
             if ((esp_timer_get_time() / 1000 - s_uninstall_t0) >= 1000) {
                 s_uninstall_armed  = false;
                 s_uninstall_fired  = true;
-                am_store_uninstall_ask(ctx, s_list[s_focus]);
+                /* ★★★ 2026-10-31 linit: 长按按「装在哪」分流 ——
+                 *   装在 TF 卡 → 问"移动到内置空间?"（新装默认都在卡上，用户想内置化）
+                 *   装在内置   → 仍是原来的卸载
+                 * 这样长按一次只有一个动作，不用引入二级菜单。 */
+                const os_app_t *lp_a = s_list[s_focus];
+                if (lp_a && am_store_app_where(lp_a) == 2) {
+                    am_move_internal_ask(ctx, lp_a);
+                } else {
+                    am_store_uninstall_ask(ctx, lp_a);
+                }
             }
         } else {
             s_uninstall_armed = false;
@@ -1708,6 +1948,15 @@ static void p_am_poll(ui_ctx_t *ctx) {
          *   原来只在"重建列表"时试一次, 任务创建失败(内存紧张)就永远空白 ✗
          *   prefetch 内部自带 busy 超时(3s) 和 s_pkg_scanned 判断, 每帧调无副作用 ✓ */
         if (!am_store_ready()) am_store_prefetch();
+
+        /* ★★★ 2026-10-30: 云端索引在后台换成了新的（服务器上架了新资源）→ 重建列表。
+         *   原来这条通路不存在：索引换了没人通知 UI，商店是脏帧渲染 ⇒ 用户必须切一次
+         *   分类、或者退出重进，才看得到新上架的字体/应用。 */
+        if (am_store_take_idx_updated()) {
+            s_col_dirty = true;
+            ctx->needs_redraw = true;
+            ESP_LOGI("APPM", "索引已更新 → 重建商店列表");
+        }
 
         /* 下载中: 进度框要每帧重画 */
         if (am_rstore_state() == ARS_DOWNLOADING) ctx->needs_redraw = true;

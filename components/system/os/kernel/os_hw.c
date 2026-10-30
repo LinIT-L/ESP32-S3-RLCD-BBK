@@ -6,6 +6,8 @@
 #include "bt_manager.h"
 #include "wifi_manager.h"
 #include "usb_hid.h"
+#include "usb_bt.h"      /* bt_start: USB-BT 适配器模式占用控制器时必须让出 */
+#include "usb_net.h"     /* bt_start: USB 网卡模式同上 */
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -44,8 +46,22 @@ static void wifi_off_task(void *arg)
 }
 
 /* 各模块 start/stop 签名不统一 (void/bool/esp_err_t), 统一包装为调度器签名 */
-static bool bt_start(void)      { bt_manager_enable(); return true; }
-static void bt_stop(void)       { bt_manager_disable(); }
+static bool bt_start(void)
+{
+    /* ★ 2026-10-30 按需加载: USB-BT(蓝牙适配器) / USB 网卡 会独占蓝牙控制器,
+     *   这时绝不能再去初始化手柄蓝牙 (原来开机路径 app_board_init_bt 也是这样让出的)。 */
+    if (usb_bt_is_active() || usb_net_is_active()) {
+        ESP_LOGW(TAG, "USB-BT/USB网卡占用控制器 ⇒ 不启动手柄蓝牙");
+        return false;
+    }
+    bt_manager_enable();               /* 同步等初始化完成 (~1~2s, 由内部RAM栈的 bt_init 执行) */
+    /* 返回**真实**结果: 失败时 os_hw_request 会回滚引用计数,
+     * 否则会留下"计数=1 但射频没起来"的假开状态。 */
+    return bt_manager_is_enabled();
+}
+/* ★ 2026-10-30: 引用计数归零时才走到这里 ⇒ 此时没有别的模块在用蓝牙,
+ *   可以安全地**真拆栈**把 71KB 内部 RAM 还回去 (原来只关射频, 内存永不回收)。 */
+static void bt_stop(void)       { bt_manager_disable_release(); }
 static bool wifi_start(void)
 {
     /* 后台关闭还没收尾 → 等它跑完再开 (通常几 ms~几百 ms), 避免"关了又被开/开了又被关"的竞态 */

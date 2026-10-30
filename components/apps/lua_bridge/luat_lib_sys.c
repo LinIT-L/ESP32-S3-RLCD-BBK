@@ -131,6 +131,17 @@ static int l_sbar_invert(lua_State *L) {
 /* 本地墙上时钟 (与状态栏同源: time() + localtime), 返回 (时, 分, 秒)。
    给"按时间命名存档"这类需求用 (白板 wbHHMMSSSS.bmp 就是 C 版的做法)。
    系统时间未同步 (没联网/没设时间) 时返回的就是开机以来的错值, 脚本自行容忍。 */
+/* ★ 2026-10-30: app.sys.date() → month, day, weekday(1=周日..7=周六)
+ *   用途: Lua 全屏页要自绘状态栏（系统不画），需要和桌面一致的"10-30 星期五"。 */
+static int l_sys_date(lua_State *L) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    lua_pushinteger(L, t ? t->tm_mon + 1 : 1);
+    lua_pushinteger(L, t ? t->tm_mday : 1);
+    lua_pushinteger(L, t ? t->tm_wday + 1 : 1);
+    return 3;
+}
+
 static int l_sys_clock(lua_State *L) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -277,6 +288,7 @@ void lua_mod_sys_register(lua_State *L)
     lua_pushcfunction(L, l_sys_battery);         lua_setfield(L, -2, "battery");
     lua_pushcfunction(L, l_sys_heap);       lua_setfield(L, -2, "heap_free");
     lua_pushcfunction(L, l_sys_time);         lua_setfield(L, -2, "time_ms");
+    lua_pushcfunction(L, l_sys_date);            lua_setfield(L, -2, "date");
     lua_pushcfunction(L, l_sys_clock);           lua_setfield(L, -2, "clock");
     lua_setfield(L, -2, "sys");
     lua_newtable(L);

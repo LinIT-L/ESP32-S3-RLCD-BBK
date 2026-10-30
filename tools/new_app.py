@@ -182,7 +182,7 @@ def main():
     print("     1) 编辑 components/apps/pages/page_%s.c 填实现" % app_id)
     print("     2) python3 tools/check_deps.py     # 确认没越层 (只许 include os_app_api.h)")
     print("     3) idf.py build")
-    print("   备注: 图标 %s —— 若要新图标, 先按 docs/App制作规则.md §2.3 生成再改 icon_idx" % a.icon)
+    print("   备注: 图标 %s —— 若要新图标, 先按 docs/手册/Lua应用开发手册.md §3 图标规范生成再改 icon_idx" % a.icon)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,19 @@ static bool s_running = false;                       /* 是否已挂载到电脑
 static bool s_driver_installed = false;
 static tinyusb_msc_storage_handle_t s_storage = NULL;
 
+/* ★ 2026-10-29: start 中途失败的统一回滚 —— 必须同时记录"原始错误"和"退出错误"。
+ *   原来的写法是 usb_composite_exit() 直接丢弃返回值: 回滚失败时串口其实没恢复,
+ *   但调用方只看到原始错误, 排查看不出"串口已废"。 */
+static void msc_abort_exit(const char *why, esp_err_t orig)
+{
+    esp_err_t ex = usb_composite_exit();
+    if (ex != ESP_OK)
+        ESP_LOGE(TAG, "%s 回滚失败: 原始=%s, 退出=%s ⇒ 串口可能未恢复(状态已保留可重试)",
+                 why, esp_err_to_name(orig), esp_err_to_name(ex));
+    else
+        ESP_LOGW(TAG, "%s, 已回滚到正常模式", why);
+}
+
 /* 启动 USB MSC (PC 看到 U盘): 暂停串口 → 切纯 MSC 设备 → 创建 storage (USB 模式).
  * 调用方负责先 sd_unmount_vfs_keep_card() (释放 VFS, 保留 card). */
 esp_err_t usbh_msc_start(void) {
@@ -49,7 +62,7 @@ esp_err_t usbh_msc_start(void) {
         ret = tinyusb_msc_install_driver(&dc);
         if (ret != ESP_OK) {
             ESP_LOGD(TAG, "tinyusb_msc_install_driver 失败: %s", esp_err_to_name(ret));
-            usb_composite_exit();
+            msc_abort_exit("tinyusb_msc_install_driver 失败", ret);
             svc_log_console_suspend(false);
             return ret;
         }
@@ -65,7 +78,7 @@ esp_err_t usbh_msc_start(void) {
         ret = tinyusb_msc_new_storage_sdmmc(&cfg, &s_storage);
         if (ret != ESP_OK) {
             ESP_LOGD(TAG, "tinyusb_msc_new_storage_sdmmc 失败: %s", esp_err_to_name(ret));
-            usb_composite_exit();
+            msc_abort_exit("tinyusb_msc_new_storage_sdmmc 失败", ret);
             svc_log_console_suspend(false);
             return ret;
         }
@@ -87,11 +100,16 @@ void usbh_msc_stop(void) {
         }
         s_storage = NULL;
     }
-    s_running = false;
+    s_running = false;   /* 先置 false: 万一恢复失败, 下次 start 仍会重走 enter → 触发重试 */
     /* 切回正常模式 (卸 TinyUSB, 装回 Serial/JTAG) */
-    usb_composite_exit();
-    svc_log_console_suspend(false);   /* 恢复串口控制台 */
-    ESP_LOGI(TAG, "[USB MSC] 已卸载 (已恢复 Serial/JTAG 控制台)");
+    esp_err_t ex = usb_composite_exit();
+    svc_log_console_suspend(false);   /* 恢复串口控制台(日志层面) */
+    /* ★ 2026-10-29: 恢复失败时不能再说"已恢复控制台"(谎报会让排查彻底跑偏) */
+    if (ex == ESP_OK)
+        ESP_LOGI(TAG, "[USB MSC] 已卸载 (已恢复 Serial/JTAG 控制台)");
+    else
+        ESP_LOGE(TAG, "[USB MSC] 已卸载, 但串口恢复失败(%s) ⇒ 状态已保留可重试, 请重启或重新挂载一次",
+                 esp_err_to_name(ex));
 }
 
 bool usbh_msc_is_running(void) { return s_running; }

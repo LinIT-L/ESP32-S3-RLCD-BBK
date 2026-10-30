@@ -4,9 +4,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* 底部手势区: **厚度 30px, 宽度 200px, 水平居中贴底** (2026-10-18 linit 定).
- * 原来 50px 全宽 (400) 太大, 稍微划一下就返回; 现在只认屏幕正中下沿这条窄带。 */
-#define GB_BAND_THICK 30
+/* 底部手势区: **厚度 20px, 宽度 200px, 水平居中贴底**。
+ * ★ 2026-10-27 linit: 30px 仍然"接近中间就触发"(屏高 300, 30px = 10%),
+ *   收紧到 20px(6.7%) —— 必须真的从最下沿起手才算返回。 */
+#define GB_BAND_THICK 20
 #define GB_BAND_WIDE  200
 
 #ifdef __cplusplus

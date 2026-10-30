@@ -17,7 +17,8 @@
 #include "pal_port.h"
 
 #include "st7305.h"
-#include "virtual_keys.h"   /* 系统现成的虚拟按键（GBC 同款） */
+#include "virtual_keys.h"
+#include "input.h"   /* engine_overlay_quickbar */   /* 系统现成的虚拟按键（GBC 同款） */
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -555,6 +556,7 @@ void pal_port_present(void *lcd_handle)
 
     /* ★ 系统虚拟按键画在游戏帧之上（框线式，不挡画面），然后一起 flush */
     if (virtual_keys_is_enabled()) virtual_keys_draw(lcd);
+    engine_overlay_quickbar(lcd);   /* ★ 游戏内下拉快捷栏 (画在游戏帧上, flush 前) */
 
     /* 送屏失败 = 这一帧没上屏。连续失败到一定程度就打一行, 免得
      * "画面不动但后台正常"时无从判断是画错了还是根本没送出去。 */

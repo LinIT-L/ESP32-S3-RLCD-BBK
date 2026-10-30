@@ -131,6 +131,8 @@ bool os_push(ui_ctx_t *ctx, os_page_t page)
     /* 进入非模态页: 按该页是否屏蔽上滑返回, 统一设置全局手势开关 (单一权威来源).
      * 模态覆盖页不改变底层页的上滑返回状态. */
     if (!overlay) gesture_back_enable(!m->swipe_back_disabled);
+    /* 底部拖动屏蔽带: 全屏绘图页(白板)要整面可用, 其余页保持屏蔽 (默认行为不变) */
+    if (!overlay) input_set_bottom_shield(!m->no_bottom_shield);
     /* V1.7.x: 页面打开耗时体检 — on_enter 是"点开应用/进页面要等一会儿"的头号嫌疑
      * (扫描目录/读 NVS/卸载引擎都在这里跑). ≥5ms 打一行, 定位是哪一页慢. */
     uint64_t t_enter0 = (uint64_t)esp_timer_get_time();
@@ -144,8 +146,7 @@ bool os_push(ui_ctx_t *ctx, os_page_t page)
 }
 
 void os_pop(ui_ctx_t *ctx)
-{
-    if (s_stack_top < 0) { ESP_LOGD(TAG, "pop: stack empty, stay"); return; }
+{    if (s_stack_top < 0) { ESP_LOGD(TAG, "pop: stack empty, stay"); return; }
     os_page_t parent = s_back_stack[s_stack_top--];
 
     const os_module_t *m = s_cur_mod;
@@ -176,6 +177,8 @@ void os_pop(ui_ctx_t *ctx)
      * 这样即使某页的 on_exit 被跳过(直接 os_pop), 返回后上滑返回也必定恢复,
      * 不会再卡成"全局失效". 弹出的只是模态覆盖层时不动底层页状态. */
     if (pm && !was_overlay) gesture_back_enable(!pm->swipe_back_disabled);
+    /* 回到父页时一并恢复父页的底部屏蔽带状态 (与上滑返回同一套"单一权威来源") */
+    if (pm && !was_overlay) input_set_bottom_shield(!pm->no_bottom_shield);
     /* 仅当被 pop 的是非模态页时, 父才需要重新 on_enter (其 push 时父已被 on_exit);
      * 被 pop 的是模态覆盖页则父未退出, 保持原状即可. */
     if (pm && !was_overlay && pm->on_enter) pm->on_enter(ctx);
@@ -261,6 +264,13 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
     /* 锁屏键 (软关机键) 点按: 进入壁纸屏保 */
     if (a == OS_ACTION_POWER_LOCK) {
         os_screensaver_force_enter();
+        ctx->needs_redraw = true;
+        return;
+    }
+    /* ★ 2026-10-29 linit: 快捷栏打开时, **返回键优先把快捷栏收起**,
+     *   而不是直接退出页面/弹出"退出程序?"。收起后本次按键即消费掉。 */
+    if (a == OS_ACTION_BACK && os_quickbar_is_open()) {
+        os_quickbar_close();
         ctx->needs_redraw = true;
         return;
     }
@@ -350,11 +360,23 @@ bool os_handle_touch(ui_ctx_t *ctx, int x, int y)
     }
     const os_module_t *m = os_cur_mod();
     if (!m) return false;
+    /* ★ 2026-10-29: 全局顶层覆盖服务 (下拉快捷栏) **先于模块**受理。
+     *   必须放在模块之前: 全屏游戏/应用自己的 touch 会在下面直接 return true,
+     *   轮不到服务层 —— 那样"游戏里下拉不出快捷栏"。
+     *   服务自身只在"抽屉已展开"或"点在顶部 200×10 起手区"时消费, 其余返回
+     *   false 放行, 所以普通点击/滑动不受影响。 */
+    for (int i = 0; i < s_service_count; i++) {
+        if (s_services[i]->overlay_top && s_services[i]->touch &&
+            s_services[i]->touch(ctx, x, y))
+            return true;
+    }
     if (m->touch) return m->touch(ctx, x, y);
     /* V1.5.x: 常驻 service 热区兜底 — 当前模块无 touch 且非全屏/非弹窗时,
-     * 依次询问各 service 是否命中 (状态栏 mini 图标等常驻控件). 命中即消费. */
+     * 依次询问各 service 是否命中 (状态栏 mini 图标等常驻控件). 命中即消费.
+     * overlay_top 服务已在上面处理过, 这里跳过避免二次调用。 */
     if (!m->fullscreen && !m->modal) {
         for (int i = 0; i < s_service_count; i++) {
+            if (s_services[i]->overlay_top) continue;
             if (s_services[i]->touch && s_services[i]->touch(ctx, x, y))
                 return true;
         }
@@ -379,6 +401,18 @@ static void on_exit_ask(ui_ctx_t *ctx, int result, void *ud) {
     }
 }
 
+/* ★★★ 2026-10-28: 延迟退出一页 —— 供"弹窗里点取消/确定之后要离开当前页"的场景.
+ *   不能在弹窗回调里直接 os_pop: 那一刻弹窗页还在栈顶, os_pop 只会弹掉弹窗层,
+ *   调用方的页面原地不动 (回调返回后 dlg_finish_top 才真正关弹窗).
+ *   所以这里只置标志, 由 os_tick 在"弹窗已关"的下一帧执行.
+ *   典型用法: 频谱仪"需占用64KB, 是否启用?"点取消 ⇒ 直接退回桌面,
+ *   而不是停在"射频未就绪"的空页上还要用户再按一次返回. */
+static bool s_pop_pending = false;
+void os_request_pop(ui_ctx_t *ctx) {
+    s_pop_pending = true;
+    if (ctx) ctx->needs_redraw = true;
+}
+
 void os_request_exit_confirm(ui_ctx_t *ctx) {
     if (!ctx) return;
     if (s_exit_ask_open || s_exit_ask_pending) return;   /* 已弹/已排队, 防重复 */
@@ -393,6 +427,13 @@ void os_tick(ui_ctx_t *ctx)
     if (s_exit_ask_pending) {
         s_exit_ask_pending = false;
         if (os_dialog_depth() <= 0 && !ctx->modal_active) os_pop(ctx);
+        ctx->needs_redraw = true;
+    }
+    /* ★ 2026-10-28: 延迟退页 (见 os_request_pop). 必须等弹窗真的关掉再 pop,
+     *   否则只弹掉弹窗层, 页面还留在前台。 */
+    if (s_pop_pending && os_dialog_depth() <= 0 && !ctx->modal_active) {
+        s_pop_pending = false;
+        os_pop(ctx);
         ctx->needs_redraw = true;
     }
 
@@ -470,6 +511,16 @@ void os_get_render_stats(uint32_t *frames, uint32_t *avg_us, uint32_t *last_draw
     if (last_draw_us)  *last_draw_us = s_last_draw_us;
     if (last_flush_us) *last_flush_us = s_last_flush_us;
 }
+
+/* ★★★ 2026-10-28: 作废"已送屏背景" —— 下一帧先整屏清白, 再重绘最底层非模态页,
+ *   然后才叠当前页/弹窗.
+ *   为什么需要它: dlg_render 是**只画弹窗自己那块**, 不清屏、不重绘背景(注释见
+ *   os_dialog.c "弹窗不清屏: 弹窗之外保留原背景"). 所以一旦背景被"旁路刷屏"盖过
+ *   —— 屏保壁纸独占刷屏、全屏模态页(赞助二维码)、引擎直刷视频帧 ——
+ *   弹窗叠上去时底下留的就是那幅残影, 看着像"弹窗浮在壁纸上/花屏".
+ *   调用点: 屏保态长按关机 → 退出屏保前调用一次.
+ *   ⚠ 副作用是正面的: 整屏清白 + 重绘 = 全屏刷新, 正好满足"弹窗首次出现必须整屏刷". */
+void os_invalidate_bg(void) { s_bg_dirty = true; }
 
 void os_render(ui_ctx_t *ctx)
 {
@@ -553,7 +604,15 @@ void os_render(ui_ctx_t *ctx)
             s_sb_prev = sb_now;
         }
         for (int i = 0; i < s_service_count; i++)
-            if (s_services[i]->render) s_services[i]->render(ctx);
+            if (!s_services[i]->overlay_top && s_services[i]->render)
+                s_services[i]->render(ctx);
+    }
+    /* ★ 2026-10-29: overlay_top 服务 (下拉快捷栏) —— 不受 fullscreen / 滚动门控,
+     *   恒画在模块 render 之上。是否真的落笔由服务自己判断(收起时什么也不画),
+     *   所以普通页面没有额外开销。 */
+    for (int i = 0; i < s_service_count; i++) {
+        if (s_services[i]->overlay_top && s_services[i]->render)
+            s_services[i]->render(ctx);
     }
     /* 提示弹窗恒最顶: 所有模块/服务渲染之后, 把 toast 覆盖在最上层再整体 flush */
     os_dialog_draw_overlay(ctx);
@@ -561,7 +620,7 @@ void os_render(ui_ctx_t *ctx)
      * - 非引擎态: os_render 整体冲刷.
      * - 引擎(game)态无覆盖: 让权给 video task/引擎(各自 flush 帧), 避免双写同一 SPI.
      * - 引擎态有弹窗/toast 覆盖: 必须由 os_render flush 一次, 否则覆盖层画进 fb 却送不上屏(不可见). */
-    bool overlay_active = os_dialog_toast_active() || ctx->modal_active;
+    bool overlay_active = os_dialog_toast_active() || ctx->modal_active || os_quickbar_is_open();
     uint64_t t_flush0 = (uint64_t)esp_timer_get_time();   /* flush 段计时起点 */
     /* 屏保刚退出(woke_up)强制 flush: 覆盖 game 模式"让权给引擎自行刷屏"的空档,
      * 否则恢复画面停在旧帧(表现为"按解锁没进桌面/没刷新") */

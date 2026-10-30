@@ -23,9 +23,9 @@ static uint16_t *s_zh16_order = NULL;
 static uint16_t s_zh16_b0_start[256];
 static uint16_t s_zh16_b0_cnt[256];   /* 用 uint16_t: b0 计数可能 >255, uint8_t 会溢出 */
 
-static void font_zh16_bind(void) {
-    const uint8_t *d = font_part_map(FONT_SLOT_16_OFF, FONT_SLOT_16_LEN);
-    size_t len = FONT_SLOT_16_LEN;
+static void font_zh16_bind_at(uint32_t off, uint32_t slot_len) {
+    const uint8_t *d = font_part_map(off, slot_len);
+    size_t len = slot_len;
     if (!d || len < 12 || memcmp(d, "ZH1FNT01", 8) != 0) return;
     uint32_t n = (uint32_t)d[8] | ((uint32_t)d[9] << 8) |
                  ((uint32_t)d[10] << 16) | ((uint32_t)d[11] << 24);
@@ -38,6 +38,36 @@ static void font_zh16_bind(void) {
     zh16_font_data = (const uint8_t (*)[32])s_zh16_glyphs;
     s_zh16_bound = true;
     if (s_zh16_order) { heap_caps_free(s_zh16_order); s_zh16_order = NULL; }  /* 重绑定失效索引 */
+}
+
+static void font_zh16_bind(void) {
+    font_zh16_bind_at(FONT_SLOT_16_OFF, FONT_SLOT_16_LEN);
+}
+
+/* 2026-10-30: 重绑定到备用槽 (设置里切字体). 失败返回 false 且不改变当前字库. */
+bool font_zh16_rebind(uint32_t off, uint32_t len) {
+    bool was = s_zh16_bound;
+    uint32_t oldc = s_zh16_count;
+    const uint8_t *oldc2 = s_zh16_chars, *oldg = s_zh16_glyphs;
+    s_zh16_bound = false;
+    s_zh16_count = 0;
+    s_zh16_chars = NULL;
+    s_zh16_glyphs = NULL;
+    zh16_chars = NULL;
+    zh16_font_data = NULL;
+    font_zh16_bind_at(off, len);
+    if (!s_zh16_bound) {
+        /* 回滚到原字库 */
+        s_zh16_bound = was;
+        s_zh16_count = oldc;
+        s_zh16_chars = oldc2;
+        s_zh16_glyphs = oldg;
+        zh16_chars = (const char *)oldc2;
+        zh16_font_data = (const uint8_t (*)[32])oldg;
+        if (s_zh16_order) { heap_caps_free(s_zh16_order); s_zh16_order = NULL; }
+        return false;
+    }
+    return true;
 }
 
 /* V1.0.90: 索引构建 (声明见文件顶部) */

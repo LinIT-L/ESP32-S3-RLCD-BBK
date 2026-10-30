@@ -44,17 +44,25 @@ EXT_RAM_BSS_ATTR static const char *s_path_ptrs[FAV_ENGINE_MAX][FAVORITES_MAX];
 
 
 
+/* ★ 2026-10-28: 前缀判定必须用 sizeof(lit)-1.
+ *   原实现手写长度 (12/11/12/11/13/14/13/11/13), 全部短于字面前缀本身 ——
+ *   "/sdcard/roms/gbc/" 是 17 字节, 写 12 只会比到 "/sdcard/roms", 于是
+ *   roms 目录下所有路径都命中第一条分支, 全被记成 GBC。
+ *   实测后果: 步步高 (.gam) 收藏写进 GBC 槽, 步步高收藏栏读 BBK 槽 ⇒ 永远为空;
+ *   GB/NES/MD/SMS 的收藏同样全进 GBC, 各自收藏栏也都空。 */
+#define FAV_PATH_HAS(p, lit) (strncmp((p), (lit), sizeof(lit) - 1) == 0)
+
 fav_engine_t favorites_engine_for_path(const char *path) {
     if (!path) return FAV_ENGINE_BBK;
-    if (strncmp(path, "/sdcard/roms/gbc/", 12) == 0) return FAV_ENGINE_GBC;
-    if (strncmp(path, "/sdcard/roms/gb/", 11) == 0)  return FAV_ENGINE_GB;
-    if (strncmp(path, "/sdcard/roms/nes/", 12) == 0) return FAV_ENGINE_FC;  /* NES 合并到 FC */
-    if (strncmp(path, "/sdcard/roms/ab/", 11) == 0)  return FAV_ENGINE_AB;
-    if (strncmp(path, "/sdcard/books/", 13) == 0) return FAV_ENGINE_BOOK;
-    if (strncmp(path, "/sdcard/roms/lava/", 14) == 0)  return FAV_ENGINE_WQX;
-    if (strncmp(path, "/sdcard/roms/vpet/", 13) == 0)     return FAV_ENGINE_VPET;
-    if (strncmp(path, "/sdcard/roms/md/", 11) == 0)       return FAV_ENGINE_MD;    /* MD/Genesis */
-    if (strncmp(path, "/sdcard/roms/sms/", 12) == 0)      return FAV_ENGINE_SMS;   /* SMS/GG */
+    if (FAV_PATH_HAS(path, "/sdcard/roms/gbc/")) return FAV_ENGINE_GBC;
+    if (FAV_PATH_HAS(path, "/sdcard/roms/gb/"))  return FAV_ENGINE_GB;
+    if (FAV_PATH_HAS(path, "/sdcard/roms/nes/")) return FAV_ENGINE_FC;  /* NES 合并到 FC */
+    if (FAV_PATH_HAS(path, "/sdcard/roms/ab/"))  return FAV_ENGINE_AB;
+    if (FAV_PATH_HAS(path, "/sdcard/books/")) return FAV_ENGINE_BOOK;
+    if (FAV_PATH_HAS(path, "/sdcard/roms/lava/"))  return FAV_ENGINE_WQX;
+    if (FAV_PATH_HAS(path, "/sdcard/roms/vpet/"))     return FAV_ENGINE_VPET;
+    if (FAV_PATH_HAS(path, "/sdcard/roms/md/"))       return FAV_ENGINE_MD;    /* MD/Genesis */
+    if (FAV_PATH_HAS(path, "/sdcard/roms/sms/"))      return FAV_ENGINE_SMS;   /* SMS/GG */
     return FAV_ENGINE_BBK;
 }
 

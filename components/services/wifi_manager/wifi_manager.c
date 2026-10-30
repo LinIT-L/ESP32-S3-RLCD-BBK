@@ -349,7 +349,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         char ipbuf[16];
         esp_ip4addr_ntoa(&e->ip_info.ip, ipbuf, sizeof(ipbuf));
         snprintf(s_ip, sizeof(s_ip), "%s", ipbuf);
-        snprintf(s_status, sizeof(s_status), "已连接 %s", ipbuf);
+        /* ★ 2026-10-30 linit: 状态栏只显示"已连接", 不再带 IP ——
+         *   用户要求"连接成功不用显示 IP"; IP 仍存进 s_ip, 需要时(
+         *   wifi_manager_get_ip() / 网络检测页)照样取得到, 只是状态文本干净了。 */
+        snprintf(s_status, sizeof(s_status), "%s", "已连接");
         ESP_LOGI(TAG, "Wi-Fi 已连接: %s", s_status);
         /* ★ 2026-10-26 linit: **每次联网都校一次时间** (原来"当天只校一次")。
          *   每次拿到 IP 都会让 SNTP 重发一次查询; 后台异步, 成功后自动 settimeofday,
@@ -640,6 +643,24 @@ bool wifi_manager_disable(void) {
     s_enabled = false;
     s_connected = false;
     s_connecting = false;
+    /* ★★★ 2026-10-28 【扫描状态必须一并复位】★★★
+     *   esp_wifi_stop() 会把正在进行的扫描一并终止, 但扫描相关的三个标志原来没人清:
+     *     s_suppress_reconnect / s_scanning / s_scan_t0。
+     *   残留后果(明确可复现的路径):
+     *     ① 用户在设置页点"扫描" ⇒ s_suppress_reconnect = true (见 scan_start)
+     *     ② 无操作 1 分钟 ⇒ 进屏保 ⇒ wallpapers.c 调 wifi_manager_disable()
+     *     ③ 退出屏保 ⇒ wallpapers 的 wifi_restore_task 调 enable(), 射频起来了
+     *     ④ wifi_supervisor_task 的重连条件是
+     *          `s_enabled && s_ssid[0] && !connected && !connecting && !s_suppress_reconnect`
+     *        此时 s_suppress_reconnect 仍是 true ⇒ **永久跳过自动重连**
+     *     ⇒ 现象: 解锁后 WiFi 显示"已开启", 却一直连不上; 要么再进设置页扫一次,
+     *        要么重启, 才会恢复正常。
+     *   (唯一的自愈途径是 UI 继续轮询 wifi_manager_is_scan_done() 的 12 秒超时,
+     *    但进了屏保之后没有 UI 在轮询它。) */
+    s_suppress_reconnect = false;
+    s_scanning  = false;
+    s_scan_t0   = 0;
+    s_scan_done = true;    /* 让仍挂在"扫描中"的 UI 轮询立刻退出, 不必等 12s 超时 */
     snprintf(s_status, sizeof(s_status), "未连接");
     ESP_LOGI(TAG, "WiFi 已关闭");
     return true;

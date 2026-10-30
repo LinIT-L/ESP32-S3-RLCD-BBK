@@ -15,14 +15,19 @@
 #include <unistd.h>
 #include <sys/stat.h>   /* mkdir */
 #include "am_asset.h"   /* ★ 2026-10-25 资源包卸载(递归删目录) */
+#include "font_book.h"  /* 2026-10-30: 查询"正在使用的字体"以免卸掉它 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "am_internal.h"
+#include "apps.h"   /* apps_builtin_has_id: 商店扫描去重 */
 #include "wifi_manager.h"   /* ★ 下载前判断是否联网 */
 #include "esp_timer.h"   /* ★ 扫描 busy 超时判断 */
 #include "apppack.h"   /* LAPP 单文件资源包: 取名称/简介 */
+#include "net_client.h"
+#include "sd_scan.h"
+#include "esp_spiffs.h"   /* 2026-10-31: 移动应用到内置前查 apps 分区余量 */   /* sd_is_mounted: 默认装 TF 卡的前提判断 */   /* ★ 2026-10-30 下载目录掉电自愈: netc_busy / netc_recover_path */
 
 #define TAG "AMSTORE"
 
@@ -138,17 +143,75 @@ static bool am_copy_file(const char *src, const char *dst) {
     if (!in) return false;
     FILE *out = fopen(dst, "wb");
     if (!out) { fclose(in); return false; }
-    char buf[512]; size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
-        if (fwrite(buf, 1, n, out) != n) { fclose(in); fclose(out); return false; }
-    fclose(in); fclose(out);
-    return true;
+
+    /* ★★★ 2026-10-30 提速: 原来是 512B **栈**缓冲。
+     *   改成 32KB 之后, 29MB 的资源包从约 5.7 万次 fread/fwrite 降到约 900 次。
+     *   ⚠ 说清楚收益边界(别把它当"卡速翻倍"): FATFS 的扇区是 4KB
+     *     (CONFIG_FATFS_SECTOR_4096), 512B 顺序写**不会**触发读-改-写 ——
+     *     前 7 次只在扇区缓存里累加, 第 8 次才真正落卡。
+     *     所以这里省的是**每次 f_write 的锁/查表/memcpy 开销**, 不是 SD 总线时间;
+     *     真实收益在小块多、文件多的场景, 纯粹大文件顺序复制的体感提升有限。
+     *   ⚠ 不用栈缓冲: 本函数所在任务栈可能只有几 KB, 4KB 数组会把栈顶掉
+     *     (踩过: remcon 把 usStackDepth 当 word 用 → 4KB 栈 → 整机重启)。
+     *   ⚠ 静态缓冲: am_copy_file 只在商店安装的后台任务里串行调用, 不存在并发。 */
+    #define AM_CP_BUF_SZ (32 * 1024)
+    static char *s_cp_buf = NULL;
+    if (!s_cp_buf) {
+        s_cp_buf = heap_caps_malloc(AM_CP_BUF_SZ, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_cp_buf) s_cp_buf = heap_caps_malloc(AM_CP_BUF_SZ, MALLOC_CAP_DEFAULT);
+        if (!s_cp_buf) { fclose(in); fclose(out); return false; }   /* 分配失败 → 如实失败 */
+    }
+
+    bool ok = true;
+    size_t n;
+    while ((n = fread(s_cp_buf, 1, AM_CP_BUF_SZ, in)) > 0)
+        if (fwrite(s_cp_buf, 1, n, out) != n) { ok = false; break; }
+    if (ferror(in)) ok = false;          /* 读出错不能被当成"复制完了" */
+    if (fclose(out) != 0) ok = false;    /* 写盘收尾失败(f_write 缓冲未落盘)必须报出来 */
+    fclose(in);
+    #undef AM_CP_BUF_SZ
+    return ok;
 }
 static int am_pkg_find_name(const char *fname) {
     for (int i = 0; i < s_pkg_n; i++)
         if (strcmp(s_pkg[i].fname, fname) == 0) return i;
     return -1;
 }
+/* ============ 下载目录掉电自愈 (2026-10-30) ============
+ * 背景: 下载走 "xxx.lua.part → 替换 → xxx.lua", 替换时**旧文件先改名成 xxx.lua.bak**。
+ *   若在"旧文件已成 .bak、新文件还没就位"之间掉电, 正式文件名就是缺失的; 而恢复原先
+ *   只在**再次下载同一路径**时触发 ⇒ 用户不重下, 那个包就一直"消失"。
+ *   这里在商店扫描开头补一次轻量恢复, 复用 net_client 的**同一套**逻辑
+ *   (netc_recover_path → netc_fs_recover), 不复制第二套状态机。
+ *
+ * 规则:
+ *   - 只扫 /sdcard/store_pkg(本下载目录), **不碰**已安装目录 /store/apps、/sdcard/apps;
+ *   - 只认 `*.lua.bak`: 正式文件缺失 → 复位; 正式文件在 → 删陈旧 .bak(正式文件优先);
+ *   - **.part 一律不删也不当包**: 它可能正被另一个任务下载, 删了会毁掉别人的传输;
+ *     扫描的 ".lua 结尾" 过滤天然也不会把它当包(它结尾是 .part);
+ *   - 下载进行中(netc_busy)直接跳过 —— 否则会和正在做的 rename 抢同一个文件;
+ *   - 没有 .bak 时每个候选只花一次 stat、不做任何写操作 ⇒ 每次刷新都跑也几乎零成本。
+ */
+static void am_store_recover_baks(void)
+{
+    if (netc_busy()) return;                    /* 下载中: 交给下载侧自己收尾 */
+    DIR *d = opendir(AM_STORE_SRC2);
+    if (!d) return;                             /* TF 卡没挂载 */
+    struct dirent *e;
+    int n = 0;
+    while ((e = readdir(d)) != NULL) {
+        const char *nm = e->d_name;
+        size_t len = strlen(nm);
+        if (len <= 8 || strcasecmp(nm + len - 8, ".lua.bak") != 0) continue;
+        if (strchr(nm, '/')) continue;
+        char fin[192];                          /* 只建正式名; .bak 名由 net_client 内部拼 */
+        snprintf(fin, sizeof(fin), "%s/%.*s", AM_STORE_SRC2, (int)len - 4, nm);
+        if (netc_recover_path(fin) != 0) n++;   /* RESTORED / CLEANED / FAILED 都算处理过 */
+    }
+    closedir(d);
+    if (n) ESP_LOGW(TAG, "下载目录自愈: 处理 %d 个 .bak", n);
+}
+
 /* 扫描商店本地包 (先内部再 SD, 同名校则覆盖 => sdcard 优先), 仅一次.
  * 全程在后台任务执行 (SPIFFS opendir + 逐包 2×fopen 较慢, 不能阻塞首帧);
  * s_pkg_scanned 在扫描完成时才置 0, 期间 UI 显示"正在扫描…". */
@@ -170,6 +233,9 @@ static void am_pkg_scan(void) {
      *   b < 2  = 待下载源(/store 根, /sdcard/store_pkg)
      *   b 2..4 = 内置已安装(/store/apps/{app,engine,ops})
      *   b 5..7 = TF 已安装(/sdcard/apps/{app,engine,ops}) */
+    /* ★ 2026-10-30: 先把下载目录里掉电残留的 .bak 复位, **再**列目录 ——
+     *   顺序不能反, 否则本次扫描仍然看不到刚恢复出来的包(要等下一次刷新)。 */
+    am_store_recover_baks();
     const char *bases[8] = { AM_STORE_SRC1, AM_STORE_SRC2,
                              AM_STORE_DST "/app", AM_STORE_DST "/engine", AM_STORE_DST "/ops",
                              "/sdcard/apps/app", "/sdcard/apps/engine", "/sdcard/apps/ops" };
@@ -191,6 +257,18 @@ static void am_pkg_scan(void) {
             if (strchr(nm, '/')) continue;
             size_t len = strlen(nm);
             if (len <= 5 || strcasecmp(nm + len - 4, ".lua") != 0) continue;
+            /* ★★★ 2026-10-30 P0-1 修「中英文重复应用」:
+             *   已安装目录 (b >= 2) 里的 xxx.lua, 若其**文件名主干**正好是固件内置应用的 id,
+             *   说明这个应用已经在主菜单/应用中心有一条中文记录了 —— 商店里再生成一条
+             *   id="pkg:xxx.lua"(英文文件名) 就是那条重复的英文条目。
+             *   ⇒ 直接跳过, 不生成商店条目。
+             *   ⚠ 只跳过"已安装目录(b>=2)"; 待下载源(b<2)不跳, 否则云端没装过的包也没了。
+             *   ⚠ 不删文件、不删注册表、不影响启动和卸载。 */
+            if (b >= 2 && len > 4) {
+                char stem[64];
+                snprintf(stem, sizeof(stem), "%.*s", (int)len - 4, nm);
+                if (apps_builtin_has_id(stem)) continue;
+            }
             int k = am_pkg_find_name(nm);
             if (k < 0) {
                 if (s_pkg_n >= AM_PKG_MAX) break;
@@ -343,6 +421,10 @@ static void am_pkg_scan(void) {
         s_pkg_n = w;
     }
     s_pkg_scanned = 0;   /* 全部填充完成, UI 才可见数据 */
+    /* 2026-10-31: 补一条可核对的日志 —— 之前"扫描到底有没有跑完"完全不可观测,
+     *   排查"商店点不动/条目少了"时只能猜。 */
+    ESP_LOGI(TAG, "商店本地扫描完成: %d 条 (内部 %s + TF卡 %s)", s_pkg_n,
+             AM_STORE_DST, "/sdcard/apps");
 }
 /* 后台扫描任务: 商店包扫描 (SPIFFS/SD 慢, 不阻塞 UI 首帧) */
 static void am_pkg_scan_task(void *arg) {
@@ -380,13 +462,23 @@ void am_store_prefetch(void) {
     } else {
         ; /* 未 busy: 走下面的正常流程 */
     }
-    if (s_pkg_scanned == 0) return;
-    /* ★ 每次进商店(>60s)顺带把云端索引也刷新一次 ✓ */
+    /* ★★★ 2026-10-30 根因修复: 「商店里看不到新上架的资源」★★★
+     *   原来这两行的顺序是反的：
+     *       if (s_pkg_scanned == 0) return;      ← 本地包扫过一遍就永远返回
+     *       ...索引刷新...
+     *   ⇒ **本地扫描完成后，云端索引再也不会刷新**。
+     *   服务器后来上架的字体/应用，用户要重启都看不到 —— 就是本次的现场。
+     *
+     *   现在把索引刷新提到 return 之前，并且理由写清楚：
+     *   「本地包扫过一次」和「云端索引是最新的」是两件事，不能互相短路。
+     *   刷新本身有 60 秒节流(am_rstore_refresh_due) + 后台任务，不会拖慢进店。
+     */
     {
         extern void am_rstore_refresh_force(void);
         extern bool am_rstore_refresh_due(void);
         if (am_rstore_refresh_due()) am_rstore_refresh_force();
     }
+    if (s_pkg_scanned == 0) return;
     s_pkg_busy = true;
     s_pkg_done = false;
     /* V1.2 修复: 原实现忽略返回值 —— 任务创建失败(内存不足)时 s_pkg_busy 永久为 true,
@@ -396,7 +488,13 @@ void am_store_prefetch(void) {
      *   ⇒ 扫描永不执行 ⇒ `s_pkg_scanned` 永远 != 0 ⇒ 商店空白 "无法获取应用列表" ✓✓
      *   (本任务只做 opendir/fopen/strcmp, 4KB 足够; 必须内部 RAM —— 读 flash 时禁缓存,
      *    PSRAM 栈会崩) */
-    if (xTaskCreatePinnedToCore(am_pkg_scan_task, "pkgscan", 4096, NULL, 3, NULL, 0) != pdPASS) {
+    /* ★★★ 2026-10-30 修「点应用中心立刻死机重启」的真根因:
+     *   串口抓到 "A stack overflow in task pkgscan has been detected."
+     *   栈只有 4096 字节, 而扫描任务里有多层局部数组
+     *   (spath[192] + nb[64] + stem[64] + LAPP 头解析缓冲) 叠加 fopen/snprintf/日志,
+     *   再加开 DEBUG 后日志调用占栈 → 直接爆栈 panic。
+     *   加到 8192 (与下载任务同级), 与"开不开日志"无关都能扛住。 */
+    if (xTaskCreatePinnedToCore(am_pkg_scan_task, "pkgscan", 8192, NULL, 3, NULL, 0) != pdPASS) {
         s_pkg_busy = false;
         s_pkg_done = false;
         ESP_LOGW(TAG, "商店扫描任务创建失败(内存不足?) ⇒ 保留上次结果, 下帧重试");
@@ -443,11 +541,25 @@ static void am_store_sync_remote(void) {
         const am_rpkg_t *rp = am_rstore_get(i);
         if (!rp || !rp->name[0]) continue;
         char fn[48];
-        snprintf(fn, sizeof(fn), "%s.lua", rp->name);
+        /* ★★★ 2026-10-30: 资源包(asset, 如字体 .zip) **不能用 "<名字>.lua" 当文件名**。
+         *   原来一律拼 .lua ⇒ 字体条目在列表里叫 "文泉驿点阵宋16.lua"：
+         *   · 和本地 .lua 包去重时永远不相等（字体本来也不该和 .lua 比）；
+         *   · "已安装"判定按 dst 找 .lua，永远 false；
+         *   · 真去下载时若哪天回落到这条路径，会拼出 404 的 <名字>.lua。
+         *   资源包一律用索引里 path 的真实文件名（font_wqy16.zip），与下载器一致。 */
+        const bool is_asset = (strcmp(rp->type, "asset") == 0);
+        if (is_asset) {
+            const char *b = strrchr(rp->path, '/');
+            snprintf(fn, sizeof(fn), "%s", b ? b + 1 : rp->path);
+        } else {
+            snprintf(fn, sizeof(fn), "%s.lua", rp->name);
+        }
         bool dup = false;
-        for (int k = 0; k < s_pkg_n; k++)
-            if (strcmp(s_pkg[k].fname, fn) == 0) { dup = true; break; }
-        if (dup) continue;                       /* 本地已有 → 走本地那条 */
+        if (!is_asset) {
+            for (int k = 0; k < s_pkg_n; k++)
+                if (strcmp(s_pkg[k].fname, fn) == 0) { dup = true; break; }
+            if (dup) continue;                   /* 本地已有同名的 .lua → 走本地那条 */
+        }
         am_pkg_entry_t *e = &s_rview[s_rview_n];
         memset(e, 0, sizeof(*e));
         e->kind  = 1;
@@ -463,9 +575,17 @@ static void am_store_sync_remote(void) {
         const char *cat  = (strcmp(icat, "运维") == 0 || strcmp(icat, "工具") == 0) ? "ops" : "app";
         snprintf(e->cat,   sizeof(e->cat),   "%s", cat);
         snprintf(e->id,    sizeof(e->id),    "pkg:%s", fn);
-        snprintf(e->src,   sizeof(e->src),   "%s/%s", AM_STORE_SRC2, fn);
-        snprintf(e->dst,   sizeof(e->dst),   "%s/%s/%s", AM_STORE_DST, cat, fn);
-        snprintf(e->dst_sd,sizeof(e->dst_sd),"/sdcard/apps/%s/%s", cat, fn);
+        if (is_asset) {
+            /* 资源包不装进 /store/apps/<cat>/，解到索引里声明的 target
+             * （字体 → /sdcard/fonts）。dst 只用于"已安装"探测，指向 target 本身。 */
+            snprintf(e->src, sizeof(e->src), "/sdcard/%s", fn);
+            snprintf(e->dst, sizeof(e->dst), "%s", rp->target[0] ? rp->target : "/sdcard");
+            e->dst_sd[0] = 0;
+        } else {
+            snprintf(e->src,   sizeof(e->src),   "%s/%s", AM_STORE_SRC2, fn);
+            snprintf(e->dst,   sizeof(e->dst),   "%s/%s/%s", AM_STORE_DST, cat, fn);
+            snprintf(e->dst_sd,sizeof(e->dst_sd),"/sdcard/apps/%s/%s", cat, fn);
+        }
         e->app.id   = e->id;
         e->app.label = e->label;
         e->app.page   = OS_PAGE_LUA;
@@ -588,7 +708,16 @@ bool am_store_auto_install(const char *fname) {
     char path_int[192], path_sd[192];
     snprintf(path_int, sizeof(path_int), "%s/%s/%s", AM_STORE_DST, sub, fname);
     snprintf(path_sd,  sizeof(path_sd),  "/sdcard/apps/%s/%s", sub, fname);
+    /* ★★★ 2026-10-31 linit: **默认一律装 TF 卡**，内置 /store/apps 只做兜底。
+     *   内置 apps 分区只有 4MB（SPIFFS 固定开销后可用 ≈3.65MB），
+     *   而 TF 卡动辄几十 G —— 新装的应用没有理由去挤内置。
+     *   三种情况要分清（原来的 `on_sd = 卡上存在` 只覆盖了第二、三种）：
+     *     ① 两边都没有（新装）+ 卡已挂载  → 装卡        ← 本轮新增
+     *     ② 卡上已有（之前装过/更新）      → 更新卡
+     *     ③ 内置已有（老数据/用户移进去的）→ 更新内置，**不要**再往卡上复制一份
+     *   没插卡时才退回内置，保证无卡也能用。 */
     bool on_sd = am_file_exist(path_sd);
+    if (!on_sd && !am_file_exist(path_int) && sd_is_mounted()) on_sd = true;
     if (on_sd) snprintf(catdir, sizeof(catdir), "/sdcard/apps/%s", sub);
     else       snprintf(catdir, sizeof(catdir), "%s/%s", AM_STORE_DST, sub);
     snprintf(dst, sizeof(dst), "%s/%s", catdir, fname);
@@ -838,19 +967,96 @@ static bool am_asset_target_of(const os_app_t *a, char *out, size_t cap)
     return true;
 }
 
+/* 2026-10-30: 取该资源包的 zip 相对路径 (pkgs/xxx.zip) —— 卸载要按它找清单 */
+static bool am_asset_zip_of(const os_app_t *a, char *out, size_t cap)
+{
+    int i = am_asset_pkg_find(a);
+    if (i < 0) return false;
+    const am_rpkg_t *rp = am_rstore_get(i);
+    if (!rp || !rp->path[0]) return false;
+    snprintf(out, cap, "%s", rp->path);
+    return true;
+}
+
 static bool am_asset_installed(const os_app_t *a)
 {
     char dir[96];
     if (!am_asset_target_of(a, dir, sizeof(dir))) return false;
-    /* ★★★ 2026-10-27 linit: **不许只看目录存在**。
-     *   目录在、但里面是空的/半截的(解压失败)时, 原来会显示"可卸载",
-     *   用户点应用却提示"资源未安装" —— 就是这次的坑。
-     *   现在只认解包器在**全部条目都成功**后写的 `.installed` 标记。 */
-    char mark[128];
-    snprintf(mark, sizeof(mark), "%s/.installed", dir);
-    FILE *f = fopen(mark, "r");
-    if (!f) return false;
-    fclose(f);
+
+    /* 包名（zip 主干）—— 字体包的 target 是 13 个包共用的 /sdcard/fonts，
+     * 一切判定都必须**按包**做，不能按目录做。 */
+    char zip[128] = {0}, stem[64] = {0};
+    if (!am_asset_zip_of(a, zip, sizeof(zip))) return false;
+    {
+        const char *b = strrchr(zip, '/');
+        b = b ? b + 1 : zip;
+        size_t k = 0;
+        while (b[k] && b[k] != '.' && k + 1 < sizeof(stem)) { stem[k] = b[k]; k++; }
+        stem[k] = 0;
+    }
+    if (!stem[0]) return false;
+
+    char mark[176], lst[176];
+    snprintf(mark, sizeof(mark), "%s/.installed.%s", dir, stem);
+    snprintf(lst,  sizeof(lst),  "%s/.pkg.%s.lst", dir, stem);
+
+    /* ① 安装标记必须存在。兼容旧版：老实现只写目录级 `<target>/.installed`，
+     *   那种标记对共享目录来说"装一个=全装"，**单独存在不算数**，
+     *   必须再配上本包自己的清单才认（下面统一按清单回验）。 */
+    int  want_cnt = -1;
+    unsigned long long want_bytes = 0;
+    bool has_bytes = false;
+    FILE *mf = fopen(mark, "r");
+    if (mf) {
+        int got = fscanf(mf, "%d %llu", &want_cnt, &want_bytes);
+        has_bytes = (got == 2);
+        fclose(mf);
+    } else {
+        char om[128];
+        snprintf(om, sizeof(om), "%s/.installed", dir);
+        FILE *of = fopen(om, "r");
+        if (!of) return false;
+        fclose(of);
+    }
+
+    /* ② 按清单逐个回验：文件在不在、大小是否 > 0、.lbf 魔数对不对。
+     *   —— 这一步就是 linit 要求的"本地文件确实存在 + 大小正确 + 格式解析成功"。
+     *   用户删了 .lbf、卡被拔、文件被别的包覆盖，都会在这里被判否 ⇒ 回到"下载"。 */
+    FILE *lf = fopen(lst, "r");
+    if (!lf) return false;
+
+    int  cnt = 0;
+    unsigned long long bytes = 0;
+    char line[288];
+    while (fgets(line, sizeof(line), lf)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (!n) continue;
+        if (line[0] == '/' || strstr(line, "..")) { fclose(lf); return false; }   /* 清单被改坏 */
+
+        char fp[336];
+        snprintf(fp, sizeof(fp), "%s/%s", dir, line);
+        struct stat st;
+        if (stat(fp, &st) != 0 || st.st_size <= 0) { fclose(lf); return false; }  /* 文件丢失 */
+
+        /* 字体文件还要过魔数：挡住"同名空壳/被截断/被换成别的东西" */
+        const char *dot = strrchr(line, '.');
+        if (dot && (strcmp(dot, ".lbf") == 0 || strcmp(dot, ".LBF") == 0)) {
+            FILE *gf = fopen(fp, "rb");
+            if (!gf) { fclose(lf); return false; }
+            char mg[4] = {0};
+            bool okm = (fread(mg, 1, 4, gf) == 4 && memcmp(mg, "LBF1", 4) == 0);
+            fclose(gf);
+            if (!okm) { fclose(lf); return false; }
+        }
+        bytes += (unsigned long long)st.st_size;
+        cnt++;
+    }
+    fclose(lf);
+
+    if (cnt <= 0) return false;
+    if (want_cnt >= 0 && cnt != want_cnt) return false;          /* 数量对不上 */
+    if (has_bytes && bytes != want_bytes) return false;          /* 总字节对不上 */
     return true;
 }
 
@@ -872,6 +1078,62 @@ void am_store_toggle(ui_ctx_t *ctx, const os_app_t *a) {
     if (am_pkg_has_update(k)) { am_store_update_start(ctx, k); return; }  /* ★ 有新版本 → 直接更新 */
     if (am_pkg_installed(k)) { am_store_uninstall_ask(ctx, a); return; }
     am_store_activate(ctx, a);          /* 未装时 activate 的本职就是弹"安装?"确认 */
+}
+
+/* ========== 商店行「详情」弹窗 (2026-10-31) ==========
+ * 点列表行的**非按钮区** → 弹这个；点右侧按钮才执行下载/安装/卸载。
+ * 数据源: 云端索引 am_rpkg_t (有 desc/ver/size/author/date) 优先, 本地包兜底。
+ * 承载用 os_dialog_list: 每行一个字段, 点任意行即关闭 (不引入新弹窗类型)。 */
+static void am_store_detail_cb(ui_ctx_t *ctx, int r, void *ud) {
+    (void)ctx; (void)r; (void)ud;      /* 框架在回调返回后自动关闭 */
+}
+
+void am_store_detail(ui_ctx_t *ctx, const os_app_t *a) {
+    if (!a) return;
+    int rk = am_rview_find(a);
+    int k  = am_pkg_find(a);
+    const am_rpkg_t *rp = (rk >= 0) ? am_rstore_get(s_rview[rk].ridx) : NULL;
+
+    char buf[7][96];
+    const char *ptrs[7];
+    int n = 0;
+
+    if (a->cat && a->cat[0]) {
+        snprintf(buf[n], sizeof(buf[n]), "\xe5\x88\x86\xe7\xb1\xbb: %s", a->cat);  /* 分类: */
+        ptrs[n] = buf[n]; n++;
+    }
+    if (rp) {
+        snprintf(buf[n], sizeof(buf[n]), "\xe7\x89\x88\xe6\x9c\xac: %u", (unsigned)rp->ver); /* 版本: */
+        ptrs[n] = buf[n]; n++;
+        if (rp->author[0]) {
+            snprintf(buf[n], sizeof(buf[n]), "\xe4\xbd\x9c\xe8\x80\x85: %s", rp->author);     /* 作者: */
+            ptrs[n] = buf[n]; n++;
+        }
+        if (rp->size) {
+            snprintf(buf[n], sizeof(buf[n]), "\xe5\xa4\xa7\xe5\xb0\x8f: %u KB",             /* 大小: */
+                     (unsigned)((rp->size + 1023u) / 1024u));
+            ptrs[n] = buf[n]; n++;
+        }
+        if (rp->date[0]) {
+            snprintf(buf[n], sizeof(buf[n]), "\xe6\x97\xa5\xe6\x9c\x9f: %s", rp->date);      /* 日期: */
+            ptrs[n] = buf[n]; n++;
+        }
+    }
+    bool installed = (am_asset_pkg_find(a) >= 0) ? am_asset_installed(a)
+                    : (k >= 0 && am_pkg_installed(k));
+    snprintf(buf[n], sizeof(buf[n]), "\xe7\x8a\xb6\xe6\x80\x81: %s",                          /* 状态: */
+             installed ? "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85"                                /* 已安装 */
+                       : "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85");                              /* 未安装 */
+    ptrs[n] = buf[n]; n++;
+
+    const char *ds = am_store_sub_of(a);
+    if (ds && ds[0] && n < 7) {
+        snprintf(buf[n], sizeof(buf[n]), "%s", ds);
+        ptrs[n] = buf[n]; n++;
+    }
+    if (n == 0) return;
+    os_dialog_list(ctx, a->label, ptrs, n, 0, am_store_detail_cb, NULL);
+    am_dlg_title16(ctx);   /* 名字可能长, 标题用 16px 不挤 (与下载确认一致) */
 }
 
 /* 商店选中: 已安装(内置或卡) → 运行; 未安装 → 弹"安装 XXX?" 确认 (目标是应用默认, 不选) */
@@ -929,6 +1191,7 @@ static void am_uninst_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+static bool s_uninst_pending = false;   /* 有卸载任务在跑 (UI 提示用) */
 static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
     if (k < 0 || k >= s_pkg_n) return;
     if (!am_pkg_installed(k)) { os_dialog_toast(ctx, "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85"); return; } /* 未安装 */
@@ -947,7 +1210,11 @@ static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
     snprintf(j->paths[j->npaths++], 192, "/store/%s", s_pkg[k].fname);
     snprintf(j->lid, sizeof(j->lid), "lua:%s", s_pkg[k].fname);
     s_pkg_inst[k] = false;   /* UI 立刻认为未安装(按钮变"下载") */
-    os_dialog_toast(ctx, "\xe5\x8d\xb8\xe8\xbd\xbd\xe4\xb8\xad...");   /* 卸载中... (后台删完会刷新列表) */
+    /* ★ 2026-10-30: 原来这里 os_dialog_toast("卸载中...") —— 但 toast 会把 s_cb_handled
+     *   置 true, 框架就不关确认框了 ⇒ 弹窗残留挡在商店上。
+     *   这里改成"不弹 toast", 靠 s_pkg_inst[k]=false 让按钮立刻变回"下载"作为反馈;
+     *   后台删完会 am_rebuild_keep() 刷新列表。 */
+    s_uninst_pending = true;
     ctx->needs_redraw = true;
     if (xTaskCreate(am_uninst_task, "am_uninst", 6144, j, 3, NULL) != pdPASS) {
         /* 任务建不起来: 退化为同步删(至少保证功能正确) */
@@ -956,12 +1223,15 @@ static void am_store_uninstall_do(ui_ctx_t *ctx, int k) {
 }
 
 static void am_store_uninstall_cb(ui_ctx_t *ctx, int result, void *ud) {
-    /* ★★★ 2026-10-18 修(弹窗不关): **先关确认框再执行** ——
-     *   因为 os_dialog_toast() 会把 s_cb_handled 置 true, 框架的 dlg_finish_top
-     *   就**不再自动关**了 ⇒ 弹窗一直挂着 ✗ */
-    if (os_dialog_depth() > 0) os_dialog_pop(ctx);
-    if (result == 0) am_store_uninstall_do(ctx, (int)(long)ud);
-    /* 同上: 交给框架自己关, 不要手动 pop */
+    /* ★★★ 2026-10-30 修「卸载确认后整个应用中心退出」的**真正根因**:
+     *   dlg_finish_top() (os_dialog.c:521) 的顺序是: 先 clear s_cb_handled → 调 cb
+     *   → cb 返回后才 os_dialog_pop。也就是说 **cb 执行时 s_top 还是 0**。
+     *   而 os_dialog_pop() 在 s_top==0 时走的是 `os_pop(ctx)` —— 直接退出弹窗页/商店页!
+     *   (os_dialog_depth() = s_top+1 = 1, 所以 `> 0` 永远成立 → 每次都退页面)
+     *   ⇒ 回调里**绝对不能**调 os_dialog_pop。
+     *   关窗交给框架的 dlg_finish_top 完成 (s_cb_handled 保持 false 即可)。 */
+    if (result != 0) { ctx->needs_redraw = true; return; }   /* 取消: 只关框, 不卸载 */
+    am_store_uninstall_do(ctx, (int)(long)ud);
     ctx->needs_redraw = true;
 }
 /* 选中的商店项若已安装 → 弹"卸载 XX?" 确认 */
@@ -975,23 +1245,35 @@ void am_store_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a) {
     am_dlg_title16(ctx);
 }
 
-/* ---------- 资源包卸载: 后台递归删 target 目录 ---------- */
+/* ---------- 资源包卸载 ----------
+ * ★ 2026-10-30: 优先「按清单只删本包的文件」。
+ *   字体包的 target 是 /sdcard/fonts（多包共用 + 用户手动放的字体也在这），
+ *   老实现递归删目录 ⇒ 卸一个字体把所有人一起清掉。
+ *   只有拿不到清单的旧包（仙剑那种独占目录）才回退到整目录删。 */
+typedef struct { char zip[128]; char dir[96]; } asset_rm_arg_t;
+
 static void am_asset_uninst_task(void *arg)
 {
-    char *dir = (char *)arg;
-    bool ok = am_asset_rmdir(dir);
-    ESP_LOGI("AMSTORE", "资源包卸载 %s: %s", dir, ok ? "OK" : "失败");
-    free(dir);
+    asset_rm_arg_t *p = (asset_rm_arg_t *)arg;
+    bool ok = am_asset_uninstall(p->zip, p->dir);
+    if (ok) {
+        ESP_LOGI("AMSTORE", "按清单卸载 %s: OK", p->dir);
+    } else {
+        ok = am_asset_rmdir(p->dir);
+        ESP_LOGI("AMSTORE", "资源包卸载(整目录) %s: %s", p->dir, ok ? "OK" : "失败");
+    }
+    free(p);
     s_uninst_done = true;    /* 通知 UI 刷新(按钮回到"下载") */
     vTaskDelete(NULL);
 }
 
 static void am_store_asset_uninstall_cb(ui_ctx_t *ctx, int result, void *ud)
 {
-    char *dir = (char *)ud;
+    asset_rm_arg_t *dir = (asset_rm_arg_t *)ud;
     if (os_dialog_depth() > 0) os_dialog_pop(ctx);
     if (result == 0 && dir) {
-        char *copy = strdup(dir);
+        asset_rm_arg_t *copy = (asset_rm_arg_t *)malloc(sizeof(*copy));
+        if (copy) *copy = *dir;
         free(dir);
         if (copy) {
             if (xTaskCreate(am_asset_uninst_task, "am_asset_rm", 4096, copy, 3, NULL) != pdPASS) {
@@ -1007,12 +1289,43 @@ static void am_store_asset_uninstall_cb(ui_ctx_t *ctx, int result, void *ud)
 
 static void am_store_asset_uninstall_ask(ui_ctx_t *ctx, const os_app_t *a)
 {
-    char dir[96];
+    char dir[96], zip[128] = {0};
     if (!am_asset_target_of(a, dir, sizeof(dir))) return;
+
+    /* ★★★ 2026-10-30: 正在被阅读器使用的字体**不许卸**。
+     *   删掉当前字库后，当前这一页会立刻变成一排缺字框，用户还以为把阅读器弄坏了。
+     *   判断方式很轻: 阅读器暴露"当前 LBF 绝对路径"，这里做一次目录前缀匹配，
+     *   不引入 apps→engines 的新依赖（apps 本来就 REQUIRES book_reader）。
+     *   用户切到别的字体（或切回内置）后，路径变了，就能正常卸了。 */
+    {
+        const char *using_f = font_book_current_file();
+        if (using_f && using_f[0]) {
+            /* 先按**本包的安装清单**核对: 正在用的字体到底是不是这个包装进来的。
+             * 只比清单而不是"目录前缀" —— /sdcard/fonts 下通常装了好几个字体，
+             * 用前缀判断会把"卸载别的字体"也拦下来。
+             * 旧包没有清单(has_file 返回 false)时退回前缀判断，宁可保守也不误删。 */
+            bool mine = zip[0] && am_asset_has_file(zip, dir, using_f);
+            if (!mine) {
+                size_t dl = strlen(dir);
+                bool under = (strncmp(using_f, dir, dl) == 0 &&
+                              (using_f[dl] == '/' || using_f[dl] == 0));
+                /* 只有"整个目录就是这一个包"时才用前缀兜底(仙剑那种独占目录) */
+                mine = under && !zip[0];
+            }
+            if (mine) {
+                ESP_LOGW("AMSTORE", "拒绝卸载: 字体正在使用中 (%s)", using_f);
+                os_dialog_toast(ctx, "\xe8\xaf\xa5\xe5\xad\x97\xe4\xbd\x93\xe6\xad\xa3\xe5\x9c\xa8\xe4\xbd\xbf\xe7\x94\xa8\xef\xbc\x8c\xe8\xaf\xb7\xe5\x85\x88\xe5\x88\x87\xe6\x8d\xa2\xe5\xad\x97\xe4\xbd\x93");
+                return;
+            }
+        }
+    }
     char msg[64];
     snprintf(msg, sizeof(msg), "\xe5\x8d\xb8\xe8\xbd\xbd %s?", a->label);   /* 卸载 XX? */
-    char *ud = strdup(dir);
+    asset_rm_arg_t *ud = (asset_rm_arg_t *)calloc(1, sizeof(*ud));
     if (!ud) return;
+    snprintf(ud->dir, sizeof(ud->dir), "%s", dir);
+    if (!am_asset_zip_of(a, zip, sizeof(zip))) zip[0] = 0;
+    snprintf(ud->zip, sizeof(ud->zip), "%s", zip);
     os_dialog_confirm_ex(ctx, msg, 0, 0, am_store_asset_uninstall_cb, ud);
     am_dlg_title16(ctx);
 }
@@ -1146,4 +1459,165 @@ bool am_store_tick(void) {
         changed = true;
     }
     return changed;
+}
+
+/* ===== 2026-10-31: 应用在「TF 卡 ↔ 内置」之间移动 ==========================
+ * 背景: 内置 apps 分区只有 4MB（SPIFFS 固定开销后可用 ≈3.65MB），
+ *   所以新装应用默认一律落 TF 卡（见 am_store_auto_install）。
+ *   但用户会希望个别应用"内置化"——不插卡也能开、卡拔了也还在。
+ *   入口：商店里长按应用图标（见 page_app_manager.c 的长按分支）。
+ * 原则：动之前先算空间，不够就明确拒绝；移动是"复制成功→校验大小→删源"，
+ *   中途失败绝不留半个文件，也不会把源弄丢。
+ */
+
+/* 0=未安装 1=内置 2=TF 卡 */
+int am_store_app_where(const os_app_t *a)
+{
+    int k = am_pkg_find(a);
+    if (k < 0) return 0;
+    if (s_pkg[k].dst_sd[0] && am_file_exist(s_pkg[k].dst_sd)) return 2;
+    if (s_pkg[k].dst[0]    && am_file_exist(s_pkg[k].dst))    return 1;
+    return 0;
+}
+
+/* apps 分区剩余字节（SPIFFS）；查询失败返回 0 */
+uint32_t am_store_internal_free(void)
+{
+    size_t total = 0, used = 0;
+    if (esp_spiffs_info("apps", &total, &used) != ESP_OK) return 0;
+    return (used >= total) ? 0u : (uint32_t)(total - used);
+}
+
+/* 把 TF 卡上的应用移到内置。成功 true；失败 err 里是中文原因。 */
+bool am_store_move_to_internal(const os_app_t *a, char *err, size_t errlen)
+{
+    if (err && errlen) err[0] = 0;
+    int k = am_pkg_find(a);
+    if (k < 0) { if (err) snprintf(err, errlen, "找不到应用记录"); return false; }
+    if (!s_pkg[k].dst_sd[0] || !am_file_exist(s_pkg[k].dst_sd)) {
+        if (err) snprintf(err, errlen, "不在 TF 卡上");
+        return false;
+    }
+    if (s_pkg[k].dst[0] && am_file_exist(s_pkg[k].dst)) {
+        if (err) snprintf(err, errlen, "内置已有一份");
+        return false;
+    }
+
+    struct stat st;
+    if (stat(s_pkg[k].dst_sd, &st) != 0 || st.st_size <= 0) {
+        if (err) snprintf(err, errlen, "源文件读不到");
+        return false;
+    }
+    const uint32_t need = (uint32_t)st.st_size;
+
+    uint32_t freeb = am_store_internal_free();
+    /* 预留 8KB：SPIFFS 的块/目录开销，卡着满容量写必然失败 */
+    if (freeb < need + 8192u) {
+        if (err) snprintf(err, errlen, "内置空间不足(需%uKB 余%uKB)",
+                          (unsigned)(need / 1024), (unsigned)(freeb / 1024));
+        ESP_LOGW("AMSTORE", "移动到内置被拒: 需 %u B, 内置余 %u B", (unsigned)need, (unsigned)freeb);
+        return false;
+    }
+
+    /* 父目录（/store/apps/<sub>）可能还不存在 */
+    char pdir[192];
+    snprintf(pdir, sizeof(pdir), "%s", s_pkg[k].dst);
+    char *slash = strrchr(pdir, '/');
+    if (slash) { *slash = 0; mkdir(pdir, 0755); }
+
+    if (!am_copy_file(s_pkg[k].dst_sd, s_pkg[k].dst)) {
+        if (err) snprintf(err, errlen, "复制失败(空间/卡错误)");
+        remove(s_pkg[k].dst);
+        return false;
+    }
+    struct stat dt;
+    if (stat(s_pkg[k].dst, &dt) != 0 || (long)dt.st_size != (long)st.st_size) {
+        if (err) snprintf(err, errlen, "复制校验不符");
+        remove(s_pkg[k].dst);                 /* 只删新写的半成品，源仍在卡上 */
+        return false;
+    }
+    remove(s_pkg[k].dst_sd);                  /* 校验通过才删源 */
+    ESP_LOGI("AMSTORE", "已移动到内置: %s (%u B, 内置余 %u B)",
+             s_pkg[k].dst, (unsigned)need, (unsigned)am_store_internal_free());
+    am_store_invalidate();
+    am_lua_invalidate();
+    return true;
+}
+
+/* 把内置的应用移回 TF 卡（反向，给"内置满了想挪出来"留个出口） */
+bool am_store_move_to_sd(const os_app_t *a, char *err, size_t errlen)
+{
+    if (err && errlen) err[0] = 0;
+    int k = am_pkg_find(a);
+    if (k < 0) { if (err) snprintf(err, errlen, "找不到应用记录"); return false; }
+    if (!s_pkg[k].dst[0] || !am_file_exist(s_pkg[k].dst)) {
+        if (err) snprintf(err, errlen, "不在内置空间");
+        return false;
+    }
+    if (!sd_is_mounted()) {
+        if (err) snprintf(err, errlen, "TF 卡未挂载");
+        return false;
+    }
+
+    struct stat st;
+    if (stat(s_pkg[k].dst, &st) != 0 || st.st_size <= 0) {
+        if (err) snprintf(err, errlen, "源文件读不到");
+        return false;
+    }
+    char pdir[192];
+    snprintf(pdir, sizeof(pdir), "%s", s_pkg[k].dst_sd);
+    char *slash = strrchr(pdir, '/');
+    if (slash) { *slash = 0; mkdir(pdir, 0755); }
+
+    if (!am_copy_file(s_pkg[k].dst, s_pkg[k].dst_sd)) {
+        if (err) snprintf(err, errlen, "复制到卡失败");
+        remove(s_pkg[k].dst_sd);
+        return false;
+    }
+    struct stat dt;
+    if (stat(s_pkg[k].dst_sd, &dt) != 0 || (long)dt.st_size != (long)st.st_size) {
+        if (err) snprintf(err, errlen, "复制校验不符");
+        remove(s_pkg[k].dst_sd);
+        return false;
+    }
+    remove(s_pkg[k].dst);
+    ESP_LOGI("AMSTORE", "已移到 TF 卡: %s", s_pkg[k].dst_sd);
+    am_store_invalidate();
+    am_lua_invalidate();
+    return true;
+}
+
+/* 长按「移动到内置空间」的确认框。目标指针存 static —— 对话框是异步的，
+ * 传栈上的指针/依赖列表索引都可能失效（列表会被重建）。 */
+static const os_app_t *s_move_target;
+
+static void am_move_cb(ui_ctx_t *ctx, int result, void *ud)
+{
+    (void)ud;
+    const os_app_t *a = s_move_target;
+    s_move_target = NULL;
+    if (result != 0 || !a) return;          /* 取消 */
+    char err[96] = {0};
+    if (am_store_move_to_internal(a, err, sizeof(err))) {
+        os_dialog_toast(ctx, "已移动到内置空间");
+        am_rebuild_keep();
+    } else {
+        os_dialog_toast(ctx, err[0] ? err : "移动失败");
+    }
+}
+
+void am_move_internal_ask(ui_ctx_t *ctx, const os_app_t *a)
+{
+    if (!a) return;
+    /* 先算一遍空间，不够就别让用户点进去了（比"点了才报错"友好） */
+    uint32_t freeb = am_store_internal_free();
+    if (freeb == 0) { os_dialog_toast(ctx, "内置空间不可用"); return; }
+    if (freeb < 16u * 1024u) {
+        char m[64];
+        snprintf(m, sizeof(m), "内置空间不足(余%uKB)", (unsigned)(freeb / 1024));
+        os_dialog_toast(ctx, m);
+        return;
+    }
+    s_move_target = a;
+    os_dialog_confirm_ex(ctx, "移动到内置空间?", 0, 0, am_move_cb, NULL);
 }

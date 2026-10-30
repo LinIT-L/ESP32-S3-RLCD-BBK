@@ -347,6 +347,11 @@ static int pt_get(const uint8_t *fb, int x, int y) {
 
 void st7305_set_portrait(st7305_handle_t *dev, uint8_t *pfb, int rot) {
     if (!dev) return;
+    /* ★ 2026-10-28: 与 st7305_set_rotation 同理 —— 这里直接换 pt_pfb / pt_rot,
+     *   换算语义变了, 但 pfb 内容可能一模一样(同一页), 指纹会误判"没变化"⇒ 整帧跳过。
+     *   必须作废, 保证换缓冲/换方向后必有一整帧重建。 */
+    extern void st7305_partial_invalidate_pub(void);
+    st7305_partial_invalidate_pub();
     dev->pt_pfb = pfb;
     dev->pt_rot = (rot == 3) ? 3 : 2;
 }
@@ -660,12 +665,96 @@ void st7305_set_full_window(st7305_handle_t *dev) {
  *   解法：整帧先 memcpy 到**内部 RAM** 的发送缓冲，再从内部 RAM 发 —— flash 操作再也
  *   碰不到这条 DMA。内部 RAM 现在有 130KB+ 余量，15000B 完全负担得起。 */
 static bool     s_win_set = false;  /* 窗口/扫描方向是否已设过 (每帧只发 0x2C) */
-static uint32_t s_last_flush_ms = 0;/* 上一帧送屏时刻: 限速用 */
 /* ★ 2026-10-25 linit「非常卡 不要限制了」⇒ 限速**关闭**(0 = 不限)。
  *   原来为了护面板加的 16fps 上限反过来把界面拖顿了, 先去掉。
  *   卡死的真正原因(PSRAM DMA / 每帧重设窗口 / 关屏命令)都已修掉,
  *   面板侧不再需要靠限速保命。若要恢复限速: 把下面改成 62 即可。 */
 #define FLUSH_MIN_MS  0             /* 0 = 不限制 */
+
+/* ★ 2026-10-29: 限速相关的状态与判断全部用**编译期条件**包起来。
+ *   原因: FLUSH_MIN_MS 是纯字面量宏。原来写成运行期 `if (FLUSH_MIN_MS > 0)`,
+ *   宏为 0 时整块是死代码, 但里面的 `(uint32_t)(now-last) < FLUSH_MIN_MS`
+ *   展开成 "无符号 < 0" ⇒ 恒假比较 ⇒ GCC 报 -Wtype-limits, 而 ESP-IDF 6.0
+ *   默认把这类警告当错误(裸 -Werror), 新克隆直接编译失败。
+ *   改用 #if 后: 0 ⇒ 这段连同 s_last_flush_ms 一起不参与编译(无死代码/无警告);
+ *                 >0 ⇒ 原样编译进来, **保持原来的无符号计时差语义**,
+ *                      不做任何有符号转换, 因此计时回绕(溢出)行为与历史版本完全一致。 */
+#if FLUSH_MIN_MS > 0
+static uint32_t s_last_flush_ms = 0;/* 上一帧送屏时刻: 限速用 (仅限速开启时需要) */
+#endif
+
+/* ============ Flush 分段计时 (2026-10-30) ============
+ * 目的: 把一次送屏拆成"命令阶段"和"数据阶段", 才知道慢在哪。
+ * 约束(按需求): 默认关闭; 关闭时**整体剔除**(连变量都不生成); 只累加不打印;
+ *              不建任务、不引入 perf_ring、不改 SPI 时钟/DMA/CS/传输流程。
+ * 用法: 把 ST7305_PERF_STATS 改 1 重新构建, 运行后调 st7305_perf_dump() 看汇总。
+ * ⚠ 只测量真实时间, 不用理论值(33MHz/15KB≈4.5ms)代替实测。 */
+#ifndef ST7305_PERF_STATS
+#define ST7305_PERF_STATS 0
+#endif
+
+#if ST7305_PERF_STATS
+typedef struct {
+    uint32_t n_flush;        /* 成功次数 */
+    uint32_t n_fail;         /* 失败次数(含送屏返回错误) */
+    uint32_t n_lockfail;     /* 拿不到 s_lcd_lock 而丢帧的次数(不计入上面两项) */
+    uint32_t cmd_n,  cmd_sum,  cmd_min,  cmd_max;
+    uint32_t data_n, data_sum, data_min, data_max;
+    uint32_t tot_n,  tot_sum,  tot_min,  tot_max;
+} st7305_perf_t;
+static st7305_perf_t s_perf = { .cmd_min = 0xFFFFFFFFu, .data_min = 0xFFFFFFFFu,
+                                .tot_min = 0xFFFFFFFFu };
+
+static inline void perf_upd(uint32_t *n, uint32_t *sum, uint32_t *mn, uint32_t *mx, uint32_t v)
+{
+    (*n)++; (*sum) += v;
+    if (v < *mn) *mn = v;
+    if (v > *mx) *mx = v;
+}
+
+void st7305_perf_reset(void)
+{
+    memset(&s_perf, 0, sizeof(s_perf));
+    s_perf.cmd_min = s_perf.data_min = s_perf.tot_min = 0xFFFFFFFFu;
+    ESP_LOGI(TAG, "perf 统计已复位");
+}
+
+void st7305_perf_dump(void)
+{
+    if (!s_perf.tot_n) {
+        ESP_LOGI(TAG, "perf: 无样本 (开关已开? 是否刷过屏?) 锁丢帧=%u",
+                 (unsigned)s_perf.n_lockfail);
+        return;
+    }
+    /* 口径说明(刻意打印出来, 免得读日志的人误判):
+     *   - 三段都从 **拿到 s_lcd_lock 之后** 开始计时 ⇒ **不含等锁时间**;
+     *   - cmd + data = total(同一时间基 t0 → t_cmd_end → t_end), 三者可直接相加对照;
+     *   - ok + fail = 样本数; 拿不到锁直接丢帧的那次**不进样本**(单独一行给出);
+     *   - 被屏保门禁 / FLUSH_MIN_MS 限速跳过的帧**不产生任何 SPI 传输**, 也不进样本。 */
+    ESP_LOGI(TAG, "perf: 口径=拿锁后开始计时(不含等锁); cmd+data=total; ok+fail=样本");
+    ESP_LOGI(TAG, "perf: flush ok=%u fail=%u 锁丢帧=%u",
+             (unsigned)s_perf.n_flush, (unsigned)s_perf.n_fail, (unsigned)s_perf.n_lockfail);
+    ESP_LOGI(TAG, "perf: 命令 us  n=%u avg=%u min=%u max=%u sum=%u",
+             (unsigned)s_perf.cmd_n, (unsigned)(s_perf.cmd_sum / s_perf.cmd_n),
+             (unsigned)s_perf.cmd_min, (unsigned)s_perf.cmd_max, (unsigned)s_perf.cmd_sum);
+    ESP_LOGI(TAG, "perf: 数据 us  n=%u avg=%u min=%u max=%u sum=%u",
+             (unsigned)s_perf.data_n, (unsigned)(s_perf.data_sum / s_perf.data_n),
+             (unsigned)s_perf.data_min, (unsigned)s_perf.data_max, (unsigned)s_perf.data_sum);
+    ESP_LOGI(TAG, "perf: 总计 us  n=%u avg=%u min=%u max=%u sum=%u",
+             (unsigned)s_perf.tot_n, (unsigned)(s_perf.tot_sum / s_perf.tot_n),
+             (unsigned)s_perf.tot_min, (unsigned)s_perf.tot_max, (unsigned)s_perf.tot_sum);
+}
+#else  /* !ST7305_PERF_STATS ------------------------------------------------
+        * 关闭时: 结构体/累加器/打点代码**全部剔除**, 静态 RAM 占用 0;
+        * 只留两个空壳函数, 让头文件声明与 remcon 的 `lcdperf` 在两种配置下
+        * 都能正常链接 (否则关闭开关就 Unresolved symbol)。 */
+void st7305_perf_reset(void) { }
+
+void st7305_perf_dump(void)
+{
+    ESP_LOGI(TAG, "perf: 未启用 (把 st7305.c 的 ST7305_PERF_STATS 改成 1 重新构建)");
+}
+#endif /* ST7305_PERF_STATS */
 
 static uint8_t *s_txbuf = NULL;     /* 内部 RAM 的整帧发送缓冲 (DMA 可读) */
 static bool     s_txbuf_tried = false;
@@ -708,7 +797,13 @@ void lintos_emu_fb_dump(const uint8_t *fb, int w, int h)
 esp_err_t st7305_flush_from(st7305_handle_t *dev, const uint8_t *fb) {
     if (s_flush_blocked) return ESP_OK;   /* 屏保门禁: 屏保期间一律不刷屏 */
 #ifdef LINTOS_EMU_MODE
+    /* ★ 2026-10-30: 模拟器里**必须**到此为止。
+     *   esp-emu 没有 SPI 从设备模型（官方 Issue #5），继续走 st7305_flush_from_raw
+     *   会在 SPI 事务上永远等不到完成 → 主任务卡死在开机 Logo 后（实测只出 6 帧）。
+     *   帧已经从 stdout 导出，PC 端渲染即可，不需要也不应该再碰 SPI。
+     *   ⚠ 只在 -DLINTOS_EMU_MODE=1 时编入，真机固件不受影响。 */
     lintos_emu_fb_dump(fb, 400, 300);     /* 模拟器: 每帧导出到 UART */
+    return ESP_OK;
 #endif
     return st7305_flush_from_raw(dev, fb);
 }
@@ -716,6 +811,34 @@ esp_err_t st7305_flush_from(st7305_handle_t *dev, const uint8_t *fb) {
 esp_err_t st7305_flush_override(st7305_handle_t *dev) {
     if (!dev || !dev->fb) return ESP_ERR_INVALID_ARG;
     return st7305_flush_from_raw(dev, dev->fb);
+}
+
+/* ★★ 2026-10-30 修复「阅读器竖屏后进系统休眠 → 方向错/残影/图标缺半边」★★
+ *
+ * 必须回到系统横屏的三个原因:
+ *   · st7305_draw_pixel / st7305_clear 在 dev->pt_pfb 非空时**只写竖屏缓冲**
+ *     （300 宽，x>299 的像素被 pt_px 直接丢弃），而 st7305_flush_override 发的是 dev->fb
+ *     ⇒ 休眠界面全画进 pt_pfb，送出去的却是阅读器最后一帧残留。
+ *   · dev->pt_rot 残留会让 st7305_flush 继续按竖屏换算。
+ *   · 控制器 MADCTL / 地址窗口也要一并回横屏，否则 fb 正确也会被面板旋转。
+ *
+ * 语义: 比 st7305_set_rotation(dev,0,NULL) 多复位了控制器侧配置，供
+ *       「系统休眠界面」这类必须脱离阅读器方向的全局画面入口调用。 */
+void st7305_reset_rotation(st7305_handle_t *dev) {
+    if (!dev) return;
+    extern void st7305_partial_invalidate_pub(void);
+    st7305_partial_invalidate_pub();   /* fb 语义变了 → 局刷基线作废 */
+    dev->pt_pfb  = NULL;
+    dev->pt_rot  = 0;
+    dev->r_flip1 = NULL;
+    if (lcd_lock_take()) {
+        send_cmd(dev, 0x36); send_data_byte(dev, MADCTL_LANDSCAPE);
+        send_cmd(dev, 0x2A); { uint8_t d[] = {CASET_START, CASET_END}; send_data(dev, d, 2); }
+        send_cmd(dev, 0x2B); { uint8_t d[] = {RASET_START, RASET_END}; send_data(dev, d, 2); }
+        s_win_set = true;
+        xSemaphoreGive(s_lcd_lock);
+    }
+    ESP_LOGI(TAG, "旋转已复位为系统横屏 (pt_pfb/pt_rot 清空, MADCTL=0x%02X)", MADCTL_LANDSCAPE);
 }
 /* === 送屏: 同步 polling (2026-10-25 回退异步 DMA 双缓冲) ===
  * 为什么回退：上一版把整帧 memcpy 到 PSRAM 的 s_tx_buf 后 queue DMA，然后**放开锁返回**，
@@ -790,22 +913,23 @@ static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb) 
     }
     if (s_lpm_on && s_lpm_force != 1) st7305_set_lpm(dev, false);   /* set_lpm 自己拿锁 */
 
+#if FLUSH_MIN_MS > 0
     /* 限速到 16fps: 太近直接跳过这一帧(内容还在 fb 里, 下一帧会带上最新内容一起送)。
-     *   ⚠ 绝不在这里 vTaskDelay —— 会阻塞调用方(主循环/游戏任务), 手感发滞。 */
-    if (FLUSH_MIN_MS > 0) {
+     *   ⚠ 绝不在这里 vTaskDelay —— 会阻塞调用方(主循环/游戏任务), 手感发滞。
+     * ★ 2026-10-29: 用 #if 而不是运行期 if —— 宏为 0 时这段不参与编译(见 s_last_flush_ms 处说明)。
+     *   计时差保持**无符号**运算(now/last 都是 uint32_t, 相减天然处理回绕), 语义与历史版本一致。 */
+    {
         uint32_t now = lcd_now_ms();
-        /* ★ 2026-10-29: 差值按**有符号**比较。FLUSH_MIN_MS 是普通 int 宏(默认 0),
-         *   左侧若留成 uint32_t, 宏展开就是 "(uint32_t)x < 0" —— 无符号与 0 比恒假,
-         *   GCC 直接报 -Wtype-limits("comparison of unsigned expression in '< 0'
-         *   is always false")。6.0 默认把这类警告当错误, 会让新克隆直接编译失败。
-         *   两个时间点之差必然远小于 2^31 ms(约 24.8 天), 转 int32_t 不丢任何语义;
-         *   FLUSH_MIN_MS=0 时外层的 if 本来就恒假, 行为与改前完全一致。 */
-        if (s_last_flush_ms && (int32_t)(now - s_last_flush_ms) < (int32_t)FLUSH_MIN_MS)
+        if (s_last_flush_ms && (now - s_last_flush_ms) < (uint32_t)FLUSH_MIN_MS)
             return ESP_OK;
         s_last_flush_ms = now;
     }
+#endif
     if (!lcd_lock_take()) {                 /* 等不到就丢帧, 不硬抢 */
         s_flush_fail_streak++;
+#if ST7305_PERF_STATS
+        s_perf.n_lockfail++;                /* 单独计: 没有发生 SPI 传输, 不进耗时样本 */
+#endif
         return ESP_ERR_TIMEOUT;
     }
 
@@ -820,6 +944,9 @@ static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb) 
     send_cmd(dev, 0x2B); { uint8_t d[] = {RASET_START, RASET_END}; send_data(dev, d, 2); }
     s_win_set = true;
     send_cmd(dev, 0x2C);
+#if ST7305_PERF_STATS
+    uint32_t t_cmd_end = (uint32_t)esp_timer_get_time();   /* 命令阶段结束 */
+#endif
     /* ★ 同步整帧, 且**从内部 RAM 发** —— 这是"画面卡死后台正常"的根治点:
      *   PSRAM 直发会在任何一次写 flash(NVS/商店/日志) 时被打断而永久阻塞。
      * ★★ 2026-10-26 linit「帧率上不去」: fb 本来就优先分配在内部 RAM (见 init 的分配策略),
@@ -844,6 +971,21 @@ static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb) 
     }
     esp_err_t e = spi_device_polling_transmit(dev->spi, &t);
     uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t0);
+#if ST7305_PERF_STATS
+    {
+        uint32_t t_end = (uint32_t)esp_timer_get_time();
+        /* 三段用**同一个时间基**(t0 → t_cmd_end → t_end), 保证
+         * 命令段 + 数据段 = 总时长, 读数能互相对上; 不要用上面的 elapsed
+         * (它取在 t_end 之前, 会比 命令+数据 少几微秒)。 */
+        perf_upd(&s_perf.cmd_n,  &s_perf.cmd_sum,  &s_perf.cmd_min,  &s_perf.cmd_max,
+                 t_cmd_end - t0);
+        perf_upd(&s_perf.data_n, &s_perf.data_sum, &s_perf.data_min, &s_perf.data_max,
+                 t_end - t_cmd_end);
+        perf_upd(&s_perf.tot_n,  &s_perf.tot_sum,  &s_perf.tot_min,  &s_perf.tot_max,
+                 t_end - t0);
+        if (e == ESP_OK) s_perf.n_flush++; else s_perf.n_fail++;
+    }
+#endif
     xSemaphoreGive(s_lcd_lock);
     if (e != ESP_OK) {
         s_flush_fail_streak++;
@@ -904,7 +1046,17 @@ void st7305_invalidate_frame(void) {
     s_last_sum_valid = false;   /* 面板被复位/唤醒后必须重发, 不能被指纹跳过 */
     s_last_psum_valid = false;  /* 竖屏缓冲指纹同样作废 */
 }
-void st7305_partial_invalidate_pub(void) { }
+/* ★★★ 2026-10-28 【必须真正作废指纹】★★★
+ *   这个函数原来是个空壳(局刷删除时的遗留), st7305_set_rotation() 却靠它作废基线。
+ *   在"竖屏指纹每帧被 flush_from_raw 清掉"的旧行为下, 空壳无害 —— 反正下一帧必然重算。
+ *   但 st7305_flush 尾部改成"送屏成功就保留 psum 指纹"之后, 空壳就变成真缺陷:
+ *     书架/阅读器同一页从 rot=2 切到 rot=3 时, pfb 缓冲内容**完全没变** ⇒ psum 相同
+ *     ⇒ 1056 行判定"内容没变"直接 return ⇒ **整帧被跳过, 屏幕方向根本没转**。
+ *   旋转改变的是"pfb → fb"的换算关系, 不是 pfb 内容, 所以必须由语义变更方主动作废。 */
+void st7305_partial_invalidate_pub(void) {
+    s_last_sum_valid  = false;
+    s_last_psum_valid = false;
+}
 
 /* ==================== 面板自刷新档位 (2026-10-24) ====================
  * 0x38 = HPM, 内部自刷新 ≈32Hz;  0x39 = LPM ≈1Hz (极省电, 静态画面看不出差别)
@@ -1083,6 +1235,7 @@ esp_err_t st7305_flush(st7305_handle_t *dev) {
     if (s_last_sum_valid && sum == s_last_sum) return ESP_OK;
 
     esp_err_t e;
+    uint32_t act_before = s_flush_act_ms;   /* 送屏成功会更新它, 用来区分"真送出去"和"被跳过" */
     if (dev->r_flip1) {
         /* 横屏 180°: 必须在内存里翻转回横屏缓冲再送 (这块压缩屏不支持硬件行翻转) */
         st7305_fb_rot180(dev->fb, dev->r_flip1);
@@ -1090,7 +1243,27 @@ esp_err_t st7305_flush(st7305_handle_t *dev) {
     } else {
         e = st7305_flush_from(dev, dev->fb);
     }
-    if (e == ESP_OK) { s_last_sum = sum; s_last_sum_valid = true; }
+    /* ★★★ 2026-10-28 【竖屏指纹修复】★★★
+     *   1053 行注释写着"阅读器停在一页不动时，把每帧开销从 12 万次转换降到 16000 字节求和"，
+     *   但那个优化**从来没生效过**：
+     *     1057 行刚把 s_last_psum_valid 置 true →
+     *     调 st7305_flush_from →
+     *     flush_from_raw 开头(775-776)把 s_last_psum_valid 清成 false（那是给
+     *     "外部绕过缓存的直送"用的语义）→
+     *     这里只恢复了 s_last_sum_valid，**psum 没恢复**。
+     *   于是下一次 st7305_flush 的 1056 行判断 `s_last_psum_valid && psum == s_last_psum`
+     *   恒为假 ⇒ 每帧照旧做 memset(15000B) + 300×400 = 12 万次像素转换。
+     *   修法: 确认这一帧**真的发上屏了**再恢复 valid。
+     *   ⚠ 不能只看 e == ESP_OK: flush_from_raw 在 FLUSH_MIN_MS>0 时限速跳过也会返回 OK,
+     *     那种帧没上屏, 若把指纹记成"已送出", 下一帧就会因内容相同被跳过 ⇒ 永久丢帧。
+     *     (当前 FLUSH_MIN_MS=0 不会发生, 但保留这道判断防以后改值。)
+     *   ⚠ 屏保/外部直送走 flush_override / flush_from, 不经过本函数, 那里的作废仍然有效。 */
+    if (e == ESP_OK) {
+        s_last_sum = sum;
+        s_last_sum_valid = true;
+        if (dev->pt_pfb && s_flush_act_ms != act_before)
+            s_last_psum_valid = true;
+    }
     return e;
 }
 

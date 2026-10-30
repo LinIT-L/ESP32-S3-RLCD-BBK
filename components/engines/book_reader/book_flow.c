@@ -174,11 +174,59 @@ static int cp_utf8_len(uint32_t cp) {
     return 4;
 }
 
+/* ---- B2 (2026-10-30): GBK 标点禁则 ----
+ * 背景: 原来 GBK 分支直接 memset(brk, 0) ⇒ 纯宽度硬切, 标点会落在行首/行尾。
+ * 这里补一张小的静态码位表 (GB2312 符号区 A1xx / 全角 ASCII 区 A3xx)。
+ * ⚠ 只做"收回断行机会"(置 0), 不给 brk 置 2 —— 真正的兜底仍由 bf_layout 负责:
+ *   当整行没有合法断点时它会硬切 (book_flow.c 里 BF_LINE_CLOSE 分支), 不会死循环。
+ * 表项 = (hi<<8)|lo, 每项 2 B, 全表约 120 B Flash, 无 RAM 增量。 */
+
+/* 禁出现在行首: 句读/闭括号/后引号 */
+static bool gbk_nostart(uint8_t hi, uint8_t lo) {
+    static const uint16_t t[] = {
+        0xA1A2, /* 、 */ 0xA1A3, /* 。 */ 0xA1A4, /* · */ 0xA1AA, /* — */
+        0xA1AD, /* … */ 0xA1B3, /* 〕 */ 0xA1B5, /* 〉 */ 0xA1B7, /* 》 */
+        0xA1B9, /* 」 */ 0xA1BB, /* 』 */ 0xA1BD, /* 】 */ 0xA1AF, /* ’ */
+        0xA1B1, /* ” */ 0xA3A1, /* ！ */ 0xA3AC, /* ， */ 0xA3A9, /* ） */
+        0xA3BB, /* ； */ 0xA3BA, /* ： */ 0xA3BF, /* ？ */ 0xA3AE, /* ． */
+        0xA3AD, /* － */
+    };
+    uint16_t v = (uint16_t)(((uint16_t)hi << 8) | lo);
+    for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+        if (t[i] == v) return true;
+    return false;
+}
+/* 禁出现在行尾: 开括号/前引号 */
+static bool gbk_noend(uint8_t hi, uint8_t lo) {
+    static const uint16_t t[] = {
+        0xA1AE, /* ‘ */ 0xA1B0, /* “ */ 0xA1B2, /* 〔 */ 0xA1B4, /* 〈 */
+        0xA1B6, /* 《 */ 0xA1B8, /* 「 */ 0xA1BA, /* 『 */ 0xA1BC, /* 【 */
+        0xA3A8, /* （ */
+    };
+    uint16_t v = (uint16_t)(((uint16_t)hi << 8) | lo);
+    for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+        if (t[i] == v) return true;
+    return false;
+}
+
 void bf_breaks(const bf_ch_t *win, int cnt, uint8_t enc,
                uint8_t *brk, uint8_t *scratch, size_t scratch_cap) {
     if (cnt <= 0) return;
     if (enc == BF_ENC_GBK) {
-        memset(brk, 0, (size_t)cnt);
+        /* 默认每字之后都可断, 再按禁则收回 */
+        for (int k = 0; k < cnt; k++) brk[k] = 1;
+        for (int k = 0; k < cnt; k++) {
+            if (win[k].kind != BF_CH_CJK) continue;      /* 只有双字节字符参与 */
+            bool ns   = gbk_nostart(win[k].hi, win[k].lo);
+            bool ne   = gbk_noend(win[k].hi, win[k].lo);
+            if (ns && k > 0) brk[k - 1] = 0;             /* 标点不能落行首 → 其前不断 */
+            if (ne) brk[k] = 0;                          /* 开括号不能落行尾 → 其后不断 */
+            /* 连续标点 (……  ——  ？！) 整串内部不断 */
+            if (k > 0 && win[k - 1].kind == BF_CH_CJK &&
+                (ns || ne) && (gbk_nostart(win[k-1].hi, win[k-1].lo) ||
+                               gbk_noend(win[k-1].hi, win[k-1].lo)))
+                brk[k - 1] = 0;
+        }
         return;
     }
     /* scratch: 前半 UTF-8 缓冲, 后半 libunibreak 结果 */

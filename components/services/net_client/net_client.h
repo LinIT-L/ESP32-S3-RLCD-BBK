@@ -57,6 +57,12 @@ typedef struct {
     bool        no_redirect;  /* ⚠ 语义是"**禁止**跳转": 零初始化的 req 默认**跟随** 3xx。
                                *   (原字段叫 redirect 太容易踩: memset 0 就变成不跟随了) */
     bool        want_crc;     /* true → 收流时顺带算 crc32 (下载包完整性校验用) */
+    /* —— 可选: 完整性闸门 (2026-10-30) ——
+     *   非 0 时, 收流结束后**先校验再进入替换阶段**; 不匹配则整次下载判失败,
+     *   `.part` 被删除, 目标文件(含旧版本)保持原样。
+     *   语义: 0 = 不校验该项 (向后兼容, 老调用方 memset 0 行为不变)。 */
+    uint32_t    expect_crc;   /* 期望 crc32; 0 = 不校验 */
+    uint32_t    expect_size;  /* 期望字节数; 0 = 不校验 */
 } netc_req_t;
 
 /* 发起一次 GET。返回 false = 忙 或 参数不合法 (url 空 / 没给落点 / body_cap<=1)。 */
@@ -78,6 +84,15 @@ void netc_reset(void);
 
 /* 请求取消: 任务侧尽快收尾 (已写半截文件按失败处理并删除) */
 void netc_cancel(void);
+
+/* 掉电恢复（2026-10-30）—— 供"非下载"上下文复用同一套恢复逻辑，例如应用中心
+ * 扫描 /sdcard/store_pkg 时发现 `xxx.lua.bak` 就复位成 `xxx.lua`。
+ * 语义（与下载路径内部的恢复**完全同一份实现**）：
+ *   正式文件缺失 + .bak 存在 → 复位；正式文件存在 + .bak 存在 → 删陈旧 .bak；
+ *   没有 .bak → 什么都不做（只花一次 stat）。
+ * 不碰 .part（可能正在下载），不碰其它文件。自带栈缓冲，与正在进行的下载无共享状态。
+ * 返回 netc_rec_t 的值：0=NONE 1=RESTORED 2=CLEANED 3=FAILED。 */
+int netc_recover_path(const char *final_path);
 
 #ifdef __cplusplus
 }

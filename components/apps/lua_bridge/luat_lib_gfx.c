@@ -21,6 +21,21 @@ int gfx_i(lua_State *L, int idx) {
 }
 
 /* ============ 大号 ASCII (8×12 点阵整数倍放大, 仿 page_pomodoro) ============ */
+/* ★ 2026-10-30: app.statusbar() —— 用**系统那一套**画状态栏（date/time/电池图标）。
+ *   背景: Lua 页面是 fullscreen，系统不画状态栏；以前各脚本自己拼文字+百分比，
+ *   样式与系统不一致（用户反馈"状态栏不是默认的"）。这里直接调 svc_statusbar_draw_game，
+ *   保证与桌面/游戏页逐像素一致。 */
+#include "board_battery.h"
+
+static int l_statusbar(lua_State *L)
+{
+    uint8_t pct = 0;
+    board_battery_status_t st;
+    if (board_battery_read(&st) == ESP_OK) pct = st.percent;
+    svc_statusbar_draw_game(s_lcd, pct, false);
+    return 0;
+}
+
 void app_big_ascii(st7305_handle_t *lcd, int x, int y, char c, int scale, bool inv) {   /* [modsplit] 共享 */
     int idx = (c >= 0x20 && c <= 0x7E) ? (c - 0x20) : ('?' - 0x20);
     st7305_color_t fg = inv ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
@@ -423,6 +438,7 @@ void lua_mod_gfx_register(lua_State *L)
     lua_pushcfunction(L, l_fill);                lua_setfield(L, -2, "fill");
     lua_pushcfunction(L, l_rect);                lua_setfield(L, -2, "store_rect");
     lua_pushcfunction(L, l_rect);                lua_setfield(L, -2, "rect");
+    lua_pushcfunction(L, l_statusbar);            lua_setfield(L, -2, "statusbar");
     lua_pushcfunction(L, l_hline);               lua_setfield(L, -2, "hline");
     lua_pushcfunction(L, l_vline);               lua_setfield(L, -2, "vline");
     lua_pushcfunction(L, l_text);                lua_setfield(L, -2, "text");

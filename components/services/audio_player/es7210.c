@@ -167,7 +167,10 @@ int es7210_init(int i2c_port) {
         es7210_update_reg_bit(ES7210_CLOCK_OFF_REG01, clk_mask, 0x00);          /* 时钟域开 */
         es7210_write_reg(pwr_reg, 0x00);
         es7210_update_reg_bit((uint8_t)(ES7210_MIC1_GAIN_REG43 + ch), 0x10, 0x10); /* 使能 PGA */
-        es7210_update_reg_bit((uint8_t)(ES7210_MIC1_GAIN_REG43 + ch), 0x0F, 0x0A); /* 增益 30dB */
+        /* ★ 2026-10-30 linit 反馈"录音声音小": 30dB → 37.5dB(芯片最大, 编码 0x0D)。
+         *   实测安静环境峰值仅 516(1.6%FS), 两路都通、DC 偏移仅 -19 ⇒ 不是没接麦,
+         *   是链路增益偏低。PGA 是唯一不引入量化噪声的模拟增益, 优先加在这里。 */
+        es7210_update_reg_bit((uint8_t)(ES7210_MIC1_GAIN_REG43 + ch), 0x0F, 0x0D); /* 增益 37.5dB */
     }
 
     /* 上电: MIC 电源 + ADC/PGA + 偏置 */
@@ -200,10 +203,18 @@ int es7210_init(int i2c_port) {
 
 void es7210_deinit(void) {
     if (!s_initialized) return;
-    es7210_write_reg(ES7210_RESET_REG00, 0x32);
-    es7210_write_reg(ES7210_CLOCK_OFF_REG01, 0x3F);
+    /* ★ 2026-10-28: 同上 —— I2C 写失败必须报出来, 否则"以为关了其实还在跑"
+     *   (ES7210 四通道 ADC 正常工作 20~30mA, 是深睡电流的头号嫌疑)。
+     *   RESET_REG00=0x32 芯片进 reset/power-down, CLOCK_OFF_REG01=0x3F 关全部时钟。 */
+    esp_err_t e1 = es7210_write_reg(ES7210_RESET_REG00, 0x32);
+    esp_err_t e2 = es7210_write_reg(ES7210_CLOCK_OFF_REG01, 0x3F);
     s_initialized = false;
-    ESP_LOGI(TAG, "ES7210 已关闭");
+    if (e1 != ESP_OK || e2 != ESP_OK) {
+        ESP_LOGE(TAG, "ES7210 掉电失败! reg00=%s reg01=%s ⇒ I2C 无应答, 芯片仍在工作(20~30mA)",
+                 esp_err_to_name(e1), esp_err_to_name(e2));
+    } else {
+        ESP_LOGI(TAG, "ES7210 已关闭 (reg00=0x32, reg01=0x3F)");
+    }
 }
 
 /* ================= 运行时诊断 (2026-10-14) =================

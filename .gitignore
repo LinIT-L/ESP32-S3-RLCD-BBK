@@ -165,7 +165,7 @@ tools/esp_bin_gpio_scan.py
 tools/knl_unpack.py
 tools/pe_exports.py
 tools/lin_screen.py
-tools/emu_screen.py
+# tools/emu_screen.py 已入库: emu_run.sh 依赖它跑模拟器出图, 是给贡献者用的工具
 tools/emu_ui.html
 tools/preview_icons_v2.py
 tools/preview_hardcore.py
