@@ -205,11 +205,14 @@ async function downloadFirmware() {
      */
     const t = String(tag);
     const bare = t.replace(/^v/, '');                 /* v2.0 → 2.0 */
-    const siteUrls = [
-      FW_SITE_BASE + 'LinTOS-' + t + '-16MB.bin',     /* 标准命名 LinTOS-v2.0-16MB.bin */
-      FW_SITE_BASE + 'LinTOS-latest-16MB.bin',        /* 别名：永远指向最新发布 */
-      FW_SITE_BASE + 'LinTOS-' + bare + '-16MB.bin'   /* 兼容不带 v 的命名 */
-    ];
+    /* ⚠ 安全约束：**指定了具体版本时，绝不能回落到 latest 别名**。
+     *   否则某个版本文件缺失 → 拿到 latest → 用户以为刷的是 v1.4.3 其实是别的版本。
+     *   刷错固件比"下载失败"严重得多，所以这里只允许同版本的两种命名互相兜底。 */
+    const siteUrls = (t === 'latest')
+      ? [ FW_SITE_BASE + 'LinTOS-latest-16MB.bin' ]     /* 别名：永远指向最新发布 */
+      : [ FW_SITE_BASE + 'LinTOS-' + t + '-16MB.bin',   /* 标准命名 LinTOS-v2.0-16MB.bin */
+          FW_SITE_BASE + 'LinTOS-' + bare + '-16MB.bin' /* 兼容不带 v 的命名 */
+        ];
     const urls = (src === 'site')
       ? siteUrls
       : ['https://cdn.jsdelivr.net/gh/' + REPO + '@main/flash/merged_16mb.bin']
@@ -224,8 +227,11 @@ async function downloadFirmware() {
       } catch (e) { r = null; }
     }
     if (!r || !r.ok) {
-      throw new Error(verLabel + ' 固件下载失败：镜像与 GitHub 都不可达。' +
-        '可换网络重试，或到 https://github.com/' + REPO + '/releases 手动下载 .bin');
+      const why = (t === 'latest')
+        ? '镜像与 GitHub 都不可达，可换网络后重试'
+        : '该版本在镜像上没有对应文件（或网络不可达），请换一个版本';
+      throw new Error(verLabel + ' 固件下载失败：' + why +
+        '。也可到 https://github.com/' + REPO + '/releases 手动下载 .bin');
     }
     /* 标明实际生效的来源，避免"选了 GitHub 其实走镜像"却不知道 */
     const srcLabel = usedUrl.indexOf('bbk.linit.cn') >= 0 ? 'BBK.LinIT.cn'
