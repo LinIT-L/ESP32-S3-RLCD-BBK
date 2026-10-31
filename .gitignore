@@ -98,8 +98,17 @@ gps_state.png
 __pycache__/
 *.pyc
 
-# ===== 在线刷机页里的固件本体 (16MB, 用 dist/ 发布) =====
-flash/merged_16mb.bin
+# ===== 在线刷机页里的固件本体 (16MB) =====
+# ★ 2026-10-31: 原来这里忽略 flash/merged_16mb.bin，导致：
+#   刷机页的「GitHub 固件」源去 jsDelivr / raw 取它 → 404，永远下载失败。
+#   而 GitHub Releases 附件域又没有 CORS 头，浏览器 fetch 不进去。
+#   ⇒ 唯一能让「GitHub 优先」真正可用的办法就是把它入库，走 jsDelivr / Pages。
+#   代价：仓库每次发版 +16MB（历史永久）。发新版时需同步更新这个文件。
+# 如需恢复忽略，取消下一行注释即可（但页面 GitHub 源会重新变成 404）。
+# flash/merged_16mb.bin
+#
+# ⚠ 注意：第 12 行的全局规则 merged_*.bin 也会命中它，所以必须在后面显式放行。
+!flash/merged_16mb.bin
 
 # ===== 过程文档 / 预览稿（本地保留，不入库）=====
 休眠分步测试计划.md

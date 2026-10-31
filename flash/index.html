@@ -33,12 +33,12 @@
 <div class="wrap">
   <div class="card">
     <div class="title">LinTOS 固件刷写</div>
-    <label><input type="radio" name="src" value="site" checked> BBK.LinIT.cn 镜像（推荐）</label>
-    <label><input type="radio" name="src" value="github"> GitHub 固件</label>
+    <label><input type="radio" name="src" value="github" checked> GitHub 固件（默认）</label>
+    <label><input type="radio" name="src" value="site"> BBK.LinIT.cn 镜像（备用）</label>
     <select id="verSel"><option value="latest">最新版（加载中…）</option></select>
     <label><input type="radio" name="src" value="local"> 本地文件</label>
     <input type="file" id="fileInput" accept=".bin" hidden>
-    <p id="fwInfo">BBK.LinIT.cn · 16MB</p>
+    <p id="fwInfo">GitHub · 16MB</p>
   </div>
 
   <button id="flashBtn">下载固件</button>
@@ -213,10 +213,28 @@ async function downloadFirmware() {
       : [ FW_SITE_BASE + 'LinTOS-' + t + '-16MB.bin',   /* 标准命名 LinTOS-v2.0-16MB.bin */
           FW_SITE_BASE + 'LinTOS-' + bare + '-16MB.bin' /* 兼容不带 v 的命名 */
         ];
-    const urls = (src === 'site')
-      ? siteUrls
-      : ['https://cdn.jsdelivr.net/gh/' + REPO + '@main/flash/merged_16mb.bin']
-          .concat(siteUrls);                          /* GitHub 取不到就回落镜像 */
+    /* GitHub 源 = 仓库内 flash/merged_16mb.bin（已入库，jsDelivr 与 Pages 都带 CORS）。
+     *   ⚠ 不能走 Release 直链：release-assets.githubusercontent.com 没有任何
+     *     Access-Control-Allow-Origin，浏览器 fetch 必被 CORS 拦掉 —— 这正是原来
+     *     "下载失败"的主因之一。仓库内文件经 CDN 才是唯一可行路径。
+     *
+     *   顺序：jsDelivr（国内通常可达，且有强缓存）→ GitHub Pages（同源最近）→ 镜像兜底。 */
+    const ghUrls = [
+      'https://cdn.jsdelivr.net/gh/' + REPO + '@main/flash/merged_16mb.bin',
+      'https://linit-l.github.io/ESP32-S3-RLCD-BBK/flash/merged_16mb.bin'
+    ];
+
+    let urls;
+    if (src === 'site') {
+      urls = siteUrls;
+    } else if (t === 'latest') {
+      urls = ghUrls.concat(siteUrls);        /* GitHub 两条都失败再回落镜像 */
+    } else {
+      /* ★ 安全：GitHub 仓库里只有「最新版」这一个文件。
+       *   用户指定了旧版本时**绝不能**拿 merged_16mb.bin 顶上 ——
+       *   那会让人以为刷 v1.4.3、实际刷成最新版。旧版本一律走镜像。 */
+      urls = siteUrls;
+    }
 
     let usedUrl = '';
     for (const u of urls) {
@@ -234,8 +252,9 @@ async function downloadFirmware() {
         '。也可到 https://github.com/' + REPO + '/releases 手动下载 .bin');
     }
     /* 标明实际生效的来源，避免"选了 GitHub 其实走镜像"却不知道 */
-    const srcLabel = usedUrl.indexOf('bbk.linit.cn') >= 0 ? 'BBK.LinIT.cn'
-                   : (usedUrl.indexOf('jsdelivr') >= 0 ? 'jsDelivr' : 'GitHub');
+    const srcLabel = (usedUrl.indexOf('bbk.linit.cn') >= 0) ? 'BBK.LinIT.cn'
+                   : (usedUrl.indexOf('jsdelivr') >= 0) ? 'jsDelivr'
+                   : (usedUrl.indexOf('github.io') >= 0) ? 'GitHub Pages' : 'GitHub';
     $('fwInfo').textContent = srcLabel + ' · ' + verLabel + ' · 16MB';
     const total = Number(r.headers.get('Content-Length')) || 0;
     const reader = r.body.getReader();
