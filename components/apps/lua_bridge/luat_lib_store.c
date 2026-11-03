@@ -5,6 +5,7 @@
  * 加新 API: 本文件写 static int l_xxx(lua_State *L), 再在文件末尾的 register 里加一行。
  */
 #include "lua_bridge.h"
+#include "lua_sandbox.h"   /* ★ 2026-10-31: NVS 命名空间按信任级隔离 */
 #include "esp_timer.h"
 #include <string.h>
 #include <stdlib.h>
@@ -45,7 +46,11 @@ typedef struct {
 static lns_slot_t        s_lns[LNS_SLOTS];
 static esp_timer_handle_t s_lns_timer;
 
-static const char *lns_ns_name(uint8_t ns) { return ns ? "core_db" : "luaapp"; }
+/* ★ 2026-10-31 越权修复: 原来硬编码 "core_db"/"luaapp" ⇒ 第三方应用能写系统共享 KV。
+ *   现在统一过 lua_sandbox_ns(): 官方原样返回(行为不变), 第三方映射成 appdb_<8hex>。 */
+static const char *lns_ns_name(uint8_t ns) {
+    return lua_sandbox_ns(ns ? "core_db" : "luaapp");
+}
 
 static bool lns_write(lns_slot_t *s)
 {

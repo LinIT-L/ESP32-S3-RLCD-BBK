@@ -18,6 +18,7 @@
 #include "esp_pm.h"          /* V1.5.x: 游戏锁频 (PM 降频下锁 240MHz 防卡顿) */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"   /* ★ 2026-10-31: 触摸采样互斥 (多任务共读 GT911) */
 #include "esp_log.h"
 #include "bt_manager.h"
 #include "touch_panel.h"
@@ -374,9 +375,20 @@ static bool     s_tg_long_fired;       /* 长按是否已投递 */
  * main.c 用 input_consume_tap 取走后清零, 用于"点哪进哪"的 hit-test. */
 static int s_tap_x = -1, s_tap_y = -1;
 
-/* V1.0.66: 当前触摸的实时屏幕坐标 (供主菜单跟手拖动读取) */
-static bool s_touch_down = false;
+/* V1.0.66: 当前触摸的实时屏幕坐标 (供主菜单跟手拖动读取)
+ * ★ 2026-10-31: 改成 volatile —— 这几个字现在被**多个任务**读:
+ *   主循环(input_poll_touch 写) / 引擎帧循环 / board_shim 视频刷新任务(快捷栏读)。
+ *   不加 volatile 时 -O2 会把读缓存进寄存器, 视频任务永远看到旧值 ⇒
+ *   "快捷栏展开后触摸穿透/坐标错乱"。 */
+static volatile bool s_touch_down = false;
+/* 坐标保持普通 int: 32 位对齐读写在 Xtensa 上不会撕裂, 且 touch_map_screen/
+ * rotate_screen_coord 接收的是 int*, 加 volatile 反而要到处强转。 */
 static int  s_touch_sx = 0, s_touch_sy = 0;
+/* 最后一次触摸状态更新时间 (ms) —— 供"本帧没人采样"时按需补采 (见 input_touch_resample) */
+static volatile uint32_t s_touch_upd_ms = 0;
+/* ★ 2026-10-31: 覆盖层(下拉快捷栏)触摸独占锁 —— 定义提前到触摸状态旁边,
+ *   因为 touch_gesture_poll() 也要读它 (屏蔽页面级手势)。 */
+static volatile bool s_overlay_lock = false;
 
 /* V1.0.68: 每 tick 只读一次触摸芯片并缓存, 供 touch_gesture_poll 与
  * input_poll_touch 共用, 避免 GT911 读后清状态被两次读互相偷走事件. */
@@ -391,14 +403,17 @@ static uint32_t   s_touch_fail_count = 0;
 
 static void touch_jump_filter(tp_point_t *pt, bool pressed);   /* 前向声明 */
 
-static void touch_read_once(tp_point_t *pt) {
-    uint32_t tick = xTaskGetTickCount();
-    if (s_touch_cached_valid && tick == s_touch_cache_tick) {
-        *pt = s_touch_cached;   /* 本 tick 已读过, 直接回放缓存 */
-        return;
-    }
-    s_touch_cached_valid = true;
-    s_touch_cache_tick = tick;
+/* ★★★ 2026-10-31: 触摸采样加互斥。
+ *   背景: 同一个缓存现在会被**两个任务**同时访问 ——
+ *     ① 主循环 input_poll_touch (正常页面)
+ *     ② board_shim 视频刷新任务里的快捷栏 (input_touch_resample, 游戏里补采)
+ *   原来只有"按 tick 去重", 但两个任务跨 tick 同时进来时都会读 I2C 并**互相覆盖**
+ *   s_touch_cached / _count / _valid ⇒ 坐标与按下状态错位 (快捷栏手势乱、虚拟按键抽风)。
+ *   互斥只包住"真正读 I2C"这一段; 同 tick 命中缓存时不进锁 (零开销)。
+ *   取锁超时 20ms: 触摸芯片挂死时宁可这一帧回放旧值, 也不能把渲染任务吊死。 */
+static SemaphoreHandle_t s_touch_mtx = NULL;
+
+static void touch_read_locked(tp_point_t *pt) {
     /* V1.0.xx: 无触摸机型自动识别: 未探测到触摸芯片 → 直接视为"未按压"跳过读取,
      * 避免每帧 touch_panel_read 恒返回 false 被误判为连续读失败狂刷日志/请求恢复. */
     if (!touch_panel_is_present()) {
@@ -446,6 +461,42 @@ static void touch_read_once(tp_point_t *pt) {
     *pt = s_touch_cached;
 }
 
+static uint32_t s_idle_read_ms = 0;   /* 空闲降频: 上次真正读 I2C 的时刻 */
+
+static void touch_read_once(tp_point_t *pt) {
+    uint32_t tick = xTaskGetTickCount();
+    if (s_touch_cached_valid && tick == s_touch_cache_tick) {
+        *pt = s_touch_cached;   /* 本 tick 已读过, 直接回放缓存 */
+        return;
+    }
+    /* ★★★ 2026-11-02 linit「触摸降频省电」★★★
+     *   主循环每 16ms 探一次 ⇒ I2C 事务 ~62 次/秒，CST836U 也就一直全速扫描（约 1mA）。
+     *   手指没按住时降到 **20Hz（50ms 一次）**，按下沿最多晚 50ms（无感）；
+     *   一旦按下立刻恢复每帧读，拖动/滑动/双击的手感不变。 */
+    if (s_touch_cached_valid && !s_touch_cached.pressed) {
+        uint32_t now = tick * portTICK_PERIOD_MS;
+        if ((uint32_t)(now - s_idle_read_ms) < 50u) { *pt = s_touch_cached; return; }
+        s_idle_read_ms = now;
+    }
+    bool locked = false;
+    if (!s_touch_mtx) {
+        /* 首次: 创建后置标, 允许并发创建时后到者复用 (FreeRTOS mutex 语义) */
+        SemaphoreHandle_t m = xSemaphoreCreateMutex();
+        if (m) s_touch_mtx = m;
+    }
+    if (s_touch_mtx) locked = (xSemaphoreTake(s_touch_mtx, pdMS_TO_TICKS(20)) == pdTRUE);
+    /* 拿到锁后再判一次: 可能刚被另一个任务读完 (同一 tick 内双击都来读) */
+    if (s_touch_cached_valid && xTaskGetTickCount() == s_touch_cache_tick) {
+        if (locked) xSemaphoreGive(s_touch_mtx);
+        *pt = s_touch_cached;
+        return;
+    }
+    s_touch_cached_valid = true;
+    s_touch_cache_tick = tick;
+    touch_read_locked(pt);
+    if (locked) xSemaphoreGive(s_touch_mtx);
+}
+
 static void touch_map_screen(int16_t rx, int16_t ry, int *sx, int *sy);
 static menu_action_t touch_gesture_poll(void);
 
@@ -455,6 +506,39 @@ void input_poll_touch(void) {
     touch_read_once(&pt);
     s_touch_down = pt.pressed;
     if (pt.pressed) touch_map_screen(pt.x, pt.y, &s_touch_sx, &s_touch_sy);
+    s_touch_upd_ms = now_ms();
+}
+
+/* ★★★ 2026-10-31 (快捷栏 / 引擎触摸冲突): **按需补采一次触摸**。
+ *   主循环每帧调 input_poll_touch, 但游戏里主任务被引擎阻塞时不跑 ⇒ 快照会"冻住"。
+ *   覆盖层(快捷栏)在自己的帧上下文里发现快照过期就调这里补一次 —— 幂等:
+ *   touch_read_once 按 tick 去重, 同一 tick 不会重复读 I2C。
+ *   只更新"当前按住状态", **不碰** 手势状态机 (s_o_armed/s_o_zone),
+ *   所以不会打断底部上滑返回 / 屏蔽带判定。 */
+void input_touch_resample(void) {
+    if (s_touch_blocked) { s_touch_down = false; return; }
+    tp_point_t pt;
+    touch_read_once(&pt);
+    s_touch_down = pt.pressed;
+    if (pt.pressed) touch_map_screen(pt.x, pt.y, &s_touch_sx, &s_touch_sy);
+    s_touch_upd_ms = now_ms();
+}
+
+/* 触摸快照多久没更新了 (ms)。覆盖层据此判断"要不要自己补采"。 */
+uint32_t input_touch_age_ms(void) {
+    if (s_touch_upd_ms == 0) return 0xFFFFFFFFu;
+    return now_ms() - s_touch_upd_ms;
+}
+
+/* ★ 2026-10-31: 释放所有"触摸派生"的按键状态。
+ *   快捷栏收起时必须调一次: 覆盖层独占期间虚拟手柄读不到点(见 input_get_touch_multi),
+ *   但引擎内部的 s_joypad / 摇杆状态是**上一帧的**, 不清就会一直"按着方向"
+ *   ⇒ 用户描述的"退出快捷栏后触摸异常 / 角色自己走"。
+ *   这里把虚拟手柄强制喂一次"全部松开", 引擎下一帧读到的就是未按下。 */
+void input_touch_release_all(void) {
+    virtual_keys_poll_multi(0, 0, false, 0, 0, false);
+    s_touch_down = false;
+    s_touch_upd_ms = now_ms();
 }
 
 /* V1.0.95: 返回当前触摸按住时长(ms); 未按住返回 0.
@@ -631,6 +715,17 @@ static menu_action_t touch_gesture_poll(void) {
     s_tap_x = s_tap_y = -1;
     tp_point_t pt;
     touch_read_once(&pt);
+    /* ★★★ 2026-10-31: 覆盖层(下拉快捷栏)独占期间, **页面级手势一律不产生**。
+     *   否则用户横向拖音量条时, 只要纵向位移够大就会被判成"底部上滑返回"，
+     *   直接把游戏/页面退掉 (用户报的"快捷栏手势与游戏操作冲突")。
+     *   这里只同步"是否按住"(覆盖层要读), 坐标仍由 input_poll_touch / 覆盖层自己写，
+     *   两边都走 touch_map_screen 的同一套映射，不会出现两套坐标系。 */
+    if (s_overlay_lock) {
+        s_touch_down = pt.pressed;
+        s_tg_state = TG_IDLE;        /* 复位手势机: 解锁后不会接着用半截手势 */
+        s_tg_long_fired = false;
+        return MENU_ACTION_NONE;
+    }
     /* 更新实时触摸屏幕坐标 (供主菜单跟手拖动读取) */
     s_touch_down = pt.pressed;
     if (pt.pressed) {
@@ -1024,27 +1119,60 @@ void input_set_bottom_shield(bool on) { s_bottom_shield = on; }
 /* ★ 引擎内 overlay 钩子 (见 input.h): os 层注入实现, 引擎每帧调用。
  * 用函数指针而不是直接调 os_* —— 引擎组件不依赖 os, 避免破坏分层单向。 */
 static engine_overlay_fn s_engine_quickbar_fn = NULL;
+/* ★ 2026-10-31: 拆成「收手势/执行动作」与「只画」两段。
+ *   原因: board_shim 的视频刷新任务是在**持有帧锁**的情况下调 overlay 的,
+ *   而快捷栏里点一下 Wi-Fi 会走 esp_wifi_start() (1~3 秒) ——
+ *   锁被占住这么久, 模拟任务一帧都提交不了 ⇒ 整个游戏冻住 (用户报的"点 Wi-Fi 就卡死")。
+ *   拆开后: tick 在锁外跑 (动作再慢也不占锁), draw 在锁内跑 (只画像素, 微秒级)。 */
+static engine_overlay_tick_fn s_engine_quickbar_tick_fn = NULL;
+static engine_overlay_fn      s_engine_quickbar_draw_fn = NULL;
 
 void engine_overlay_set_quickbar(engine_overlay_fn fn) { s_engine_quickbar_fn = fn; }
+void engine_overlay_set_quickbar_split(engine_overlay_tick_fn tick, engine_overlay_fn draw)
+{
+    s_engine_quickbar_tick_fn = tick;
+    s_engine_quickbar_draw_fn = draw;
+}
 
 void engine_overlay_quickbar(void *lcd)
 {
+    if (s_engine_quickbar_tick_fn) s_engine_quickbar_tick_fn();
+    if (s_engine_quickbar_draw_fn) { if (lcd) s_engine_quickbar_draw_fn(lcd); return; }
     if (s_engine_quickbar_fn && lcd) s_engine_quickbar_fn(lcd);
 }
 
+void engine_overlay_quickbar_tick(void)
+{
+    if (s_engine_quickbar_tick_fn) s_engine_quickbar_tick_fn();
+}
+
+void engine_overlay_quickbar_draw(void *lcd)
+{
+    if (!lcd) return;
+    if (s_engine_quickbar_draw_fn) s_engine_quickbar_draw_fn(lcd);
+    else if (s_engine_quickbar_fn) s_engine_quickbar_fn(lcd);
+}
+
 /* ★ 覆盖层触摸独占锁 (2026-10-29, 下拉快捷栏): 置位后普通调用者一律返回"无触摸",
- *   避免从顶部下拉时下方主菜单/列表跟着滚动。覆盖层自己用 _raw 版本读真实坐标。 */
-static bool s_overlay_lock = false;
+ *   避免从顶部下拉时下方主菜单/列表跟着滚动。覆盖层自己用 _raw 版本读真实坐标。
+ * ★ 2026-10-31: 加 volatile —— 写方(主循环/视频任务)与读方(引擎任务)不同,
+ *   不加会被编译器缓存成常量, 表现为"锁不住 / 收不起来"。
+ *   (变量定义已提前到触摸状态区, 见 s_overlay_lock) */
 
 void input_set_overlay_lock(bool on) { s_overlay_lock = on; }
+bool input_overlay_locked(void)      { return s_overlay_lock; }
 
+/* ★★★ 2026-10-31: 覆盖层读触摸 —— **只读快照, 不跑手势状态机**。
+ *   原来这里是把锁临时放开再调 input_get_touch_pos(): 那会完整执行
+ *   s_o_armed / s_o_zone / 屏蔽带判定, 而这些状态由主循环**同时**消费 ⇒
+ *   两个任务抢同一套锁存状态 → 底部上滑返回/拖动判定错乱, 表现就是
+ *   "快捷栏关掉之后触摸变怪"。现在只取"当前是否按住 + 屏幕坐标"。 */
 bool input_get_touch_pos_raw(int *x, int *y)
 {
-    bool saved = s_overlay_lock;
-    s_overlay_lock = false;              /* 临时放开, 让原逻辑跑完整流程 */
-    bool r = input_get_touch_pos(x, y);
-    s_overlay_lock = saved;
-    return r;
+    if (s_touch_blocked || !s_touch_down) return false;
+    if (x) *x = s_touch_sx;
+    if (y) *y = s_touch_sy;
+    return true;
 }
 
 bool input_get_touch_pos(int *x, int *y) {
@@ -1108,6 +1236,13 @@ void input_get_touch_multi(tp_point_t pts[TP_MAX_POINTS], int *count) {
     if (count) *count = 0;
     if (!pts) return;
     for (int i = 0; i < TP_MAX_POINTS; i++) pts[i].pressed = false;
+    /* ★★★ 2026-10-31 (快捷栏与引擎抢触摸的根因之一):
+     *   原来这里**不看** s_overlay_lock ⇒ 快捷栏展开时, 虚拟手柄照样拿得到触点,
+     *   于是"同一组触摸"被两方同时处理: 用户拖音量条, 游戏同时收到方向键;
+     *   收起后引擎的 s_joypad 还停在按下态 ⇒ 角色自己走。
+     *   覆盖层独占期间一律返回"没有触点": 下游 virtual_keys_poll_multi 收到
+     *   d0=false 会自动把摇杆/按键全部松开, 不需要引擎各写一份释放逻辑。 */
+    if (s_overlay_lock) return;
     tp_point_t p0;
     touch_read_once(&p0);   /* 确保本帧已刷新缓存 (含全部触点) */
     int c = s_touch_cached_count;

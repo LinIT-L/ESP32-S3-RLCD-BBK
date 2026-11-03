@@ -5,6 +5,9 @@
 #include "bt_manager.h"   /* bt_manager_is_enabled(): BT 开着时扫描时序不能覆盖 */
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_netif_ip_addr.h"   /* IPSTR / IP2STR（AP 模式打印 IP） */
+#include "dns_server.h"          /* AP captive 门户的 DNS 劫持（与 AP 同生命周期） */
+#include "lwip/ip4_addr.h"       /* IP4_ADDR */
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 #include "freertos/FreeRTOS.h"
@@ -13,6 +16,7 @@
 #include "svc_nvs.h"
 #include "svc_time.h"
 #include "esp_attr.h"
+#include "esp_timer.h"     /* 下载结束后延迟恢复 DTIM 省电用 */
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
@@ -23,7 +27,13 @@
 #define KEY_PASS "pass"
 #define KEY_STATE "state"   /* 用户显式开关意图: 1=开 0=关; 缺省=auto(有凭据才开) */
 
+static int  s_ps_hold;                    /* 下载中引用计数 (>0 = 禁止省电) */
+static bool s_ps_diag_off;                /* 串口诊断 `wifi ps 0` 的强制全醒 */
+static esp_timer_handle_t s_ps_timer;     /* 下载结束后延迟恢复 DTIM 的定时器 */
 static bool s_inited = false;
+/* ★ 2026-11-01: AP 热点状态（由本模块统一持有；见 wifi_manager_ap_start） */
+static bool                 s_ap_on  = false;
+static dns_server_handle_t  s_ap_dns = NULL;
 static bool s_diag_done = false;   /* 一次性域名/TCP 诊断 */
 static int8_t s_stable_power = 0;   /* ★ 连上时记下的发射功率(重连直接复用) */    /* esp_wifi_init 已调用 */
 static bool s_enabled = false;   /* esp_wifi_start 已成功 */
@@ -53,7 +63,8 @@ static bool s_suppress_reconnect = false;  /* 扫描期间禁止自动重连 (�
  * 自动连接仍然只用 s_ssid/s_pass(= 最近一次成功使用的那条), 这里只是历史。 */
 #define WIFI_HIST_MAX 5
 typedef struct { char ssid[33]; char pass[65]; } wifi_hist_t;
-static wifi_hist_t s_hist[WIFI_HIST_MAX];
+/* ★ 2026-11-02: 5 条历史（490 B）只在 WiFi 页面里用, 放 PSRAM。 */
+static EXT_RAM_BSS_ATTR wifi_hist_t s_hist[WIFI_HIST_MAX];
 static int  s_hist_n = 0;
 static bool s_hist_loaded = false;
 #define KEY_HIST "hist"
@@ -362,9 +373,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         /* ★★ 2026-10-26 linit「省电」: 连上并拿到 IP 后进入 DTIM 省电。
          *   原来全程 WIFI_PS_NONE(射频永远全醒 ~70~90mA), 那是为了扫描/连接稳定;
          *   但**连上之后不扫描了** ⇒ 可以按 AP 的 DTIM 间隔睡射频(降到 ~20~30mA)。
-         *   断开/扫描时会切回 NONE(见 DISCONNECTED 分支与 scan 入口)。 */
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-        ESP_LOGI(TAG, "WiFi 省电: 已切到 MIN_MODEM (按 DTIM 间隔睡射频)");
+         *   断开/扫描时会切回 NONE(见 DISCONNECTED 分支与 scan 入口)。
+         * ★ 2026-10-31: 若此刻正在下载(s_ps_hold>0) 或用户用 `wifi ps 0` 强制全醒,
+         *   这里**不能**把省电打开 —— 否则重连一次就把"下载期间全醒"的规则破坏了。 */
+        if (s_ps_hold > 0 || s_ps_diag_off) {
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            ESP_LOGI(TAG, "WiFi 省电: 下载/诊断中, 保持 NONE(全醒)");
+        } else {
+            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+            ESP_LOGI(TAG, "WiFi 省电: 已切到 MIN_MODEM (按 DTIM 间隔睡射频)");
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
         /* 扫描完成: 取回 AP 列表 */
         s_scan_done = true;
@@ -581,8 +599,10 @@ bool wifi_manager_enable(void) {
     if (!s_inited) wifi_manager_init();
     if (!s_inited) return false;
 
-    /* V1.0.67: 网页手柄可能切过 AP 模式, 这里强制回 STA */
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    /* V1.0.67: 网页手柄可能切过 AP 模式, 这里强制回 STA。
+     * ★ 2026-11-01: 但如果热点正开着，必须用 APSTA —— 用 MODE_STA 会把热点关掉，
+     *   而 s_ap_on 还留着 true ⇒ 网页手柄的页面立刻打不开。 */
+    esp_wifi_set_mode(s_ap_on ? WIFI_MODE_APSTA : WIFI_MODE_STA);
     if (esp_wifi_start() != ESP_OK) {
         ESP_LOGD(TAG, "WiFi 启动失败");
         return false;
@@ -624,7 +644,102 @@ bool wifi_manager_enable(void) {
     return true;
 }
 
+/* ==================== AP 热点（统一持有，APSTA） ====================
+ * 设计要点见 wifi_manager.h。三条硬约束：
+ *   ① **绝不**用 WIFI_MODE_AP —— 那会踢掉已连接的 STA；
+ *      APSTA 下驱动自动把 AP 信道对齐到 STA 信道。
+ *   ② 退出只关 AP（stop dhcps/dns + 模式回 STA），不碰 STA 连接。
+ *   ③ 重复 start 幂等；stop 后 s_ap_on 必须复位，否则下次永远起不来。 */
+esp_err_t wifi_manager_ap_start(const char *ssid, const char *pass,
+                                uint8_t channel, uint8_t max_conn, bool captive)
+{
+    if (!ssid || !ssid[0]) return ESP_ERR_INVALID_ARG;
+    if (s_ap_on) return ESP_OK;
+
+    if (!s_inited) wifi_manager_init();
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    if (!wifi_manager_enable()) return ESP_FAIL;      /* 射频起（内部已处理 APSTA） */
+
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap) ap = esp_netif_create_default_wifi_ap();
+    if (!ap) return ESP_FAIL;
+
+    wifi_config_t cfg = { 0 };
+    size_t sl = strlen(ssid);
+    if (sl > sizeof(cfg.ap.ssid) - 1) sl = sizeof(cfg.ap.ssid) - 1;
+    memcpy(cfg.ap.ssid, ssid, sl);
+    cfg.ap.ssid_len = (uint8_t)sl;
+    cfg.ap.channel  = channel ? channel : 6;
+    cfg.ap.max_connection = max_conn ? max_conn : 4;
+    cfg.ap.pmf_cfg.required = false;
+    if (pass && strlen(pass) >= 8) {              /* WPA2 要求 ≥8 字符 */
+        size_t pl = strlen(pass);
+        if (pl > sizeof(cfg.ap.password) - 1) pl = sizeof(cfg.ap.password) - 1;
+        memcpy(cfg.ap.password, pass, pl);          /* 有意截断：WPA2 密码上限 63 */
+        cfg.ap.password[pl] = 0;
+        cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        cfg.ap.password[0] = 0;
+        cfg.ap.authmode    = WIFI_AUTH_OPEN;
+    }
+
+    /* ★ 关键：APSTA，保 STA 不掉线 */
+    if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK) return ESP_FAIL;
+    if (esp_wifi_set_config(WIFI_IF_AP, &cfg) != ESP_OK) return ESP_FAIL;
+
+    /* 网关固定 8.8.8.8：手机连上后浏览器直接访问它（好记，和旧行为一致） */
+    esp_netif_ip_info_t ip = { 0 };
+    IP4_ADDR(&ip.ip,      8, 8, 8, 8);
+    IP4_ADDR(&ip.gw,      8, 8, 8, 8);
+    IP4_ADDR(&ip.netmask, 255, 255, 255, 0);
+    esp_netif_dhcps_stop(ap);
+    esp_netif_set_ip_info(ap, &ip);
+    if (captive)
+        esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
+                               "http://8.8.8.8/", strlen("http://8.8.8.8/"));
+    esp_netif_dhcps_start(ap);
+
+    if (captive) {
+        dns_server_config_t dc = DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
+        s_ap_dns = start_dns_server(&dc);
+        if (!s_ap_dns) ESP_LOGW(TAG, "captive DNS 启动失败（不影响网页访问）");
+    }
+
+    s_ap_on = true;
+    ESP_LOGI(TAG, "AP 已开启: '%s' (%s, ch=%u, captive=%d) 已连接的 STA 保持不动",
+             ssid, cfg.ap.authmode == WIFI_AUTH_OPEN ? "开放" : "WPA2",
+             (unsigned)cfg.ap.channel, (int)captive);
+    return ESP_OK;
+}
+
+void wifi_manager_ap_stop(void)
+{
+    if (!s_ap_on) return;
+    s_ap_on = false;
+    if (s_ap_dns) { stop_dns_server(s_ap_dns); s_ap_dns = NULL; }
+    /* 只关 AP，STA 继续用：回 STA 模式即可（AP netif 不再承载流量） */
+    if (s_enabled) esp_wifi_set_mode(WIFI_MODE_STA);
+    ESP_LOGI(TAG, "AP 已关闭（STA 保持不变: %s）", s_connected ? "已连接" : "未连接");
+}
+
+bool wifi_manager_ap_is_on(void) { return s_ap_on; }
+
+bool wifi_manager_ap_get_ip(char *out, size_t cap)
+{
+    if (!s_ap_on || !out || cap == 0) return false;
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap) return false;
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(ap, &ip) != ESP_OK) return false;
+    snprintf(out, cap, IPSTR, IP2STR(&ip.ip));
+    return true;
+}
+
 bool wifi_manager_disable(void) {
+    /* ★ 2026-11-01: 关射频前先把本模块的 AP 关掉（AP 归本模块管）。
+     *   不然下面 esp_wifi_stop() 会把热点一起停掉，但 s_ap_on 仍为 true，
+     *   下次开热点会误判"已开"直接返回 ⇒ 热点再也起不来。 */
+    if (s_ap_on) wifi_manager_ap_stop();
     if (!s_enabled) return true;
     esp_wifi_disconnect();
     esp_wifi_stop();
@@ -732,6 +847,57 @@ bool wifi_manager_consume_connected_event(void) {
 const char *wifi_manager_get_status(void) { return s_status; }
 
 /* V1.6.x: 返回已连接 WiFi 的纯 IP 串 (未连接则为空串) */
+void wifi_manager_set_ps_diag(bool ps_off) {
+    s_ps_diag_off = ps_off;
+    if (ps_off && s_ps_timer && esp_timer_is_active(s_ps_timer)) esp_timer_stop(s_ps_timer);
+    esp_wifi_set_ps(ps_off ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    ESP_LOGW(TAG, "诊断: 射频省电已设为 %s", ps_off ? "NONE(全醒)" : "MIN_MODEM(默认)");
+}
+
+/* ============ 下载期间强制全醒 (2026-10-31 linit 定规) ============
+ * 规则: **任何下载/取数期间都不许进 DTIM 省电**。
+ * 真机依据(同一张卡/同一个 AP, 就差一个省电开关):
+ *   省电 MIN_MODEM: 局域网 ping 丢包 37.5%, RTT 21~276ms(均值 144ms);
+ *                   41.7 MB 资源包传到第 8 个文件(7.5MB)就断流, 之后连 TCP 都建不起来。
+ *   关掉省电:      丢包 0%, RTT 10~44ms(均值 22ms); 同样的包一次跑完。
+ * 实现: 引用计数 + 延迟恢复。
+ *   · netc 每次请求开始 hold(+1) → 计数 0→1 时立刻 NONE;
+ *   · 请求结束 hold(-1) → 计数归零后 **等 8 秒**再回 MIN_MODEM:
+ *     109 个文件连续下载时不会每个文件都切一次模式(每次切 DTIM 要重新协商,
+ *     频繁切反而更差), 而单次临时取数结束后又能及时省电。 */
+#define PS_RESTORE_DELAY_MS 8000
+
+static void ps_restore_cb(void *arg) {
+    (void)arg;
+    if (s_ps_hold > 0 || s_ps_diag_off) return;
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    ESP_LOGI(TAG, "WiFi 省电: 下载已结束 %d s, 恢复 MIN_MODEM", PS_RESTORE_DELAY_MS / 1000);
+}
+
+void wifi_manager_ps_hold(bool on) {
+    if (on) {
+        if (s_ps_timer && esp_timer_is_active(s_ps_timer)) esp_timer_stop(s_ps_timer);
+        if (s_ps_hold == 0 && !s_ps_diag_off) {
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            ESP_LOGI(TAG, "WiFi 省电: 开始下载, 切 NONE(全醒)");
+        }
+        s_ps_hold++;
+        return;
+    }
+    if (s_ps_hold == 0) return;
+    if (--s_ps_hold > 0) return;
+    if (s_ps_diag_off) return;             /* 诊断态由用户控制, 不自动恢复 */
+    if (!s_ps_timer) {
+        esp_timer_create_args_t a = { .callback = ps_restore_cb, .name = "ps_restore" };
+        if (esp_timer_create(&a, &s_ps_timer) != ESP_OK) {
+            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   /* 建不出定时器就直接恢复 */
+            return;
+        }
+    }
+    esp_timer_stop(s_ps_timer);
+    esp_timer_start_once(s_ps_timer, (uint64_t)PS_RESTORE_DELAY_MS * 1000);
+}
+
 bool wifi_manager_get_ip(char *out, size_t sz) {
     if (!out || sz == 0) return false;
     out[0] = '\0';

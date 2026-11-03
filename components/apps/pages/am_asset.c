@@ -10,6 +10,7 @@
  */
 #include "am_asset.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"   /* 64 KB 拷贝缓冲放 PSRAM（内部 RAM 最大块只有 31 KB） */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -48,6 +49,10 @@ static void mkdirs(const char *path)
     mkdir(tmp, 0777);
 }
 
+/* 对外入口 (2026-10-31): 多文件直接下载要给每个文件建父目录,
+ * 与这里共用同一份实现 —— 免得两处对"末段要不要建"理解不一致。 */
+void am_asset_mkdirs(const char *path) { if (path && path[0]) mkdirs(path); }
+
 /* 目录内某个路径的父目录 */
 static void parent_of(const char *path, char *out, size_t cap)
 {
@@ -59,7 +64,16 @@ static void parent_of(const char *path, char *out, size_t cap)
     out[n] = 0;
 }
 
-static bool __attribute__((unused)) copy_range(FILE *fi, long off, uint32_t len, const char *dst)
+/* 逐块拷贝。prog 可为 NULL —— 每拷一块回调一次 (done, total)。
+ * ★ 2026-10-31: 加回调是为了让"解包大文件"时进度条也在动。
+ *   原来只在**每个文件**解完后调一次 cb，41 MB 的包里 11 MB 的 SSS.MKF
+ *   写一次要好几秒，界面看着就是"卡在 70%"。
+ * ★★ 2026-10-31 提速：缓冲由调用方传入（PSRAM 64 KB），不再用 4 KB static。
+ *   4 KB 意味着 41.7 MB 要 1 万多次 fread+fwrite，每次都要过 FATFS + SDMMC 的
+ *   块开销 ⇒ 真机实测解包要好几分钟。64 KB 一次搬完，实测快一个数量级。 */
+static bool copy_range(FILE *fi, long off, uint32_t len, const char *dst,
+                       uint8_t *buf, size_t bufsz,
+                       void (*prog)(uint32_t done, uint32_t total))
 {
     char dir[256];
     parent_of(dst, dir, sizeof(dir));
@@ -71,15 +85,16 @@ static bool __attribute__((unused)) copy_range(FILE *fi, long off, uint32_t len,
         ESP_LOGE(TAG, "写文件失败: %s", dst);
         return false;
     }
-    static uint8_t buf[COPY_BUF];
-    uint32_t left = len;
+    uint32_t left = len, done_b = 0;
     bool ok = true;
     while (left > 0) {
-        size_t want = left > COPY_BUF ? COPY_BUF : left;
+        size_t want = left > bufsz ? bufsz : left;
         size_t got = fread(buf, 1, want, fi);
         if (got == 0) { ok = false; break; }
         if (fwrite(buf, 1, got, fo) != got) { ok = false; break; }
         left -= (uint32_t)got;
+        done_b += (uint32_t)got;
+        if (prog) prog(done_b, len);
     }
     fclose(fo);
     if (!ok) {
@@ -89,11 +104,61 @@ static bool __attribute__((unused)) copy_range(FILE *fi, long off, uint32_t len,
     return ok;
 }
 
-/* miniz 的解压回调: 逐块写文件 —— 流式, 内存不随包体增长(11MB 的 GOP.MKF 也扛得住) */
+/* miniz 的解压回调 —— 2026-10-31 起 deflate 条目不再走 miniz（见 stored_data_ofs 注释），
+ * 这里保留以备将来需要，避免编译器报 unused。 */
+__attribute__((unused))
 static size_t asset_write_cb(void *opaque, mz_uint64 file_ofs, const void *buf, size_t n)
 {
     (void)file_ofs;
     return fwrite(buf, 1, n, (FILE *)opaque);
+}
+
+/* ★★★ 2026-10-31 (linit): **stored 条目不走 miniz**，直接从 zip 里搬字节。
+ *
+ *   真机现场（两次，20 KB 和 32 KB 栈都复现）：
+ *     Guru Meditation (LoadProhibited)  EXCVADDR=0x28
+ *     PC = mz_zip_reader_extract_to_callback  miniz_zip.c:1909
+ *     A4 = NULL, A2 = A3 = 0x10000(64KB)
+ *   ⇒ miniz 在 1909 行用 pRead_buf 时它已经是 NULL：
+ *     它内部 `m_pAlloc(1, MZ_ZIP_MAX_IO_BUF_SIZE=64KB)` 在本机拿不到内存
+ *     （内部 RAM largest 只有 31 KB；虽然配了 SPIRAM_USE_MALLOC，这条路径仍然失败），
+ *     而 1909 行之前那处 NULL 检查没有拦住（deflate 分支的读缓冲在别处分配）。
+ *   ⇒ 结论：**跟压缩算法、跟栈大小都无关，是 miniz 的缓冲分配在本机不可靠**。
+ *
+ *   对策：stored 条目本来就不需要解压器 —— zip 里存的就是原文件字节，
+ *   只要算出数据起点（local header + 30 + 文件名长 + extra 长）直接拷即可。
+ *   零分配、零解压器、零风险。这也是为什么打包约定必须是 ZIP_STORED。
+ *
+ *   返回数据区绝对偏移，失败 -1。 */
+static long stored_data_ofs(FILE *zf, mz_uint64 local_header_ofs)
+{
+    uint8_t h[30];
+    if (!zf) return -1;
+    if (local_header_ofs > 0x7FFFFFF0ull) return -1;
+    if (fseek(zf, (long)local_header_ofs, SEEK_SET) != 0) return -1;
+    if (fread(h, 1, sizeof(h), zf) != sizeof(h)) return -1;
+    if (h[0] != 'P' || h[1] != 'K' || h[2] != 3 || h[3] != 4) return -1;
+    uint16_t nlen = (uint16_t)(h[26] | (h[27] << 8));
+    uint16_t elen = (uint16_t)(h[28] | (h[29] << 8));
+    return (long)local_header_ofs + 30 + nlen + elen;
+}
+
+/* ===== 解包进度（按**字节**推进，不是按文件数） =====
+ * 只在下载任务的上下文里用（单线程），不需要加锁。
+ * 目的：41 MB 的包里 11 MB 的大文件写一次要好几秒，按文件数回报会看着"卡住"。 */
+static am_asset_prog_cb_t s_prog_cb;
+static unsigned long long s_prog_total;      /* 全部条目解压后总字节 */
+static unsigned long long s_prog_done;       /* 已经写完的字节（不含当前文件） */
+
+static void prog_bytes(uint32_t done_b, uint32_t total_b)
+{
+    (void)total_b;
+    if (!s_prog_cb || s_prog_total == 0) return;
+    unsigned long long d = s_prog_done + done_b;
+    int pm = (int)(d * 1000ull / s_prog_total);
+    if (pm > 1000) pm = 1000;
+    if (pm < 0) pm = 0;
+    s_prog_cb(pm);
 }
 
 bool am_asset_install_cb(const char *zip_path, const char *target_dir,
@@ -115,6 +180,33 @@ bool am_asset_install_cb(const char *zip_path, const char *target_dir,
     ESP_LOGI(TAG, "资源包 %s: %d 个条目", zip_path, total);
     if (total <= 0) { mz_zip_reader_end(&z); return false; }
 
+    /* ★ 2026-10-31 (linit): 统计压缩方法并告警。
+     *   服务器上曾经混进过 **deflate(method=8)** 打的 pal.zip / wuxia.zip：
+     *   解包走 tinfl，栈帧比 stored 深得多，真机上直接
+     *   `Guru Meditation (LoadProhibited)` + 重启，SD 上只留一个 .tmp。
+     *   以后再有压缩包，看这一行日志就能立刻定位，不用再反汇编数栈帧。
+     *   （正常应该全是 stored —— tools/pack_asset.py 就是 ZIP_STORED。） */
+    {
+        int n_deflate = 0, n_other = 0;
+        unsigned long long tot = 0;
+        for (int i = 0; i < total; i++) {
+            mz_zip_archive_file_stat st0;
+            if (!mz_zip_reader_file_stat(&z, i, &st0) || st0.m_is_directory) continue;
+            if (st0.m_method == MZ_DEFLATED) n_deflate++;
+            else if (st0.m_method != 0)     n_other++;
+            tot += st0.m_uncomp_size;
+        }
+        if (n_deflate || n_other) {
+            ESP_LOGW(TAG, "资源包 %s 含压缩条目: deflate=%d 其它=%d (共 %d 条) —— "
+                          "走 tinfl 解压、栈需求更大；建议用 tools/pack_asset.py 以 ZIP_STORED 重打",
+                     zip_path, n_deflate, n_other, total);
+        }
+        /* 进度基准：按总解压字节推进（大文件写入期间进度条也在动） */
+        s_prog_cb    = cb;
+        s_prog_total = tot;
+        s_prog_done  = 0;
+    }
+
     mkdirs(target_dir);
 
     /* ★★★ 2026-10-30: 记录"本包装了哪些文件"。
@@ -132,6 +224,32 @@ bool am_asset_install_cb(const char *zip_path, const char *target_dir,
         snprintf(lst, sizeof(lst), "%s/.pkg.%s.lst", target_dir, stem);
     }
     FILE *fl = fopen(lst, "w");
+    /* stored 条目直接从这里搬字节（不经 miniz），失败不影响 miniz 读中央目录 */
+    FILE *zf = fopen(zip_path, "rb");
+
+    /* ★★★ 2026-10-31 提速核心：拷贝缓冲 **512 KB**（PSRAM）。
+     *
+     *   解包慢的真正原因不是 CPU，而是**源和目标在同一张 SD 卡上**：
+     *   每读一块就要写一块，读写交替是闪存最慢的模式。
+     *   原来缓冲只有 4 KB ⇒ 41.7 MB 要 1 万多次 fread+fwrite 交替，
+     *   真机上解包比下载还慢（用户实测好几分钟）。
+     *   512 KB 之后同样数据只需 82 次交替，实测提速一个数量级。
+     *   PSRAM 有 7 MB 空闲，512 KB 只占 7%；分不到就逐级回退，不会因它失败。 */
+    size_t cpbuf_sz = 1024 * 1024;
+    uint8_t *cpbuf = heap_caps_malloc(cpbuf_sz, MALLOC_CAP_SPIRAM);
+    if (!cpbuf) { cpbuf_sz = 512 * 1024; cpbuf = heap_caps_malloc(cpbuf_sz, MALLOC_CAP_SPIRAM); }
+    if (!cpbuf) { cpbuf_sz = 256 * 1024; cpbuf = heap_caps_malloc(cpbuf_sz, MALLOC_CAP_SPIRAM); }
+    if (!cpbuf) { cpbuf_sz = 64  * 1024; cpbuf = heap_caps_malloc(cpbuf_sz, MALLOC_CAP_SPIRAM); }
+    if (!cpbuf) { cpbuf_sz = 16  * 1024; cpbuf = heap_caps_malloc(cpbuf_sz, MALLOC_CAP_SPIRAM); }
+    if (!cpbuf) { cpbuf_sz = 4   * 1024; cpbuf = heap_caps_malloc(cpbuf_sz, MALLOC_CAP_8BIT);   }
+    if (!cpbuf) {
+        ESP_LOGE(TAG, "拷贝缓冲分配失败（PSRAM/内部都拿不到）");
+        mz_zip_reader_end(&z);
+        if (fl) fclose(fl);
+        if (zf) fclose(zf);
+        return false;
+    }
+    ESP_LOGI(TAG, "解包缓冲 %u KB（PSRAM 优先）", (unsigned)(cpbuf_sz / 1024));
 
     char dst[320];
     int done = 0, skipped = 0, failed = 0;
@@ -157,26 +275,49 @@ bool am_asset_install_cb(const char *zip_path, const char *target_dir,
          *   对**共享目录** (/sdcard/fonts) 来说等于"装一个坏包把用户原有的好字体毁掉"。
          *   字体资源包的 target 就是 /sdcard/fonts，必须保证失败时原文件分毫不动。 */
         char tmp[336];
-        snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
-        FILE *fo = fopen(tmp, "wb");
-        if (!fo) { ESP_LOGE(TAG, "写文件失败: %s", tmp); failed++; continue; }
-        bool ok = mz_zip_reader_extract_to_callback(&z, (mz_uint)i, asset_write_cb, fo, 0);
-        fclose(fo);
+        /* ★ 提速：目标不存在（首次安装的常态）直接写目标文件，
+         *   省掉 ".tmp + remove + rename" 三次元数据操作；
+         *   已存在才走临时文件，保证写到一半掉电不会毁掉旧文件。 */
+        struct stat st_old;
+        bool existed = (stat(dst, &st_old) == 0);
+        if (existed) snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
+        else         snprintf(tmp, sizeof(tmp), "%s", dst);
+        bool ok = false;
+        if (st.m_method == 0) {
+            /* ★ stored：直接搬字节。copy_range 自己 fopen(tmp,"wb") 逐块拷贝，
+             *   用 PSRAM 的 512 KB 大缓冲，大幅减少 SD 卡读写交替。 */
+            long ofs = stored_data_ofs(zf, st.m_local_header_ofs);
+            if (ofs < 0) {
+                ESP_LOGE(TAG, "定位数据区失败: %s", name);
+            } else {
+                ok = copy_range(zf, ofs, (uint32_t)st.m_comp_size, tmp,
+                                cpbuf, cpbuf_sz, prog_bytes);
+            }
+        } else {
+            /* ★ deflate 不再尝试用 miniz 解 —— 它在 64 KB 缓冲分配失败时会空指针崩溃
+             *   （真机 miniz_zip.c:1909）。按打包约定资源包必须是 ZIP_STORED，
+             *   遇到压缩包直接判失败并说清原因，绝不再把设备搞重启。 */
+            ESP_LOGE(TAG, "该条目是压缩格式(method=%u)，固件只支持 ZIP_STORED: %s",
+                     (unsigned)st.m_method, name);
+            remove(tmp);
+        }
         if (!ok) {
             ESP_LOGE(TAG, "解压失败: %s", dst);
             remove(tmp);                 /* 只删临时文件, 目标位置的旧文件不动 */
             failed++;
             continue;
         }
-        /* FATFS 的 rename 在目标已存在时可能失败 ⇒ 先移除旧文件。
-         * 此刻新内容已完整落在 .tmp，即使下一步掉电，旧文件也只是"没了"而不是"半截"。 */
-        struct stat st_old;
-        if (stat(dst, &st_old) == 0) remove(dst);
-        if (rename(tmp, dst) != 0) {
-            ESP_LOGE(TAG, "落盘失败 (rename): %s", dst);
-            remove(tmp);
-            failed++;
-            continue;
+        /* 只有走临时文件时才需要 rename；直接写目标的那条路径到此已落盘 */
+        if (existed) {
+            /* FATFS 的 rename 在目标已存在时可能失败 ⇒ 先移除旧文件。
+             * 此刻新内容已完整落在 .tmp，即使下一步掉电，旧文件也只是"没了"而不是"半截"。 */
+            remove(dst);
+            if (rename(tmp, dst) != 0) {
+                ESP_LOGE(TAG, "落盘失败 (rename): %s", dst);
+                remove(tmp);
+                failed++;
+                continue;
+            }
         }
         done++;
         out_bytes += (unsigned long long)st.m_uncomp_size;
@@ -185,6 +326,8 @@ bool am_asset_install_cb(const char *zip_path, const char *target_dir,
     }
     mz_zip_reader_end(&z);
     if (fl) fclose(fl);
+    if (zf) fclose(zf);
+    if (cpbuf) { heap_caps_free(cpbuf); cpbuf = NULL; }   /* 1 MB 缓冲用完即还，不常驻 */
 
     ESP_LOGI(TAG, "解包完成: 成功 %d / 跳过 %d / 失败 %d → %s", done, skipped, failed, target_dir);
     bool all_ok = (failed == 0 && done > 0);
@@ -282,7 +425,34 @@ bool am_asset_uninstall(const char *zip_path, const char *target_dir)
         if (remove(p) == 0) removed++;
     }
     fclose(f);
+
+    /* ★ 2026-10-31 真机验证时补的两个残留（之前都留着）:
+     *   ① 空子目录 —— 仙剑这类包有 music/ 之类子目录, 文件删光了目录还在,
+     *      看目录大小/备份时会以为"没卸干净"。再扫一遍清单, 把每个人的父目录 rmdir
+     *      一次(非空的会失败, 忽略即可)。
+     *   ② `.installed.<主干>` 标记 —— 原来只删 .lst 不删它, 留一个孤零零的标记文件。
+     *      虽然"已安装"判定要求 .lst 也在(所以不会误判), 但残留本身不该有。 */
+    f = fopen(lst, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            size_t n = strlen(line);
+            while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+            if (!n || line[0] == '/' || strstr(line, "..")) continue;
+            char *sl = strrchr(line, '/');
+            if (!sl) continue;                     /* 顶层文件, 没有子目录 */
+            *sl = 0;
+            char p[336];
+            snprintf(p, sizeof(p), "%s/%s", target_dir, line);
+            rmdir(p);                              /* 非空/不存在都无妨 */
+        }
+        fclose(f);
+    }
     remove(lst);
+    {
+        char mark[336];
+        snprintf(mark, sizeof(mark), "%s/.installed.%s", target_dir, stem);
+        remove(mark);
+    }
 
     /* 目录空了才删；还有别的字体/文件就保持原样 */
     DIR *d = opendir(target_dir);

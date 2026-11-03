@@ -33,6 +33,9 @@
 #define WP_TXT_SET        "\xe5\xa3\x81\xe7\xba\xb8\xe5\xb7\xb2\xe8\xae\xbe\xe7\xbd\xae" /* 壁纸已设置 */
 #define WP_TXT_LOCKED     "\xe5\x86\x85\xe7\xbd\xae\xe5\xa3\x81\xe7\xba\xb8\xe4\xb8\x8d\xe5\x8f\xaf\xe5\x88\xa0\xe9\x99\xa4" /* 内置壁纸不可删除 */
 #define WP_TXT_DELQ       "\xe5\x88\xa0\xe9\x99\xa4\xe8\xaf\xa5\xe5\xa3\x81\xe7\xba\xb8?" /* 删除该壁纸? */
+/* ★ 2026-10-31: 人生指南数据加载失败（文件损坏 / PSRAM 不足）—— 明说，不静默保持星空 */
+#define WP_TXT_LOADFAIL   "\xe4\xba\xba\xe7\x94\x9f\xe6\x8c\x87\xe5\x8d\x97\xe6\x95\xb0\xe6\x8d\xae\xe5\x8a\xa0\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5"
+                          /* 人生指南数据加载失败 */
 
 static int s_wp_program = 0;      /* 当前动态壁纸程序 (0=星空) */
 /* ★ 2026-10-26 linit「壁纸不需要设置壁纸时间」: 本页的"壁纸时间"入口已删除 ——
@@ -111,7 +114,9 @@ static void wp_dynamic_open(ui_ctx_t *ctx) {
     n++;   /* 星空 (内置, 动态) */
     /* ★ 2026-10-23 linit: **没安装就不显示这一项** ——
      *   人生指南是 Lua 应用，卸载后壁纸仍然可选会导致屏保没内容。
-     *   判据: /store/apps/app/lifeguide.lua 能否打开。 */
+     * ★ 2026-10-31: 判据改为**多路径探测**（TF 卡 / 内置 / 历史目录），
+     *   原来只认 /store/apps/app —— 而商店默认把应用装到 TF 卡，等于永远判"未安装"。
+     *   见 wp_module_lifeguide.c 的 LG_PATHS[]。 */
     if (wp_lifeguide_installed()) {
         snprintf(dlg.items[n], sizeof(dlg.items[n]), "%s%s",
                  (s_wp_program == WP_PROG_LIFEGUIDE) ? "* " : "", WP_LABEL_LIFE);
@@ -119,6 +124,8 @@ static void wp_dynamic_open(ui_ctx_t *ctx) {
     } else if (s_wp_program == WP_PROG_LIFEGUIDE) {
         s_wp_program = WP_PROG_STARS;                 /* 已卸载 → 回星空 */
         svc_cfg_set_i32(WP_NS, "prog", WP_PROG_STARS);
+        wp_set_program(WP_PROG_STARS);                /* ★ 屏保任务同步回星空 */
+        wp_lifeguide_release();                       /* 顺手把数据还回去 */
     }
     /* [下载扩展点] 以后商店下载的动画壁纸程序在此按 n++ 追加列表项 (可删). */
     dlg.count = n;
@@ -134,12 +141,32 @@ static bool wp_dynamic_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void
     }
     if (a != OS_ACTION_CONFIRM) return false;
     if (d->sel >= d->count) return false;
-    if (d->sel == 0 || d->sel == 1) {   /* 0=星空 1=人生指南 */
-        s_wp_program = (d->sel == 0) ? WP_PROG_STARS : WP_PROG_LIFEGUIDE;
+    if (d->sel == 0) {                  /* 星空 */
+        s_wp_program = WP_PROG_STARS;
         svc_cfg_set_i32(WP_NS, "prog", s_wp_program);   /* 落盘: 屏保任务据此决定画哪个 */
+        wp_set_program(s_wp_program);                   /* ★ 立即生效, 不用重启 */
+        /* ★ 2026-10-31: 切走就把人生指南那 ~380KB PSRAM 还回去。
+         *   本函数在 UI 任务（内部 RAM 栈）运行，释放是安全的。 */
+        wp_lifeguide_release();
         os_dialog_pop(ctx);          /* 弹掉本列表层 → 回父层 */
         wp_dynamic_open(ctx);        /* 重压同名层带 * 标记 (原地替换, 层级不加深) */
         os_dialog_toast(ctx, WP_TXT_SET);   /* 壁纸已设置 */
+    } else if (d->sel == 1) {           /* 人生指南 */
+        /* ★ 2026-10-31: **先装载、再落盘**。
+         *   屏保任务栈在 PSRAM，不能自己去读文件（碰 SPIFFS 会 panic），
+         *   所以数据必须在这里（UI 任务，内部 RAM 栈）预加载进 PSRAM。
+         *   装载失败就不要写 NVS —— 否则重启后开机预加载同样失败，
+         *   用户会看到"选了人生指南却是星空"，且没有任何提示。 */
+        if (!wp_lifeguide_preload()) {
+            os_dialog_toast(ctx, WP_TXT_LOADFAIL);
+            return true;
+        }
+        s_wp_program = WP_PROG_LIFEGUIDE;
+        svc_cfg_set_i32(WP_NS, "prog", s_wp_program);
+        wp_set_program(s_wp_program);                   /* ★ 立即生效, 不用重启 */
+        os_dialog_pop(ctx);
+        wp_dynamic_open(ctx);
+        os_dialog_toast(ctx, WP_TXT_SET);
     }
     return true;
 }

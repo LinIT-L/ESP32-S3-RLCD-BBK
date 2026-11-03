@@ -132,6 +132,7 @@ typedef enum {
     OS_PAGE_LUA,               /* Lua 单文件程序 (可放到内存卡运行) */
     OS_PAGE_SDR,                   /* 频谱仪 (new_app.py 生成) */
     OS_PAGE_PAL,                   /* 仙剑奇侠传 (new_app.py 生成) */
+    OS_PAGE_PERFMON,               /* 性能监视器: 独立应用页 (面板与设置里的弹窗同一套绘制) */
     OS_PAGE_COUNT
 } os_page_t;
 
@@ -438,6 +439,10 @@ const os_app_t *os_app_visible_at(int idx);
  * 持久化到 NVS, 覆盖应用的默认 hidden. 返回是否"显式出现在主菜单". */
 bool os_app_in_mainmenu(const char *id);
 void os_app_set_mainmenu(const char *id, bool show);
+/* ★ 2026-11-01: 桌面"图标的增删"代次。用户添加/删除桌面图标**不改变条目数**，
+ *   主菜单原来只在 os_app_count() 变化时重建可见缓存 ⇒ 删掉图标后回到桌面仍然显示
+ *   （看着就是"删不掉"）。主菜单 poll 比一次这个代次即可立刻生效。 */
+uint32_t os_app_vis_gen(void);
 /* 显式隐藏/恢复 (从主菜单彻底移除, 类似卸载的入口动作). */
 bool os_app_in_hidden(const char *id);
 void os_app_set_hidden(const char *id, bool hide);

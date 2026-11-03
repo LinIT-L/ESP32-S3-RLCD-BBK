@@ -38,6 +38,13 @@ set(EXTRA_COMPONENT_DIRS
     ${CMAKE_SOURCE_DIR}/components/tools
 )
 
+# 测试组件只在该开关打开时参与构建（默认完全不存在于正式固件）。
+# 用法: idf.py -DLINTOS_LAVAX_BENCH=1 build
+if(LINTOS_LAVAX_BENCH)
+    list(APPEND EXTRA_COMPONENT_DIRS ${CMAKE_SOURCE_DIR}/components/test)
+    message(STATUS "[BENCH] LINTOS_LAVAX_BENCH=1 → 编译 components/test/lavax_bench")
+endif()
+
 # === V1.x: 方案还原 — 使用官方 esp-idf 蓝牙 (Bluedroid + esp_hid), 移除 bluepad32/btstack ===
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)

@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>   /* size_t（去掉 FreeRTOS.h 后需显式包含） */
 #include "sdkconfig.h"
-#include "freertos/FreeRTOS.h"   /* 供 bt_manager_get_init_stack 的 StackType_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -174,8 +174,8 @@ bool bt_manager_calibration_done(void);          /* 首次校准是否完成 */
 uint8_t bt_manager_calibration_neutral(void);    /* 当前中性值 */
 
 void bt_manager_init(void);
-/* 取得蓝牙初始化任务用的内部 RAM 静态栈 (供 app_board.c 开机 bt_init 复用) */
-StackType_t *bt_manager_get_init_stack(int *words_out);
+/* 创建 bt_init 任务（内部 RAM 动态栈；任务初始化完自删即归还，PSRAM 栈会断言不可用）。 */
+bool bt_manager_start_init_task(void);
 const char *bt_manager_get_status(void);
 void bt_manager_start_scan(bt_scan_callback_t callback);
 void bt_manager_start_scan_continuous(bt_device_found_cb_t callback);

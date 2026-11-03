@@ -157,6 +157,24 @@ static int l_touch_hold(lua_State *L) {
     return 1;
 }
 
+/* ---- app.vk(enabled): 本应用是否启用**系统虚拟手柄**（线条式覆盖，非脚本自绘）
+ *
+ * 语义: 应用声明"我需要虚拟手柄"，由固件统一绘制、统一把它转成按键事件，
+ *       脚本仍然只通过 action(a) 收键 —— **不新增第二套输入路径**。
+ * 参数: true=要 / false=不要 / 省略=只查询。返回当前值。
+ * 默认: false —— 老应用不调就没有，行为完全不变。
+ * 生命周期: 只影响当前运行的这个 Lua 应用；page_lua 在退出时强制关掉并复位边沿，
+ *       不泄漏到其他应用，也不触碰游戏引擎自己的 vk 设置（egset/vk）。 */
+bool lua_vk_want = false;          /* page_lua.c 读它决定 enable / draw / 按键映射 */
+
+static int l_app_vk(lua_State *L)
+{
+    if (lua_gettop(L) >= 1 && lua_isboolean(L, 1))
+        lua_vk_want = lua_toboolean(L, 1) ? true : false;
+    lua_pushboolean(L, lua_vk_want);
+    return 1;
+}
+
 void lua_mod_input_register(lua_State *L)
 {
     lua_pushcfunction(L, l_millis);              lua_setfield(L, -2, "millis");
@@ -169,4 +187,5 @@ void lua_mod_input_register(lua_State *L)
     lua_pushcfunction(L, l_touch_start);         lua_setfield(L, -2, "touch_start");
     lua_pushcfunction(L, l_touch_hold);          lua_setfield(L, -2, "touch_hold");
     lua_pushcfunction(L, l_redraw);              lua_setfield(L, -2, "redraw");
+    lua_pushcfunction(L, l_app_vk);              lua_setfield(L, -2, "vk");
 }

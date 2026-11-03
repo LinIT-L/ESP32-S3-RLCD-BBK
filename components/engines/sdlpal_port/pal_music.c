@@ -142,6 +142,28 @@ LPAUDIOPLAYER RIX_Init(LPCSTR szFileName)
     snprintf(mdir, sizeof(mdir), "%s/music", p->dir);
     struct stat mst;
     bool has_music = (stat(mdir, &mst) == 0 && S_ISDIR(mst.st_mode));
+
+    /* ★ 2026-11-01 修「进游戏全程没声音」：
+     *   上面这个判断只看目录**在不在**。而 shop 解压中断（我们实测卡在 70%）
+     *   会留下一个"半装"的 music/ 目录 —— 目录在、曲目缺一半。
+     *   此时引擎照样切"音乐模式"，音效被让位；缺的那首放不出来 ⇒ **两头都哑**。
+     *   这里补一次"到底能不能放"的探针：剧本曲目从 1 开始编号，探前 3 首，
+     *   一首都打不开就当没有音乐，保持音效通路（宁可没音乐，不能没声音）。
+     *   只用 fopen，不依赖任何新接口；完整包（86 首都在）行为完全不变。 */
+    if (has_music) {
+        int usable = 0;
+        for (int i = 1; i <= 3 && !usable; i++) {
+            char probe[192];
+            snprintf(probe, sizeof(probe), "%s/%d.mp3", mdir, i);
+            FILE *pf = fopen(probe, "rb");
+            if (pf) { fclose(pf); usable++; }
+        }
+        if (!usable) {
+            has_music = false;
+            ESP_LOGW(TAG, "music/ 目录在但前 3 首都打不开（多半是解压不完整）"
+                          " ⇒ 按无音乐处理，保留音效通路");
+        }
+    }
     pal_audio_external_music = has_music;
     ESP_LOGI(TAG, "预渲染音乐就绪: dir=%s | music 目录=%s ⇒ %s",
              p->dir, has_music ? "有" : "无",

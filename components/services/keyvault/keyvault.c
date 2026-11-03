@@ -63,7 +63,7 @@ static bool     s_ready = false;
 static uint8_t  s_salt[KV_SALT_LEN];
 static uint32_t s_fails = 0;
 static uint32_t s_lock_until_ms = 0;
-static char     s_cat_names[KEYVAULT_MAX_CATS][32];
+EXT_RAM_BSS_ATTR static char s_cat_names[KEYVAULT_MAX_CATS][32];   /* 只有密码本用 */
 static int      s_cat_count = 0;
 
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }

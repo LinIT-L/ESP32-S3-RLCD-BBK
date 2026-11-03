@@ -410,7 +410,7 @@ static void init_lookup_tables(void) {
 
 /* 在 ST7305 fb 中清除一个物理点 (置黑). x,y 为屏坐标 (从 RGB 原点算).
  * fb[idx] 的位 = 7 - ((y_sub<<1) | (x&1)), y_sub = ((ST7305_HEIGHT-1-y) & 3) */
-static inline void IRAM_ATTR fb_clear_pixel(uint8_t *fb, int x, int y) {
+static inline void fb_clear_pixel(uint8_t *fb, int x, int y) {
     int inv_y = ST7305_HEIGHT - 1 - y;
     int y_group = inv_y >> 2;
     int y_sub = inv_y & 3;
@@ -419,7 +419,7 @@ static inline void IRAM_ATTR fb_clear_pixel(uint8_t *fb, int x, int y) {
 }
 
 /* 在 ST7305 fb 中设置一个物理点 (置白). 供抗锯齿圆角用: 去掉外凸的黑角像素 */
-static inline void IRAM_ATTR fb_set_pixel_white(uint8_t *fb, int x, int y) {
+static inline void fb_set_pixel_white(uint8_t *fb, int x, int y) {
     int inv_y = ST7305_HEIGHT - 1 - y;
     int y_group = inv_y >> 2;
     int y_sub = inv_y & 3;
@@ -575,7 +575,7 @@ void scale2x_1bit(const uint8_t *src, int src_w, int src_h,
 
 /* EPX 直接把 4-bit pattern (位3=左上, 位2=右上, 位1=左下, 位0=右下, 黑=1 需清除)
  * 按 2x2 写进 ST7305 fb (GAME_X/GAME_Y 起始的居中区域). 前提: fb 已经 memset 0xFF=白. */
-static inline void IRAM_ATTR fb_fill_epx_block(uint8_t *fb, int ox, int oy,
+static inline void fb_fill_epx_block(uint8_t *fb, int ox, int oy,
                                                 uint8_t pattern) {
     for (int yy = 0; yy < 2; yy++) {
         for (int xx = 0; xx < 2; xx++) {
@@ -598,7 +598,7 @@ static inline void IRAM_ATTR fb_fill_epx_block(uint8_t *fb, int ox, int oy,
  *   mode 4 (孤立点): 无任何相邻黑 → 只涂中心一点.
  * cut: mode 3 时指定要去除外角 (0=左上,1=右上,2=左下,3=右下).
  */
-static inline void IRAM_ATTR fb_fill_block_aa(uint8_t *fb, int ox, int oy,
+static inline void fb_fill_block_aa(uint8_t *fb, int ox, int oy,
                                               int bw, int bh, int mode, int cut) {
     for (int yy = 0; yy < bh; yy++) {
         for (int xx = 0; xx < bw; xx++) {
@@ -626,7 +626,7 @@ static inline void IRAM_ATTR fb_fill_block_aa(uint8_t *fb, int ox, int oy,
  * 边界: u/d/l/r 越界按黑 (保持边缘直线实心), 对角越界按白.
  * V1.0.57: 斜线/孤立点一律实心 (不删像素, 避免笔画变细);
  * 仅拐角/端点去外角圆滑, 保证"保粗"优先. */
-static inline int IRAM_ATTR fb_classify_aa(bool u, bool d, bool l, bool r,
+static inline int fb_classify_aa(bool u, bool d, bool l, bool r,
                                            bool lu, bool ld, bool ru, bool rd,
                                            int *cut) {
     (void)lu; (void)ld; (void)ru; (void)rd;   /* 斜线不再用于删像素 */
@@ -640,7 +640,7 @@ static inline int IRAM_ATTR fb_classify_aa(bool u, bool d, bool l, bool r,
     return 0;
 }
 
-static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, size_t pitch) {
+static void render_frame(const void *data, unsigned w, unsigned h, size_t pitch) {
     /* ★ 2026-10-29: 点对点模式的垂直位置随虚拟手柄状态变化 ——
      *   有手柄 → 顶到最上(0), 避免被下半屏的方向键/A/B 压住;
      *   无手柄 → 居中(54), 维持原样。全屏/拉伸模式不受影响。 */
@@ -866,7 +866,7 @@ static void IRAM_ATTR render_frame(const void *data, unsigned w, unsigned h, siz
 }
 
 /* === libretro 视频回调: 在这里把核心输出到 ST7305 === */
-static void IRAM_ATTR video_cb(const void *data, unsigned w, unsigned h, size_t pitch) {
+static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch) {
     if (g_running) {
         uint32_t t0 = xTaskGetTickCount() * portTICK_PERIOD_MS;
         render_frame(data, w, h, pitch);

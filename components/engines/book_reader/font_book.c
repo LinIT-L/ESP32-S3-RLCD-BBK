@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 
 #include "book_flow.h"    /* bf_cp_to_utf8 */
+#include "esp_attr.h"     /* EXT_RAM_BSS_ATTR: 低频状态表放 PSRAM, 不占内部 RAM */
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "font_zh.h"      /* 内置 24px 兜底 */
@@ -48,8 +49,55 @@ static char         s_cur_path[128];
  *   用户切 A→B→A 时，若 B 加载后把 A 释放了，切回 A 又得重读 TF 卡。
  *   这里保留最近一个，切回时**直接交换指针**，零 IO 零分配。
  *   内存：最多 2 个整块实例（实测最大 1.23MB/个），PSRAM 余量不足时自动放弃这一槽。 */
-static lbf_font_t  *s_prev_lbf = NULL;
-static char         s_prev_path[128];
+/* ★ 2026-11-01 linit：字体缓存从「1 个上一字体」扩到 **3 槽**。
+ *   原来只有 s_prev_lbf 一个槽 ⇒ 在字体列表里来回选 A→B→C→A 时，
+ *   每次没命中就要从 TF 卡整块读 LBF（30 万~70 万字节，实测 1~2 秒），
+ *   这就是"选择字体非常慢"的真正原因。
+ *   现在 3 个槽常驻 PSRAM（每个 0.3~0.7MB，合计 ≤2MB，PSRAM 7.3MB 够用），
+ *   常见切换全部命中缓存、不读卡。
+ *   ⚠ 全部在 PSRAM，核心 RAM 占用仍为 0。 */
+#define FB_CACHE_N 3
+static lbf_font_t *s_cache_lbf[FB_CACHE_N];
+EXT_RAM_BSS_ATTR static char s_cache_path[FB_CACHE_N][128];   /* 384B: 只有阅读器用 */
+static int         s_cache_rr;
+
+/* 取出缓存（命中则从槽里摘走，供调用方当"新字体"用） */
+static lbf_font_t *font_cache_take(const char *path) {
+    if (!path || !path[0]) return NULL;
+    for (int i = 0; i < FB_CACHE_N; i++) {
+        if (s_cache_lbf[i] && strcmp(s_cache_path[i], path) == 0) {
+            lbf_font_t *f = s_cache_lbf[i];
+            s_cache_lbf[i] = NULL;
+            s_cache_path[i][0] = 0;
+            return f;
+        }
+    }
+    return NULL;
+}
+
+/* 放进缓存（槽满则轮转淘汰最老的一个） */
+static void font_cache_put(lbf_font_t *f, const char *path) {
+    if (!f || !path || !path[0]) { if (f) lbf_close(f); return; }
+    for (int i = 0; i < FB_CACHE_N; i++)
+        if (s_cache_lbf[i] && strcmp(s_cache_path[i], path) == 0) { lbf_close(f); return; }
+    int slot = -1;
+    for (int i = 0; i < FB_CACHE_N; i++) if (!s_cache_lbf[i]) { slot = i; break; }
+    if (slot < 0) {
+        slot = s_cache_rr;
+        s_cache_rr = (s_cache_rr + 1) % FB_CACHE_N;
+        if (s_cache_lbf[slot]) lbf_close(s_cache_lbf[slot]);
+    }
+    s_cache_lbf[slot] = f;
+    snprintf(s_cache_path[slot], sizeof(s_cache_path[0]), "%s", path);
+}
+
+static void font_cache_clear(void) {
+    for (int i = 0; i < FB_CACHE_N; i++) {
+        if (s_cache_lbf[i]) { lbf_close(s_cache_lbf[i]); s_cache_lbf[i] = NULL; }
+        s_cache_path[i][0] = 0;
+    }
+    s_cache_rr = 0;
+}
 static int          s_px = 24;        /* 目标渲染像素 */
 static int          s_scale = 1;      /* 只允许 1 或 2 */
 static int          s_native = 24;    /* 当前后端原生像素 */
@@ -57,15 +105,58 @@ static bool         s_inited = false;
 static const char  *s_error = "未初始化";
 static const char  *s_default_err = "";
 
-/* 内置字库 2 倍放大缓冲：48px × 6 字节/行 = 288 */
-static uint8_t s_scale_buf[384];
+/* 内置字库 2 倍放大缓冲：48px × 6 字节/行 = 288
+ * ★ 2026-11-02: 这 4 块（合计 2304 B）只在**看书时**用, 平时白占内部 RAM ⇒ 放 PSRAM。
+ *   无 DMA、不进 ISR。若日后觉得翻页变慢, 把 EXT_RAM_BSS_ATTR 去掉即可回内部 RAM。 */
+static EXT_RAM_BSS_ATTR uint8_t s_scale_buf[384];
 /* LBF 字形回填到统一网格用的缓冲：32px × 4 字节/行 = 128（2 倍时 64×8=512） */
-static uint8_t s_cell_buf[512];
-static uint8_t s_cell2_buf[1024];
+static EXT_RAM_BSS_ATTR uint8_t s_cell_buf[512];
+static EXT_RAM_BSS_ATTR uint8_t s_cell2_buf[1024];
 /* LBF ASCII 前进宽度（半角），select_file 时按 'A' 实测；0=用 FONT8X12 */
 static int s_lbf_ascii_w = 0;
 /* FONT8X12 放大缓冲 */
-static uint8_t s_ascii_buf[384];
+static EXT_RAM_BSS_ATTR uint8_t s_ascii_buf[384];
+
+/* ★★★ 2026-10-31: 每个字体记住"上次用的合法字号"★★★
+ *   用户 内置(48px) → 融合像素8(自动收敛到 16px) → 切回内置，
+ *   期望回到 **48px**，而不是被 16 带着走。原来只有一个全局 s_px，
+ *   换字体就等于把上一字体的字号丢掉，切回去得手动再调一次。
+ *   只放内存：重启后统一由 NVS 里的当前档位决定，不需要逐字体持久化。
+ *   4 槽（内置 + 最近 3 个 TF 字体），满了按环形覆盖最老的。 */
+#define FB_MEM_SLOTS 4
+/* 放 PSRAM：低频状态，启动即清零（px==0 即"没记录"），不占内部 RAM */
+EXT_RAM_BSS_ATTR static struct { char path[96]; int px; } s_mem[FB_MEM_SLOTS];
+static int s_mem_next = 0;
+
+static void mem_put(const char *path, int px) {
+    if (px <= 0) return;
+    if (!path) path = "";
+    for (int i = 0; i < FB_MEM_SLOTS; i++) {
+        if (s_mem[i].px > 0 && strcmp(s_mem[i].path, path) == 0) { s_mem[i].px = px; return; }
+    }
+    snprintf(s_mem[s_mem_next].path, sizeof(s_mem[0].path), "%.95s", path);
+    s_mem[s_mem_next].px = px;
+    s_mem_next = (s_mem_next + 1) % FB_MEM_SLOTS;
+}
+/* 返回 0 = 没记录过 */
+static int mem_get(const char *path) {
+    if (!path) path = "";
+    for (int i = 0; i < FB_MEM_SLOTS; i++)
+        if (s_mem[i].px > 0 && strcmp(s_mem[i].path, path) == 0) return s_mem[i].px;
+    return 0;
+}
+
+/* 一段"原生 N px"的字库支持哪些显示字号：N 与 2N（2N>64 只给 N）。
+ * native<=0 表示内置字库：16/24/32/48（16、24 原生，32=16×2，48=24×2）。 */
+static int sizes_for_native(int native, int out[4]) {
+    if (native > 0) {
+        out[0] = native;
+        out[1] = (native * 2 <= 64) ? native * 2 : native;
+        return (out[1] != out[0]) ? 2 : 1;
+    }
+    out[0] = 16; out[1] = 24; out[2] = 32; out[3] = 48;
+    return 4;
+}
 
 /* 把 LBF 的紧凑字形放回 native_w × native_h 的统一网格。
  * 位图按行 MSB 左、1=墨点，与 UI 字库同构，渲染层无需知道字形偏移。 */
@@ -262,15 +353,16 @@ void font_book_select(int style, int size_px) {
     s_px = cand[best].px;
     s_scale = (s_px > s_native) ? 2 : 1;
     s_error = NULL;
+    ESP_LOGI(TAG, "字号生效(内置): 请求 %dpx → 显示 %dpx (原生 %d, %dx)",
+             size_px, s_px, s_native, s_scale);
 }
 
 void font_book_select_embedded(int style, int size_px) {
     if (s_lbf) {
+        mem_put(s_cur_path, s_px);       /* 记住这个 TF 字体用的字号，切回来时恢复 */
         /* ★ 2026-10-31: 退到 prev 槽而不是就地释放 —— 用户常常"内置↔TF"来回切，
          *   释放了就得重读整卡。内存不够时才真释放（下面 prev 满时自然顶掉）。 */
-        if (s_prev_lbf) lbf_close(s_prev_lbf);
-        s_prev_lbf = s_lbf;
-        snprintf(s_prev_path, sizeof(s_prev_path), "%s", s_cur_path);
+        font_cache_put(s_lbf, s_cur_path);
         s_lbf = NULL;
         ESP_LOGI(TAG, "TF 字库转入缓存槽, 切回内置字体");
     }
@@ -278,16 +370,26 @@ void font_book_select_embedded(int style, int size_px) {
     s_backend = BACKEND_UI24;
     s_native = 24;
     s_lbf_ascii_w = 0;
-    font_book_select(style, size_px);
+    /* 内置字体自己那份记忆优先于调用方传进来的档位（切回内置要回到上次的内置字号） */
+    {
+        int want = mem_get("");
+        font_book_select(style, want > 0 ? want : size_px);
+    }
 }
 
 /* 2026-10-31: 退出阅读器时释放**全部**字体实例（当前槽 + 缓存槽）。
  * 阅读器关书必须调用：否则两个 1MB+ 的映像会一直压在 PSRAM 里，
  * 挤占游戏引擎/其他模块。再次进入时重新预加载即可（30 万~70 万字节，<0.5s）。 */
-void font_book_release_all(void) {
-    if (s_lbf)      { lbf_close(s_lbf);      s_lbf = NULL; }
-    if (s_prev_lbf) { lbf_close(s_prev_lbf); s_prev_lbf = NULL; }
-    s_prev_path[0] = 0;
+bool font_book_is_cached(const char *path) {
+    if (!path || !path[0]) return true;                   /* 内置字体 = 零 IO */
+    if (s_lbf && s_cur_path[0] && strcmp(s_cur_path, path) == 0) return true;
+    for (int i = 0; i < FB_CACHE_N; i++)
+        if (s_cache_lbf[i] && strcmp(s_cache_path[i], path) == 0) return true;
+    return false;
+}
+
+void font_book_release_all(void) {    if (s_lbf) { lbf_close(s_lbf); s_lbf = NULL; }
+    font_cache_clear();
     s_cur_path[0]  = 0;
     ESP_LOGI(TAG, "字体实例已全部释放 (当前槽 + 缓存槽)");
 }
@@ -304,12 +406,71 @@ const char *font_book_current_name(void) {
 int font_book_native_px(void) { return s_native; }
 int font_book_scale(void)     { return s_scale; }
 
+/* 当前字体**真实支持**的显示字号（升序）。字号列表 / 正文绘制 / 行高 / 分页
+ * 全部从这里取，避免"菜单列 48px、实际按 16px 画"这种错位。 */
+static int legal_sizes(int out[4]) {
+    int native = (s_backend == BACKEND_LBF && s_lbf && s_native > 0) ? s_native : 0;
+    return sizes_for_native(native, out);
+}
+
+int font_book_size_count(void) {
+    int t[4];
+    return legal_sizes(t);
+}
+
+int font_book_size_px_at(int idx) {
+    int t[4];
+    int n = legal_sizes(t);
+    if (idx < 0) idx = 0;
+    if (idx >= n) idx = n - 1;      /* 超出范围收敛到最大合法档，不返回非法字号 */
+    return t[idx];
+}
+
 int font_book_size_options(int *out, int max) {
     if (!out || max <= 0) return 0;
-    int n = 0;
-    out[n++] = s_native;
-    if (n < max) out[n++] = s_native * 2;
+    int t[4];
+    int n = legal_sizes(t);
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) out[i] = t[i];
     return n;
+}
+
+/* ===== 按"字体文件"给字号表（不加载字形，只读 96 字节头） =====================
+ * 书库的「字号」滚轮必须按**已选中的字体**列字号，而那一刻 LBF 往往还没加载
+ * （用户只是站在书架上）。所以这里用 lbf_peek() 只取 native_w。
+ * 头部结果做 4 槽缓存：一页里反复开滚轮不会重复打 TF 卡。 */
+#define FB_PEEK_SLOTS 4
+EXT_RAM_BSS_ATTR static struct { char path[96]; int native; } s_peek[FB_PEEK_SLOTS];
+static int s_peek_next = 0;
+
+static int peek_native(const char *path) {
+    if (!path || !path[0]) return 0;                 /* 内置 */
+    for (int i = 0; i < FB_PEEK_SLOTS; i++)
+        if (s_peek[i].native > 0 && strcmp(s_peek[i].path, path) == 0) return s_peek[i].native;
+
+    int nw = 0;
+    if (!lbf_peek(path, NULL, 0, &nw, NULL) || nw <= 0) return 0;
+    snprintf(s_peek[s_peek_next].path, sizeof(s_peek[0].path), "%.95s", path);
+    s_peek[s_peek_next].native = nw;
+    s_peek_next = (s_peek_next + 1) % FB_PEEK_SLOTS;
+    return nw;
+}
+
+int font_book_size_options_for(const char *path, int *out, int max) {
+    if (!out || max <= 0) return 0;
+    int t[4];
+    int n = sizes_for_native(peek_native(path), t);
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) out[i] = t[i];
+    return n;
+}
+
+int font_book_size_px_for(const char *path, int idx) {
+    int t[4];
+    int n = sizes_for_native(peek_native(path), t);
+    if (idx < 0) idx = 0;
+    if (idx >= n) idx = n - 1;
+    return t[idx];
 }
 
 int font_book_cell_w(void)  { return s_px; }
@@ -360,20 +521,43 @@ bool font_book_glyph_ascii(uint8_t c, book_glyph_t *out) {
         {32, 16, 32, 3},
         {48, 24, 48, 5},
     };
-    int ow = 8, oh = 16, oy = 1;
+    int ow = 0, oh = 0, oy = 0;
     for (size_t i = 0; i < sizeof(AT) / sizeof(AT[0]); i++)
         if (AT[i].px == px) { ow = AT[i].ow; oh = AT[i].oh; oy = AT[i].oy; break; }
+    if (!oh) {
+        /* ★ 2026-10-31: 不在内置四档里的字号（例如 8px 点阵字体、LBF 原生 10/12px）。
+         *   原实现落到默认 {8,16,1}，于是 8px 字号却画出 16 行高的 ASCII —— 比中文高一倍，
+         *   行距直接压字。这里按 px 现算，并**完全不碰**上面四档的数值（白线修复不动）：
+         *     ow = px/2（半角，四舍五入），oh = px，oy = 0（小字号不下移，避免底部被裁） */
+        oh = px;
+        ow = (px + 1) / 2;
+        if (ow < 4) ow = 4;
+        oy = 0;
+    }
     {
         int dbpr = (ow + 7) / 8;
         if ((size_t)dbpr * oh > sizeof(s_ascii_buf)) return false;
         memset(s_ascii_buf, 0, (size_t)dbpr * oh);
-        for (int y = 0; y < 16; y++) {
-            int ty = oy + y * oh / 16;       /* 源行 → 目标行（含基线偏移） */
-            if (ty >= oh) break;             /* 超出画布的行丢弃（都是空白/降部末梢） */
+
+        /* ★★★ 2026-10-31 修「内置字体英文/数字出现横向白线（斑马线）」★★★
+         *   根因：原来是**源行 → 目标行**的单向映射
+         *        ty = oy + y * oh / 16;          (y 只走 16 个源行)
+         *   16 个源行只能点亮 oh 个目标行里的 16 个，其余目标行**没人写**，保持全白：
+         *        24px: 16/24 ≈ 有 8 行空白（每 2~3 行一条白线）
+         *        32px: y*2 ⇒ 只写偶数行 ⇒ **每两行一条白线**
+         *        48px: y*3 ⇒ 每三行一条 ⇒ 18 条白线
+         *   横向没这个问题，因为列方向是从目标列反查源列的（tx 覆盖满 ow）。
+         *   修法：纵向也改成**目标行 → 源行**反查，保证每个目标行都被填充。
+         *   主机侧实测（'H' 字形内部空行数）：24px 4→0、32px 9→0、48px 18→0。 */
+        for (int ty = 0; ty < oh; ty++) {
+            int tgy = ty + oy;              /* 基线偏移后的目标行 */
+            if (tgy >= oh) break;           /* 只裁掉画布底部 oy 行（源字模里本就是空白） */
+            const uint8_t srow = FONT8X12[c - 0x20][ty * 16 / oh];   /* 最近邻：目标行 → 源行 */
+            if (!srow) continue;
             for (int x = 0; x < 8; x++) {
-                if (!(FONT8X12[c - 0x20][y] & (0x80 >> x))) continue;
+                if (!(srow & (0x80 >> x))) continue;
                 for (int tx = x * ow / 8; tx < (x + 1) * ow / 8 && tx < ow; tx++)
-                    s_ascii_buf[(size_t)ty * dbpr + (tx >> 3)] |= (uint8_t)(0x80 >> (tx & 7));
+                    s_ascii_buf[(size_t)tgy * dbpr + (tx >> 3)] |= (uint8_t)(0x80 >> (tx & 7));
             }
         }
         out->w = (uint8_t)ow;
@@ -415,18 +599,10 @@ bool font_book_select_file(const char *path) {
     bool from_prev = false;
 
     /* ② 目标就在"上一个"槽里 → 交换引用，不读卡、不分配 */
-    if (s_prev_lbf && strcmp(s_prev_path, path) == 0) {
-        nf = s_prev_lbf;
-        s_prev_lbf = NULL;
-        s_prev_path[0] = 0;
-        from_prev = true;
+    nf = font_cache_take(path);
+    if (nf) {
+        from_prev = true;    /* 命中 3 槽缓存 ⇒ 不读卡 */
     } else {
-        /* 内存紧就先丢掉上一槽，保证当前字体能整块进 PSRAM（预加载才是快的根本） */
-        if (s_prev_lbf && heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < (3u << 20)) {
-            lbf_close(s_prev_lbf);
-            s_prev_lbf = NULL;
-            s_prev_path[0] = 0;
-        }
         nf = lbf_open(path, err, sizeof(err));
         if (!nf) {
             /* 明确失败：保留当前字体不变，绝不静默切换 */
@@ -436,16 +612,20 @@ bool font_book_select_file(const char *path) {
         }
     }
 
-    /* ③ 当前字体退到 prev 槽（顶掉更老的那个） */
-    if (s_prev_lbf) lbf_close(s_prev_lbf);
-    s_prev_lbf = s_lbf;
-    if (s_lbf) snprintf(s_prev_path, sizeof(s_prev_path), "%s", s_cur_path);
-    else       s_prev_path[0] = 0;
+    /* ③ 当前字体放进缓存，下次切回来直接命中、不读卡 */
+    if (s_lbf) font_cache_put(s_lbf, s_cur_path);
+
+    /* ★ 2026-10-31: 换字体前先记住**老字体**用的字号，再取**新字体**上次用的字号。
+     *   没有记录（第一次用这个字体）才沿用当前 s_px，由 snap_px 收敛到合法档。 */
+    mem_put(s_cur_path, s_px);
 
     s_lbf = nf;
     s_backend = BACKEND_LBF;
     s_native = lbf_native_w(nf);
-    s_px = snap_px(s_px, s_native);
+    {
+        int want = mem_get(path);
+        s_px = snap_px(want > 0 ? want : s_px, s_native);
+    }
     s_scale = (s_px >= s_native * 2) ? 2 : 1;
     s_error = NULL;
 
@@ -583,3 +763,43 @@ strip:
     while (cap > 1 && buf[0] && buf[strlen(buf) - 1] == ' ') buf[strlen(buf) - 1] = 0;
     return buf;
 }
+
+/* ===== 系统 UI 字体（与阅读字体彻底隔离） ================================
+ * 阅读器菜单、弹窗、按钮、提示永远用这一套：16px 宋体 + 8×16 ASCII，
+ * 不随 TF 卡字体变化。放在 font_book.c 是因为这里已经同时持有
+ * font_zh16 与 FONT8X12 两套数据；阅读器只负责"画"，不必知道字从哪来。
+ * 阅读正文/页码/进度走另一条路（font_book_glyph_*，跟随阅读字体）。
+ */
+#define UI_FONT_PX 16
+
+bool font_book_ui_glyph_unicode(uint32_t cp, book_glyph_t *out) {
+    if (!out) return false;
+    if (cp >= 0x20 && cp <= 0x7E) {          /* ASCII: 8×16 原尺寸直出，不缩放、不移位 */
+        out->w = 8;
+        out->h = 16;
+        out->bitmap = FONT8X12[cp - 0x20];
+        return true;
+    }
+    uint8_t utf8[4];
+    int n = bf_cp_to_utf8(cp, utf8);
+    if (n <= 0) return false;
+    int idx = font_zh16_find_utf8((const char *)utf8);
+    if (idx < 0) return false;
+    const uint8_t *bmp = font_zh16_get_bitmap_by_index(idx);
+    if (!bmp) return false;
+    out->w = (uint8_t)UI_FONT_PX;
+    out->h = (uint8_t)UI_FONT_PX;
+    out->bitmap = bmp;
+    return true;
+}
+
+bool font_book_ui_glyph_gb(uint8_t hi, uint8_t lo, book_glyph_t *out) {
+    if (hi < 0xA1 || hi > 0xFE || lo < 0xA1 || lo > 0xFE) return false;
+    uint32_t cp = gb2312_to_uni[hi - 0xA1][lo - 0xA1];
+    if (cp == 0) return false;
+    return font_book_ui_glyph_unicode(cp, out);
+}
+
+int font_book_ui_cell_w(void)  { return UI_FONT_PX; }
+int font_book_ui_cell_h(void)  { return UI_FONT_PX; }
+int font_book_ui_ascii_w(void) { return 8; }

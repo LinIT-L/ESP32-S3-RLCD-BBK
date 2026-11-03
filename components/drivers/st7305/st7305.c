@@ -228,30 +228,15 @@ esp_err_t st7305_init(st7305_handle_t *out, const st7305_config_t *config) {
 
     /* 帧缓冲: PSRAM 优先 (省内部 SRAM; 绘制逐像素写入 PSRAM 虽稍慢, 主菜单卡顿根因是
      * 渲染时每帧反复读 NVS, 与 fb 位置无关 — 已在 page_main 用可见应用缓存修复). */
-    /* ★ 2026-10-23 性能: 帧缓冲优先放**内部 RAM**（15000B，占内部堆 11%）。
-     *   原因: fb 是列优先布局（idx = (x>>1)*75 + (y>>2)），画横线时相邻像素落在
-     *   相隔 75 字节的位置，等于每个像素都踩新的 cache line —— 放在 PSRAM 上就是
-     *   每像素一次 PSRAM 往返（RMW），整屏 12 万像素时绘制是帧耗时的大头。
-     *   放内部 SRAM 后这笔开销直接归零，且 SPI DMA 也能原生从内部 RAM 取数。
-     *   PSRAM 兜底保留：内部 RAM 紧到分不出来时行为不变。 */
-    out->fb = (uint8_t *)heap_caps_calloc(1, FB_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (out->fb) {
-        /* ⚠ 内部 RAM 是有底线的：I2S DMA(≈18KB)、WiFi/BT、TLS 都要内部连续块。
-         *   分完 fb 后剩余不足 64KB 就还回去 —— 宁可绘制慢，也不能把音频/联网挤死。 */
-        size_t left = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        if (left < 64u * 1024u) {
-            ESP_LOGW(TAG, "内部 RAM 只剩 %u B (<64KB), fb 退回 PSRAM", (unsigned)left);
-            heap_caps_free(out->fb);
-            out->fb = NULL;
-        }
-    }
+    /* ★ 2026-11-01 linit: framebuffer 强制走 PSRAM。
+     *   内部 RAM 要留给 WiFi / TLS / I2S DMA，15KB 的 1bpp 整帧缓冲没必要占内部。
+     *   整帧刷新是连续大块写，PSRAM 上开销可接受；分配失败才退回内部 RAM。 */
+    out->fb = (uint8_t *)heap_caps_calloc(1, FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!out->fb) {
-        out->fb = (uint8_t *)heap_caps_calloc(1, FB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!out->fb) return ESP_ERR_NO_MEM;
+        ESP_LOGW(TAG, "PSRAM 分配 fb 失败, 退回内部 RAM");
+        out->fb = (uint8_t *)heap_caps_calloc(1, FB_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
-    if (!out->fb) {
-        return ESP_ERR_NO_MEM;
-    }
+    if (!out->fb) return ESP_ERR_NO_MEM;
     ESP_LOGI(TAG, "fb=%p size=%d [%s]",
              (void*)out->fb, FB_BYTES,
              esp_ptr_internal(out->fb) ? "SRAM" : "PSRAM");
@@ -662,8 +647,10 @@ void st7305_set_full_window(st7305_handle_t *dev) {
  *   正在跑的 GDMA 读 PSRAM 被打断 ⇒ 传输永远不结束 ⇒ spi_device_polling_transmit
  *   在**主任务**上无限阻塞 ⇒ 画面冻结；而音频/WiFi 在别的核上照常跑 ⇒ "后台正常"。
  *   面板自愈也跑不到（同一条任务卡在 transmit 里），所以只能断电。
- *   解法：整帧先 memcpy 到**内部 RAM** 的发送缓冲，再从内部 RAM 发 —— flash 操作再也
- *   碰不到这条 DMA。内部 RAM 现在有 130KB+ 余量，15000B 完全负担得起。 */
+ *
+ *   ★ 现行解法（2026-11-02 收敛）：不要再整帧 15KB 中转，改 **2048B 分块 + 段间 CS 保持**。
+ *     同样做到"DMA 只读内部 RAM、flash 永远碰不到它"，内部 RAM 只占 2KB。
+ *     细节见 TX_CHUNK_BYTES 处。 */
 static bool     s_win_set = false;  /* 窗口/扫描方向是否已设过 (每帧只发 0x2C) */
 /* ★ 2026-10-25 linit「非常卡 不要限制了」⇒ 限速**关闭**(0 = 不限)。
  *   原来为了护面板加的 16fps 上限反过来把界面拖顿了, 先去掉。
@@ -756,22 +743,39 @@ void st7305_perf_dump(void)
 }
 #endif /* ST7305_PERF_STATS */
 
-static uint8_t *s_txbuf = NULL;     /* 内部 RAM 的整帧发送缓冲 (DMA 可读) */
-static bool     s_txbuf_tried = false;
+/* ★ 2026-11-02: 整帧发送改用 **2KB 内部缓冲分块 + CS 全程保持**。
+ *
+ *   为什么不是 15KB 整块：原来那块 s_txbuf 占内部 RAM 15000 B，只为把 PSRAM 里的
+ *   fb 中转一次给 DMA。
+ *   又为什么不是"PSRAM 直发"（SPI_TRANS_DMA_USE_PSRAM 一次发完）：
+ *     ESP32-S3 的 PSRAM 与 flash 共用 MSPI。一旦别的任务在 DMA 读 PSRAM 期间写
+ *     flash（NVS 落盘 / 商店写包 / 写文件），PSRAM 立刻不可访问 ⇒ GDMA 取不到数
+ *     据 ⇒ 传输永不结束；而 spi_flash 那边在等另一个核让出 cache ⇒ **双核互等死锁**。
+ *     表现就是 2026-10-25 记过的"画面冻结、后台正常、只能断电"。
+ *   现在：DMA 只读内部 RAM（永远不受 flash 影响），缓冲缩到 2048 B，
+ *   段间用 SPI_TRANS_CS_KEEP_ACTIVE 保持 CS 低电平，屏幕上看到的仍是一条连续数据流。 */
+#define TX_CHUNK_BYTES  2048
+static uint8_t *s_tx_chunk = NULL;
+/* 分配状态三态, 避免"分配失败后每次 flush 都重新 malloc":
+ *   0 = 尚未尝试  1 = 已分配成功  2 = 分配失败(不再重试)
+ * 唯一的复位机会是 panel_soft_recover() —— 项目既有的屏幕自愈流程,
+ * 不另外造重试系统。 */
+#define TX_CHUNK_UNINIT  0
+#define TX_CHUNK_READY   1
+#define TX_CHUNK_FAILED  2
+static uint8_t  s_tx_chunk_state = TX_CHUNK_UNINIT;
 
-static uint8_t *txbuf_get(void)
+static uint8_t *tx_chunk_get(void)
 {
-    if (s_txbuf) return s_txbuf;
-    if (s_txbuf_tried) return NULL;
-    s_txbuf_tried = true;
-    s_txbuf = (uint8_t *)heap_caps_malloc(FB_BYTES,
-                  MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (!s_txbuf) {
-        ESP_LOGE(TAG, "内部 RAM 发送缓冲分配失败 (%d B) → 退回 PSRAM 直发(可能卡死)", FB_BYTES);
-    } else {
-        ESP_LOGI(TAG, "整帧发送缓冲: 内部 RAM %d B (避免 PSRAM DMA 被 flash 操作打断)", FB_BYTES);
-    }
-    return s_txbuf;
+    if (s_tx_chunk) { s_tx_chunk_state = TX_CHUNK_READY; return s_tx_chunk; }
+    if (s_tx_chunk_state == TX_CHUNK_FAILED) return NULL;   /* 失败过就不再试 */
+    s_tx_chunk = (uint8_t *)heap_caps_malloc(TX_CHUNK_BYTES,
+                    MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    s_tx_chunk_state = s_tx_chunk ? TX_CHUNK_READY : TX_CHUNK_FAILED;
+    if (!s_tx_chunk)
+        ESP_LOGE(TAG, "DMA 分块缓冲分配失败 (%d B) → 暂停刷新, 不接受 PSRAM DMA 降级",
+                 TX_CHUNK_BYTES);
+    return s_tx_chunk;
 }
 
 static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb); /* 前向声明 */
@@ -867,6 +871,9 @@ static void panel_soft_recover(st7305_handle_t *dev)
 {
     if (s_recovering || !dev) return;
     s_recovering = true;
+    /* 分块缓冲若处于"分配失败"态, 借这次自愈复位成未尝试 —— 只在这里给第二次机会,
+     * 不在每次 flush 里重试(避免每帧 malloc)。 */
+    if (s_tx_chunk_state == TX_CHUNK_FAILED) s_tx_chunk_state = TX_CHUNK_UNINIT;
     ESP_LOGW(TAG, "面板 %u ms 无成功送屏 → 软复位重建 (不用断电)",
              (unsigned)(lcd_now_ms() - s_ok_ms));
     if (lcd_lock_take()) {
@@ -883,9 +890,41 @@ static void panel_soft_recover(st7305_handle_t *dev)
             send_cmd(dev, 0x2A); { uint8_t d[] = {CASET_START, CASET_END}; send_data(dev, d, 2); }
             send_cmd(dev, 0x2B); { uint8_t d[] = {RASET_START, RASET_END}; send_data(dev, d, 2); }
             send_cmd(dev, 0x2C);
-            spi_transaction_t t = { .length = FB_BYTES * 8, .tx_buffer = dev->fb,
-                                    .flags = esp_ptr_external_ram(dev->fb) ? SPI_TRANS_DMA_USE_PSRAM : 0 };
-            spi_device_polling_transmit(dev->spi, &t);
+            /* ★ 2026-11-02: 与正常刷新统一 —— 2KB 内部 DMA 分块, 不再用 PSRAM DMA。
+             *   自愈是"连续多次刷新失败"之后才跑的, 如果它自己还走 PSRAM 直发, 一旦
+             *   失败原因正是 flash 写并发, 这次重画会再卡死一次 —— 自愈等于失效。
+             *   ⚠ 这里不累加 s_flush_fail_streak: 刚在 886 行清零, 再累加会让下一帧
+             *     立刻又触发自愈, 变成自激循环。重画失败只记日志。 */
+            esp_err_t re = ESP_OK;
+            uint8_t *chunk = tx_chunk_get();
+            if (!chunk) {
+                re = ESP_ERR_NO_MEM;
+                ESP_LOGW(TAG, "恢复重画跳过: DMA 分块缓冲不可用 (不是 SPI 传输错误)");
+            } else {
+                esp_err_t aq = spi_device_acquire_bus(dev->spi, portMAX_DELAY);
+                if (aq != ESP_OK) {
+                    ESP_LOGW(TAG, "恢复重画中止: SPI 总线获取失败 (%s)", esp_err_to_name(aq));
+                    re = aq;
+                } else {
+                    const uint8_t *psrc = dev->fb;
+                    int left = FB_BYTES;
+                    while (left > 0) {
+                        int n = (left > TX_CHUNK_BYTES) ? TX_CHUNK_BYTES : left;
+                        memcpy(chunk, psrc, (size_t)n);
+                        psrc += n;
+                        left -= n;
+                        spi_transaction_t t = {
+                            .length    = (size_t)n * 8,
+                            .tx_buffer = chunk,
+                            .flags     = (left > 0) ? SPI_TRANS_CS_KEEP_ACTIVE : 0,
+                        };
+                        re = spi_device_polling_transmit(dev->spi, &t);
+                        if (re != ESP_OK) break;
+                    }
+                    spi_device_release_bus(dev->spi);
+                }
+            }
+            if (re != ESP_OK) ESP_LOGW(TAG, "恢复重画未完成 (%s)", esp_err_to_name(re));
             xSemaphoreGive(s_lcd_lock);
         }
         ESP_LOGI(TAG, "面板已恢复 (第 %d 次)", s_recover_cnt);
@@ -947,29 +986,47 @@ static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb) 
 #if ST7305_PERF_STATS
     uint32_t t_cmd_end = (uint32_t)esp_timer_get_time();   /* 命令阶段结束 */
 #endif
-    /* ★ 同步整帧, 且**从内部 RAM 发** —— 这是"画面卡死后台正常"的根治点:
-     *   PSRAM 直发会在任何一次写 flash(NVS/商店/日志) 时被打断而永久阻塞。
-     * ★★ 2026-10-26 linit「帧率上不去」: fb 本来就优先分配在内部 RAM (见 init 的分配策略),
-     *   而这里又无条件 memcpy 一份到另一块 15KB 的 s_txbuf —— 等于内部 RAM 白占 15KB,
-     *   还外加每帧白拷 15KB。现在: fb 已在内部 RAM 就直接当 tx_buffer
-     *   (省拷贝 + 不再分配 txbuf); 同步 polling_transmit 发完才返回,
-     *   不存在"CPU 边画 / DMA 边读"的并发。只有 fb 退到 PSRAM 时才走原来的中转路径。 */
-    spi_transaction_t t = { .length = FB_BYTES * 8 };
+    /* ★ 同步整帧发送（安全性依据见 TX_CHUNK_BYTES 处的注释）:
+     *   fb 已在内部 RAM → 一次发完, 零拷贝;
+     *   fb 在 PSRAM   → 2048B 分块中转, CS 段间保持, DMA 只读内部 RAM。
+     * ⛔ 分块缓冲拿不到时**直接失败**, 不再退回 PSRAM DMA —— 那条路在 flash 写并发
+     *    时会让 GDMA 永久阻塞(见 TX_CHUNK_BYTES 注释), 宁可这一帧不刷。 */
+    esp_err_t e = ESP_OK;
+    bool dma_buf_fail = false;
     if (esp_ptr_internal(fb)) {
-        t.tx_buffer = (void *)fb;    /* 内部 RAM 直发: 无需 PSRAM DMA 标志, 也无须 txbuf */
-        t.flags     = 0;
+        spi_transaction_t t = { .length = FB_BYTES * 8, .tx_buffer = (void *)fb, .flags = 0 };
+        e = spi_device_polling_transmit(dev->spi, &t);
     } else {
-        uint8_t *tx = txbuf_get();
-        if (tx) {
-            memcpy(tx, fb, FB_BYTES);
-            t.tx_buffer = tx;
-            t.flags     = 0;
+        uint8_t *chunk = tx_chunk_get();
+        if (!chunk) {
+            dma_buf_fail = true;
+            e = ESP_ERR_NO_MEM;
         } else {
-            t.tx_buffer = (void *)fb; /* 兜底: 中转缓冲也分不到才直发 */
-            t.flags     = SPI_TRANS_DMA_USE_PSRAM;
+            /* 拿总线: 必须成功才发, 失败直接放弃本帧; release 只在成功时调用 */
+            esp_err_t aq = spi_device_acquire_bus(dev->spi, portMAX_DELAY);
+            if (aq != ESP_OK) {
+                ESP_LOGE(TAG, "刷新中止: SPI 总线获取失败 (%s)", esp_err_to_name(aq));
+                e = aq;
+            } else {
+                const uint8_t *src = fb;
+                int left = FB_BYTES;
+                while (left > 0) {
+                    int n = (left > TX_CHUNK_BYTES) ? TX_CHUNK_BYTES : left;
+                    memcpy(chunk, src, (size_t)n);
+                    src  += n;
+                    left -= n;
+                    spi_transaction_t t = {
+                        .length    = (size_t)n * 8,
+                        .tx_buffer = chunk,
+                        .flags     = (left > 0) ? SPI_TRANS_CS_KEEP_ACTIVE : 0,
+                    };
+                    e = spi_device_polling_transmit(dev->spi, &t);
+                    if (e != ESP_OK) break;
+                }
+                spi_device_release_bus(dev->spi);
+            }
         }
     }
-    esp_err_t e = spi_device_polling_transmit(dev->spi, &t);
     uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t0);
 #if ST7305_PERF_STATS
     {
@@ -989,7 +1046,10 @@ static esp_err_t st7305_flush_from_raw(st7305_handle_t *dev, const uint8_t *fb) 
     xSemaphoreGive(s_lcd_lock);
     if (e != ESP_OK) {
         s_flush_fail_streak++;
-        ESP_LOGE(TAG, "整帧送屏失败: %d", (int)e);
+        if (dma_buf_fail)
+            ESP_LOGE(TAG, "整帧送屏失败: DMA 分块缓冲不可用 (不是 SPI 传输错误)");
+        else
+            ESP_LOGE(TAG, "整帧送屏失败: SPI 传输错误 %d", (int)e);
         return e;
     }
     s_flush_fail_streak = 0;
@@ -1332,23 +1392,64 @@ esp_err_t st7305_flush_rotated(st7305_handle_t *dev, uint8_t rot, uint8_t *work_
         }
     }
 
-    /* 切竖屏扫描 + 竖屏窗口 (列=0..299, 行=0..399), 再发竖屏缓冲 */
+    /* 切竖屏扫描 + 竖屏窗口 (列=0..299, 行=0..399), 再发竖屏缓冲。
+     * ★ 2026-11-02: 发送方式与横屏统一 —— 2048B 分块 + 段间 CS 保持, DMA 只读内部 RAM。
+     *   原实现无条件带 SPI_TRANS_DMA_USE_PSRAM 直发 work_fb, 一旦别的任务在 DMA 读
+     *   PSRAM 期间写 flash, GDMA 取不到数据 ⇒ 传输不结束 ⇒ 双核互等锁死
+     *   (机理见 TX_CHUNK_BYTES 处的注释)。竖屏不该是唯一的例外。
+     * ⚠ 本函数自己取 s_lcd_lock, 调用方不得持锁 —— 与 st7305_flush_from_raw 同一约定。 */
+    if (!lcd_lock_take()) return ESP_ERR_TIMEOUT;
+
     send_cmd(dev, 0x36); send_data_byte(dev, MADCTL_PORTRAIT);
     send_cmd(dev, 0x2A); { uint8_t d[] = {RASET_START, RASET_END}; send_data(dev, d, 2); }
     send_cmd(dev, 0x2B); { uint8_t d[] = {CASET_START, CASET_END}; send_data(dev, d, 2); }
     send_cmd(dev, 0x2C);
 
-    spi_transaction_t t = {
-        .length = FB_BYTES * 8,
-        .tx_buffer = work_fb,
-        .flags = SPI_TRANS_DMA_USE_PSRAM,
-    };
-    esp_err_t ret = spi_device_polling_transmit(dev->spi, &t);
+    esp_err_t ret = ESP_OK;
+    bool dma_buf_fail = false;
+    uint8_t *chunk = tx_chunk_get();
+    if (!chunk) {
+        dma_buf_fail = true;
+        ret = ESP_ERR_NO_MEM;           /* 不退回 PSRAM DMA */
+    } else {
+        esp_err_t aq = spi_device_acquire_bus(dev->spi, portMAX_DELAY);
+        if (aq != ESP_OK) {
+            ESP_LOGE(TAG, "竖屏刷新中止: SPI 总线获取失败 (%s)", esp_err_to_name(aq));
+            ret = aq;
+        } else {
+            const uint8_t *psrc = work_fb;
+            int left = FB_BYTES;
+            while (left > 0) {
+                int n = (left > TX_CHUNK_BYTES) ? TX_CHUNK_BYTES : left;
+                memcpy(chunk, psrc, (size_t)n);
+                psrc += n;
+                left -= n;
+                spi_transaction_t t = {
+                    .length    = (size_t)n * 8,
+                    .tx_buffer = chunk,
+                    .flags     = (left > 0) ? SPI_TRANS_CS_KEEP_ACTIVE : 0,
+                };
+                ret = spi_device_polling_transmit(dev->spi, &t);
+                if (ret != ESP_OK) break;
+            }
+            spi_device_release_bus(dev->spi);
+        }
+    }
+    if (ret != ESP_OK) {
+        s_flush_fail_streak++;
+        if (dma_buf_fail)
+            ESP_LOGE(TAG, "竖屏刷新失败: DMA 分块缓冲不可用 (不是 SPI 传输错误)");
+        else
+            ESP_LOGE(TAG, "竖屏刷新失败: SPI 传输错误 %d", (int)ret);
+    }
 
-    /* 发完恢复横屏扫描, 避免下次菜单绘制错乱 */
+    /* 发完恢复横屏扫描, 避免下次菜单绘制错乱。
+     * ⚠ 失败时也必须执行 —— 否则扫描方向停在竖屏, 后续所有界面画错。 */
     send_cmd(dev, 0x36); send_data_byte(dev, MADCTL_LANDSCAPE);
     send_cmd(dev, 0x2A); { uint8_t d[] = {CASET_START, CASET_END}; send_data(dev, d, 2); }
     send_cmd(dev, 0x2B); { uint8_t d[] = {RASET_START, RASET_END}; send_data(dev, d, 2); }
+
+    xSemaphoreGive(s_lcd_lock);
     return ret;
 }
 

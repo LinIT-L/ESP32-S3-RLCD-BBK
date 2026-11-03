@@ -18,8 +18,33 @@ extern "C" {
  * 手动关机不走这里 (关机一律刷白, 不显示任何东西)。图数据见 wp_sleep_default.h。 */
 void wp_sleep_wallpaper_draw(st7305_handle_t *lcd);
 
-/* 人生指南壁纸是否可用 (应用已安装): 壁纸列表据此决定是否显示该项 */
+/* 人生指南壁纸是否可用 (应用已安装): 壁纸列表据此决定是否显示该项。
+ * ★ 2026-10-31: 改为**多路径探测** —— 商店默认把应用装到 TF 卡(/sdcard/apps/app),
+ *   原来只认 /store/apps/app 会导致"装了但壁纸里没有这一项"。 */
 bool wp_lifeguide_installed(void);
+
+/* ★ 2026-10-31: 预加载 / 释放人生指南数据段（约 380KB PSRAM）。
+ *
+ * 为什么必须由外部在**安全上下文**调用，而不是让渲染函数自己去读文件：
+ *   屏保监督任务的栈位于 **PSRAM**（wallpapers.c 的 SS_SUPER_STACK + EXT_RAM_BSS_ATTR）。
+ *   该上下文里一旦触发内部 flash 操作（SPIFFS/NVS），spi_flash 会临时禁用缓存 →
+ *   PSRAM 栈不可访问 → 断言/panic → 重启循环（项目里已踩过这个坑，见 wp_ss_prime 注释）。
+ *   TF 卡走 SDMMC 不受影响，但 /store 是 SPIFFS，属于禁区内。
+ * 因此：**读文件只允许在 UI 任务/开机任务（内部 RAM 栈）里做**，
+ *       渲染函数只消费已经装进 PSRAM 的内存。
+ * 返回 true = 数据已就绪（含"本来就已经加载好"）。 */
+bool wp_lifeguide_preload(void);
+/* 释放已加载的数据段。多次调用安全。
+ *
+ * ★ 2026-10-31 两段式释放：本函数**只登记意图，不立即 free**。
+ *   数据的使用者是屏保监督任务（栈在 PSRAM），UI 任务无法确定它此刻不在 render 里。
+ *   真正的 free 由 `wp_lifeguide_reap()` 在屏保任务确认空闲后执行。
+ *   调用方照常调本函数即可，不需要知道这套机制。 */
+void wp_lifeguide_release(void);
+/* 由屏保监督任务在**非屏保**分支调用（wallpapers.c 的 ss_supervisor_task）。
+ * 只有在 pending 且 render 不在跑时才真正 free；其余情况立即返回。
+ * 不对外使用。 */
+void wp_lifeguide_reap(void);
 
 /* ==== 壁纸模块注册表 (壁纸模块化: 各壁纸通过注册表分发, 便于以后从商店下载新壁纸) ====
  * ★ 渲染返回值: 1 = 本帧有新内容, 需要 flush 上屏; 0 = 没有变化, 不要刷屏。
@@ -29,6 +54,16 @@ typedef struct {
     int id;
     const char *name;
     wp_render_fn render;
+    /* ★ 2026-10-31: 静态壁纸轮询间隔(ms)。0 = 动态壁纸（按"本帧是否有新内容"分档，
+     *   有内容 62ms/240MHz，无内容 1000ms/80MHz —— 与原有行为完全一致）。
+     *   >0 = 静态壁纸：**固定 80MHz + 浅睡 + 该间隔轮询**，不因偶尔画一帧就升到 240MHz。
+     *
+     * 修的是什么：静态壁纸每 60 秒换一条会产生 1 帧 drew=1 →
+     *   原逻辑立刻 esp_pm_configure(240MHz) → 下一帧又切回 80MHz；
+     *   也就是"每分钟整机调频两次"。调频本身有代价（DFS 重配置、浅睡门控 SPI），
+     *   而且这一帧根本不需要 240MHz（画 20 行 16px 汉字在 80MHz 下也就几 ms）。
+     * 现在静态壁纸全程停在 80MHz，只在换条那一帧多花几 ms。 */
+    uint32_t idle_ms;
 } wp_module_t;
 
 void wp_register_module(const wp_module_t *m);
@@ -37,6 +72,17 @@ const wp_module_t *wp_get_module_by_index(int idx);
 int wp_get_module_count(void);
 
 const char *wp_prog_name(int id);
+
+/* ★ 2026-10-31: 让"下一帧屏保用哪个壁纸"立刻生效。
+ *
+ * 修的问题：屏保任务用的 `s_ss_prog` 原来**只在开机读一次 NVS**，
+ *   用户在壁纸设置里改完只写了 NVS（os_wp/prog），屏保任务根本不知道 ——
+ *   表现就是"换了壁纸没反应，重启才变"。
+ *
+ * 只能在 UI 任务（内部 RAM 栈）里调：本函数只改一个 int，不碰 NVS、不碰 flash。
+ * （不能改成让屏保任务自己读 NVS —— 那是在 PSRAM 栈上碰 flash，会 panic。）
+ * 传入的 id 未注册时收敛为星空。 */
+void wp_set_program(int prog);
 
 /* 渲染一帧到 LCD (内部 1bpp PSRAM 缓冲 + flush) */
 int  wp_program_render(st7305_handle_t *lcd, int prog, uint32_t now_ms);   /* 1=有新内容需送屏 */

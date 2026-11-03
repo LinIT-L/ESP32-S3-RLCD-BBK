@@ -69,7 +69,7 @@ static const board_pins_t BP_WEIXUE = {
 
 /* ==================== ③ 标准扩展版 ====================
  * 官方标准 ESP32-S3 模块 + 按需扩展：屏幕同微雪；有触摸(15/7/17/2)；
- * 音频走 NS4168 纯功放（**无 MCLK、无录音**）；三个键各自独立（电源 1 / 返回 0 / 确认 18）。 */
+ * 音频走 **NS4168（ESOP8 I2S 数字功放，I2S 直入，无 MCLK / 无 I2C / 无录音）**；三个键各自独立（电源 1 / 返回 0 / 确认 18）。 */
 static const board_pins_t BP_STD = {
     .id = BOARD_ID_STD, .name = "标准扩展版",
     .lcd_dc = 5, .lcd_cs = 40, .lcd_sck = 11, .lcd_mosi = 12, .lcd_rst = 41,

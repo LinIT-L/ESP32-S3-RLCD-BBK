@@ -26,7 +26,11 @@
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"   /* ★ vTaskDeleteWithCaps: 与 xTaskCreateWithCaps 配对 */
 
+#include "lpk_mode.h"     /* 资源模式判定（唯一入口 lpk_mode_decide） */
+#include "lpk_vfs.h"      /* /lpk 的 VFS 挂载（真机入口） */
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -39,6 +43,110 @@ static volatile bool s_running = false;
 static volatile bool s_stop_req = false;
 static int64_t s_launch_us = 0;        /* 本次启动时刻: 载入阶段耗时以它为 0 点 */
 static TaskHandle_t  s_task = NULL;
+
+/* ---------------- 资源模式（一次性判定，启动时定死） ----------------
+ * ★ 2026-11-01: 仙剑支持两种装法 —— 单文件 .lpk（免解压）/ 原 ZIP 解压目录。
+ *   判定在 lpk_mode.c（安装记录 + 自检 + 无记录时目录优先），这里只负责：
+ *     ① 判定 → ② LPK 模式挂 /lpk → ③ 把结果给 pal_platform.c 改写 gConfig。
+ *   ⛔ 不允许"包里没找到就回退到盘上"：那是资源混用，见 lpk_mount.h 三条规则。 */
+static lpk_res_mode_t s_res = LPK_RES_NONE;
+static bool           s_res_mounted = false;
+
+/* 可写旁路：这三个路径无论引擎怎么拼，都只落真实 FAT。
+ * 现在引擎的存档/配置路径直接就是 PAL_DATA_DIR（不经过 /lpk），
+ * 这张表是**兜底**：万一将来某条代码拼出 /lpk/save/...，也不会写进只读包。 */
+static const lpk_vfs_wr_t PAL_WRITABLE[] = {
+    { "save/",       true  },
+    { "screenshot/", true  },
+    { "sdlpal.cfg",  false },
+};
+
+static void make_lpk_path(char *out, size_t cap) {
+    snprintf(out, cap, "%s/pal.lpk", pal_entry_datadir());
+}
+
+pal_res_mode_t pal_res_mode(void) { return (pal_res_mode_t)s_res; }
+const char *pal_res_gamepath(void) {
+    return (s_res == LPK_RES_LPK) ? LPK_VFS_MNT : PAL_DATA_DIR;
+}
+bool pal_res_mounted(void) { return s_res_mounted; }
+
+const char *pal_res_mode_str(pal_res_mode_t m) { return lpk_mode_str((lpk_res_mode_t)m); }
+
+/* 只判定不挂载。索引表按头里的 count 分配（PSRAM 优先），判完即放。 */
+pal_res_mode_t pal_res_probe(char *why, size_t cap) {
+    char local[128];
+    if (!why) { why = local; cap = sizeof(local); }
+    if (cap) why[0] = 0;
+
+    const char *dir = pal_entry_datadir();
+    char lpkp[200];
+    make_lpk_path(lpkp, sizeof(lpkp));
+
+    lpk_entry_t *tab = NULL;
+    int max = 0;
+    lpk_t h;
+    if (lpk_open(&h, lpkp, NULL, 0) == LPK_OK) {      /* 只读 64 B 头，拿条数 */
+        max = (int)h.count;
+        lpk_close(&h);
+        if (max > 0) {
+            size_t bytes = (size_t)max * sizeof(lpk_entry_t);
+            tab = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!tab) tab = malloc(bytes);
+            if (!tab) max = 0;                        /* 分配失败就让判定层自己再试一次 */
+        }
+    }
+    lpk_res_mode_t m = lpk_mode_decide(dir, tab, max, why, cap);
+    if (tab) free(tab);
+    return (pal_res_mode_t)m;
+}
+
+/* 启动前准备：判定 + 需要时挂载。返回 false = 不能启动。 */
+static bool res_prepare(void) {
+    if (s_res_mounted) {                              /* 上一次没收拾干净 */
+        lpk_vfs_unmount();
+        s_res_mounted = false;
+    }
+
+    const char *dir = pal_entry_datadir();
+    struct stat st;
+    if (stat(dir, &st) != 0) {                        /* 目录是两种模式的共同根，必须先有 */
+        ESP_LOGE(TAG, "数据目录不存在: %s", dir);
+        return false;
+    }
+
+    char why[128] = {0};
+    s_res = (lpk_res_mode_t)pal_res_probe(why, sizeof(why));
+    ESP_LOGW(TAG, "资源判定: %s —— %s", lpk_mode_str(s_res), why);
+    if (s_res == LPK_RES_NONE) return false;
+
+    if (s_res == LPK_RES_LPK) {
+        char lpkp[200];
+        make_lpk_path(lpkp, sizeof(lpkp));
+        esp_err_t e = lpk_vfs_mount(lpkp, dir, PAL_WRITABLE,
+                                    (int)(sizeof(PAL_WRITABLE) / sizeof(PAL_WRITABLE[0])));
+        if (e == ESP_OK) {
+            s_res_mounted = true;
+            ESP_LOGW(TAG, "LPK 模式: %s → %s（%d 条资源，免解压）",
+                     lpkp, LPK_VFS_MNT, lpk_vfs_file_count());
+        } else {
+            /* 挂载失败绝不能"假装成功"继续跑 —— 引擎会一路 ENOENT 然后 abort。
+             * 如果目录模式还完整，就老实回落到目录模式（存档目录本来就在那儿）。 */
+            ESP_LOGE(TAG, "挂载 %s 失败: %s", lpkp, esp_err_to_name(e));
+            char w2[128] = {0};
+            if (lpk_mode_dir_ready(dir, w2, sizeof(w2))) {
+                ESP_LOGW(TAG, "回落到目录模式（%s）", dir);
+                s_res = LPK_RES_DIR;
+            } else {
+                ESP_LOGE(TAG, "目录模式也不可用: %s", w2);
+                return false;
+            }
+        }
+    }
+    ESP_LOGW(TAG, "本次 GamePath=%s SavePath=%s",
+             (s_res == LPK_RES_LPK) ? LPK_VFS_MNT : PAL_DATA_DIR, PAL_DATA_DIR);
+    return true;
+}
 
 static void pal_task(void *arg)
 {
@@ -119,6 +227,7 @@ void pal_shutdown(void)
     h = xTaskGetHandle("sdlpal");
     if (h) { ESP_LOGW(TAG, "残留 sdlpal ⇒ 强制结束"); vTaskDeleteWithCaps(h); st7305_lock_recover(); killed = true; }
 
+
     /* ④a2 ★★★ 2026-10-25: 强杀过就必须重建文件系统。
      *   被强杀的任务可能正持有 FatFs 卷锁, 之后每次开/读/关文件都会等满超时,
      *   表现就是"退出后整机卡死"(rebuild 10s、列目录无响应)。
@@ -129,6 +238,18 @@ void pal_shutdown(void)
         ESP_LOGW(TAG, "强杀过任务 ⇒ 重建 SD 文件系统 (防 FatFs 卷锁泄漏)");
         esp_err_t e = sd_remount();
         ESP_LOGW(TAG, "sd_remount 结果: %s", esp_err_to_name(e));
+    }
+
+    /* ③b ★ 2026-11-01 实测修正: 卸载 /lpk **必须放在 sd_remount 之后**。
+     *   原来放在强杀之后、remount 之前 —— 结果 unmount 里的 fclose 去拿 FatFs 卷锁，
+     *   而锁被刚被 vTaskDelete 的任务带走 ⇒ 卡了整整 **10 秒**才返回（真机日志实测）。
+     *   现在先 remount（把卷和锁重置掉），再卸载；此时 fclose 立刻失败返回，
+     *   既不会挂住，也不会把"退出后整机卡死"的老病引回来。
+     *   ⚠ 不删包、不碰存档：这里只注销挂载点、释放条目表与缓存。 */
+    if (s_res_mounted) {
+        lpk_vfs_unmount();
+        s_res_mounted = false;
+        ESP_LOGI(TAG, "已卸载 %s", LPK_VFS_MNT);
     }
 
     /* ④b ★★★ 2026-10-25 「第二次进游戏没声音」的根因:
@@ -225,10 +346,13 @@ bool pal_launch(void)
         s_task    = NULL;
     }
 
-    /* 数据文件必须在, 否则 SDLPal 会 TerminateOnError -> 直接 abort */
-    struct stat st;
-    if (stat(pal_entry_datadir(), &st) != 0) {
-        ESP_LOGE(TAG, "数据目录不存在: %s", pal_entry_datadir());
+    /* 资源准备：判定 LPK / 目录模式；LPK 模式在这里把 /lpk 挂上。
+     * ★ 2026-11-01: 原来只 stat 数据目录。现在两种装法的"可用"标准不同，
+     *   统一交给 res_prepare()（内部走 lpk_mode_decide，唯一判定点）。
+     *   两种都不可用时**不启动** —— 否则引擎 TerminateOnError → abort，
+     *   表现是"点一下震一下，然后什么都没发生"，比明确不启动更难查。 */
+    if (!res_prepare()) {
+        ESP_LOGE(TAG, "资源不可用（LPK 与目录都不完整），放弃启动");
         return false;
     }
 
@@ -254,6 +378,7 @@ bool pal_launch(void)
         s_running = false;
         s_task = NULL;
         ESP_LOGE(TAG, "任务创建失败");
+        if (s_res_mounted) { lpk_vfs_unmount(); s_res_mounted = false; }
         return false;
     }
     /* ★ 内存体检: 进游戏 3 秒后再打一次, 差值就是 SDLPal 吃掉的量。
@@ -278,7 +403,13 @@ static char s_datadir[96] = PAL_DATA_DIR;   /* 与 pal_config.h 的 PAL_PREFIX �
 const char *pal_entry_datadir(void) { return s_datadir; }
 void pal_entry_set_datadir(const char *d)
 {
-    if (d && d[0]) snprintf(s_datadir, sizeof(s_datadir), "%s", d);
+    if (d && d[0]) {
+        /* 换目录 = 换资源来源，缓存下来的模式立刻作废；
+         * 若还挂着旧的 /lpk 必须先卸（同一个挂载点不能挂两次）。 */
+        if (s_res_mounted) { lpk_vfs_unmount(); s_res_mounted = false; }
+        s_res = LPK_RES_NONE;
+        snprintf(s_datadir, sizeof(s_datadir), "%s", d);
+    }
 }
 
 

@@ -72,6 +72,11 @@
 #include "sd_scan.h"   /* sd_is_mounted: logsave 前判断卡是否挂着 */
 #include "svc_log.h"   /* svc_log_flush_once(): logsave 要按真实返回值报告 (2026-10-29) */
 #include "bt_manager.h"     /* ★ 2026-10-27: bt 命令诊断用 */
+#include "lpk1.h"           /* ★ 2026-11-01: lpk 命令 (自包含包读取自检) */
+#include "lpk_vfs.h"        /* ★ 2026-11-01: lpkv 命令 (/lpk 挂载 + 真机自检) */
+#include "lpk_mode.h"
+#include "am_lpkg.h"        /* ★ 2026-11-01: lpkinst/lpklist/lpkrm */       /* ★ 2026-11-01: lpkmode 命令 (模式判定 / 安装记录) */
+#include "os.h"             /* ★ 2026-11-01: apps 命令 (桌面图标归属诊断) */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -105,6 +110,7 @@ void rc_touch_scan(void);   /* 定义在文件末尾: 触摸 I2C 总线扫描 */
 #include "esp_pm.h"        /* pm: 打印 PM 配置 + 锁表 (看 DFS/浅睡是否被驱动锁住) */
 #include "power_mgr.h"     /* sleepstage: 分阶段功耗诊断掩码 (2026-10-28 从 sleep.h 迁出) */
 #include "board_battery.h" /* bat: 电池 raw/脚上mV/分压系数/VBAT 现场核对 (2026-10-14) */
+#include "svc_time.h"      /* timed: 时间服务状态诊断 (2026-11-01) */
 #include "am_store_json.h"   /* ★ am_rpkg_t (storedl 命令用) */
 
 #define RC_TAG      "remcon"
@@ -426,7 +432,18 @@ static void rc_cmd_immediate(const char *line){
                 const char *dn = am_rstore_dl_name();
                 printf("STORE_PROGRESS %d %d%%\r\n", t, pm < 0 ? -1 : pm / 10);
                 if (!dn || !dn[0]) {
-                    /* ★ 下载完成 → 自动安装(与 UI 路径同一个函数) */
+                    /* ★ 2026-11-01: **只对普通 .lua 包**做这一步。
+                     *   资源包 / LPK 在下载任务里已经自己装完了（am_lpk_finish → 安装器 /
+                     *   解包到 target），这里再拼一个 "<名字>.lua" 去 auto_install 会把
+                     *   商店源目录里的旧残留重新复制进 /sdcard/apps/app ⇒ 白捡出一条
+                     *   重复的 .lua 行（录音机/航班雷达 当时就是这么又冒出来的）。
+                     *   判据用索引里的 type，与商店保持一致。 */
+                    const am_rpkg_t *rp = am_rstore_get(idx);
+                    if (rp && am_pkg_is_res(rp->type)) {
+                        printf("STORE_INSTALL SKIP (资源包/LPK 由下载任务自行安装)\r\n");
+                        printf("STORE_DONE\r\n");
+                        break;
+                    }
                     extern bool am_store_auto_install(const char *fname);
                     char fn[56];
                     snprintf(fn, sizeof(fn), "%s.lua", want);
@@ -475,6 +492,12 @@ static void rc_cmd_immediate(const char *line){
             if (!ssid[0]) printf("WIFI conn: 无已存配置\r\n");
             else { (void)os_hw_request(OS_HW_WIFI);   /* 占住引用计数, 否则连上后没人持有会被拆掉 */
                    printf("WIFI conn %s ok=%d\r\n", ssid, (int)wifi_manager_connect(ssid, pass)); }
+        } else if (wa && strcmp(wa, "ps") == 0) {
+            /* wifi ps 0|1 —— 临时关/开射频省电(仅诊断用)。
+             * 大文件下载时 MIN_MODEM 会丢包导致断流, 测量时先关掉。 */
+            char *v = rc_next(&rest);
+            wifi_manager_set_ps_diag(!(v && *v == '1'));
+            printf("WIFI ps=%s\r\n", (v && *v == '1') ? "MIN_MODEM" : "NONE");
         } else if (wa && strcmp(wa, "set") == 0) {
             /* wifi set <ssid> <pass>  (2026-10-09)
              * 用途: 在掌机上用软键盘打 WiFi 密码很痛苦; 烧过整片镜像清了 nvs 之后
@@ -575,12 +598,123 @@ static void rc_cmd_immediate(const char *line){
             vTaskDelay(pdMS_TO_TICKS(200));
         }
         printf("BEEP_END\r\n");
+    } else if (strcmp(cmd, "lpkstat") == 0) {
+        /* lpkstat [0|1|r] —— /lpk 的 I/O 与 PSRAM 缓存计数。
+         *   不带参数: 打印   0/1: 关/开整资源缓存   r: 清零计数
+         * 用途: 判断"载入慢"是慢在读卡(SD) 还是慢在 CPU —— 看 KB/s 与毫秒直接得结论。 */
+        char *a = rc_next(&rest);
+        if (a && (*a == '0' || *a == '1')) {
+            lpk_vfs_cache_set(*a == '1');
+            if (*a == '0') lpk_vfs_cache_flush();
+            printf("LPKSTAT 缓存=%s\r\n", *a == '1' ? "开" : "关");
+        } else if (a && (*a == 'r' || *a == 'R')) {
+            lpk_vfs_stats_reset();
+            printf("LPKSTAT 计数已清零\r\n");
+        } else {
+            uint32_t reads = 0, bytes = 0, us = 0, hits = 0, loads = 0, cb = 0;
+            lpk_vfs_stats(&reads, &bytes, &us, &hits, &loads, &cb);
+            uint32_t kbps = us ? (uint32_t)(((uint64_t)bytes * 1000 / 1024) / us) : 0;
+            printf("LPKSTAT 挂载=%d 缓存=%s(%u KB, 预载 %u 次, 命中 %u 次)\r\n",
+                   (int)lpk_vfs_is_mounted(), lpk_vfs_cache_get() ? "开" : "关",
+                   (unsigned)(cb / 1024), (unsigned)loads, (unsigned)hits);
+            printf("LPKSTAT 读卡 %u 次 / %u KB / %u ms ⇒ %u KB/s\r\n",
+                   (unsigned)reads, (unsigned)(bytes / 1024), (unsigned)us, (unsigned)kbps);
+        }
+    } else if (strcmp(cmd, "sdb") == 0) {
+        /* sdb [MB] —— SD 卡**裸读吞吐**基准：同一个文件用 4K/16K/64K/256K 分块各读一遍。
+         * 为什么需要它: "载入一分钟"到底是卡在 SD 还是卡在 CPU，靠猜没意义；
+         * 顺便验证"加大单次读长度能不能提速"（决定要不要做预读）。 */
+        char *a = rc_next(&rest);
+        int mb = (a && *a) ? atoi(a) : 4;
+        if (mb < 1) mb = 1;
+        if (mb > 16) mb = 16;
+        const char *fp = "/sdcard/apps/app/pal/pal.lpk";
+        static const int CH[] = { 4096, 16384, 65536 };
+        /* ★ 2026-11-01 修正测量方法：IDF 的 sdmmc_read_sectors() 只在**缓冲可直接 DMA** 时
+         *   走单次 DMA；否则每次都要 malloc 一块 DMA 缓冲 + 拷贝（sdmmc_cmd.c:660）。
+         *   上一轮用 PSRAM 缓冲测，正好落进慢分支，430 KB/s 低估了真实文件读。
+         *   这里**两种缓冲都测**，并明确标出来，避免再拿错数据下结论。 */
+        uint8_t *dma = heap_caps_malloc(65536, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        uint8_t *ps  = heap_caps_malloc(65536, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!dma) printf("SDB_ERR 内部 DMA 缓冲分配失败\r\n");
+        if (!dma && !ps) printf("SDB_ERR 缓冲分配失败\r\n");
+        else {
+            printf("SDB %s, 每次读 %d MB (缓冲: 内部DMA=%s PSRAM=%s)\r\n",
+                   fp, mb, dma ? "有" : "无", ps ? "有" : "无");
+            size_t want = (size_t)mb * 1024 * 1024;
+            for (int pass = 0; pass < 2; pass++) {
+                uint8_t *buf = pass == 0 ? dma : ps;
+                if (!buf) continue;
+                printf("SDB --- 缓冲=%s ---\r\n", pass == 0 ? "内部DMA" : "PSRAM");
+                for (int k = 0; k < 3; k++) {
+                    FILE *f = fopen(fp, "rb");
+                    if (!f) { printf("SDB_ERR 打不开 %s\r\n", fp); break; }
+                    int64_t t0 = esp_timer_get_time();
+                    size_t got = 0, chunk = (size_t)CH[k];
+                    while (got < want) {
+                        size_t n = fread(buf, 1, chunk, f);
+                        if (n == 0) break;
+                        got += n;
+                    }
+                    int64_t dt = esp_timer_get_time() - t0;
+                    fclose(f);
+                    uint32_t kbps = dt ? (uint32_t)(((uint64_t)got * 1000000 / 1024) / (uint64_t)dt) : 0;
+                    printf("SDB chunk=%6u B: %u KB in %d ms ⇒ %u KB/s\r\n",
+                           (unsigned)chunk, (unsigned)(got / 1024), (int)(dt / 1000), (unsigned)kbps);
+                }
+            }
+            free(dma);
+            free(ps);
+        }
+    } else if (strcmp(cmd, "lpkinst") == 0) {
+        /* lpkinst <file.lpk> —— 走**设备端真实安装器**（不与打包工具共用代码）：
+         *   验 manifest → 解包到 staging → 原子切换 → installed/<app_id>/ → 注册 */
+        char *p = rc_next(&rest);
+        if (!p || !*p) { printf("RC_ERR lpkinst <file.lpk>\r\n"); return; }
+        char why[160] = {0};
+        esp_err_t e = am_lpkg_install(p, why, sizeof(why));
+        if (e == ESP_OK) printf("LPKINST OK %s\r\n", p);
+        else             printf("LPKINST ERR %s: %s\r\n", esp_err_to_name(e), why);
+    } else if (strcmp(cmd, "lpklist") == 0) {
+        /* ★ 2026-11-01: 同时打印**两套版本**，这是商店更新判定是否正确的现场依据：
+         *   pkg=  包内 manifest 自称的版本   store= 商店索引交付时的版本
+         *   两行不一致 ⇒ 服务器只抬了索引没重新打包（商店按 store 判定，不会无限更新，
+         *   但索引应该重新生成）。MISMATCH 就是那个告警的落地标记。 */
+        int n = am_lpkg_scan();
+        printf("LPKLIST %d\r\n", n);
+        for (int i = 0; i < n; i++) {
+            const char *id = am_lpkg_id_at(i);
+            am_lpkg_info_t inf;
+            if (am_lpkg_info(id, &inf)) {
+                printf("LPKAPP %s pkg=%s/%s store=%s/%s%s\r\n",
+                       id, inf.mf_ver, inf.mf_build, inf.ver, inf.build,
+                       inf.meta_mismatch ? " MISMATCH" : "");
+            } else {
+                printf("LPKAPP %s pkg=%s (registry 不可读)\r\n", id, am_lpkg_ver_at(i));
+            }
+        }
+    } else if (strcmp(cmd, "lpkrm") == 0) {
+        /* lpkrm <app_id> [purge]  —— purge 才会删用户数据 */
+        char *p = rc_next(&rest);
+        char *k = rc_next(&rest);
+        if (!p || !*p) { printf("RC_ERR lpkrm <app_id> [purge]\r\n"); return; }
+        bool keep = !(k && strcmp(k, "purge") == 0);
+        char why[160] = {0};
+        esp_err_t e = am_lpkg_uninstall(p, keep, why, sizeof(why));
+        if (e == ESP_OK) printf("LPKRM OK %s (data %s)\r\n", p, keep ? "kept" : "purged");
+        else             printf("LPKRM ERR %s: %s\r\n", esp_err_to_name(e), why);
     } else if (strcmp(cmd, "pal") == 0) {
         /* ★ 2026-10-24 linit 定: 仙剑引擎**不在任何界面显示**, 只从终端敲 `pal` 启动。
          *   这里给串口留同一条入口 (远程自测用)。数据目录必须是 /sdcard/pal。 */
         extern bool pal_launch(void);
-        printf("RC_OK pal (data=/sdcard/pal)\r\n");
-        if (!pal_launch()) printf("RC_ERR pal 启动失败: 检查 /sdcard/pal\r\n");
+        extern const char *pal_entry_datadir(void);
+        /* ★ 2026-11-01: 原来这里硬写着 /sdcard/pal（2026-10-25 之前的旧目录）。
+         *   实际数据目录早已是 /sdcard/apps/app/pal，且现在可能是单文件 LPK 模式 ——
+         *   报错时指错目录会直接把排查带偏，所以统一从 pal_entry_datadir() 取。 */
+        printf("RC_OK pal (data=%s)\r\n", pal_entry_datadir());
+        if (!pal_launch())
+            printf("RC_ERR pal 启动失败: 检查 %s（lpkmode 可看模式与原因）\r\n",
+                   pal_entry_datadir());
     } else if (strcmp(cmd, "gps") == 0) {
         /* gps → GPS (MAX-M10S) 电源状态 + 引脚 (排查耗电: 待机 46µA vs 跟踪 ~10mA/峰值25mA) */
         const gps_config_t *gc = gps_default_config();
@@ -662,6 +796,46 @@ static void rc_cmd_immediate(const char *line){
                (unsigned)uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()));
     } else if (strcmp(cmd, "uptime") == 0) {
         printf("UPTIME %.1fs\r\n", (double)esp_timer_get_time() / 1e6);
+    } else if (strcmp(cmd, "batdiag") == 0) {
+        /* ★ 2026-10-31: `batdiag` = `bat` 的别名（精简后两者输出同一行）。
+         *   保留这个名字是因为脚本/习惯里已经写了它；输出见 board_battery_diag()。 */
+        board_battery_diag();
+        fflush(stdout);
+    } else if (strcmp(cmd, "batlog") == 0) {
+        /* ★ 2026-10-31: 真机测试记录 (默认关).
+         *   batlog            查状态 (是否在记 / 已记几条 / 容量)
+         *   batlog on|off     开关
+         *   batlog dump       按时间旧→新把记录打成 CSV (t_s,mv_raw,mv_f,mv_p,anchor,soc_raw,soc,flags,chg)
+         *   batlog clear      清空记录 (不动开关)
+         * ⚠ 记录本身不额外采样: 只搭 60s 那一拍的便车。 */
+        char *av = rc_next(&rest);
+        if (!av) {
+            printf("BATLOG %s 条数=%d/%d (chg: 0=未充电 1=充电中)\r\n",
+                   board_battery_trace_is_on() ? "ON" : "OFF",
+                   (int)board_battery_trace_count(), (int)BOARD_BATTERY_TRACE_MAX);
+            printf("用法: batlog on|off|dump|clear\r\n");
+        } else if (strcmp(av, "on") == 0) {
+            board_battery_trace_enable(true);
+            printf("BATLOG ON (每 60s 一条, 最多 %d 条)\r\n", (int)BOARD_BATTERY_TRACE_MAX);
+        } else if (strcmp(av, "off") == 0) {
+            board_battery_trace_enable(false);
+            printf("BATLOG OFF 条数=%d\r\n", (int)board_battery_trace_count());
+        } else if (strcmp(av, "dump") == 0) {
+            printf("BATLOG_CSV t_s,mv,soc,flags,chg\r\n");
+            int n = board_battery_trace_dump();
+            printf("BATLOG_END %d 条\r\n", n);
+        } else if (strcmp(av, "clear") == 0) {
+            board_battery_trace_clear();
+            printf("BATLOG CLEARED\r\n");
+        } else {
+            printf("BATLOG_ERR 用法: batlog on|off|dump|clear\r\n");
+        }
+    } else if (strcmp(cmd, "timed") == 0) {
+        /* ★ 2026-11-01: 时间服务状态一行诊断 (remcon 命令白名单里必须同时放行)。
+         *   看 state / 本地时间 / 上次校准 / 距上次多久 / 成功次数 / 判定原因。 */
+        char b[192];
+        printf("TIMED %s\r\n", svc_time_diag(b, (int)sizeof(b)));
+        printf("TIMED 有效=%d (可用于显示/证书)\r\n", (int)svc_time_is_valid());
     } else if (strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0) {
         /* 电池分压/满量程校准用: raw / 脚上 mV / 系数 / VBAT / 百分比 (日志行前缀 BATDIAG) */
         board_battery_diag();
@@ -720,6 +894,26 @@ static void rc_cmd_immediate(const char *line){
         } else {
             printf("BT_ERR 用法: bt | bt on | bt off\r\n");
         }
+    } else if (strcmp(cmd, "perf") == 0) {
+        /* ★ 2026-11-01 linit：任务性能表 —— 名称 / CPU% / 栈余 / 位置(核心|PSRAM)。
+         *   与设置页「性能监视」同源，供串口侧直接定位"谁在吃核心内存、谁在占 CPU"。
+         *   用法: perf     （一行一任务，末行给全局空闲） */
+        static EXT_RAM_BSS_ATTR TaskStatus_t ts[24];   /* 24×~40B 放 PSRAM，不占核心 RAM */
+        UBaseType_t tn = uxTaskGetSystemState(ts, 24, NULL);
+        uint64_t tot = 0;
+        for (UBaseType_t i = 0; i < tn; i++) tot += (uint64_t)ts[i].ulRunTimeCounter;
+        printf("\r\nTASK                CPU%%   STK_FREE  LOC\r\n");
+        for (UBaseType_t i = 0; i < tn; i++) {
+            uint32_t pm = tot ? (uint32_t)((uint64_t)ts[i].ulRunTimeCounter * 1000u / tot) : 0u;
+            printf("%-18s %2u.%u%% %7uB  %s\r\n",
+                   ts[i].pcTaskName,
+                   (unsigned)(pm / 10u), (unsigned)(pm % 10u),
+                   (unsigned)(ts[i].usStackHighWaterMark * sizeof(StackType_t)),
+                   esp_ptr_external_ram(ts[i].pxStackBase) ? "PSRAM" : "CORE");
+        }
+        printf("PERF CORE_FREE=%u PSRAM_FREE=%u\r\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     } else if (strcmp(cmd, "batcal") == 0) {
         /* ★ 2026-10-27: 用外部仪表(万用表/INA226)的真实 VBAT 标定分压比。
          *   用法: batcal <真实mV>   例: batcal 4038
@@ -739,7 +933,9 @@ static void rc_cmd_immediate(const char *line){
          * 用法: 拔掉 USB 放置一段时间 → 插上后立刻发 batstat。
          * 打印三个窗口的电压斜率 mV/h (跨深睡段的空白由首末两点自动跨过去算)。
          * 折算: 电池 500mAh / 满空电压差 ~900mV ⇒ 1mA ≈ 1.8mV/h。 */
-        static bat_sample_t bw[BOARD_BATTERY_WAVE_MAX];
+        /* ★ 2026-11-01 linit 内存规则：5.6KB 波形缓冲默认放 PSRAM。
+         *   只有手敲 batstat 命令才用到，却常驻内部 RAM 一整个固件生命周期，不划算。 */
+        static EXT_RAM_BSS_ATTR bat_sample_t bw[BOARD_BATTERY_WAVE_MAX];
         const uint32_t win[3] = { 3600u, 6u * 3600u, 24u * 3600u };
         board_battery_status_t bs;
         if (board_battery_read_cached(&bs) == ESP_OK)
@@ -849,6 +1045,16 @@ static void rc_cmd_immediate(const char *line){
         } else {
             printf("NOW_ERR 未知子命令 %s\r\n", sub);
         }
+    } else if (strcmp(cmd, "luaprof") == 0) {
+        /* luaprof [0|1] —— 打开/关闭 Lua 应用启动与退出的分阶段计时 (默认关)。
+         *   开: luaprof 1 → 进任意 .lua 应用 → 串口看 LUAPROF 行 (每段 +xx us)
+         *   关: luaprof 0 */
+        extern void lua_prof_set(int on);
+        extern int  lua_prof_get(void);
+        char *a = rc_next(&rest);
+        int on = a ? atoi(a) : 1;
+        lua_prof_set(on);
+        printf("LUAPROF %s\r\n", lua_prof_get() ? "ON" : "OFF");
     } else if (strcmp(cmd, "luasmoke") == 0) {
         /* Lua 冒烟自检 (原开机自动跑, 占 248ms 启动时间 → 2026-10-20 改成手动触发):
          * 挂 SPIFFS + 加载执行 /store/test.lua, 结果只看串口 LUA 行。 */
@@ -998,6 +1204,165 @@ static void rc_cmd_immediate(const char *line){
             closedir(dd);
             printf("LS_DONE\r\n");
         }
+    } else if (strcmp(cmd, "lpk") == 0) {
+        /* lpk <file.lpk> [v] —— 打开自包含包并打印摘要(只读)。
+         * v = 额外做整包 CRC 校验(41MB 约几秒)。真机验证 LPK 读取就靠它。 */
+        char *p = rc_next(&rest);
+        char *v = rc_next(&rest);
+        if (!p || !*p) { printf("RC_ERR lpk <file.lpk> [v]\r\n"); }
+        else {
+            lpk_t h;
+            int rc = lpk_open(&h, p, NULL, 0);        /* 先只读头, 拿到条数 */
+            if (rc != 0) {
+                printf("LPK_ERR rc=%d (%s)\r\n", rc, p);
+            } else {
+                printf("LPK %s: files=%u lua=%u B total=%u data_off=%u pkg_crc=%08x\r\n",
+                       p, (unsigned)h.count, (unsigned)h.lua_size,
+                       (unsigned)h.total_size, (unsigned)h.data_off, (unsigned)h.pkg_crc);
+                uint32_t cnt = h.count;
+                lpk_close(&h);
+                if (cnt > 0) {
+                    lpk_entry_t *tab = heap_caps_malloc((size_t)cnt * sizeof(lpk_entry_t),
+                                                        MALLOC_CAP_SPIRAM);
+                    if (!tab) {
+                        printf("LPK_ERR 内存不足(表 %u 条)\r\n", (unsigned)cnt);
+                    } else {
+                        rc = lpk_open(&h, p, tab, (int)cnt);
+                        if (rc != 0) {
+                            printf("LPK_ERR 读索引 rc=%d\r\n", rc);
+                        } else {
+                            int show = cnt < 8 ? (int)cnt : 8;
+                            for (int i = 0; i < show; i++)
+                                printf("  [%d] %-24s %9u B @%u crc=%08x\r\n", i, tab[i].name,
+                                       (unsigned)tab[i].size, (unsigned)tab[i].off,
+                                       (unsigned)tab[i].crc32);
+                            if ((int)cnt > show) printf("  ... 共 %u 条\r\n", (unsigned)cnt);
+                            if (h.lua_size) {
+                                char *lb = heap_caps_malloc(h.lua_size + 1, MALLOC_CAP_SPIRAM);
+                                uint32_t got = 0;
+                                if (lb && lpk_read_lua(&h, lb, h.lua_size, &got) == LPK_OK) {
+                                    lb[got < h.lua_size ? got : h.lua_size] = 0;
+                                    printf("LUA_HEAD: %.40s\r\n", lb);
+                                }
+                                if (lb) free(lb);
+                            }
+                            if (v && (*v == 'v' || *v == 'V'))
+                                printf("PKG_CRC %s\r\n", lpk_verify_pkg(&h) == LPK_OK ? "OK" : "MISMATCH");
+                            lpk_close(&h);
+                        }
+                        free(tab);
+                    }
+                }
+                printf("LPK_DONE\r\n");
+            }
+        }
+    } else if (strcmp(cmd, "lpkv") == 0) {
+        /* lpkv [lpk路径] [base目录] [c] —— 把 LPK 挂到 /lpk 并跑**真机**自检。
+         *   c = 逐条 CRC(慢, 41 MB 几十秒)：证明"读出来的每个字节都对"。
+         * 不带参数用仙剑默认位置: /sdcard/apps/app/pal/pal.lpk + 同目录当可写旁路。
+         * 输出逐行 PASS/FAIL, 末尾 SUMMARY。跑完自动卸载, 不影响游戏。 */
+        extern esp_err_t lpk_vfs_mount(const char *, const char *, const lpk_vfs_wr_t *, int);
+        extern esp_err_t lpk_vfs_unmount(void);
+        extern int       lpk_vfs_selftest(bool, char *, size_t);
+
+        char *p    = rc_next(&rest);
+        char *b    = rc_next(&rest);
+        char *fl   = rc_next(&rest);
+        char defp[160], defb[128];
+        if (!p || !*p) { snprintf(defp, sizeof(defp), "/sdcard/apps/app/pal/pal.lpk"); p = defp; }
+        if (!b || !*b) { snprintf(defb, sizeof(defb), "/sdcard/apps/app/pal");         b = defb; }
+        bool full = (fl && (*fl == 'c' || *fl == 'C'));
+
+        static const lpk_vfs_wr_t W[] = { { "save/", true }, { "screenshot/", true }, { "sdlpal.cfg", false } };
+        esp_err_t e = lpk_vfs_mount(p, b, W, (int)(sizeof(W) / sizeof(W[0])));
+        if (e != ESP_OK) {
+            printf("LPKV_ERR mount %s -> %s\r\n", p, esp_err_to_name(e));
+        } else {
+            size_t cap = 6144;
+            char *out = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+            if (!out) out = malloc(cap);
+            if (!out) printf("LPKV_ERR 输出缓冲分配失败\r\n");
+            else {
+                int fails = lpk_vfs_selftest(full, out, cap);
+                /* 逐行打印（串口一屏一屏刷，比一坨 printf 更好读） */
+                char *s = out;
+                while (s && *s) {
+                    char *nl = strchr(s, '\n');
+                    if (nl) *nl = 0;
+                    if (*s) printf("LPKV %s\r\n", s);
+                    if (!nl) break;
+                    s = nl + 1;
+                }
+                printf("LPKV_EXIT fails=%d\r\n", fails);
+                free(out);
+            }
+            lpk_vfs_unmount();
+        }
+    } else if (strcmp(cmd, "lpkmode") == 0) {
+        /* lpkmode [dir] [auto|lpk|zip] —— 看/改"资源模式"。
+         *   auto(默认) = 只跑判定并打印（不改任何东西）；
+         *   lpk / zip  = 写安装记录 <dir>/.install_mode（**将来商店安装器调的就是这一条**）。
+         * 写 lpk 之前会用同一套自检验包：缺资源/截断包一律拒绝，不会"装了个打不开的模式"。
+         * 判定与记录格式见 components/services/lpk/lpk_mode.c。 */
+        char *d = rc_next(&rest);
+        char *m = rc_next(&rest);
+        char defd[128];
+        if (!d || !*d) { snprintf(defd, sizeof(defd), "/sdcard/apps/app/pal"); d = defd; }
+        char why[160] = {0};
+
+        lpk_entry_t *tab = NULL; int cnt = 0;
+        char lp[200]; snprintf(lp, sizeof(lp), "%s/pal.lpk", d);
+        lpk_t h;
+        if (lpk_open(&h, lp, NULL, 0) == LPK_OK) { cnt = (int)h.count; lpk_close(&h); }
+
+        if (m && (*m == 'l' || *m == 'L')) {
+            if (!lpk_mode_lpk_ready(lp, NULL, 0, why, sizeof(why))) {
+                printf("LPMODE_ERR 拒绝写 lpk: %s\r\n", why);
+            } else if (lpk_mode_record_write(d, 1) != 0) {
+                printf("LPMODE_ERR 写 %s/%s 失败\r\n", d, LPK_MODE_RECORD);
+            } else {
+                printf("LPMODE ok 已记录 lpk → %s（%d 条资源）\r\n", d, cnt);
+            }
+        } else if (m && (*m == 'z' || *m == 'Z')) {
+            if (!lpk_mode_dir_ready(d, why, sizeof(why))) {
+                printf("LPMODE_ERR 拒绝写 zip: %s\r\n", why);
+            } else if (lpk_mode_record_write(d, 0) != 0) {
+                printf("LPMODE_ERR 写 %s/%s 失败\r\n", d, LPK_MODE_RECORD);
+            } else {
+                printf("LPMODE ok 已记录 zip → %s\r\n", d);
+            }
+        } else {
+            int rec = lpk_mode_record_read(d);
+            lpk_res_mode_t got = lpk_mode_decide(d, tab, 0, why, sizeof(why));
+            printf("LPMODE dir=%s 记录=%s 判定=%s\r\n", d,
+                   rec == 1 ? "lpk" : (rec == 0 ? "zip" : "无"),
+                   lpk_mode_str(got));
+            printf("LPMODE 原因: %s | 包内 %d 条 | 包=%s\r\n", why, cnt, lp);
+        }
+    } else if (strcmp(cmd, "mf") == 0) {
+        /* mf <mirror> <manifest_rel> <target> [zip_path] —— 多文件直接下载自测。
+         * 例: mf http://10.10.10.103:8899 manifest.json /sdcard/apps/app/mftest pkgs/pal.zip
+         * 只读调试入口(与 asset 命令同级), 用于验证清单拉取/逐文件下载/连接复用/续传。 */
+        extern int am_asset_multi_install_cli(const char *mirror, const char *rel,
+                                             const char *target, const char *zip);
+        char *m  = rc_next(&rest);
+        char *mr = rc_next(&rest);
+        char *tg = rc_next(&rest);
+        char *zp = rc_next(&rest);
+        if (!m || !*m || !mr || !*mr || !tg || !*tg) {
+            printf("RC_ERR mf <mirror> <manifest_rel> <target> [zip_path]\r\n");
+        } else {
+            int r = am_asset_multi_install_cli(m, mr, tg, (zp && *zp) ? zp : "pal.zip");
+            printf("MF rc=%d\r\n", r);
+        }
+    } else if (strcmp(cmd, "mfun") == 0) {
+        /* mfun <target> <zip_path> —— 按安装清单卸载(与商店"卸载"同一函数) */
+        extern bool am_asset_uninstall_cli(const char *target, const char *zip);
+        char *tg = rc_next(&rest);
+        char *zp = rc_next(&rest);
+        if (!tg || !*tg) printf("RC_ERR mfun <target> [zip_path]\r\n");
+        else printf("MFUN %s : %s\r\n", tg,
+                    am_asset_uninstall_cli(tg, (zp && *zp) ? zp : "pal.zip") ? "OK" : "FAIL");
     } else if (strcmp(cmd, "asset") == 0) {
         /* asset <zip> <target> —— 资源包解包自测 (不联网也能验证 am_asset) */
         extern bool am_asset_install(const char *zip_path, const char *target_dir);
@@ -1136,7 +1501,7 @@ static void rc_cmd_immediate(const char *line){
             fflush(stdout);
         }
     } else if (strcmp(cmd, "help") == 0) {
-        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait bat esr esw es7 es7w mic help\r\n");
+        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait bat batdiag batlog esr esw es7 es7w mic help\r\n");
     }
     fflush(stdout);
 }
@@ -1297,8 +1662,12 @@ static void rc_exec(const char *line){
         strcmp(cmd, "audit") == 0 || strcmp(cmd, "stack") == 0 ||
         strcmp(cmd, "uptime") == 0 || strcmp(cmd, "tasks") == 0 ||
         strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0 || strcmp(cmd, "batcal") == 0 ||
+        /* ★ 2026-10-31: batdiag/batlog 的处理在 rc_cmd_immediate() 里 ——
+         *   必须**同时**出现在本白名单，否则 command 走不到那里（前一段 sleepstage
+         *   就是这么"上线即不可用"的，实测才发现）。 */
+        strcmp(cmd, "batdiag") == 0 || strcmp(cmd, "batlog") == 0 || strcmp(cmd, "timed") == 0 ||
         strcmp(cmd, "bt") == 0 || strcmp(cmd, "gpsprobe") == 0 || strcmp(cmd, "gpsdiag") == 0 || strcmp(cmd, "gpssleep") == 0 ||
-        strcmp(cmd, "ls") == 0 || strcmp(cmd, "asset") == 0 || strcmp(cmd, "wifi") == 0 ||
+        strcmp(cmd, "ls") == 0 || strcmp(cmd, "asset") == 0 || strcmp(cmd, "mf") == 0 || strcmp(cmd, "lpk") == 0 || strcmp(cmd, "lpkv") == 0 || strcmp(cmd, "lpkmode") == 0 || strcmp(cmd, "lpkstat") == 0 || strcmp(cmd, "lpkinst") == 0 || strcmp(cmd, "lpklist") == 0 || strcmp(cmd, "lpkrm") == 0 || strcmp(cmd, "sdb") == 0 || strcmp(cmd, "mfun") == 0 || strcmp(cmd, "wifi") == 0 ||
         strcmp(cmd, "cat") == 0 || strcmp(cmd, "rm") == 0 ||
         strcmp(cmd, "cp") == 0 || strcmp(cmd, "diag") == 0 ||
         strcmp(cmd, "help") == 0 || strcmp(cmd, "shutdown") == 0 ||
@@ -1309,6 +1678,7 @@ static void rc_exec(const char *line){
         strcmp(cmd, "beep") == 0 ||
         strcmp(cmd, "gps") == 0 || strcmp(cmd, "pal") == 0 || strcmp(cmd, "pm") == 0 ||
         strcmp(cmd, "pwr") == 0 || strcmp(cmd, "poweroff") == 0 ||
+        strcmp(cmd, "perf") == 0 ||   /* ★ 2026-11-01: 任务性能表(CPU%/栈余/位置) */
         strcmp(cmd, "batstat") == 0 || strcmp(cmd, "standby") == 0 ||
         strcmp(cmd, "luasmoke") == 0 ||
         strcmp(cmd, "wpss") == 0 ||
@@ -1457,6 +1827,32 @@ static void rc_exec(const char *line){
                 rc_enqueue(&m); found = 1; break;
             }
         if (!found) printf("RC_ERR unknown page '%s'\r\n", pn);
+    } else if (strcmp(cmd, "apps") == 0) {
+        /* ★ 2026-11-01: 桌面图标归属诊断（只读）。
+         *   打印注册表里每条应用对"桌面可见性"的四个判据，回答"为什么它还在桌面上"：
+         *     vis  = os_app_visible() 最终结果（桌面/主菜单是否显示）
+         *     mm   = 在 mainmenu 列表里（用户显式添加过）
+         *     mh   = 在 mmhide   列表里（用户显式删除过）
+         *     dh   = 应用自带的 hidden 默认值（第三方应用现在默认 1=不占桌面）
+         *     req  = requires 路径（- 表示无；不存在时 vis 必为 0）
+         *   用法: apps [id 前缀]  —— 带参只打印匹配项。
+         */
+        const char *pfx = rc_next(&rest);
+        int n = os_app_count();
+        int shown = 0;
+        printf("APPS %d gen=%lu\r\n", n, (unsigned long)os_app_vis_gen());
+        for (int i = 0; i < n; i++) {
+            const os_app_t *a = os_app_get(i);
+            if (!a || !a->id) continue;
+            if (pfx && pfx[0] && strncmp(a->id, pfx, strlen(pfx)) != 0) continue;
+            const char *req = (a->requires && a->requires[0]) ? a->requires : "-";
+            printf("APP %s vis=%d mm=%d mh=%d dh=%d cat=%s req=%s\r\n",
+                   a->id, (int)os_app_visible(a),
+                   (int)os_app_in_mainmenu(a->id), (int)os_app_in_hidden(a->id),
+                   (int)a->hidden, a->cat ? a->cat : "-", req);
+            shown++;
+        }
+        printf("APPS_DONE %d\r\n", shown);
     } else if (strcmp(cmd, "app") == 0) {
         /* 直接拉起指定 Lua 应用 (等价于在应用管家点这一项):
          * 设置 boot 路径 + 进 Lua 页。用途 = 自动化回归: 远程打开应用后
@@ -1610,7 +2006,11 @@ void remcon_tick(ui_ctx_t *ctx){
  *   调用链: rc_task(acc[256]) → rc_exec(buf[256]+cmd[32]) → rc_cmd_immediate(args[256]+
  *   cp 分支 buf[1024]) → printf/vfs/usb_serial_jtag, 叠加后约 4KB。
  *   改 16KB(4 倍余量), 代价内部 RAM −12KB(桌面基线 205.9KB → 约 193.6KB)。 */
-#define RC_TASK_STACK   16384
+/* ★ 2026-11-01：16384 → 12288。实测栈余 12,416B（只用了约 3.9KB），
+ *   16KB 纯属浪费。⚠ 不能搬到 PSRAM —— remcon 会执行 ls/cat/rm/reboot 等
+ *   flash 操作，栈在 PSRAM 时 flash 操作期间访问自身栈会直接崩。
+ *   shutdown/gpsdiag 这类深调用链已经另开 8KB 独立任务，不占这条栈。 */
+#define RC_TASK_STACK   9216
 
 void remcon_init(void){
     s_q = xQueueCreate(RC_QUEUE_LEN, sizeof(rc_cmd_t));

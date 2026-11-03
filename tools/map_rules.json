@@ -1,0 +1,49 @@
+{
+  "_comment": "离线地图生成规则。改这里，不改代码。产物目录相对仓库根。",
+  "version": 1,
+  "data_sources": {
+    "province_pbf": "https://download.geofabrik.de/asia/china/<region>-latest.osm.pbf",
+    "mirror_pbf": "https://download.openstreetmap.fr/extracts/asia/china/<region>.osm.pbf",
+    "license": "ODbL 1.0 (© OpenStreetMap contributors)",
+    "_note": "数据源不擅自更换；换源前先验证覆盖与许可证，见 docs/规范/离线地图分发与生成.md §5"
+  },
+  "limits": {
+    "max_disk_mb": 2048,
+    "max_concurrent": 1,
+    "timeout_s": 1800
+  },
+  "regions": [
+    {
+      "id": "fj",
+      "label": "福建省",
+      "pbf": "cache_map/fujian-latest.osm.pbf",
+      "outdir": "dist/map/fj",
+      "outputs": ["fj.bin", "fj.json"],
+      "index": "fj.json",
+      "tile": 0.15,
+      "ovcls": 1,
+      "published": true
+    },
+    {
+      "id": "putian",
+      "label": "莆田市区",
+      "pbf": "cache_map/putian.osm.pbf",
+      "outdir": "dist/map/putian",
+      "outputs": ["putian_road.ltm", "putian_contour.ltm", "putian_poi.ltm"],
+      "tile": 0.02,
+      "ovcls": 1,
+      "published": true
+    },
+    {
+      "id": "zj",
+      "label": "浙江省",
+      "pbf": "cache_map/zhejiang-latest.osm.pbf",
+      "outdir": "dist/map/zj",
+      "outputs": ["zj.bin", "zj.json"],
+      "index": "zj.json",
+      "tile": 0.15,
+      "ovcls": 1,
+      "published": false
+    }
+  ]
+}

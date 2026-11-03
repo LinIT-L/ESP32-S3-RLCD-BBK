@@ -15,11 +15,13 @@
 
 #define TAG "OSAPP"
 
-#define OS_APP_MAX 64
+#define OS_APP_MAX 96   /* 2026-11-01: 34 内置 + TF 卡 Lua 最多 48 ⇒ 64 会溢出 */
 #define APPN_NS "os_apps"
 static const os_app_t *s_apps[OS_APP_MAX];
 static int s_app_count = 0;
 static bool s_hidden_visible = false;
+/* 桌面图标增删代次 (用户"添加/移出主菜单"时 +1, 见 os_app_vis_gen) */
+static uint32_t s_vis_gen = 1;
 
 /* 隐藏应用开关 (赞助页 5 连点切换): 打开后主菜单显示隐藏的引擎/应用管理 */
 static void hidden_load(void) {
@@ -51,7 +53,11 @@ bool os_app_available(const os_app_t *a) {
     if (!a) return false;
     if (a->requires && a->requires[0]) {
         struct stat st;
-        if (stat(a->requires, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+        /* ★ 2026-11-01: 与 os_app_visible() 保持一致 —— **存在即可**(文件或目录)。
+         *   原来这里只认目录，而 TF 卡 Lua 应用的 requires 是 .lua **文件** ⇒
+         *   应用中心列表用本函数过滤，结果"主菜单有、应用中心没有"。
+         *   资源包类(目录)行为不变。 */
+        if (stat(a->requires, &st) != 0) return false;
     }
     return true;
 }
@@ -63,7 +69,11 @@ bool os_app_visible(const os_app_t *a) {
     if (a->requires && a->requires[0]) {
         struct stat st;
         int rc = stat(a->requires, &st);
-        bool ok = (rc == 0) && S_ISDIR(st.st_mode);
+        /* ★ 2026-11-01: 原来只认**目录**（资源包类应用）。TF 卡上的 Lua 单文件应用
+         *   的 requires 是一个 .lua 文件路径 —— 放宽成"存在即可"(文件或目录都算)，
+         *   这样"卡里有就显示、拔卡就不显示"对两种形态都成立。
+         *   原资源包(仙剑 requires=/sdcard/apps/app/pal)行为不变。 */
+        bool ok = (rc == 0);
         /* 诊断: 每个 requires 应用只打一次, 避免每帧刷屏 */
         static char s_logged[8][24]; static int s_logged_n;
         bool seen = false;
@@ -119,7 +129,9 @@ const os_app_t *os_app_visible_at(int idx) {
  *   原来**每次判断可见性都 nvs_get_str**(跨 flash 页, 2~5ms), 应用管家 20 个应用
  *   × 2 个列表 = 40+ 次 ⇒ 40~100ms 卡顿 ✗
  *   改为 **RAM 缓存**: 首次读入静态缓冲, 之后纯内存比对; 写列表时置脏。 */
-static char s_idlist_cache[2][MAINMENU_MAX];
+/* ★ 2026-11-02: 缓存本身 1KB, 只在主循环/应用中心里做字符串比对, 不进 ISR、不做 DMA,
+ *   移到 PSRAM 后内部 RAM 立省 1KB（命中后纯内存比较, 依然比 nvs_get_str 快两个量级）。 */
+static EXT_RAM_BSS_ATTR char s_idlist_cache[2][MAINMENU_MAX];
 static bool s_idlist_ok[2] = { false, false };
 static int idlist_idx(const char *key) {
     if (strcmp(key, MMHIDE_KEY) == 0)   return 0;
@@ -206,14 +218,17 @@ bool os_app_in_mainmenu(const char *id) { return id_in_list(MAINMENU_KEY, id); }
 void os_app_set_mainmenu(const char *id, bool show) {
     id_set_in_list(MAINMENU_KEY, id, show);
     if (show) id_set_in_list(MMHIDE_KEY, id, false);   /* 加入时清除隐藏标记 */
+    s_vis_gen++;                                        /* 主菜单要立刻重建可见缓存 */
     ESP_LOGI(TAG, "主菜单 %s: %s", show ? "加入" : "移出", id);
 }
 bool os_app_in_hidden(const char *id) { return id_in_list(MMHIDE_KEY, id); }
 void os_app_set_hidden(const char *id, bool hide) {
     id_set_in_list(MMHIDE_KEY, id, hide);
     if (hide) id_set_in_list(MAINMENU_KEY, id, false);   /* 隐藏时清除加入标记 */
+    s_vis_gen++;
     ESP_LOGI(TAG, "主菜单 %s: %s", hide ? "隐藏" : "恢复", id);
 }
+uint32_t os_app_vis_gen(void) { return s_vis_gen; }
 
 void os_app_register(const os_app_t *app)
 {

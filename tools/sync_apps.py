@@ -112,7 +112,7 @@ MANIFEST = {
     #   三页: 码表 / 轨迹 / GPS 诊断(上机调线就看这页)。GPS 未接好时自动降级成内置模拟。
     #   心率栏是**预留位**(显示 --), 后续接 BLE 心率带或 Garmin 广播心率时只填 G.hr, 界面不动。
     #   图标 ICON_BIKE 是程序化线描 (64×64, 墨量 0.17), 不是彩色缩图。
-    "bikecomp": ("app", "码表", "程序",
+    "bikecomp": ("app", "自行车码表", "程序",
                  "自行车码表: GPS 速度/里程/轨迹, 心率栏已预留", "ICON_BIKE"),
     # ★ 矢量离线地图: 数据是 tools/map_vec.py 从 OSM(Overpass) + terrarium DEM 编译出来的
     #   **矢量包** .ltm (只有折线点串, 不是图片), 放在 apps/lua/map/ → 设备上 /store/map/。
@@ -151,17 +151,19 @@ NEED = {"planeradar": "wifi"}
 def targets_of(n):
     """某个应用要写盘 / 要打包的**全部**路径。
 
-    - 预装副本: apps/lua/apps/{cat}/{n}.lua  → 设备上 /store/apps/{cat}/{n}.lua (应用管家→应用)
-    - 商店包  : apps/lua/{n}.lua            → 设备上 /store/{n}.lua (商店里可下载)
+    - 预装副本: apps/lua/apps/{cat}/{label}.lua  → 设备上 /store/apps/{cat}/{label}.lua
+    - 商店包  : apps/lua/{label}.lua            → 设备上 /store/{label}.lua
+      文件名 = 中文显示名(label), 与「应用名称统一显示文件名称」规则一致, 不用英文 key。
 
     ⚠ STORE_ONLY 的**两份都写**(2026-10-02 定案)。原因: 整片烧 16MB 会重建整个 SPIFFS,
       只放商店的话每烧一次应用就没了, 用户得重新去商店装一遍 —— 实测被误判成
       "应用进去没反应"(其实 /store/apps/app/xxx.lua 不存在 → Lua 页退回文件列表态)。
       两份内容一致(都过 LAPP 打包), 商店里仍显示"已安装"并可卸载, 语义不变。
     """
-    inst = os.path.join(DEST_ROOT, MANIFEST[n][0], n + ".lua")
+    label = MANIFEST[n][1]
+    inst = os.path.join(DEST_ROOT, MANIFEST[n][0], label + ".lua")
     if n in STORE_ONLY:
-        store = os.path.normpath(os.path.join(DEST_ROOT, "..", n + ".lua"))
+        store = os.path.normpath(os.path.join(DEST_ROOT, "..", label + ".lua"))
         return [store, inst]
     return [inst]
 
@@ -204,7 +206,7 @@ def main():
 
     print("① 桌面源码 → 应用安装区 / 商店待装包")
     for n in names:
-        cat = MANIFEST[n][0]
+        cat, label = MANIFEST[n][0], MANIFEST[n][1]
         src = os.path.join(SRC_DIR, n + ".lua")
         if not os.path.exists(src):
             raise SystemExit("桌面没有源码: %s" % src)
@@ -213,9 +215,9 @@ def main():
             shutil.copy(src, t)
         if n in STORE_ONLY:
             print("   %-11s → apps/lua/%s.lua [商店包] + apps/lua/apps/%s/%s.lua [预装]"
-                  % (n, n, cat, n))
+                  % (n, label, cat, label))
         else:
-            print("   %-11s → apps/lua/apps/%s/%s.lua" % (n, cat, n))
+            print("   %-11s → apps/lua/apps/%s/%s.lua" % (n, cat, label))
 
     print("② 语法 + 契约闸门")
     files = [t for n in names for t in targets_of(n)]

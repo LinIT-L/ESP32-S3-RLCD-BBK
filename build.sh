@@ -43,13 +43,10 @@ export ESP_IDF_VERSION="${ESP_IDF_VERSION:-6.0.3}"
 #       内置源联网拉 /index.json ⇒ 只是"离线商店没有内置应用", 不影响开机/联网/其它功能。
 #     · 想真正内置离线商店, 必须先准备 store/index.json(tools/store_build.py 生成)。
 if [ -f store/index.json ]; then
-    python3 - <<'PYEOF' 2>/dev/null || true
-src = open("store/index.json", encoding="utf-8").read()
-esc = src.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-open("components/apps/pages/store_index_builtin.h", "w", encoding="utf-8").write(
-    '/* store_index_builtin.h — 固件内置商店索引(离线可用), 自动生成 */\n'
-    '#pragma once\nstatic const char STORE_INDEX_BUILTIN[] =\n"%s";\n' % esc)
-PYEOF
+    # ★ 2026-10-31: 内置索引统一由 tools/gen_store_index_builtin.py 生成。
+    #   原来这里是一段内联 python, 转义格式与脚本不同 ⇒ `gen_store_index_builtin.py --check`
+    #   永远报"不一致", 而两者内容其实等价。现在只有**一个**生成器, 便于提交前校验。
+    python3 tools/gen_store_index_builtin.py >/dev/null 2>&1 || true
     if [ ! -f components/apps/pages/store_index_builtin.h ]; then
         echo "[错误] store/index.json 存在, 但内置索引生成失败(见上面的 python 报错)"
         echo "       缺该头文件 → 编译必在 am_store_net.c 处 fatal error, 故此处直接中止。"

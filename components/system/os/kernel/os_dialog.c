@@ -193,6 +193,21 @@ EXT_RAM_BSS_ATTR static os_dlg_stack_t s_stack[DLG_MAX_DEPTH];
 static int s_top = -1;
 static int s_top_fwd(void) { return s_top; }
 
+/* ★★★ 2026-11-01 「关弹窗把关掉整页」根因修复:
+ *   `os_push()` **不去重** —— 每调一次都往 s_back_stack 压一个父页。
+ *   而弹窗页(OS_PAGE_DIALOG)有 3 条关闭路径(os_dialog_pop / toast_tick / toast_dismiss)，
+ *   只要"开的次数"多于"关的次数"，就会残留一个**空白弹窗页**：
+ *   用户按返回关它时，被弹掉的就是下层真页面(应用中心 → 直接回主菜单)。
+ *   实测对应现象：Wi-Fi 连上后应用中心被弹回主菜单，再进商店又弹一次联网确认
+ *   (p_am_exit 复位了会话标志)。
+ *   这里用一个权威标志 + 实时页面类型双重判断，保证"页最多开一次、关一次"。 */
+static bool s_dlg_page_open = false;
+
+/* 弹窗页此刻是否真的在页面栈顶(以实际页面为准, 不信单一标志) */
+static bool dlg_page_live(const ui_ctx_t *ctx) {
+    return s_dlg_page_open || (ctx && ctx->current_page == OS_PAGE_DIALOG);
+}
+
 /* toast (不占弹窗栈: 瞬时提示) */
 static char     s_toast_msg[72];   /* 72B=24 个汉字(UTF-8 3B/字), 避免长中文提示被截到汉字中间成乱码 */
 static uint32_t s_toast_ms;
@@ -836,7 +851,11 @@ void os_page_dialog_register(void) { os_register(&s_mod_dialog); }
 void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg) {
     if (!dlg) return;
     if (s_top + 1 >= DLG_MAX_DEPTH) return;   /* 栈满: 拒绝 */
-    if (s_top < 0) os_push(ctx, OS_PAGE_DIALOG);   /* 首层: 打开弹窗页 */
+    /* 首层: 只在弹窗页确实不在栈上时才打开 —— 否则会叠出第二个 DIALOG 页 */
+    if (s_top < 0 && !dlg_page_live(ctx)) {
+        os_push(ctx, OS_PAGE_DIALOG);
+        s_dlg_page_open = true;
+    }
     s_stack[++s_top] = *dlg;                       /* 整体拷贝, 含回调/ud/自定义 */
     s_stack[s_top].open_ms = os_millis();             /* 记录打开时刻 (供超时) */
     /* ★★★ 2026-10-28 linit「点一个弹窗没有刷新」根因修复 ★★★
@@ -870,6 +889,7 @@ void os_dialog_pop(ui_ctx_t *ctx) {
     } else if (s_top == 0) {
         s_top = -1;
         os_pop(ctx);   /* 关闭弹窗页, 恢复底层 */
+        s_dlg_page_open = false;
     }
     /* ★ 2026-10-24: 关窗即清滚动状态。否则"拖动中被关掉"会让 s_scroll_busy 永久为真,
      *   os_core 从此不画状态栏 (顶部信息条整块消失)。 */
@@ -1110,14 +1130,18 @@ void os_dialog_toast_dismiss(ui_ctx_t *ctx) {
     bool owns = s_toast_owns_page;
     s_toast_owns_page = false;
     os_dialog_toast_clear();
-    if (ctx && owns) os_pop(ctx);
+    if (ctx && owns) { os_pop(ctx); if (s_top < 0) s_dlg_page_open = false; }
     if (ctx) ctx->needs_redraw = true;
 }
 /* V1.7.x: 全局 toast 超时清理 — 由 os_core 每帧调用 (不依赖 DIALOG 页的 dlg_poll,
  * 保证 toast 叠在普通弹窗/页面之上时同样 1s 自动关并重绘, 不残留不卡死) */
 void os_dialog_toast_tick(ui_ctx_t *ctx) {
     if (s_toast_msg[0] && os_millis() - s_toast_ms >= s_toast_dur_ms) {
-        if (s_toast_owns_page) { if (ctx) os_pop(ctx); s_toast_owns_page = false; }
+        if (s_toast_owns_page) {
+            if (ctx) os_pop(ctx);
+            s_toast_owns_page = false;
+            if (s_top < 0) s_dlg_page_open = false;
+        }
         s_toast_msg[0] = 0;
         if (ctx) ctx->needs_redraw = true;
     }
@@ -1131,7 +1155,17 @@ void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms) {
     s_toast_dur_ms = ms;
     snprintf(s_toast_msg, sizeof(s_toast_msg), "%s", msg ? msg : "");
     s_toast_ms = os_millis();
-    if (s_top < 0) { os_push(ctx, OS_PAGE_DIALOG); s_toast_owns_page = true; }   /* 无弹窗栈时需打开弹窗页 */
+    /* 无弹窗栈时需要弹窗页承载 toast。⚠ 必须判"页面是否已开"：
+     *   原来只判 s_top，连续两条 toast 会 push 两个 DIALOG 页，只 pop 一次 ⇒ 残留空白页。 */
+    if (s_top < 0) {
+        if (!dlg_page_live(ctx)) {
+            os_push(ctx, OS_PAGE_DIALOG);
+            s_dlg_page_open = true;
+            s_toast_owns_page = true;
+        } else {
+            s_toast_owns_page = false;   /* 页面是别人开的, 不归 toast 收 */
+        }
+    }
     ctx->needs_redraw = true;                      /* 立即触发重绘, 让 toast 叠在顶层显示 */
     /* ★★ 2026-10-19 linit: **toast 不得保活弹窗**。
      * 原来这里置 s_cb_handled=true ⇒ 回调里只要弹了 toast，确认框就永远不关

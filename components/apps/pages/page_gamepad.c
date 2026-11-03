@@ -388,10 +388,20 @@ static void hist_dlg_select(ui_ctx_t *ctx, int result, void *ud) {
 
 static void open_hist_dialog(ui_ctx_t *ctx) {
     int cnt = bt_manager_get_history_count();
-    if (cnt <= 0) { os_dialog_toast(ctx, "\xe6\x97\xa0\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xb0\xe5\xbd\x95"); return; }
-    EXT_RAM_BSS_ATTR static char items[4][64];
+    /* ★ 2026-11-01 修"连接记录点了没反应、只能退出"：
+     *   原来 cnt<=0 时弹 toast —— toast 是叠在菜单之上的临时层，
+     *   用户点它只会被 toast 消费掉，看起来就是"整页死机"。
+     *   改成打开一个正常的列表弹窗（显示"暂无记录"），BACK 即可返回，输入不会丢。 */
+    if (cnt > 4) cnt = 4;                     /* items 只有 4 槽，防越界野指针 */
+    static EXT_RAM_BSS_ATTR char items[4][64];
     static const char *ptrs[4];
-    for (int i = 0; i < cnt && i < 4; i++) {
+    if (cnt <= 0) {
+        snprintf(items[0], sizeof(items[0]), "\xe6\x9a\x82\xe6\x97\xa0\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xb0\xe5\xbd\x95"); /* 暂无连接记录 */
+        ptrs[0] = items[0];
+        os_dialog_list(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe8\xae\xb0\xe5\xbd\x95", ptrs, 1, 0, hist_dlg_select, NULL);
+        return;
+    }
+    for (int i = 0; i < cnt; i++) {
         const bt_device_t *dev = bt_manager_get_history_at(i);
         snprintf(items[i], 64, "%s", dev && dev->name[0] ? dev->name : "??");
         ptrs[i] = items[i];

@@ -4,6 +4,7 @@
  * 支持数字/科学计数、一元负、隐式乘法、pi/e/Ans、^ % ! 及科学函数.
  */
 #include "calc_engine.h"
+#include "esp_attr.h"   /* EXT_RAM_BSS_ATTR：大静态数组放 PSRAM */
 
 #include <ctype.h>
 #include <math.h>
@@ -89,11 +90,43 @@ static double apply_fn(int f, double x) {
     }
 }
 
+/* ★★★ 2026-11-01 修「计算器算完显示答案, 然后重启」★★★
+ *
+ *   根因: 栈溢出。本函数原来把这 5 个工作区全开在栈上:
+ *       etok   tk[192]  16 B/项  = 3072
+ *       int    postt[192] 4 B/项 =  768
+ *       double postv[192] 8 B/项 = 1536
+ *       int    os[96]     4 B/项 =  384
+ *       double st[192]    8 B/项 = 1536
+ *                            合计 = 7296 B
+ *   而主循环跑在 app_main 的任务上, 栈只有
+ *       CONFIG_ESP_MAIN_TASK_STACK_SIZE = 6144 B
+ *   ⇒ 只这一层就超了 1152 B, 还没算调用链本身与本函数里的标量。
+ *
+ *   表现之所以是"先显示答案再重启": 溢出写下去的是主任务栈底之外的相邻内存,
+ *   calc_eval 自己算得好好的, 返回值一路正常 → 答案照常上屏;
+ *   被踩坏的那块要等下一次堆操作/任务切换才爆 → 延迟 panic → PRINT_REBOOT 重启。
+ *   所以**不能靠"答案对不对"判断有没有问题**, 只能看栈用量的算术。
+ *
+ *   改法: 移到 .bss 静态区, 栈占用降到几十字节。
+ *   安全性: calc_eval 全仓只有 page_calculator.c:403 一个调用点, 在 UI 任务里
+ *           同步调用, 函数内不外调任何可能重入的回调 ⇒ 不存在并发冲突。
+ *           （将来若要多线程调, 必须改成加锁或按任务分配, 不能共用这份静态区。）
+ */
+/* ★ 2026-11-01 linit 内存规则：3KB token 栈放 PSRAM（纯 CPU 访问，不进 ISR/DMA）。
+ * ★ 2026-11-02: 其余 4 个工作区也一并放 PSRAM —— 它们只在 UI 任务里被 calc_eval
+ *   同步读写，不进 ISR、不做 DMA，留在内部 RAM 白占 4.2KB。 */
+static EXT_RAM_BSS_ATTR etok   s_tk[MAX_TOK];
+static EXT_RAM_BSS_ATTR int    s_postt[MAX_TOK];
+static EXT_RAM_BSS_ATTR double s_postv[MAX_TOK];
+static EXT_RAM_BSS_ATTR int    s_os[MAX_STACK];
+static EXT_RAM_BSS_ATTR double s_st[MAX_TOK];
+
 int calc_eval(const char *expr, double ans, double *out) {
     if (!expr || !out) return -1;
 
     /* ---- 1. 分词 ---- */
-    etok tk[MAX_TOK];
+    etok *tk = s_tk;
     int tkn = 0;
     const char *p = expr;
     while (*p) {
@@ -155,8 +188,8 @@ int calc_eval(const char *expr, double ans, double *out) {
     if (tkn == 0) return -1;
 
     /* ---- 2. 调车场转后缀 ---- */
-    int postt[MAX_TOK]; double postv[MAX_TOK]; int pn = 0;
-    int os[MAX_STACK]; int osn = 0;
+    int *postt = s_postt; double *postv = s_postv; int pn = 0;
+    int *os = s_os; int osn = 0;
 
     for (int i = 0; i < tkn; i++) {
         int t = tk[i].t;
@@ -211,7 +244,7 @@ int calc_eval(const char *expr, double ans, double *out) {
     }
 
     /* ---- 3. 后缀求值 ---- */
-    double st[MAX_TOK]; int sn = 0;
+    double *st = s_st; int sn = 0;
     for (int i = 0; i < pn; i++) {
         int t = postt[i];
         if (t == T_NUM) {

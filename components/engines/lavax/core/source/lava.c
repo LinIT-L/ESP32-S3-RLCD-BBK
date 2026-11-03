@@ -225,7 +225,23 @@ void lavReset()
 	ramusee=0x0;
 	ramarm=1;
 	if (RamBits>16) {
-		memset(lRam+0x2000,0,(VRam+MY_DATA_SIZE)-(lRam+0x2000));
+		/* ★ 安全加固(2026-10-31): 原写法直接
+		 *   memset(lRam+0x2000, 0, (VRam+MY_DATA_SIZE)-(lRam+0x2000))
+		 * 没有判断 lRam 是否已经越过 VM RAM 末尾 —— exec 出子任务后 lRam 会
+		 * 按 local_sp 上移, 32 位程序若把子任务放得靠后, 差值会变成负数,
+		 * 转成 size_t 就是天文数字 ⇒ 越界 memset 直接把 PSRAM 写成垃圾。
+		 * 这里先做区间判断, 不成立就跳过清零(该情形本身已说明游戏栈越界)。 */
+		byte *clear_start=lRam+0x2000;
+		byte *clear_end=(byte *)VRam+MY_DATA_SIZE;
+		if (clear_start<clear_end)
+			memset(clear_start,0,(size_t)(clear_end-clear_start));
+		else {
+			static int warned=0;
+			if (!warned) {
+				printf("[LAVAX] lavReset: task RAM base out of range, clear skipped\n");
+				warned=1;
+			}
+		}
 		set_sys_ram();
 		string_ptr=string_stack;
 	} else {
@@ -391,10 +407,30 @@ void sn_err()
 static size_t current_opcode_offset;
 static int current_opcode=-1;
 
-/* 调试: 最近执行的指令地址环 (供 pc_platform 冻结分析) */
+/* ── 执行循环策略 ────────────────────────────────────────────────────────
+ * LAVAX_POLL_STRIDE: 每执行多少条字节码回一次平台 poll(输入/tick/显示/退出)。
+ *   原实现是"每条指令都 poll", 函数调用 + esp_timer_get_time + 一组 64 位比较
+ *   在热路径上占了可观比例。32 条 ≈ 40µs, 远小于输入(5ms)/tick(3.9ms)/
+ *   刷新(66ms)的节流粒度, 响应速度无可测差异。置 1 = 恢复旧行为。
+ * LAVAX_DEBUG_PC_RING: 指令地址环(供 pc_platform 冻结分析), 默认关 ——
+ *   开启时**每条指令写一次 PSRAM**, 是热路径里最大的单项额外开销。 */
+#ifndef LAVAX_POLL_STRIDE
+#define LAVAX_POLL_STRIDE 32
+#endif
+#ifndef LAVAX_DEBUG_PC_RING
+#define LAVAX_DEBUG_PC_RING 0
+#endif
+
+#if LAVAX_DEBUG_PC_RING
 #define DBG_PC_N 1024
 EXT_RAM_BSS_ATTR size_t dbg_pcs[DBG_PC_N];   /* 调试指令地址环: 放 PSRAM 省内部 RAM */
 int    dbg_pc_idx = 0;
+#define LAVAX_DBG_PC_RECORD(off) do { \
+		dbg_pcs[dbg_pc_idx] = (off); \
+		dbg_pc_idx = (dbg_pc_idx + 1) % DBG_PC_N; } while (0)
+#else
+#define LAVAX_DBG_PC_RECORD(off) do { (void)(off); } while (0)
+#endif
 
 long lRamRead4(a32 addr);
 
@@ -421,18 +457,36 @@ extern size_t g_vm_ram_size;   /* 实际分配的 VM RAM 大小 (V1.0.9x) */
 
 static byte *vm_memory_pointer(a32 addr,size_t size,const char *operation)
 {
-	uintptr_t base=(uintptr_t)VRam;
-	uintptr_t current=(uintptr_t)lRam;
-	size_t offset;
+	/* ★ 2026-10-31 优化: 把"当前任务在 VM RAM 中的可用长度"缓存起来。
+	 * 原实现**每次访问**都重新读 VRam / lRam / g_vm_ram_size 三个全局,
+	 * 再做 4 次指针算术和 2 组分支 —— 而 lRam 只在任务切换(task_lev 变化)时
+	 * 才动, VRam 与 g_vm_ram_size 在整个 VM 生命周期内不变。
+	 *
+	 * 正确性: 缓存以 lRam 本身作为"失效键", lRam 一变就重算, 所以
+	 *   任务切换 / shutdown(置 NULL) / 不同 vm_ram_size 三种情况都会重算;
+	 *   合法区间判定 `size>available || addr>available-size` 与原实现逐字相同,
+	 *   负数地址(a32 无符号)与跨边界访问的行为完全不变 —— 安全检查没有关闭,
+	 *   只是把"不变的量"从热路径里挪出去。 */
+	static byte *cached_lram = NULL;
+	static size_t cached_avail = 0;
 	size_t available;
-	size_t ram_size = g_vm_ram_size ? g_vm_ram_size : MY_DATA_SIZE;
 
-	if (!VRam || !lRam || current<base || current-base>ram_size) {
-		vm_memory_error(addr,size,operation);
-		return NULL;
+	if (lRam!=cached_lram) {
+		uintptr_t base=(uintptr_t)VRam;
+		uintptr_t current=(uintptr_t)lRam;
+		size_t ram_size = g_vm_ram_size ? g_vm_ram_size : MY_DATA_SIZE;
+
+		if (!VRam || !lRam || current<base || current-base>ram_size) {
+			cached_lram=NULL;
+			cached_avail=0;
+			vm_memory_error(addr,size,operation);
+			return NULL;
+		}
+		cached_avail=ram_size-(size_t)(current-base);
+		cached_lram=lRam;
 	}
-	offset=(size_t)(current-base);
-	available=ram_size-offset;
+
+	available=cached_avail;
 	if (size>available || (size_t)addr>available-size) {
 		vm_memory_error(addr,size,operation);
 		return NULL;
@@ -556,16 +610,24 @@ a32 get_lvaddr()
 
 static int pop_address_offset(a32 *offset)
 {
+	byte *p;
+
 	if (eval_top<4) {
 		vm_memory_error(eval_stack+eval_top,4,"address stack underflow");
 		*offset=0;
 		return 0;
 	}
 	eval_top-=4;
-	*offset=(a32)lRamRead(eval_stack+eval_top)|
-		((a32)lRamRead(eval_stack+eval_top+1)<<8);
+	/* 一次边界检查读出 2/3 字节 (原实现走 2~3 次 lRamRead, 每次各做一遍
+	 * vm_memory_pointer 的指针运算与分支)。地址栈位置固定且连续, 合并安全。 */
+	p=vm_memory_pointer(eval_stack+eval_top,RamBits>16?3:2,"address stack read");
+	if (!p) {
+		*offset=0;
+		return 0;
+	}
+	*offset=(a32)p[0]|((a32)p[1]<<8);
 	if (RamBits>16)
-		*offset|=(a32)lRamRead(eval_stack+eval_top+2)<<16;
+		*offset|=(a32)p[2]<<16;
 	return lPC!=NULL;
 }
 
@@ -2000,29 +2062,45 @@ static void write8(word x,word y,word width,word height,byte *data)
 	byte *td;
 	register byte *disp,*tt;
 	int temp;
+	unsigned skip;
+	const size_t tmp_cap=(size_t)LCD_WIDTH*(size_t)LCD_HEIGHT;
 
 	x_bak=x;
-	widths=width;	
-	if (negative) {
-		td=ram_base+MY_LOCAL_RAM;
-		memcpy(td,data,widths*height);
-		for (i=0;i<height;i++)
-			for (j=0;j<widths/2;j++) {
-				t=td[i*widths+j];
-				td[i*widths+j]=td[i*widths+widths-1-j];
-				td[i*widths+widths-1-j]=t;
-			}
-	} else
-		td=data;
-		
+	widths=width;
+	/* ★ 安全修复(2026-10-31): 纵向裁剪提到 memcpy 之前。
+	 *   原实现无条件 memcpy(td,data,widths*height), 而 td 指向 local_ram 里
+	 *   LCD_WIDTH*LCD_HEIGHT(49152) 字节的临时缓冲 —— 图块尺寸异常时会直接
+	 *   越界写 PSRAM 堆, 破坏 VM RAM 乃至相邻堆块。
+	 *   屏幕外的行本来就不绘制, 提前裁剪不改变任何正常游戏的输出。 */
+	skip=0;
 	if (y>=ScreenHeight) {
-		temp=0x10000-y;
-		if (height<=temp) return; //ȫ�ڻ����⣬����Ҫ��
-		height-=temp;
-		td+=temp*widths;
+		skip=0x10000u-(unsigned)y;          /* word 回绕保护, 与原逻辑一致 */
+		if ((unsigned)height<=skip) return;
+		height=(word)((unsigned)height-skip);
 		y=0;
 	}
-	if (y+height>ScreenHeight) height=ScreenHeight-y; //��ȥ����������
+	if ((unsigned)y+(unsigned)height>(unsigned)ScreenHeight)
+		height=(word)(ScreenHeight-y);
+
+	if (negative) {
+		/* 临时缓冲容量校验: 放不下就放弃本次绘制(不崩/不越界), 并留一行日志 */
+		if ((size_t)widths*(size_t)height>tmp_cap) {
+			printf("[LAVAX] write8: block %ux%u exceeds local buffer, skipped\n",
+			       (unsigned)widths,(unsigned)height);
+			return;
+		}
+		td=ram_base+MY_LOCAL_RAM;
+		memcpy(td,data+(size_t)skip*(size_t)widths,(size_t)widths*(size_t)height);
+		for (i=0;i<(int)height;i++)
+			for (j=0;j<(int)widths/2;j++) {
+				t=td[(size_t)i*widths+j];
+				td[(size_t)i*widths+j]=td[(size_t)i*widths+widths-1-j];
+				td[(size_t)i*widths+widths-1-j]=t;
+			}
+	} else
+		td=data+(size_t)skip*(size_t)widths;
+
+
 	if (x_bak>=ScreenWidth) {
 		temp=0x10000-x_bak;
 		if (width<=temp) return; //ȫ�ڻ����⣬����Ҫ��
@@ -3608,7 +3686,10 @@ void c_strchr()
 	t2=(byte)a3;
 	{
 		char *string=vm_cstring_pointer(t1,"strchr string");
-		if (!string) return;
+		/* 指针越界: 按"未找到"返回 0 并**回压一个值** —— 前面 get_val2/get_val 已弹出
+		 * 两个操作数, 这里若裸 return 会让求值栈永久偏移 4 字节, 后续表达式全部错位。
+		 * (原版是 CheckAddr→FATAL 直接退出, 我们选"不崩", 就必须自己补齐栈平衡。) */
+		if (!string) { a1=0; put_val(); return; }
 		p=(byte*)strchr(string,t2);
 	}
 	if (p==NULL) a1=0;
@@ -3632,7 +3713,9 @@ void c_strcmp()
 	{
 		char *left=vm_cstring_pointer(t1,"strcmp left string");
 		char *right=vm_cstring_pointer(t2,"strcmp right string");
-		if (!left || !right) return;
+		/* 任一越界: 按"相等"返回 0 并回压, 保持求值栈平衡 (同 c_strchr 的理由)。
+		 * 返回 0 而不是 ±1 —— 语义上相当于"两个空串比较", 不会让游戏误判大小关系。 */
+		if (!left || !right) { a1=0; put_val(); return; }
 		t=strcmp(left,right);
 	}
 	if (t==0) a1=0;
@@ -3657,7 +3740,8 @@ void c_strstr()
 	{
 		char *haystack=vm_cstring_pointer(t1,"strstr haystack");
 		char *needle=vm_cstring_pointer(t2,"strstr needle");
-		if (!haystack || !needle) return;
+		/* 指针越界: 按"未找到"返回 0 并回压, 保持求值栈平衡 (同 c_strchr)。 */
+		if (!haystack || !needle) { a1=0; put_val(); return; }
 		p=(byte*)strstr(haystack,needle);
 	}
 	if (p==NULL) a1=0;
@@ -4691,20 +4775,31 @@ void main_loop()
 {
 	int t;
 	CODES code;
+	unsigned poll_step;
 
 	if (!pLAVA)
 		return;
 
+	poll_step=0;
 	for (;;) {
-		lavax_platform_poll();
-		if (CheckExitKey()) {
-			printf("[LAVAX-EXIT] CheckExitKey\n"); return;
+		/* ★ 平台 poll 降频(2026-10-31): 原实现**每条字节码**调一次
+		 * lavax_platform_poll() —— 内含 cheat 冻结检查、esp_timer_get_time()、
+		 * 输入/tick/刷新三组 64 位比较。单条 VM 指令只有微秒级, 这些固定开销
+		 * 占比过高。改为每 LAVAX_POLL_STRIDE 条 poll 一次(见文件头宏说明):
+		 * 第一次迭代仍先 poll, 保证进入循环时输入/显示/退出状态已就绪。 */
+		if (poll_step==0) {
+			lavax_platform_poll();
+			if (CheckExitKey()) {
+				printf("[LAVAX-EXIT] CheckExitKey\n"); return;
+			}
+			CheckAppExit();
 		}
-		CheckAppExit();
+		if (++poll_step>=LAVAX_POLL_STRIDE) poll_step=0;
+
 		current_opcode_offset=lPC && pLAVA ? (size_t)(lPC-pLAVA) : 0;
 		current_opcode=-1;
 		t=getcode();
-		dbg_pcs[dbg_pc_idx] = current_opcode_offset; dbg_pc_idx = (dbg_pc_idx + 1) % DBG_PC_N; /* 记录指令地址环 */
+		LAVAX_DBG_PC_RECORD(current_opcode_offset);   /* 默认编译为空 (LAVAX_DEBUG_PC_RING=0) */
 		if (!lPC) { printf("[LAVAX-EXIT] lPC==NULL before getcode off=0x%lX\n",(unsigned long)current_opcode_offset); return; }
 		current_opcode=t;
 		if (t&0x80) {

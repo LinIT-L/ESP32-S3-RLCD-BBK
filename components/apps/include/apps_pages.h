@@ -37,6 +37,16 @@ void os_page_lua_register(void);            /* Lua single-file app */
 
 void os_page_sdr_register(void);             /* 频谱仪 */
 
+/* 性能监视器:
+ *   · os_page_perfmon_register() = 独立应用页（应用中心→应用→系统）—— **当前唯一入口**
+ *   · perfmon_open()             = 350×250 弹窗实现，2026-11-03 起**没有 UI 入口**
+ *                                  （设置里那一项已删除），保留备用；要彻底删除
+ *                                  就把它和 page_perfmon.c 的弹窗段一起清掉。
+ * 两者画的是同一块面板（pm_draw_panel）。 */
+struct ui_ctx;
+void perfmon_open(struct ui_ctx *ctx);
+void os_page_perfmon_register(void);
+
 /* ★ 连接后自动映射 (C5): 让手柄页 on_enter 直接打开按键映射向导 (任何页面可触发) */
 void page_gamepad_request_map_on_enter(void);
 

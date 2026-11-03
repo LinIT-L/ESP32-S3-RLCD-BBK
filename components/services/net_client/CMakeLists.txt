@@ -4,5 +4,5 @@
 idf_component_register(
     SRCS "net_client.c" "netc_fs_replace.c"
     INCLUDE_DIRS "."
-    REQUIRES esp_http_client mbedtls esp_event
+    REQUIRES esp_http_client mbedtls esp_event wifi_manager
 )

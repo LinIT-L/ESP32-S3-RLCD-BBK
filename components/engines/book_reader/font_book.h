@@ -54,6 +54,10 @@ bool font_book_select_file(const char *path);
  * 商店卸载前用它判断"有没有正在用的字体"，避免删掉正在读的字库。 */
 const char *font_book_current_file(void);
 
+/* 2026-11-01: 该字体是否已驻留（当前槽或缓存槽）。
+ * 未命中就意味着切过去要整块读 TF 卡（1~2 秒）—— UI 据此决定要不要先弹"正在加载"。 */
+bool font_book_is_cached(const char *path);
+
 /* 2026-10-31: 释放全部字体实例（当前槽 + PSRAM 缓存槽）。关书时调用。 */
 void font_book_release_all(void);
 
@@ -82,7 +86,28 @@ int font_book_native_px(void);
 int font_book_scale(void);
 
 /* 当前可用字号列表（原生 / 2 倍），返回个数，写入 out */
+/* 当前字体真实支持的显示字号（升序）。内置 = 16/24/32/48；LBF = 原生 N 与 2N。
+ * 字号列表、正文绘制、行高、分页都从这份列表取，不要再各自写死一张表。 */
 int font_book_size_options(int *out, int max);
+int font_book_size_count(void);
+/* 第 idx 档的有效像素；越界收敛到最大合法档（不返回非法字号）。 */
+int font_book_size_px_at(int idx);
+
+/* 2026-10-31: 按**字体文件路径**给字号表（只读 96 字节头，不加载字形）。
+ * 为什么需要：书库的「字号」滚轮在 LBF 还没加载时就要列字号 —— 只用当前
+ * 已加载字体的话永远列内置的 16/24/32/48，选了 8px 字体也照样显示四档。
+ *   path 为空串 ⇒ 内置字体（16/24/32/48）；LBF ⇒ 原生 N 与 2N；坏文件/不存在 ⇒ 内置表。 */
+int font_book_size_options_for(const char *path, int *out, int max);
+int font_book_size_px_for(const char *path, int idx);
+
+/* ===== 系统 UI 字体（与阅读字体隔离）=====
+ * 阅读器菜单/弹窗/按钮用这一套（16px 宋体 + 8×16 ASCII），不随 TF 字体变化。
+ * 只读接口，不改变当前阅读字体状态。 */
+bool font_book_ui_glyph_unicode(uint32_t cp, book_glyph_t *out);
+bool font_book_ui_glyph_gb(uint8_t hi, uint8_t lo, book_glyph_t *out);
+int  font_book_ui_cell_w(void);
+int  font_book_ui_cell_h(void);
+int  font_book_ui_ascii_w(void);
 
 #ifdef __cplusplus
 }

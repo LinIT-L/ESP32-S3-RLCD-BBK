@@ -1,5 +1,6 @@
 idf_component_register(
-    SRCS "board_battery.c"
+    # battery_model.c: 纯 C 算法层 (滤波/曲线/稳定器/充电识别), 依赖仅 stdint, 主机可测
+    SRCS "board_battery.c" "battery_model.c"
     INCLUDE_DIRS "include"
     # driver: gpio_config 读 CHRG; board_pins: 引脚唯一真相源 (.chrg)
     # 两者都只在本 .c 里用, 头文件不暴露 ⇒ PRIV_REQUIRES

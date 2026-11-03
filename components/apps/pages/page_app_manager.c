@@ -12,6 +12,7 @@
  */
 #include "os.h"
 #include "am_internal.h"   /* 应用中心内部模块接口 (am_store / am_lua) */
+#include "am_app_core.h"   /* ★ 2026-11-03: 唯一应用数据来源（列表/身份/安装状态） */
 #include "os_theme.h"
 #include "ui_common.h"
 #include "ui_scroll.h"   /* ★ 2026-10-24 统一跟手滚动 */
@@ -84,45 +85,119 @@ static const char *const s_sub_names[AM_SUB_COUNT] = {
  *   "商店 → 点开某个应用 → 返回商店" 不会再提示一遍 (那份 on_exit/on_enter 是子页往返)。
  * ⚠ 不要自己 os_hw_request(OS_HW_WIFI): settings_wifi_connect_open() 内部按需 request
  *   并记账, 用户取消时才会 release。 */
-static bool s_store_wifi_asked   = false;   /* 商店联网提示只弹一次 */
+/* ==== 联网流程诊断 (2026-11-01) ====
+ * 目的: 把"重复确认 / 重复扫描 / 连上后退出主菜单"变成可判定的日志。
+ *   s_am_sess = 每次**真进入**应用中心 +1 (会话)
+ *   s_am_op   = 每次用户**同意联网** +1 (一次联网流程)
+ * 一条完整流程应该是: enter s3 → gate 弹 → confirm → scan_start → ap_selected
+ *   → connect_start → got_ip → (后台刷新) ，全程同一个 s/o，且**不再出现第二次 gate 弹窗**。
+ * 若看到两个不同 o 号各有 scan_start ⇒ 一次操作起了两套流程；
+ * 若 saw pop: app_butler -> (main) ⇒ 页面真被弹了，再看 pop 前的日志即可定位谁弹的。 */
+static uint32_t s_am_sess;      /* 应用中心会话号 */
+static uint32_t s_am_op;        /* 联网流程号 */
+#define AMNET(fmt, ...) ESP_LOGI("APPSTORE", "s%u/o%u " fmt, \
+                                 (unsigned)s_am_sess, (unsigned)s_am_op, ##__VA_ARGS__)
+
 static int  s_am_leave_child     = 0;      /* >0 = 本次离开管家是进了自己推的子页 */
-/* 商店联网门禁 (2026-10-15 linit "联网归网络模块"): 商店**不自己连网** ——
- * 已配过就等网络模块连上 (toast 提示一下), 没配过就引导去设置。
- * 连上后云端索引由 am_rstore 自己拉 (它也只看 is_connected)。 */
+
+/* ============ 应用中心联网状态机（2026-11-01 重写）============
+ * 为什么重写
+ * ----------
+ * 旧实现用两个 bool（asked / session_ok）+ 页面 on_exit 复位来表达"本次只问一次"。
+ * 只要页面**被意外 pop 一次**（弹窗页残留、误按键、别的模块弹页），
+ * on_exit 的 else 分支就会把标志复位 ⇒ 再进商店又弹一遍。
+ * 实测症状正是"连上 Wi-Fi 后回到商店又弹'是否连接网络更新应用'"。
+ *
+ * 新实现：显式状态 + **状态不随页面 exit 复位**。
+ *   · CONNECTING / UP 是**粘性**状态 —— 即使页面被弹走、重进，也不会重复问
+ *   · 只有 用户取消(DECLINED) / 连接失败(FAILED) 才在"下次进页面"时回到 IDLE
+ *   · 一条流程只可能处在一个状态，重复触发天然被挡住（不需要再靠时间戳防抖）
+ *
+ * 状态流转（正常路径）：
+ *   IDLE --用户进商店且未联网--> ASKING --确定--> CONNECTING --拿到 IP--> UP
+ *                                  |                  |
+ *                                  +--取消--> DECLINED +--20s 未连上--> FAILED
+ */
+typedef enum {
+    AMNET_IDLE = 0,     /* 未询问：需要时可弹一次 */
+    AMNET_ASKING,       /* 确认框已弹出，等用户 */
+    AMNET_CONNECTING,   /* 用户已同意：选网/输密码/连接中（粘性） */
+    AMNET_UP,           /* 已联网（粘性） */
+    AMNET_DECLINED,     /* 用户本次取消 */
+    AMNET_FAILED,       /* 连接失败，冷却后可重试 */
+} amnet_st_t;
+
+static amnet_st_t s_net_st = AMNET_IDLE;
+static uint32_t   s_net_ms;                      /* 进入当前状态的时刻(ms) */
+static uint32_t   net_now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+static const char *net_st_name(amnet_st_t st) {
+    switch (st) {
+    case AMNET_IDLE:       return "IDLE";
+    case AMNET_ASKING:     return "ASKING";
+    case AMNET_CONNECTING: return "CONNECTING";
+    case AMNET_UP:         return "UP";
+    case AMNET_DECLINED:   return "DECLINED";
+    case AMNET_FAILED:     return "FAILED";
+    default:               return "?";
+    }
+}
+static void net_set(amnet_st_t st, const char *why) {
+    AMNET("net: %s → %s  (%s)", net_st_name(s_net_st), net_st_name(st), why);
+    s_net_st = st;
+    s_net_ms = net_now_ms();
+}
+
 /* ★ 商店门禁确认回调: 0=确定(左) 1=取消(右) */
 static void am_wifi_gate_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
-    if (result != 0) return;
-    /* ★★★ 2026-10-30 修「连完 WiFi 回来又弹一次"是否连接网络更新应用?"」:
-     *   原来这里直接 settings_wifi_connect_open(), 而 p_am_exit 只在 s_am_leave_child>0 时
-     *   才不重置 s_store_wifi_asked —— 但 s_am_leave_child++ 只发生在 am_launch(打开应用)里,
-     *   连 WiFi 这条路径**没打标记** ⇒ 从 WiFi 弹窗返回时 asked 被清成 false
-     *   ⇒ 回到商店 on_enter 又弹一遍。这里补上标记, 连完返回就不再问。 */
-    s_am_leave_child++;
-    settings_wifi_connect_open(ctx);
+    if (result != 0) { net_set(AMNET_DECLINED, "用户取消, 本次不再问"); return; }
+    net_set(AMNET_CONNECTING, "用户同意 → 打开 Wi-Fi 流程");
+
+    /* ★★★ 2026-11-01 「还是那个弹窗、还在那个位置」的真正根因 ★★★
+     *   settings_wifi_connect_open() 内部会 os_dialog_push(扫描弹窗)，而
+     *   os_dialog_push 会置 `s_cb_handled = true`（含义是"回调里已接管，别自动关父层"）。
+     *   后果：**这个确认框不会被 dlg_finish_top 自动关闭，一直垫在弹窗栈底**。
+     *   于是：扫描弹窗压在它上面 → 密码键盘再压 → wifi_pwd_connect 里
+     *   os_dialog_pop() 只弹掉键盘那一层 ⇒ **又露出这个确认框**。
+     *   用户看到的就是"连接完还是那个弹窗、还在那个位置"；再按一次确定 ⇒ 整流程重来。
+     *
+     *   修法：在回调里**先把确认框弹掉**（os_dialog_pop 在同层是"关弹窗页"，
+     *   并会置 s_cb_handled，回调返回后不会再重复关闭），然后再开 Wi-Fi 流程。
+     *   这样弹窗栈从 0 层干净开始，扫描/键盘都是第一层，pop 一次就回应用中心。 */
+    /* ★ 2026-11-01: **不要 pop**。
+     *   原来这里 os_dialog_pop 会把弹窗页一起弹掉(先露出下层页面), 再 push 扫描弹窗,
+     *   中间闪一帧 —— 用户看到"Wi-Fi 二级弹窗是在主菜单上弹的"。
+     *   现在用复用入口：确认框**原位改写**成扫描列表，全程一层弹窗，页面上不闪。 */
+    { extern void settings_wifi_connect_open_reuse(ui_ctx_t *);
+      settings_wifi_connect_open_reuse(ctx); }
 }
+
+/* 商店联网门禁：**唯一**的"要不要问用户联网"判定点。
+ * 被 p_am_enter / 切分类 / 触摸切分类多处调用 —— 所以这里必须绝对幂等。 */
 static void am_store_wifi_gate(ui_ctx_t *ctx) {
-    if (s_store_wifi_asked) return;
-    s_store_wifi_asked = true;
-    if (wifi_manager_is_connected()) return;
-    /* ★★★ 2026-10-25 linit「切换过去不提醒是否联网，直接正在连接网络」:
-     *   原来按 wifi_manager_has_saved() 分流 —— **配过一次 WiFi 之后** 就直接
-     *   toast "正在连接网络" 并用联网模块自己连，用户完全没被征求过意见。
-     *   现在一律先弹确认框：点"确定"才走 settings_wifi_connect_open(已保存则直连、
-     *   未保存则弹扫描+密码)，点"取消"保持离线、只浏览本地已装的包。 */
-    /* ★★★ 2026-10-30 linit: **已保存过 WiFi 配置就直接后台连, 不再弹窗**。
-     *   2026-10-25 那次改成了"一律弹确认框", 导致用户每次进商店都被问一遍
-     *   "是否连接网络更新应用?" —— 明明已经连上/有配置, 纯属打扰。
-     *   现在恢复分流:
-     *     · 有保存配置  → 直接 settings_wifi_connect_open(内部走已保存直连), 不弹
-     *     · 没有配置    → 才弹确认框 (否则无从连接, 必须让用户去配)
-     *   两种情况都**只做后台连接/更新索引**, 不退出商店、不打断浏览。 */
-    if (wifi_manager_has_saved()) {
-        ESP_LOGI(TAG, "商店门禁: 已有保存配置, 后台直连(不弹窗)");
-        settings_wifi_connect_open(ctx);
+    if (wifi_manager_is_connected()) {
+        if (s_net_st != AMNET_UP) net_set(AMNET_UP, "已连接");
         return;
     }
-    ESP_LOGI(TAG, "商店门禁: 无保存配置, 弹确认框询问是否联网");
+    /* 驱动正在握手/连接：用户已经在选了，等结果，绝不再问 */
+    if (wifi_manager_is_connecting()) { AMNET("gate: 驱动连接中 → 等结果"); return; }
+
+    /* ★ 核心：流程进行中 / 已联网，一律不问。这两个状态是粘性的，页面 exit 也不清。 */
+    if (s_net_st == AMNET_ASKING || s_net_st == AMNET_CONNECTING) {
+        AMNET("gate: 流程进行中(%s) → 不重复弹", net_st_name(s_net_st));
+        return;
+    }
+    if (s_net_st == AMNET_DECLINED) { AMNET("gate: 用户已取消 → 不弹"); return; }
+
+    uint32_t now = net_now_ms();
+    if (s_net_st == AMNET_FAILED && now - s_net_ms < 10000u) {
+        AMNET("gate: 刚失败, 冷却中 → 不弹");      /* 失败后 10 秒冷却, 防弹窗刷屏 */
+        return;
+    }
+
+    s_am_op++;
+    net_set(AMNET_ASKING, "未连接 → 弹确认框");
     os_dialog_confirm_ex(ctx, "\xe6\x98\xaf\xe5\x90\xa6\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c\xe6\x9b\xb4\xe6\x96\xb0\xe5\xba\x94\xe7\x94\xa8\xef\xbc\x9f", 0, -1, am_wifi_gate_cb, NULL); /* 是否连接网络更新应用？ */
 }
 
@@ -185,6 +260,9 @@ static bool  s_gdrag_active = false;
 static uint8_t *s_col = NULL;                       /* PSRAM 整列缓冲 */
 static int      s_col_h = 0;                        /* 当前列高 (px) */
 static bool     s_col_dirty = false;                /* 需要重渲染整列 */
+/* ★ 2026-10-31: 下载中进度重绘的节流时间戳(ms)。原来每帧重绘(≈60 Hz)会
+ *   用 SPI 全屏刷新抢走下载任务(优先级 4)的 CPU，实测明显压低下行吞吐。 */
+static uint32_t s_dl_redraw_ms = 0;
 
 /* 长按 (首次按下即算, 无需放手指): 按住图标 3s 弹"添加/删除桌面快捷方式"确认 */
 #define AM_LP_MS       3000
@@ -311,17 +389,14 @@ static void am_launch(ui_ctx_t *ctx, const os_app_t *a) {
     if (am_lua_open_if_entry(ctx, a)) return;
     os_push(ctx, a->page);
 }
-/* 商店列表行触摸: 分成两个区 —— **右侧按钮**执行下载/安装/卸载/更新,
- * **名称区(其余部分)** 弹「详情」。 */
+/* 商店列表行触摸: **整行点击 = 执行该行的动作**（未装→下载/已装→卸载确认/有新版→更新），
+ * 详情改由「长按 1 秒」触发（见 am_long_press）。点击不再弹任何信息框。 */
 static void am_launch_list(ui_ctx_t *ctx, const os_app_t *a, int x, int ty, int y_row) {
     if (!a || s_cat != AM_CAT_STORE) { am_launch(ctx, a); return; }
-    (void)ty; (void)y_row;
-    /* ★ 2026-10-31 linit: 「点每一栏除了下载都要弹详情」。
-     *   命中右侧按钮框 → 走原来的装/卸/下载；否则 → 详情弹窗。
-     *   按钮左边界 AM_ROW_BTN_X0 是按钮**文字**左边, 外框再往外 4px,
-     *   这里再放宽 6px, 让手指点在框边缘也算按钮(触摸误差)。 */
-    if (x >= AM_ROW_BTN_X0 - 6) { am_store_toggle(ctx, a); return; }
-    am_store_detail(ctx, a);
+    (void)x; (void)ty; (void)y_row;
+    /* ★ 2026-11-04: 整行都执行动作。原来"只有右侧按钮区才动作、名称区无操作"，
+     *   导致用户点在名称区(面积大)时"点下载没反应"。详情已在长按 1s，点击不必再让位。 */
+    am_store_toggle(ctx, a);
 }
 
 
@@ -330,6 +405,10 @@ int  am_cat(void) { return s_cat; }
 int  am_sub(void) { return s_sub; }
 bool am_push_app(const os_app_t *a) {
     if (!a || s_list_n >= 64) return false;
+    /* ★ 2026-11-01: 去重。TF 卡 Lua 应用现在既在 os_app 注册表里（主菜单要用），
+     *   又会由 am_lua_append() 追加到列表 ⇒ 同一指针会被加两次，界面上出现两条。
+     *   n ≤ 64，线性查一遍的开销可忽略。 */
+    for (int i = 0; i < s_list_n; i++) if (s_list[i] == a) return true;
     s_list[s_list_n++] = a;
     return true;
 }
@@ -345,57 +424,68 @@ bool am_sub_want_cat(const char *cat) {
 
 static void am_rebuild_ex(bool keep_cam) {
     const int64_t t_rebuild0 = esp_timer_get_time();
+    /* ★★★ 2026-11-01 linit：**列表建一次就复用**。
+     *   原来每次进/返回应用中心都全量重建（实测 191ms，其中可见性判定 188ms，
+     *   os_app_visible 逐个读 NVS flash，是全机最慢的一步）。
+     *   keep_cam=true 只用于「进入/返回」，此时若列表已存在且分类没变，直接复用；
+     *   切分类 / 安装卸载 / 扫描完成走的都是 am_rebuild()(keep_cam=false) ⇒ 仍强制重建，
+     *   数据不会不同步。 */
+    static int s_built_cat = -1, s_built_sub = -1;
+    static uint32_t s_built_gen = 0;   /* 构建本列表时的核心数据代次 */
+    /* ★ 核心代次：列表里存的是 &s_app[i].view **裸指针**，
+     *   核心换缓冲后这些指针全部指向被弃用的旧缓冲 ⇒
+     *   再用它们渲染就是"卸载/更新后说明消失、按钮错乱"。
+     *   所以复用自己的缓存列表前，必须确认核心数据没换代。
+     *   （切分类会走 keep_cam=false，本来就强制重建；这条管的是
+     *     "分类没变但数据变了"的场景 —— 卸载/下载完成后的那一帧。） */
+    if (keep_cam && s_list_n > 0 && s_cat == s_built_cat && s_sub == s_built_sub
+        && s_built_gen == am_core_gen()) {
+        s_col_dirty = true;          /* 只需重绘，不需要重算数据 */
+        ESP_LOGI(TAG, "rebuild 复用缓存: %d 条（分类=%d 子=%d）", s_list_n, s_cat, s_sub);
+        return;
+    }
     /* 视图固定不可切换: 商店=列表, 其他分类=图标网格 */
     s_view_grid = (s_cat != AM_CAT_STORE);
-    /* 分类 Lua 后台扫描 (不再同步阻塞首帧): 本次先只组 C 应用; 若该分类数据还没就绪,
-     * 后台扫完由 poll 迁移到 s_lua 并重建填充. s_lua_ok_cat==s_cat 表示数据可用. */
-    if (s_cat != AM_CAT_STORE) {
-        am_lua_prefetch(s_cat);   /* 已扫过 → 标记就绪; 未扫 → 启动后台扫描 */
-    }
     s_list_n = 0;
+    /* ════════════════════════════════════════════════════════════════════
+     * 列表**全部**来自统一核心 am_app_core（2026-11-03 起）：
+     *   · 应用中心 → am_core_count_center()/center_at()（内置 + 已安装的 Lua/LPK）
+     *   · 商店     → am_core_count_store()/store_at()  + 商店侧的资源包段
+     * 这里只做"分类过滤 + 排序"，不再自己扫目录、不再自己判"装没装"。
+     * ════════════════════════════════════════════════════════════════════ */
     if (s_cat == AM_CAT_STORE) {
-        /* 商店: 本地应用包 (后台扫描 /store 根 与 /sdcard/store_pkg, 不联网).
-         * 首次未扫完 → 空列表显示"正在扫描…", 扫描完成后由 poll 重建列表. */
-        am_store_prefetch();
-        /* ★★★★ 2026-10-17 修 (linit 反复反馈"商店全在软件里"的真凶):
-         *   原来只在「全部」和「软件」两个页签填列表 ⇒ 其它页签永远空, 而「软件」装了全部 8 个。
-         *   改为与其它分类一致: **逐个条目走 app_match_sub() 按分类过滤** ✓ */
-        if (am_store_ready())
-            for (int k = 0; k < am_store_count() && s_list_n < 64; k++) {
-                const os_app_t *sa = am_store_app(k);
-                if (sa && app_match_sub(sa)) s_list[s_list_n++] = sa;
-            }
-    } else if (s_cat == AM_CAT_ENGINE) {
-        /* 引擎: 按用户指定顺序插入 (从注册表取对应应用) */
-        for (int o = 0; o < ENGINE_ORDER_COUNT && s_list_n < 64; o++) {
-            int total = os_app_count();
-            for (int i = 0; i < total; i++) {
-                const os_app_t *a = os_app_get(i);
-                /* ★ 2026-10-25: 必须过可见性判定 —— 资源包类应用(requires 目录不在)
-                 *   和用户隐藏的应用, 不能进列表。原来只按分类/id 匹配 ⇒ 隐藏的照样显示。 */
-                if (a && strcmp(a->id, s_engine_order[o]) == 0 && os_app_available(a)) {
-                    s_list[s_list_n++] = a;
-                    break;
+        am_store_prefetch();          /* 触发一次重扫 + 按需刷新云端索引 */
+        const int total = am_store_count();
+        for (int k = 0; k < total && s_list_n < 64; k++) {
+            const os_app_t *sa = am_store_app(k);
+            if (!sa || !app_match_sub(sa)) continue;
+            s_list[s_list_n++] = sa;
+        }
+    } else {
+        const int total = am_core_count_center();
+        if (s_cat == AM_CAT_ENGINE) {
+            /* 引擎: 按用户指定顺序插入（顺序表里的 id 就是 rt_id） */
+            for (int o = 0; o < ENGINE_ORDER_COUNT && s_list_n < 64; o++) {
+                for (int i = 0; i < total; i++) {
+                    const am_app_t *e = am_core_center_at(i);
+                    if (e && e->view.id && strcmp(e->view.id, s_engine_order[o]) == 0) {
+                        s_list[s_list_n++] = &e->view;
+                        break;
+                    }
                 }
             }
+        } else if (s_cat == AM_CAT_OPS) {
+            for (int i = 0; i < total && s_list_n < 64; i++) {
+                const am_app_t *e = am_core_center_at(i);
+                if (e && e->view.cat && strcmp(e->view.cat, "\xe8\xbf\x90\xe7\xbb\xb4") == 0)
+                    s_list[s_list_n++] = &e->view;      /* 运维 */
+            }
+        } else {
+            for (int i = 0; i < total && s_list_n < 64; i++) {
+                const am_app_t *e = am_core_center_at(i);
+                if (e && app_match_cat(&e->view)) s_list[s_list_n++] = &e->view;
+            }
         }
-        if (am_lua_ready(s_cat)) am_lua_append(false);   /* 并入 Lua 引擎文件 (后台扫完才有) */
-    } else if (s_cat == AM_CAT_OPS) {
-        /* 运维: cat=运维 应用 + 运维类 Lua 文件 */
-        int total = os_app_count();
-        for (int i = 0; i < total && s_list_n < 64; i++) {
-            const os_app_t *a = os_app_get(i);
-            if (app_match_cat(a) && os_app_available(a)) s_list[s_list_n++] = a;   /* ★ 只过滤资源未就绪的 */
-        }
-        if (am_lua_ready(s_cat)) am_lua_append(true);    /* 只并入运维类 Lua */
-    } else {
-        /* 应用: cat 匹配 (游戏/软件/系统/学习…) + 非运维类 Lua 文件 */
-        int total = os_app_count();
-        for (int i = 0; i < total && s_list_n < 64; i++) {
-            const os_app_t *a = os_app_get(i);
-            if (app_match_cat(a) && os_app_available(a)) s_list[s_list_n++] = a;   /* ★ 只过滤资源未就绪的 */
-        }
-        if (am_lua_ready(s_cat)) am_lua_append(false);   /* 并入 Lua 应用文件 (排除运维类) */
     }
     /* 缓存可见性: 渲染循环不再逐帧调 os_app_visible(读 NVS flash 极慢, 是管家卡顿根因) */
     const int64_t tb0 = esp_timer_get_time();
@@ -427,6 +517,8 @@ static void am_rebuild_ex(bool keep_cam) {
      *   引擎/运维这种一屏装得下的分类，内容整体下移、顶部空一排，
      *   看起来就像"应用少了一条"。 */
     am_sc_sync();
+    s_built_cat = s_cat; s_built_sub = s_sub;   /* 记录本次构建的分类，供复用判断 */
+    s_built_gen = am_core_gen();   /* 记录构建时的核心代次：代次变了 ⇒ 旧指针已失效，必须重建 */
     s_col_dirty = true;   /* 列表内容变了, 整列需重渲染 */
     ESP_LOGI(TAG, "rebuild: %d 条, 总计=%lld us (可见性段=%lld us, 收尾=%lld us)",
              s_list_n, (long long)(esp_timer_get_time() - t_rebuild0),
@@ -956,17 +1048,23 @@ static void am_col_text_sz(int x, int y, const char *s, bool inv, int sz) {
                 const uint8_t *b = FONT8X12[*p - 0x20];
                 if (aw == 16) {
                     /* ★ 2026-11-01: 横向**精确 2 倍**（8 → 16，竖笔恒 2px，不再被压成 1px），
-                     *   纵向按 sz 做最近邻（12 → sz），**高度与汉字完全相等** ⇒ 顶底齐平。
-                     *   原来 sz<24 时横竖都按 sz*16/24 小数采样：22px 下宽只有 14、
-                     *   竖笔会被压成 1px，中文却是 2px，英文看着又细又断（linit 反馈）。
-                     *   现在中英同高同基线，步进固定 16（与主菜单 draw_ascii 同口径）。 */
+                     *   纵向按 sz 做最近邻（12 → sz），字框高度与汉字相等。
+                     *
+                     * ★ 同日第二轮：linit 反馈「英文整体比中文低几个像素」——这是**字形自带的上留白**:
+                     *   FONT8X12 源字模第 0/1 行是空的（留给大写上伸与重音），墨迹从第 2 行起；
+                     *   铺满 22 行后那段空白变成 ~4px，而汉字墨迹顶部只有 1px，
+                     *   于是同一基线对齐时英文块看着"往下掉了 2～3px"。
+                     *   对策: 英文整体上移 sz/11（22px → 2px），让两边**墨迹中心对齐**
+                     *   （英 2..19 中心 10.5，汉字 1..20 中心 10.5）。
+                     *   ⚠ 不要再改成"顶对齐(上移3)"——那样小写字母会浮在汉字底边之上 2px。 */
+                    const int lift = sz / 11;
                     for (int dy = 0; dy < sz; dy++) {
                         uint8_t bits = b[dy * 12 / sz];
                         if (!bits) continue;
                         for (int c = 0; c < 8; c++) {
                             if (!(bits & (0x80u >> c))) continue;
-                            am_col_px(x + c * 2,     y + dy, !inv);
-                            am_col_px(x + c * 2 + 1, y + dy, !inv);
+                            am_col_px(x + c * 2,     y + dy - lift, !inv);
+                            am_col_px(x + c * 2 + 1, y + dy - lift, !inv);
                         }
                     }
                 } else {
@@ -1233,8 +1331,10 @@ static void am_col_render_list(void) {
              *      一两个文件, 按钮就跳成"卸载"(还没到 100% 就变), 现在按"是否正在
              *      下发/解包"锁住, 完成(进度清空)后才允许显示"卸载";
              *   ③ 框宽按字数自适应 (2 字 48px / 3 字 72px), 右边缘对齐不变。 */
+            /* 按钮文案**完全由 am_store_state_of() 给出**（下载/下载中/安装中/更新/更新中/卸载/卸载中）。
+             * ★ 2026-11-01: 删掉这里原来的一句 `act = "下载中"` 覆盖 ——
+             *   那会把"更新中/安装中"也压成"下载中"，与状态机打架。 */
             const char *act = am_store_btn_of(a);
-            if (am_store_dl_permille_of(a) >= 0) act = "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad";  /* 下载中 */
             int nch = 0;
             for (const unsigned char *q = (const unsigned char *)act; *q; ) {
                 q += (*q >= 0xf0) ? 4 : (*q >= 0xe0) ? 3 : (*q >= 0xc0) ? 2 : 1;
@@ -1311,6 +1411,114 @@ __attribute__((unused)) static void am_draw_dl_overlay(st7305_handle_t *lcd, int
     if (pm > 0) {
         int fw = ((bx1 - bx0 - 2) * pm) / 1000;
         if (fw > 0) fill_rect(lcd, bx0 + 1, by0 + 1, bx0 + fw, by1 - 1, ST7305_COLOR_BLACK);
+    }
+}
+
+/* ==== 统一「下载状态条」(2026-10-31) ====
+ * 字体包 / Lua 包 / 其它商店资源**共用这一个组件** —— 数据全来自 am_dl_view(),
+ * 页面不再关心下的是什么。两行布局:
+ *   ① 状态词 + 已下/总 + 速度 ............ 百分比
+ *   ② 进度条 (整宽)
+ * 只在有任务时出现 (任务结束由 am_rstore_tick 回收, 条自动消失)。
+ * 从 AM_CATBAR_W 起画, 不压左侧分类栏; 也完全不改商店原有布局。 */
+#define AM_DL_BAR_H 38
+
+static void am_fmt_size(char *out, size_t cap, uint32_t b)
+{
+    /* 不用 %f: IDF 默认 newlib-nano 不带浮点格式化 */
+    if (b >= 1048576u)      snprintf(out, cap, "%u.%uM", (unsigned)(b / 1048576u),
+                                     (unsigned)((b % 1048576u) * 10u / 1048576u));
+    else if (b >= 1024u)    snprintf(out, cap, "%uK", (unsigned)(b / 1024u));
+    else                    snprintf(out, cap, "%uB", (unsigned)b);
+}
+
+static void am_draw_dl_bar(st7305_handle_t *lcd)
+{
+    am_dl_view_t v;
+    if (!am_dl_view(&v)) return;
+
+    const int x0 = AM_CATBAR_W + 2;          /* 让开 2px 分割线 */
+    const int x1 = UI_SCREEN_W - 2;
+    const int y0 = UI_SCREEN_H - AM_DL_BAR_H;
+    fill_rect(lcd, x0, y0, x1, UI_SCREEN_H - 1, ST7305_COLOR_WHITE);
+    draw_hline(lcd, x0, x1, y0, ST7305_COLOR_BLACK);
+
+    const char *st;
+    switch (v.phase) {
+    case AM_DLP_CONNECT:  st = "\xe8\xbf\x9e\xe6\x8e\xa5\xe4\xb8\xad"; break;           /* 连接中 */
+    case AM_DLP_DOWNLOAD: st = "\xe4\xb8\x8b\xe8\xbd\xbd\xe4\xb8\xad"; break;           /* 下载中 */
+    case AM_DLP_INSTALL:  st = "\xe5\xae\x89\xe8\xa3\x85\xe4\xb8\xad"; break;           /* 安装中 */
+    case AM_DLP_DONE:     st = "\xe5\xae\x8c\xe6\x88\x90"; break;                       /* 完成 */
+    default:              st = "\xe5\xa4\xb1\xe8\xb4\xa5"; break;                       /* 失败 */
+    }
+
+    char pct[16];
+    if (v.total_files > 0 && v.phase != AM_DLP_FAIL && v.phase != AM_DLP_CONNECT) {
+        /* ★ 2026-10-31: 多文件直接下载 —— 右上角显示「已完成 32/109 个文件」(只显 32/109)。
+         *   这条路径"下载即安装", 没有解包阶段, 百分比本身由字节比给出;
+         *   文件数才是用户判断"还剩多久"的直接依据(每个文件大小差很多)。 */
+        snprintf(pct, sizeof(pct), "%d/%d", v.done_files, v.total_files);
+    } else if (v.permille >= 0) {
+        int p10 = v.permille / 10;
+        if (p10 < 0) p10 = 0;
+        if (p10 > 100) p10 = 100;
+        snprintf(pct, sizeof(pct), "%d%%", p10);
+    } else {
+        snprintf(pct, sizeof(pct), "--");
+    }
+    const int pw = text_width(pct);
+    const int ly = y0 + 2;
+
+    /* 第一行: 左=状态 + 明细, 右=百分比 */
+    char head[64];
+    if (v.phase == AM_DLP_FAIL) {
+        snprintf(head, sizeof(head), "%s %s", st, v.err[0] ? v.err : "");
+    } else if (v.phase == AM_DLP_INSTALL) {
+        /* ★ 2026-10-31: 原来写死"正在写入字体"（仙剑这类资源包也走这条路径，文案不对），
+         *   而且只有一个百分比，41 MB 的包解压要 2 分多钟，看着就是"卡住"。
+         *   现在改成 **已解压 / 总大小**：数字一直在涨，用户能确认还活着。
+         *   进度基准是"已写字节 / 总解压字节"（am_asset.c 的 prog_bytes）。 */
+        uint32_t inst_done = 0;
+        if (v.permille > 700 && v.total > 0)
+            inst_done = (uint32_t)((unsigned long long)v.total * (unsigned)(v.permille - 700) / 300u);
+        char g[12], t2[12];
+        am_fmt_size(g,  sizeof(g),  inst_done);
+        am_fmt_size(t2, sizeof(t2), v.total);
+        /* 形如：安装中  12.3M/41.7M */
+        snprintf(head, sizeof(head), "%s  %s/%s", st, g, t2);
+    } else if (v.phase == AM_DLP_DONE) {
+        snprintf(head, sizeof(head), "%s %s", st,
+                 "\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98");                                    /* 已保存 */
+    } else {
+        char g[12], t[12], sp[12];
+        am_fmt_size(g,  sizeof(g),  v.got);
+        am_fmt_size(t,  sizeof(t),  v.total);
+        if (v.bps > 0) {
+            am_fmt_size(sp, sizeof(sp), v.bps);
+            snprintf(head, sizeof(head), "%s %s/%s %s/s", st, g, t, sp);
+        } else {
+            snprintf(head, sizeof(head), "%s %s/%s", st, g, t);
+        }
+    }
+    am_draw_text_l_clip(lcd, x0 + 3, ly, head, false, x1 - pw - 8);
+    am_draw_text_l(lcd, x1 - pw, ly, pct, false);
+
+    /* 第二行: 进度条 (失败时不画条) */
+    const int by0 = y0 + 21, by1 = by0 + 9;
+    if (v.phase == AM_DLP_FAIL) {
+        /* ★ 2026-10-31 linit「失败后提示一直停留、没有可点的按钮」:
+         *   原来这里画一句"点右侧按钮重试"，**而右侧根本没有按钮** —— 纯误导。
+         *   失败的交互入口是系统确认框(左"确定"=重试 / 右"取消")，由 poll 里的
+         *   ARS_DLFAIL 边沿弹出；状态条只负责显示"失败 + 原因"(第一行已有)，
+         *   并在 3 秒后自动收掉(见 am_store_net.c 的保留期)，不再留残影。 */
+        return;
+    }
+    draw_rect_outline(lcd, x0 + 3, by0, x1 - 3, by1, ST7305_COLOR_BLACK);
+    int pm = v.permille;
+    if (pm > 0) {
+        int span = (x1 - 3) - (x0 + 3) - 2;
+        int fw = span * pm / 1000;
+        if (fw > 0) fill_rect(lcd, x0 + 4, by0 + 1, x0 + 3 + fw, by1 - 1, ST7305_COLOR_BLACK);
     }
 }
 
@@ -1534,6 +1742,11 @@ static void p_am_render(ui_ctx_t *ctx) {
         am_elbow(lcd, lx, by + w1, R, 2, 2, ST7305_COLOR_BLACK);  /* 左下: 外凸向左下 */
         am_elbow(lcd, rx, by + w1, R, 3, 2, ST7305_COLOR_BLACK);  /* 右下: 外凸向右上 */
     }
+
+    /* ★ 2026-10-31: 统一下载状态条 —— 最后画, 盖在列表/分隔线之上.
+     *   字体包与 Lua 包走同一组件, 进度/大小/速度/阶段完全一致。
+     *   只在商店分类显示: 下载任务本身与页面无关, 切走继续下, 回来接着看进度。 */
+    if (s_cat == AM_CAT_STORE) am_draw_dl_bar(lcd);
 }
 
 /* 是否有顶部子分类横排 (应用/商店 两分类) */
@@ -1541,7 +1754,22 @@ static bool am_has_sub(void) { return (s_cat == AM_CAT_APP) || (s_cat == AM_CAT_
 
 /* ==== 交互 ==== */
 
+/* 长按（触摸 3s / 硬件确认键 2s）：添加/删除桌面图标，或商店里卸载。
+ * 定义在文件后半段（触摸长按处），键盘分支要先声明。 */
+static void am_long_press(ui_ctx_t *ctx, int idx);
+
 static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
+    /* ★ 2026-11-01 linit: 硬件确认键长按 = 添加/删除**桌面图标**（非商店分类）。
+     *   必须放在"分类栏/子分类栏"两个焦点分支**之前** —— 那两个分支会 early return，
+     *   焦点停在左栏或顶部子分类时，长按会被它们吞掉（实测就是这样：按了没反应）。
+     *   长按的语义是"操作当前选中的那一条"，所以先把焦点拉回内容区再弹确认框。 */
+    if (a == OS_ACTION_BT_SEARCH && s_cat != AM_CAT_STORE) {
+        s_focus_bar = 0;
+        s_col_dirty = true;
+        am_long_press(ctx, s_focus);
+        ctx->needs_redraw = true;
+        return;
+    }
     /* 左侧分类栏聚焦 (UP/DOWN 切分类; RIGHT/确认 选定回内容; LEFT/BACK 回内容) */
     if (s_focus_bar == 2) {
         switch (a) {
@@ -1661,10 +1889,20 @@ static void p_am_action(ui_ctx_t *ctx, os_action_t a) {
             ctx->needs_redraw = true;
             break;
         }
-        /* 非商店分类: 视图固定不可切换 (图标/列表模式由分类固定), 忽略长按 */
+        /* ★ 2026-11-01 linit: 非商店分类的长按在**函数最前面**统一处理了
+         *   （见 p_am_action 开头：长按确认键 = 添加/删除桌面图标）。
+         *   这里只剩商店分支持续有效。 */
         break;
     case OS_ACTION_BACK:
     case OS_ACTION_HOME:
+        /* ★ 2026-10-31 (linit「联网的时候它会退出」取证用):
+         *   本文件里**只有这一处**会 os_pop 本页(全文件搜 os_pop 只有这里)，
+         *   所以"应用中心被弹走"必然要么走这里、要么是全局路径(空闲超时/崩溃/别的模块)。
+         *   这行日志就是判据：串口有它 ⇒ 是按键退的；没有它却退出了 ⇒ 不是按键的锅。
+         *   纯日志，不改变任何行为。 */
+        ESP_LOGI(TAG, "退出应用中心: action=%d session=%d asked=%d conn=%d 分类=%d",
+                 (int)a, (int)s_net_st, (int)s_am_leave_child,
+                 (int)wifi_manager_is_connected(), s_cat);
         os_pop(ctx);
         break;
     default:
@@ -1701,14 +1939,20 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
             if (d < 0) d = -d;
             if (d < best_d) { best_d = d; best = r; }
         }
-        if (best >= 0 && best != s_cat) {
-            s_cat = best;
-            s_sub = AM_SUB_ALL;
-            s_focus = 0; s_scroll = 0;
-            s_focus_bar = 0;   /* 触摸点分类后回到内容聚焦 */
-            am_rebuild();
+        if (best >= 0) {
+            if (best != s_cat) {
+                s_cat = best;
+                s_sub = AM_SUB_ALL;
+                s_focus = 0; s_scroll = 0;
+                s_focus_bar = 0;   /* 触摸点分类后回到内容聚焦 */
+                am_rebuild();
+                ctx->needs_redraw = true;
+            }
+            /* ★ 2026-11-01 linit: 联网确认改成"点'商店'这个分类时才问"。
+             *   ⚠ 必须放在 `best != s_cat` 之外 —— 上次就停在商店分类时，
+             *   用户再点一次商店(分类没变)也应该能触发联网询问，否则点了没反应。
+             *   gate 内部是幂等的(已连接/流程中/已取消都直接返回)，重复调用安全。 */
             if (s_cat == AM_CAT_STORE) am_store_wifi_gate(ctx);
-            ctx->needs_redraw = true;
         }
         return true;
     }
@@ -1731,6 +1975,9 @@ static bool p_am_touch(ui_ctx_t *ctx, int x, int y) {
     /* 右栏内容 (y < content_top: 顶部状态栏/子分类条区域 → 不触发下方图标) */
     int content_top = am_content_top();
     if (y < content_top) return false;
+    /* ★ 2026-10-31: 统一下载状态条覆盖的底部区域不响应列表点击 ——
+     *   否则"点最后一行"实际点到的是状态条, 列表却按被遮住的位置算索引, 会误装/误卸。 */
+    if (s_cat == AM_CAT_STORE && y >= UI_SCREEN_H - AM_DL_BAR_H && am_dl_view(NULL)) return true;
     /* 商店后台扫描未完成: 吞掉内容点击（此时列表还是半成品，点了会错位）。
      *
      * ★★★ 2026-10-31 linit 反馈「下载时商店卡住、点不动」★★★
@@ -1794,9 +2041,12 @@ static void am_lp_confirm_cb(ui_ctx_t *ctx, int result, void *ud) {
         os_app_set_mainmenu(a->id, true);
         os_dialog_toast(ctx, "\xe5\xb7\xb2\xe6\xb7\xbb\xe5\x8a\xa0\xe6\xa1\x8c\xe9\x9d\xa2\xe5\x9b\xbe\xe6\xa0\x87"); /* 已添加桌面图标 */
     }
-    /* 确定后必须立即关闭确认弹窗: os_dialog_toast 会置 s_cb_handled 阻止 dlg_finish_top
-     * 自动关, 这里显式弹掉 (否则确认框一直卡着). 之后由 os_enter 重建可见列表. */
-    os_dialog_pop(ctx);
+    /* ★★★ 2026-10-31 修「改了桌面图标 → 应用中心直接退出」：
+     *   这里原来跟着一句 `os_dialog_pop(ctx)`，注释写的是"toast 会置 s_cb_handled
+     *   阻止自动关" —— 那是 2026-10-19 之前的老行为（见 os_dialog.c:1136）。
+     *   现在 toast **不再**接管弹窗，于是 os_dialog_pop 在 s_top==0 时走 os_pop，
+     *   把弹窗页连同**应用中心页**一起退掉。
+     *   正确做法：回调里什么都不做，关窗由框架 dlg_finish_top 完成。 */
     ctx->needs_redraw = true;
     /* 刷新可见性缓存 (长按增删桌面图标后不能让渲染用旧值) */
     for (int i = 0; i < s_list_n; i++)
@@ -1806,8 +2056,8 @@ static void am_lp_confirm_cb(ui_ctx_t *ctx, int result, void *ud) {
 static void am_long_press(ui_ctx_t *ctx, int idx) {
     if (idx < 0 || idx >= s_list_n) return;
     if (!s_list[idx]) return;   /* 仅已安装应用图标 */
-    if (s_cat == AM_CAT_STORE) {          /* 商店长按 → 卸载已安装包 */
-        am_store_uninstall_ask(ctx, s_list[idx]);
+    if (s_cat == AM_CAT_STORE) {          /* 商店长按 1s → 详情 (卸载改走右侧按钮) */
+        am_store_detail(ctx, s_list[idx]);
         return;
     }
     /* 2026-09-22: Lua 文件项**也要能加/删桌面图标**。原先这里直接 return → 长按完全没反应
@@ -1838,8 +2088,56 @@ static int am_idx_at(int tx, int ty, int content_top) {
     }
 }
 
+/* 下载失败 → "重试/取消" 确认框的回调 (2026-10-31)。
+ * ud = 失败包在索引里的下标; 重试就是拿这个下标再启动一次下载。 */
+static void am_dlfail_retry_cb(ui_ctx_t *ctx, int result, void *ud) {
+    if (result != 0) return;                       /* 取消: 框架自动关框 */
+    int idx = (int)(long)ud;
+    if (idx < 0 || !am_rstore_dl_start(idx)) {
+        os_dialog_toast(ctx, "重试失败: 网络或存储不可用");
+    } else {
+        ESP_LOGI("APPM", "下载失败后重试: idx=%d", idx);
+    }
+}
+
 /* ==== 每帧轮询: 触摸上下拖动 (相机跟手 + 惯性甩动 + 网格吸附, 仿主菜单) ==== */
 static void p_am_poll(ui_ctx_t *ctx) {
+    /* ★★★ 2026-11-01: 联网成功 ⇒ **自动后台刷新商店索引**。
+     *   任务定义: "连接成功后后台刷新是自动行为, 不是第二次用户授权行为"。
+     *   这里用**边沿检测**(false→true) 而不是消费全局事件:
+     *     · 不抢别的模块的 wifi_manager_consume_connected_event()
+     *     · 天然只触发一次; 断网后重连会再触发一次(合理)
+     *     · 首帧就已连接 ⇒ 也会走一次, 满足"已有网络直接后台刷新"
+     *   刷新本身有 60 秒节流(am_rstore_refresh_due)+ 后台任务, 不会拖慢界面。 */
+    {
+        extern void am_store_refresh_index_if_due(void);
+        uint32_t now = net_now_ms();
+        /* 连接结果轮询: 设置页不在前台时也得跑, 否则连上了没人知道 */
+        { extern void settings_wifi_conn_poll(ui_ctx_t *);
+          settings_wifi_conn_poll(ctx); }
+        switch (s_net_st) {
+        case AMNET_CONNECTING:
+            if (wifi_manager_is_connected()) {
+                net_set(AMNET_UP, "拿到 IP → 自动后台刷新商店");
+                am_store_refresh_index_if_due();      /* 自动刷新, 不再要用户点第二次 */
+            } else if (!wifi_manager_is_connecting() && now - s_net_ms > 20000u) {
+                net_set(AMNET_FAILED, "20 秒未连上");
+            }
+            break;
+        case AMNET_UP:
+            if (!wifi_manager_is_connected()) net_set(AMNET_IDLE, "断网(保留离线列表, 不重弹确认)");
+            break;
+        case AMNET_ASKING:
+            /* 确认框被外部关掉(按返回 / 页面被弹走) ⇒ 回 IDLE, 免得卡在 ASKING 再也不问。
+             * 给 1.5s 宽限: 弹窗刚 push 的那一帧 depth 可能还没同步。 */
+            if (os_dialog_depth() <= 0 && now - s_net_ms > 1500u)
+                net_set(AMNET_IDLE, "确认框已不在");
+            break;
+        default:
+            break;
+        }
+    }
+
     /* 子页没真推入(如 Wi-Fi 门禁拦下)时把"离开管家"标记收回, 否则会累积 */
     if (s_am_leave_child > 0 && ctx->current_page == OS_PAGE_APP_MANAGER) s_am_leave_child = 0;
     /* 商店卸载: 确认键按满 3s (BT_SEARCH 起点再加 1s) 且未松手 → 弹卸载确认。
@@ -1855,10 +2153,10 @@ static void p_am_poll(ui_ctx_t *ctx) {
                  *   装在内置   → 仍是原来的卸载
                  * 这样长按一次只有一个动作，不用引入二级菜单。 */
                 const os_app_t *lp_a = s_list[s_focus];
-                if (lp_a && am_store_app_where(lp_a) == 2) {
-                    am_move_internal_ask(ctx, lp_a);
+                if (lp_a && am_store_movable(lp_a)) {
+                    am_move_internal_ask(ctx, lp_a);   /* TF 上的 Lua：问"搬到内置?" */
                 } else {
-                    am_store_uninstall_ask(ctx, lp_a);
+                    am_store_uninstall_ask(ctx, lp_a); /* 其余（含资源/LPK）→ 卸载 */
                 }
             }
         } else {
@@ -1875,10 +2173,21 @@ static void p_am_poll(ui_ctx_t *ctx) {
     /* ★★★ 2026-10-18 linit: **下载中每帧重绘 + 标脏列缓冲** ——
      *   行是渲染到离屏列缓冲 s_col 的, 只有 s_col_dirty 才重新渲染 ✗
      *   ⇒ 只设 needs_redraw 等于把【旧缓冲】重新贴一遍, 进度条永远不动 ✓
-     *   (linit 报"下载没进度, 一下子完成"就是这个) */
-    if (s_cat == AM_CAT_STORE && am_rstore_state() == ARS_DOWNLOADING) {
-        ctx->needs_redraw = true;
-        s_col_dirty = true;
+     *   (linit 报"下载没进度, 一下子完成"就是这个)
+     *
+     * ★★★ 2026-10-31 (linit 提"下载比原来慢"): **改成节流 5 Hz**。
+     *   原来是"每帧"——UI 主循环约 60 Hz，等于每秒 60 次
+     *   「重渲染整列 → 打脏 → 全屏 400x300 单色推送」。ST7305 一次全屏要十几毫秒 SPI，
+     *   加起来 ~900 ms/s 都花在画进度条上；而 netc 下载任务优先级只有 4，
+     *   被高优先级 UI 任务这样压着，等于给下载人为限速。
+     *   进度条 5 Hz 已经完全够看(人眼分辨不出 200 ms 的差别)，把 CPU 让回给收包。 */
+    if (s_cat == AM_CAT_STORE && am_dl_view(NULL)) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now_ms - s_dl_redraw_ms >= 200) {
+            s_dl_redraw_ms = now_ms;
+            ctx->needs_redraw = true;
+            s_col_dirty = true;
+        }
     }
     /* ★★★ 2026-10-18 linit: **卸载完成后自动刷新页面** ——
      *   后台删完文件只会置标志; 这里取一次 ⇒ 强制重渲染整列(按钮变"下载")
@@ -1916,10 +2225,13 @@ static void p_am_poll(ui_ctx_t *ctx) {
         s_dl_was = dl_now;
     }
 
-    /* 分类 Lua 后台扫描完成: 影子缓冲搬到 s_lua, 标记数据就绪, 重建列表 (UI 线程取货).
-     * 迁移须在 UI 线程一次性完成 (后台只写 s_lua_bg, 避免与渲染读 s_lua 竞态). */
-    if (am_lua_tick()) {
-        if (s_cat != AM_CAT_STORE) { am_rebuild_keep(); ctx->needs_redraw = true; }
+    /* 统一应用核心取货（UI 线程换缓冲）：内置/Lua/LPK/索引合并都在这一刻生效。
+     * 数据变了就重建当前分类列表 —— 商店段由下面的 store_dirty 统一处理，
+     * 其它分类在这里立刻刷新（原来是等 am_lua_tick）。 */
+    bool core_dirty = am_core_tick();
+    if (core_dirty && s_cat != AM_CAT_STORE) {
+        am_rebuild_keep();
+        ctx->needs_redraw = true;
     }
 
     /* 商店包后台扫描完成 / 云端索引到达 → 重建列表 (UI 线程取货) */
@@ -1932,13 +2244,38 @@ static void p_am_poll(ui_ctx_t *ctx) {
             if (rs == ARS_OK) {
                 /* ★ 2026-10-18: 自动安装已移到**下载任务**(后台线程) ——
                  *   UI 线程只负责提示, 不做文件 I/O(否则开店死机)。 */
-                os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85");   /* 已安装 */
+                /* ★ 2026-11-03 linit: 下载完成提示**只显示 1 秒**（原来用默认 toast 0.5s，
+                 *   在"下载中→已完成"之间一闪就没，用户来不及看清"已保存"状态）。 */
+                os_dialog_toast_ms(ctx, "\xe5\xb7\xb2\xe5\xae\x89\xe8\xa3\x85", 1000);   /* 已安装 */
                 am_rstore_ack();
                 am_store_invalidate();      /* 重扫: 刚下好的包要从"云端"变成"可安装" */
                 am_store_prefetch();
             } else if (rs == ARS_DLFAIL) {
-                os_dialog_toast(ctx, "\xe4\xb8\x8b\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5");   /* 下载失败 */
+                /* ★ 2026-10-31: 原来只弹一句"下载失败"(2 秒消失), 用户既不知道原因、
+                 *   也没有再试的入口。改成**确认框**: 标题里带失败原因, 左"重试"/右"取消"。
+                 *   失败包的索引下标必须**在 ack 之前**取 (ack 会把 dl_index 清成 -1)。 */
+                int fidx = am_rstore_dl_index();
                 am_rstore_ack();
+                /* ★ 2026-10-31 linit: 用**自定义双按钮**弹窗（重试 / 取消）。
+                 *   os_dialog_confirm_ex 的按钮文字写死是"确定/取消" —— 用户看到
+                 *   "确定"不知道该点哪；这里直接写明"重试"，一点就真的重下。
+                 *   按钮 0=重试 → am_dlfail_retry_cb 里调 am_rstore_dl_start(fidx)，
+                 *   那是**真的重新启动下载任务**，不是只关窗。
+                 *   标题两行(失败 + 原因)，用 16px 标题样式，32 字节标题区刚好装下。 */
+                os_dlg_stack_t d;
+                memset(&d, 0, sizeof(d));
+                snprintf(d.title, sizeof(d.title), "下载失败\n%s", am_dl_err_text(am_rstore_dl_err()));
+                snprintf(d.items[0], sizeof(d.items[0]), "\xe9\x87\x8d\xe8\xaf\x95");   /* 重试 */
+                snprintf(d.items[1], sizeof(d.items[1]), "\xe5\x8f\x96\xe6\xb6\x88");   /* 取消 */
+                d.count      = 2;
+                d.sel        = 0;
+                d.no_footer  = true;
+                d.small      = true;
+                d.title_small = true;
+                d.cb         = am_dlfail_retry_cb;
+                d.ud         = (void *)(long)fidx;
+                os_dialog_push(ctx, &d);
+                ESP_LOGW("APPM", "下载失败弹窗: idx=%d err=%s", fidx, am_dl_err_text(am_rstore_dl_err()));
             } else if (rs == ARS_FAIL) {
                 os_dialog_toast(ctx, "\xe6\x97\xa0\xe6\xb3\x95\xe8\x8e\xb7\xe5\x8f\x96\xe5\xba\x94\xe7\x94\xa8\xe5\x88\x97\xe8\xa1\xa8"); /* 无法获取应用列表 */
             }
@@ -2061,8 +2398,9 @@ static void p_am_poll(ui_ctx_t *ctx) {
     if (moved >= AM_DRAG_THRESH) { s_gdrag_active = true; }
     if (moved >= AM_LP_DRAG_MAX) { s_lp_idx = -1; s_lp_fired = false; }
     else if (s_lp_idx >= 0 && !s_lp_fired && !s_gdrag_active) {
-        /* 按住 3s 未放手即触发 */
-        if (am_now_ms() - s_lp_t0 >= AM_LP_MS) {
+        /* 商店长按 1s（看详情，要求反应快）；其它分类仍 3s（加/删桌面图标，防误触） */
+        uint32_t lp_ms = (s_cat == AM_CAT_STORE) ? 1000u : AM_LP_MS;
+        if (am_now_ms() - s_lp_t0 >= lp_ms) {
             s_lp_fired = true;
             s_lp_suppress = true;
             am_long_press(ctx, s_lp_idx);
@@ -2145,6 +2483,14 @@ static bool am_sc_poll(ui_ctx_t *ctx) {
 
 /* ==== 模块 ==== */
 static void p_am_enter(ui_ctx_t *ctx) {
+    /* ★ 2026-11-01: 新会话号。同一 s 号内不应该出现第二次 gate 弹窗/扫描。 */
+    s_am_sess++;
+    /* 取消 / 失败 ⇒ 允许本次进页面再问一次;
+     * ⚠ CONNECTING / UP **不重置** —— 这正是"页面被弹走又重进时不再重复确认"的关键。 */
+    if (s_net_st == AMNET_DECLINED || s_net_st == AMNET_FAILED) s_net_st = AMNET_IDLE;
+    AMNET("enter cat=%d st=%s conn=%d wifi_en=%d dlg=%d",
+          s_cat, net_st_name(s_net_st), (int)wifi_manager_is_connected(),
+          (int)wifi_manager_is_enabled(), os_dialog_depth());
     /* V1.7.x: 进页面耗时分解 (打开应用中心"要等一会儿"的定位探针) */
     uint64_t t_all = (uint64_t)esp_timer_get_time();
     uint64_t t_prev = t_all;
@@ -2174,7 +2520,9 @@ static void p_am_enter(ui_ctx_t *ctx) {
     /* 进应用管家即后台预扫描商店包 (幂等: 已扫描/扫描中会早退), 不必等首次切到商店;
      * 这样首次进商店时列表/安装态已就绪, 不再闪现"正在扫描…". */
     am_store_prefetch();
-    if (s_cat == AM_CAT_STORE) am_store_wifi_gate(ctx);   /* 进来就停在商店 → 照样提示一次 */
+    /* ★ 2026-11-01 linit: **进应用中心一律不弹联网确认**。
+     *   改成"用户主动点了'商店'分类之后才问"—— 见触摸/按键切分类处的 am_store_wifi_gate()。
+     *   这样即使上次停在商店分类，重进时也只是显示列表，不会先弹一个框挡住。 */
     uint64_t t_store = (uint64_t)esp_timer_get_time();
     am_rebuild_keep();
     uint64_t t_end = (uint64_t)esp_timer_get_time();
@@ -2188,12 +2536,20 @@ static void p_am_enter(ui_ctx_t *ctx) {
 /* 离开管家: 进子页只收回标记; **真退出**才复位商店联网提示 (下次重进重新提示一次) */
 static void p_am_exit(ui_ctx_t *ctx) {
     (void)ctx;
-    if (s_am_leave_child > 0) s_am_leave_child--;
-    else                      s_store_wifi_asked = false;
+    if (s_am_leave_child > 0) {
+        s_am_leave_child--;            /* 进了自己推的子页(打开应用): 会话继续, 不清 */
+    }
+    /* ★★★ 2026-11-01 重写要点: **不再在这里复位联网状态**。
+     *   旧实现在"真退出"时把 asked/session 清空 —— 而页面只要被意外 pop 一次
+     *   (弹窗页残留 / 误按键 / 别的模块弹页) 就会走到这里, 于是"下次重进再问一遍",
+     *   表现为用户刚连上 Wi-Fi 回到商店又被问"是否连接网络更新应用"。
+     *   现在状态只在 用户取消(DECLINED) / 连接失败(FAILED) 时, 由 p_am_enter 拉回 IDLE；
+     *   CONNECTING / UP 保持粘性, 退出重进都不再问。 */
+    AMNET("exit: st=%s child=%d (联网状态保留)", net_st_name(s_net_st), s_am_leave_child);
     /* ★ 2026-10-24 规范化: 整列缓冲 (PSRAM, 64 行 × 41B ≈ 63KB) 原来只在 on_enter 分配、
      *   on_exit 不还 —— 违反 linit "退出就释放" 铁律。退出即 free, 下次进页面重分配。 */
     if (s_col) { free(s_col); s_col = NULL; s_col_dirty = true; }
-    ESP_LOGI(TAG, "exit: child=%d asked=%d", s_am_leave_child, (int)s_store_wifi_asked);
+    ESP_LOGI(TAG, "exit: child=%d st=%s", s_am_leave_child, net_st_name(s_net_st));
 }
 static const os_module_t s_mod_app_manager = {
     .name       = "app_butler",

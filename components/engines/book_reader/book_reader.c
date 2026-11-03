@@ -146,7 +146,10 @@ static volatile bool s_idx_stop = false;
 static bool          s_toc_prescanned = false;   /* 章节目录已由预扫描填满, 分页不再重复追加 */
 
 /* === 阅读菜单 === */
-enum { BM_READ = 0, BM_MENU = 1, BM_TOC = 2, BM_BMKS = 3, BM_FONT = 4, BM_PCT = 5 };
+/* ★ 2026-10-31: 加 BM_SIZE —— 字号选择仍然放在阅读器二级弹窗里（linit 要求配置
+ *   全部留在弹窗内，不要搬到书库）。它读的是**当前字体的真实字号表**，
+ *   所以 8px 字体只会列出 8px / 16px。 */
+enum { BM_READ = 0, BM_MENU = 1, BM_TOC = 2, BM_BMKS = 3, BM_FONT = 4, BM_PCT = 5, BM_SIZE = 6 };
 static uint8_t      s_menu = BM_READ;
 static uint32_t     s_menu_sel = 0;
 static uint32_t     s_menu_scroll = 0;
@@ -178,6 +181,41 @@ static uint32_t     s_toc_page = 0;           /* 目录页码 (0 起) */
 EXT_RAM_BSS_ATTR static char s_sd_fonts[SD_FONT_MAX][64];      /* TF 卡字体文件名列表 */
 EXT_RAM_BSS_ATTR static char s_sd_font_names[SD_FONT_MAX][40];  /* 对应字体的显示名 (LBF 头里的 name) */
 static int          s_sd_font_count = 0;     /* TF 卡字体数量 */
+static bool         s_sd_font_scanned = false;
+
+/* 扫描 /sdcard/fonts 并逐个体检（只读 96 字节头，不加载字形）。
+ * ★ 2026-10-31 改成**懒执行 + 一次缓存**：
+ *   原来 book_reader_open() 里每次都扫一遍（readdir + 每个文件 fopen/fread/fclose），
+ *   而这份列表**只服务于字体选择菜单**。现在字体配置已挪到书库，阅读器不再需要它，
+ *   每开一本书都去读 10 个文件头纯属浪费 —— 改成第一次真正要用时才扫，之后复用。
+ *   字体安装/卸载后由 book_reader_close() 重置标记（下次进入重新扫）。 */
+static void sd_font_scan(void) {
+    if (s_sd_font_scanned) return;
+    s_sd_font_scanned = true;
+
+    int nr = font_book_scan_sd(s_sd_fonts, SD_FONT_MAX);
+    int keep = 0;
+    for (int i = 0; i < nr; i++) {
+        char full[128], disp[40] = {0};
+        /* 精度限定 %.63s / %.39s: 源数组是定长 [64]/[40]，不加精度 GCC 会按
+         * "最坏可达 1023 字节"报 -Wformat-truncation（本项目 -Werror）。 */
+        snprintf(full, sizeof(full), "/sdcard/fonts/%.63s", s_sd_fonts[i]);
+        if (!lbf_peek(full, disp, sizeof(disp), NULL, NULL)) {
+            ESP_LOGW(TAG, "跳过无法识别的字体: %.63s", s_sd_fonts[i]);
+            continue;
+        }
+        if (keep != i) snprintf(s_sd_fonts[keep], 64, "%.63s", s_sd_fonts[i]);
+        /* 扫描阶段就转成短中文名，菜单直接取指针 —— 避免在渲染里用 static 缓冲互相覆盖 */
+        {
+            char sn[40];
+            font_book_short_name(disp[0] ? disp : s_sd_fonts[keep], sn, sizeof(sn));
+            snprintf(s_sd_font_names[keep], sizeof(s_sd_font_names[0]), "%.39s", sn);
+        }
+        keep++;
+    }
+    s_sd_font_count = keep;
+    if (s_sd_font_count > 0) ESP_LOGI(TAG, "发现 %d 个 TF 卡字体", s_sd_font_count);
+}
 
 /* === 旋转/夜间 === */
 static uint8_t      s_rot = 0;            /* 0上 1下 2左 3右 */
@@ -195,8 +233,10 @@ static uint8_t      s_fontsize = 1;       /* 字号档 0=16 1=24 2=32 3=48 (默�
  *   书架传进来的 32px 档(索引 4)会被夹成 3，落在 24px 上 ⇒ **菜单显示 32、实际画 24**。
  *   现在档位与像素一一对应（0..3 → 16/24/32/48），不再有夹值，也没有重复项。 */
 static int book_reader_size_px(int id) {
-    static const int t[4] = {16, 24, 32, 48};
-    return t[(id < 0) ? 1 : (id > 3) ? 3 : id];
+    /* 2026-10-31: 改为按**当前字体真实支持的字号**取档（font_book_size_px_at）。
+     *   内置 = 16/24/32/48；TF 卡 LBF = 原生 N 与 2N（如 8px 字体只有 8/16）。
+     *   原来的写死表在选了 8px 字体后仍给出 24/32/48，与实际渲染错位。 */
+    return font_book_size_px_at(id);
 }
 static uint8_t      s_margin_id = 1;      /* 0=窄 1=中 2=宽 */
 static uint8_t      s_lineh_id = 1;       /* 0=紧凑 1=标准 2=宽松 */
@@ -881,6 +921,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  lineh;
     uint8_t  gap;
     uint8_t  indent;
+    uint32_t font_id;        /* ★ v09: 字体身份（换字体但字号像素相同也必须失效） */
     uint32_t indexed_bytes;
     uint32_t pages;
     uint32_t chapters;
@@ -899,6 +940,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  gap;
     uint8_t  indent;
     uint8_t  fontsize;
+    uint32_t font_id;        /* ★ v06: 字体身份 */
     uint32_t last_page;
     uint32_t last_off;   /* V1.0.68 fix: 当前页字节偏移 (布局/字体变化时按偏移恢复) */
 } prog_hdr_t;
@@ -920,6 +962,18 @@ static uint8_t book_layout_id(void) {
     return book_is_portrait() ? 1 : 0;
 }
 
+/* ★★★ 2026-10-31: 字体身份（缓存键必须带它）★★★
+ *   原来 .idx / .pos 的失效条件只看 font_w / font_h（像素）——
+ *   从 hzk24 换成 fusion12 再换回 24px，像素一样但**半角宽度和基线不同**
+ *   （s_lbf_ascii_w 是按字体实测的），页边界随之改变，旧页表却仍被判为有效 ⇒
+ *   翻到某页会错位、书签/进度落在别处。这里把"哪个字体 + 原生尺寸"一起哈希进去。 */
+static uint32_t book_font_id(void) {
+    char key[160];
+    const char *f = font_book_current_file();
+    snprintf(key, sizeof(key), "%s|%d", (f && f[0]) ? f : "builtin", font_book_native_px());
+    return fnv1a(key);
+}
+
 static void book_save_sidecar(void) {
     if (!s_path[0] || s_page_count == 0) return;
     char path[300];
@@ -929,7 +983,7 @@ static void book_save_sidecar(void) {
     if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
     sidx_hdr_t h;
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, "BBKIDX08", 8);   /* v08(B1): 正文行数扣除底部信息条, 页边界变了 ⇒ 旧缓存必须失效 */
+    memcpy(h.magic, "BBKIDX09", 8);   /* v09(2026-10-31): 缓存键加"字体身份", 换字体必须失效 */
     h.fsz = s_file_size;
     h.mtime = s_mtime;
     h.enc = s_enc;
@@ -940,6 +994,7 @@ static void book_save_sidecar(void) {
     h.lineh = s_lineh_id;
     h.gap = s_gap_id;
     h.indent = s_indent ? 1 : 0;
+    h.font_id = book_font_id();
     h.indexed_bytes = s_indexed_bytes;
     h.pages = s_page_count;
     h.chapters = s_chapter_count;
@@ -967,11 +1022,12 @@ static bool book_load_sidecar(void) {
     if (!f) return false;
     sidx_hdr_t h;
     if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
-        memcmp(h.magic, "BBKIDX08", 8) != 0 ||
+        memcmp(h.magic, "BBKIDX09", 8) != 0 ||
         h.fsz != s_file_size || h.mtime != s_mtime || h.enc != s_enc ||
         h.layout != book_layout_id() ||
         h.font_w != (uint8_t)font_book_cell_w() ||
         h.font_h != (uint8_t)font_book_cell_h() ||
+        h.font_id != book_font_id() ||
         h.margin != s_margin_id || h.lineh != s_lineh_id || h.gap != s_gap_id ||
         h.indent != (s_indent ? 1 : 0) ||
         h.indexed_bytes > s_src_size ||
@@ -1047,7 +1103,7 @@ static void book_save_progress(void) {
     if (!f) return;
     prog_hdr_t h;
     memset(&h, 0, sizeof(h));
-    memcpy(h.magic, "BBKPOS05", 8);
+    memcpy(h.magic, "BBKPOS06", 8);
     h.fsz = s_file_size;
     h.mtime = s_mtime;
     h.layout = book_layout_id();
@@ -1058,6 +1114,7 @@ static void book_save_progress(void) {
     h.gap = s_gap_id;
     h.indent = s_indent ? 1 : 0;
     h.fontsize = s_fontsize;
+    h.font_id = book_font_id();
     h.bm_count = (uint8_t)s_bm_count;
     h.last_page = s_page;
     h.last_off = (s_page_off && s_page < s_page_count) ? s_page_off[s_page] : 0;
@@ -1161,7 +1218,7 @@ static void book_load_progress(void) {
     }
     prog_hdr_t h;
     if (fread(&h, 1, sizeof(h), f) == sizeof(h) &&
-        memcmp(h.magic, "BBKPOS05", 8) == 0 &&
+        memcmp(h.magic, "BBKPOS06", 8) == 0 &&
         h.fsz == s_file_size && h.mtime == s_mtime) {
         /* 始终记录最近字节偏移, 重开时按偏移恢复 (页号因重开页数可能不同而不可靠) */
         if (h.last_off > 0) s_pending_last_off = h.last_off;
@@ -1170,6 +1227,7 @@ static void book_load_progress(void) {
             h.layout == book_layout_id() &&
             h.font_w == (uint8_t)font_book_cell_w() &&
             h.font_h == (uint8_t)font_book_cell_h() &&
+            h.font_id == book_font_id() &&
             h.margin == s_margin_id && h.lineh == s_lineh_id &&
             h.gap == s_gap_id && h.fontsize == s_fontsize &&
             h.indent == (s_indent ? 1 : 0);
@@ -1180,8 +1238,21 @@ static void book_load_progress(void) {
             s_pending_layout_diff = true;
             ESP_LOGI(TAG, "布局已变化, 待按字节偏移 %lu 恢复", (unsigned long)h.last_off);
         }
-        /* 书签仅在布局一致时保留 (页号/偏移才对应) */
-        if (layout_match && h.bm_count <= BOOK_MAX_BOOKMARKS) {
+        /* ★★★ 2026-11-01 linit「调整阅读优化后书签消失」的根因修复 ★★★
+         *
+         * 原来这一行是 `if (layout_match && h.bm_count <= BOOK_MAX_BOOKMARKS)`：
+         * 只要字体/字号/行距/边距/字距/缩进/旋转动过任意一项，layout_match 为假，
+         * **一条书签都不读进内存**（s_bm_count 保持 0）。而退出阅读器时
+         * book_save_progress() 会用 s_bm_count=0 整份重写 .pos
+         * ⇒ 磁盘上的书签区被真正抹掉。先"看不见"、再"真没了"，两步丢数据。
+         *
+         * 书签存的 off 是**源文件字节偏移**，与排版无关、永远有效：
+         *   · 布局一致  → 直接用记录的页号
+         *   · 布局已变  → 页号置 UINT32_MAX，跳转时走 book_page_for_offset(off) 重算
+         *     (BM_BMKS 分支本来就有 `p >= s_page_count` 兜底，这里主动触发它，
+         *      避免"旧页号碰巧没越界、却指向错误位置"这种更隐蔽的错位)
+         * 所以书签必须**无条件读入**，只有"页号能否直接用"才依赖 layout_match。 */
+        if (h.bm_count <= BOOK_MAX_BOOKMARKS) {
             s_bm_count = h.bm_count;
             for (uint32_t i = 0; i < s_bm_count; i++) {
                 prog_bm_t b;
@@ -1189,11 +1260,14 @@ static void book_load_progress(void) {
                 if (fread(&b, 1, sizeof(b), f) != sizeof(b)) { s_bm_count = i; break; }
                 if (b.tlen > 31) b.tlen = 31;
                 s_bms[i].off = b.off;
-                s_bms[i].page = b.page;
+                /* 布局一致才敢用旧页号；变了就置无效，跳转按字节偏移重算 */
+                s_bms[i].page = layout_match ? b.page : 0xFFFFFFFFu;
                 memcpy(s_bms[i].title, b.title, 32);
                 s_bms[i].title[31] = 0;
             }
-            ESP_LOGI(TAG, "进度已加载: 页 %lu 书签 %lu", (unsigned long)s_loaded_page, (unsigned long)s_bm_count);
+            ESP_LOGI(TAG, "书签已加载: %lu 条%s",
+                     (unsigned long)s_bm_count,
+                     layout_match ? "" : " (布局已变 → 按字节偏移重新定位)");
         }
     }
     fclose(f);
@@ -1721,8 +1795,11 @@ static void render_landscape(st7305_handle_t *lcd) {
     int64_t t_draw1 = esp_timer_get_time();
     int64_t rt1 = esp_timer_get_time();
     if (rt1 - rt0 > 20000) {
-        ESP_LOGD(TAG, "渲染耗时 %lld ms (flow=%lld 绘制=%lld)", (long long)(rt1 - rt0) / 1000,
-                 (long long)(t_flow1 - t_flow0) / 1000, (long long)(t_draw1 - t_flow1) / 1000);
+        /* ★ 2026-11-01 临时开成 WARN：用户反馈"阅读界面弹窗很卡"，需要实测哪一段慢 */
+        ESP_LOGW(TAG, "渲染耗时 %lld ms (flow=%lld 绘制=%lld) menu=%d",
+                 (long long)(rt1 - rt0) / 1000,
+                 (long long)(t_flow1 - t_flow0) / 1000,
+                 (long long)(t_draw1 - t_flow1) / 1000, (int)s_menu);
     }
 }
 
@@ -1861,6 +1938,7 @@ static const char *menu_str(const char *utf8, const char *gbk) {
 #define M_BM_FULL     menu_str("\xE4\xB9\xA6\xE7\xAD\xBE\xE5\xB7\xB2\xE6\xBB\xA1", "\xCA\xE9\xC7\xA9\xD2\xD1\xC2\xFA")
 #define M_FONT_SEL    menu_str("\xE5\xAD\x97\xE4\xBD\x93\xE9\x80\x89\xE6\x8B\xA9", "\xD7\xD6\xCC\xE5\xD1\xA1\xD4\xF1")  /* 字体选择 */
 #define M_EMB_FS      menu_str("\xE5\x86\x85\xE7\xBD\xAE\xE5\xAD\x97\xE4\xBD\x93", "\xC4\xDA\xD6\xC3\xD7\xD6\xCC\xE5")  /* 内置字体 */
+#define M_SIZE        menu_str("\xE5\xAD\x97\xE5\x8F\xB7", "\xD7\xD6\xBA\xC5")                                  /* 字号 */
 #define M_EMB_HT      M_EMB_FS
 #define M_CLEARED     menu_str("\xE5\xB7\xB2\xE6\xB8\x85\xE7\xA9\xBA", "\xD2\xD1\xC7\xE5\xBF\xD5")
 #define M_EXIT_ASK    menu_str("\xE7\xA1\xAE\xE5\xAE\x9A\xE9\x80\x80\xE5\x87\xBA\xE9\x98\x85\xE8\xAF\xBB\xEF\xBC\x9F", "\xC8\xB7\xB6\xA8\xCD\xCB\xB3\xF6\xD4\xC4\xB6\xC1\xA3\xBF")
@@ -1881,8 +1959,9 @@ static void menu_fb_px(st7305_handle_t *lcd, int x, int y, bool black) {
     }
 }
 
-/* 菜单文字 (按原编码绘制, invert=白字黑底) */
-static void menu_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bool invert) {
+/* 阅读平面文字 (正文/页码/进度/章节): **跟随阅读字体**, 按原编码绘制。
+ * invert=白字黑底。菜单/弹窗**不要**用这个 —— 见下面的 ui_draw_text。 */
+static void read_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bool invert) {
     const uint8_t *p = (const uint8_t *)s;
     int cx = x;
     int x1 = (book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH) - 44;
@@ -1939,6 +2018,87 @@ static void menu_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bo
     }
 }
 
+/* ★★★ 2026-10-31 字体隔离（本轮核心）★★★
+ *   UI 层（菜单 / 目录 / 书签列表 / 确认框 / 底部返回 / 滚动页码）**固定用系统
+ *   16px 宋体 + 8×16 ASCII**，与当前阅读字体彻底无关。
+ *
+ *   原来的菜单走 font_book_glyph_*（= 当前阅读字体），于是：
+ *     · 换成 TF 卡字体后，菜单/弹窗二手跟着变；
+ *     · 阅读字号 48 时菜单字大到放不下，还得靠
+ *       `font_book_select(32)` … `font_book_select(24)` 临时改全局再改回来
+ *       —— 既有闪烁风险，也违反"不许改全局字体"的约束。
+ *   现在两条绘制通路彻底分开：
+ *     阅读平面 → read_draw_text  (跟随阅读字体)
+ *     操作界面 → ui_draw_text    (系统字体，永远是 16px)
+ */
+static void ui_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bool invert) {
+    const uint8_t *p = (const uint8_t *)s;
+    int cx = x;
+    int x1 = (book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH) - 44;
+    const int cw = font_book_ui_cell_w();
+    const int aw = font_book_ui_ascii_w();
+
+    while (*p) {
+        int w = cw;
+        book_glyph_t g;
+        bool ok = false;
+        if (s_enc == BF_ENC_GBK && p[0] >= 0x81 && p[1]) {
+            ok = font_book_ui_glyph_gb(p[0], p[1], &g);
+            p += 2;
+        } else if (p[0] < 0x80) {
+            ok = font_book_ui_glyph_unicode(p[0], &g);
+            w = aw;
+            p++;
+        } else {
+            const uint8_t *q = p;
+            uint32_t cp = *q++;
+            int extra = 0;
+            if ((cp & 0xE0) == 0xC0) { extra = 1; cp &= 0x1F; }
+            else if ((cp & 0xF0) == 0xE0) { extra = 2; cp &= 0x0F; }
+            else if ((cp & 0xF8) == 0xF0) { extra = 3; cp &= 0x07; }
+            else { p++; continue; }
+            for (int k = 0; k < extra && *q; k++) cp = (cp << 6) | (*q++ & 0x3F);
+            p = q;
+            ok = font_book_ui_glyph_unicode(cp, &g);
+        }
+        if (cx + w > x1) break;
+        if (ok && g.bitmap) {
+            int rb = (g.w + 7) / 8;
+            for (int row = 0; row < g.h; row++) {
+                const uint8_t *src = g.bitmap + row * rb;
+                for (int col = 0; col < g.w; col++) {
+                    if (src[col >> 3] & (1u << (7 - (col & 7))))
+                        menu_fb_px(lcd, cx + col, y + row, invert ? false : true);
+                }
+            }
+        } else if (invert) {
+            int chh = font_book_ui_cell_h();
+            for (int i = 0; i < w; i++) {
+                menu_fb_px(lcd, cx + i, y, false);
+                menu_fb_px(lcd, cx + i, y + chh - 1, false);
+            }
+            for (int i = 0; i < chh; i++) {
+                menu_fb_px(lcd, cx, y + i, false);
+                menu_fb_px(lcd, cx + w - 1, y + i, false);
+            }
+        }
+        cx += w;
+    }
+}
+
+static int ui_text_width(const char *s) {
+    const uint8_t *p = (const uint8_t *)s;
+    int w = 0;
+    while (*p) {
+        if (p[0] < 0x80) { w += font_book_ui_ascii_w(); p++; }
+        else if ((p[0] & 0xE0) == 0xC0) { w += font_book_ui_cell_w(); p += 2; }
+        else if ((p[0] & 0xF0) == 0xE0) { w += font_book_ui_cell_w(); p += 3; }
+        else if ((p[0] & 0xF8) == 0xF0) { w += font_book_ui_cell_w(); p += 4; }
+        else p++;
+    }
+    return w;
+}
+
 /* 目录分页 (50章/页): 当前页 global 起始下标、当前页章数、总页数 */
 static uint32_t toc_page_base(void)   { return s_toc_page * TOC_PER_PAGE; }
 static uint32_t toc_pages_count(void) {
@@ -1953,7 +2113,7 @@ static uint32_t toc_page_items(void) {
 }
 static const char *toc_display_title(uint32_t gi);   /* 章题转数字 (定义在后) */
 
-static int menu_text_width(const char *s);   /* fwd: 实现在菜单绘制区 */
+static int read_text_width(const char *s);   /* fwd: 实现在菜单绘制区 */
 
 /* ★ B4 (2026-10-30): 索引受限时在底部条位置显示原因 + 已索引百分比。
  *   以前 s_index_error 只影响内部逻辑, 用户只看到"翻到某页突然翻不动", 完全不知道发生了什么。 */
@@ -1969,33 +2129,42 @@ static void draw_idx_warn(st7305_handle_t *lcd) {
     uint32_t pct = s_src_size ? (uint32_t)(((uint64_t)s_indexed_bytes * 100u) / s_src_size) : 0;
     if (pct > 100) pct = 100;
     snprintf(buf, sizeof(buf), "%s %u%%", why, (unsigned)pct);
-    int tw = menu_text_width(buf);
+    int tw = read_text_width(buf);      /* 与页码/进度同一平面 → 跟随阅读字体 */
     int y  = ST7305_HEIGHT - font_book_ascii_h() - 2;
     if (y < 0) y = 0;
     int x  = (ST7305_WIDTH - tw) / 2;
     if (x < 0) x = 0;
-    menu_draw_text(lcd, x, y, buf, false);
+    read_draw_text(lcd, x, y, buf, false);
 }
 
 static int menu_item_count(void) {
     switch (s_menu) {
-        /* ★★★ 2026-10-31: 加第 8 项「字体选择」。
-         *   原菜单只有 7 项, **没有任何入口能进 BM_FONT** —— 字体切换的代码
-         *   (font_book_select_file / NVS 记忆 / 扫描列表) 全都在, 但用户点不到,
-         *   等于功能不存在。这是本轮发版前必须补上的一环。 */
-        case BM_MENU: return 8;   /* 目录/上一章/下一章/跳到进度/加书签/书签列表/字体/返回书库 */
+        /* ★ 2026-10-31: 保留「字体选择」入口（linit 要求阅读器内直接能换字体）。
+         *   ⚠ 它和 书库 →「阅读优化 → 字体」是**同一份状态**：两边都写 NVS 的
+         *   ftn（字体文件名，空=内置），所以哪儿改都一样，不会各存一套。
+         *   字号仍然只在书库「阅读优化 → 字号大小」里改（阅读菜单无字号项）。 */
+        case BM_MENU: return 9;   /* 目录/上一章/下一章/跳到进度/加书签/书签列表/字体/字号/返回书库 */
         case BM_PCT:  return 21;  /* 0%,5%,...,100% */
         case BM_TOC:  return (s_chapter_count == 0) ? 1 : (int)toc_page_items();
         case BM_BMKS: return (s_bm_count == 0) ? 1 : (int)s_bm_count + 1;   /* ... + 清空 */
-        case BM_FONT: return s_sd_font_count + 1;  /* TF 卡 LBF 字体 + 内置字体 */
+        case BM_FONT: sd_font_scan(); return s_sd_font_count + 1;  /* TF 卡 LBF 字体 + 内置字体 */
+        case BM_SIZE: return font_book_size_count();               /* 当前字体真实支持的档数 */
         default: return 0;
     }
+}
+
+/* "字号 24px" —— 选项上直接显示当前生效值，不用点进去才知道 */
+static char s_size_lbl[24];
+static const char *size_menu_label(void) {
+    snprintf(s_size_lbl, sizeof(s_size_lbl), "%s %dpx", M_SIZE, font_book_cell_w());
+    return s_size_lbl;
 }
 
 static const char *menu_item_text(int i) {
     switch (s_menu) {
         case BM_MENU:
-            /* 目录/添加书签/书签列表/返回书库 (旋转方向统一由书架"阅读优化"设置) */
+            /* 目录/上一章/下一章/跳到进度/加书签/书签列表/字体/字号/返回书库
+             * (旋转方向统一由书架"阅读优化"设置) */
             switch (i) {
                 case 0: return M_TOC;
                 case 1: return M_PREV_CH;
@@ -2003,8 +2172,9 @@ static const char *menu_item_text(int i) {
                 case 3: return M_GOTO_PCT;
                 case 4: return M_ADD_BM;
                 case 5: return M_BM_LIST;
-                case 6: return M_FONT_SEL;    /* 字体选择 */
-                case 7: return M_BACK_LIB;
+                case 6: return M_FONT_SEL;    /* 字体选择（与书库同一份状态） */
+                case 7: return size_menu_label();
+                case 8: return M_BACK_LIB;
             }
             return "";
         case BM_PCT: {
@@ -2027,6 +2197,14 @@ static const char *menu_item_text(int i) {
             if (i < s_sd_font_count)
                 return s_sd_font_names[i][0] ? s_sd_font_names[i] : s_sd_fonts[i];
             return M_EMB_FS;
+        case BM_SIZE: {
+            /* 字号列表 = 当前字体的真实规格（内置 16/24/32/48；8px 字体只有 8/16） */
+            static char t[4][8];
+            int n = font_book_size_count();
+            if (i < 0 || i >= n) return "";
+            snprintf(t[i], sizeof(t[0]), "%dpx", font_book_size_px_at(i));
+            return t[i];
+        }
         default: return "";
     }
 }
@@ -2037,13 +2215,14 @@ static const char *menu_title_text(void) {
         case BM_TOC:  return M_TOC;
         case BM_BMKS: return M_BM_LIST;
         case BM_FONT: return M_FONT_SEL;
+        case BM_SIZE: return M_SIZE;
         case BM_PCT:  return M_PCT_TITLE;
         default: return "";
     }
 }
 
 /* 菜单文字宽度 (当前激活字号) */
-static int menu_text_width(const char *s) {
+static int read_text_width(const char *s) {
     const uint8_t *p = (const uint8_t *)s;
     int w = 0;
     while (*p) {
@@ -2056,14 +2235,80 @@ static int menu_text_width(const char *s) {
     return w;
 }
 
+/* ★★★ 2026-10-31 三类字体绘制上下文（本轮核心）★★★
+ *
+ *   ① FCTX_CONTENT  阅读内容平面：正文 / 页码 / 进度百分比 / 章节名 / 索引提示
+ *                   → read_draw_text()  跟随当前阅读字体
+ *   ② FCTX_READNAV  阅读导航弹窗：章节目录(章节选择)、跳到进度(阅读位置)、
+ *                   书签列表、以及承载「上一章 / 下一章 / 跳到进度」的阅读菜单
+ *                   → 与 ① **同一个字体来源**（阅读字体），只是画在弹窗里
+ *   ③ FCTX_SYS      系统操作与配置 UI：字体选择、字号设置、退出确认、Toast、书库
+ *                   → ui_draw_text()    永远系统 16px 宋体 + 8×16 ASCII
+ *
+ *   为什么要分三层而不是"全部系统字体"：linit 2026-10-31 明确要求阅读导航弹窗
+ *   必须跟随阅读字体（否则正文换成像素字体、点开目录还是宋体，割裂感很重）；
+ *   但配置类界面必须稳定用系统字体 —— 它们和"看什么字体读书"无关。
+ *
+ *   字体上下文只决定"从哪个后端取字形"，**不改动任何全局字体状态**
+ *   （旧实现靠 font_book_select(24) 临时改全局再改回来，已删除）。 */
+typedef enum { FCTX_CONTENT = 0, FCTX_READNAV = 1, FCTX_SYS = 2 } font_ctx_t;
+
+/* ★ 2026-10-31 最终决定（linit 选定 B 方案 = Kindle / 微信读书 风格）：
+ *   所有弹窗（阅读菜单 / 字体 / 字号 / 目录 / 跳进度 / 书签 / 退出确认）统一用
+ *   **系统字体**；只有 正文、页码、进度百分比、章节名 这些"阅读平面"文字跟随阅读字体。
+ *
+ *   依据：主流阅读器里带配置项的菜单一律用 UI 字体 —— 否则把字体切成 8px 点阵后，
+ *   连"字体选择"面板本身都变成 8px 点阵，会互相影响、且 48px 时菜单一行要 64px，
+ *   在 400×300 上必须滚动才看得全。
+ *
+ *   这里保留三态枚举而不是删掉分支：将来若要改成"目录跟阅读字体"（多看风格），
+ *   只改下面这一处返回值即可，绘制/命中/几何全都自动跟着走。 */
+static font_ctx_t menu_font_ctx(void) {
+    return FCTX_SYS;
+}
+static bool menu_read_font(void) { return menu_font_ctx() == FCTX_READNAV; }
+
+/* 行高 / 标题高 / 底部返回行高都跟着当前上下文**实际字高**走：
+ *   16px 系统字 → 32 / 26 / 44（与改造前完全一致，视觉不变）
+ *   24px 阅读字 → 40 / 34 / 44    48px → 64 / 58 / 60
+ *   8px 点阵字  → 24 / 18 / 44（下限保护，否则点不中） */
+static int menu_cell_h(void) {
+    return menu_read_font() ? font_book_cell_h() : font_book_ui_cell_h();
+}
+static int menu_row_h(void) {
+    int h = menu_cell_h() + 16;
+    if (h < 24) h = 24;
+    if (h > 72) h = 72;
+    return h;
+}
+static int menu_title_h(void) { return menu_cell_h() + 10; }
+static int menu_foot_h(void) {
+    int h = menu_cell_h() + 12;
+    return (h < 44) ? 44 : h;
+}
+static int toc_pager_h(void) {
+    int h = menu_cell_h() + 6;
+    return (h < TOC_PAGER_H) ? TOC_PAGER_H : h;
+}
+static void menu_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bool invert) {
+    if (menu_read_font()) read_draw_text(lcd, x, y, s, invert);
+    else                  ui_draw_text(lcd, x, y, s, invert);
+}
+static int menu_text_w(const char *s) {
+    return menu_read_font() ? read_text_width(s) : ui_text_width(s);
+}
+
 /* 阅读菜单几何 (绘制与触摸共用同一套, 彻底消除点击偏移):
- * 固定宽 200, 高度随内容自适应; 结构: 顶距6 + 标题区(可选26) + 列表行(32px) + 底部返回行44 + 底距6. */
+ * 宽度按**当前字体的实际文本宽度**自适应（48px 时 "跳到进度" 需要 192px，
+ * 固定 200 会截字），高度随内容; 结构: 顶距6 + 标题区 + 列表行 + 底部返回行 + 底距6. */
 static void book_menu_geom(int *bx, int *by, int *bw, int *bh, int *ty, int *content_bot, int *foot_y) {
     int W = book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH;
     int H = book_is_portrait() ? BOOK_PORTRAIT_H : ST7305_HEIGHT;
     const char *title = menu_title_text();
-    int title_h = title[0] ? 26 : 0;
+    int title_h = title[0] ? menu_title_h() : 0;
     int n = menu_item_count();
+    int row  = menu_row_h();
+    int foot = menu_foot_h();
     int w, h;
     if (s_menu == BM_TOC) {
         /* 目录 = 超长窗口: 占满整屏(扣除边距), 一次拖动可看/选更多章节 */
@@ -2071,7 +2316,12 @@ static void book_menu_geom(int *bx, int *by, int *bw, int *bh, int *ty, int *con
         h = H - 8;
     } else {
         w = 200;
-        h = 6 + title_h + n * 32 + 44 + 6;
+        for (int i = 0; i < n; i++) {                 /* 窄了会被截字，按最长项放宽 */
+            int m = menu_text_w(menu_item_text(i)) + 24;
+            if (m > w) w = m;
+        }
+        if (w > W - 8) w = W - 8;
+        h = 6 + title_h + n * row + foot + 6;
         if (h > H - 8) h = H - 8;   /* 长列表超高时裁到屏内, 内部滚动 */
         if (h < 120) h = 120;
     }
@@ -2079,8 +2329,8 @@ static void book_menu_geom(int *bx, int *by, int *bw, int *bh, int *ty, int *con
     *bx = (W - w) / 2;
     *by = (H - h) / 2;
     *ty = *by + 6 + title_h;
-    *foot_y = *by + h - 44;                        /* 底部"返回"行顶 */
-    *content_bot = *foot_y - ((s_menu == BM_TOC) ? TOC_PAGER_H : 0);  /* 目录预留页码条 */
+    *foot_y = *by + h - foot;                      /* 底部"返回"行顶 */
+    *content_bot = *foot_y - ((s_menu == BM_TOC) ? toc_pager_h() : 0);  /* 目录预留页码条 */
 }
 
 /* ---- 章页标题整理: "第一千一百一十一章" -> "第1111章" (省宽度) ---- */
@@ -2159,9 +2409,8 @@ static int toc_pager_layout(int bx, int bw, int top, int out[][3]) {
     int left = bx + 1;
     out[idx][0] = -1; out[idx][1] = left; out[idx][2] = left + asc; idx++;
     /* > 贴最右 (内缩 2px 避免被边缘裁掉) */
-    int asc2 = asc; if (asc2 > 14) asc2 = 14;   /* >/< 用较小宽度, 确保在窗口内 */
-    int right = bx + bw - 2 - asc2;
-    out[idx][0] = -2; out[idx][1] = right; out[idx][2] = right + asc2; idx++;
+    int right = bx + bw - 2 - asc;
+    out[idx][0] = -2; out[idx][1] = right; out[idx][2] = right + asc; idx++;
     /* 页码在中间均匀铺满 */
     int midL = left + asc + gap;
     int midR = right - gap;
@@ -2183,11 +2432,12 @@ static int toc_pager_layout(int bx, int bw, int top, int out[][3]) {
 static void toc_pager_draw(st7305_handle_t *lcd, int bx, int by, int bw, int top) {
     if (s_chapter_count == 0 && !s_open) return;   /* 无章节时也画 < 页 >, 仅不影响元素 */
     int b[TOC_PAGER_MAX][3]; int n = toc_pager_layout(bx, bw, top, b);
-    int y = top + (TOC_PAGER_H - font_book_ascii_h()) / 2;
+    const int ph = toc_pager_h();
+    int y = top + (ph - menu_cell_h()) / 2;
     for (int i = 0; i < n; i++) {
         bool cur_page = (b[i][0] == (int)s_toc_page);
         if (cur_page)
-            for (int yy = top; yy < top + TOC_PAGER_H; yy++)
+            for (int yy = top; yy < top + ph; yy++)
                 for (int xx = b[i][1]; xx < b[i][2]; xx++)
                     menu_fb_px(lcd, xx, yy, true);
         if (b[i][0] == -1) {
@@ -2208,7 +2458,8 @@ static void draw_reader_menu(st7305_handle_t *lcd) {
     if (count <= 0) return;
     int bx, by, bw, bh, ty, content_bot, foot_y;
     book_menu_geom(&bx, &by, &bw, &bh, &ty, &content_bot, &foot_y);
-    const int ROW_H = 32;
+    const int ROW_H = menu_row_h();
+    const int cell_h = menu_cell_h();
     const char *title = menu_title_text();
     int vis = (content_bot - ty) / ROW_H; if (vis < 1) vis = 1;
     if (s_menu_sel < s_menu_scroll) s_menu_scroll = s_menu_sel;
@@ -2221,7 +2472,9 @@ static void draw_reader_menu(st7305_handle_t *lcd) {
     if ((int)s_menu_scroll + shown >= count && shown > 0) shown = count - (int)s_menu_scroll;
     if (shown < 0) shown = 0;
 
-    font_book_select(s_fontstyle, 24);  /* 列表标准 24px */
+    /* ★ 2026-10-31: 这里原来有 `font_book_select(s_fontstyle, 24)` ——
+     *   为了让菜单"用 24px 画"而临时改**全局阅读字号**。现在 UI 用系统 16px，
+     *   阅读字号不该被菜单改动，删掉。 */
     /* 实心白底 + 2px 粗黑边框 */
     for (int y = by; y <= by + bh - 1; y++)
         for (int x = bx; x <= bx + bw - 1; x++)
@@ -2232,11 +2485,11 @@ static void draw_reader_menu(st7305_handle_t *lcd) {
     }
     /* 标题 (居中, 下方分隔线) */
     if (title[0]) {
-        int tw = menu_text_width(title);
+        int tw = menu_text_w(title);
         int tx = bx + (bw - tw) / 2;
         if (tx < bx + 2) tx = bx + 2;
         menu_draw_text(lcd, tx, by + 2, title, false);
-        for (int x = bx + 2; x <= bx + bw - 3; x++) menu_fb_px(lcd, x, by + 24, true);
+        for (int x = bx + 2; x <= bx + bw - 3; x++) menu_fb_px(lcd, x, by + menu_title_h() - 2, true);
     }
     /* 列表项 (像素级跟手: 整体上移 s_menu_pix 像素) */
     {
@@ -2257,18 +2510,19 @@ static void draw_reader_menu(st7305_handle_t *lcd) {
                     for (int xx = bx + 2; xx < bx + bw - 2; xx++)
                         menu_fb_px(lcd, xx, yy, true);
             const char *text = menu_item_text(idx);
-            int tw = menu_text_width(text);
+            int tw = menu_text_w(text);
             /* ★ F7: 目录左对齐并为"当前章"标记留出 8px 槽位, 保证各行文字起点一致 */
             int tx = (s_menu == BM_TOC) ? (bx + 11) : (bx + (bw - tw) / 2);
             if (tx < bx + 2) tx = bx + 2;
-            int texty = row_y + (ROW_H - 24) / 2;
+            int texty = row_y + (ROW_H - cell_h) / 2;   /* 按当前字体实际字高垂直居中 */
             if (texty < ty) texty = ty;
             /* ★ F7 (2026-10-30): 当前正在阅读的章节 —— 行首画 4×4 实心方块。
              *   黑白屏不能靠颜色, 选中行已反白(黑底), 所以标记要反向取色才看得见。 */
             if (s_menu == BM_TOC && s_chapter_count > 0) {
                 uint32_t gi = toc_page_base() + (uint32_t)idx;
                 if (gi == (uint32_t)book_cur_chapter()) {
-                    for (int yy = texty + 8; yy < texty + 12 && yy < content_bot; yy++)
+                    int m0 = texty + cell_h / 2 - 2;
+                    for (int yy = m0; yy < m0 + 4 && yy < content_bot; yy++)
                         for (int xx = bx + 3; xx < bx + 7; xx++)
                             menu_fb_px(lcd, xx, yy, !sel);
                 }
@@ -2304,18 +2558,17 @@ static void draw_reader_menu(st7305_handle_t *lcd) {
     }
     /* 目录: 底部页码条 (位于列表与"返回"之间) */
     if (s_menu == BM_TOC) toc_pager_draw(lcd, bx, by, bw, content_bot);
-    /* 底部返回行: 单独一行, 用大字号 (2号) 居中显示 */
+    /* 底部返回行: 单独一行居中。
+     * ★ 2026-10-31: 原来是 `font_book_select(32)` 画完再 `font_book_select(24)` 改回来 ——
+     *   **临时改全局阅读字号**的反模式（中途返回/异常就回不去，还会让正文闪一下）。
+     *   现在 UI 固定 16px 系统字，不需要任何全局改动。 */
     for (int x = bx + 2; x <= bx + bw - 3; x++) menu_fb_px(lcd, x, foot_y, true);
-    font_book_select(s_fontstyle, 32);  /* 底部返回: 大字号 32px */
     const char *back = M_BACK;
-    int bw2 = menu_text_width(back);
-    int by2 = foot_y + (44 - font_book_cell_h()) / 2;
+    int bw2 = menu_text_w(back);
+    int by2 = foot_y + (menu_foot_h() - cell_h) / 2;
     int bx2 = bx + (bw - bw2) / 2;
     if (bx2 < bx + 2) bx2 = bx + 2;
     menu_draw_text(lcd, bx2, by2, back, false);
-    font_book_select(s_fontstyle, 24);  /* 恢复列表字号 24px */
-
-    font_book_select(s_fontstyle, book_reader_size_px(s_fontsize));   /* 恢复阅读字号 */
 }
 
 /* 退出确认弹窗 */
@@ -2325,7 +2578,10 @@ static void exit_confirm_rect(int *X0, int *Y0, int *X1, int *Y1) {
     int W = book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH;
     int H = book_is_portrait() ? BOOK_PORTRAIT_H : ST7305_HEIGHT;
     int bw = W - 40;                       /* 横向宽条 */
-    int bh = book_line_h() + 18 + 40;      /* 提示行 + 40px 按钮行 */
+    /* ★ 2026-10-31: 原来用 book_line_h()（= 阅读字体行高）算高度，而框里画的是
+     *   16px 系统字 —— 阅读字号 8px 时框会比字还矮，提示文字直接被按钮压住。
+     *   系统 UI 的几何只能用系统字高。 */
+    int bh = font_book_ui_cell_h() + 18 + 40;      /* 提示行 + 40px 按钮行 */
     *X0 = (W - bw) / 2; *X1 = *X0 + bw - 1;
     *Y0 = (H - bh) / 2; *Y1 = *Y0 + bh - 1;
 }
@@ -2342,7 +2598,7 @@ static void draw_exit_confirm(st7305_handle_t *lcd) {
     for (int y = y0; y <= y1; y++) { menu_fb_px(lcd, X0, y, true); menu_fb_px(lcd, X1, y, true); }
     for (int x = X0; x <= X1; x++) { menu_fb_px(lcd, x, y0 + 1, true); menu_fb_px(lcd, x, y1 - 1, true); }
     for (int y = y0; y <= y1; y++) { menu_fb_px(lcd, X0 + 1, y, true); menu_fb_px(lcd, X1 - 1, y, true); }
-    menu_draw_text(lcd, X0 + 8, y0 + 6, M_EXIT_ASK, false);
+    ui_draw_text(lcd, X0 + 8, y0 + 6, M_EXIT_ASK, false);
 
     /* 按钮行: 上方 2px 分隔线 + 左右两半对称 (与全项目弹窗同一观感) */
     int btn_top = y1 - 1 - 40;
@@ -2350,9 +2606,9 @@ static void draw_exit_confirm(st7305_handle_t *lcd) {
     int mid = (X0 + X1) / 2;
     for (int y = btn_top + 2; y <= y1 - 2; y++) { menu_fb_px(lcd, mid, y, true); menu_fb_px(lcd, mid + 1, y, true); }
     const char *ok = M_CONFIRM, *cc = M_CANCEL;
-    int ty = btn_top + 2 + ((y1 - 1 - (btn_top + 2)) - 24) / 2;
-    menu_draw_text(lcd, (X0 + mid) / 2 - 16, ty, ok, false);   /* 左半: 确定退出 */
-    menu_draw_text(lcd, (mid + X1) / 2 - 16, ty, cc, false);   /* 右半: 取消 */
+    int ty = btn_top + 2 + ((y1 - 1 - (btn_top + 2)) - font_book_ui_cell_h()) / 2;
+    ui_draw_text(lcd, (X0 + mid) / 2 - 16, ty, ok, false);   /* 左半: 确定退出 */
+    ui_draw_text(lcd, (mid + X1) / 2 - 16, ty, cc, false);   /* 右半: 取消 */
 }
 
 /* ============ 渲染入口 ============ */
@@ -2548,32 +2804,41 @@ static void book_font_save(const char *lbf_path)
     if (svc_nvs_open("os_book", NVS_READWRITE, &nh) != ESP_OK) return;
     svc_nvs_set_str(nh, "br_font", (lbf_path && lbf_path[0]) ? lbf_path : "");
     svc_nvs_set_i32(nh, "br_style", (int32_t)s_fontstyle);
+
+    /* ★★★ 2026-10-31: 与 书库 →「阅读优化 → 字体」共用**同一份**状态 ★★★
+     *   书库那边持久化的是文件名 ftn（空串=内置）+ ft 标记；这里在阅读器内换字体
+     *   必须写同样的键，否则两处各存一套：阅读器里换成 A，回书库仍显示 B，
+     *   再开书又被 B 盖回去。ftn 存**文件名**而不是路径/序号 —— 序号会随目录变化错位，
+     *   路径又绑死了 /sdcard 前缀。 */
+    {
+        const char *base = "";
+        if (lbf_path && lbf_path[0]) {
+            const char *sl = strrchr(lbf_path, '/');
+            base = sl ? sl + 1 : lbf_path;
+        }
+        svc_nvs_set_str(nh, "ftn", base);
+        svc_nvs_set_i32(nh, "ft", base[0] ? 1 : 0);
+    }
     svc_nvs_commit(nh);
     svc_nvs_close(nh);
 }
 
-/* 返回 true = 已恢复到上次的 LBF。false = 用内置字库（正常或回退） */
-static bool book_font_restore(void)
+/* 字号持久化（2026-10-31）：与书库「阅读优化 → 字号大小」共用同一个键 fs，
+ * 存的是**档位下标**（该字体字号表里的第几档）。读回时按当前字体重新解释 ——
+ * 因为不同字体的表长不同（内置 4 档 / 8px 字体 2 档），下标越界会收敛到最大合法档。 */
+static void book_size_save(int idx)
 {
     nvs_handle_t nh;
-    if (svc_nvs_open("os_book", NVS_READONLY, &nh) != ESP_OK) return false;
-    char path[128] = {0};
-    size_t len = sizeof(path);
-    bool has = (svc_nvs_get_str(nh, "br_font", path, &len) == ESP_OK);
+    if (svc_nvs_open("os_book", NVS_READWRITE, &nh) != ESP_OK) return;
+    svc_nvs_set_i32(nh, "fs", (int32_t)idx);
+    svc_nvs_commit(nh);
     svc_nvs_close(nh);
-    if (!has) return false;
-    if (!path[0]) return false;              /* 上次就是内置字体 */
-
-    if (font_book_select_file(path)) {
-        ESP_LOGI(TAG, "恢复上次字体: %s", path);
-        return true;
-    }
-    /* 卡拔了 / 文件删了 / 内容坏了 —— 回退内置并清记忆，避免每次开书重试 */
-    ESP_LOGW(TAG, "上次的字体不可用 (%s): %s ⇒ 回退内置字库",
-             path, font_book_error());
-    book_font_save(NULL);
-    return false;
 }
+
+/* 2026-10-31: book_font_restore() 已删除 —— 字体来源改为**书库单一权威**
+ * （书库 NVS 的 ftn，bs_apply() 在开书前选好字）。阅读器再按 br_font 恢复
+ * 会和书库互相覆盖：在书库选「内置字体」后一开书又被拉回旧 TF 字体。
+ * book_font_save() 现在被阅读器内「字体选择」调用，写的也是同一组键（ftn/ft）。 */
 
 static void book_menu_select(void) {
     int idx = (int)s_menu_sel;
@@ -2592,14 +2857,42 @@ static void book_menu_select(void) {
                 case 3: s_menu = BM_PCT; s_menu_sel = 0; s_menu_scroll = 0; break;   /* 跳到进度 */
                 case 4: book_add_bookmark(); break;                                  /* 添加书签 */
                 case 5: s_menu = BM_BMKS; s_menu_sel = 0; s_menu_scroll = 0; break; /* 书签列表 */
-                case 6: s_menu = BM_FONT; s_menu_sel = 0; s_menu_scroll = 0; break; /* 字体选择 */
-                case 7: book_reader_close(); break;                                  /* 返回书库 */
+                case 6: sd_font_scan();                                              /* 字体选择 */
+                        s_menu = BM_FONT; s_menu_sel = 0; s_menu_scroll = 0; break;
+                case 7: {                                                            /* 字号 */
+                        int n = font_book_size_count();
+                        if (n < 1) break;
+                        if ((int)s_fontsize >= n) s_fontsize = (uint8_t)(n - 1);   /* 换过小字库后可能越界 */
+                        s_menu = BM_SIZE;
+                        s_menu_sel = (uint32_t)s_fontsize;
+                        s_menu_scroll = 0;
+                        } break;
+                case 8: book_reader_close(); break;                                  /* 返回书库 */
             }
             return;
         case BM_PCT:
             if (book_goto_pct(idx * 5)) book_save_progress();
             s_menu = BM_READ;
             return;
+        case BM_SIZE: {
+            /* ★ 2026-10-31: 字号选择。列表本身就来自当前字体的真实规格
+             *   （font_book_size_count / px_at），所以点第几档就是第几档像素 ——
+             *   不会出现"菜单写 32px、正文画 24px"。改完写 NVS 的 fs（与书库同一个键），
+             *   重新分页，回二级菜单时高亮停在"字号"这一项。 */
+            int cnt = font_book_size_count();
+            if (idx >= 0 && idx < cnt) {
+                int px = font_book_size_px_at(idx);
+                s_fontsize = (uint8_t)idx;
+                font_book_select(s_fontstyle, px);
+                book_size_save(idx);
+                book_restart_index();
+                ESP_LOGI(TAG, "字号切换: %dpx (第 %d/%d 档)", px, idx + 1, cnt);
+            }
+            s_menu = BM_MENU;
+            s_menu_sel = 7;
+            s_menu_scroll = 0;
+            return;
+        }
         case BM_FONT: {
             bool font_changed = false;
             if (idx < s_sd_font_count) {
@@ -2668,48 +2961,22 @@ bool book_reader_open(const char *path) {
     if (s_open) book_reader_close();
     s_lcd = NULL;
 
+    /* ★ 2026-10-31: 打开耗时分解（字体 / 文件+首屏），一行给出可直接对比的数字。 */
+    int64_t t_open0 = esp_timer_get_time();
+
     if (!font_book_init()) {
         ESP_LOGD(TAG, "字库初始化失败: %s", font_book_error());
         return false;
     }
     font_book_select(s_fontstyle, book_reader_size_px(s_fontsize));   /* 按设置切换字号 */
 
-    /* V1.0.88: 扫描 TF 卡字体 (仅在阅读器内扫描, 不影响开机/菜单)
-     * ★ 2026-10-30: 逐个体检 —— 只保留**能打开且格式兼容**的，顺带取字体自报的名字。
-     *   · 坏文件 / 版本不兼容: 直接不进列表。否则用户在菜单里选中它只会"加载失败"，
-     *     而菜单本身还占一行。
-     *   · 名字取 LBF 头里的 name 字段（没有就用文件名主干），不写死在代码里，
-     *     所以往 /sdcard/fonts 丢个新 .lbf 重启进书就能看到它 —— 不用改固件。
-     *   · 原地压缩，不额外开 1KB 临时数组（阅读器任务栈不宽裕）。 */
-    {
-        int nr = font_book_scan_sd(s_sd_fonts, SD_FONT_MAX);
-        int keep = 0;
-        for (int i = 0; i < nr; i++) {
-            char full[128], disp[40] = {0};
-            /* 精度限定 %.63s / %.39s: 源数组是定长 [64]/[40]，不加精度 GCC 会按
-             * "最坏可达 1023 字节"报 -Wformat-truncation（本项目 -Werror）。 */
-            snprintf(full, sizeof(full), "/sdcard/fonts/%.63s", s_sd_fonts[i]);
-            if (!lbf_peek(full, disp, sizeof(disp), NULL, NULL)) {
-                ESP_LOGW(TAG, "跳过无法识别的字体: %.63s", s_sd_fonts[i]);
-                continue;
-            }
-            if (keep != i) snprintf(s_sd_fonts[keep], 64, "%.63s", s_sd_fonts[i]);
-            /* 扫描阶段就转成短中文名，菜单直接取指针 —— 避免在渲染里用 static 缓冲互相覆盖 */
-            {
-                char sn[40];
-                font_book_short_name(disp[0] ? disp : s_sd_fonts[keep], sn, sizeof(sn));
-                snprintf(s_sd_font_names[keep], sizeof(s_sd_font_names[0]), "%.39s", sn);
-            }
-            keep++;
-        }
-        s_sd_font_count = keep;
-        if (s_sd_font_count > 0) {
-            ESP_LOGI(TAG, "发现 %d 个 TF 卡字体", s_sd_font_count);
-        }
-    }
-
-    /* ★ 2026-10-30: 恢复上次选的字体（放在扫描之后 —— 路径要能被上面筛过） */
-    book_font_restore();
+    /* ★ 2026-10-31: 这里原来每次都做「TF 字体全量体检」+「恢复上次字体」两件事，
+     *   现在两件都删除：
+     *   ① 字体列表只服务字体选择菜单 → 改成 sd_font_scan() 懒扫（进菜单才扫，一次会话一次）；
+     *   ② 「恢复上次字体」读的是 NVS 的 br_font，而书库有自己的 ftn 记录 ——
+     *      两套持久化会互相覆盖：在书库选了「内置字体」，一开书又被 br_font 拉回 TF 字体。
+     *      现在**书库/阅读器共用 ftn 一个键**（on_book_select 里 bs_apply() 先选好字再开书）。 */
+    int64_t t_font0 = esp_timer_get_time();
 
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -2870,6 +3137,14 @@ bool book_reader_open(const char *path) {
     input_set_swipe_turn(true);          /* 阅读器内横滑翻页 */
     ESP_LOGI(TAG, "阅读器就绪: %s, %lu 页, 断点=%lu",
              s_title, (unsigned long)s_page_count, (unsigned long)s_page);
+    /* 耗时分解（ms）：字体=切字/预加载（命中缓存则≈0），其余=开文件+首屏排版 */
+    {
+        int64_t t_end = esp_timer_get_time();
+        ESP_LOGI(TAG, "打开耗时 %lld ms (字体 %lld / 文件+首屏 %lld)",
+                 (long long)((t_end - t_open0) / 1000),
+                 (long long)((t_font0 - t_open0) / 1000),
+                 (long long)((t_end - t_font0) / 1000));
+    }
 
     return true;
 }
@@ -2920,14 +3195,16 @@ void book_reader_close(void) {
     s_bm_count = 0;
     s_exit_confirm = false;
     s_open = false;
+    s_sd_font_scanned = false;   /* 下次进入/下次要用字体列表时重新扫（字体可能刚装/卸过） */
     s_path[0] = 0;
     s_src_path[0] = 0;
     input_set_screen_rotation(0);   /* V1.0.68: 退出阅读器, 触摸恢复横屏 */
     input_set_swipe_turn(false);   /* 关闭阅读器横滑翻页 (恢复其它界面拖动) */
-    /* ★ 2026-10-31: 字体整块映像(最大 1.23MB/个 × 最多 2 槽)必须在这里放掉 ——
-     *   否则关书后它还压在 PSRAM 里，游戏引擎/其他模块拿不到连续大块。
-     *   再次进书会重新预加载（<0.5s），比长期占着划算。 */
-    font_book_release_all();
+    /* ★ 2026-10-31 改：**关书不释放字体**。
+     *   字体整块映像(最大 1.23MB×2)唯一一次预加载要 ~1.1s（TF 卡 537KB 实测），
+     *   关书就放掉的话，「看完一本换一本」每次都要再等 1.1s —— 这正是"打开慢"的
+     *   主要来源。现在改为：关书保留，**离开书架页**时由 page_book 调
+     *   font_book_release_all() 统一释放（见 p_book_exit）。同一会话内换书 ≈ 0 IO。 */
     ESP_LOGI(TAG, "阅读器已关闭, 内存已释放");
 }
 
@@ -2937,6 +3214,17 @@ const char *book_reader_title(void) {
 
 bool book_reader_knock_active(void) {
     return false;   /* 敲击翻页功能已删除 (V1.0.64) */
+}
+
+/* 2026-10-31: 字体/字号变化后重新排版 + 重新分页，并给出可对比的耗时。
+ * 只重算必要的东西：字号/字体变了才重排，单纯的边距/行高变化也在 layout_changed 里
+ * 一起走这里 —— 但字体实例本身由 font_book 复用（命中则零 IO）。 */
+static void book_relayout_after_font_change(void) {
+    int64_t t0 = esp_timer_get_time();
+    font_book_select(s_fontstyle, book_reader_size_px(s_fontsize));
+    book_restart_index();
+    ESP_LOGI(TAG, "字体/字号切换: 显示 %dpx, 重新分页耗时 %lld ms",
+             font_book_cell_w(), (long long)((esp_timer_get_time() - t0) / 1000));
 }
 
 void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, int rot,
@@ -2975,8 +3263,8 @@ void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, in
             s_pfb = NULL;
         }
         if (now_portrait != was_portrait || layout_changed) {
-            if (layout_changed || style_changed) font_book_select(s_fontstyle, book_reader_size_px(s_fontsize));
-            book_restart_index();
+            if (layout_changed || style_changed) book_relayout_after_font_change();
+            else                                 book_restart_index();
         } else {
             s_page = 0;
         }
@@ -2986,7 +3274,7 @@ void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, in
         s_menu_msg[0] = 0;
     } else {
         s_rot = new_rot;
-        if (layout_changed || style_changed) font_book_select(s_fontstyle, book_reader_size_px(s_fontsize));
+        if (layout_changed || style_changed) book_relayout_after_font_change();
     }
     /* V1.0.68: 旋转方向变化时同步输入层, 触摸跟随旋转.
      * 仅阅读器打开时生效: 否则会把竖屏旋转泄漏到书籍二级菜单/主菜单的触摸坐标,
@@ -3093,8 +3381,16 @@ bool book_reader_handle_action(int action) {
             book_reader_prev_page();
             return true;
         case BOOK_ACTION_BACK:
-            /* V1.0.68: 长按 BOOT (返回键) 在阅读页 = 退出阅读器回书库二级菜单 */
-            book_reader_close();
+            /* ★★★ 2026-11-01 linit：**返回键改为翻页**，不再直接退出阅读器。
+             *   · 旋转方向左 (s_rot==2) → 上一页
+             *   · 旋转方向右 (s_rot==3) / 不旋转 → 下一页
+             *   退出阅读器改走 HOME 键（见下面 BOOK_ACTION_HOME）或菜单里的「退出阅读」。 */
+            if (s_rot == 2) {
+                book_reader_prev_page();
+            } else {
+                book_reader_next_page();
+                if (s_page != s_last_saved_page) book_progress_maybe_save(false);
+            }
             return true;
         case BOOK_ACTION_HOME:
             s_exit_confirm = true;
@@ -3130,7 +3426,7 @@ static bool book_menu_handle_touch(int x, int y) {
         s_menu_scroll = 0;
         return true;
     }
-    const int ROW_H = 32;
+    const int ROW_H = menu_row_h();
     if (s_menu == BM_TOC && y >= content_bot && y < foot_y) {
         /* 目录底部页码条点按 */
         int b[TOC_PAGER_MAX][3]; int n = toc_pager_layout(bx, bw, content_bot, b);
@@ -3237,7 +3533,7 @@ bool book_reader_poll(void) {
     int bx, by, bw, bh, ty0, content_bot, foot_y;
     book_menu_geom(&bx, &by, &bw, &bh, &ty0, &content_bot, &foot_y);
     (void)foot_y;
-    const int ROW_H = 32;
+    const int ROW_H = menu_row_h();
     int count = menu_item_count();
     if (count <= 0) { s_drag_y0 = -1; s_menu_dragged = false; return false; }
     /* 滚动条区域 (右侧 20px 宽条) */

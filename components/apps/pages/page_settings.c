@@ -2,7 +2,8 @@
  * page_settings.c — 设置 页面模块.
  *
  * 用 os_dialog 弹窗栈呈现: 主菜单 4 项 (显示配置/声音调整/无线连接/系统信息).
- *   - 显示配置: 时间设置 + 字体风格 (粗/细)
+ *   - 显示与声音: 黑暗模式 / 声音开关 / 调整日期 / 修改时间
+ *     (★ 2026-10-31: 字体入口已移除, 系统 UI 字体改由应用中心管理)
  *   - 声音调整: 声音开关 / 音量设置 / 震动开关
  *   - 无线连接: 蓝牙开关 / WiFi 开关 (开后显示"连接WiFi") / 连接WiFi → WiFi 键盘页
  *   - 系统信息: CPU/Flash/RAM/电池等
@@ -18,7 +19,7 @@
 #include "input.h"       /* input_consume_tap / input_get_touch_pos (时间滚轮), esp_util.h */
 #include "esp_attr.h"
 #include "font_zh.h"
-#include "font_switch.h"
+/* ★ 2026-10-31: font_switch.h 不再引入 —— 设置页已无字体入口, 字体由应用中心管理。 */
 #include "audio_player.h"
 #include "vibrator.h"
 #include "wifi_manager.h"
@@ -42,6 +43,10 @@
 #include <time.h>
 #include <sys/time.h>
 #include "str_trunc.h"   /* str_trunc(): 短字段的有意截断拷贝 */
+
+/* 性能监视: 2026-11-03 起**只从「应用中心→应用→系统」进**(独立应用页)。
+ * 本页的「性能监视」菜单项已删除, 不再需要 perfmon_open()。
+ * (page_perfmon.c 里那个 350×250 弹窗实现仍在, 只是没有 UI 入口了。) */
 
 #define TAG "PSET"
 #define SET_NS "os_settings"
@@ -616,7 +621,6 @@ static void open_dark_dlg(ui_ctx_t *ctx) {
 
 /* 休眠相关子菜单 (V1.5.x): 壁纸时间 / 休眠时间 / 关机时间 / 电池信息 / 触摸唤醒
  * (linit 2026-10-14: 触摸唤醒常驻**最下面**, 开关类放末尾) */
-static void open_disp_dlg(ui_ctx_t *ctx, int sel);
 static void open_sleepgrp_dlg(ui_ctx_t *ctx, int sel);
 /* 关机时间 (os_wp/wp_shut): 屏保播满该时长 → 自动关机 */
 static int shutgrp_min_get(void) {
@@ -806,50 +810,6 @@ static void open_sleepgrp_dlg(ui_ctx_t *ctx, int sel) {
     os_dialog_list(ctx, "\xe4\xbc\x91\xe7\x9c\xa0\xe7\x9b\xb8\xe5\x85\xb3", ptrs, 4, sel, on_sleepgrp_select, NULL);
 }
 
-/* ---- 显示与时间弹窗: 平铺 4 项 (日期/时间/字体/暗黑; 休眠独立为主菜单项) ---- */
-/* ---- 菜单主题 ----
- * 2026-09-22: 曾加过「显示与时间 → 菜单主题」入口 (当时有 4 个内置主题)。
- * linit 要求先只保留"默认"主题 (他要的主题是完全不同的视觉方案, 不是参数微调),
- * 只剩一项的菜单没意义 → 入口一并撤掉。真主题定了之后在这里再挂回来:
- *   open_theme_dlg() 用 os_theme_count()/os_theme_name(i) 列项,
- *   选中 → os_theme_set(i) + os_theme_save() + toast("已切换主题")。 */
-
-static void on_disp_select(ui_ctx_t *ctx, int result, void *ud) {
-    (void)ud;
-    switch (result) {
-    case 0:   /* 日期更改 */
-        if (!s_edit_valid) {
-            time_t t = time(NULL); struct tm *ct = localtime(&t);
-            if (ct) s_edit_tm = *ct;
-            s_edit_valid = true;
-        }
-        s_time_mode = 0; s_time_field = tm_first();
-        open_time_wheel_dlg(ctx);
-        break;
-    case 1:   /* 时间调整 */
-        if (!s_edit_valid) {
-            time_t t = time(NULL); struct tm *ct = localtime(&t);
-            if (ct) s_edit_tm = *ct;
-            s_edit_valid = true;
-        }
-        s_time_mode = 1; s_time_field = tm_first();
-        open_time_wheel_dlg(ctx);
-        break;
-    case 2: open_dark_dlg(ctx); break;   /* 暗黑模式: 三选弹窗 (关闭/暗黑UI/全部暗黑) */
-    default: break;
-    }
-}
-static void open_disp_dlg(ui_ctx_t *ctx, int sel) {
-    char items[3][24];
-    const char *ptrs[3];
-    snprintf(items[0], sizeof(items[0]), "\xe6\x97\xa5\xe6\x9c\x9f\xe6\x9b\xb4\xe6\x94\xb9");  /* 日期更改 */
-    snprintf(items[1], sizeof(items[1]), "\xe6\x97\xb6\xe9\x97\xb4\xe8\xb0\x83\xe6\x95\xb4");  /* 时间调整 */
-    /* [V1.0.9x 精简: 移除"字体调整"项 (细宋已删, 粗细无意义; 字号固定) */
-    snprintf(items[2], sizeof(items[2]), "\xe6\x9a\x97\xe9\xbb\x91\xe6\xa8\xa1\xe5\xbc\x8f");  /* 暗黑模式 */
-    ptrs[0] = items[0]; ptrs[1] = items[1]; ptrs[2] = items[2];
-    sel = (sel < 0) ? 0 : (sel > 2 ? 2 : sel);
-    os_dialog_list(ctx, "", ptrs, 3, sel, on_disp_select, NULL);
-}
 
 /* ---- 声音调整弹窗: 声音开关/音量/震动 (动态显示状态) ---- */
 static void open_snd_dlg(ui_ctx_t *ctx, int sel);
@@ -915,8 +875,6 @@ static void open_snd_dlg(ui_ctx_t *ctx, int sel) {
  *   后 2 项 = 原有的日期更改 / 时间调整（按"暂不删除"要求保留, 只调顺序）。
  * 深色模式仍是三态 (关/暗黑UI/全部), 复用 s_dark + open_dark_dlg, 未改底层。 */
 static void open_av_dlg(ui_ctx_t *ctx, int sel);
-static void open_font16_dlg(ui_ctx_t *ctx, int sel);
-static void open_font24_dlg(ui_ctx_t *ctx, int sel);
 static void open_touchfb_dlg(ui_ctx_t *ctx, int sel);
 
 static void on_av_select(ui_ctx_t *ctx, int result, void *ud) {
@@ -929,8 +887,6 @@ static void on_av_select(ui_ctx_t *ctx, int result, void *ud) {
         settings_save_u8("snd_on", m ? 0 : 1);
         break;
     }
-    case 4: open_font16_dlg(ctx, font16_get()); return;   /* 16px 字体 */
-    case 5: open_font24_dlg(ctx, font24_get()); return;   /* 24px 字体 */
     case 2: case 3: {                            /* 调整日期 / 修改时间 (原样逻辑) */
         if (!s_edit_valid) {
             time_t t = time(NULL); struct tm *ct = localtime(&t);
@@ -949,8 +905,8 @@ static void on_av_select(ui_ctx_t *ctx, int result, void *ud) {
 }
 
 static void open_av_dlg(ui_ctx_t *ctx, int sel) {
-    char items[6][40];
-    const char *ptrs[6];
+    char items[4][40];
+    const char *ptrs[4];
     /* 2026-10-29 linit: 标签不再带状态后缀(如":关"), 状态由子弹窗里的选中项表达;
      * 音量调节项已按要求删除 (全局音量在快捷栏下拉里调, 不在这里重复)。 */
     snprintf(items[0], sizeof(items[0]), "\xe9\xbb\x91\xe6\x9a\x97\xe6\xa8\xa1\xe5\xbc\x8f");      /* 黑暗模式 */
@@ -958,74 +914,14 @@ static void open_av_dlg(ui_ctx_t *ctx, int sel) {
              audio_player_is_muted() ? "\xe5\x85\xb3" : "\xe5\xbc\x80");
     snprintf(items[2], sizeof(items[2]), "\xe8\xb0\x83\xe6\x95\xb4\xe6\x97\xa5\xe6\x9c\x9f");      /* 调整日期 */
     snprintf(items[3], sizeof(items[3]), "\xe4\xbf\xae\xe6\x94\xb9\xe6\x97\xb6\xe9\x97\xb4");      /* 修改时间 */
-    /* 2026-10-30: 字体切换，16px / 24px 两档独立（只换系统 UI 字库;
-     * 阅读器字体在书内菜单，走 LBF，与此无关） */
-    snprintf(items[4], sizeof(items[4]), "16px\xe5\xad\x97\xe4\xbd\x93:%s", font16_name(font16_get()));
-    snprintf(items[5], sizeof(items[5]), "24px\xe5\xad\x97\xe4\xbd\x93:%s", font24_name(font24_get()));
-    for (int i = 0; i < 6; i++) ptrs[i] = items[i];
-    sel = (sel < 0) ? 0 : (sel > 5 ? 5 : sel);
-    os_dialog_list(ctx, "", ptrs, 6, sel, on_av_select, NULL);
+    /* ★ 2026-10-31 linit: 「16px 字体 / 24px 字体」两项**已从设置里移除**。
+     *   字体改由应用中心统一管理(下载/更换), 设置页不再出现字体入口。
+     *   注意: 这里只删"入口", font_switch 模块、字库文件、阅读器字体设置都没动。 */
+    for (int i = 0; i < 4; i++) ptrs[i] = items[i];
+    sel = (sel < 0) ? 0 : (sel > 3 ? 3 : sel);
+    os_dialog_list(ctx, "", ptrs, 4, sel, on_av_select, NULL);
 }
 
-/* ---- 字体选择: 16px / 24px 两档独立 ----
- * 切换后立刻重建「显示与声音」菜单, 让标签与新字形同时刷新;
- * 失败时弹一条明确提示并自动回退该档默认。 */
-static void on_font_err_ok(ui_ctx_t *ctx, int r, void *ud) {
-    (void)r;
-    int which = (int)(intptr_t)ud;          /* 4 = 16px 档, 5 = 24px 档 */
-    os_dialog_pop(ctx);
-    open_av_dlg(ctx, which);
-}
-
-static void on_font16_select(ui_ctx_t *ctx, int result, void *ud) {
-    (void)ud;
-    if (result < 0 || result >= F16_COUNT) return;
-    bool ok = font16_apply(result);
-    settings_save_u8("uif16", ok ? (uint8_t)result : 0);
-
-    os_dialog_pop(ctx);          /* 关字体弹窗 */
-    os_dialog_pop(ctx);          /* 关旧的"显示与声音" (旧字形) */
-    ctx->needs_redraw = true;
-
-    if (ok) {
-        open_av_dlg(ctx, 4);
-    } else {
-        static const char *p[1] = { "\xe5\xad\x97\xe4\xbd\x93\xe4\xb8\x8d\xe5\x8f\xaf\xe7\x94\xa8" };  /* 字体不可用 */
-        os_dialog_list(ctx, "", p, 1, 0, on_font_err_ok, (void *)(intptr_t)4);
-    }
-}
-
-static void on_font24_select(ui_ctx_t *ctx, int result, void *ud) {
-    (void)ud;
-    if (result < 0 || result >= F24_COUNT) return;
-    bool ok = font24_apply(result);
-    settings_save_u8("uif24", ok ? (uint8_t)result : 0);
-
-    os_dialog_pop(ctx);
-    os_dialog_pop(ctx);
-    ctx->needs_redraw = true;
-
-    if (ok) {
-        open_av_dlg(ctx, 5);
-    } else {
-        static const char *p[1] = { "\xe5\xad\x97\xe4\xbd\x93\xe4\xb8\x8d\xe5\x8f\xaf\xe7\x94\xa8" };
-        os_dialog_list(ctx, "", p, 1, 0, on_font_err_ok, (void *)(intptr_t)5);
-    }
-}
-
-static void open_font16_dlg(ui_ctx_t *ctx, int sel) {
-    const char *ptrs[F16_COUNT];
-    for (int i = 0; i < F16_COUNT; i++) ptrs[i] = font16_name(i);
-    sel = (sel < 0) ? 0 : (sel >= F16_COUNT ? F16_COUNT - 1 : sel);
-    os_dialog_list(ctx, "", ptrs, F16_COUNT, sel, on_font16_select, NULL);
-}
-
-static void open_font24_dlg(ui_ctx_t *ctx, int sel) {
-    const char *ptrs[F24_COUNT];
-    for (int i = 0; i < F24_COUNT; i++) ptrs[i] = font24_name(i);
-    sel = (sel < 0) ? 0 : (sel >= F24_COUNT ? F24_COUNT - 1 : sel);
-    os_dialog_list(ctx, "", ptrs, F24_COUNT, sel, on_font24_select, NULL);
-}
 
 /* ==================== 触摸与反馈 (2026-10-29) ====================
  * 菜单震动 / 游戏震动：**沿用现有两套独立配置**（s_vib_ui / s_vib_game,
@@ -1090,6 +986,21 @@ static bool bt_is_on(void)   { return bt_manager_is_ready() || bt_manager_is_ena
 static bool wifi_is_on(void) { return wifi_manager_is_enabled() || os_hw_is_active(OS_HW_WIFI); }
 
 static bool s_wifi_conn_we_opened = false;
+/* ★★★ 2026-11-01: 「从确认框直接转入扫描」时**原位改写当前弹窗层**。
+ *   原来应用中心的做法是：os_dialog_pop 关确认框（这会连弹窗页一起 pop，露出下层页面）
+ *   再 os_dialog_push 扫描弹窗 ⇒ 中间闪一帧底层页面。
+ *   用户看到的就是"选 Wi-Fi 的二级弹窗是在主菜单上弹出来的"。
+ *   改成复用当前层：确认框直接"变"成扫描弹窗，全程只有一层、不 pop 页面、不闪。
+ *   只有主动要求复用的调用方走这条路，其余调用点（设置页/手柄页等）行为完全不变。 */
+static bool s_scan_reuse_top = false;
+
+void settings_wifi_connect_open_reuse(ui_ctx_t *ctx);
+void settings_wifi_connect_open_reuse(ui_ctx_t *ctx) {
+    s_scan_reuse_top = true;
+    settings_wifi_connect_open(ctx);
+    s_scan_reuse_top = false;
+}
+
 void settings_wifi_connect_open(ui_ctx_t *ctx) {
     if (!wifi_is_on()) { os_hw_request(OS_HW_WIFI); s_wifi_conn_we_opened = true; }
     open_wifi_scan(ctx);
@@ -1189,30 +1100,86 @@ static void wp_apply(ui_ctx_t *ctx, int r, int c) {
 
 /* 密码页发起连接后, 后台轮询连接结果并 toast 提示 */
 static bool s_wifi_conn_pending = false;
+/* ★ 2026-11-01: 记下发起时刻 —— 用来给"连接失败"判定加握手宽限期(见下面 poll 的注释)。 */
+static uint32_t s_wifi_conn_t0 = 0;
 
 static void wifi_pwd_connect(ui_ctx_t *ctx) {
     s_wifi_pwd_pass[s_wifi_pwd_len] = '\0';
-    os_dialog_pop(ctx);                        /* 关密码键盘(扫描层) → 回"网络与系统"菜单 */
-    os_dialog_toast(ctx, "\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbf\x9e\xe6\x8e\xa5..."); /* 正在连接... */
+    /* ★ 2026-11-01 linit: 「输完密码就全程后台, 出问题再弹窗」。
+     *   原来这里 os_dialog_pop 关键盘后又 os_dialog_toast("正在连接...")，
+     *   而 toast 在弹窗栈空时会**自己开一个弹窗页** ⇒ 用户看到一个框挡在那里等。
+     *   现在：关掉键盘就彻底回列表，连接在后台跑；成功静默, 失败才弹窗(见 conn_poll)。 */
+    os_dialog_pop(ctx);                        /* 关密码键盘(扫描层) → 回列表 */
     if (!os_hw_is_active(OS_HW_WIFI)) os_hw_request(OS_HW_WIFI);   /* 与入口一致, 避免双重引用计数 */
     s_wifi_conn_we_opened = false;   /* 已确认连接意图: 后续取消不再释放(用户要保留 WiFi) */
-    if (wifi_manager_connect(s_wifi_pwd_ssid, s_wifi_pwd_pass))
+    if (wifi_manager_connect(s_wifi_pwd_ssid, s_wifi_pwd_pass)) {
         s_wifi_conn_pending = true;
-    ESP_LOGI(TAG, "WiFi 连接: %s", s_wifi_pwd_ssid);
+        s_wifi_conn_t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    }
+    ESP_LOGI("APPSTORE", "connect_start ssid=%s dlg_depth=%d", s_wifi_pwd_ssid, os_dialog_depth());
 }
 
 /* 每帧: 连接成功→"连接成功"提示; 失败(重试结束)→"连接失败" (设置内连接不提示 IP) */
-static void wifi_conn_poll(ui_ctx_t *ctx) {
+/* ★ 2026-11-01: 导出给应用中心调用。
+ *   原因: 连接结果轮询原来只挂在**设置页的 tick** 上 —— 从应用中心进 Wi-Fi 流程时
+ *   设置页根本没被 push, 所以 `got_ip / connect_failed` 永远没人处理,
+ *   `s_wifi_conn_pending` 一直挂着; 等用户日后进设置页时才突然弹一个过期的结果提示。
+ *   连接结果是**全局事件**, 不该绑在某一页的 tick 上。 */
+void settings_wifi_conn_poll(ui_ctx_t *ctx);
+void settings_wifi_conn_poll(ui_ctx_t *ctx) {
     if (!s_wifi_conn_pending) return;
     if (wifi_manager_is_connected()) {
         s_wifi_conn_pending = false;
-        os_dialog_toast(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe6\x88\x90\xe5\x8a\x9f"); /* 连接成功 */
+        { char ipb[24] = {0}; wifi_manager_get_ip(ipb, sizeof(ipb));
+          ESP_LOGI("APPSTORE", "got_ip ip=%s （静默成功, 不弹窗）", ipb); }
+        /* ★ 成功不弹任何东西 —— 用户要"全程后台"。列表会自动刷新, 那就是最好的反馈。 */
         return;
     }
-    if (!wifi_manager_is_connecting()) {          /* 连接结束但未连上 = 失败 */
-        s_wifi_conn_pending = false;
-        os_dialog_toast(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5"); /* 连接失败 */
+
+    /* ★★★ 2026-11-01 修「一发起就报连接失败, 几秒后后台又连上了」★★★
+     *
+     *   根因是**竞态**，不是真的失败：
+     *   wifi_manager_connect() 内部先 esp_wifi_disconnect()(换目标时)，这个断开是**异步**的，
+     *   WIFI_EVENT_STA_DISCONNECTED 会在事件任务里把 s_connecting 清成 false
+     *   （见 wifi_manager.c 的 DISCONNECTED 分支）。于是：
+     *     主线程 s_connecting = true → 事件任务清成 false → 驱动其实正在握手
+     *   ⇒ 下一帧这里看到"既没连上、也不在连接中" → 立刻误判失败、弹"连接失败"；
+     *     而 2~3 秒后 IP_EVENT_STA_GOT_IP 到了，网络其实是通的。
+     *
+     *   修法：给"失败"判定加一个**握手宽限期**。前 4 秒无论 s_connecting 是什么都不判失败；
+     *   4 秒后若仍在重试则继续等，最多等到 15 秒（真·连不上才报）。 */
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t dt  = now - s_wifi_conn_t0;
+    if (dt < 4000u) return;                                     /* 握手窗口内: 不判失败 */
+    if (wifi_manager_is_connecting()) {
+        if (dt < 15000u) return;                                /* 还在自愈重试: 继续等 */
+    } else if (dt < 6000u) {
+        /* 4~6 秒"不在连接中"再复核 2 秒 —— 断开事件把 s_connecting 清掉、
+         * 但驱动其实还在握手的窗口通常就在这几秒内。 */
+        return;
     }
+    s_wifi_conn_pending = false;
+    ESP_LOGW("APPSTORE", "connect_failed (dt=%ums connecting=%d)", (unsigned)dt,
+             (int)wifi_manager_is_connecting());
+    /* ★ 只有失败才打断用户, 并且用**确认框**(需要用户确认), 不是一闪而过的 toast。 */
+    { extern void conn_fail_notify(ui_ctx_t *);
+      conn_fail_notify(ctx); }
+}
+
+/* 连接失败提示: 单独抽出来, 避免在 poll 里直接弹窗造成重入。
+ * 内容按实际原因给一句能看懂的(密码错/找不到网络/超时)。 */
+void conn_fail_notify(ui_ctx_t *ctx);
+void conn_fail_notify(ui_ctx_t *ctx) {
+    char msg[96];
+    const char *st = wifi_manager_get_status();
+    if (st && (strstr(st, "\xe5\xaf\x86\xe7\xa0\x81") || strstr(st, "PASSWORD"))) {
+        snprintf(msg, sizeof(msg), "\xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x9a\xe5\xaf\x86\xe7\xa0\x81\xe5\x8f\xaf\xe8\x83\xbd\xe4\xb8\x8d\xe5\xaf\xb9"); /* 连接失败：密码可能不对 */
+    } else if (st && strstr(st, "\xe6\xb2\xa1\xe6\x89\xbe\xe5\x88\xb0")) {
+        snprintf(msg, sizeof(msg), "\xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x9a\xe6\xb2\xa1\xe6\x89\xbe\xe5\x88\xb0\xe8\xaf\xa5\xe7\xbd\x91\xe7\xbb\x9c"); /* 连接失败：没找到该网络 */
+    } else {
+        snprintf(msg, sizeof(msg), "\xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x9a\xe8\xb6\x85\xe6\x97\xb6\xe6\x88\x96\xe4\xbf\xa1\xe5\x8f\xb7\xe5\xa4\xaa\xe5\xbc\xb1"); /* 连接失败：超时或信号太弱 */
+    }
+    os_dialog_confirm_ex(ctx, msg, 0, -1, NULL, NULL);
 }
 
 /* 画一个键: 整块填充 + 居中文本 + 右分割线 (垂直);
@@ -1506,6 +1473,7 @@ static void wifi_scan_dlg_cb(ui_ctx_t *ctx, int result, void *ud) {
     }
     char ssid[33];
     if (!wifi_manager_get_scan_ssid(result, ssid, sizeof(ssid)) || !ssid[0]) return;
+    ESP_LOGI("APPSTORE", "ap_selected idx=%d ssid=%s", result, ssid);
 
     /* ★ 2026-10-20 linit 定的三条规则 */
     char saved_ssid[33] = {0}, saved_pass[65] = {0};
@@ -1533,6 +1501,7 @@ static void wifi_scan_dlg_cb(ui_ctx_t *ctx, int result, void *ud) {
         return;
     }
     /* ③ 其余 (新网络 / 密码变了) → 输密码键盘 */
+    ESP_LOGI("APPSTORE", "password_required ssid=%s dlg_depth=%d", ssid, os_dialog_depth());
     open_wifi_pwd_dlg(ctx, ssid);
 }
 /* ================= 网络配置 (二级) =================
@@ -1662,7 +1631,23 @@ static void open_wifi_scan(ui_ctx_t *ctx) {
     dlg.sel = 0;
     dlg.on_poll = wifi_scan_dlg_poll;
     dlg.cb = wifi_scan_dlg_cb;
-    os_dialog_push(ctx, &dlg);
+    {
+        /* 需要复用时：把当前弹窗(确认框)原位改写成扫描列表，不 pop 页面、不闪 */
+        os_dlg_stack_t *cur = (s_scan_reuse_top && os_dialog_depth() > 0)
+                              ? os_dialog_top_mut(ctx) : NULL;
+        if (cur) {
+            uint32_t keep = cur->open_ms;    /* 保留打开时刻, 不触发超时 */
+            *cur = dlg;
+            cur->open_ms = keep;
+            os_dialog_mark_handled(ctx);     /* 回调返回后别把这一层自动关掉 */
+            ESP_LOGI("APPSTORE", "scan_ui: 原位改写当前弹窗(不 pop 页面, 无闪烁)");
+        } else {
+            os_dialog_push(ctx, &dlg);
+        }
+    }
+    ESP_LOGI("APPSTORE", "scan_start busy=%d wifi_en=%d conn=%d dlg_depth=%d",
+             (int)s_scan_busy, (int)wifi_manager_is_enabled(),
+             (int)wifi_manager_is_connected(), os_dialog_depth());
     if (!s_scan_busy) {
         s_scan_busy = true;
         if (xTaskCreate(wifi_scan_task, "wifi_scan", 5120, NULL, 4, NULL) != pdPASS) {
@@ -1742,6 +1727,8 @@ static int wifi_dlg_build(char items[][32], const char *ptrs[], int cap)
     if (n < cap) { snprintf(items[n], 32, "系统信息"); ptrs[n] = items[n]; n++; }
     s_wifi_idx_selfcheck = n;
     if (n < cap) { snprintf(items[n], 32, "硬件管理"); ptrs[n] = items[n]; n++; }
+    /* 2026-11-03: 「性能监视」入口已删除 —— 它现在是独立应用
+     * (应用中心 → 应用 → 系统), 不再藏在本页的二级菜单里。 */
     return n;
 }
 
@@ -1762,7 +1749,9 @@ static void wifi_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud)
         if (strcmp(d->items[i], items[i]) != 0) changed = true;
     if (!changed) return;
 
-    for (int i = 0; i < n; i++) snprintf(d->items[i], sizeof(d->items[0]), "%s", items[i]);
+    for (int i = 0; i < n; i++)
+        snprintf(d->items[i], sizeof(d->items[0]), "%.*s",
+                 (int)(sizeof(d->items[0]) - 1), items[i]);
     d->count = n;
     if (d->sel >= n) d->sel = n - 1;
     if (d->sel < 0)  d->sel = 0;
@@ -2025,7 +2014,7 @@ static void on_gamemode_changed(bool enabled) {
  * (连接由"连接WiFi"密码页发起, 但连上可能发生在用户回到桌面之后). */
 static const os_service_t s_svc_wifi_conn = {
     .name = "wifi_conn",
-    .tick = wifi_conn_poll,
+    .tick = settings_wifi_conn_poll,
 };
 
 void os_page_settings_register(void) {

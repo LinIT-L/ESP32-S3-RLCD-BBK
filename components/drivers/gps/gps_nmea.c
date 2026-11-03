@@ -26,6 +26,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -79,11 +80,11 @@ static volatile uint32_t s_gen;
  * GSV 是"多句分片"的: 每个星座每轮 1~4 句, 每句 4 组 (PRN/仰角/方位/SNR)。
  * 收齐靠: msg==1 时先清掉该星座旧条目, 后面几句往里追加。
  * GSA 给"参与解算"的 PRN 列表 → used 位图 (按星座分开, GN 混合句进 s_used_any)。 */
-static gps_sat_t s_sats[GPS_MAX_SATS];
+EXT_RAM_BSS_ATTR static gps_sat_t s_sats[GPS_MAX_SATS];   /* 只有 GPS 定位时用 */
 static int       s_sat_n;
 /* ★ 2026-10-27: 每条卫星最后一次被 GSV 提到的时刻(ms)。用来做"超时剔除",
  *   这样一轮 GSV 未走完时数量不会掉, 卫星真消失后 15s 内自动移除。 */
-static uint32_t  s_sat_ms[GPS_MAX_SATS];
+EXT_RAM_BSS_ATTR static uint32_t  s_sat_ms[GPS_MAX_SATS];
 #define SAT_TTL_MS 15000u
 static uint64_t  s_used[6];
 static uint64_t  s_used_any;

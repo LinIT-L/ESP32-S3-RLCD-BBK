@@ -57,6 +57,10 @@ set(SDLPAL_SRCS
     #    只对这一个文件把 main 改名成 pal_main，再由 pal_entry.c 包装成 pal_run()。
     "${SDLPAL_DIR}/main.c"
     "pal_entry.c"
+    # ★ 2026-11-01: 平台钩子（替代 third_party/util.c 的弱默认 UTIL_Platform_Init）。
+    #   作用：在 PAL_LoadConfig() 之后按"LPK / 目录"模式改写 gConfig 的 GamePath/SavePath。
+    #   走 pal_config.h 的 PAL_HAS_PLATFORM_SPECIFIC_UTILS，**不动物三方的代码**。
+    "pal_platform.c"
 )
 
 if(PAL_MUSIC_MODE STREQUAL "opl")
@@ -96,6 +100,9 @@ idf_component_register(
         # fonts = 系统 16px 宋体字库（font_zh16，mmap 自 appdata）；SDLPal 直接用它当汉字字模，
         # 不再需要把字模编进 flash，也不必往 TF 卡放字模文件。
         st7305 audio_player fonts virtual_keys sd_scan
+        # ★ 2026-11-01: lpk = LPK 读取器 + /lpk 的 VFS 挂载（单文件免解压）。
+        #   pal_entry.c 用 lpk_mode_* 判模式、lpk_vfs_mount 挂载；pal_platform.c 只读模式。
+        lpk
     # PAL_LARGE 标记的大缓冲走 extram_bss 段，需要这个 fragment 才能收进 PSRAM
     LDFRAGMENTS "linker.lf"
 )

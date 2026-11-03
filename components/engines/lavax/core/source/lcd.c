@@ -159,8 +159,15 @@ void lav_setpalette(byte from, int num, byte *addr)
 
 void ClearNdsScreen(void)
 {
+    /* ★ 2026-10-31 修复: 原来写 `graph_mode == 8 ? 0 : 255`, 但 LavaX 的
+     * 索引语义是「0 = 背景/白, 数值越大越暗」(与原作者 SetSBuffer 的
+     * memset(BmpData,0,...) 一致)。graph_mode==4 时 15 才是黑, 清 255 会被
+     * present_to_gray 映射成 idx 15 → **整屏黑**; 而 1 色模式清 255 与清 0
+     * 结果都是白(idx!=1), 8 色模式原本就走 0 —— 所以统一清 0 后:
+     *   1 色: 不变(白)   4 色: 由黑修正为白   8 色: 不变
+     * 仅仅修掉 4 色模式下清屏反色这一支, 不影响另外两种模式。 */
     if (bmpdata_buf)
-        memset(bmpdata_buf, graph_mode == 8 ? 0 : 255, SCREEN_BUFFER_SIZE);
+        memset(bmpdata_buf, 0, SCREEN_BUFFER_SIZE);
 }
 
 void DmaRefresh(void)

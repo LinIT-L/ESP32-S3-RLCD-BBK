@@ -4,13 +4,15 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
+#include "esp_attr.h"      /* EXT_RAM_BSS_ATTR */
 #include "esp_log.h"
 
 static const char *TAG = "lbf";
 
-/* 2 倍放大的输出缓冲：32px 原生 → 64px，行宽 8 字节 × 64 行 = 512 */
+/* 2 倍放大的输出缓冲：32px 原生 → 64px，行宽 8 字节 × 64 行 = 512
+ * ★ 2026-11-02: 只在看书时用, 放 PSRAM（640 B）。 */
 #define LBF_SCALE_BUF_BYTES (LBF_MAX_GLYPH_BYTES * 4)
-static uint8_t s_scale_buf[LBF_SCALE_BUF_BYTES];
+static EXT_RAM_BSS_ATTR uint8_t s_scale_buf[LBF_SCALE_BUF_BYTES];
 
 typedef struct {
     uint32_t cp;

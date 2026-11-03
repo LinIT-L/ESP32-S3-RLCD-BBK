@@ -17,6 +17,7 @@
 #include "svc_nvs.h"
 #include "svc_cfg.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include <dirent.h>
@@ -55,14 +56,26 @@ static bool s_reader_open = false;
 
 /* ==== 阅读优化设置 (3.3: 字号/字体/页码/边距/行高/字距/缩进/旋转) ==== */
 static int s_bs_fontsize = 1;   /* 0=16 1=24 2=32 3=48 (2026-10-31 四档) */
-static int s_bs_font     = 0;   /* 0=仿宋 1=黑体 2+=TF 字体索引 */
-static char s_bs_tfname[64] = {0};   /* 选中的 TF 字库文件名 */
+static int s_bs_font     = 0;   /* 0=内置 1=TF 字体（只作"有没有选 TF 字体"的标记，真正的选择看 s_bs_tfname） */
+static char s_bs_tfname[64] = {0};   /* 选中的 TF 字库文件名（空=内置） */
 static int s_bs_pagenum  = 1;   /* 0=关 1=开 */
 static int s_bs_margin   = 1;   /* 0=窄 1=中 2=宽 */
 static int s_bs_lineh    = 1;   /* 0=紧凑 1=标准 2=宽松 */
 static int s_bs_gap      = 1;   /* 0=紧凑 1=标准 2=宽松 */
 static int s_bs_indent   = 1;   /* 0=关 1=开 (段落首行缩进两全角空格) */
 static int s_bs_rot      = 2;   /* 0=上 1=下 2=左 3=右 (阅读优化旋转方向) —— 默认「左」(linit 2026-10-24) */
+
+/* 当前选中的字体文件全路径；内置返回 ""（空串）。
+ * ★ 2026-10-31: 字体单一来源 = NVS 的 ftn（文件名）。阅读器内「字体选择」写的是**同一组键**，
+ *   所以两边显示/生效的永远是同一个字体，不再各存一套。 */
+static const char *bs_font_path(void) {
+    static char p[96];
+    if (s_bs_font >= 1 && s_bs_tfname[0]) {
+        snprintf(p, sizeof(p), "/sdcard/fonts/%.63s", s_bs_tfname);
+        return p;
+    }
+    return "";
+}
 
 static void bs_load(void) {
     nvs_handle_t h;
@@ -72,8 +85,19 @@ static void bs_load(void) {
         /* 字号 0..3 = 16/24/32/48。旧存档只有 0..2，语义不变，天然兼容。 */
         if (svc_nvs_get_i32(h, "fs", &v) == ESP_OK)
             s_bs_fontsize = (v < 0) ? 1 : (v > 3) ? 3 : (int)v;
-        /* 字体: 0=仿宋 1=黑体 ≥2=TF 字库索引 (linit 保留, 以后读 TF 卡字体) */
-        if (svc_nvs_get_i32(h, "ft", &v) == ESP_OK && v >= 0) s_bs_font = (int)v;
+        /* 字体: 以文件名 ftn 为准（空=内置）。ft 只作旧档兼容标记 —— 老版本只存了
+         * 一个序号，序号没法反查是哪个文件，只能退回内置，不能瞎猜。 */
+        {
+            char nm[64] = {0};
+            size_t nl = sizeof(nm);
+            if (svc_nvs_get_str(h, "ftn", nm, &nl) == ESP_OK && nm[0]) {
+                snprintf(s_bs_tfname, sizeof(s_bs_tfname), "%.63s", nm);
+                s_bs_font = 1;
+            } else {
+                s_bs_tfname[0] = 0;
+                s_bs_font = 0;
+            }
+        }
         if (svc_nvs_get_i32(h, "pn", &v) == ESP_OK && v >= 0 && v <= 1) s_bs_pagenum = (int)v;
         if (svc_nvs_get_i32(h, "mg", &v) == ESP_OK && v >= 0 && v <= 2) s_bs_margin = (int)v;
         if (svc_nvs_get_i32(h, "lh", &v) == ESP_OK && v >= 0 && v <= 2) s_bs_lineh = (int)v;
@@ -92,6 +116,15 @@ static void bs_load(void) {
 static void bs_save(void) {
     svc_cfg_set_i32(BNS, "fs", s_bs_fontsize);
     svc_cfg_set_i32(BNS, "ft", s_bs_font);
+    /* 字体以文件名持久化：阅读器内「字体选择」写同一组键，保证两边状态一致 */
+    {
+        nvs_handle_t h;
+        if (svc_nvs_open(BNS, NVS_READWRITE, &h) == ESP_OK) {
+            svc_nvs_set_str(h, "ftn", s_bs_tfname);
+            svc_nvs_commit(h);
+            svc_nvs_close(h);
+        }
+    }
     svc_cfg_set_i32(BNS, "pn", s_bs_pagenum);
     svc_cfg_set_i32(BNS, "mg", s_bs_margin);
     svc_cfg_set_i32(BNS, "lh", s_bs_lineh);
@@ -103,9 +136,21 @@ static void bs_save(void) {
 static int  bs_size_reader_idx(void);   /* 前置声明 (定义在下方): 三档字号 → 阅读器内部档位 */
 static void bs_apply(void) {
     int style = 0;                                   /* 内置字体只有一套（宋体），style 不再分仿宋/黑体 */
-    if (s_bs_font >= 1 && s_bs_tfname[0]) {
-        char p[128]; snprintf(p, sizeof(p), "/sdcard/fonts/%s", s_bs_tfname);
-        font_book_select_file(p);
+    const char *fp = bs_font_path();
+    if (fp[0]) {
+        if (!font_book_select_file(fp)) {
+            /* 文件被删 / 内容损坏 → 回退内置，并把记录改回内置，避免每次开书都白试一次 */
+            ESP_LOGW(TAG, "字体不可用 %s: %s → 回退内置", fp, font_book_error());
+            s_bs_font = 0;
+            s_bs_tfname[0] = 0;
+            bs_save();
+            font_book_select_embedded(style, font_book_size_px_for("", s_bs_fontsize));
+        }
+    } else {
+        /* ★ 2026-10-31 修：原来这一段只在"选了 TF 字体"时才动字体，
+         *   选回「内置字体」什么都不做 ⇒ 上一本书的 TF 字体一直生效，
+         *   "内置字体"形同虚设（而且书库显示内置、正文还是像素字体）。 */
+        font_book_select_embedded(style, font_book_size_px_for("", s_bs_fontsize));
     }
     book_reader_set_settings(false, 1, false, s_bs_pagenum != 0, s_bs_rot,
                              style, bs_size_reader_idx(), s_bs_margin, s_bs_lineh,
@@ -174,21 +219,28 @@ static void book_pad(char *buf, size_t len, int target, const char *name, const 
  *   2 = 32px  → font_zh16 的 **2 倍整数放大** (笔画干净; 不用 24→32 的 1.33 倍, 那会断笔)
  * ⛔ 20px / 28px 已去掉 —— 它们是"既非原生、又非整数倍"的两档, 缩放最糊。 */
 static const char *bs_fs_name(void) {
-    /* 2026-10-30: 四档，从小到大 16 / 24 / 32 / 48。
-     * 48 不是新字体文件，是 24px 字形在绘制阶段做严格 2 倍点阵放大。 */
-    static const char *n[4] = { "16", "24", "32", "48" };
-    return n[(s_bs_fontsize < 0) ? 1 : (s_bs_fontsize > 3) ? 3 : s_bs_fontsize];
+    /* ★ 2026-10-31: 不再写死 16/24/32/48，而是问**当前选中的字体**真实支持的字号。
+     *   内置字体 = 16/24/32/48；TF 卡 LBF = 原生 N 与 2N（8px 字体只有 8/16）。
+     *   注意这里用的是 font_book_size_px_for(path) —— 按**字体文件头**算，
+     *   而不是按"当前已加载的字体"算：站在书库时 LBF 往往还没加载，
+     *   用 font_book_size_px_at() 会永远返回内置四档。
+     *   统一显示成 "16px" 形式，避免"菜单写 24、实际画 8"的错位。 */
+    static char b[10];
+    snprintf(b, sizeof(b), "%dpx", font_book_size_px_for(bs_font_path(), s_bs_fontsize));
+    return b;
 }
 /* → 阅读器档位。两边现在是**同一套** 0..3 = 16/24/32/48，直接透传。
  * ⚠ 旧实现查的是 {0,2,4}，而阅读器把档位夹在 0..3 ⇒ 32px 档(4) 被夹成 3(24px)，
  *   菜单写 32、实际画 24。现在档位一一对应，不再有夹值。 */
 static int bs_size_reader_idx(void) {
-    return (s_bs_fontsize < 0) ? 1 : (s_bs_fontsize > 3) ? 3 : s_bs_fontsize;
+    /* 档位 = 当前字体字号表里的下标；越界由阅读器按"最大合法档"收敛
+     * （font_book_size_px_at），不会再出现"菜单 32、实际 24"。 */
+    return (s_bs_fontsize < 0) ? 0 : s_bs_fontsize;
 }
 static const char *bs_font_name(void) {
     /* 2026-10-31: 也走中文短名, 与滚轮/阅读器菜单保持一致 */
     static char s_disp[24];
-    if (s_bs_font >= 1 && s_bs_tfname[0]) return font_book_short_name(s_bs_tfname, s_disp, sizeof(s_disp));
+    if (s_bs_tfname[0]) return font_book_short_name(s_bs_tfname, s_disp, sizeof(s_disp));
     return "\xe5\x86\x85\xe7\xbd\xae\xe5\xad\x97\xe4\xbd\x93";   /* 内置字体 */
 }
 static const char *bs_on_off(int v) { return v ? "\xe5\xbc\x80" : "\xe5\x85\xb3"; } /* 开/关 */
@@ -261,10 +313,15 @@ static void p_book_settings_render(ui_ctx_t *ctx, os_pane_t *p, int rx0, int rx1
     }
 }
 
-/* TF 卡字体文件夹扫描: 返回字体文件数 (存 s_tf_fonts) */
+/* TF 卡字体文件夹扫描: 返回字体文件数 (存 s_tf_fonts)
+ * ★ 2026-10-31: 结果缓存，一次进页面只扫一次（原来每次打开字体滚轮都 readdir 一遍）。
+ *   字体装/卸/拷贝后由 p_book_enter() 置脏，下次进入书库重新扫。 */
 EXT_RAM_BSS_ATTR static char s_tf_fonts[16][64];
 static int  s_tf_font_n = 0;
+static bool s_tf_font_dirty = true;
 static void tf_font_scan(void) {
+    if (!s_tf_font_dirty) return;
+    s_tf_font_dirty = false;
     s_tf_font_n = 0;
     DIR *d = opendir("/sdcard/fonts");
     if (!d) return;
@@ -408,7 +465,10 @@ static bool bs_wheel_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void 
     return true;   /* 弹窗内其他区域吞掉 (拖动调值由 poll 处理) */
 }
 
+static ui_ctx_t *s_wheel_ctx;   /* 滚轮弹窗的 ctx：commit 回调没有 ctx 参数，靠这个拿 */
+
 static void bs_wheel_push(ui_ctx_t *ctx) {
+    s_wheel_ctx = ctx;
     os_dlg_stack_t dlg;
     memset(&dlg, 0, sizeof(dlg));
     dlg.no_footer = true;
@@ -419,34 +479,138 @@ static void bs_wheel_push(ui_ctx_t *ctx) {
     os_dialog_push(ctx, &dlg);
 }
 
-/* 字号 (4 档: 16/24/32/48，从小到大) */
+/* 字号：**按当前选中字体动态生成**（内置 16/24/32/48；8px 点阵字体只有 8/16）。
+ * 用 font_book_size_options_for(路径) —— 站在书库时 LBF 还没加载也能拿到真实规格。
+ * 静态缓冲按条目保存 —— 滚轮长期持有 opts 指针，不能指向临时栈。 */
+static char s_bs_size_disp[8][8];
 static void bs_wheel_commit_size(void) { s_bs_fontsize = s_bs_wheel_idx; bs_save(); bs_apply(); }
 static void bs_size_wheel_open(ui_ctx_t *ctx) {
-    static const char *opts[] = { "16", "24", "32", "48" };
-    for (int i = 0; i < 4; i++) s_bs_wheel_opts[i] = opts[i];
-    s_bs_wheel_n = 4;
-    s_bs_wheel_idx = s_bs_fontsize;
+    int px[8];
+    int n = font_book_size_options_for(bs_font_path(), px, 8);
+    if (n <= 0) { px[0] = 24; n = 1; }
+    for (int i = 0; i < n; i++) {
+        snprintf(s_bs_size_disp[i], sizeof(s_bs_size_disp[i]), "%dpx", px[i]);
+        s_bs_wheel_opts[i] = s_bs_size_disp[i];
+    }
+    s_bs_wheel_n = n;
+    s_bs_wheel_idx = (s_bs_fontsize < 0) ? 0 : (s_bs_fontsize >= n ? n - 1 : s_bs_fontsize);
     s_bs_wheel_commit = bs_wheel_commit_size;
     bs_wheel_push(ctx);
 }
 
-/* 字体: 内置仿宋/黑体 + TF 字库 */
+/* ===== 字体后台加载（pin 到 core 0，UI 在 core 1 不受影响）=====
+ * 起因：lbf_open 一次性整块读 TF 卡（0.3~0.7MB，1~2 秒），在 UI 任务里同步跑
+ * ⇒ 界面完全卡死、连"正在加载"都画不出来。
+ * 现在：丢给独立任务在另一个核读，UI 立刻弹提示窗；读完后由 poll 收尾并应用设置。 */
+static volatile int s_font_load_st;        /* 0=空闲 1=加载中 2=成功 3=失败 */
+static char         s_font_load_path[128];
+static char         s_font_load_name[64];
+static ui_ctx_t    *s_font_wait_ctx;
+
+static void font_load_task(void *arg)
+{
+    (void)arg;
+    bool ok = font_book_select_file(s_font_load_path);
+    s_font_load_st = ok ? 2 : 3;
+    vTaskDelete(NULL);
+}
+
+/* 加载完成收尾：应用字体设置 + 关提示窗（在 UI 任务里执行，安全） */
+static void font_wait_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud)
+{
+    (void)d; (void)ud;
+    if (s_font_load_st == 1) return;              /* 还在读卡 */
+    if (s_font_load_st == 2) {
+        s_bs_font = 1;
+        strncpy(s_bs_tfname, s_font_load_name, sizeof(s_bs_tfname) - 1);
+        s_bs_tfname[sizeof(s_bs_tfname) - 1] = 0;
+        int cnt = font_book_size_count();
+        if (cnt > 0 && s_bs_fontsize >= cnt) s_bs_fontsize = cnt - 1;
+        bs_save(); bs_apply();
+    } else if (s_font_load_st == 3) {
+        ESP_LOGW(TAG, "字体加载失败: %s", font_book_error());
+    }
+    s_font_load_st = 0;
+    os_dialog_pop(ctx);
+    ctx->needs_redraw = true;
+}
+
+static void font_wait_push(ui_ctx_t *ctx)
+{
+    s_font_wait_ctx = ctx;
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    snprintf(dlg.title, sizeof(dlg.title), "字体");
+    dlg.count = 1;
+    snprintf(dlg.items[0], sizeof(dlg.items[0]), "正在加载字体…");
+    dlg.sel = -1;
+    dlg.no_footer = true;
+    dlg.on_poll = font_wait_poll;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* 字体: 内置 + TF 字库（与阅读器内「字体选择」是同一份状态：都认 NVS 的 ftn） */
 static void bs_wheel_commit_font(void) {
     int idx = s_bs_wheel_idx;
     if (idx < 1) {
         s_bs_font = 0;     /* 0=内置字体 */
+        s_bs_tfname[0] = 0;
         bs_save(); bs_apply();
-    } else {
-        int fi = idx - 1;
-        if (fi >= 0 && fi < s_tf_font_n) {
-            char path[128];
-            snprintf(path, sizeof(path), "/sdcard/fonts/%s", s_tf_fonts[fi]);
-            if (font_book_select_file(path)) {
-                s_bs_font = idx;
-                strncpy(s_bs_tfname, s_tf_fonts[fi], sizeof(s_bs_tfname) - 1);
-                s_bs_tfname[sizeof(s_bs_tfname) - 1] = 0;
-                bs_save(); bs_apply();
-            }
+        return;
+    }
+    int fi = idx - 1;
+    if (fi < 0 || fi >= s_tf_font_n) return;
+
+    char path[128];
+    snprintf(path, sizeof(path), "/sdcard/fonts/%s", s_tf_fonts[fi]);
+
+    /* 诊断：确认到底走哪条路（用户反馈"没弹窗直接卡一下切换"） */
+    ESP_LOGW(TAG, "字体提交: idx=%d name=%s cached=%d st=%d ctx=%p",
+             idx, s_tf_fonts[fi], (int)font_book_is_cached(path),
+             s_font_load_st, (void *)s_wheel_ctx);
+
+    /* 已缓存（最近用过 3 个之内）→ 同步切换，零 IO、无提示 */
+    if (font_book_is_cached(path)) {
+        if (font_book_select_file(path)) {
+            s_bs_font = 1;
+            strncpy(s_bs_tfname, s_tf_fonts[fi], sizeof(s_bs_tfname) - 1);
+            s_bs_tfname[sizeof(s_bs_tfname) - 1] = 0;
+            int cnt = font_book_size_count();
+            if (cnt > 0 && s_bs_fontsize >= cnt) s_bs_fontsize = cnt - 1;
+            bs_save(); bs_apply();
+        }
+        return;
+    }
+
+    /* 未缓存 → 后台核加载 + 提示窗 */
+    if (s_font_load_st == 1) return;              /* 已有一次在跑，忽略连点 */
+    snprintf(s_font_load_path, sizeof(s_font_load_path), "%s", path);
+    snprintf(s_font_load_name, sizeof(s_font_load_name), "%s", s_tf_fonts[fi]);
+    s_font_load_st = 1;
+
+    ui_ctx_t *ctx = s_wheel_ctx;
+    ESP_LOGW(TAG, "字体: 走异步加载, ctx=%p", (void *)ctx);
+    if (!ctx) {                                   /* 没有 ctx 就别冒风险，直接同步 */
+        s_font_load_st = 0;
+        ESP_LOGE(TAG, "字体: 无 ctx, 同步加载");
+        if (font_book_select_file(path)) {
+            s_bs_font = 1;
+            strncpy(s_bs_tfname, s_tf_fonts[fi], sizeof(s_bs_tfname) - 1);
+            s_bs_tfname[sizeof(s_bs_tfname) - 1] = 0;
+            bs_save(); bs_apply();
+        }
+        return;
+    }
+    font_wait_push(ctx);                          /* 先把提示画出来 */
+    if (xTaskCreatePinnedToCore(font_load_task, "fontload", 4096, NULL, 2, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "字体加载任务创建失败, 回退同步");
+        s_font_load_st = 0;
+        os_dialog_pop(ctx);
+        if (font_book_select_file(path)) {
+            s_bs_font = 1;
+            strncpy(s_bs_tfname, s_tf_fonts[fi], sizeof(s_bs_tfname) - 1);
+            s_bs_tfname[sizeof(s_bs_tfname) - 1] = 0;
+            bs_save(); bs_apply();
         }
     }
 }
@@ -457,13 +621,16 @@ static char s_bs_font_disp[24][24];
 static void bs_font_wheel_open(ui_ctx_t *ctx) {
     tf_font_scan();
     int n = 0;
+    int sel = 0;
     s_bs_wheel_opts[n++] = "\xe5\x86\x85\xe7\xbd\xae\xe5\xad\x97\xe4\xbd\x93";  /* 内置字体 */
     for (int i = 0; i < s_tf_font_n && n < 24; i++) {
         font_book_short_name(s_tf_fonts[i], s_bs_font_disp[i], sizeof(s_bs_font_disp[i]));
         s_bs_wheel_opts[n++] = s_bs_font_disp[i];
+        /* 选中项按**文件名**定位，不按序号 —— 序号会随目录增删错位 */
+        if (s_bs_tfname[0] && strcmp(s_bs_tfname, s_tf_fonts[i]) == 0) sel = i + 1;
     }
     s_bs_wheel_n = n;
-    s_bs_wheel_idx = (s_bs_font < 1) ? 0 : s_bs_font;
+    s_bs_wheel_idx = sel;
     s_bs_wheel_commit = bs_wheel_commit_font;
     bs_wheel_push(ctx);
 }
@@ -691,6 +858,8 @@ static void book_recent_load(void) {
 }
 
 static void p_book_enter(ui_ctx_t *ctx) {
+    int64_t t_enter0 = esp_timer_get_time();   /* 2026-10-31: 「进入书库耗时」实测打点 */
+    s_tf_font_dirty = true;    /* 字体可能刚装/卸/拷过 → 下次列字体时重扫目录 */
     if (!s_bp.loaded) {
         s_bp.root = BOOK_ROOT;
         s_bp.is_item = is_txt;
@@ -715,6 +884,8 @@ static void p_book_enter(ui_ctx_t *ctx) {
     input_set_screen_rotation(0);   /* 书架触摸用物理坐标, 页内自映射 (防前一页残留旋转) */
     book_rotation_ensure(ctx);   /* 进入书架即按旋转方向启用竖屏 */
     os_pane_build_right(&s_bp);
+    ESP_LOGI(TAG, "进入书库耗时 %lld ms (%d 本)",
+             (long long)((esp_timer_get_time() - t_enter0) / 1000), s_bp.item_count);
 }
 
 static void p_book_exit(ui_ctx_t *ctx) {
@@ -727,6 +898,11 @@ static void p_book_exit(ui_ctx_t *ctx) {
     }
     book_rotation_off(ctx);   /* 卸载书架旋转 (含 map_touch), 阅读器自管全局旋转 */
     input_set_screen_rotation(0);
+
+    /* ★ 2026-10-31: 字体整块映像（PSRAM，最大 1.23MB × 2 槽）在这里统一释放。
+     *   关书不再释放 —— 同一会话里换书要复用，否则每本都要重新预加载 ~1.1s。
+     *   离开书架页说明"不看了"，这时才把 PSRAM 还给游戏引擎等模块。 */
+    font_book_release_all();
 }
 
 static void p_book_render(ui_ctx_t *ctx) {

@@ -147,11 +147,23 @@ bool os_push(ui_ctx_t *ctx, os_page_t page)
 
 void os_pop(ui_ctx_t *ctx)
 {    if (s_stack_top < 0) { ESP_LOGD(TAG, "pop: stack empty, stay"); return; }
+    /* ★★★ 2026-10-31: 离开页面前**必须先收回快捷栏的触摸独占**。
+     *   原来只有"按 BACK 键"会关快捷栏; 如果快捷栏开着时页面被别的路径弹掉
+     *   (游戏自己退出/超时回主菜单/弹窗链路), overlay 锁会**留在置位状态**,
+     *   之后所有普通调用者都拿不到触摸 ⇒ 整机触摸失灵, 只能重启。
+     *   os_quickbar_close() 内部会解锁 + 释放虚拟手柄的按下态。 */
+    if (os_quickbar_is_open()) os_quickbar_close();
     os_page_t parent = s_back_stack[s_stack_top--];
 
     const os_module_t *m = s_cur_mod;
     bool was_overlay = m && m->modal;
     const os_module_t *pm = (parent >= 0 && parent < OS_PAGE_COUNT) ? s_modules[parent] : NULL;
+
+    /* ★ 2026-11-01 诊断(可关): 页面被弹走时留下"从哪页 → 到哪页", 并标出当前是否
+     *   在弹窗流程里。排查"应用中心连 Wi-Fi 后被弹回主菜单"靠这一行定位:
+     *   有它 ⇒ 页面真的被 pop 了(且能看到是不是弹窗链路的锅); 没它 ⇒ 不是 pop 的问题。 */
+    ESP_LOGI(TAG, "pop: %s -> %s (back_stack=%d modal=%d)",
+             m ? m->name : "?", pm ? pm->name : "(main)", s_stack_top, (int)was_overlay);
 
     /* ★★ 2026-10-14 linit 反馈"确认退出后要干等 0.5 秒才真的退" —— 根因:
      *   `os_pop` 原来是**先跑本页 on_exit, 再切父页**, 而 on_exit 里有几百 ms 的阻塞动作
@@ -439,6 +451,20 @@ void os_tick(ui_ctx_t *ctx)
 
     /* V1.7.x: 全局 toast 超时清理 — 任意页面/弹窗上提示 1s 自动关+重绘 (不依赖 DIALOG 页 poll) */
     os_dialog_toast_tick(ctx);
+
+    /* ★★★ 2026-11-01 兜底: 「弹窗栈已空, 页面却还停在 DIALOG」= 残留空白弹窗页。
+     *   成因: `os_dialog_toast_ms()` 在 s_top<0 时会 os_push(OS_PAGE_DIALOG) 自开一页,
+     *         而 `os_dialog_pop()` 在 s_top<0 时**什么都不做** ⇒ 这一页关不掉。
+     *   后果(真机实测): 残留页挡在上面, 用户按返回时被 os_pop 的是**下层真页面**
+     *         (应用中心 → 直接回主菜单 → on_exit 复位联网会话标志 → 再进商店又弹确认)。
+     *         page_gamepad.c 早就手工兜过同一个坑("清掉独立 toast 残留的弹窗页")。
+     *   这里做成全局兜底: 栈空 + 无 toast + 当前页是 DIALOG ⇒ 一定是残留, 收掉。
+     *   风险: 极低 —— 正常弹窗一定 s_top>=0; 正常 toast 一定 toast_active()。 */
+    if (ctx->current_page == OS_PAGE_DIALOG && os_dialog_depth() <= 0 && !os_dialog_toast_active()) {
+        ESP_LOGW(TAG, "残留空白弹窗页(弹窗栈已空) → 自动收掉, 避免误弹下层页面");
+        os_pop(ctx);
+        ctx->needs_redraw = true;
+    }
 
     /* V1.4.x: 每帧同步"按键模拟"上下文屏蔽 — 主菜单/软件管家页直接内容不震
      * (拖动图标/管理列表保持干净), 弹窗覆盖时 modal_active=true → 不拦截,

@@ -37,7 +37,7 @@
 
 > 由 `tools/lua_api_doc.py` 从 `components/apps/lua_bridge/luat_lib_*.c` **自动提取**。
 > 「说明」一列取的是源码里函数上方的注释 —— **改代码就是改文档**，不要手改本节。
-> 共 **201** 个 API / 17 个模块。「定义」列是源码位置。
+> 共 **203** 个 API / 17 个模块。「定义」列是源码位置。
 
 ### `espnow` — ESP-NOW 点对点/广播（≤250 字节/包，不用路由器；双机联机、遥控、信标）
 
@@ -144,16 +144,17 @@
 
 | API | 说明 | 定义 |
 |---|---|---|
-| `app.millis` | Lua: 时间/输入/声音/震动/退出 | `luat_lib_input.c:162` |
-| `app.key` | （源码未写注释） | `luat_lib_input.c:163` |
-| `app.delay` | （源码未写注释） | `luat_lib_input.c:164` |
-| `app.key_down` | 做"按住持续移动/连发"全靠它 | `luat_lib_input.c:165` |
-| `app.keys_mask` | 支持多键同时: `if m & 1 ~= 0 and m & 4 ~= 0` = 左上一起按(斜向) | `luat_lib_input.c:166` |
-| `app.key_repeat` | （源码未写注释） | `luat_lib_input.c:167` |
-| `app.touch` | app.touch(): 返回 x,y 或 nil | `luat_lib_input.c:168` |
-| `app.touch_start` | 无手势返回 nil * 与 app.touch() 同帧使用: 起点固定、当前点变化, 两者相减即位移 | `luat_lib_input.c:169` |
-| `app.touch_hold` | 脚本据此实现"长按" | `luat_lib_input.c:170` |
-| `app.redraw` | app.redraw(): 标记本帧需重绘刷屏. Lua 应用 poll() 里逐帧刷新用(雷达/触屏绘制). | `luat_lib_input.c:171` |
+| `app.millis` | Lua: 时间/输入/声音/震动/退出 | `luat_lib_input.c:180` |
+| `app.key` | （源码未写注释） | `luat_lib_input.c:181` |
+| `app.delay` | （源码未写注释） | `luat_lib_input.c:182` |
+| `app.key_down` | 做"按住持续移动/连发"全靠它 | `luat_lib_input.c:183` |
+| `app.keys_mask` | 支持多键同时: `if m & 1 ~= 0 and m & 4 ~= 0` = 左上一起按(斜向) | `luat_lib_input.c:184` |
+| `app.key_repeat` | （源码未写注释） | `luat_lib_input.c:185` |
+| `app.touch` | app.touch(): 返回 x,y 或 nil | `luat_lib_input.c:186` |
+| `app.touch_start` | 无手势返回 nil * 与 app.touch() 同帧使用: 起点固定、当前点变化, 两者相减即位移 | `luat_lib_input.c:187` |
+| `app.touch_hold` | 脚本据此实现"长按" | `luat_lib_input.c:188` |
+| `app.redraw` | app.redraw(): 标记本帧需重绘刷屏. Lua 应用 poll() 里逐帧刷新用(雷达/触屏绘制). | `luat_lib_input.c:189` |
+| `app.vk` | page_lua.c 读它决定 enable / draw / 按键映射 | `luat_lib_input.c:190` |
 
 ### `json` — 
 
@@ -186,19 +187,20 @@
 
 | API | 说明 | 定义 |
 |---|---|---|
-| `app.net.is_connected` | （源码未写注释） | `luat_lib_net.c:279` |
-| `app.net.mirrors` | app.net.* : 网络状态 / HTTP / ping app.net.mirrors() → { "https: bbk.linit.cn/bbk", ... } * * 分发包的**镜像源清单**, 取自固件里的 os_sourc… | `luat_lib_net.c:280` |
-| `app.net.get_ip` | （源码未写注释） | `luat_lib_net.c:281` |
-| `app.net.http_get` | 现在改成 net_client 的同步包装 —— 行为不变 (调用方仍阻塞等结果), 但底层只剩一个客户端 | `luat_lib_net.c:282` |
-| `app.net.fetch_start` | 本次请求是否流式落盘 (决定 poll 返回几个值) | `luat_lib_net.c:283` |
-| `app.net.fetch_poll` | （源码未写注释） | `luat_lib_net.c:284` |
-| `app.net.fetch_got` | 非流式也能看"收了多少") | `luat_lib_net.c:285` |
-| `app.net.ping` | （源码未写注释） | `luat_lib_net.c:286` |
-| `app.net.port` | V1.2 新增: 局域网扫描 (netscan 服务) —— 解锁 netdect 类应用 | `luat_lib_net.c:287` |
-| `app.net.arp` | （源码未写注释） | `luat_lib_net.c:288` |
-| `app.net.arp_list` | （源码未写注释） | `luat_lib_net.c:289` |
-| `app.net.ipinfo` | 返回 ip, 掩码, 网关, DNS, 接口名 (未联网 / 无 netif 时返回 0 个值) | `luat_lib_net.c:290` |
-| `app.net.vendor` | 未命中返回 nil (OUI 字典常驻固件, 与 netdect 的厂商显示同源) | `luat_lib_net.c:291` |
+| `app.net.is_connected` | （源码未写注释） | `luat_lib_net.c:323` |
+| `app.net.mirrors` | app.net.* : 网络状态 / HTTP / ping app.net.mirrors() → { "https: bbk.linit.cn/bbk", ... } * * 分发包的**镜像源清单**, 取自固件里的 os_sourc… | `luat_lib_net.c:324` |
+| `app.net.get_ip` | （源码未写注释） | `luat_lib_net.c:325` |
+| `app.net.http_get` | 现在改成 net_client 的同步包装 —— 行为不变 (调用方仍阻塞等结果), 但底层只剩一个客户端 | `luat_lib_net.c:326` |
+| `app.net.http_url` | 失败 → nil, 0 | `luat_lib_net.c:327` |
+| `app.net.fetch_start` | 本次请求是否流式落盘 (决定 poll 返回几个值) | `luat_lib_net.c:328` |
+| `app.net.fetch_poll` | （源码未写注释） | `luat_lib_net.c:329` |
+| `app.net.fetch_got` | 非流式也能看"收了多少") | `luat_lib_net.c:330` |
+| `app.net.ping` | （源码未写注释） | `luat_lib_net.c:331` |
+| `app.net.port` | V1.2 新增: 局域网扫描 (netscan 服务) —— 解锁 netdect 类应用 | `luat_lib_net.c:332` |
+| `app.net.arp` | （源码未写注释） | `luat_lib_net.c:333` |
+| `app.net.arp_list` | （源码未写注释） | `luat_lib_net.c:334` |
+| `app.net.ipinfo` | 返回 ip, 掩码, 网关, DNS, 接口名 (未联网 / 无 netif 时返回 0 个值) | `luat_lib_net.c:335` |
+| `app.net.vendor` | 未命中返回 nil (OUI 字典常驻固件, 与 netdect 的厂商显示同源) | `luat_lib_net.c:336` |
 
 ### `rec` — 
 
@@ -226,15 +228,15 @@
 
 | API | 说明 | 定义 |
 |---|---|---|
-| `app.nvs.get_int` | （源码未写注释） | `luat_lib_store.c:219` |
-| `app.nvs.set_int` | （源码未写注释） | `luat_lib_store.c:220` |
-| `app.nvs.get_str` | （源码未写注释） | `luat_lib_store.c:221` |
-| `app.nvs.set_str` | （源码未写注释） | `luat_lib_store.c:222` |
-| `app.db.set` | （源码未写注释） | `luat_lib_store.c:225` |
-| `app.db.get` | （源码未写注释） | `luat_lib_store.c:226` |
-| `app.db.del` | （源码未写注释） | `luat_lib_store.c:227` |
-| `app.db.seti` | （源码未写注释） | `luat_lib_store.c:228` |
-| `app.db.geti` | （源码未写注释） | `luat_lib_store.c:229` |
+| `app.nvs.get_int` | （源码未写注释） | `luat_lib_store.c:224` |
+| `app.nvs.set_int` | （源码未写注释） | `luat_lib_store.c:225` |
+| `app.nvs.get_str` | （源码未写注释） | `luat_lib_store.c:226` |
+| `app.nvs.set_str` | （源码未写注释） | `luat_lib_store.c:227` |
+| `app.db.set` | （源码未写注释） | `luat_lib_store.c:230` |
+| `app.db.get` | （源码未写注释） | `luat_lib_store.c:231` |
+| `app.db.del` | （源码未写注释） | `luat_lib_store.c:232` |
+| `app.db.seti` | （源码未写注释） | `luat_lib_store.c:233` |
+| `app.db.geti` | （源码未写注释） | `luat_lib_store.c:234` |
 
 ### `sys` — 系统与提示（日志 / 音效 / 震动 / 退出 / 状态栏，以及 `sys`、`dlg` 子表）
 

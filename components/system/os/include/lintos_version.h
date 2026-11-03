@@ -25,15 +25,15 @@
 #pragma once
 
 /* ===== 对外版本 (只往 外面 推送时改) ===== */
-#define LINTOS_VERSION_PUBLIC  "2.0"
+#define LINTOS_VERSION_PUBLIC  "2.1"
 
 /* ===== 内部版本 (自测用, 小步走) ===== */
 #define LINTOS_VERSION_MAJOR   2
-#define LINTOS_VERSION_MINOR   0
+#define LINTOS_VERSION_MINOR   1
 #define LINTOS_VERSION_PATCH   0
-#define LINTOS_VERSION_STR     "2.0.0"    /* 内部三段: 主.次.修订 */
-#define LINTOS_VERSION_DATE    "2026-10-31"
-#define LINTOS_VERSION_NAME    "\xe6\xad\xa3\xe5\xbc\x8f\xe7\x89\x88"  /* 本次迭代主题: 正式版 2.0 (阅读器字体系统 + 应用商店) */
+#define LINTOS_VERSION_STR     "2.1.0"    /* 内部三段: 主.次.修订 */
+#define LINTOS_VERSION_DATE    "2026-11-04"
+#define LINTOS_VERSION_NAME    "\xe6\x80\xa7\xe8\x83\xbd\xe7\x9b\x91\xe8\xa7\x86\xe5\x99\xa8 + \xe5\xba\x94\xe7\x94\xa8\xe5\x95\x86\xe5\xba\x97\xe4\xb8\x8e\xe5\x86\x85\xe5\xad\x98\xe4\xbc\x98\xe5\x8c\x96"  /* 本次迭代主题: 2.1 性能监视器 + 应用商店与内存优化 */
 
 /* ===== 取用接口 (实现: kernel/os_version.c) ===== */
 const char *os_version_public(void);  /* 对外: "1.3" */

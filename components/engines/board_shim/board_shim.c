@@ -88,7 +88,36 @@ void board_rlcd_screensaver_set(bool active) { s_ss_lcd_hold = active; }
 static volatile uint32_t s_flush_interval_us = BOARD_VIDEO_FLUSH_INTERVAL_US;
 static int64_t s_last_flush_us = 0;
 EXT_RAM_BSS_ATTR static StackType_t s_video_stack[BOARD_VIDEO_STACK_WORDS];
+/* ⛔ 必须内部 RAM: xPortCheckValidTCBMem() 校验 TCB 所在内存, 放 PSRAM 会 assert (2026-10-09 教训) */
 static StaticTask_t s_video_tcb;
+
+/* === 缩放映射缓冲 (NES 拉伸 / GB·GBC 全屏) ===
+ * 只在游戏缩放路径里用: 进游戏才分配, 视频任务引用归零即释放 —— 待机零占用.
+ * 必须留在内部 RAM: 每帧每行随机读 400B 的 col_map, 放 PSRAM 会拖帧率.
+ * GBC 与 NES 不会同时运行, 两个绘制函数共用这一套, 不再各占一份. */
+#define BOARD_SCALE_MAP_BYTES  (ST7305_HEIGHT + ST7305_WIDTH * 2)   /* 1100 B */
+static uint8_t *s_scale_map = NULL;   /* [row_map 300][col_map 400][scaled_row 400] */
+static int s_scale_cached_w = -1, s_scale_cached_h = -1;
+
+static uint8_t *board_scale_map_ensure(void)
+{
+    if (s_scale_map) return s_scale_map;
+    s_scale_map = heap_caps_malloc(BOARD_SCALE_MAP_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s_scale_map) {
+        ESP_LOGE(TAG, "缩放映射分配失败 (%d B)", BOARD_SCALE_MAP_BYTES);
+        return NULL;
+    }
+    s_scale_cached_w = s_scale_cached_h = -1;
+    return s_scale_map;
+}
+
+void board_scale_map_release(void)
+{
+    if (!s_scale_map) return;
+    heap_caps_free(s_scale_map);
+    s_scale_map = NULL;
+    s_scale_cached_w = s_scale_cached_h = -1;
+}
 
 /* NES: 模拟任务输出 2bit 打包灰度帧 (PSRAM), 拷贝到内部 RAM 显示缓冲,
  * 视频任务从内部 RAM 解包缩放 -> 写 FB -> SPI (全部在 core0, 不拖模拟帧). */
@@ -217,6 +246,10 @@ static void board_video_flush_task(void *arg)
         int64_t t0 = esp_timer_get_time();
         if (s_nes_shade_src) {
             /* NES: 灰度帧 -> 全屏缩放/点对点 -> FB, 全部在 core0 视频任务内完成 */
+            /* ★ 2026-10-31: 快捷栏「收手势/执行动作」必须在**帧锁之外** ——
+             *   点一下 Wi-Fi 走 esp_wifi_start() 要 1~3 秒, 占着锁会让模拟任务
+             *   一帧都提交不了 (用户报的"点 Wi-Fi 就卡死")。锁内只保留"画"。 */
+            if (!cheat_float_is_active()) engine_overlay_quickbar_tick();
             board_rlcd_fb_lock();
             if (s_nes_shade_mode != 0) {
                 /* 1=全屏 / 2=拉伸: 均走 scaled 拉伸到全屏 (400 宽) 归一处理 */
@@ -235,11 +268,12 @@ static void board_video_flush_task(void *arg)
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
             if (!takeover) vid_tune_overlay_tick(s_lcd);
-        if (!takeover) engine_overlay_quickbar(s_lcd);   /* ★ 游戏内下拉快捷栏 */
+        if (!takeover) engine_overlay_quickbar_draw(s_lcd);   /* 锁内: 只画像素 */   /* ★ 游戏内下拉快捷栏 */
             board_rlcd_fb_unlock();
             if (!takeover) st7305_flush_from(s_lcd, s_lcd->fb);
         } else if (s_gbc_src && s_gbc_w > 0 && s_gbc_h > 0) {
             /* GB/GBC: RGB565 双缓冲帧 -> 按显示模式转 FB (core0, 不占模拟帧预算) */
+            if (!cheat_float_is_active()) engine_overlay_quickbar_tick();   /* 锁外: 收手势/慢动作 */
             board_rlcd_fb_lock();
             int64_t c0 = esp_timer_get_time();
             if (s_gbc_mode == 2) {
@@ -300,7 +334,7 @@ static void board_video_flush_task(void *arg)
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
             if (!takeover) vid_tune_overlay_tick(s_lcd);
-        if (!takeover) engine_overlay_quickbar(s_lcd);   /* ★ 游戏内下拉快捷栏 */
+        if (!takeover) engine_overlay_quickbar_draw(s_lcd);   /* 锁内: 只画像素 */   /* ★ 游戏内下拉快捷栏 */
             board_rlcd_fb_unlock();
             s_gbc_conv_us = esp_timer_get_time() - c0;
             int64_t s0 = esp_timer_get_time();
@@ -308,11 +342,12 @@ static void board_video_flush_task(void *arg)
             s_gbc_spi_us = esp_timer_get_time() - s0;
         } else {
             /* GB/GBC: 快照拷贝 + SPI (模拟任务画完 FB 后通知) */
+            if (!cheat_float_is_active()) engine_overlay_quickbar_tick();   /* 锁外: 收手势/慢动作 */
             board_rlcd_fb_lock();
             virtual_keys_draw(s_lcd);
             bool takeover = cheat_float_overlay_tick(s_lcd);
             if (!takeover) vid_tune_overlay_tick(s_lcd);
-        if (!takeover) engine_overlay_quickbar(s_lcd);   /* ★ 游戏内下拉快捷栏 */
+        if (!takeover) engine_overlay_quickbar_draw(s_lcd);   /* 锁内: 只画像素 */   /* ★ 游戏内下拉快捷栏 */
             if (!takeover)
                 memcpy(s_flush_snapshot, s_lcd->fb, ST7305_WIDTH * ST7305_HEIGHT / 8);
             board_rlcd_fb_unlock();
@@ -379,7 +414,7 @@ void board_rlcd_video_task_start(void)
 
 void board_rlcd_video_task_stop(void)
 {
-    if (!s_video_task_running) return;
+    if (!s_video_task_running) { board_scale_map_release(); return; }
     if (s_video_task_refs > 1) {
         s_video_task_refs--;
         return;
@@ -396,6 +431,8 @@ void board_rlcd_video_task_stop(void)
         s_fb_stage = NULL;
         s_nes_packed_bytes = 0;
     }
+    /* 引擎已经退出, 缩放映射不会再用 —— 立即还给系统, 待机时内部 RAM 零占用 */
+    board_scale_map_release();
 }
 
 void board_shim_set_lcd(st7305_handle_t *lcd) {
@@ -734,17 +771,17 @@ esp_err_t board_rlcd_draw_gbc_stretch(const uint16_t *buf_le, int src_w, int src
         src_w <= 0 || src_h <= 0)
         return ESP_ERR_INVALID_ARG;
 
-    static uint8_t s_row_map[ST7305_HEIGHT];
-    static uint8_t s_col_map[ST7305_WIDTH];
-    static uint8_t s_scaled_row[ST7305_WIDTH];
-    static int s_cached_w = -1, s_cached_h = -1;
-    if (s_cached_w != src_w || s_cached_h != src_h) {
+    if (!board_scale_map_ensure()) return ESP_ERR_NO_MEM;
+    uint8_t *row_map    = s_scale_map;
+    uint8_t *col_map    = s_scale_map + ST7305_HEIGHT;
+    uint8_t *scaled_row = col_map + ST7305_WIDTH;
+    if (s_scale_cached_w != src_w || s_scale_cached_h != src_h) {
         for (int y = 0; y < ST7305_HEIGHT; y++)
-            s_row_map[y] = (uint8_t)((uint32_t)y * (uint32_t)src_h / ST7305_HEIGHT);
+            row_map[y] = (uint8_t)((uint32_t)y * (uint32_t)src_h / ST7305_HEIGHT);
         for (int x = 0; x < ST7305_WIDTH; x++)
-            s_col_map[x] = (uint8_t)((uint32_t)x * (uint32_t)src_w / ST7305_WIDTH);
-        s_cached_w = src_w;
-        s_cached_h = src_h;
+            col_map[x] = (uint8_t)((uint32_t)x * (uint32_t)src_w / ST7305_WIDTH);
+        s_scale_cached_w = src_w;
+        s_scale_cached_h = src_h;
     }
 
     /* 1) 源帧 RGB565 -> 2bit 打包灰度, 放内部 RAM (逐行顺序读 PSRAM, 缓存友好) */
@@ -771,16 +808,16 @@ esp_err_t board_rlcd_draw_gbc_stretch(const uint16_t *buf_le, int src_w, int src
     memset(fb, 0, NES_FB_BYTES);
     int py = 0;
     for (int sy = 0; sy < src_h; sy++) {
-        while (py < ST7305_HEIGHT && s_row_map[py] < sy) py++;
+        while (py < ST7305_HEIGHT && row_map[py] < sy) py++;
         int py0 = py;
-        while (py < ST7305_HEIGHT && s_row_map[py] == sy) py++;
+        while (py < ST7305_HEIGHT && row_map[py] == sy) py++;
         int py1 = py - 1;
         if (py0 > py1) continue;
 
         const uint8_t *prow = packed + sy * pw;
         for (int px = 0; px < ST7305_WIDTH; px++) {
-            int sx = s_col_map[px];
-            s_scaled_row[px] = (uint8_t)((prow[sx >> 2] >> ((sx & 3) << 1)) & 3);
+            int sx = col_map[px];
+            scaled_row[px] = (uint8_t)((prow[sx >> 2] >> ((sx & 3) << 1)) & 3);
         }
 
         for (int yy = py0; yy <= py1; yy++) {
@@ -790,8 +827,8 @@ esp_err_t board_rlcd_draw_gbc_stretch(const uint16_t *buf_le, int src_w, int src
             const uint8_t (*rbt)[2] = s_rowbits[local_y][yy & 1];   /* [pair][xph] */
             uint32_t idx = block_y;   /* 增量索引, 避免每字节乘 75 */
             for (int cp = 0; cp < ST7305_WIDTH / 2; cp++) {
-                uint8_t pair = (uint8_t)((s_scaled_row[cp << 1] << 2) |
-                                         s_scaled_row[(cp << 1) | 1]);
+                uint8_t pair = (uint8_t)((scaled_row[cp << 1] << 2) |
+                                         scaled_row[(cp << 1) | 1]);
                 fb[idx] |= rbt[pair][cp & 1];   /* xph = cp&1 (同一字节两列属同一块) */
                 idx += FB_HEIGHT_DIV_4;
             }
@@ -842,17 +879,17 @@ esp_err_t board_rlcd_draw_nes_scaled(const uint8_t *shade, int src_w, int src_h)
         return ESP_ERR_INVALID_ARG;
     int64_t t_scale0 = esp_timer_get_time();
 
-    static uint8_t s_row_map[ST7305_HEIGHT];
-    static uint8_t s_col_map[ST7305_WIDTH];
-    static uint8_t s_scaled_row[ST7305_WIDTH];
-    static int s_cached_w = -1, s_cached_h = -1;
-    if (s_cached_w != src_w || s_cached_h != src_h) {
+    if (!board_scale_map_ensure()) return ESP_ERR_NO_MEM;
+    uint8_t *row_map    = s_scale_map;
+    uint8_t *col_map    = s_scale_map + ST7305_HEIGHT;
+    uint8_t *scaled_row = col_map + ST7305_WIDTH;
+    if (s_scale_cached_w != src_w || s_scale_cached_h != src_h) {
         for (int y = 0; y < ST7305_HEIGHT; y++)
-            s_row_map[y] = (uint8_t)((uint32_t)y * (uint32_t)src_h / ST7305_HEIGHT);
+            row_map[y] = (uint8_t)((uint32_t)y * (uint32_t)src_h / ST7305_HEIGHT);
         for (int x = 0; x < ST7305_WIDTH; x++)
-            s_col_map[x] = (uint8_t)((uint32_t)x * (uint32_t)src_w / ST7305_WIDTH);
-        s_cached_w = src_w;
-        s_cached_h = src_h;
+            col_map[x] = (uint8_t)((uint32_t)x * (uint32_t)src_w / ST7305_WIDTH);
+        s_scale_cached_w = src_w;
+        s_scale_cached_h = src_h;
     }
 
     uint8_t *fb = s_fb_stage;
@@ -860,16 +897,16 @@ esp_err_t board_rlcd_draw_nes_scaled(const uint8_t *shade, int src_w, int src_h)
 
     int py = 0;
     for (int sy = 0; sy < src_h; sy++) {
-        while (py < ST7305_HEIGHT && s_row_map[py] < sy) py++;
+        while (py < ST7305_HEIGHT && row_map[py] < sy) py++;
         int py0 = py;
-        while (py < ST7305_HEIGHT && s_row_map[py] == sy) py++;
+        while (py < ST7305_HEIGHT && row_map[py] == sy) py++;
         int py1 = py - 1;
         if (py0 > py1) continue;
 
         const uint8_t *src_row = shade + ((size_t)sy * src_w >> 2);
         for (int px = 0; px < ST7305_WIDTH; px++) {
-            int sx = s_col_map[px];
-            s_scaled_row[px] = (uint8_t)((src_row[sx >> 2] >> ((sx & 3) << 1)) & 3);
+            int sx = col_map[px];
+            scaled_row[px] = (uint8_t)((src_row[sx >> 2] >> ((sx & 3) << 1)) & 3);
         }
 
         for (int yy = py0; yy <= py1; yy++) {
@@ -878,8 +915,8 @@ esp_err_t board_rlcd_draw_nes_scaled(const uint8_t *shade, int src_w, int src_h)
             uint8_t local_y = inv & 3U;
             const uint8_t (*rbt)[2] = s_rowbits[local_y][yy & 1];   /* [pair][xph] */
             for (int cp = 0; cp < ST7305_WIDTH / 2; cp++) {
-                uint8_t pair = (uint8_t)((s_scaled_row[cp << 1] << 2) |
-                                         s_scaled_row[(cp << 1) | 1]);
+                uint8_t pair = (uint8_t)((scaled_row[cp << 1] << 2) |
+                                         scaled_row[(cp << 1) | 1]);
                 fb[(uint32_t)cp * FB_HEIGHT_DIV_4 + block_y] |= rbt[pair][cp & 1];
             }
         }

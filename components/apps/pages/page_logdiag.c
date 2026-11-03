@@ -40,6 +40,7 @@
 #include "os_hid.h"
 #include "diag_core.h"  /* 纯逻辑: RC/事件ID/采集链分节解析 (与主机测试共用同一实现) */
 #include "font_zh16.h"
+#include "esp_attr.h"   /* EXT_RAM_BSS_ATTR: 历史缓冲放 PSRAM */
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -458,7 +459,8 @@ static TaskHandle_t s_task = NULL;
 
 /* 历史浏览 */
 static int  s_view = 0;             /* 0=主网格 1=历史列表 2=历史内容 3=分析结论 */
-static char s_hist[24][40];
+/* ★ 2026-11-02: 只有本页打开时才用, 放 PSRAM（960 B）, 不白占内部 RAM。 */
+static EXT_RAM_BSS_ATTR char s_hist[24][40];
 static int  s_hist_n = 0;
 static int  s_hist_sel = 0;
 static char s_text[15][44];
@@ -1354,8 +1356,10 @@ static bool ld_touch(ui_ctx_t *ctx, int x, int y)
         if (x >= cx && x < cx + 120 && y >= cy && y < cy + card_h()) {
             s_sel = i;                                    /* 先选中(选中环立刻可见) */
             if (s_run >= 0) return true;                  /* 采集中不响应卡片 */
+            /* ★ 2026-11-01 linit：采集类卡片**只选中、不自动开跑**，
+             *   必须再按右下角「确认」才真正开始（见 ld_action 的 OS_ACTION_CONFIRM）。
+             *   历史记录是"打开列表"而非"开始采集"，保持点击即进入。 */
             if (s_cards[i].action == 2) { ld_hist_scan(); s_hist_sel = 0; s_view = 1; }
-            else ld_start(ctx, i);
             ctx->needs_redraw = true;
             return true;
         }

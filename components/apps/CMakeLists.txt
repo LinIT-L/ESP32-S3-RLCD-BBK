@@ -12,10 +12,17 @@ idf_component_register(
         "apps_registry.c"
         "theme/r_carousel.c"
         "applock/applock.c"
+        "pages/am_app_core.c"      # 2026-11-03: 统一应用管理核心(发现/身份/状态/动作 唯一来源)
+        "pages/am_core_logic.c"    # 2026-11-03: 核心的纯逻辑部分(可宿主机单测, tests/app_core)
         "pages/am_asset.c"
+        "pages/am_asset_multi.c"   # 2026-10-31: 资源包多文件直接下载(替代 zip 解包)
+        "pages/am_lpk.c"           # 2026-11-01: type=lpk 单文件资源包(下载即完成, 不解压)
+        "pages/am_lpkg.c"          # 2026-11-01: 第三方 LPK 应用安装器(manifest/统一目录/注册表)
+        "pages/am_manifest.c"      # 清单解析 + 路径守卫 (纯 C, 可主机单测)
         "pages/am_lua.c"
         "pages/am_store.c"
         "pages/am_store_json.c"
+        "pages/am_store_state.c"   # 2026-11-01: 商店条目状态/版本比较 (纯 C, 可主机单测)
         "pages/am_store_net.c"
         "os_sources.c"
         "pages/page_app_manager.c"
@@ -31,6 +38,9 @@ idf_component_register(
         "pages/page_lua.c"
         # ↓ Lua 桥模块 (2026-10-02 从 page_lua.c 拆出; 加新 API 去对应模块, 不要往 page_lua.c 堆)
         "lua_bridge/lua_bridge.c"
+        "lua_bridge/lua_sandbox.c"
+        "lua_bridge/lua_path_guard.c"
+        "lua_bridge/lua_quota.c"
         "lua_bridge/luat_lib_consts.c"
         "lua_bridge/luat_lib_gfx.c"
         "lua_bridge/luat_lib_input.c"
@@ -69,12 +79,13 @@ idf_component_register(
         "pages/page_wifiprobe.c"
         "pages/page_winassist.c"
         "pages/page_sdr.c"
+        "pages/page_perfmon.c"   # 性能监视器 (2026-11-02: 从设置页独立出来的内置应用)
         "pages/page_pal.c"
         "pages/sdr_view.c"
     INCLUDE_DIRS "include" "pages" "lua_bridge"
     # ★ 2026-10-13: md_emu 默认停用(省 715KB), 恢复见 os.h 的 LINTOS_ENABLE_MD
     REQUIRES
-        miniz vid_tune os apppack freertos netscan st7305 ui_common input touch_panel audio_player tone_player vibrator engine_manager gam4980 gb_emu gbc_emu nes_emu lavax book_reader wallpapers usb_hid usb_bt usb_net wifi_manager fonts kbd_lib sd_scan board_battery esp_netif lwip spi_flash nvs_flash svc_cfg svc_nvs esp_system bt_ctl web_gamepad usbh_msc vpet virtual_keys board_shim keyvault calc esp_http_client spiffs favorites esp_timer lua espressif__esp-dsp gps net_client espnow sdlpal_port wiki hw_cfg
+        miniz vid_tune os apppack freertos netscan st7305 ui_common input touch_panel audio_player tone_player vibrator engine_manager gam4980 gb_emu gbc_emu nes_emu lavax book_reader wallpapers usb_hid usb_bt usb_net wifi_manager fonts kbd_lib sd_scan board_battery esp_netif lwip spi_flash nvs_flash svc_cfg svc_nvs esp_system bt_ctl web_gamepad usbh_msc vpet virtual_keys board_shim keyvault calc esp_http_client spiffs favorites esp_timer web_core wifi_manager web_files lua espressif__esp-dsp gps net_client espnow sdlpal_port wiki hw_cfg lpk mbedtls
 )
 
 # 与 os 组件保持一致的告警策略 (页面代码原来在 os 组件下, 搬家后需显式继承)

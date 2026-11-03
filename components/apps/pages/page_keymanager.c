@@ -20,7 +20,7 @@
 #include "applock.h"   /* 通用应用锁 (统一 PIN 弹窗) */
 #include "os_hid.h"
 #include "keyboard.h"
-#include "wifi_manager.h"   /* is_connected/get_ip 等 */
+#include "wifi_manager.h"   /* is_connected/get_ip、AP 管理 */
 
 #include "svc_nvs.h"
 #include "svc_cfg.h"
@@ -28,6 +28,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
+#include "web_core.h"      /* ★ 2026-11-01: 统一 HTTP 服务 */
 #include "esp_netif_ip_addr.h"
 #include "lwip/ip4_addr.h"
 #include "dns_server.h"
@@ -815,8 +816,6 @@ static bool km_touch(ui_ctx_t *ctx, int x, int y) {
 
 /* ================= 网页配置 (AP 热点 + HTTP 数据库) ================= */
 static const char KV_AP_SSID[] = "LinTOS-KV";
-static httpd_handle_t s_kv_httpd = NULL;
-static void          *s_kv_dns   = NULL;
 static bool           s_web_on   = false;
 static uint8_t        s_web_key[KEYVAULT_KEY_LEN];
 
@@ -829,25 +828,37 @@ static const char *km_web_html(void)
     ".w{max-width:520px;margin:0 auto;padding:14px}h2{margin:.2em 0}input,select,button{padding:8px;margin:2px;font-size:15px;border-radius:6px;border:0}"
     "input,select{background:#22262e;color:#eee;flex:1;min-width:0}button{background:#2f6fdf;color:#fff;cursor:pointer}button.g{background:#444}"
     "button.r{background:#c0392b}.row{display:flex;gap:4px;margin:4px 0;align-items:center}.item{background:#1a1e26;padding:8px;border-radius:8px;margin:6px 0}"
-    "b{color:#9fd0ff}small{color:#9aa}td{padding:2px 6px}</style></head><body><div class='w'>"
-    "<h2>密钥管理</h2><small id=st></small>"
+    "b{color:#9fd0ff}small{color:#9aa}td{padding:2px 6px}#lerr{color:#f66}</style></head><body><div class='w'>"
+    /* 登录层：先输 PIN 换 token，之后所有请求带 Bearer（原来这里没有任何保护） */
+    "<div id=login><h2>密钥管理</h2><small>请输入设备 PIN 后进入</small>"
+    "<div class='row'><input id=pin type=password placeholder='PIN'><button onclick=doLogin()>进入</button></div>"
+    "<small id=lerr></small></div>"
+    "<div id=app style='display:none'><h2>密钥管理</h2><small id=st></small>"
     "<div class='row'>分类:<select id=cat></select><button class=g onclick=addcat()>+分类</button>"
     "<button class=g onclick=delcat()>-分类</button><button onclick=rencat()>改名</button></div>"
     "<div id=f><div class='row'>网站<input id=g placeholder='网站名'></div>"
     "<div class='row'>账号<input id=a placeholder='账号'></div>"
     "<div class='row'>密码<input id=p placeholder='密码'><button onclick=add()>添加</button></div></div>"
-    "<div id=list></div></div>"
-    "<script>const $=id=>document.getElementById(id),E=encodeURIComponent;"
-    "async function api(u){const r=await fetch(u);return r.json()}async function load(){"
-    "const d=await api('/api/list');$('cat').innerHTML=d.cats.map((c,i)=>'<option value='+i+'>'+c+'</option>').join('');"
+    "<div id=list></div></div></div>"
+    "<script>const $=id=>document.getElementById(id),E=encodeURIComponent;var TOK='';"
+    "function hd(){return TOK?{'Authorization':'Bearer '+TOK}:{}}"
+    /* 相对路径: 页面在 /keys/ 下, api/list → /keys/api/list */
+    "async function api(u,opt){opt=opt||{};opt.headers=Object.assign({},opt.headers||{},hd());"
+    "const r=await fetch(u,opt);if(r.status==401){TOK='';$('app').style.display='none';$('login').style.display='';"
+    "$('lerr').textContent='登录已过期, 请重新输入 PIN';throw 0}return r.json()}"
+    "async function doLogin(){const p=$('pin').value;if(!p){$('lerr').textContent='请输入 PIN';return}"
+    "const r=await fetch('login',{method:'POST',body:p});const j=await r.json();"
+    "if(j&&j.ok){TOK=j.t;$('lerr').textContent='';$('login').style.display='none';$('app').style.display='';load()}"
+    "else{$('lerr').textContent=(j&&j.err=='nopin')?'设备未设置 PIN，请先在掌机 设置 里设置 PIN':'PIN 错误'}}"
+    "async function load(){const d=await api('api/list');$('cat').innerHTML=d.cats.map((c,i)=>'<option value='+i+'>'+c+'</option>').join('');"
     "$('list').innerHTML=d.items.map(x=>'<div class=item><b>'+x.name+'</b> · '+x.account+'<br>密码: '+x.secret"
     "+'<button class=r onclick=del('+x.id+')>删除</button></div>').join('')||'<small>空</small>';$('st').textContent='共 '+d.items.length+' 条'}"
-    "async function add(){await api('/api/add?cat='+$('cat').value+'&g='+E($('g').value)+'&a='+E($('a').value)+'&p='+E($('p').value));load()}"
-    "async function del(id){await api('/api/del?id='+id);load()}"
-    "async function addcat(){let n=prompt('新分类名');if(n)await api('/api/cat?op=add&n='+E(n)),load()}"
-    "async function delcat(){await api('/api/cat?op=del&id='+$('cat').value);load()}"
-    "async function rencat(){let n=prompt('新名', $('cat').selectedOptions[0].text);if(n)await api('/api/cat?op=ren&id='+$('cat').value+'&n='+E(n)),load()}"
-    "load()</script></body></html>";
+    "async function add(){await api('api/add?cat='+$('cat').value+'&g='+E($('g').value)+'&a='+E($('a').value)+'&p='+E($('p').value));load()}"
+    "async function del(id){await api('api/del?id='+id);load()}"
+    "async function addcat(){let n=prompt('新分类名');if(n)await api('api/cat?op=add&n='+E(n)),load()}"
+    "async function delcat(){await api('api/cat?op=del&id='+$('cat').value);load()}"
+    "async function rencat(){let n=prompt('新名', $('cat').selectedOptions[0].text);if(n)await api('api/cat?op=ren&id='+$('cat').value+'&n='+E(n)),load()}"
+    "</script></body></html>";
 }
 
 static esp_err_t km_web_index_handler(httpd_req_t *req)
@@ -943,71 +954,111 @@ static esp_err_t km_web_cat_handler(httpd_req_t *req)
 }
 
 static int s_web_phase = 0;   /* 0=空闲 1=启动中 2=已启动 3=失败 */
+/* ---------- web_core 注册（第二回合） ----------
+ * 三条注册：页面(公开) / 登录(公开) / API(必须 Bearer)。
+ * 原来 api 段完全裸奔（连上热点就能读全部密码），这里补上统一认证。 */
+static esp_err_t km_web_login_handler(httpd_req_t *req);   /* 定义在下面 */
+
+static const httpd_uri_t s_kv_page_uris[] = {
+    { .uri = "/", .method = HTTP_GET, .handler = km_web_index_handler, .user_ctx = NULL },
+};
+static const web_app_t s_kv_page_app = {
+    .name = "keys", .prefix = "/keys",
+    .uris = s_kv_page_uris, .n_uris = 1,
+    .need_auth = false, .is_default = false,
+};
+
+static const httpd_uri_t s_kv_login_uris[] = {
+    { .uri = "/login", .method = HTTP_POST, .handler = km_web_login_handler, .user_ctx = NULL },
+};
+static const web_app_t s_kv_login_app = {
+    .name = "keys_login", .prefix = "/keys",
+    .uris = s_kv_login_uris, .n_uris = 1,
+    .need_auth = false, .is_default = false,
+};
+
+static const httpd_uri_t s_kv_api_uris[] = {
+    { .uri = "/api/list", .method = HTTP_GET, .handler = km_web_list_handler, .user_ctx = NULL },
+    { .uri = "/api/add",  .method = HTTP_GET, .handler = km_web_add_handler,  .user_ctx = NULL },
+    { .uri = "/api/del",  .method = HTTP_GET, .handler = km_web_del_handler,  .user_ctx = NULL },
+    { .uri = "/api/cat",  .method = HTTP_GET, .handler = km_web_cat_handler,  .user_ctx = NULL },
+};
+static const web_app_t s_kv_api_app = {
+    .name = "keys_api", .prefix = "/keys",
+    .uris = s_kv_api_uris, .n_uris = sizeof(s_kv_api_uris) / sizeof(s_kv_api_uris[0]),
+    .need_auth = true,   /* ← 统一 Bearer 校验（原来没有） */
+    .is_default = false,
+};
+
+/* 与收藏夹共用同一个 web_core token，所以 PIN 判定口径必须一致：只认 keyvault 的 PIN。
+ * "没设 PIN" 的情况在 login 里单独给 nopin 错误码，前端提示去掌机设置，
+ * 不在这里放行 —— 否则收藏夹在没 PIN 时会被顺带放进来。 */
+static bool km_pin_check(const char *pin)
+{
+    os_keyvault_init();
+    return os_keyvault_verify_pin(pin) == 0;
+}
+
+/* POST /keys/login  body=PIN → {"ok":true,"t":"<token>"} */
+static esp_err_t km_web_login_handler(httpd_req_t *req)
+{
+    char pin[24] = { 0 };
+    int n = httpd_req_recv(req, pin, sizeof(pin) - 1);
+    if (n <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return web_core_send_err(req, NULL, "body");
+    }
+    pin[n] = 0;
+    os_keyvault_init();
+    if (!os_keyvault_has_pin())
+        return web_core_send_err(req, "401 Unauthorized", "nopin");   /* 设备没设 PIN */
+    char tok[WEB_CORE_TOKEN_LEN + 1];
+    if (!web_core_auth_login(pin, tok, sizeof(tok)))
+        return web_core_send_err(req, "401 Unauthorized", "auth");
+    char out[64];
+    snprintf(out, sizeof(out), "{\"ok\":true,\"t\":\"%s\"}", tok);
+    return web_core_send_json(req, out);
+}
+
+static bool km_web_start_core(void)
+{
+    web_core_auth_set_pin_check(km_pin_check);
+    if (web_core_start(0) != ESP_OK) return false;
+    if (web_core_register(&s_kv_page_app)  != ESP_OK) goto fail;
+    if (web_core_register(&s_kv_login_app) != ESP_OK) goto fail;
+    if (web_core_register(&s_kv_api_app)   != ESP_OK) goto fail;
+    return true;
+fail:
+    web_core_unregister(&s_kv_page_app);
+    web_core_unregister(&s_kv_login_app);
+    web_core_unregister(&s_kv_api_app);
+    web_core_stop();
+    return false;
+}
+
+/* 热点模式：AP 交给 wifi_manager（APSTA，不动已连接的 STA） */
 static void km_web_task(void *arg)
 {
     (void)arg;
-    esp_err_t r;
-    esp_netif_init();
-    r = esp_event_loop_create_default();
-    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) { s_web_phase = 3; vTaskDelete(NULL); return; }
-
-    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (ap_netif == NULL) ap_netif = esp_netif_create_default_wifi_ap();
-
-    wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
-    ic.wifi_task_core_id = 0;
-    r = esp_wifi_init(&ic);
-    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) { s_web_phase = 3; vTaskDelete(NULL); return; }
-
-    wifi_config_t ap;
-    memset(&ap, 0, sizeof(ap));
-    memcpy(ap.ap.ssid, KV_AP_SSID, strlen(KV_AP_SSID));
-    ap.ap.ssid_len = strlen(KV_AP_SSID);
-    ap.ap.channel = 6;
-    ap.ap.max_connection = 4;
-    if (s_pin_plain[0] && strlen(s_pin_plain) >= 8) {   /* 有 PIN(≥8位) → Wi-Fi 密码 = PIN (WPA2) */
-        memcpy(ap.ap.password, s_pin_plain, strlen(s_pin_plain));
-        ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    } else {
-        ap.ap.password[0] = 0;        /* 无/过短 PIN → 开放 (WPA2 需≥8位) */
-        ap.ap.authmode = WIFI_AUTH_OPEN;
+    if (wifi_manager_ap_start(KV_AP_SSID, s_pin_plain, 6, 4, true) != ESP_OK) {
+        ESP_LOGE(TAG, "热点启动失败 ⇒ 密钥服务未启动");
+        s_web_phase = 3;
+        vTaskDelete(NULL);
+        return;
     }
-    ap.ap.pmf_cfg.required = false;
-    if (esp_wifi_set_mode(WIFI_MODE_AP) != ESP_OK ||
-        esp_wifi_set_config(WIFI_IF_AP, &ap) != ESP_OK ||
-        esp_wifi_start() != ESP_OK) { s_web_phase = 3; vTaskDelete(NULL); return; }
-    os_ap_set(true);   /* 状态栏显示 NET 图标 */
+    os_ap_set(true);
     os_keyvault_init();   /* 确保分类已加载, 网页下拉能列出分类 */
-
-    esp_netif_ip_info_t ip = { 0 };
-    IP4_ADDR(&ip.ip, 8, 8, 8, 8); IP4_ADDR(&ip.gw, 8, 8, 8, 8);
-    IP4_ADDR(&ip.netmask, 255, 255, 255, 0);
-    esp_netif_dhcps_stop(ap_netif);
-    esp_netif_set_ip_info(ap_netif, &ip);
-    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
-                           "http://8.8.8.8/", strlen("http://8.8.8.8/"));
-    esp_netif_dhcps_start(ap_netif);
-    dns_server_config_t dc = DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
-    s_kv_dns = start_dns_server(&dc);
-
-    if (s_kv_httpd == NULL) {
-        httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-        cfg.lru_purge_enable = true; cfg.stack_size = 8192;
-        if (httpd_start(&s_kv_httpd, &cfg) == ESP_OK) {
-            httpd_uri_t u;
-            u.user_ctx = NULL;
-            u.method = HTTP_GET; u.uri = "/"; u.handler = km_web_index_handler;
-            httpd_register_uri_handler(s_kv_httpd, &u);
-            u.uri = "/api/list"; u.handler = km_web_list_handler; httpd_register_uri_handler(s_kv_httpd, &u);
-            u.uri = "/api/add";  u.handler = km_web_add_handler;  httpd_register_uri_handler(s_kv_httpd, &u);
-            u.uri = "/api/del";  u.handler = km_web_del_handler;  httpd_register_uri_handler(s_kv_httpd, &u);
-            u.uri = "/api/cat";  u.handler = km_web_cat_handler;  httpd_register_uri_handler(s_kv_httpd, &u);
-        }
+    if (!km_web_start_core()) {
+        wifi_manager_ap_stop();
+        os_ap_set(false);
+        ESP_LOGE(TAG, "HTTP 服务启动失败 ⇒ 密钥服务未启动");
+        s_web_phase = 3;
+        vTaskDelete(NULL);
+        return;
     }
-    s_web_on = true;
-    s_web_phase = (s_kv_httpd != NULL) ? 2 : 3;
-    ESP_LOGI(TAG, "网页配置: 热点 %s 已%s", KV_AP_SSID,
-             (s_kv_httpd != NULL) ? "开启 (http://8.8.8.8)" : "开启失败");
+    s_web_on    = true;
+    s_web_phase = 2;
+    ESP_LOGI(TAG, "网页配置: 热点 %s 已开启 → http://8.8.8.8/keys/", KV_AP_SSID);
     vTaskDelete(NULL);
 }
 
@@ -1030,10 +1081,14 @@ void km_web_stop(ui_ctx_t *ctx)
 {
     (void)ctx;
     if (!s_web_on && s_web_phase == 0) return;
-    if (s_kv_httpd) { httpd_stop(s_kv_httpd); s_kv_httpd = NULL; }
-    if (s_web_mode == 0) {   /* 热点(AP)模式额外清理: DNS + 停WiFi(AP) + 状态栏NET图标 */
-        if (s_kv_dns) { stop_dns_server(s_kv_dns); s_kv_dns = NULL; }
-        esp_wifi_stop();
+    /* 只注销自己 + 减引用；别的网页应用还在线时服务不会停 */
+    web_core_unregister(&s_kv_page_app);
+    web_core_unregister(&s_kv_login_app);
+    web_core_unregister(&s_kv_api_app);
+    web_core_stop();
+    if (!web_core_is_running()) web_core_auth_clear();   /* 服务真停了才作废 token */
+    if (s_web_mode == 0) {   /* 热点模式额外清理: 关热点 + 状态栏NET图标 */
+        wifi_manager_ap_stop();
         os_ap_set(false);
     }
     s_web_on = false;
@@ -1048,23 +1103,15 @@ static void km_web_task_lan(void *arg)
 {
     (void)arg;
     os_keyvault_init();   /* 确保分类已加载 */
-    if (s_kv_httpd == NULL) {
-        httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-        cfg.lru_purge_enable = true; cfg.stack_size = 8192;
-        if (httpd_start(&s_kv_httpd, &cfg) == ESP_OK) {
-            httpd_uri_t u;
-            u.user_ctx = NULL;
-            u.method = HTTP_GET; u.uri = "/"; u.handler = km_web_index_handler;
-            httpd_register_uri_handler(s_kv_httpd, &u);
-            u.uri = "/api/list"; u.handler = km_web_list_handler; httpd_register_uri_handler(s_kv_httpd, &u);
-            u.uri = "/api/add";  u.handler = km_web_add_handler;  httpd_register_uri_handler(s_kv_httpd, &u);
-            u.uri = "/api/del";  u.handler = km_web_del_handler;  httpd_register_uri_handler(s_kv_httpd, &u);
-            u.uri = "/api/cat";  u.handler = km_web_cat_handler;  httpd_register_uri_handler(s_kv_httpd, &u);
-        }
+    if (!km_web_start_core()) {
+        ESP_LOGE(TAG, "HTTP 服务启动失败 ⇒ 密钥服务未启动(LAN)");
+        s_web_phase = 3;
+        vTaskDelete(NULL);
+        return;
     }
-    s_web_on = true;
-    s_web_phase = (s_kv_httpd != NULL) ? 2 : 3;
-    ESP_LOGI(TAG, "IP配置: 密钥服务已%s", (s_kv_httpd != NULL) ? "开启" : "开启失败");
+    s_web_on    = true;
+    s_web_phase = 2;
+    ESP_LOGI(TAG, "IP配置: 密钥服务已开启 → http://<设备IP>/keys/");
     vTaskDelete(NULL);
 }
 

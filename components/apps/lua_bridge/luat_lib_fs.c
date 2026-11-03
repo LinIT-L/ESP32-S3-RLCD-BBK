@@ -131,6 +131,10 @@ static int l_fs_mkdir(lua_State *L) {
     char tmp[256];
     size_t n = strlen(p);
     if (n == 0 || n >= sizeof(tmp)) { lua_pushboolean(L, false); return 1; }
+    /* ⚠ 尾斜杠**不用特判**：FatFs 的路径解析会忽略尾分隔符
+     *   （ff.c create_name: `if (IsTerminator(*p)) cf = NS_LAST;`），
+     *   f_mkdir("/a/b/") 与 f_mkdir("/a/b") 返回同一个结果。
+     *   2026-11-01 曾怀疑"尾斜杠导致 FR_INVALID_NAME"，读源码后证伪，已撤回改动。 */
     memcpy(tmp, p, n + 1);
     for (char *q = tmp + 1; *q; q++) {           /* 从第 2 个字符起, 跳过根 '/' */
         if (*q != '/') continue;

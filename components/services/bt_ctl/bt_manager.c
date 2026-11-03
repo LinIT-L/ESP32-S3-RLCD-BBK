@@ -11,6 +11,7 @@
 #include "bt_map.h"
 #include "bt_kbd.h"
 #include "esp_hid_gap.h"   /* 提供 esp_hid_scan_result_t (官方底层扫描结果结构) */
+#include "esp_attr.h"      /* EXT_RAM_BSS_ATTR: 扫描缓存挪到 PSRAM */
 
 #include <string.h>
 #include <stdlib.h>
@@ -24,6 +25,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"   /* V1.5.x: enable 同步等待初始化任务完成 */
 #include "freertos/timers.h"   /* V1.5.x: 开机自动回连窗口软件定时器 */
+#include "freertos/idf_additions.h"   /* xTaskCreateWithCaps: 按 caps 建任务(内部RAM动态栈) */
+#include "esp_heap_caps.h"           /* MALLOC_CAP_INTERNAL */
 
 static const char *TAG = "bt_manager";
 
@@ -82,7 +85,7 @@ static void bt_reconnect_task(void *arg);   /* 前向声明: init 里启动, 定
 static bool s_last_connect_was_new = false;
 static bool s_pending_new = false;   /* 发起连接时判定"是否新设备", 连接成功后在 on_connected 消费 */
 
-static bt_device_t s_history[BT_HISTORY_MAX];
+EXT_RAM_BSS_ATTR static bt_device_t s_history[BT_HISTORY_MAX];   /* 只在扫描/回连时用 */
 static int s_history_count = 0;
 
 static phys_t s_map[FUNC_MAX];
@@ -210,9 +213,11 @@ static void bt_conn_failed(const char *why, bool allow_reset)
 static char  s_last_conn_name[32] = {0};
 static bool  s_last_conn_name_valid = false;
 
-/* 扫描结果缓存 (转发给上层回调) */
+/* 扫描结果缓存 (转发给上层回调)
+ * ★ 2026-11-02: 1.6KB, 只在"扫描那几秒"里用, 平时纯占内部 RAM ⇒ 放 PSRAM。
+ *   无 DMA、不进 ISR, 拷贝发生在蓝牙回调任务里, 安全。 */
 #define BT_SCAN_CACHE_MAX 40
-static bt_device_t s_dev_cache[BT_SCAN_CACHE_MAX];
+static EXT_RAM_BSS_ATTR bt_device_t s_dev_cache[BT_SCAN_CACHE_MAX];
 static int s_dev_cache_count = 0;
 
 /* 回调 */
@@ -462,7 +467,7 @@ typedef struct {
     gpm_ent_t e[GPM_MAX];
 } gpm_t;
 
-static gpm_t s_gpm;
+EXT_RAM_BSS_ATTR static gpm_t s_gpm;   /* 手柄映射表: 只有接手柄时读, 待机不占内部 RAM */
 
 static void gpm_save(void)
 {
@@ -1263,24 +1268,27 @@ void bt_manager_init(void)
     s_init_task_running = false;
     if (s_init_done_sem) xSemaphoreGive(s_init_done_sem);   /* 通知 enable 等待方 */
 
-    /* 本函数被 bt_manager_enable 作为 "bt_init" 任务入口运行. FreeRTOS 任务函数禁止返回,
-     * 完成初始化后必须删除自身 (否则报 "Task should not return" abort 重启). */
-    vTaskDelete(NULL);
+    /* 本函数被 bt_manager_start_init_task 作为 "bt_init" 任务入口运行.
+     * FreeRTOS 任务函数禁止返回, 完成初始化后必须删除自身 (否则 "Task should not return" 重启).
+     * ★ 用 WithCaps 版本: 顺带释放 xTaskCreateWithCaps 分配的栈(内部 RAM)。 */
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* ========================================================================
- *  初始化任务静态栈 (内部 RAM)
- *  app_board.c 开机时用 xTaskCreateStatic 以 bt_manager_init 作入口创建 bt_init 任务.
- *  bt_manager_init 会调用 esp_bt_controller_init/esp_hid_gap_init, 期间禁用 cache,
- *  故该栈 MUST 放内部 RAM (PSRAM 栈会断言重启). 由 get_init_stack 共享给 app_board.
+ *  初始化任务栈：动态分配，且**必须内部 RAM**
+ *  bt_manager_init 会调 esp_bt_controller_init/esp_hid_gap_init，期间 cache 被禁；
+ *  PSRAM 栈会触发 esp_task_stack_is_sane_cache_disabled() 断言 ⇒ 不能放 PSRAM。
+ *  ★ 2026-11-02 linit: 原来是 static 数组常驻 4096B，可 bt_init 初始化完就自删了，
+ *    之后这 4KB 一直是死占用。改成 xTaskCreateWithCaps(MALLOC_CAP_INTERNAL)，
+ *    任务删除时随栈一起归还堆 —— 峰值不变，常驻降为 0。
  * ======================================================================== */
-#define INIT_TASK_STACK_WORDS 4096   /* 16KB, 内部 RAM */
-static StackType_t s_init_task_stack[INIT_TASK_STACK_WORDS];
+#define BT_INIT_STACK_BYTES 4096     /* 字节(StackType_t=uint8_t) */
 
-StackType_t *bt_manager_get_init_stack(int *words_out)
+bool bt_manager_start_init_task(void)
 {
-    if (words_out) *words_out = INIT_TASK_STACK_WORDS;
-    return s_init_task_stack;
+    return xTaskCreateWithCaps((TaskFunction_t)bt_manager_init, "bt_init",
+                               BT_INIT_STACK_BYTES, NULL, 1, NULL,
+                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) == pdPASS;
 }
 
 const char *bt_manager_get_status(void)
@@ -1625,13 +1633,9 @@ void bt_manager_enable(void)
         if (!s_inited) s_bt_on = false;
         return;
     }
-    int words = 0;
-    StackType_t *stack = bt_manager_get_init_stack(&words);
-    static StaticTask_t bt_task_buf;
     xSemaphoreTake(s_init_done_sem, 0);   /* 丢弃上一轮残留信号, 避免假完成 */
     s_init_task_running = true;
-    if (!stack || !xTaskCreateStatic((TaskFunction_t)bt_manager_init, "bt_init",
-                                     words, NULL, 1, stack, &bt_task_buf)) {
+    if (!bt_manager_start_init_task()) {
         s_init_task_running = false;
         s_bt_on = false;
         ESP_LOGE(TAG, "bt_init 任务创建失败 ⇒ 蓝牙不可用");

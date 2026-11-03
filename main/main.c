@@ -304,6 +304,14 @@ static void __attribute__((unused)) gps_selftest_task(void *arg)
 
 static void os_shell_loop(ui_ctx_t *ctx) {
     ESP_LOGI(TAG, "OS 主循环 (自适应帧率: 脏帧 1ms / 空闲 16ms)");
+    /* ★★★ 2026-11-02 linit「串口日志可以临时全部关闭」★★★
+     *   进入主循环后把 ESP_LOG 全关。省的是三处真实开销：
+     *     ① 每条日志的格式化 + UART/USB 发送（115200 下几行/秒就是持续占用）；
+     *     ② svc_log 钩子把日志刷进 SD 卡（SD 写是会唤醒卡、拉高电流的）；
+     *     ③ 后台组件被自己的日志唤醒、反复进出调度。
+     *   ⚠ printf 不走 esp_log ⇒ remcon 命令（heap/uptime/bat/pm/tasks…）照常回结果；
+     *     真需要看日志时串口发 `loglevel info` 即可恢复，重启后仍是静默。 */
+    esp_log_level_set("*", ESP_LOG_NONE);
     uint32_t last_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     uint32_t last_input_ms = 0;   /* 最近输入时间 (管家空闲检测用) */
     bool     was_ss = false;      /* 上一圈是否在屏保 (跳变检测, 见下) */
@@ -787,6 +795,10 @@ static void os_boot_shell(st7305_handle_t *lcd, app_board_t *board) {
          *   结束即卸 UART(内部 RAM 归零) —— 全程后台, 不占启动路径、不常驻。 */
         /* ★ 2026-10-27: 由一次性"开机停靠"改成**常驻管家** —— 模块被噪声唤醒/上次没睡成时
          *   会自动再送 PMREQ; 应用在用(app.gps.start)时让路。见 board_gps_guard_task 注释。 */
+        /* ⛔ 2026-11-01 实测失败，已回退：把 gps_guard 栈改成 PSRAM 静态栈后，
+         *   设备在进桌面后立刻 rst:0xc 无限重启（无 panic 日志，属主动复位路径）。
+         *   原因：该任务链里有必须内部 RAM 的操作（UART 驱动/ISR 交互或 NVS），
+         *   PSRAM 栈在 cache 关闭窗口被访问即失效。**GPS 栈保持内部 4KB**。 */
         if (xTaskCreate(board_gps_guard_task, "gps_guard", 4096, board, 2, NULL) != pdPASS)
             app_board_init_gps(board);   /* 建任务失败就退回同步(至少功能不丢) */
     }
@@ -868,6 +880,19 @@ static void boot_ts(const char *step)
 void app_main(void)
 {
     boot_ts("app_main 入口");
+
+#ifdef LINTOS_LAVAX_BENCH
+    /* LavaX VM 自动测试入口（仅 -DLINTOS_LAVAX_BENCH=1 的构建里存在）。
+     * 放在外设初始化之前：测试不碰屏幕/触摸/电池，只测 VM。
+     * 跑完**继续正常启动** —— 不要在这里 for(;;) 挂住：
+     *   死循环会让后续代码变成不可达，gc-sections 顺势把 os/apps 等组件
+     *   整个剔掉，而 lavax 的 platform.c 仍引用 apps 提供的符号，链接直接失败。
+     * 外部用 esp-emu --exit-on "BENCH DONE" 在测试结束时退出即可。 */
+    {
+        void lavax_bench_run(void);
+        lavax_bench_run();
+    }
+#endif
     /* 关机唤醒门控 —— 必须最先执行: 手动关机唤醒时要求 PWR 键保持按住 ≥0.5s,
      * 不足(碰一下)判为误触, 直接回深睡(不返回); 自动关机 / 上电启动直接放行。 */
     power_mgr_wake_gate();

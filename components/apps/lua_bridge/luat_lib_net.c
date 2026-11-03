@@ -62,6 +62,50 @@ static int l_net_http_get(lua_State *L) {
     return 0;
 }
 
+/* ---- app.net.http_url(url[, timeout[, max_bytes]]) → body / nil, status
+ *
+ * ★ 2026-10-31: 为什么加它 (而不是继续用 http_get):
+ *   原来 http_get(host, port, path) 把 scheme 写死成 'http' —— 也就是说 Lua 应用
+ *   根本发不出 HTTPS 请求。而 net_client 本身是带 `esp_crt_bundle_attach` 的
+ *   (证书校验在 C 层是真的在做), 只是 Lua 这层把 https 挡住了。
+ *   现在: 传完整 URL, https 走证书校验 (不提供"跳过校验"的开关, 按项目安全规则)。
+ *
+ *   安全约定:
+ *     · 不接受 http:// 之外的明文降级参数, 也不返回任何响应头 —— 脚本拿不到 Cookie,
+ *       避免把会话凭据带进 Lua 堆里。
+ *     · 超时由调用方给 (默认 5s, 上限 15s), 并且**调用方负责不要在主循环里频繁调**;
+ *       这是同步接口, 会阻塞当前任务。
+ *     · url 必须是 http:// 或 https:// 开头, 其它 scheme 直接拒绝 (不做别名的协议转发)。
+ *   返回: 成功 → body, http 状态码; 失败 → nil, 0。
+ */
+static int l_net_http_url(lua_State *L) {
+    const char *url = luaL_checkstring(L, 1);
+    int timeout = (int)luaL_optinteger(L, 2, 5000);
+    if (timeout <= 0) timeout = 5000;
+    if (timeout > 15000) timeout = 15000;                 /* 上限: 别让一个脚本把界面卡死一分钟 */
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        lua_pushnil(L);
+        lua_pushinteger(L, 0);
+        return 2;
+    }
+    EXT_RAM_BSS_ATTR static char body[4097];               /* 同 http_get: 搬 PSRAM */
+    netc_req_t r = { 0 };
+    r.url = url;
+    r.timeout_ms = timeout;
+    r.body = body; r.body_cap = sizeof(body);
+    if (!netc_start(&r)) { lua_pushnil(L); lua_pushinteger(L, 0); return 2; }
+    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    while (netc_busy() && (uint32_t)(esp_timer_get_time() / 1000) - t0 < (uint32_t)timeout + 2000)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    int n = (netc_state() == NETC_DONE) ? netc_len() : 0;
+    int code = netc_http();                                /* 0 = 没拿到状态码 */
+    netc_reset();
+    if (n <= 0) { lua_pushnil(L); lua_pushinteger(L, code); return 2; }
+    lua_pushlstring(L, body, (size_t)n);
+    lua_pushinteger(L, code);
+    return 2;
+}
+
 /* ---- app.net.ping(): 逐次 ICMP echo, 每次一个独立完整会话(count=1, 等 on_ping_end 才删会话) ---- */
 typedef struct { volatile int done; volatile int ok; volatile uint32_t rtt; } lua_ping_ctx_t;
 static lua_ping_ctx_t s_ping_ctx;
@@ -280,6 +324,7 @@ void lua_mod_net_register(lua_State *L)
     lua_pushcfunction(L, l_net_mirrors);         lua_setfield(L, -2, "mirrors");
     lua_pushcfunction(L, l_net_get_ip);          lua_setfield(L, -2, "get_ip");
     lua_pushcfunction(L, l_net_http_get);        lua_setfield(L, -2, "http_get");
+    lua_pushcfunction(L, l_net_http_url);        lua_setfield(L, -2, "http_url");   /* ★ 2026-10-31: 支持 https(带证书校验) */
     lua_pushcfunction(L, l_net_fetch_start);     lua_setfield(L, -2, "fetch_start");
     lua_pushcfunction(L, l_net_fetch_poll);      lua_setfield(L, -2, "fetch_poll");
     lua_pushcfunction(L, l_net_fetch_got);       lua_setfield(L, -2, "fetch_got");

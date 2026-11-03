@@ -48,7 +48,12 @@ static struct {
     int   count;
 
     FILE      *idx;              /* index.bin 常驻句柄：二分/取标题不再每次 open */
-    char      *text;             /* PSRAM: 当前文章纯文本 */
+    FILE      *py;               /* py.bin  常驻句柄（全拼）—— FATFS 每次 open 都要走目录 */
+    FILE      *pyi;              /* pyi.bin 常驻句柄（首字母）*/
+    uint8_t   *comp;             /* PSRAM: 压缩块缓冲（跨文章复用，不缩容）*/
+    size_t     comp_cap;
+    char      *text;             /* PSRAM: 当前文章纯文本（跨文章复用，不缩容）*/
+    size_t     text_cap;
     wiki_ln_t *line;             /* PSRAM: 每行 (起点, 长度) */
     int        nlines;
     int        lcap;
@@ -187,7 +192,10 @@ int wiki_open(const char *dir) {
 
 void wiki_close(void) {
     if (S.idx) { fclose(S.idx); S.idx = NULL; }
-    ps_free(S.text); S.text = NULL;
+    if (S.py)  { fclose(S.py);  S.py  = NULL; }
+    if (S.pyi) { fclose(S.pyi); S.pyi = NULL; }
+    ps_free(S.text); S.text = NULL; S.text_cap = 0;
+    ps_free(S.comp); S.comp = NULL; S.comp_cap = 0;
     ps_free(S.line); S.line = NULL;
     S.nlines = S.lcap = 0;
     S.open = false;
@@ -221,12 +229,29 @@ static int lower_bound(const char *q, size_t qlen) {
 int wiki_search(const char *q, wiki_hit_t *out, int max) {
     if (!wiki_is_open() || !q || !q[0] || !out || max <= 0) return 0;
     size_t qlen = strlen(q);
+
+    /* ★ P1 修复（2026-10-31）：栈越界读。
+     *
+     * 原代码这里是 `memcmp(t, q, qlen)`，而 `t` 只有 WIKI_TITLE_MAX(=64) 字节，
+     * qlen 来自 Lua 字符串、没有任何上限 —— 查询 ≥65 字节就会把栈读穿。
+     * （只读不写，不会立刻崩，但属内存安全违规，ASan 必报 heap/stack-buffer-overflow。）
+     *
+     * 正解不是"截断查询"，而是语义上就无解：
+     *   索引里的标题最长为 WIKI_TITLE_MAX-1 字节（read_rec 会强制 title[63]=0，
+     *   strnlen 也封顶 64），所以任何长度 ≥64 字节的查询都不可能成为
+     *   某条标题的前缀 —— 唯一正确结果就是"零匹配"。
+     *
+     * 这样既消除越界，又不改变任何长度 ≤63 字节查询的语义。
+     * UTF-8 多字节也不会被从中间切断（因为根本不截断）。 */
+    if (qlen > WIKI_TITLE_MAX - 1) return 0;
+
     int id = lower_bound(q, qlen);
     int n = 0;
     char t[WIKI_TITLE_MAX];
     uint32_t c, o, cl, ul;
     for (; id < S.count && n < max; id++) {
         if (!read_rec(id, t, &c, &o, &cl, &ul)) break;
+        /* 此处 qlen ≤ 63，memcmp 读 t 的前 qlen 字节，永不越过 64 字节缓冲 */
         if (memcmp(t, q, qlen) != 0) break;          /* 前缀不再匹配，收工 */
         out[n].id = id;
         memcpy(out[n].title, t, WIKI_TITLE_MAX);
@@ -271,6 +296,25 @@ int wiki_titles(int from, int n, wiki_hit_t *out) {
 #define PY_KEY 60
 #define PY_REC 64
 
+/* 拼音索引句柄：打开一次就常驻，与 index.bin 同样待遇。
+ * FATFS 每次 open 都要走目录查找，连续搜索时是明显开销。
+ * wiki_open() 会先 wiki_close()，所以换库时旧句柄一定被关掉。 */
+static FILE *py_handle(bool initials) {
+    FILE **slot = initials ? &S.pyi : &S.py;
+    if (*slot) return *slot;
+    char path[PATH_CAP];
+    snprintf(path, sizeof(path), "%s/%s", S.dir, initials ? "pyi.bin" : "py.bin");
+    *slot = fopen(path, "rb");
+    return *slot;
+}
+
+/* 出错/卡被拔掉时丢弃句柄：下次调用会重新 fopen，
+ * 不会一直卡在一个已经失效的 FILE* 上。 */
+static void py_drop(bool initials) {
+    FILE **slot = initials ? &S.pyi : &S.py;
+    if (*slot) { fclose(*slot); *slot = NULL; }
+}
+
 int wiki_search_py(const char *q, int initials, wiki_hit_t *out, int max) {
     if (!wiki_is_open() || !q || !q[0] || !out || max <= 0) return 0;
 
@@ -285,29 +329,29 @@ int wiki_search_py(const char *q, int initials, wiki_hit_t *out, int max) {
     key[ql] = 0;
     if (ql == 0) return 0;
 
-    char path[PATH_CAP];
-    snprintf(path, sizeof(path), "%s/%s", S.dir, initials ? "pyi.bin" : "py.bin");
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END);
+    FILE *f = py_handle(initials != 0);
+    if (!f) return 0;                                /* 没生成拼音索引：安静退化 */
+
+    if (fseek(f, 0, SEEK_END) != 0) { py_drop(initials != 0); return 0; }
     long sz = ftell(f);
+    if (sz < PY_REC) return 0;                       /* 空索引：留句柄，下次还能用 */
     int n = (int)(sz / PY_REC);
-    if (n <= 0) { fclose(f); return 0; }
 
     uint8_t rec[PY_REC];
     int lo = 0, hi = n - 1, at = n;
     while (lo <= hi) {
         int mid = lo + (hi - lo) / 2;
-        if (fseek(f, (long)mid * PY_REC, SEEK_SET) != 0) break;
-        if (fread(rec, 1, PY_REC, f) != PY_REC) break;
+        if (fseek(f, (long)mid * PY_REC, SEEK_SET) != 0) { py_drop(initials != 0); return 0; }
+        if (fread(rec, 1, PY_REC, f) != PY_REC)          { py_drop(initials != 0); return 0; }
+        /* key 最多 PY_KEY-1=59 字节，rec 是 64 字节记录，ql ≤ 59 ⇒ 不越界 */
         if (memcmp(rec, key, ql) < 0) lo = mid + 1;
         else { at = mid; hi = mid - 1; }
     }
 
     int got = 0;
     for (int i = at; i < n && got < max; i++) {
-        if (fseek(f, (long)i * PY_REC, SEEK_SET) != 0) break;
-        if (fread(rec, 1, PY_REC, f) != PY_REC) break;
+        if (fseek(f, (long)i * PY_REC, SEEK_SET) != 0) { py_drop(initials != 0); break; }
+        if (fread(rec, 1, PY_REC, f) != PY_REC)          { py_drop(initials != 0); break; }
         if (memcmp(rec, key, ql) != 0) break;        /* 前缀不再匹配 */
         uint32_t id;
         memcpy(&id, rec + PY_KEY, 4);
@@ -316,7 +360,7 @@ int wiki_search_py(const char *q, int initials, wiki_hit_t *out, int max) {
         out[got].id = (int)id;
         got++;
     }
-    fclose(f);
+    /* 句柄常驻，这里不 fclose */
     return got;
 }
 
@@ -573,6 +617,22 @@ static int layout_lines(char *t, size_t n) {
 
 /* ------------------------------------------------------------------ 载入 */
 
+/* 保证 *p 至少有 need 字节，跨文章复用同一块 PSRAM。
+ *
+ * 只增不缩：缩容会导致「大小交替的两篇文章」反复 malloc/free，在 PSRAM 上打出碎片。
+ * 失败时 *p 保持原样 —— 旧缓冲仍然有效，调用方不会拿到悬空指针。 */
+static bool ensure_buf(void **p, size_t *cap, size_t need) {
+    if (*p && *cap >= need) return true;
+    size_t want = (need + 4095u) & ~(size_t)4095u;     /* 4KB 对齐，减少抖动 */
+    if (want < need) return false;                      /* 加法溢出 */
+    void *np = ps_malloc(want);
+    if (!np) return false;                              /* 旧缓冲不动 */
+    ps_free(*p);
+    *p = np;
+    *cap = want;
+    return true;
+}
+
 int wiki_load(int id) {
     if (!wiki_is_open()) return -1;
     if (id < 0 || id >= S.count) return -2;
@@ -601,22 +661,39 @@ int wiki_load(int id) {
     memcpy(&h_clen, hdr + 8, 4);
     if (h_ulen != ulen || h_clen != clen) { fclose(f); return -5; }
 
-    uint8_t *comp = ps_malloc(clen);
-    char    *raw  = ps_malloc((size_t)ulen + 1);
-    if (!comp || !raw) {
-        ps_free(comp); ps_free(raw); fclose(f);
-        ESP_LOGE(TAG, "PSRAM 不足：要 %u + %u 字节", (unsigned)clen, (unsigned)ulen);
+    /* 峰值 = 压缩块 clen + 解压后 ulen（+1 放结尾 NUL）。
+     * 分配之前先跟实际可用的 PSRAM 最大连续块比一遍：与其让 malloc 失败后
+     * 只说"PSRAM 不足"，不如一开始就说清"要多少、最多能给多少"。 */
+    size_t need = (size_t)clen + (size_t)ulen + 1;
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    if (largest && need > largest) {
+        fclose(f);
+        ESP_LOGE(TAG, "PSRAM 不足：需 %u B（clen %u + ulen %u），最大连续块 %u B",
+                 (unsigned)need, (unsigned)clen, (unsigned)ulen, (unsigned)largest);
         return -8;
     }
+
+    if (!ensure_buf((void **)&S.comp, &S.comp_cap, clen) ||
+        !ensure_buf((void **)&S.text, &S.text_cap, (size_t)ulen + 1)) {
+        fclose(f);
+        ESP_LOGE(TAG, "PSRAM 分配失败：要 %u + %u 字节", (unsigned)clen, (unsigned)ulen);
+        return -8;
+    }
+    uint8_t *comp = S.comp;
+    char    *raw  = S.text;
+
     size_t rd = fread(comp, 1, clen, f);
     fclose(f);
-    if (rd != clen) { ps_free(comp); ps_free(raw); return -6; }
+    if (rd != clen) { S.nlines = 0; return -6; }
 
     size_t out = 0;
     int rc = lz4_dec_block(comp, clen, (uint8_t *)raw, ulen, &out);
-    ps_free(comp);
+    /* comp 不再释放：留在 S.comp 里给下一篇复用。峰值仍是 clen+ulen，与原实现相同。 */
     if (rc != 0 || out != ulen) {
-        ps_free(raw);
+        /* ★ 复用的代价：raw 就是 S.text，此时内容已经被写坏。
+         *   必须把行表清零，绝不能让调用方以为还能读到上一篇的正文。
+         *   缓冲本身不释放（下次接着复用），所以也不存在悬空指针。 */
+        S.nlines = 0;
         ESP_LOGE(TAG, "解压失败 id=%d rc=%d out=%u/%u", id, rc, (unsigned)out, (unsigned)ulen);
         return -7;
     }
@@ -628,10 +705,9 @@ int wiki_load(int id) {
     { extern void wiki_dbg(const char*, size_t); wiki_dbg(raw, tlen); }
 #endif
 
-    ps_free(S.text);
-    S.text = raw;                       /* 直接接管，省一次 1.7MB 拷贝 */
+    /* raw 就是 S.text 本身 —— 复用后不需要"接管"这一步，也就省掉了每次 1.7MB 的拷贝 */
     if (layout_lines(S.text, tlen) < 0) {
-        ps_free(S.text); S.text = NULL; S.nlines = 0;
+        S.nlines = 0;                    /* 行表满了：正文作废，但缓冲留着复用 */
         return -8;
     }
     return S.nlines;

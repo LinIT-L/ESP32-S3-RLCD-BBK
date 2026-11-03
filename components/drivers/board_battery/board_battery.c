@@ -2,10 +2,12 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_attr.h"       /* EXT_RAM_BSS_ATTR: 诊断记录放 PSRAM */
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -13,6 +15,7 @@
 #include "nvs_flash.h"      /* 一个月电池日档持久化 (跨天写一次) */
 #include "driver/gpio.h"
 #include "board_pins.h"     /* board_pins_get()->chrg: 充电中检测脚 */
+#include "battery_model.h"  /* ★ 2026-10-31: 纯算法层 (滤波/曲线/稳定/充电识别) */
 
 static const char *TAG = "board_battery";
 
@@ -111,149 +114,84 @@ static void bat_div_load(void)
 #define BOARD_BATTERY_FULL_MV         4100
 #define BOARD_BATTERY_EMPTY_MV        3300
 
-/* ==== ★★ "满电压" = 最近 30 天的电压峰值 (linit 2026-10-14 定案) ★★
- * 需求原话: "我需要一个月以内电压最高状态 作为电池充满状态。"
- * 做法: 按"天"记电压峰值, 环形保留最近 31 个槽位; 百分比基准 = 窗口内的**最高值**。
- *   ⇒ 每次充电到顶, 峰值被自然抬高; 超过 30 天的老峰值自动过期掉出窗口, 不会被旧数据长期绑架。
- * 天的来源: **RTC 计时器** `esp_rtc_get_time_us()` —— 深睡期间继续走, 只有全断电才归零
- *   (那时窗口本就该重来, 所以状态放 RTC 内存就够, 不需要 NVS)。
- *   ⛔ 不用墙上时钟: 本机没有 RTC 后备电池, 断电后 `time()` 会回到 1970。
- * 护栏: 峰值 < 4000mV 时不认 (说明这段时间压根没充过电), 退回固定基准 4100mV。 */
-#define BAT_WIN_DAYS      31          /* 窗口 = 最近 31 天 */
-#define BAT_WIN_MIN_MV    4000        /* 峰值下限: 低于此值不足以当"满" */
-#define BAT_WIN_MAX_MV    4320        /* 单点上限: 超过判为异常读数, 丢弃 */
-#define BAT_WIN_MAGIC     0x42415457u /* "BATW": 校验 RTC 内存是否为本模块写过 */
-
-typedef struct {
-    uint32_t magic;
-    uint32_t day[BAT_WIN_DAYS];   /* 各槽的"日号+1"; 0 = 空槽 (日号从 0 起, 故 +1 避开 0) */
-    uint16_t mv [BAT_WIN_DAYS];   /* 各槽当天的电压峰值 (mV) */
-    uint16_t mvmin[BAT_WIN_DAYS]; /* 各槽当天的电压谷值 (mV) —— 一个月日档用 */
-} bat_win_t;
-
-/* 日档持久化: ns/key, 只在跨天时写一次 (一个月 30 次, 无磨损顾虑) */
-#define BAT_DAY_NVS_NS   "batcal"
-#define BAT_DAY_NVS_KEY  "daywin"
-
-static RTC_NOINIT_ATTR bat_win_t s_win;
-
-static uint32_t bat_day_now(void)
-{
-    return (uint32_t)(esp_rtc_get_time_us() / 86400000000ull);   /* 天 */
-}
-
-/* ---- 一个月日档: NVS 读写 (每天一条 min/max; 只在跨天写, 一个月 ~30 次) ---- */
-static void bat_days_save(void)
-{
-    if (s_win.magic != BAT_WIN_MAGIC) return;
-    nvs_handle_t h;
-    if (nvs_open(BAT_DAY_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    if (nvs_set_blob(h, BAT_DAY_NVS_KEY, (const void *)&s_win, sizeof(s_win)) == ESP_OK) nvs_commit(h);
-    nvs_close(h);
-}
-
-static void bat_days_load(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(BAT_DAY_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
-    bat_win_t tmp;
-    size_t len = sizeof(tmp);
-    if (nvs_get_blob(h, BAT_DAY_NVS_KEY, &tmp, &len) == ESP_OK &&
-        len == sizeof(tmp) && tmp.magic == BAT_WIN_MAGIC) {
-        memcpy((void *)&s_win, &tmp, sizeof(s_win));   /* 断电后恢复一个月日档 */
-        int ok = 0;
-        uint32_t d1 = bat_day_now() + 1;
-        for (int i = 0; i < BAT_WIN_DAYS; i++)
-            if (s_win.day[i] && d1 >= s_win.day[i] && (d1 - s_win.day[i]) < BAT_WIN_DAYS) ok++;
-        ESP_LOGI(TAG, "恢复电池日档: %d 天有效 (最长 %d 天)", ok, BAT_WIN_DAYS);
-    }
-    nvs_close(h);
-}
-
-/* 每次**真采样**调一次: 把当天峰值抬到当前读数 (只记"够高"的读数, 低电量不参与) */
-static void bat_win_add(uint16_t mv)
-{
-    if (mv < BAT_WIN_MIN_MV || mv > BAT_WIN_MAX_MV) return;
-    if (s_win.magic != BAT_WIN_MAGIC) { memset(&s_win, 0, sizeof(s_win)); s_win.magic = BAT_WIN_MAGIC; }
-    uint32_t d1 = bat_day_now() + 1;              /* +1: 0 留作"空槽"标记 */
-    int slot = (int)((d1 - 1) % BAT_WIN_DAYS);
-    if (s_win.day[slot] != d1) {                 /* 新的一天: 重开, 并把刚结束的一天落盘 */
-        s_win.day[slot]   = d1;
-        s_win.mv[slot]    = mv;
-        s_win.mvmin[slot] = mv;
-        bat_days_save();
-    } else {
-        if (mv > s_win.mv[slot])    s_win.mv[slot]    = mv;   /* 同一天: 抬峰 */
-        if (mv < s_win.mvmin[slot]) s_win.mvmin[slot] = mv;   /* 同一天: 压谷 */
-    }
-}
-
-/* 窗口内 (最近 BAT_WIN_DAYS 天) 的最高电压; 0 = 窗口里没有有效数据 */
-static uint16_t bat_win_full_mv(void)
-{
-    if (s_win.magic != BAT_WIN_MAGIC) return 0;
-    uint32_t d1 = bat_day_now() + 1;
-    uint16_t best = 0;
-    for (int i = 0; i < BAT_WIN_DAYS; i++) {
-        if (s_win.day[i] == 0) continue;
-        if (d1 < s_win.day[i]) continue;                                  /* 日号来自上一次上电 → 过期 */
-        if ((d1 - s_win.day[i]) >= BAT_WIN_DAYS) continue;                /* 超过窗口 → 过期 */
-        if (s_win.mv[i] > best) best = s_win.mv[i];
-    }
-    return best;
-}
-
-/* 取日档 (旧→新; day = 日号, 非日历日期 —— 计时走 RTC, 断电重来) */
-int board_battery_days_get(bat_day_t *out, int max)
-{
-    if (out == NULL || max <= 0 || s_win.magic != BAT_WIN_MAGIC) return 0;
-    uint32_t d1 = bat_day_now() + 1;
-    bat_day_t tmp[BAT_WIN_DAYS];
-    int c = 0;
-    for (int i = 0; i < BAT_WIN_DAYS; i++) {
-        if (s_win.day[i] == 0 || d1 < s_win.day[i]) continue;
-        if ((d1 - s_win.day[i]) >= BAT_WIN_DAYS) continue;
-        tmp[c].day    = s_win.day[i] - 1;
-        tmp[c].min_mv = s_win.mvmin[i];
-        tmp[c].max_mv = s_win.mv[i];
-        c++;
-    }
-    for (int i = 1; i < c; i++) {                 /* 按日号插入排序 */
-        bat_day_t k = tmp[i];
-        int j = i - 1;
-        while (j >= 0 && tmp[j].day > k.day) { tmp[j + 1] = tmp[j]; j--; }
-        tmp[j + 1] = k;
-    }
-    int n = (c < max) ? c : max;
-    for (int i = 0; i < n; i++) out[i] = tmp[i];
-    return n;
-}
-
-static uint32_t battery_full_mv(void)
-{
-    uint16_t w = bat_win_full_mv();
-    return (w >= BAT_WIN_MIN_MV) ? w : BOARD_BATTERY_FULL_MV;
-}
+/* ==== 满/空电压口径（固定，不做动态锚点）====
+ * ★ 2026-10-31 linit「精简」: 删掉"最近 30 天电压峰值当满电基准"的动态锚点。
+ *   理由（实测证据）: 锚点由**带载/充电时**的读数顶高（本次实测 4116mV），
+ *   而静置满电只有 4.10~4.15V ⇒ 满电基准被抬高 ⇒ 平时读数系统性偏低，
+ *   而且这个偏差会随"最近一个月充没充过电"漂移，用户完全无从判断。
+ *   现在固定 4100/3300，口径唯一、可复现；老电芯容量衰减不再靠锚点遮掩。
+ * ⚠ 代价: 老电芯可能永远显示不足 100%（那就是真实情况，不再"修饰"）。
+ */
+#define BOARD_BATTERY_FULL_MV         4100
+#define BOARD_BATTERY_EMPTY_MV        3300
 
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 static adc_cali_handle_t s_cali_handle = NULL;
 static bool s_calibrated = false;
 static bool s_initialized = false;
 
+/* ★ 2026-10-31 精简: 只保留**充电脚去抖**这一个状态。
+ *   原先是四个（9 点滤波 / 5 点峰窗 / SOC 稳定器 / 充电趋势），
+ *   现在电压每轮独立算、电量直接查表，跨轮状态清零 ⇒ 休眠唤醒天然没有旧数据。 */
+static bm_chrg_db_t s_chg;
+
+/* 诊断快照 (remcon `bat` 用; 纯只读, 不参与控制) */
+static struct {
+    uint16_t raw_avg;     /* 本轮 8 次原始采样均值 (去极值后) */
+    uint16_t raw_min, raw_max;
+    uint16_t pin_mv;      /* ADC 校准后的脚上电压 */
+    uint16_t vbat_mv;     /* ×分压比后的电池电压 */
+    uint8_t  soc;         /* 查表电量 */
+    uint8_t  flags;       /* 异常标记, 见 BATF_* */
+    bool     charging;
+} s_diag;
+
+#define BATF_ADC_SAT    0x01   /* 采样贴 0 或 4095: 断线/短路/超量程 */
+#define BATF_RANGE      0x02   /* 电压超出 2500~4500mV */
+#define BATF_NOISY      0x04   /* 单轮波动 > 80mV: 分压阻抗高/干扰大 */
+#define BATF_UNCAL      0x08   /* 未启用 IDF 校准 (走了 3.3V 线性回退) */
+
 static void bat_hist_meta_load(void);   /* 前向声明: init 里先调用, 定义在下方 */
+
+/* ==================== 真机测试记录 (batlog) ====================
+ * 每次真采样记一条。**不参与计算**，关闭时开销只有一次判断。
+ * ★ 2026-10-31 精简: 字段从 9 个减到 5 个（去掉了峰窗/锚点/两套 SOC 口径）。 */
+#define BAT_TRACE_N BOARD_BATTERY_TRACE_MAX   /* 120 × 12B = 1440B; 60s 一条 ⇒ 2 小时 */
+typedef struct {
+    uint32_t t;        /* RTC 秒（跨深睡连续） */
+    uint16_t mv;       /* 分压换算后的电池电压（对外报的就是它） */
+    uint8_t  soc;      /* 查表得到的电量 */
+    uint8_t  flags;    /* BATF_* 位 */
+    uint8_t  chg;      /* 1=CHRG 低(充电中) 0=高(未充电) */
+} bat_trace_t;
+
+/* 放 PSRAM: sdkconfig 已开 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY ⇒
+ * 不会占内部 RAM（本项目内部 DRAM 紧张，诊断缓冲不该挤在那里）。 */
+EXT_RAM_BSS_ATTR static bat_trace_t s_trace[BAT_TRACE_N];
+static volatile bool s_trace_on = false;   /* volatile: remcon 任务写, 采样方(UI 任务)读 */
+static uint8_t  s_trace_n  = 0;    /* 已存条数（<= BAT_TRACE_N） */
+static uint8_t  s_trace_i  = 0;    /* 下一个写位置 */
+
+static void bat_trace_push(uint16_t mv, uint8_t soc, uint8_t flags, uint8_t chg)
+{
+    if (!s_trace_on) return;       /* 关闭时唯一的开销就是这一句 */
+    bat_trace_t *e = &s_trace[s_trace_i];
+    e->t     = board_battery_clock_s();
+    e->mv    = mv;
+    e->soc   = soc;
+    e->flags = flags;
+    e->chg   = chg;
+    s_trace_i = (uint8_t)((s_trace_i + 1) % BAT_TRACE_N);
+    if (s_trace_n < BAT_TRACE_N) s_trace_n++;
+}
 
 static uint8_t board_battery_voltage_to_percent(uint32_t mv)
 {
-    const uint32_t full = battery_full_mv();   /* ★ 满电压优先用"自学习"到的值 */
-    if (mv >= full) {
-        return 100;
-    }
-    if (mv <= BOARD_BATTERY_EMPTY_MV) {
-        return 0;
-    }
-
-    return (uint8_t)(((mv - BOARD_BATTERY_EMPTY_MV) * 100U) /
-                     (full - BOARD_BATTERY_EMPTY_MV));
+    /* 固定口径的查表（表在 battery_model.c，单节锂电通用曲线）。
+     * ⚠ 只是**估算**，不是库仑计；温度/负载/电芯老化都会让它偏，
+     *   见 battery_model.h 顶部的说明。 */
+    if (mv > 0xFFFF) mv = 0xFFFF;
+    return bm_soc_from_mv((uint16_t)mv);
 }
 
 static void board_battery_init_calibration(void)
@@ -364,14 +302,14 @@ esp_err_t board_battery_init(void)
 
     board_battery_init_calibration();
     bat_div_load();        /* ★ NVS 里若有标定过的分压比, 覆盖默认值 */
-    bat_days_load();       /* 恢复一个月日档 (NVS, 断电不丢) */
     bat_hist_meta_load();  /* 电压历史元数据 (数组懒加载, 不拖慢开机) */
 
     s_initialized = true;
-    ESP_LOGI(TAG, "Battery ADC initialized: %s ADC1_CH%d, divider x%d/%d, 满电压 %u mV",
+    ESP_LOGI(TAG, "Battery ADC initialized: %s ADC1_CH%d, divider x%d/%d, 口径 %u..%u mV, 校准=%s",
              BOARD_BATTERY_ADC_GPIO_NAME, BOARD_BATTERY_ADC_CH,
              s_div_num, s_div_den,
-             (unsigned)battery_full_mv());
+             BOARD_BATTERY_EMPTY_MV, BOARD_BATTERY_FULL_MV,
+             s_calibrated ? "IDF curve-fitting" : "无(3.3V 线性回退)");
 
     /* ★ 2026-10-05 一次性自检打印 —— 用来**校准分压比**。
      * 小智模块的电池分压做在**模块内部**(接 GPIO3)，阻值未知；拿万用表量一下真实 VBAT，
@@ -411,16 +349,28 @@ esp_err_t board_battery_read(board_battery_status_t *status)
 #endif
     ESP_RETURN_ON_ERROR(board_battery_init(), TAG, "init battery adc failed");
 
-    int raw_sum = 0;
+    /* ★★ 2026-10-31: 采样改法 (原来 8 次直接平均，单点尖峰能拉偏 1/8)
+     *   ① **丢弃首个转换** —— oneshot 切通道后的第一次常带残留/未稳；
+     *   ② 采 N 个存下来，排序后**丢最大 1 / 最小 1** 再平均；
+     *   ③ 顺带记下本轮 min/max，供诊断判断"是噪声还是真压降"。 */
+    {
+        int discard = 0;
+        adc_oneshot_read(s_adc_handle, s_bat_chan, &discard);   /* 失败也不影响后续 */
+    }
+
+    int raws[BOARD_BATTERY_SAMPLE_COUNT];
+    int rmin = 0x7FFF, rmax = 0;
     for (int i = 0; i < BOARD_BATTERY_SAMPLE_COUNT; i++) {
         int raw = 0;
         ESP_RETURN_ON_ERROR(adc_oneshot_read(s_adc_handle, s_bat_chan, &raw),
                             TAG,
                             "read battery adc failed");
-        raw_sum += raw;
+        raws[i] = raw;
+        if (raw < rmin) rmin = raw;
+        if (raw > rmax) rmax = raw;
     }
-
-    int raw_avg = raw_sum / BOARD_BATTERY_SAMPLE_COUNT;
+    /* 去极值平均移到 battery_model.c（纯函数，主机可测"异常值"场景） */
+    int raw_avg = bm_despeckle_avg(raws, BOARD_BATTERY_SAMPLE_COUNT);
     int adc_mv = 0;
 
     if (s_calibrated) {
@@ -433,7 +383,20 @@ esp_err_t board_battery_read(board_battery_status_t *status)
 
     uint32_t battery_mv = ((uint32_t)adc_mv * (uint32_t)s_div_num) / (uint32_t)s_div_den;
     status->voltage_mv = battery_mv;
-    status->percent = board_battery_voltage_to_percent(battery_mv);
+    status->percent = bm_soc_from_mv((uint16_t)battery_mv);   /* 曲线直出, 未平滑 */
+
+    /* ---- 诊断快照 + 异常标记 ---- */
+    s_diag.raw_avg  = (uint16_t)raw_avg;
+    s_diag.raw_min  = (uint16_t)rmin;
+    s_diag.raw_max  = (uint16_t)rmax;
+    s_diag.pin_mv   = (uint16_t)(adc_mv > 0 ? adc_mv : 0);
+    s_diag.vbat_mv  = (uint16_t)(battery_mv > 0xFFFF ? 0xFFFF : battery_mv);
+    s_diag.soc      = status->percent;
+    s_diag.flags    = 0;
+    if (raw_avg <= 0 || raw_avg >= 4095)                 s_diag.flags |= BATF_ADC_SAT;
+    if (battery_mv < 2500 || battery_mv > 4500)          s_diag.flags |= BATF_RANGE;
+    if ((rmax - rmin) * 3 > 240)                         s_diag.flags |= BATF_NOISY;  /* 脚上 >80mV ⇒ 电池 >240mV */
+    if (!s_calibrated)                                   s_diag.flags |= BATF_UNCAL;
 
     return ESP_OK;
 }
@@ -676,42 +639,91 @@ bool board_battery_calibrate(uint32_t real_mv)
 void board_battery_diag(void)
 {
     if (board_battery_init() != ESP_OK) {
-        ESP_LOGI(TAG, "BATDIAG 初始化失败");
+        ESP_LOGI(TAG, "BAT 初始化失败");
         return;
     }
-    int raw_sum = 0;
+
+    /* ---- 现场再采一轮（同样的 8 次去极值），给万用表对照用 ---- */
+    int raws[BOARD_BATTERY_SAMPLE_COUNT];
+    int rmin = 0x7FFF, rmax = 0;
     for (int i = 0; i < BOARD_BATTERY_SAMPLE_COUNT; i++) {
         int raw = 0;
         if (adc_oneshot_read(s_adc_handle, s_bat_chan, &raw) != ESP_OK) return;
-        raw_sum += raw;
+        raws[i] = raw;
+        if (raw < rmin) rmin = raw;
+        if (raw > rmax) rmax = raw;
     }
-    int raw_avg = raw_sum / BOARD_BATTERY_SAMPLE_COUNT;
-    int pin_mv = -1;
-    if (s_calibrated && s_cali_handle) adc_cali_raw_to_voltage(s_cali_handle, raw_avg, &pin_mv);
-    uint32_t vbat = (pin_mv > 0)
-        ? (uint32_t)pin_mv * s_div_num / s_div_den : 0;
-    {   /* 一个月日档: 有效天数 + 今日 min/max */
-        bat_day_t db[BOARD_BATTERY_DAYS];
-        int dn = board_battery_days_get(db, BOARD_BATTERY_DAYS);
-        if (dn > 0)
-            ESP_LOGI(TAG, "BATDAYS %d 天归档 (最长 %d 天, 存NVS断电不丢); 最近一天 min=%umV max=%umV",
-                     dn, BOARD_BATTERY_DAYS, (unsigned)db[dn-1].min_mv, (unsigned)db[dn-1].max_mv);
-        else
-            ESP_LOGI(TAG, "BATDAYS 暂无日档 (跨天后自动归档)");
+    int raw_avg = bm_despeckle_avg(raws, BOARD_BATTERY_SAMPLE_COUNT);
+    int pin_mv = 0;
+    if (s_calibrated && s_cali_handle) {
+        if (adc_cali_raw_to_voltage(s_cali_handle, raw_avg, &pin_mv) != ESP_OK) pin_mv = 0;
+    } else {
+        pin_mv = (raw_avg * 3300) / 4095;      /* 未校准回退，下面会标"未校准" */
     }
-    {   /* 历史环形状态 (验证"跨深睡保留"): 条数 / 最旧-最新时间戳 / 容量 */
-        ESP_LOGI(TAG, "BATHIST 1字节/分钟 %u天=%dB base=%us next_gi=%u now=%us 跨度=%us ok=%d ld=%d",
-                 (unsigned)BAT_KEEP_DAYS, BAT_SLOTS, (unsigned)s_hist_base_s,
-                 (unsigned)s_hist_next_gi, (unsigned)board_battery_clock_s(),
-                 (unsigned)board_battery_hist_span_s(), (int)s_hist_ready, (int)s_hist_loaded);
-    }
-    ESP_LOGI(TAG, "BATDIAG %s raw=%d/%d 脚上=%d mV 系数=%d/%d => VBAT=%u mV (%u%%) "
-                  "[满=%u(30天峰值%s) 空=%d mV]",
-             BOARD_BATTERY_ADC_GPIO_NAME, raw_avg, 4095, pin_mv,
-             s_div_num, s_div_den,
+    uint32_t vbat = (pin_mv > 0) ? ((uint32_t)pin_mv * s_div_num / s_div_den) : 0;
+
+    /* 异常位 */
+    uint8_t flags = 0;
+    if (raw_avg <= 0 || raw_avg >= 4095)         flags |= BATF_ADC_SAT;
+    if (vbat < 2500 || vbat > 4500)              flags |= BATF_RANGE;
+    if ((rmax - rmin) * 3 > 240)                 flags |= BATF_NOISY;
+    if (!s_calibrated)                           flags |= BATF_UNCAL;
+
+    char fl[48] = "";
+    if (flags & BATF_ADC_SAT) snprintf(fl + strlen(fl), sizeof(fl) - strlen(fl), "ADC饱和 ");
+    if (flags & BATF_RANGE)   snprintf(fl + strlen(fl), sizeof(fl) - strlen(fl), "电压越界 ");
+    if (flags & BATF_NOISY)   snprintf(fl + strlen(fl), sizeof(fl) - strlen(fl), "波动大 ");
+    if (flags & BATF_UNCAL)   snprintf(fl + strlen(fl), sizeof(fl) - strlen(fl), "未校准 ");
+    if (!fl[0]) snprintf(fl, sizeof(fl), "正常");
+
+    /* 充电脚原始电平（不做去抖，诊断要看"现在是什么"） */
+    chrg_ensure();
+    const char *chrg_s = (s_chrg_pin < 0) ? "本板未接"
+                       : (gpio_get_level((gpio_num_t)s_chrg_pin) == 0 ? "低(充电中)" : "高(未充电)");
+
+    /* ★ 一段式输出（2026-10-31 精简）: 6 个必须项 + 异常位，一行看全 */
+    ESP_LOGI(TAG, "BAT raw=%u[%u..%u]/4095 校准=%s 脚上=%umV 分压=x%d/%d VBAT=%umV soc=%u%% CHRG=%s | %s",
+             (unsigned)raw_avg, (unsigned)rmin, (unsigned)rmax,
+             s_calibrated ? "ok(curve-fitting)" : "失败(3.3V 线性回退)",
+             (unsigned)pin_mv, s_div_num, s_div_den,
              (unsigned)vbat, (unsigned)board_battery_voltage_to_percent(vbat),
-             (unsigned)battery_full_mv(), bat_win_full_mv() ? "命中" : "默认",
-             BOARD_BATTERY_EMPTY_MV);
+             chrg_s, fl);
+}
+
+/* ---- 真机测试记录: 公开接口 ---- */
+bool board_battery_trace_enable(bool on)
+{
+    s_trace_on = on;
+    ESP_LOGI(TAG, "BATLOG %s (已记 %d 条, 容量 %d)", on ? "ON" : "OFF",
+             (int)s_trace_n, (int)BAT_TRACE_N);
+    return s_trace_on;
+}
+
+bool board_battery_trace_is_on(void) { return s_trace_on; }
+int  board_battery_trace_count(void) { return (int)s_trace_n; }
+
+void board_battery_trace_clear(void)
+{
+    s_trace_n = 0;
+    s_trace_i = 0;
+}
+
+int board_battery_trace_dump(void)
+{
+    if (s_trace_n == 0) {
+        ESP_LOGI(TAG, "BATLOG 无记录 (先 `batlog on`)");
+        return 0;
+    }
+    /* 环形缓冲：满时最旧的一格就是下一个要写的格 */
+    const int start = (s_trace_n < BAT_TRACE_N) ? 0 : (int)s_trace_i;
+    for (int k = 0; k < (int)s_trace_n; k++) {
+        const bat_trace_t *e = &s_trace[(start + k) % BAT_TRACE_N];
+        ESP_LOGI(TAG, "%u,%u,%u,%u,%u",
+                 (unsigned)e->t, (unsigned)e->mv, (unsigned)e->soc,
+                 (unsigned)e->flags, (unsigned)e->chg);
+    }
+    ESP_LOGI(TAG, "BATLOG_END %d 条", (int)s_trace_n);
+    return (int)s_trace_n;
 }
 
 esp_err_t board_battery_read_cached(board_battery_status_t *status)
@@ -719,15 +731,42 @@ esp_err_t board_battery_read_cached(board_battery_status_t *status)
     if (status == NULL) return ESP_ERR_INVALID_ARG;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     if (!s_cache_valid || (uint32_t)(now - s_cache_ms) >= BOARD_BATTERY_CACHE_MS) {
-        esp_err_t err = board_battery_read(&s_cache);
+        board_battery_status_t raw;
+        esp_err_t err = board_battery_read(&raw);
         if (err != ESP_OK) return err;   /* 采样失败不污染旧缓存 */
-        s_cache_ms = now;
+
+        /* ★ 2026-10-31 精简: 这里原来有"采样中断 → 重置 9 点滤波/5 点峰窗"的一整段。
+         *   现在电压每轮独立计算、电量纯查表，**没有任何跨轮历史**，
+         *   所以深睡唤醒后的第一次采样天然就是新值，不需要重置逻辑。 */
+
+        /* ---- 充电识别: 只读 CHRG 硬件脚（保留 3 次去抖），不再用电压趋势推断 ---- */
+        int chrg_lvl = -1;
+        chrg_ensure();
+        if (s_chrg_pin >= 0)
+            chrg_lvl = (gpio_get_level((gpio_num_t)s_chrg_pin) == 0) ? 1 : 0;
+        bool charging = bm_chrg_update(&s_chg, chrg_lvl);
+
+        /* ---- ④ 查表得电量：纯函数，无跨轮状态 ----
+         *   电压就是本轮 8 次去极值的平均值，不做任何历史平滑；
+         *   所以**休眠唤醒后的第一次采样天然就是新值**，没有旧状态要清。 */
+        uint8_t soc = board_battery_voltage_to_percent(raw.voltage_mv);
+
+        s_cache.voltage_mv = raw.voltage_mv;
+        s_cache.percent    = soc;
+        s_cache_ms    = now;
         s_cache_valid = true;
+
+        /* 诊断快照 */
+        s_diag.soc      = soc;
+        s_diag.charging = charging;
+
+        /* 真机测试记录（关闭时只判一个 bool，不采样不分配） */
+        bat_trace_push((uint16_t)raw.voltage_mv, soc, s_diag.flags, (uint8_t)(charging ? 1 : 0));
+
         /* ★ 开机 10s 静默期: boot 期间 WiFi/BT/SD/LCD/音频一起上电, 电池端电压被负载拉低,
          *   这段时间记进去就是 linit 问的"刚开机电压为什么波动"(那是真实压降, 但不该污染趋势图)。 */
         if (esp_timer_get_time() > (int64_t)BAT_HIST_SKIP_BOOT_US)
-            bat_hist_put((uint16_t)s_cache.voltage_mv);
-        bat_win_add((uint16_t)s_cache.voltage_mv);         /* 记录"最近 30 天电压峰值" */
+            bat_hist_put((uint16_t)raw.voltage_mv);
     }
     *status = s_cache;
     return ESP_OK;

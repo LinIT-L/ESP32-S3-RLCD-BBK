@@ -8,6 +8,7 @@
  * 场景复制一份绘制代码 —— 新增外观只需加一个 thin wrapper 或调不同参数, 不必重造键盘.
  */
 #include "keyboard.h"
+#include "ui_common.h"   /* ★ 2026-11-01 linit：键盘英文改用 16px 字体（ui_text16） */
 #include <string.h>
 
 /* 与虚拟键鼠共用同一套 ASCII 字形 (定义于 menu_system.c) */
@@ -22,6 +23,9 @@ static void kpf(st7305_handle_t* l, int w, int x0, int y0, int x1, int y1, int c
     int t; if(x0>x1){t=x0;x0=x1;x1=t;} if(y0>y1){t=y0;y0=y1;y1=t;}
     for(int yy=y0;yy<=y1;yy++)for(int xx=x0;xx<=x1;xx++)kpx(l,xx,yy,w,c);
 }
+/* ★ 2026-11-01 linit：键盘英文用 **FONT8X12（= font8x16_zh，8×16 点阵）**渲染，
+ *   与终端键盘（page_term.c 的 dascii）完全同一套字模。
+ *   曾试过 ui_text16，但它走的是 font_zh16 的 ASCII 字形（另一套），观感反而和终端不一致。 */
 static void kdascii(st7305_handle_t* l, int w, int x, int y, const char* s, int fg){
     int cx=x; for(const unsigned char*p=(const unsigned char*)s;*p;p++){
         int idx=((*p>=' '&&*p<=0x7E)?(*p-0x20):('?'-0x20));

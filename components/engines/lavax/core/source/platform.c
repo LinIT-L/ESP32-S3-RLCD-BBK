@@ -19,6 +19,7 @@
 #include "rg_stub.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
+#include "esp_heap_caps.h"   /* 行缓冲改放 PSRAM: 省 15KB 内部 RAM */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -265,22 +266,27 @@ void lavax_platform_present_rgb555(const uint16_t *pixels, int width, int height
 static int s_disp_mode = 1;
 void lavax_platform_set_display_mode(int m){ s_disp_mode = m; }
 
-/* ---- 把灰度缓冲画出: 浮点缩放→1bpp 打包→st7305 blit (支持非整数放大铺满) ---- */
-static void render_to_lcd(void)
+/* ---- 把灰度缓冲画出: 定点缩放表 → 1bpp 打包 → st7305 blit ----
+ * ★ 2026-10-31 优化: 旧实现每帧对 400×300 逐像素做一次浮点除法
+ *   ((y-sy)/k 或 (y-sy)/ky), 单帧约 12 万次; ESP32-S3 每次 float 除法
+ *   十几周期, 单是这一步就吃掉数毫秒(15fps 下每帧预算 66ms)。
+ *   现在把"输出坐标 → 源坐标"预先算进两张表, 布局(模式或源尺寸)不变
+ *   时直接查表, 内层只剩一次比较和一个或运算。
+ *   布局公式与旧实现**逐字一致**, 所以输出像素完全相同, 不是"近似优化"。
+ *   行缓冲同时从 malloc(内部 RAM) 改到 PSRAM: 它是 CPU 顺序读的源数据,
+ *   不参与 SPI 发送(SPI 发的是驱动内部 fb), 放 PSRAM 可省 15KB 内部 RAM。 */
+#define MAP_NONE 0xFFFFu
+static uint16_t s_map_x[400];
+static uint16_t s_map_y[300];
+static int s_map_sw = -1, s_map_sh = -1, s_map_mode = -1;
+
+static void build_scale_map(int dw, int dh)
 {
-    static uint8_t *rows = NULL;
-    static int cap = 0;
-    int dw = 400, dh = 300;
+    float k = 1.0f;
+    int kx = 1, ky = 1;
+    int sw = s_cur_w, sh = s_cur_h, sx = 0, sy = 0;
+    int i;
 
-    if (!g_lcd || !g_gray || s_cur_w <= 0 || s_cur_h <= 0)
-        return;
-
-    st7305_clear(g_lcd, ST7305_COLOR_WHITE);
-
-    /* 输出区域 (sw x sh, 位于屏幕内) */
-    float k = 1.0f;                 /* 全屏/点对点: 等比系数 */
-    int   kx = 1, ky = 1;           /* 拉伸: 每轴系数 */
-    int   sw = s_cur_w, sh = s_cur_h, sx = 0, sy = 0;
     if (s_disp_mode == 1) {         /* 全屏: 等比 cover 填满 (放大到最大) */
         float ca = (float)dw / s_cur_w, cb = (float)dh / s_cur_h;
         k = (ca > cb) ? ca : cb;
@@ -293,23 +299,59 @@ static void render_to_lcd(void)
         sx = (dw - sw) / 2; sy = (dh - sh) / 2;
     }
 
-    int rowb = (dw + 7) / 8;
-    if (cap < dh * rowb) { free(rows); rows = (uint8_t*)malloc((size_t)dh * rowb); cap = dh * rowb; }
+    for (i = 0; i < dw; i++) {
+        int sxi;
+        if (i < sx || i >= sx + sw) { s_map_x[i] = MAP_NONE; continue; }
+        sxi = (s_disp_mode == 2) ? (i - sx) / kx : (int)((i - sx) / k);
+        s_map_x[i] = (uint16_t)(sxi < 0 ? 0 : (sxi >= s_cur_w ? s_cur_w - 1 : sxi));
+    }
+    for (i = 0; i < dh; i++) {
+        int syi;
+        if (i < sy || i >= sy + sh) { s_map_y[i] = MAP_NONE; continue; }
+        syi = (s_disp_mode == 2) ? (i - sy) / ky : (int)((i - sy) / k);
+        s_map_y[i] = (uint16_t)(syi < 0 ? 0 : (syi >= s_cur_h ? s_cur_h - 1 : syi));
+    }
+    s_map_sw = s_cur_w; s_map_sh = s_cur_h; s_map_mode = s_disp_mode;
+}
+
+static void render_to_lcd(void)
+{
+    static uint8_t *rows = NULL;
+    static int cap = 0;
+    const int dw = 400, dh = 300;
+    int rowb, y, b, kk;
+
+    if (!g_lcd || !g_gray || s_cur_w <= 0 || s_cur_h <= 0)
+        return;
+
+    if (s_map_sw != s_cur_w || s_map_sh != s_cur_h || s_map_mode != s_disp_mode)
+        build_scale_map(dw, dh);
+
+    st7305_clear(g_lcd, ST7305_COLOR_WHITE);
+
+    rowb = (dw + 7) / 8;
+    if (cap < dh * rowb) {
+        if (rows) { heap_caps_free(rows); rows = NULL; }
+        rows = heap_caps_malloc((size_t)dh * rowb, MALLOC_CAP_SPIRAM);
+        if (!rows) rows = malloc((size_t)dh * rowb);   /* PSRAM 不可用才回退内部 RAM */
+        cap = rows ? dh * rowb : 0;
+    }
     if (!rows) return;
 
-    for (int y = 0; y < dh; y++) {
+    for (y = 0; y < dh; y++) {
         uint8_t *dst = rows + (size_t)y * rowb;
-        for (int b = 0; b < rowb; b++) {
+        int syi = s_map_y[y];
+        const uint8_t *src;
+        if (syi == MAP_NONE) { memset(dst, 0, (size_t)rowb); continue; }  /* 留白 */
+        src = g_gray + (size_t)syi * 256;
+        for (b = 0; b < rowb; b++) {
             uint8_t byte = 0;
-            for (int kk = 0; kk < 8; kk++) {
-                int x = b * 8 + kk; if (x >= dw) break;
-                if (y < sy || y >= sy + sh || x < sx || x >= sx + sw) continue; /* 留白 */
-                int syi, sxi;
-                if (s_disp_mode == 2) { syi = (y - sy) / ky; sxi = (x - sx) / kx; }
-                else                  { syi = (int)((y - sy) / k); sxi = (int)((x - sx) / k); }
-                syi = syi < 0 ? 0 : (syi >= s_cur_h ? s_cur_h - 1 : syi);
-                sxi = sxi < 0 ? 0 : (sxi >= s_cur_w ? s_cur_w - 1 : sxi);
-                if (g_gray[syi * 256 + sxi] < 90) byte |= (0x80 >> kk);
+            for (kk = 0; kk < 8; kk++) {
+                int x = b * 8 + kk;
+                int sxi;
+                if (x >= dw) break;
+                sxi = s_map_x[x];
+                if (sxi != MAP_NONE && src[sxi] < 90) byte |= (0x80 >> kk);
             }
             dst[b] = byte;
         }

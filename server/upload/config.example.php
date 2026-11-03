@@ -21,9 +21,13 @@ return [
     /* 运行时数据（SQLite + 待审包），必须禁止外部访问 */
     'data_dir'    => __DIR__ . '/data',
 
-    /* 审核面板令牌：浏览器打开 /upload/review.php?k=<这串> 即可，不用登录
-     * 生成命令: php -r "echo bin2hex(random_bytes(16));" */
-    'review_key'  => 'CHANGE_ME_REVIEW_KEY',
+    /* ⚠ 已废弃: 审核面板不再接受 ?k= 令牌（会进 nginx access log / 浏览器历史 / Referer）。
+     *   现在必须用管理员账号登录（php admin_cli.php init 创建）。
+     *   这个键留着只是为了让老配置不报错，没有任何地方再用它。 */
+    'review_key'  => '',
+
+    /* 管理员会话空闲超时（秒）。超过就要重新登录。 */
+    'admin_idle_ttl' => 1800,
 
     /* SMTP：25 端口被阿里云封了，必须用 465(SSL) 或 587(STARTTLS)
      * pass 填的是「邮箱授权码」，不是邮箱登录密码 */

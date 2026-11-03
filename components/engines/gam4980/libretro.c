@@ -133,12 +133,12 @@ EXT_RAM_BSS_ATTR static uint16_t fb[(LCD_WIDTH + 1) * LCD_HEIGHT];
 static void sys_isr(void);
 static bool sys_halt_p(void);
 static void mem_bs(uint8_t sel);
-static uint8_t IRAM_ATTR mem_read(uint16_t addr);
-static uint8_t IRAM_ATTR mem_readx(uint16_t addr);
+static uint8_t mem_read(uint16_t addr);
+static uint8_t mem_readx(uint16_t addr);
 static uint16_t mem_read16(uint16_t addr);
 static uint16_t mem_readx16(uint16_t addr);
 static uint16_t mem_read16_wrapped(uint16_t addr);
-static void IRAM_ATTR mem_write(uint16_t addr, uint8_t val);
+static void mem_write(uint16_t addr, uint8_t val);
 #if BBK_AUDIO_ENABLE
 static void bbk_audio_flush_frame(void);
 #endif
@@ -215,7 +215,7 @@ static void s6502_push(uint8_t val)
     mem_write(0x100 | s_cpu.sp--, val);
 }
 
-static bool IRAM_ATTR sys_halt_p(void)
+static bool sys_halt_p(void)
 {
     return s_ram[_SYSCON] & 0x08;
 }
@@ -1148,7 +1148,7 @@ static void sys_load(const uint8_t *gam, size_t size)
     if (g_boot_progress_cb) g_boot_progress_cb(95, "Starting...");
 }
 
-static void IRAM_ATTR sys_timer(uint32_t n)
+static void sys_timer(uint32_t n)
 {
     static uint32_t t[5] = { 0 };
 
@@ -1214,7 +1214,7 @@ static void sys_rtc()
 }
 
 
-static void IRAM_ATTR sys_isr()
+static void sys_isr()
 {
     uint8_t idx = 0;
     if (s_cpu.status & 0x04)
@@ -1260,7 +1260,7 @@ static void IRAM_ATTR sys_isr()
     s_cpu.pc = 0x0300 + idx * 4;
 }
 
-static void IRAM_ATTR sys_step()
+static void sys_step()
 {
     static int32_t cycles = 0;
     static uint32_t ticked = 0;
@@ -1634,7 +1634,7 @@ static void blend_frame(void)
 }
 
 
-void IRAM_ATTR retro_run(void)
+void retro_run(void)
 {
     bool vupdated = false;
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &vupdated) && vupdated)

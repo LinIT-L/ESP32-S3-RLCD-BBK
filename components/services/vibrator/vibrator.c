@@ -90,12 +90,25 @@ static bool ledc_init(void) {
         .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = VIB_TIMER,
         .duty_resolution = VIB_RES, .freq_hz = VIB_RES_FREQ, .clk_cfg = LEDC_AUTO_CLK,
     };
-    if (ledc_timer_config(&tc) != ESP_OK) return false;
+    /* ★ 2026-10-31: 原来失败走 ESP_LOGD，而 sdkconfig 的 CONFIG_LOG_MAXIMUM_LEVEL=3
+     *   ⇒ 这句在编译期就被裁掉 ⇒ "震动初始化失败但没有任何错误日志"（正是排障时最难受的状态）。
+     *   改成 WARN 并带上错误码与引脚号，启动日志一眼能看出卡在哪一步。 */
+    esp_err_t e = ledc_timer_config(&tc);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "LEDC timer 配置失败: %s (GPIO%d, %dHz, %dbit) ⇒ 震动不可用",
+                 esp_err_to_name(e), (int)s_vib_pin, VIB_RES_FREQ, 8);
+        return false;
+    }
     ledc_channel_config_t ch = {
         .gpio_num = s_vib_pin, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = VIB_CHANNEL,
         .timer_sel = VIB_TIMER, .duty = 0, .hpoint = 0,
     };
-    if (ledc_channel_config(&ch) != ESP_OK) return false;
+    e = ledc_channel_config(&ch);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "LEDC channel 配置失败: %s (GPIO%d, ch%d) ⇒ 震动不可用",
+                 esp_err_to_name(e), (int)s_vib_pin, (int)VIB_CHANNEL);
+        return false;
+    }
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIB_CHANNEL);
     return true;
 }

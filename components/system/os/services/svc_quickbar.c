@@ -35,6 +35,9 @@
 #include "vid_tune.h"
 #include "vibrator.h"   /* 音量档位咔哒反馈 */   /* 画面优化器: 快捷栏内入口 */   /* os_screensaver_active: 屏保/睡眠时不响应下拉 */
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"   /* ★ 2026-10-31: trylock 保证 qb_tick/qb_render 单写者 */
 /* 蓝牙 / Wi-Fi 图标直接用状态栏那一套位图, 保证与状态栏完全一致
  * (status_icons.inc 里的 static 数组, 各编译单元各存一份, 不会冲突)。 */
 #include "status_icons.inc"
@@ -158,6 +161,17 @@ static void qb_draw_tune(st7305_handle_t *lcd);
 #define QB_HS_X1     299
 #define QB_HS_Y1     10
 #define QB_TH        12          /* 下拉/上滑判定阈值 */
+/* ★ 2026-10-31 (linit): 面板自身的"免收起缓冲带"。
+ *   手指点面板边缘/按钮下沿时很容易落到 1~2px 之外, 原来立刻被判成"点外部"
+ *   把面板关掉。用户要求"判定范围整体加大": 这里独立取 60 (原来等于 QB_H=40),
+ *   面板本体 40 高 + 下方 60 = 100 以内都不算"点外部"。 */
+#define QB_HIT_PAD    60
+/* 面板内点按 vs 手势上滑的分界。
+ *   原来"上滑收起"对任何起点都只要求 dy <= -QB_TH(12)，于是点蓝牙/Wi-Fi 按钮时
+ *   手指往上带 12px 就被判成"上滑收起" —— 按钮没响应、面板却关了。
+ *   现在按起点位置区分：起点在面板内(点按钮)要滑 48px 才收起，点按抖动不会误关；
+ *   起点在面板外(下方空白)仍用 QB_TH，手势保持干脆。 */
+#define QB_CLOSE_TH_IN 48        /* 面板内起手时, 判定为上滑收起所需位移 */
 
 /* ===== 状态 ===== */
 static bool s_open;              /* 抽屉是否展开 */
@@ -182,17 +196,44 @@ static int  s_start_y;
 static const os_platform_ops_t *s_ops;
 void os_quickbar_set_platform(const os_platform_ops_t *ops) { s_ops = ops; }
 
+/* ★★★ 2026-10-31: 单写者保护。
+ *   本服务在两种上下文里被驱动:
+ *     ① 普通页面: os_tick → 服务 tick (主循环任务)
+ *     ② 全屏游戏: board_shim 视频任务 / 引擎帧循环 (阻塞式引擎)
+ *   两者可能在同一时刻都调进来 (游戏刚起来/刚退出那一瞬) ⇒ s_open/s_gesture/
+ *   s_vol_track 会被两个任务同时改, 表现是"拉一半收回去""手势丢失"。
+ *   这里用**非阻塞 trylock**: 拿不到就跳过本帧, 绝不等待 —— 不引入新的阻塞点。 */
+static SemaphoreHandle_t s_qb_mtx = NULL;
+static bool qb_guard_take(void)
+{
+    if (!s_qb_mtx) {
+        s_qb_mtx = xSemaphoreCreateMutex();
+        if (!s_qb_mtx) return true;      /* 建不出来就退化为无保护, 至少功能不丢 */
+    }
+    return xSemaphoreTake(s_qb_mtx, 0) == pdTRUE;
+}
+static void qb_guard_give(void) { if (s_qb_mtx) xSemaphoreGive(s_qb_mtx); }
+
 bool os_quickbar_is_open(void) { return s_open; }
 
 /* 立刻收起 (2026-10-29: 按返回键时优先关快捷栏, 而不是退出页面/游戏) */
 void os_quickbar_close(void)
 {
     if (!s_open) return;
+    bool g = qb_guard_take();
     s_open = false;
     s_gesture = false;
     s_from_hs = false;
     s_vol_track = false;
+    s_expand = false;
+    s_drag_param = -1;
+    s_tap_valid = false;
+    s_press_done = false;
     input_set_overlay_lock(false);
+    /* ★ 2026-10-31: 把触摸派生的按键状态一起清掉 —— 否则引擎停在"手指还按着",
+     *   退出快捷栏后角色自己走/方向卡住 (虚拟手柄状态是上一帧的快照)。 */
+    input_touch_release_all();
+    if (g) qb_guard_give();
 }
 
 /* ===== 小工具 ===== */
@@ -409,7 +450,7 @@ static void qb_draw_volume(st7305_handle_t *lcd)
     qb_disc(lcd, cx, cy, QB_DOT_R, ST7305_COLOR_BLACK);
 }
 
-static void qb_render(ui_ctx_t *ctx)
+static void qb_render_impl(ui_ctx_t *ctx)
 {
     if (!s_open || !ctx || !ctx->lcd) return;
     st7305_handle_t *lcd = ctx->lcd;
@@ -435,6 +476,15 @@ static void qb_render(ui_ctx_t *ctx)
     if (opt_on) qb_icon_opt(lcd, QB_OPT_X, (QB_H - QB_OPT_SZ) / 2);   /* 垂直居中 */
     qb_draw_volume(lcd);
     if (s_expand) qb_draw_tune(lcd);   /* 展开态: 2×2 四条 + 保存/取消 */
+}
+
+/* 绘制包一层 trylock: 与 qb_tick 用的是同一把锁 —— 保证"正在处理触摸"时不会被
+ * 另一个任务插进来画半屏; 拿不到就跳过本帧 (下一帧还会画)。 */
+static void qb_render(ui_ctx_t *ctx)
+{
+    if (!qb_guard_take()) return;
+    qb_render_impl(ctx);
+    qb_guard_give();
 }
 
 /* ===== 操作 ===== */
@@ -580,7 +630,7 @@ static bool qb_tune_touch(ui_ctx_t *ctx, int x, int y)
 }
 
 static bool qb_touch(ui_ctx_t *ctx, int x, int y);   /* 前向: 游戏内点击复用同一套判定 */
-static void qb_tick(ui_ctx_t *ctx)
+static void qb_tick_impl(ui_ctx_t *ctx)
 {
     /* ★ 2026-10-29 linit: 屏保/睡眠/动态壁纸状态下不响应下拉。
      *   此时既不该弹出抽屉, 也不该保持展开 (退出时顺带归还触摸控制权)。 */
@@ -596,6 +646,9 @@ static void qb_tick(ui_ctx_t *ctx)
     }
 
     int tx = 0, ty = 0;
+    /* ★★★ 2026-10-31: 引擎阻塞主循环时没人采样触摸, 快照会停在旧值。
+     *   过期就自己补采一次 (幂等, 只更新"按住/坐标", 不碰手势状态机)。 */
+    if (input_touch_age_ms() > 50) input_touch_resample();
     /* 用 _raw 读: 本服务自己必须能看到触摸, 即使已经置了独占锁 */
     bool down = input_get_touch_pos_raw(&tx, &ty);
 
@@ -605,7 +658,11 @@ static void qb_tick(ui_ctx_t *ctx)
         /* ⚠ 2026-10-30 修"松手弹回": 必须排除 s_vol_track ——
          * 拖动过音量条时不能把这个手势再当"点击", 否则会用**按下位置**重设音量,
          * 把刚拖到的档位覆盖掉 (这正是弹回的真正原因)。 */
-        if (s_open && s_tap_valid && !s_swallowed && !s_vol_track && s_tap_y < QB_H)
+        /* ★ 2026-10-31: 不再限制 `s_tap_y < QB_H`。
+         *   原来只有"点在面板内"才走 qb_touch ⇒ **游戏里点面板外根本收不起来**
+         *   (游戏没有 os 触摸分发, 抬手判定是唯一通路)。现在任意位置的点击都交给
+         *   qb_touch 判: 面板内→按钮/滑条, 面板外(缓冲带之外)→收起。 */
+        if (s_open && s_tap_valid && !s_swallowed && !s_vol_track)
             qb_touch(ctx, s_tap_x, s_tap_y);
         /* 本次手势结束, 允许下一次按下重新处理 (放在抬手侧复位,
          * 才能保证"按下即生效", 而不是从第二次起变成松手才响应) */
@@ -617,8 +674,15 @@ static void qb_tick(ui_ctx_t *ctx)
         s_swallowed = false;      /* 抬手: 本次手势彻底结束, 下次按下可正常调音量 */
         s_last_step = -1;         /* 下次拖动第一档也应有咔哒反馈 */
         s_start_y = -1;
-        /* 手指抬起: 抽屉还开着就继续独占(免得点穿到下层), 已收起则立即还给下层 */
-        input_set_overlay_lock(s_open);
+        /* 手指抬起: 抽屉还开着就继续独占(免得点穿到下层); 已收起则**在这里**归还触摸。
+         * ★ 2026-10-31: 归还时顺手把虚拟手柄的按下态清掉 —— 覆盖层独占期间引擎读不到
+         *   触点, 它内部还留着"上一帧按着"的快照, 不清就是"退出后角色自己走"。 */
+        if (s_open) {
+            input_set_overlay_lock(true);
+        } else {
+            input_set_overlay_lock(false);
+            input_touch_release_all();
+        }
         return;
     }
 
@@ -659,18 +723,46 @@ static void qb_tick(ui_ctx_t *ctx)
             ESP_LOGI(TAG, "展开 (dy=%d)", dy);
         }
     } else if (dy <= -QB_TH && !s_from_hs) {
-        s_open = false;
-        s_gesture = false;
-        if (ctx) ctx->needs_redraw = true;
-        ESP_LOGI(TAG, "收起 (dy=%d)", dy);
+        /* ★ 2026-10-31 (linit): 起点在**面板内**(点蓝牙/Wi-Fi/音量)时, 必须明显上滑
+         *   才收起。原来这里一律用 QB_TH(12), 点按时手指往上带一点就被判成"上滑收起"
+         *   —— 按钮没响应、面板却关了, 正是用户说的"点的时候经常变成关闭"。
+         *   起点在面板外(下方空白)时仍然按 QB_TH, 手势保持干脆。 */
+        int need = (s_tap_y <= QB_H) ? QB_CLOSE_TH_IN : QB_TH;
+        if (dy <= -need) {
+            s_open = false;
+            s_gesture = false;
+            if (ctx) ctx->needs_redraw = true;
+            ESP_LOGI(TAG, "收起 (dy=%d 阈值=%d 起点y=%d)", dy, need, s_tap_y);
+        }
     }
 }
 
+/* tick 包一层 trylock (与 qb_render 共用): 主循环与游戏刷新任务同时驱动时,
+ * 只让一个进来, 另一个跳过本帧。绝不阻塞。 */
+static void qb_tick(ui_ctx_t *ctx)
+{
+    if (!qb_guard_take()) return;
+    qb_tick_impl(ctx);
+    qb_guard_give();
+}
+
 /* ===== 触摸 (tap) ===== */
+/* QB_HIT_PAD / QB_CLOSE_TH_IN 已挪到上方常量区(手势状态机也要用) */
+
 static bool qb_touch(ui_ctx_t *ctx, int x, int y)
 {
-    /* 展开态: 全部交给调节区 (滑条/保存/取消) */
-    if (s_open && s_expand) return qb_tune_touch(ctx, x, y);
+    /* 展开态: 先判"点外面 → 收起", 再交给调节区 (滑条/保存/取消) */
+    if (s_open && s_expand) {
+        if (y >= QB_H_EXP + QB_HIT_PAD) {
+            s_open = false;
+            s_expand = false;
+            s_drag_param = -1;
+            if (ctx) ctx->needs_redraw = true;
+            ESP_LOGI(TAG, "收起 (点外部, 展开态 y=%d)", y);
+            return true;
+        }
+        return qb_tune_touch(ctx, x, y);
+    }
     if (!s_open) {
         /* 收起时只占住起手区: 消费掉, 避免下层把它当点击 (下拉由 tick 完成) */
         return (y <= QB_HS_Y1 && x >= QB_HS_X0 && x <= QB_HS_X1);
@@ -683,12 +775,15 @@ static bool qb_touch(ui_ctx_t *ctx, int x, int y)
     if (s_press_done) return true;
     s_press_done = true;
 
-    /* 抽屉下方: 关闭并吃掉这一次点击, 防止误触下方页面/游戏 */
-    if (y >= QB_H) {
+    /* 面板外(含缓冲带之外): 关闭并吃掉这一次点击, 防止误触下方页面/游戏 */
+    if (y >= QB_H + QB_HIT_PAD) {
         s_open = false;
         s_expand = false;
-        input_set_overlay_lock(false);   /* 收起即归还触摸, 下层马上恢复响应 */
+        /* ★ 2026-10-31: 这里**不立刻**解锁 —— 手指还按在屏上(就在刚刚点的那一下).
+         *   立刻 unlock 会让这一下点击穿透到游戏(角色跳/开枪)。
+         *   所有权统一在 qb_tick 的抬手分支归还 (见那里 input_set_overlay_lock(false))。 */
         if (ctx) ctx->needs_redraw = true;
+        ESP_LOGI(TAG, "收起 (点外部 y=%d)", y);
         return true;
     }
 
@@ -734,10 +829,37 @@ void os_quickbar_game_frame(st7305_handle_t *lcd)
     }
 }
 
+/* ★★★ 2026-10-31: 分段入口 —— board_shim 的视频任务在**持有帧锁**时调 overlay,
+ *   而这里点一下 Wi-Fi 会走 esp_wifi_start()(1~3 秒), 锁被占住 ⇒ 模拟任务提交不了帧,
+ *   整个游戏冻住。所以把"收手势/执行动作"挪到锁外(tick), 锁内只画(draw)。 */
+void os_quickbar_game_tick(void)
+{
+    if (!s_ops) return;
+    qb_tick(NULL);
+}
+
+void os_quickbar_game_draw(st7305_handle_t *lcd)
+{
+    if (!lcd || !s_ops) return;
+    if (!(s_open || s_gesture)) return;
+    ui_ctx_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.lcd = lcd;
+    qb_render(&tmp);
+}
+
 /* void* 适配层: input 层的钩子用 void* 以避免依赖 st7305 类型 */
 static void qb_game_frame_void(void *lcd)
 {
     os_quickbar_game_frame((st7305_handle_t *)lcd);
+}
+static void qb_game_tick_void(void)
+{
+    os_quickbar_game_tick();
+}
+static void qb_game_draw_void(void *lcd)
+{
+    os_quickbar_game_draw((st7305_handle_t *)lcd);
 }
 
 void os_svc_quickbar_register(void)
@@ -745,4 +867,5 @@ void os_svc_quickbar_register(void)
     os_register_service(&s_svc_quickbar);
     /* 把实现注入给引擎层: 阻塞式引擎每帧调 engine_overlay_quickbar() 就能用 */
     engine_overlay_set_quickbar(qb_game_frame_void);
+    engine_overlay_set_quickbar_split(qb_game_tick_void, qb_game_draw_void);
 }

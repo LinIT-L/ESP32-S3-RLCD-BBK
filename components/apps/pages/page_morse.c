@@ -606,8 +606,14 @@ static void morse_poll(ui_ctx_t *ctx)
 static void morse_action(ui_ctx_t *ctx, os_action_t a)
 {
     if (a == OS_ACTION_BACK) {
-        if (s_view == 1) { s_view = 0; redraw(ctx); return; }   /* 查表 → 转换 */
-        os_request_exit_confirm(ctx);                           /* 转换 → 退出确认 */
+        /* ★ 2026-11-01 修"点解码后返回不去"：
+         *   本页 .fullscreen=true 全自绘，会**盖在确认弹窗之上**，
+         *   原来这里调 os_request_exit_confirm() ⇒ 确认框被遮住，看起来就是返回失灵。
+         *   改成逐层后退，最后直接退出页面：
+         *     查表视图 → 转换视图 → 码→文 → 文→码 → 退出。 */
+        if (s_view == 1) { s_view = 0; redraw(ctx); return; }
+        if (s_dec)       { s_dec = 0; mre_stop(); text_changed(ctx); return; }
+        os_pop(ctx);
         return;
     }
     if (a == OS_ACTION_CONFIRM) {

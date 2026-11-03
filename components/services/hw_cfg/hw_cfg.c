@@ -196,7 +196,7 @@ static int detect_board(void) {
 static uint8_t scan_peripherals(int board) {
     uint8_t m = 0;
     /* 音频: 三块板都有声音通路（小智/微雪 = ES8311 解码 + I2S；
-     *       标准扩展 = NS4168 纯功放 + I2S，无 I2C ⇒ 不能用 I2C 判断有无） */
+     *       标准扩展 = NS4168 I2S 数字功放（I2S 直入），无 I2C ⇒ 不能用 I2C 判断有无） */
     m |= (1u << HW_AUDIO);
     /* 触摸: 小智 5/13/12/6 · 标准扩展 & 微雪 15/7/17/2
      * ★ 用带 RST 时序的 probe_touch_on, 不能裸探 (见上面的说明) */

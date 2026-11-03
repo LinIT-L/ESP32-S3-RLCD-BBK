@@ -23,6 +23,27 @@
 #define PAL_CONFIG_PREFIX     PAL_DATA_DIR "/"
 #define PAL_SCREENSHOT_PREFIX PAL_DATA_DIR "/"
 
+/* ---- 两种资源装法（2026-11-01）----
+ * 一套固件要同时支持"ZIP 解压目录"和"单个 .lpk 免解压"，而上面这些宏是**编译期**
+ * 的、只能有一个值，所以运行时的最终路径由 pal_platform.c 的 UTIL_Platform_Init()
+ * 在 PAL_LoadConfig() 之后改写 gConfig（那是引擎自己的路径真相源）：
+ *
+ *   ZIP 模式：pszGamePath = PAL_PREFIX（原样，历史行为不变）
+ *   LPK 模式：pszGamePath = PAL_LPK_GAMEPATH（= "/lpk"，VFS 挂载点）
+ *             其余（存档/配置/截图）一律落在 PAL_DATA_DIR —— **真实 FAT**。
+ *
+ * 存档为什么不走 /lpk：写进只读包是"假成功"，比失败更糟。即使走了，
+ * lpk_mount 的可写旁路也会把它重定向到真实 FAT（见 lpk_mount.h 三条规则）。
+ * 判定 LPK / ZIP 的唯一入口是 lpk_mode_decide()，不看临时文件猜。 */
+#define PAL_LPK_GAMEPATH      "/lpk"
+#define PAL_LPK_FILE          PAL_DATA_DIR "/pal.lpk"
+
+/* ★ 2026-11-01：把 third_party/util.c 里那份"弱默认"的 UTIL_Platform_Init 等
+ * 四个函数换成我们自己的实现（pal_platform.c）——
+ * 这是**不改 third_party** 的官方口子：util.c 用 `#if !defined(...)` 挡住默认实现，
+ * 我们只在自己的头里定义这个宏。改 third_party 会让上游升级变成手工合并地狱。 */
+#define PAL_HAS_PLATFORM_SPECIFIC_UTILS 1
+
 /* ---- 音频 ---- */
 #define PAL_AUDIO_DEFAULT_BUFFER_SIZE  1024   /* 帧数; 我们后端再喂给 audio_player */
 #define PAL_HAS_MP3            0

@@ -5,11 +5,17 @@
  *   一个像素都不画。Lua 应用拿行号逐行 app.mix 绘制。
  *
  * 内存策略：
- *   * 索引不常驻：index.bin 每条 80 字节，二分靠 lseek 逐条读（18 次 × 80B）
- *   * 单篇整篇进 PSRAM（最大 1.76MB 实测），解压 → 原地剥 HTML → 原地折行
+ *   * 索引不常驻：index.bin 每条 80 字节，二分靠 lseek 逐条读（约 18 次 × 80B）
+ *   * 单篇整篇进 PSRAM，解压 → 原地剥 HTML → 原地折行
+ *   * 正文/压缩块缓冲**跨文章复用**（只增不缩）：换文章不再反复 1.7MB 级 malloc/free，
+ *     避免 PSRAM 碎片；峰值仍是 clen + ulen
  *   * 不用内部 RAM 存正文；内部 RAM 只占几百字节的句柄状态
  *
- * 数据格式见 docs/format-spec.md（生成工具 nomad-wiki/tools/build_wiki_db.py）
+ * 数据格式（生成工具 tools/wiki/mk_wiki_db.py，见同目录 README.md）：
+ *   index.bin         80B/条：title[64] chunk:u32 off:u32 clen:u32 ulen:u32（小端）
+ *   articles_%04d.dat 每篇：'WK1\0' ulen:u32 clen:u32 crc:u32 + LZ4 block（裸 block，无长度前缀）
+ *   py.bin / pyi.bin  64B/条：key[60] 小写 ASCII + id:u32
+ *   metadata.json     必须含 "version": 2 与 "articleCount"
  */
 #pragma once
 

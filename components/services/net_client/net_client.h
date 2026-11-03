@@ -63,6 +63,14 @@ typedef struct {
      *   语义: 0 = 不校验该项 (向后兼容, 老调用方 memset 0 行为不变)。 */
     uint32_t    expect_crc;   /* 期望 crc32; 0 = 不校验 */
     uint32_t    expect_size;  /* 期望字节数; 0 = 不校验 */
+    /* —— 可选: 连接复用 (2026-10-31, 资源包多文件下载用) ——
+     *   true 时本请求结束后**保留底层 TCP/TLS 连接**，下一个同 host 的
+     *   netc_start() 直接复用（跳过 DNS + TLS 握手 ≈ 每次省 100~300 ms）。
+     *   109 个文件逐个下载时这是最大的一笔固定开销。
+     *   ★ 用完必须调 netc_ka_close()，否则连接与 mbedtls 上下文一直占着内部 RAM。
+     *   ★ 服务器回 `Connection: close`、或复用的连接已被对端关掉时，自动重连一次，
+     *     不需要调用方处理。 */
+    bool        keep_alive;
 } netc_req_t;
 
 /* 发起一次 GET。返回 false = 忙 或 参数不合法 (url 空 / 没给落点 / body_cap<=1)。 */
@@ -84,6 +92,29 @@ void netc_reset(void);
 
 /* 请求取消: 任务侧尽快收尾 (已写半截文件按失败处理并删除) */
 void netc_cancel(void);
+
+/* ==================== 连接复用 (2026-10-31) ====================
+ * 用法（资源包多文件下载）:
+ *     ... 每个文件 netc_req_t.keep_alive = true ...
+ *     netc_ka_close();      // 全部做完后收尾，释放连接 + mbedtls 上下文
+ * 语义:
+ *   · 只在**同一 scheme://host:port** 之间复用；换 host 自动重连；
+ *   · 复用的连接恰好被对端关掉（服务器 idle 超时）时，内部自动重连一次；
+ *   · 任何失败都会关闭并丢弃会话 ⇒ 不会留下"半死"的连接给下一次用。
+ */
+void netc_ka_close(void);
+bool netc_ka_reused(void);   /* 本次请求是否复用了已有连接 (统计/日志用) */
+/* 本轮复用会话的统计: hits = 真的复用成功次数, reconnects = 复用失效后重连次数。
+ * 语义: 每次"新会话"(handle 尚未建立)时清零，供一次安装结束后打日志。 */
+void netc_ka_stats(int *hits, int *reconnects);
+/* 清零上面两个计数。**一次安装开始前调一次** —— 统计要覆盖整个安装(含中途重连)；
+ * 若按"每个连接"清零，服务器主动关连接时日志会少报复用次数。 */
+void netc_ka_stats_reset(void);
+
+/* 计算一个磁盘文件的 crc32 (与下载用的同一份实现)。
+ * 用途: 核对"这个文件上次是否已经下完且完好"，完好就跳过不重下。
+ * 打不开/读失败返回 0 —— 调用方的期望 crc 恒非 0，因此 0 必然判为不匹配。 */
+uint32_t netc_crc32_file(const char *path);
 
 /* 掉电恢复（2026-10-30）—— 供"非下载"上下文复用同一套恢复逻辑，例如应用中心
  * 扫描 /sdcard/store_pkg 时发现 `xxx.lua.bak` 就复位成 `xxx.lua`。

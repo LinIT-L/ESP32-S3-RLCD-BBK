@@ -11,15 +11,12 @@
 
 #include "board_battery.h"
 #include "esp_check.h"
-#include "esp_event.h"
-#include "esp_http_server.h"
+#include "esp_http_server.h"   /* 只是 httpd_req_t/httpd_uri_t 类型（handler 签名） */
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "dns_server.h"
-#include "esp_wifi.h"
-#include "lwip/ip4_addr.h"
 #include "svc_nvs.h"
 #include "sys/time.h"
+#include "web_core.h"          /* ★ 2026-11-01: 统一 HTTP 服务 */
+#include "wifi_manager.h"      /* ★ AP 热点与 STA 都由它统一管 */
 
 static const char *TAG = "web_gamepad";
 
@@ -31,8 +28,6 @@ static const char *TAG = "web_gamepad";
 #define WEB_GAMEPAD_AP_CHANNEL     6
 #define WEB_GAMEPAD_AP_MAX_CONN    4
 
-static httpd_handle_t s_server = NULL;
-static dns_server_handle_t s_dns = NULL;
 static bool s_started = false;
 static volatile uint8_t s_joypad_state = 0xFF;
 
@@ -92,7 +87,7 @@ static const char s_index_html[] =
     "let state=255,pressed={},stickMode=false,stickId=null;"
     "const dpad=document.getElementById('dpad'),stick=document.getElementById('stick'),knob=stick.querySelector('.knob'),toggle=document.getElementById('toggle');"
     "function vib(){if(navigator.vibrate)navigator.vibrate(15)}"
-    "function send(){let s=255;for(const id in pressed)s&=~(1<<(+id));if(s!==state){state=s;fetch('/joypad?state='+state,{method:'POST',cache:'no-store'}).catch(()=>{});}}"
+    "function send(){let s=255;for(const id in pressed)s&=~(1<<(+id));if(s!==state){state=s;fetch('joypad?state='+state,{method:'POST',cache:'no-store'}).catch(()=>{});}}"
     "document.querySelectorAll('.btn[data-b]').forEach(b=>{const id=b.dataset.b;"
     "b.addEventListener('pointerdown',e=>{e.preventDefault();vib();pressed[id]=1;b.classList.add('down');send();});"
     "b.addEventListener('pointerup',e=>{e.preventDefault();delete pressed[id];b.classList.remove('down');send();});"
@@ -151,71 +146,22 @@ static esp_err_t web_gamepad_battery_handler(httpd_req_t *req)
     return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
 }
 
-/* 捕获门户: 未匹配请求 302 重定向到手柄页 (绝对路径, iOS/Android 都认) */
-static esp_err_t web_gamepad_captive_redirect(httpd_req_t *req)
-{
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://8.8.8.8/");
-    httpd_resp_send(req, "Redirect to BBK gamepad", HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-static esp_err_t web_gamepad_start_http_server(void)
-{
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true;
-    config.stack_size = 4096;
-    config.task_priority = 3;
-    config.core_id = 0;
-    /* V1.0.67: 关键! 默认 uri_match_fn=NULL 是精确匹配, catch-all 通配路径
-     * 必须用 wildcard 匹配器才能命中任意路径, 否则 captive portal 永远 404 不弹网页. */
-    config.uri_match_fn = httpd_uri_match_wildcard;
-
-    ESP_RETURN_ON_ERROR(httpd_start(&s_server, &config), TAG, "start http server failed");
-
-    const httpd_uri_t index_uri = {
-        .uri = "/", .method = HTTP_GET, .handler = web_gamepad_index_handler, .user_ctx = NULL,
-    };
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &index_uri), TAG, "register index uri failed");
-
-    const httpd_uri_t joypad_uri = {
-        .uri = "/joypad", .method = HTTP_POST, .handler = web_gamepad_joypad_handler, .user_ctx = NULL,
-    };
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &joypad_uri), TAG, "register joypad uri failed");
-
-    const httpd_uri_t battery_uri = {
-        .uri = "/battery", .method = HTTP_GET, .handler = web_gamepad_battery_handler, .user_ctx = NULL,
-    };
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &battery_uri), TAG, "register battery uri failed");
-
-    /* 捕获门户: 兜底所有未匹配的 GET 请求, 302 重定向到手柄页 */
-    const httpd_uri_t catch_uri = {
-        .uri = "/*", .method = HTTP_GET, .handler = web_gamepad_captive_redirect, .user_ctx = NULL,
-    };
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &catch_uri), TAG, "register catch uri failed");
-
-    return ESP_OK;
-}
-
-/* 局域网模式: 不起 AP、无 captive portal, 服务绑定 0.0.0.0, 同网设备经 STA 局域网 IP 访问 */
-static esp_err_t web_gamepad_start_http_server_lan(void)
-{
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true;
-    config.stack_size = 4096;
-    config.task_priority = 3;
-    config.core_id = 0;
-    config.uri_match_fn = httpd_uri_match_wildcard;
-
-    ESP_RETURN_ON_ERROR(httpd_start(&s_server, &config), TAG, "start http server failed");
-    const httpd_uri_t index_uri =  { .uri = "/",       .method = HTTP_GET,  .handler = web_gamepad_index_handler,   .user_ctx = NULL };
-    const httpd_uri_t joypad_uri = { .uri = "/joypad", .method = HTTP_POST, .handler = web_gamepad_joypad_handler,  .user_ctx = NULL };
-    const httpd_uri_t battery_uri ={ .uri = "/battery",.method = HTTP_GET,  .handler = web_gamepad_battery_handler, .user_ctx = NULL };
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &index_uri), TAG, "reg index failed");
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &joypad_uri), TAG, "reg joypad failed");
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &battery_uri), TAG, "reg battery failed");
-    return ESP_OK;
-}
+/* ---------- 向 web_core 注册本应用的页面与接口 ----------
+ * URI 写**相对路径**，由 web_core 拼成 /pad/...（不依赖前缀通配，见 web_core.h）。
+ * is_default=true：访问 http://8.8.8.8/ 会被 302 到 /pad/，captive 门户照旧弹网页。 */
+static const httpd_uri_t s_pad_uris[] = {
+    { .uri = "/",        .method = HTTP_GET,  .handler = web_gamepad_index_handler,   .user_ctx = NULL },
+    { .uri = "/joypad",  .method = HTTP_POST, .handler = web_gamepad_joypad_handler,  .user_ctx = NULL },
+    { .uri = "/battery", .method = HTTP_GET,  .handler = web_gamepad_battery_handler, .user_ctx = NULL },
+};
+static const web_app_t s_pad_app = {
+    .name       = "pad",
+    .prefix     = "/pad",
+    .uris       = s_pad_uris,
+    .n_uris     = sizeof(s_pad_uris) / sizeof(s_pad_uris[0]),
+    .need_auth  = false,   /* 手柄页保持"连上就能玩"，不加 PIN（与原体验一致） */
+    .is_default = true,
+};
 
 /* 网页服务模式 (NVS "web_svc_mode"): 0=AP直连(自建热点) 1=局域网(WiFi共享).
  * 默认 1 (联网/局域网), 用户不需手动切; 仅当显式设 0 才走 AP. */
@@ -252,96 +198,41 @@ static esp_err_t begin_ap(void);
 
 esp_err_t web_gamepad_start(void)
 {
-    if (s_started) {
-        return ESP_OK;
-    }
+    if (s_started) return ESP_OK;
 
     ESP_RETURN_ON_ERROR(web_gamepad_init_nvs(), TAG, "init nvs failed");
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "init netif failed");
 
-    esp_err_t ret = esp_event_loop_create_default();
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_RETURN_ON_ERROR(ret, TAG, "create event loop failed");
-    }
-
-    /* 局域网共享模式: 设备需已连入路由器(STA), 不起 AP, 同网设备经局域网 IP 访问 */
+    /* ① 局域网模式：复用 wifi_manager 已连接的 STA，不碰射频 */
     if (web_gamepad_svc_mode() == 1) {
-        /* 注意: esp_netif_get_handle_from_ifkey 需传字符串键 "WIFI_STA_DEF",
-         * 绝不能用 WIFI_IF_STA(int enum) 当指针——那会导致读 0x2 崩溃. */
-        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        esp_netif_ip_info_t ip;
-        if (!sta || esp_netif_get_ip_info(sta, &ip) != ESP_OK || ip4_addr_isany(&ip.ip)) {
-            ESP_LOGD(TAG, "局域网模式需要设备先连接 WiFi (STA), 未取到局域网 IP");
+        if (!wifi_manager_is_connected()) {
+            ESP_LOGD(TAG, "局域网模式需要设备先连接 WiFi (STA)");
             return ESP_ERR_INVALID_STATE;
         }
+        char ip[20] = "-";
+        wifi_manager_get_ip(ip, sizeof(ip));
         ESP_RETURN_ON_ERROR(board_battery_init(), TAG, "init battery monitor failed");
-        ESP_RETURN_ON_ERROR(web_gamepad_start_http_server_lan(), TAG, "start lan server failed");
+        ESP_RETURN_ON_ERROR(web_core_start(0), TAG, "web_core start failed");
+        ESP_RETURN_ON_ERROR(web_core_register(&s_pad_app), TAG, "register pad failed");
         s_joypad_state = 0xFF;
         s_started = true;
-        char iptxt[16];
-        snprintf(iptxt, sizeof(iptxt), IPSTR, IP2STR(&ip.ip));
-        ESP_LOGI(TAG, "网页手柄[局域网模式] http://%s/ (同网设备访问)", iptxt);
+        ESP_LOGI(TAG, "网页手柄[局域网模式] http://%s/pad/ (同网设备访问)", ip);
         return ESP_OK;
     }
 
-    return begin_ap();
-}
-
-static esp_err_t begin_ap(void)
-{
-    /* AP 模式: 自建热点 (保留原逻辑) */
-    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (ap_netif == NULL) {
-        ap_netif = esp_netif_create_default_wifi_ap();
-    }
-
-    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
-    init_config.wifi_task_core_id = 0;
-    esp_err_t wifi_init_ret = esp_wifi_init(&init_config);
-    if (wifi_init_ret != ESP_OK && wifi_init_ret != ESP_ERR_INVALID_STATE) {
-        ESP_RETURN_ON_ERROR(wifi_init_ret, TAG, "init wifi failed");
-    }
-
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = WEB_GAMEPAD_AP_SSID,
-            .password = WEB_GAMEPAD_AP_PASSWORD,
-            .ssid_len = strlen(WEB_GAMEPAD_AP_SSID),
-            .channel = WEB_GAMEPAD_AP_CHANNEL,
-            .max_connection = WEB_GAMEPAD_AP_MAX_CONN,
-            .authmode = WIFI_AUTH_OPEN,
-            .pmf_cfg = { .required = false },
-        },
-    };
-
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "set wifi mode failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_config), TAG, "set ap config failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start wifi failed");
-
-    /* AP 网关 IP 设为 8.8.8.8 (简单好记), 浏览器访问 http://8.8.8.8 即打开手柄页 */
-    esp_netif_ip_info_t ip_info = { 0 };
-    IP4_ADDR(&ip_info.ip, 8, 8, 8, 8);
-    IP4_ADDR(&ip_info.gw, 8, 8, 8, 8);
-    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
-    esp_netif_dhcps_stop(ap_netif);
-    ESP_RETURN_ON_ERROR(esp_netif_set_ip_info(ap_netif, &ip_info), TAG, "set ap ip failed");
-
-    /* DHCP captive portal URL: 手机连接后据此自动弹网页 */
-    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
-                           "http://8.8.8.8/", strlen("http://8.8.8.8/"));
-    esp_netif_dhcps_start(ap_netif);
-
-    /* DNS 劫持: 所有域名解析到 8.8.8.8 */
-    dns_server_config_t dns_cfg = DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
-    s_dns = start_dns_server(&dns_cfg);
-
+    /* ② AP 直连：热点交给 wifi_manager（内部 APSTA，不会踢掉已连接的 STA） */
+    ESP_RETURN_ON_ERROR(wifi_manager_ap_start(WEB_GAMEPAD_AP_SSID, WEB_GAMEPAD_AP_PASSWORD,
+                                              WEB_GAMEPAD_AP_CHANNEL, WEB_GAMEPAD_AP_MAX_CONN,
+                                              true), TAG, "ap start failed");
     ESP_RETURN_ON_ERROR(board_battery_init(), TAG, "init battery monitor failed");
-    ESP_RETURN_ON_ERROR(web_gamepad_start_http_server(), TAG, "start web gamepad server failed");
+
+    esp_err_t e = web_core_start(0);            /* 0 = 默认端口 80 */
+    if (e != ESP_OK) { wifi_manager_ap_stop(); return e; }
+    e = web_core_register(&s_pad_app);
+    if (e != ESP_OK) { web_core_stop(); wifi_manager_ap_stop(); return e; }
 
     s_joypad_state = 0xFF;
     s_started = true;
-
-    ESP_LOGI(TAG, "网页手柄已就绪: 热点 '%s' (无密码), 连上后浏览器自动打开 http://8.8.8.8",
+    ESP_LOGI(TAG, "网页手柄已就绪: 热点 '%s'（无密码），连上后浏览器打开 http://8.8.8.8/pad/",
              WEB_GAMEPAD_AP_SSID);
     return ESP_OK;
 }
@@ -351,19 +242,11 @@ void web_gamepad_stop(void)
     if (!s_started) return;
     s_started = false;
     s_joypad_state = 0xFF;
-    if (s_dns) {
-        stop_dns_server(s_dns);
-        s_dns = NULL;
-    }
-    if (s_server) {
-        httpd_stop(s_server);
-        s_server = NULL;
-    }
-    /* 仅 AP 直连模式才停 WiFi 射频 (热点由本模块创建, 归本模块).
-     * 局域网(WiFi共享)模式 WiFi 是 wifi_manager 管理的 STA, 绝不能在此停. */
-    if (web_gamepad_svc_mode() == 0) {
-        esp_wifi_stop();
-    }
+    /* 只注销自己、只减自己的引用 —— 别人还在用同一个 server 时不会被关掉 */
+    web_core_unregister(&s_pad_app);
+    web_core_stop();
+    /* 仅 AP 直连模式才关热点（局域网模式下射频归 wifi_manager 的 STA，动不得） */
+    if (web_gamepad_svc_mode() == 0) wifi_manager_ap_stop();
     ESP_LOGI(TAG, "网页手柄已停止");
 }
 

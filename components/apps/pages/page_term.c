@@ -9,6 +9,7 @@
 #include "os.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"      /* EXT_RAM_BSS_ATTR: 历史行缓冲放 PSRAM */
 #include "ui_common.h"
 #include "virtual_keys.h"  /* 系统虚拟按键（GBC 同款） */
 #include "input.h"
@@ -898,7 +899,8 @@ static bool exec_one(char*c){
  *   - 环形覆盖, 满 8 条后淘汰最旧;
  *   - 长度受 TM_LINE_LEN 限制 (与命令栏一致)。 */
 #define TM_HIST_N 8
-static char s_hist[TM_HIST_N][TM_LINE_LEN];
+/* ★ 2026-11-02: 终端没打开时这 490 B 纯属占位, 放 PSRAM。 */
+static EXT_RAM_BSS_ATTR char s_hist[TM_HIST_N][TM_LINE_LEN];
 static int  s_hist_n;      /* 已有条数 */
 static int  s_hist_pos;    /* 下一条写入位置 */
 static int  s_hist_view;   /* 0=当前输入, >0=回看第 N 条 */

@@ -11,6 +11,7 @@
 #define PAL_ENTRY_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -55,6 +56,24 @@ void pal_poll_keys(void);
 
 const char *pal_entry_datadir(void);
 void        pal_entry_set_datadir(const char *d);
+
+/* ---------------- 资源模式（LPK 单文件 / ZIP 解压目录） ----------------
+ * 判定逻辑不在本文件：唯一实现在 components/services/lpk/lpk_mode.c
+ * （安装记录 .install_mode → 各自自检 → 无记录时目录优先）。 */
+typedef enum {
+    PAL_RES_NONE = 0,   /* 两种资源都不成立，不能启动 */
+    PAL_RES_DIR  = 1,   /* ZIP 解压目录（历史模式） */
+    PAL_RES_LPK  = 2,   /* 单个 .lpk，挂到 /lpk 免解压 */
+} pal_res_mode_t;
+
+pal_res_mode_t pal_res_mode(void);                 /* 本次启动实际用的模式 */
+const char    *pal_res_mode_str(pal_res_mode_t m); /* "LPK" / "ZIP-DIR" / "NONE" */
+/* 引擎该用的数据目录：LPK 模式 = "/lpk"，否则 = PAL_DATA_DIR。
+ * （pal_platform.c 的 UTIL_Platform_Init 用它改写 gConfig.pszGamePath） */
+const char    *pal_res_gamepath(void);
+bool           pal_res_mounted(void);              /* /lpk 是否已挂上 */
+/* 只做判定、不挂载（串口诊断用；结果同时缓存给下次启动） */
+pal_res_mode_t pal_res_probe(char *why, size_t cap);
 
 /* 仙剑单独限帧 (0=不限)。默认 20fps: 主循环里 pal_tick 是"超时跳过",
  * 不阻塞输入/音频; 面板本身也只有 16~24Hz, 再高纯属白耗 CPU 并把主任务占满。 */

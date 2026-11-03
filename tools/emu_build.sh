@@ -66,9 +66,11 @@ if [ "$1" = "clean" ]; then
 fi
 
 echo "[build] LINTOS_EMU_MODE=1 → build_emu/"
+# LINTOS_EXTRA_CMAKE 可透传额外 -D 开关（例如 LavaX VM 基准）
+#   LINTOS_EXTRA_CMAKE="-DLINTOS_LAVAX_BENCH=1" ./tools/emu_build.sh
 python3 "${IDF_PATH}/tools/idf.py" -B build_emu \
     -DSDKCONFIG="${PROJECT_DIR}/sdkconfig.emu" \
-    -DLINTOS_EMU_MODE=1 build
+    -DLINTOS_EMU_MODE=1 ${LINTOS_EXTRA_CMAKE} build
 
 # ---- 合并 16MB 整镜像 (必须带字库分区, 否则模拟器里只有数字没文字) ----
 echo "[merge] build_emu/emu_flash.bin"

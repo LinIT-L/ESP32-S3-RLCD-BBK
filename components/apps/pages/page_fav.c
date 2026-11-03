@@ -36,7 +36,9 @@
 #include "esp_http_server.h"
 #include "esp_netif_ip_addr.h"
 #include "lwip/ip4_addr.h"
-#include "dns_server.h"
+#include "dns_server.h"   /* 仅保留类型无关的旧引用，AP/DNS 已归 wifi_manager */
+#include "web_core.h"      /* ★ 2026-11-01: 统一 HTTP 服务 */
+#include "wifi_manager.h"  /* ★ AP/STA 统一由它管理 */
 #include "esp_attr.h"
 #include "esp_random.h"
 #include "esp_heap_caps.h"
@@ -193,8 +195,6 @@ static void  fav_json_esc(char *d, size_t cap, const char *src);   /* 前向: li
 #define FAV_AP_SSID     "LinTOS-FAV"
 /* ★ C1: 本次会话的备份口令（独立于设备 PIN，不写入任何文件） */
 static char s_bk_pw[33] = {0};
-static httpd_handle_t s_fav_httpd = NULL;
-static void          *s_fav_dns   = NULL;
 static bool           s_web_on    = false;   /* 网页服务启动标志 */
 static bool           s_web_allow = false;   /* ★ 是否对外可访问 (预热后仍要用户点「局域网配置」才开放) */
 static bool           s_web_open_req = false;/* 用户点了开, 但服务还在启动中 */
@@ -612,8 +612,8 @@ static void fav_icon_del(int gi);
 static void fav_icons_migrate(void);
 
 /* 备份列表 (弹窗选择用) */
-static char        s_bak_path[FAV_BAK_MAX][56];
-static char        s_bak_label[FAV_BAK_MAX][40];
+EXT_RAM_BSS_ATTR static char s_bak_path[FAV_BAK_MAX][56];    /* 只有收藏页备份弹窗用 */
+EXT_RAM_BSS_ATTR static char s_bak_label[FAV_BAK_MAX][40];
 static const char *s_bak_items[FAV_BAK_MAX];
 
 /* ==================== C1: 备份整包加密 ====================
@@ -1264,23 +1264,15 @@ static esp_err_t fav_web_index_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, fav_web_html(), HTTPD_RESP_USE_STRLEN);
 }
-/* ★ 2026-10-19: 局域网网页需要 PIN 才能读写 (token 30 分钟有效) */
-static char    s_web_tok[17];
-static int64_t s_web_tok_us;
+/* ★ 2026-11-01 第二回合: token 交给 web_core 统一签发/校验（30 分钟，Bearer）。
+ *   本文件的业务逻辑不变，只是"谁的 token"从模块私有变成全系统共用。 */
+static bool fav_web_authed(httpd_req_t *req) { return web_core_auth_check(req); }
 
-/* ★ R4: 只接受 `Authorization: Bearer <token>`。
- *   URL query 里的 t= 兼容分支已**整段删除** —— token 放 URL 会进浏览器历史/Referer/代理日志。
- *   前端(fav_web_page.h)已全部走请求头, 删除后没有遗留依赖。 */
-static bool fav_web_authed(httpd_req_t *req)
+/* web_core 的 PIN 校验回调 —— 仍走原来的 keyvault PIN，逻辑一行没改。 */
+static bool fav_pin_check(const char *pin)
 {
-    if (!s_web_tok[0]) return false;
-    if (esp_timer_get_time() - s_web_tok_us > 30LL * 60 * 1000000) return false;
-    char hv[64];
-    if (httpd_req_get_hdr_value_str(req, "Authorization", hv, sizeof(hv)) != ESP_OK) return false;
-    const char *b = hv;
-    if (strncmp(b, "Bearer ", 7) == 0) b += 7;
-    else if (strncmp(b, "bearer ", 7) == 0) b += 7;      /* 头名大小写不敏感, 值这里宽容一点 */
-    return strcmp(b, s_web_tok) == 0;
+    os_keyvault_init();
+    return os_keyvault_verify_pin(pin) == 0;
 }
 
 /* 严格整数解析: 只接受可选负号 + 纯数字, 其余一律失败。
@@ -1336,13 +1328,11 @@ static esp_err_t fav_web_login_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         return fav_web_send_json(req, "{\"ok\":false,\"err\":\"body\"}");
     }
-    os_keyvault_init();
-    if (os_keyvault_verify_pin(pin) != 0) return fav_web_deny(req);
-    uint64_t r = ((uint64_t)esp_random() << 32) | esp_random();
-    snprintf(s_web_tok, sizeof(s_web_tok), "%016llx", (unsigned long long)r);
-    s_web_tok_us = esp_timer_get_time();
+    /* PIN 正确 ⇒ web_core 统一签发 token（同一个 PIN 体系，行为与原来一致） */
+    char tok[WEB_CORE_TOKEN_LEN + 1];
+    if (!web_core_auth_login(pin, tok, sizeof(tok))) return fav_web_deny(req);
     char out[64];
-    snprintf(out, sizeof(out), "{\"ok\":true,\"t\":\"%s\"}", s_web_tok);
+    snprintf(out, sizeof(out), "{\"ok\":true,\"t\":\"%s\"}", tok);
     return fav_web_send_json(req, out);
 }
 
@@ -1879,6 +1869,9 @@ static esp_err_t fav_web_api_dispatch(httpd_req_t *req)
     str_trunc(path, sizeof(path), req->uri);
     char *qm = strchr(path, '?'); if (qm) *qm = 0;
     const char *u = path;
+    /* ★ 2026-11-01: 迁移到 /fav 前缀后，URI 变成 /fav/api/xxx；剥掉前缀，
+     *   下面这串 if 与原来完全一致（业务判断一行没动）。 */
+    if (strncmp(u, "/fav", 4) == 0) u += 4;
     if (!strcmp(u, "/api/login")) return fav_web_login_handler(req);
     if (!strcmp(u, "/api/list"))  return fav_web_list_handler(req);
     if (!strcmp(u, "/api/add"))   return fav_web_add_handler(req);
@@ -1896,104 +1889,73 @@ static esp_err_t fav_web_api_dispatch(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":false}");
 }
 
-static void fav_web_register_uris(httpd_handle_t h)
+/* ---------- web_core 注册（第二回合） ----------
+ * 页面与 API 都挂在 /fav 前缀下。need_auth=false 是因为**登录接口必须公开**；
+ * 其余端点仍由 fav_web_api_dispatch() 逐个校验（与迁移前一致，逻辑没改）。 */
+static const httpd_uri_t s_fav_uris[] = {
+    { .uri = "/",      .method = HTTP_GET, .handler = fav_web_index_handler, .user_ctx = NULL },
+    { .uri = "/api/*", .method = HTTP_ANY, .handler = fav_web_api_dispatch,  .user_ctx = NULL },
+};
+static const web_app_t s_fav_app = {
+    .name       = "fav",
+    .prefix     = "/fav",
+    .uris       = s_fav_uris,
+    .n_uris     = sizeof(s_fav_uris) / sizeof(s_fav_uris[0]),
+    .need_auth  = false,
+    .is_default = false,
+};
+
+/* 起服务：注入 PIN 校验 + 注册应用（AP / 局域网两条路共用） */
+static bool fav_web_start_core(void)
 {
-    httpd_uri_t u;
-    u.user_ctx = NULL;
-    u.method = HTTP_GET;  u.uri = "/";       u.handler = fav_web_index_handler;
-    httpd_register_uri_handler(h, &u);
-    u.method = HTTP_ANY;  u.uri = "/api/*";  u.handler = fav_web_api_dispatch;
-    httpd_register_uri_handler(h, &u);
+    web_core_auth_set_pin_check(fav_pin_check);
+    if (web_core_start(0) != ESP_OK) return false;
+    if (web_core_register(&s_fav_app) != ESP_OK) { web_core_stop(); return false; }
+    return true;
 }
-static void fav_web_task(void *arg)   /* 热点(AP)模式: 自建热点 + 网页服务 */
+
+/* 热点模式：AP 交给 wifi_manager（APSTA，不踢掉已连接的 STA） */
+static void fav_web_task(void *arg)
 {
     (void)arg;
-    esp_err_t r;
-    esp_netif_init();
-    r = esp_event_loop_create_default();
-    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) { s_web_phase = 3; vTaskDelete(NULL); return; }
-
-    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (ap_netif == NULL) ap_netif = esp_netif_create_default_wifi_ap();
-
-    wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
-    ic.wifi_task_core_id = 0;
-    r = esp_wifi_init(&ic);
-    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) { s_web_phase = 3; vTaskDelete(NULL); return; }
-
-    wifi_config_t ap;
-    memset(&ap, 0, sizeof(ap));
-    memcpy(ap.ap.ssid, FAV_AP_SSID, strlen(FAV_AP_SSID));
-    ap.ap.ssid_len = strlen(FAV_AP_SSID);
-    ap.ap.channel = 6;
-    ap.ap.max_connection = 4;
     char pwd[20] = "";
     fav_ap_password(pwd, sizeof(pwd));
-    if (pwd[0]) {
-        memcpy(ap.ap.password, pwd, strlen(pwd));
-        ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    } else {
-        ap.ap.password[0] = 0;
-        ap.ap.authmode = WIFI_AUTH_OPEN;
+    if (wifi_manager_ap_start(FAV_AP_SSID, pwd, 6, 4, true) != ESP_OK) {
+        ESP_LOGE("FAV", "热点启动失败 ⇒ 收藏服务未启动");
+        s_web_phase = 3;
+        vTaskDelete(NULL);
+        return;
     }
-    ap.ap.pmf_cfg.required = false;
-    if (esp_wifi_set_mode(WIFI_MODE_AP) != ESP_OK ||
-        esp_wifi_set_config(WIFI_IF_AP, &ap) != ESP_OK ||
-        esp_wifi_start() != ESP_OK) { s_web_phase = 3; vTaskDelete(NULL); return; }
-    os_ap_set(true);   /* 状态栏显示 NET 图标 */
-
-    esp_netif_ip_info_t ip = { 0 };
-    IP4_ADDR(&ip.ip, 8, 8, 8, 8); IP4_ADDR(&ip.gw, 8, 8, 8, 8);
-    IP4_ADDR(&ip.netmask, 255, 255, 255, 0);
-    esp_netif_dhcps_stop(ap_netif);
-    esp_netif_set_ip_info(ap_netif, &ip);
-    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
-                           "http://8.8.8.8/", strlen("http://8.8.8.8/"));
-    esp_netif_dhcps_start(ap_netif);
-    dns_server_config_t dc = DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
-    s_fav_dns = start_dns_server(&dc);
-
-    if (s_fav_httpd == NULL) {
-        httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-        cfg.max_uri_handlers = 16;   /* 默认 8 不够 (注册 9 个 URI) */
-        cfg.max_open_sockets = 4;
-        cfg.stack_size = 8192;       /* ★ 与密钥管理器一致: 默认栈太小, httpd 任务起不来 */
-        cfg.lru_purge_enable = true;
-        cfg.lru_purge_enable = true; cfg.stack_size = 8192;
-        cfg.uri_match_fn = httpd_uri_match_wildcard;   /* 不开通配匹配时 api 通配路径会 404 */
-        {
-            esp_err_t hr = httpd_start(&s_fav_httpd, &cfg);
-            ESP_LOGW("FAV", "httpd_start=%d port=%d handlers=%d", (int)hr, cfg.server_port, (int)cfg.max_uri_handlers);
-            if (hr == ESP_OK) fav_web_register_uris(s_fav_httpd);
-        }
+    os_ap_set(true);
+    if (!fav_web_start_core()) {
+        wifi_manager_ap_stop();
+        os_ap_set(false);
+        ESP_LOGE("FAV", "HTTP 服务启动失败 ⇒ 收藏服务未启动");
+        s_web_phase = 3;
+        vTaskDelete(NULL);
+        return;
     }
-    s_web_on = true;
-    s_web_phase = (s_fav_httpd != NULL) ? 2 : 3;
-    ESP_LOGI("FAV", "网页配置: 热点 %s %s", FAV_AP_SSID,
-             (s_fav_httpd != NULL) ? "开启 (http://8.8.8.8)" : "开启失败");
+    s_web_on    = true;
+    s_web_phase = 2;
+    if (s_web_open_req) { s_web_open_req = false; s_web_allow = true; s_lan_toast_pending = true; }
+    ESP_LOGI("FAV", "收藏服务已开启: 热点 '%s' → http://8.8.8.8/fav/", FAV_AP_SSID);
     vTaskDelete(NULL);
 }
-static void fav_web_task_lan(void *arg)   /* IP配置(STA)模式: 复用当前WiFi, 只启动网页服务 */
+
+/* 局域网模式：复用 wifi_manager 已连接的 STA，不起热点 */
+static void fav_web_task_lan(void *arg)
 {
     (void)arg;
-    if (s_fav_httpd == NULL) {
-        httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-        cfg.max_uri_handlers = 16;   /* 默认 8 不够 (注册 9 个 URI) */
-        cfg.max_open_sockets = 4;
-        cfg.stack_size = 8192;       /* ★ 与密钥管理器一致: 默认栈太小, httpd 任务起不来 */
-        cfg.lru_purge_enable = true;
-        cfg.lru_purge_enable = true; cfg.stack_size = 8192;
-        cfg.uri_match_fn = httpd_uri_match_wildcard;   /* 不开通配匹配时 api 通配路径会 404 */
-        {
-            esp_err_t hr = httpd_start(&s_fav_httpd, &cfg);
-            ESP_LOGW("FAV", "httpd_start=%d port=%d handlers=%d", (int)hr, cfg.server_port, (int)cfg.max_uri_handlers);
-            if (hr == ESP_OK) fav_web_register_uris(s_fav_httpd);
-        }
+    if (!fav_web_start_core()) {
+        ESP_LOGE("FAV", "HTTP 服务启动失败 ⇒ 收藏服务未启动(LAN)");
+        s_web_phase = 3;
+        vTaskDelete(NULL);
+        return;
     }
-    s_web_on = true;
-    s_web_phase = (s_fav_httpd != NULL) ? 2 : 3;
+    s_web_on    = true;
+    s_web_phase = 2;
     if (s_web_open_req) { s_web_open_req = false; s_web_allow = true; s_lan_toast_pending = true; }
-    ESP_LOGI("FAV", "IP配置: 收藏服务已%s", (s_fav_httpd != NULL) ? "开启" : "开启失败");
+    ESP_LOGI("FAV", "IP配置: 收藏服务已开启 → http://<设备IP>/fav/");
     vTaskDelete(NULL);
 }
 
@@ -2168,40 +2130,37 @@ static void fav_web_start_lan_ex(ui_ctx_t *ctx, bool toast)
         ESP_LOGE("FAV", "favweb 任务创建失败(LAN) ⇒ 收藏夹服务未启动");
         return;
     }
-    /* ★ 2026-10-19: 网页服务期间关掉 WiFi 省电(PS) —— 否则每个请求要多等 ~100-300ms 唤起,
-     *   页面点击明显发滞。服务停止时恢复默认省电。 */
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    /* 网页服务期间关掉 WiFi 省电 —— 否则每个请求要多等 ~100-300ms 唤起, 页面点击发滞。
+     * ★ 2026-11-01: 改走 wifi_manager 的引用计数版本（下载也在用同一个计数，
+     *   直接调 esp_wifi_set_ps 会把下载期间的"保持全醒"提前恢复，两边打架）。 */
+    wifi_manager_ps_hold(true);
     /* 不登记资源管家: IP/局域网服务在 toast IP 后回主桌面仍须运行 (1:1 局域网手柄), 仅由设置项手动关闭 */
 }
 static void fav_web_stop(ui_ctx_t *ctx)
 {
     (void)ctx;
     if (!s_web_on && s_web_phase == 0) return;
-    if (s_fav_httpd) { httpd_stop(s_fav_httpd); s_fav_httpd = NULL; }
-    if (s_web_mode == 0) {   /* 热点(AP)模式额外清理: DNS + 恢复 STA + 状态栏NET图标 */
-        if (s_fav_dns) { stop_dns_server(s_fav_dns); s_fav_dns = NULL; }
+    /* 只注销自己 + 减引用计数；别的网页应用还在线时服务不会停 */
+    web_core_unregister(&s_fav_app);
+    web_core_stop();
+    if (s_web_mode == 0) {   /* 热点(AP)模式额外清理: 关热点 + 状态栏 NET 图标 */
         os_ap_set(false);
-        /* ★ 2026-10-20: 热点模式把 WiFi 设成了 WIFI_MODE_AP, 关闭后**必须切回 STA**,
-         *   否则后面「连接Wi-Fi」扫描会直接报"扫描失败, 请重试"(mode 不是 STA 就没法扫)。 */
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        if (wifi_manager_get_want_on()) {
-            wifi_manager_enable();      /* 本来就想联网 → 重新拉起射频 */
-            wifi_manager_autostart();   /* 有存档就自动重连 */
-        } else {
-            esp_wifi_stop();
-        }
+        /* ★ 2026-11-01: 热点由 wifi_manager 统一关（内部已把模式回 STA），
+         *   这里不再自己 set_mode / esp_wifi_stop —— 否则会把别的应用正在用的
+         *   射频一起关掉。只有"用户本来就不想联网 + 没有别的网页应用在用"才关射频。 */
+        wifi_manager_ap_stop();
+        if (!wifi_manager_get_want_on() && !web_core_is_running()) wifi_manager_disable();
     }
     s_web_on = false;
     s_web_phase = 0;
     s_web_allow = false;
     /* ★ C11: 服务停下即销毁会话，重新开放后旧 token 一律失效 */
-    s_web_tok[0] = 0;
-    s_web_tok_us = 0;
+    if (!web_core_is_running()) web_core_auth_clear();   /* 服务真停了才作废 token */
     s_web_open_req = false;
     s_lan_pending = false;
     s_lan_toast_pending = false;
-    /* 恢复默认省电 (仅 STA 模式; AP 模式前面已 esp_wifi_stop) */
-    if (s_web_mode == 1) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    /* 恢复默认省电（引用计数归零才真的恢复；下载还在跑就不会被提前恢复） */
+    wifi_manager_ps_hold(false);
 }
 
 /* ================= HID ================= */
@@ -2453,25 +2412,44 @@ static void main_render(st7305_handle_t *l){
         /* ★ 与密钥管理器完全一致: 同顺序、同 32px 行高、同右栏居中 */
         /* ★ 已联网时, 最后一项直接显示当前 IP (浏览器输这个地址就能改收藏夹) */
         static char s_ipitem[40] = "IP\xe9\x85\x8d\xe7\xbd\xae";   /* IP配置 */
+        static char s_ipitem2[28];                     /* 开启成功后的 IP 行（空=不显示） */
+        s_ipitem2[0] = 0;
         {
             char ip[24] = {0};
-            /* ★ 只有服务真正开启后才显示 IP; 未开启显示「网络配置」 */
-            if (s_web_on && s_web_allow && wifi_manager_is_connected() && wifi_manager_get_ip(ip, sizeof(ip)) && ip[0])
-                snprintf(s_ipitem, sizeof(s_ipitem), "IP %s", ip);
+            /* ★ 2026-11-01 linit：三种状态分别给明确文案
+             *   ① 已开启且有 IP → 「已成功开启局域网配置」+ 下一行 IP
+             *   ② WiFi 已连但服务没开 → 「点击开启局域网配置」
+             *   ③ 没联网 → 「局域网配置」 */
+            if (s_web_on && s_web_allow && wifi_manager_is_connected() && wifi_manager_get_ip(ip, sizeof(ip)) && ip[0]) {
+                snprintf(s_ipitem, sizeof(s_ipitem),
+                         "\xe5\xb7\xb2\xe6\x88\x90\xe5\x8a\x9f"
+                         "\xe5\xbc\x80\xe5\x90\xaf"
+                         "\xe5\xb1\x80\xe5\x9f\x9f\xe7\xbd\x91"
+                         "\xe9\x85\x8d\xe7\xbd\xae");   /* 已成功开启局域网配置 */
+                snprintf(s_ipitem2, sizeof(s_ipitem2), "IP %s", ip);
+            }
             else if (s_web_phase == 1)
                 snprintf(s_ipitem, sizeof(s_ipitem), "\xe5\x90\xaf\xe5\x8a\xa8\xe4\xb8\xad\xe2\x80\xa6");  /* 启动中… */
+            else if (wifi_manager_is_connected())
+                snprintf(s_ipitem, sizeof(s_ipitem),
+                         "\xe7\x82\xb9\xe5\x87\xbb\xe5\xbc\x80\xe5\x90\xaf"
+                         "\xe5\xb1\x80\xe5\x9f\x9f\xe7\xbd\x91"
+                         "\xe9\x85\x8d\xe7\xbd\xae");   /* 点击开启局域网配置 */
             else
                 snprintf(s_ipitem, sizeof(s_ipitem), "\xe5\xb1\x80\xe5\x9f\x9f\xe7\xbd\x91\xe9\x85\x8d\xe7\xbd\xae");  /* 局域网配置 */
         }
-        const char *set_items[5] = {
+        /* ★ 2026-11-01 linit：开启成功后**另起一行**显示 IP（菜单从 5 项变 6 项） */
+        const char *set_items[6] = {
             "\xe5\xaf\xbc\xe5\x87\xba\xe5\xa4\x87\xe4\xbb\xbd",  /* 导出备份 */
             "\xe5\xaf\xbc\xe5\x85\xa5\xe5\xa4\x87\xe4\xbb\xbd",  /* 导入备份 */
             "\xe4\xbf\xae\xe6\x94\xb9PIN",        /* 修改PIN */
             "\xe7\x83\xad\xe7\x82\xb9\xe9\x85\x8d\xe7\xbd\xae",  /* 热点配置 */
-            s_ipitem,                                      /* IP配置 / IP x.x.x.x */
+            s_ipitem,                                      /* 局域网状态 */
+            s_ipitem2,                                     /* IP x.x.x.x（仅开启后有内容） */
         };
+        int set_n = s_ipitem2[0] ? 6 : 5;
         int y = HDR_H + 6 - s_scroll;
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < set_n; i++) {
             if (y + 32 >= HDR_H && y <= S_H - 10) {
                 bool sel = (i == s_sel) || (tv && ty >= y && ty < y + 32 && tx >= LIST_X + 2 && tx <= S_W - 2);
                 if (sel) fill_rect(l, LIST_X + 2, y, S_W - 2, y + 30, ST7305_COLOR_BLACK);

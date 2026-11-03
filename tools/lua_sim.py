@@ -147,6 +147,13 @@ class Sim:
         self.t_was = False
         self.ms = 0
         self.nvs, self.fs, self.db = {}, {}, {}
+        # ★ LIN_SIM_NOSD=1: 模拟「TF 卡没插 / 挂载失败」—— 真机上 /sdcard 是 VFS 挂载点,
+        #   卡不在时 exists/mkdir/listdir 全部失败。用来复现"打开录音机提示无法创建录音目录"。
+        #   与 LIN_SIM_NOMAP 同一套路, 默认关, 不影响既有测试。
+        self.nosd = bool(os.environ.get("LIN_SIM_NOSD"))
+        # ★ LIN_SIM_NOFS=1: 模拟「固件没有 app.fs」—— 老固件 / 沙箱未放行时的状态。
+        #   用来验证"应用直接索引 nil 会抛英文 Lua 错误"这条路径。
+        self.nofs = bool(os.environ.get("LIN_SIM_NOFS"))
         self._seed_fs()
         self.imgs = {}
         self.log = []
@@ -521,6 +528,12 @@ class Sim:
         a.exit = lambda: setattr(self, "exited", True)
         a.redraw = lambda: None
         a.sbar = lambda v=False: setattr(self, "sbar_invert", bool(v))
+        # ★ 2026-11-02: app.statusbar() = 真机上"用系统样式画状态栏"的入口
+        #   (luat_lib_gfx.c 的 l_statusbar → svc_statusbar_draw_game)。
+        #   模拟器没有系统状态栏可画, 这里只**计数**, 用来验证"应用确实每帧都要求画"。
+        #   录音机曾经完全不调 —— 而它的清屏从 y=24 起, 顶部 24 行于是永远停着上屏残影。
+        self.sbar_calls = 0
+        a.statusbar = lambda: setattr(self, "sbar_calls", self.sbar_calls + 1)
         a.touch = lambda: self._touch()
         a.touch_start = lambda: self._touch_start()
         a.touch_hold = lambda: (self.ms - self.t_down_ms) if self.touch_xy else 0
@@ -592,7 +605,15 @@ class Sim:
                             if int(i) in self.imgs else None),
             free=lambda i: self.imgs.pop(int(i), None),
             freeall=lambda: self.imgs.clear())
-        a.fs = self.lua.table(exists=lambda p: str(p) in self.fs,
+        # ★ 2026-10-31: app.net.http_url 的模拟 (真机=net_client 带证书校验的 HTTPS)
+        #   只模拟两种: /api/stats 的真实返回结构, 其它 URL 一律失败。
+        def _http_url(url, timeout=5000):
+            self.log.append("[sim] http_url %s (timeout=%s)" % (url, timeout))
+            if "gmud.online/api/stats" in str(url):
+                body = b'{"registered":379,"online":21,"peakOnline":22,"peakOnlineAt":1792831518}'
+                return body.decode(), 200
+            return None, 0
+        a.fs = self.lua.table(exists=lambda p: self._fs_exists(str(p)),
                               read=lambda p: self.fs.get(str(p)),
                               write=lambda p, hexd: (self.fs.__setitem__(
                                   str(p), bytes.fromhex(str(hexd))), True)[1],
@@ -629,8 +650,15 @@ class Sim:
             return h
 
         def _rec_start(path, rate=16000):
+            p = str(path)
+            # ★ 2026-11-02: 与固件 audio_player_rec_start() 同契约 ——
+            #   fopen 打不开就返回 -3(无法创建文件), 不是笼统的"录音失败"。
+            #   有了这条, 录音机"目录建不出来"的分支才能在模拟器里验证到。
+            d = p.rsplit("/", 1)[0] if "/" in p else ""
+            if d and not self._fs_exists(d):
+                return -3
             self.rec_t0 = self.ms
-            self.rec_path = str(path)
+            self.rec_path = p
             self.fs[self.rec_path] = bytes(_rec_hdr(int(rate)))
             return 0
 
@@ -731,7 +759,8 @@ class Sim:
             return t
 
         a.poly = lambda d, w=1, ct=0, cb=299: self._poly(d, w, ct, cb)
-        a.net = self.lua.table(mirrors=_mirrors,is_connected=lambda: True, get_ip=lambda: "192.168.1.23",
+        a.net = self.lua.table(mirrors=_mirrors,http_url=_http_url,
+            is_connected=lambda: True, get_ip=lambda: "192.168.1.23",
                                http_get=lambda *ar: self._http_get(*ar),
                                ping=lambda ip, c=4, t=500: self._ping(ip, c),
                                port=lambda ip, p, ms=300: int(p) in (80, 443, 8080, 22, 21, 445) and
@@ -888,6 +917,9 @@ class Sim:
           `access()` —— 卡没插时挂载点不存在, 应用据此拒绝加载 (地图应用就是这么判的)。
           模拟器没有 VFS, 用这个键代替"卡已插上"。
         """
+        if self.nosd:
+            # LIN_SIM_NOSD=1: 完全没有 /sdcard (卡没插) —— 连挂载标记都不放
+            return
         self.fs["/sdcard"] = b""
         # 地图数据包 (若已编译) → /sdcard/Map/。应用**只认 TF 卡**, 没卡就拒绝加载,
         # 所以模拟器必须把它们放在 TF 路径下, 而不是 /store/。
@@ -1252,6 +1284,12 @@ class Sim:
             return None
         return b[off:off + n]
 
+    def _fs_exists(self, p):
+        """app.fs.exists —— 与固件一致: 卡不在时 /sdcard 整棵子树都不存在。"""
+        if self.nosd and (p.rstrip("/") == "/sdcard" or p.startswith("/sdcard/")):
+            return False
+        return p in self.fs
+
     def _fs_mkdir(self, p):
         """与固件一致: 逐级创建 (mkdir -p), 已存在也返回 true。
 
@@ -1262,6 +1300,8 @@ class Sim:
         p = str(p).rstrip("/")
         if not p:
             return False
+        if self.nosd and (p == "/sdcard" or p.startswith("/sdcard/")):
+            return False      # 卡不在: 建目录必失败 (真机 mkdir 返回 -1)
         parts = p.split("/")
         for i in range(2, len(parts) + 1):           # 从 "/a" 起逐级建
             self.fs.setdefault("/".join(parts[:i]), b"")
@@ -1273,6 +1313,8 @@ class Sim:
         ⚠ 这个语义踩过坑: 脚本用 pairs() 迭代会拿到下标 1/2/3…, 把下标当文件名。
         """
         d = str(d).rstrip("/")
+        if self.nosd and (d == "/sdcard" or d.startswith("/sdcard/")):
+            return None       # 与固件一致: opendir 失败 → 返回 nil, 不是空表
         names = []
         for k in self.fs:
             if d and not k.startswith(d + "/"):
@@ -1600,6 +1642,7 @@ def main():
     shots = run_steps(sim, steps, outdir, args.scale, args.verbose)
     print("=== %s 模拟完成: %d 帧 → %s ===" % (name, len(shots), outdir))
     print("    状态栏反白(app.sbar): %s" % ("开" if sim.sbar_invert else "关"))
+    print("    状态栏绘制(app.statusbar): %d 次" % sim.sbar_calls)
     for s in shots:
         print("  " + os.path.basename(s))
     if sim.log:

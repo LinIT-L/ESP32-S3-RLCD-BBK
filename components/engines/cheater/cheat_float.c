@@ -39,7 +39,7 @@ static cheater_bits_t s_bits = CHEAT_BITS_8;
 #define CHEAT_PRIO        7
 #define CHEAT_STACK_WORDS 16384
 EXT_RAM_BSS_ATTR static StackType_t s_cheat_stack[CHEAT_STACK_WORDS];
-static StaticTask_t  s_cheat_tcb;
+static StaticTask_t  s_cheat_tcb;   /* ⛔ 必须内部 RAM: xPortCheckValidTCBMem 校验 */
 static TaskHandle_t  s_cheat_task = NULL;
 static SemaphoreHandle_t s_open_req = NULL; /* 呼出通知 (唤醒任务) */
 static st7305_handle_t *s_lcd = NULL;

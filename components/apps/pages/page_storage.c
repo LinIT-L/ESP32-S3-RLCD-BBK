@@ -11,6 +11,8 @@
 #include "input.h"
 #include "sd_scan.h"
 #include "usbh_msc_sdspi.h"
+#include "web_files.h"     /* ★ 2026-11-01 第三回合: TF 卡网页共享 (/files/) */
+#include "wifi_manager.h"  /* 开共享时可能需要开热点; 状态栏 NET 图标 */
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -28,6 +30,8 @@
 #define TAG "PSTO"
 
 static void open_sd_dlg(ui_ctx_t *ctx);
+static void open_sd_share(ui_ctx_t *ctx);   /* ★ 第三回合: 网络访问存储 (定义在下面) */
+static void open_sd_format(ui_ctx_t *ctx);  /* ★ 2026-11-01: 入口移到「存储信息」页顶部, 需前置声明 */
 
 /* 返回/取消 → 关弹窗 + 直接退出存储页 (回主菜单).
  * 用户规范 2026-09-28: **存储只做弹窗**, 不要独立的整页界面 (不要"按返回键退出"那种全屏页)。
@@ -40,27 +44,38 @@ static void sd_close(ui_ctx_t *ctx, int result, void *ud) {
 }
 
 /* ---- 存储信息弹窗 (3.3: 只读多行 + 返回) ---- */
-static void sd_info_noop(ui_ctx_t *ctx, int result, void *ud) {
-    (void)ctx; (void)result; (void)ud;   /* 只读 */
+/* ★ 2026-11-01: 标记"本次格式化是从存储信息页进来的" —— 格式化完成后要连那一层一起关，
+ *   否则会停在一个显示**格式化前**容量/剩余的旧快照页上（数字全是过期的）。 */
+static bool s_fmt_from_info = false;
+
+static void sd_info_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    /* ★ 2026-11-01: 顶部第一项 = 「格式化TF卡」(原来在主菜单里, 现挪到本页顶部)。
+     *   其余几行是只读信息, 点了不该关窗 → 用 mark_handled 阻止自动 pop。
+     *   （open_sd_format 内部的 os_dialog_push 本身也会置 handled, 父层不受影响。） */
+    if (result == 0) { s_fmt_from_info = true; open_sd_format(ctx); return; }
+    if (result >= 0) os_dialog_mark_handled(ctx);
 }
+
 static void open_sd_info(ui_ctx_t *ctx) {
     EXT_RAM_BSS_ATTR static char items[6][40];
     static const char *ptrs[6];
     int n = 0;
     uint64_t total = 0, free = 0;
-    /* ★ 2026-10-18: 第一行原来是 CID 型号名(\"SD16G\"), 用户会当成容量 —— 那是出厂型号, 不是容量。
-     *   现在显示 **品牌 + 标称容量**(按字节换十进制 GB 四舍五入: 3834MB→4G / 14.8GiB→16G),
-     *   型号另起一行明确标注, 换卡时仍能一眼分辨是哪张。 */
+    /* ★ 2026-11-01 linit: "格式化TF卡" 放到本页**顶部**，作为可点项；主菜单里已去掉。 */
+    snprintf(items[n++], sizeof(items[0]), "%s",
+             "\xe6\xa0\xbc\xe5\xbc\x8f\xe5\x8c\x96TF\xe5\x8d\xa1");   /* 格式化TF卡 */
+    /* ★ 2026-10-18: 第一行原来是 CID 型号名("SD16G"), 用户会当成容量 —— 那是出厂型号, 不是容量。
+     *   现在显示 **品牌 + 标称容量**(按字节换十进制 GB 四舍五入: 3834MB→4G / 14.8GiB→16G)。
+     * ★ 2026-11-01 linit: 原来第二行「名称: xxx」(出厂 CID 名) 不再显示。 */
     uint64_t cap_bytes = sd_get_size_bytes();
     if (cap_bytes > 0) {
         uint32_t nominal_g = (uint32_t)((cap_bytes + 500000000ULL) / 1000000000ULL);
         if (nominal_g == 0) nominal_g = 1;
-        snprintf(items[n++], sizeof(items[0]), "\xe4\xbf\xa1\xe6\x81\xaf: %s %uG",      /* 卡: 品牌 XG */
+        snprintf(items[n++], sizeof(items[0]), "\xe5\x8d\xa1: %s %uG",      /* 卡: 品牌 XG */
                  sd_get_vendor_str(), (unsigned)nominal_g);
-        snprintf(items[n++], sizeof(items[0]), "\xe5\x90\x8d\xe7\xa7\xb0: %s", /* 出厂名: xxx */
-                 sd_get_cid_name());
     } else {
-        snprintf(items[n++], sizeof(items[0]), "\xe4\xbf\xa1\xe6\x81\xaf: %s", sd_get_cid_name());   /* 卡: xxx */
+        snprintf(items[n++], sizeof(items[0]), "\xe5\x8d\xa1: %s", sd_get_cid_name());   /* 卡: xxx */
     }
     if (sd_get_info(&total, &free) == 0) {
         uint32_t total_mb = (uint32_t)(total / (1024ULL * 1024ULL));
@@ -74,7 +89,7 @@ static void open_sd_info(ui_ctx_t *ctx) {
         snprintf(items[n++], sizeof(items[0]), "\xe7\x8a\xb6\xe6\x80\x81: %s", sd_get_mnt_state_str()); /* 状态: ... */
     }
     for (int i = 0; i < n; i++) ptrs[i] = items[i];
-    os_dialog_list(ctx, "\xe5\xad\x98\xe5\x82\xa8\xe4\xbf\xa1\xe6\x81\xaf", ptrs, n, 0, sd_info_noop, NULL); /* 存储信息 */
+    os_dialog_list(ctx, "\xe5\xad\x98\xe5\x82\xa8\xe4\xbf\xa1\xe6\x81\xaf", ptrs, n, 0, sd_info_cb, NULL); /* 存储信息 */
 }
 
 /* ---- 格式化TF卡: 三次重复确认防误触, 第 3 次确认才真正执行 ---- */
@@ -129,7 +144,11 @@ static void fmt_progress_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud)
     (void)d; (void)ud;
     if (sd_format_is_running()) { ctx->needs_redraw = true; return; }   /* 进度在动 → 持续重绘 */
     int rc = sd_format_result();
-    os_dialog_pop(ctx);
+    os_dialog_pop(ctx);                 /* 关进度窗 */
+    if (s_fmt_from_info) {              /* 从存储信息页进来的: 连带关掉那一层(数据已过期), 回主菜单 */
+        s_fmt_from_info = false;
+        os_dialog_pop(ctx);
+    }
     os_dialog_toast(ctx, (rc == 0)
                     ? "\xe6\xa0\xbc\xe5\xbc\x8f\xe5\x8c\x96\xe5\xae\x8c\xe6\x88\x90"        /* 格式化完成 */
                     : "\xe6\xa0\xbc\xe5\xbc\x8f\xe5\x8c\x96\xe5\xa4\xb1\xe8\xb4\xa5");     /* 格式化失败 */
@@ -146,6 +165,7 @@ static void sd_format_done(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     if (result != 0) {           /* 取消 / 返回: 直接关确认框, 归零 */
         s_fmt_stage = 0;
+        s_fmt_from_info = false; /* ★ 取消时标记也要清, 否则下次完成会多关一层 */
         return;
     }
     os_dialog_pop(ctx);          /* 确认: 先关当前确认框 */
@@ -201,6 +221,7 @@ static void open_sd_format(ui_ctx_t *ctx) {
  *      已挂载按"退出挂载" → 停止 MSC + 重挂 VFS + 恢复 watcher, 无需重启.
  * ===================================================================== */
 #include "mount_icon.inc"
+#include "web_icon.inc"     /* ★ 2026-11-01: 「网络访问存储」用的浏览器图标 64x64 */
 
 /* 后台挂载/卸载状态机 (on_poll 轮询, 避免跨任务直接改 UI):
  *  -2=挂载中; -1=空闲; 0=已挂载; 1=卸载VFS失败; 2=usbh_msc_start失败; 3=挂载中取消; 4=已卸载 */
@@ -377,12 +398,28 @@ static void open_sd_mount(ui_ctx_t *ctx) {
 #define FB_BY 25      /* 弹窗顶 */
 #define FB_BW 350     /* 弹窗宽 (与存储菜单一致) */
 #define FB_BH 250     /* 弹窗高 */
-#define FB_RH 30      /* 行高 */
-/* ★ 列表行的纵向基准 —— 绘制/命中/滚动跟随/拖动判定**必须**全用这两个,
- *   不许各处再写 by+4 / by+30 / by+32. 之前三个值并存, 行高正好 30,
- *   差值 28px ≈ 一行, 导致"点哪都选中上面一项". */
-#define FB_ROW_TOP (FB_BY + 4)
-#define FB_ROW_BOT (FB_BY + FB_BH - 30)
+#define FB_RH 24      /* 行高 (16px 字体) */
+/* ★ 2026-11-01 linit 改版：
+ *   顶部路径栏横跨两栏 → 左侧快捷位置 100px → 右侧列表(16px 图标 + 名称 + 右对齐信息)
+ *   → 底部左「确认」右「返回」。
+ *   ⚠ 行区/行高改动必须同步 fb_render / fb_touch / fb_follow / fb_poll，四处同源。 */
+#define FB_PATH_H 26                          /* 顶部路径栏高 */
+#define FB_SIDE_W 100                         /* 左栏快捷位置宽 */
+#define FB_ROW_TOP (FB_BY + FB_PATH_H + 2)    /* 列表顶 (路径栏之下) */
+#define FB_ROW_BOT (FB_BY + FB_BH - 6)        /* 列表底 (无底部按钮栏，直接用到底) */
+
+/* ★ 左栏入口：根目录 / 应用 / 游戏 / 音乐 / 返回（22px、居中、可点击）
+ *   路径名取自设备实测：/sdcard 下有 apps、roms、media、fonts、books、Rec、data。 */
+/* ★ 左栏入口：5 个目录项从上往下排，「返回」**固定在左栏最底部**（不跟列表走） */
+#define FB_SIDE_DIRS 5                        /* 目录项个数 */
+#define FB_SIDE_BACK 5                        /* 「返回」在数组里的下标（固定底部） */
+static const char *const FB_SIDE_NAME[FB_SIDE_BACK + 1] = {
+    "根目录", "应用", "游戏", "音乐", "书籍", "返回"
+};
+static const char *const FB_SIDE_PATH[FB_SIDE_BACK + 1] = {
+    "", "apps", "roms", "media", "books", NULL
+};
+static int s_fb_side_cur = 0;                 /* 当前所在快捷位置 */
 
 static EXT_RAM_BSS_ATTR char  s_fb_path[160] = "";          /* 相对根目录, ""= /sdcard */
 static EXT_RAM_BSS_ATTR char  s_fb_names[FB_MAX][30];       /* 条目名 (不含分隔符) */
@@ -497,26 +534,18 @@ static bool sd_main_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *u
         s_fb_path[0] = '\0';   /* 每次进入从根开始 */
         open_fb_dlg(ctx);
         break;
-    case 1:  /* 挂载到电脑 (3.3: 卸载VFS + USB MSC; 退出重启恢复) */
-        open_sd_mount(ctx);
-        break;
-    case 2:  /* 格式化TF卡 */
-        open_sd_format(ctx);
-        break;
-    case 3:  /* 存储信息 */
+    case 1:  /* 存储信息 (★ 「格式化TF卡」在这个页面的顶部) */
         open_sd_info(ctx);
         break;
-    case 4:  /* 备份还原 */
+    case 2:  /* 备份还原 */
         open_sd_bak_restore(ctx);
         break;
-    case 5: {   /* 重新挂载TF卡 (2026-09-29): 换卡/插卡后免重启 (SD Watcher 自动补挂已禁用) */
-        esp_err_t r = sd_remount();
-        char msg[48];
-        snprintf(msg, sizeof(msg), "TF\xe5\x8d\xa1: %s", sd_get_mnt_state_str());  /* TF卡: xxx */
-        ESP_LOGI(TAG, "手动重新挂载: ret=%s 状态=%s", esp_err_to_name(r), sd_get_mnt_state_str());
-        os_dialog_toast(ctx, msg);
+    case 3:  /* USB访问存储 (原「挂载到电脑 → USB 数据线」, 2026-11-01 提到主菜单) */
+        open_sd_mount(ctx);
         break;
-    }
+    case 4:  /* 网络访问存储 (原「挂载到电脑 → 网络访问存储」, 同上) */
+        open_sd_share(ctx);
+        break;
     default:
         break;
     }
@@ -538,6 +567,7 @@ static void fb_fullpath(char *out, int cap, const char *name) {
 /* 文件类型 (用于行首 【xxx】 标签) */
 typedef enum { FBT_DIR, FBT_IMG, FBT_MP3, FBT_VID, FBT_GAME, FBT_TXT, FBT_OTHER } fb_type_t;
 static EXT_RAM_BSS_ATTR fb_type_t s_fb_type[FB_MAX];
+static EXT_RAM_BSS_ATTR uint32_t  s_fb_size[FB_MAX];   /* ★ 文件字节数(目录=0)，右侧信息列用 */
 static EXT_RAM_BSS_ATTR int  s_fb_sel = 0;
 static EXT_RAM_BSS_ATTR int  s_fb_off = 0;         /* 滚动像素偏移 (跟手拖动) */
 static EXT_RAM_BSS_ATTR int  s_fb_drag = -1, s_fb_drag_off0 = 0;
@@ -597,15 +627,20 @@ static void fb_scan(void) {
     while ((e = readdir(d)) != NULL && s_fb_count < FB_MAX) {
         if (fb_junk(e->d_name)) continue;
         bool isdir = (e->d_type == DT_DIR);
-        if (e->d_type == DT_UNKNOWN) {
+        uint32_t fsz = 0;
+        {   /* 统一 stat 一次：既拿准确类型，也拿文件大小（右侧信息列要用） */
             char p[180];
             fb_fullpath(p, sizeof(p), e->d_name);
             struct stat st;
-            if (stat(p, &st) == 0) isdir = S_ISDIR(st.st_mode);
+            if (stat(p, &st) == 0) {
+                isdir = S_ISDIR(st.st_mode);
+                if (!isdir) fsz = (uint32_t)st.st_size;
+            }
         }
         memcpy(s_fb_names[s_fb_count], e->d_name, 29);
         s_fb_names[s_fb_count][29] = 0;
         s_fb_isdir[s_fb_count] = isdir;
+        s_fb_size[s_fb_count]  = fsz;
         s_fb_type[s_fb_count] = fb_type_of(e->d_name, isdir);
         s_fb_count++;
     }
@@ -617,10 +652,10 @@ static void fb_scan(void) {
                         ? strcmp(s_fb_names[j], s_fb_names[j - 1])
                         : (s_fb_isdir[j - 1] ? -1 : 1);
             if (c < 0) {
-                char tn[30]; bool tf; fb_type_t tt;
-                strcpy(tn, s_fb_names[j - 1]); tf = s_fb_isdir[j - 1]; tt = s_fb_type[j - 1];
-                strcpy(s_fb_names[j - 1], s_fb_names[j]); s_fb_isdir[j - 1] = s_fb_isdir[j]; s_fb_type[j - 1] = s_fb_type[j];
-                strcpy(s_fb_names[j], tn); s_fb_isdir[j] = tf; s_fb_type[j] = tt;
+                char tn[30]; bool tf; fb_type_t tt; uint32_t tsz;
+                strcpy(tn, s_fb_names[j - 1]); tf = s_fb_isdir[j - 1]; tt = s_fb_type[j - 1]; tsz = s_fb_size[j - 1];
+                strcpy(s_fb_names[j - 1], s_fb_names[j]); s_fb_isdir[j - 1] = s_fb_isdir[j]; s_fb_type[j - 1] = s_fb_type[j]; s_fb_size[j - 1] = s_fb_size[j];
+                strcpy(s_fb_names[j], tn); s_fb_isdir[j] = tf; s_fb_type[j] = tt; s_fb_size[j] = tsz;
             } else break;
         }
 }
@@ -634,6 +669,31 @@ static void fb_go_up(void) {
     char *sl = strrchr(s_fb_path, '/');
     if (sl) *sl = '\0';
     else s_fb_path[0] = '\0';
+}
+/* 左栏点击：目录项跳转；「返回」项回到上级（根目录则退出） */
+static void fb_side_goto(ui_ctx_t *ctx, int i) {
+    if (i < 0 || i > FB_SIDE_BACK) return;
+    if (i == FB_SIDE_BACK) {
+        if (fb_at_root()) { os_dialog_pop(ctx); return; }
+        fb_go_up();
+        s_fb_side_cur = 0;
+        s_fb_sel = 0; s_fb_off = 0;
+        fb_scan();
+        return;
+    }
+    const char *p = FB_SIDE_PATH[i];
+    if (!p) return;
+    if (p[0]) {
+        char full[180];
+        snprintf(full, sizeof(full), "/sdcard/%s", p);
+        struct stat st;
+        if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+    }
+    snprintf(s_fb_path, sizeof(s_fb_path), "%s", p);
+    s_fb_side_cur = i;
+    s_fb_sel = 0;
+    s_fb_off = 0;
+    fb_scan();
 }
 static void fb_delete_cb(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
@@ -673,7 +733,48 @@ static void fb_follow(void) {
     if (s_fb_off > maxoff) s_fb_off = maxoff;
 }
 
-/* 自定义整层渲染: 左对齐 + 类型标签 + 选中黑条 + 底部返回行 */
+/* 按 16px 实际像素宽截断 —— 路径/文件名可能很长，必须保证不越过右边框 */
+static const char *fb_fit16(const char *s, int maxw)
+{
+    static char buf[64];
+    snprintf(buf, sizeof(buf), "%s", s);
+    int len = (int)strlen(buf);
+    while (len > 0 && ui_text16w(buf) > maxw) buf[--len] = 0;
+    return buf;
+}
+
+/* 16px 类型图标（12×14 轮廓 + 内部标识）—— 全部用绘图原语，不占额外内存 */
+static void fb_draw_icon(st7305_handle_t *lcd, int x, int y, fb_type_t t, bool inv)
+{
+    uint8_t c = inv ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
+    draw_hline(lcd, x, x + 11, y, c);
+    draw_hline(lcd, x, x + 11, y + 13, c);
+    draw_vline(lcd, x, y, y + 13, c);
+    draw_vline(lcd, x + 11, y, y + 13, c);
+    switch (t) {
+    case FBT_DIR:                                   /* 文件夹：顶部折角 */
+        draw_hline(lcd, x + 1, x + 5, y + 1, c);
+        draw_vline(lcd, x + 5, y + 1, y + 3, c);
+        break;
+    case FBT_GAME:                                  /* 游戏：实心块 */
+        fill_rect(lcd, x + 3, y + 5, x + 8, y + 9, c);
+        break;
+    case FBT_TXT:
+    case FBT_OTHER:                                 /* 文本：三条横线 */
+        draw_hline(lcd, x + 3, x + 8, y + 4, c);
+        draw_hline(lcd, x + 3, x + 8, y + 7, c);
+        draw_hline(lcd, x + 3, x + 8, y + 10, c);
+        break;
+    default:                                        /* 图片/音频/视频：方框 */
+        draw_hline(lcd, x + 3, x + 8, y + 4, c);
+        draw_vline(lcd, x + 3, y + 4, y + 9, c);
+        draw_vline(lcd, x + 8, y + 4, y + 9, c);
+        draw_hline(lcd, x + 3, x + 8, y + 9, c);
+        break;
+    }
+}
+
+/* 自定义整层渲染：顶部路径栏(横跨) + 左栏快捷位置 + 右栏列表(图标/名称/右对齐信息) + 底部按钮 */
 static bool fb_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     (void)d; (void)ud;
     st7305_handle_t *lcd = ctx->lcd;
@@ -686,32 +787,98 @@ static bool fb_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         draw_vline(lcd, bx + k, by + k, by + bh - 1 - k, ST7305_COLOR_BLACK);
         draw_vline(lcd, bx + bw - 1 - k, by + k, by + bh - 1 - k, ST7305_COLOR_BLACK);
     }
-    /* 无标题名: 列表由弹窗顶部开始 (同标准选择菜单), 文件项左对齐 */
-    if (s_fb_count == 0) {
-        draw_text(lcd, bx + 12, by + 8, "\xe7\xa9\xba\xe7\x9b\xae\xe5\xbd\x95", false); /* 空目录 */
+
+    /* ---- ① 顶部路径栏：横跨两栏，右端为「返回上级」图标 ---- */
+    /* 路径显示：根目录 "< /sdcard"，子目录 "< /sdcard/xxx"（★ 别漏斜杠，否则会拼成 /sdcardapps）
+     * 注意 s_fb_path 存的是**相对**路径（不含开头的 /），显示时要自己补。 */
+    char pathbuf[48];
+    const char *rp = s_fb_path[0] ? s_fb_path : "";
+    if (rp[0]) snprintf(pathbuf, sizeof(pathbuf), "< /sdcard/%s", rp);
+    else       snprintf(pathbuf, sizeof(pathbuf), "< /sdcard");
+    ui_text16(lcd, bx + 6, by + 5, fb_fit16(pathbuf, bw - 12 - 34), false);   /* 留出右侧图标宽度，绝不越界 */
+    /* 右端返回图标：方框 + 左箭头（纯几何绘制，不依赖字形） */
+    {
+        int ix = bx + bw - 24, iy = by + 6;
+        draw_hline(lcd, ix, ix + 15, iy, ST7305_COLOR_BLACK);
+        draw_hline(lcd, ix, ix + 15, iy + 13, ST7305_COLOR_BLACK);
+        draw_vline(lcd, ix, iy, iy + 13, ST7305_COLOR_BLACK);
+        draw_vline(lcd, ix + 15, iy, iy + 13, ST7305_COLOR_BLACK);
+        draw_hline(lcd, ix + 4, ix + 11, iy + 6, ST7305_COLOR_BLACK);
+        draw_hline(lcd, ix + 4, ix + 6, iy + 4, ST7305_COLOR_BLACK);
+        draw_hline(lcd, ix + 4, ix + 6, iy + 8, ST7305_COLOR_BLACK);
     }
+    draw_hline(lcd, bx + 2, bx + bw - 3, by + FB_PATH_H - 2, ST7305_COLOR_BLACK);
+
+    /* ---- ② 左栏：目录项(22px 居中) + 底部固定「返回」 ---- */
+    int sy = by + FB_PATH_H + 8;
+    for (int i = 0; i < FB_SIDE_DIRS; i++) {
+        bool cur = (i == s_fb_side_cur);
+        if (cur) fill_rect(lcd, bx + 3, sy - 3, bx + FB_SIDE_W - 4, sy + 21, ST7305_COLOR_BLACK);
+        draw_text_centered_in(lcd, bx, bx + FB_SIDE_W, sy, FB_SIDE_NAME[i], cur);
+        sy += 30;                    /* ★ 项间距：22px 字 + 8px 缝隙，不要挤在一起 */
+    }
+    /* 「返回」固定在左栏最底部，带一条分割线与上面目录项区分 */
+    draw_hline(lcd, bx + 4, bx + FB_SIDE_W - 5, by + bh - 40, ST7305_COLOR_BLACK);
+    draw_text_centered_in(lcd, bx, bx + FB_SIDE_W, by + bh - 34, FB_SIDE_NAME[FB_SIDE_BACK], false);
+    draw_vline(lcd, bx + FB_SIDE_W, by + FB_PATH_H, by + bh - 4, ST7305_COLOR_BLACK);
+
+    /* ---- ③ 右栏：文件列表 ---- */
+    const int lx = bx + FB_SIDE_W + 5;       /* 图标左 */
+    const int tx = lx + 18;                  /* 名称左 */
+    const int rx = bx + bw - 8;              /* 右侧信息右边界 */
     int rtop = FB_ROW_TOP, rbot = FB_ROW_BOT, rh = FB_RH;
     int view = rbot - rtop;
     int off = s_fb_off; if (off < 0) off = 0;
     int first = off / rh, mod = off % rh;
     int maxvis = view / rh; if (maxvis < 1) maxvis = 1;
+
+    if (s_fb_count == 0) {
+        ui_text16(lcd, tx, rtop + 4, "空目录", false);
+    }
     for (int i = 0; i <= maxvis; i++) {
         int idx = first + i;
         if (idx >= s_fb_count) break;
         int y = rtop + i * rh - mod;
-        if (y < rtop) continue;          /* 顶部半行不画, 与命中同源 */
+        if (y < rtop) continue;
+        /* ★ 2026-11-01 修复"拖动时底部越界变黑"：
+         *   滚动时最后一行是半行，原来只判了上边界，黑条/图标会画到 FB_ROW_BOT 以下
+         *   （弹窗底 275 → 实际画到 291），越出边框的部分留在屏幕上越积越黑。
+         *   这里按列表下边界裁剪行高，并且整行完全在界外就不再画。 */
+        if (y >= rbot) break;
+        int rh_draw = (y + rh - 2 > rbot) ? (rbot - y) : (rh - 2);
+        if (rh_draw < 4) break;
+        /* ★ 只有**完整行**才画图标和文字：半行只画黑条。
+         *   否则文字垂直居中后会超出 rbot（16px 字放在 y+4，若 y 已接近底边 ⇒ 直接出框）。 */
+        bool full_row = (y + rh <= rbot);
         bool sel = (idx == s_fb_sel);
-        if (sel) fill_rect(lcd, bx + 3, y, bx + bw - 4, y + rh - 2, ST7305_COLOR_BLACK);
-        int ty = y + (rh - 24) / 2;
-        const char *tag = fb_type_label(s_fb_type[idx]);
-        draw_text(lcd, bx + 6, ty, tag, sel);
-        int tw = text_width(tag);
-        int maxw = (bx + bw - 6) - (bx + 6 + tw + 4); if (maxw < 12) maxw = 12;
-        draw_text(lcd, bx + 6 + tw + 4, ty, fb_fit_name(s_fb_names[idx], maxw), sel);
+        if (sel) fill_rect(lcd, lx - 3, y, rx + 2, y + rh_draw, ST7305_COLOR_BLACK);
+        if (!full_row) continue;
+
+        fb_draw_icon(lcd, lx, y + (rh - 14) / 2, s_fb_type[idx], sel);
+
+        /* 右侧信息：目录显示"目录"，文件显示大小 */
+        char info[16];
+        if (s_fb_isdir[idx]) snprintf(info, sizeof(info), "目录");
+        else {
+            uint32_t s = s_fb_size[idx];
+            if (s < 1024)            snprintf(info, sizeof(info), "%uB", (unsigned)s);
+            else if (s < 1024u * 1024u) snprintf(info, sizeof(info), "%uK", (unsigned)(s / 1024u));
+            else                     snprintf(info, sizeof(info), "%u.%uM",
+                                              (unsigned)(s / (1024u * 1024u)),
+                                              (unsigned)((s % (1024u * 1024u)) / 102400u));
+        }
+        int iw = ui_text16w(info);
+        ui_text16(lcd, rx - iw, y + (rh - 16) / 2, info, sel);
+
+        /* 名称：按 16px 实际像素宽截断，保证不压到右侧信息列 */
+        int maxw = (rx - iw - 6) - tx;
+        if (maxw < 16) maxw = 16;
+        ui_text16(lcd, tx, y + (rh - 16) / 2, fb_fit16(s_fb_names[idx], maxw), sel);
     }
-    /* 右侧滚动条 (内容超出可见区, 同标准选择菜单) */
+
+    /* 滚动条 */
     if (s_fb_count > maxvis) {
-        int bxr = bx + bw - 3;
+        int bxr = bx + bw - 4;
         int bar_y0 = rtop, bar_y1 = rtop + maxvis * rh - 1;
         draw_vline(lcd, bxr, bar_y0, bar_y1, ST7305_COLOR_BLACK);
         int track = bar_y1 - bar_y0;
@@ -722,10 +889,7 @@ static bool fb_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
         fill_rect(lcd, bxr, bar_y0 + py, bxr, bar_y0 + py + th - 1, ST7305_COLOR_BLACK);
     }
 
-    /* 底部"返回/退出"行 */
-    draw_hline(lcd, bx, bx + bw - 1, by + bh - 30, ST7305_COLOR_BLACK);
-    draw_text(lcd, bx + 10, by + bh - 26,
-              fb_at_root() ? "\xe9\x80\x80\xe5\x87\xba" : "\xe8\xbf\x94\xe5\x9b\x9e\xe4\xb8\x8a\xe7\xba\xa7", false);
+    /* ---- ④ 底部：已移除按钮栏，列表直到底边 ---- */
     return true;
 }
 /* 按键: 上下移动 / 确认进目录 / 长按删除 / 返回上级 */
@@ -770,16 +934,33 @@ static bool fb_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
     (void)d; (void)ud;
     int bx = FB_BX, by = FB_BY, bw = FB_BW, bh = FB_BH;
     if (x < bx || x > bx + bw - 1 || y < by || y > by + bh - 1) return false;
-    if (y >= by + bh - 30) {           /* 底部返回行 */
-        if (fb_at_root()) { os_dialog_pop(ctx); }
-        else { fb_go_up(); os_dialog_pop(ctx); open_fb_dlg(ctx); }
+    /* 顶部栏：右端返回图标 = 返回上级 / 根目录退出 */
+    if (y < by + FB_PATH_H) {
+        if (x >= bx + bw - 32) {
+            if (fb_at_root()) os_dialog_pop(ctx);
+            else { fb_go_up(); s_fb_side_cur = 0; os_dialog_pop(ctx); open_fb_dlg(ctx); }
+        }
         return true;
     }
-    int rh = FB_RH;
-    /* 命中反解必须与 fb_render 的 y = rtop + i*rh - mod 严格互逆:
-     *   idx = (s_fb_off + (y - FB_ROW_TOP)) / rh  */
-    if (y < FB_ROW_TOP) return true;
-    int idx = (s_fb_off + (y - FB_ROW_TOP)) / rh;
+    /* 左栏：底部「返回」固定区，其余为目录项 */
+    if (x < bx + FB_SIDE_W) {
+        if (y >= by + bh - 44) {          /* 底部固定「返回」 */
+            fb_side_goto(ctx, FB_SIDE_BACK);
+            ctx->needs_redraw = true;
+            return true;
+        }
+        int sy = by + FB_PATH_H + 8;
+        for (int i = 0; i < FB_SIDE_DIRS; i++) {
+            if (y >= sy - 3 && y <= sy + 21) {
+                fb_side_goto(ctx, i);
+                ctx->needs_redraw = true;
+                return true;
+            }
+            sy += 30;
+        }
+        return true;
+    }
+    int idx = (s_fb_off + (y - FB_ROW_TOP)) / FB_RH;
     if (idx < 0 || idx >= s_fb_count) return true;
     s_fb_sel = idx;
     ctx->needs_redraw = true;
@@ -820,19 +1001,111 @@ static void open_fb_dlg(ui_ctx_t *ctx) {
     os_dialog_push(ctx, &dlg);
 }
 
+/* ==== 局域网共享 (第三回合): 浏览器访问 http://<设备IP>/files/ 管理 TF 卡 ====
+ * 服务本体在 services/web_files（走统一 web_core，不自己起 HTTP Server）。
+ * 这里只做"开关 + 告诉用户去哪儿访问"，不复制任何网络代码。
+ * ★ 2026-11-01 linit: 交互改成和「USB访问存储」同款 —— 先确认框，确定后同框换成
+ *   **浏览器图标** + 「关闭共享/取消」，不再是一进来就一个纯文字列表。 */
+
+/* 图标窗按钮: 0=关闭共享, 1=取消(走默认 pop, 共享继续运行) */
+static void wf_icon_btn_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result != 0) return;
+    web_files_stop();
+    if (!wifi_manager_ap_is_on()) os_ap_set(false);
+    os_dialog_pop(ctx);
+    os_dialog_toast(ctx, "已关闭网络访问存储");
+}
+
+/* 把栈顶弹窗原地改写成「浏览器图标 + 关闭共享/取消」(不关不弹栈) */
+static void wf_morph_to_icon(ui_ctx_t *ctx) {
+    os_dlg_stack_t *d = os_dialog_top_mut(ctx);
+    if (!d) return;
+    os_dialog_mark_handled(ctx);          /* 保持同一弹窗, 不自动关闭 */
+    d->title[0] = '\0';
+    d->count = 2;
+    snprintf(d->items[0], sizeof(d->items[0]), "\xe5\x85\xb3\xe9\x97\xad\xe5\x85\xb1\xe4\xba\xab"); /* 关闭共享 */
+    snprintf(d->items[1], sizeof(d->items[1]), "\xe5\x8f\x96\xe6\xb6\x88");                        /* 取消 */
+    d->sel = 0;
+    d->icon   = web_icon_64;
+    d->icon_w = WEB_ICON_W;
+    d->icon_h = WEB_ICON_H;
+    d->cb     = wf_icon_btn_cb;
+}
+
+static void wf_start_cb(ui_ctx_t *ctx, int result, void *ud) {
+    (void)ud;
+    if (result != 0) return;              /* 取消 */
+    if (!wifi_manager_is_connected()) {   /* ★ 局域网共享要求先连上 WiFi, 不开热点 */
+        os_dialog_pop(ctx);
+        os_dialog_toast(ctx, "请先连接 WiFi");
+        return;
+    }
+    wf_morph_to_icon(ctx);                /* 同框变图标窗(和 USB 挂载一致的手感) */
+    if (web_files_start() != ESP_OK) {
+        os_dialog_pop(ctx);
+        os_dialog_toast(ctx, "网络访问存储启动失败");
+        return;
+    }
+    os_ap_set(true);
+    char ip[20] = "-";
+    web_files_get_addr(ip, sizeof(ip));
+    char msg[48];
+    snprintf(msg, sizeof(msg), "http://%s/files/", ip);
+    os_dialog_toast(ctx, msg);            /* toast 叠在图标窗上, 1.5s 后自动消失 */
+}
+
+static void open_sd_share(ui_ctx_t *ctx) {
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    dlg.count = 2;
+    dlg.sel = 0;
+    dlg.no_footer = true;
+    dlg.small = true;
+
+    if (!web_files_is_running()) {
+        /* 与「USB访问存储」同款确认框: 确定后同框换图标 */
+        snprintf(dlg.title, sizeof(dlg.title), "\xe5\xbc\x80\xe5\x90\xaf\xe7\xbd\x91\xe7\xbb\x9c\xe8\xae\xbf\xe9\x97\xae\xe5\xad\x98\xe5\x82\xa8?"); /* 开启网络访问存储? */
+        snprintf(dlg.items[0], sizeof(dlg.items[0]), "\xe7\xa1\xae\xe5\xae\x9a");   /* 确定 */
+        snprintf(dlg.items[1], sizeof(dlg.items[1]), "\xe5\x8f\x96\xe6\xb6\x88");   /* 取消 */
+        dlg.fix_w = text_width(dlg.title) + 24;
+        dlg.cb = wf_start_cb;
+        os_dialog_push(ctx, &dlg);
+        return;
+    }
+    /* 已在运行: 直接给图标窗, 点「关闭共享」才停 */
+    dlg.title[0] = '\0';
+    snprintf(dlg.items[0], sizeof(dlg.items[0]), "\xe5\x85\xb3\xe9\x97\xad\xe5\x85\xb1\xe4\xba\xab");
+    snprintf(dlg.items[1], sizeof(dlg.items[1]), "\xe5\x8f\x96\xe6\xb6\x88");
+    dlg.icon   = web_icon_64;
+    dlg.icon_w = WEB_ICON_W;
+    dlg.icon_h = WEB_ICON_H;
+    dlg.cb = wf_icon_btn_cb;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* ★ 2026-11-01 linit: 「挂载到电脑」二级菜单取消 —— 两个去向(USB访问存储 / 网络访问存储)
+ *   已直接提到存储主菜单最下面两行, 这里原有两个函数(mount_way_cb / open_mount_way)删除。 */
+
 static void open_sd_dlg(ui_ctx_t *ctx) {
-    static const char *const items[6] = {
-        "\xe6\xb5\x8f\xe8\xa7\x88\xe6\x96\x87\xe4\xbb\xb6",     /* 浏览文件 */
-        "\xe6\x8c\x82\xe8\xbd\xbd\xe5\x88\xb0\xe7\x94\xb5\xe8\x84\x91", /* 挂载到电脑 */
-        "\xe6\xa0\xbc\xe5\xbc\x8f\xe5\x8c\x96TF\xe5\x8d\xa1",    /* 格式化TF卡 */
-        "\xe5\xad\x98\xe5\x82\xa8\xe4\xbf\xa1\xe6\x81\xaf",     /* 存储信息 */
-        "\xe5\xa4\x87\xe4\xbb\xbd\xe8\xbf\x98\xe5\x8e\x9f",      /* 备份还原 */
-        "\xe9\x87\x8d\xe6\x96\xb0\xe6\x8c\x82\xe8\xbd\xbdTF\xe5\x8d\xa1", /* 重新挂载TF卡 */
+    /* ★ 2026-11-01 linit 再调整:
+     *   ① 「格式化TF卡」→ 已移到「存储信息」页顶部
+     *   ② 「挂载到电脑」二级菜单取消, 两个去向直接摆到最下面两行:
+     *        倒数第二行 USB访问存储 (原 USB 数据线挂载)
+     *        最后一行   网络访问存储
+     *   ③ 「重新挂载TF卡」删除 (换卡后 sd_remount 由 SD watcher 自动补挂)
+     *   最终 5 项。 */
+    static const char *const items[5] = {
+        "\xe6\xb5\x8f\xe8\xa7\x88\xe6\x96\x87\xe4\xbb\xb6",                    /* 0 浏览文件 */
+        "\xe5\xad\x98\xe5\x82\xa8\xe4\xbf\xa1\xe6\x81\xaf",                     /* 1 存储信息 (顶部含格式化) */
+        "\xe5\xa4\x87\xe4\xbb\xbd\xe8\xbf\x98\xe5\x8e\x9f",                     /* 2 备份还原 */
+        "USB\xe8\xae\xbf\xe9\x97\xae\xe5\xad\x98\xe5\x82\xa8",                  /* 3 USB访问存储 */
+        "\xe7\xbd\x91\xe7\xbb\x9c\xe8\xae\xbf\xe9\x97\xae\xe5\xad\x98\xe5\x82\xa8", /* 4 网络访问存储 */
     };
     os_dlg_stack_t dlg;
     memset(&dlg, 0, sizeof(dlg));
-    dlg.count = 6;
-    for (int i = 0; i < 6; i++)
+    dlg.count = 5;
+    for (int i = 0; i < 5; i++)
         snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", items[i]);
     dlg.sel = 0;
     dlg.on_key = sd_main_key;

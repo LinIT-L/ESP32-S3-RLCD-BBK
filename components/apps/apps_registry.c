@@ -28,6 +28,11 @@ static const os_app_t s_builtin_apps[] = {
     { .id="usb_hid", .label="\xe4\xbb\xbf\xe7\x9c\x9f\xe9\x94\xae\xe9\xbc\xa0", .icon_idx=ICON_USB_HID, .page=OS_PAGE_USB_HID, .hidden=true, .cat="\xe8\xbf\x90\xe7\xbb\xb4" }, /* 仿真键鼠 运维 (隐藏) */
     { .id="storage", .label="\xe5\xad\x98\xe5\x82\xa8",             .icon_idx=ICON_STORAGE,  .page=OS_PAGE_STORAGE,     .cat="\xe7\xa8\x8b\xe5\xba\x8f" }, /* 存储 程序 */
     { .id="settings",.label="\xe8\xae\xbe\xe7\xbd\xae",             .icon_idx=ICON_SETTINGS,  .page=OS_PAGE_SETTINGS,    .cat="\xe7\xb3\xbb\xe7\xbb\x9f" }, /* 设置 系统 */
+    /* ★ 2026-11-03 linit: 性能监视器独立成本应用（**唯一入口**，设置里那一项已删除）。
+     *   画面沿用原来那块 350×250 面板(page_perfmon.c 的 pm_draw_panel);
+     *   hidden=true ⇒ 默认只在「应用中心→应用→系统」出现, 要上桌面需长按添加
+     *   (与商店安装的应用同一条规则)。 */
+    { .id="perfmon", .label="\xe6\x80\xa7\xe8\x83\xbd\xe7\x9b\x91\xe8\xa7\x86\xe5\x99\xa8", .icon_idx=ICON_PERFMON, .page=OS_PAGE_PERFMON, .hidden=true, .cat="\xe7\xb3\xbb\xe7\xbb\x9f" }, /* 性能监视器 系统 */
     { .id="app_mgr", .label="\xe5\xba\x94\xe7\x94\xa8\xe4\xb8\xad\xe5\xbf\x83", .icon_idx=ICON_APP_MGR, .page=OS_PAGE_APP_MANAGER, .hidden=true, .reveal=true }, /* 应用中心 (原"应用管家", 2026-09-20 改名) */
     /* ==== 内置工具应用: 2026-09-28 起**改以内置 C 版为准** ====
      * 背景: 2026-09-22 曾定"只留 Lua 版"(免烧录/可 TF 侧改), 但 Lua 版在真机上暴露问题
@@ -90,6 +95,9 @@ static const os_app_t s_builtin_apps[] = {
     /* ★ 资源包类应用: requires 目录不存在就整条不显示 ⇒ 装了游戏数据才出现在"游戏"分类里。
      *   数据由商店资源包解压到 /sdcard/pal (见 am_store 的 asset 类型)。 */
     { .id="pal", .label="\xe4\xbb\x99\xe5\x89\x91\xe5\xa5\x87\xe4\xbe\xa0\xe4\xbc\xa0", .icon_idx=ICON_PAL, .page=OS_PAGE_PAL, .hidden=true, .cat="\xe6\xb8\xb8\xe6\x88\x8f", .requires="/sdcard/apps/app/pal" },
+    /* 性能监视器: 2026-11-03 起**是独立应用**了, 见上面"应用→系统"那条 (id=perfmon)。
+     * 历史: 2026-11-02 曾收回成「设置→系统与连接」的 350×250 弹窗、撤掉全屏页;
+     * 2026-11-03 又独立成应用, 并把设置里那个入口删了 ⇒ 现在**只有**应用中心一条路。 */
 };
 #define BUILTIN_APP_COUNT (sizeof(s_builtin_apps) / sizeof(s_builtin_apps[0]))
 
@@ -98,6 +106,12 @@ void apps_register_all(void)
 {
     /* 崩溃定位: 打印"上次复位前 Lua 启动走到哪一步 + 本次复位原因" (RTC 保留内存) */
     lua_probe_boot_report();
+    /* ★ 2026-11-01: 启动就扫描并注册 TF 卡/内置分区的 Lua 应用。
+     *   不这么做的话，注册表里没有 "lua:xxx.lua"，主菜单的"添加到桌面"永远是空写。 */
+    { extern void am_lua_register_boot(void); am_lua_register_boot(); }
+    /* ★ 2026-11-01: 扫描 /sdcard/apps/installed/ 下已安装的第三方 LPK 应用并注册。
+     *   身份来自包内 manifest 的 app_id（不再是文件名），入口 = installed/<app_id>/<entry>。 */
+    { extern int am_lpkg_scan(void); am_lpkg_scan(); }
 /* 应用页模块 (每页一个 .c) */
     os_page_main_register();          /* 主菜单桌面 */
     os_page_select_game_register();   /* 选择文曲星游戏 */
@@ -143,6 +157,7 @@ void apps_register_all(void)
     os_page_lua_register();           /* Lua 单文件程序 */
     os_page_sdr_register();                /* 频谱仪 */
     os_page_pal_register();                /* 仙剑奇侠传 */
+    os_page_perfmon_register();            /* 性能监视器 (独立应用页; 面板与设置里的弹窗同一套绘制) */
 
 /* 应用注册表 (主菜单/应用管理共用) */
     for (int i = 0; i < (int)BUILTIN_APP_COUNT; i++)
@@ -186,4 +201,17 @@ bool apps_builtin_has_id(const char *id)
         if (bid && strcmp(bid, id) == 0) return true;
     }
     return false;
+}
+
+/* ★ 2026-11-03: 统一核心 am_app_core 按表枚举内置应用（只读）。
+ *   与上面的 has_id() 同源同一张表，不存在第二份清单。 */
+int apps_builtin_count(void)
+{
+    return (int)(sizeof(s_builtin_apps) / sizeof(s_builtin_apps[0]));
+}
+
+const os_app_t *apps_builtin_at(int i)
+{
+    if (i < 0 || i >= apps_builtin_count()) return NULL;
+    return &s_builtin_apps[i];
 }

@@ -95,7 +95,16 @@ bool input_consume_tap(int *x, int *y);
  *   覆盖层自己用 input_get_touch_pos_raw() 读真实坐标 (不受本锁影响)。
  * 解索时机: 手指抬起且抽屉已收起 —— 由快捷栏自己维护。 */
 void input_set_overlay_lock(bool on);
+bool input_overlay_locked(void);
 bool input_get_touch_pos_raw(int *x, int *y);
+
+/* ==== 触摸快照补采 / 释放 (2026-10-31) ====
+ * 引擎阻塞主循环时没人调 input_poll_touch, 触摸快照会"冻住"。覆盖层在自己帧里
+ * 发现 input_touch_age_ms() 过期就调 input_touch_resample() 补一次 (幂等, 按 tick 去重,
+ * 不改手势状态机)。input_touch_release_all() 用于覆盖层收起时把虚拟手柄强制松开。 */
+void     input_touch_resample(void);
+uint32_t input_touch_age_ms(void);
+void     input_touch_release_all(void);
 
 /* ==== 引擎内 overlay 钩子 (2026-10-29) ====
  * 问题: 阻塞式引擎 (自己跑 while 循环: board_shim / gam4980 / lavax / vpet / arduboy / sdlpal)
@@ -105,8 +114,14 @@ bool input_get_touch_pos_raw(int *x, int *y);
  *       引擎**不需要依赖 os 组件** (保持分层单向), 未注入时为空操作。
  * 注意: 睡眠/屏保/动态壁纸状态下不要调用 (那时不该响应下拉)。 */
 typedef void (*engine_overlay_fn)(void *lcd);   /* void* 避免 input 层依赖 st7305 类型 */
+typedef void (*engine_overlay_tick_fn)(void);   /* ★ 2026-10-31: 只收手势/执行动作, 不碰像素 */
 void engine_overlay_set_quickbar(engine_overlay_fn fn);
-void engine_overlay_quickbar(void *lcd);
+/* ★ 分段注册: tick 在**帧锁之外**跑 (可执行 WiFi/蓝牙开关等慢动作),
+ *   draw 在帧锁内跑 (只画像素)。board_shim 用这套避免"点 Wi-Fi 冻结整局游戏"。 */
+void engine_overlay_set_quickbar_split(engine_overlay_tick_fn tick, engine_overlay_fn draw);
+void engine_overlay_quickbar(void *lcd);        /* 兼容: 一次做完 tick + draw */
+void engine_overlay_quickbar_tick(void);
+void engine_overlay_quickbar_draw(void *lcd);
 
 /* V1.0.66: 返回当前触摸的实时屏幕坐标 (400x300), 供主菜单跟手拖动.
  * 返回 false 表示当前无手指按下. */

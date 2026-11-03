@@ -166,8 +166,12 @@ int am_store_json_parse(const char *txt,
         if (*p != '{') break;
         const char *e = j_close(p);
         if (!e) break;
-        /* 对象截到局部缓冲再按 key 取 —— 免得 j_key 的 strstr 串到下一个对象里去 */
-        char ob[512];
+        /* 对象截到局部缓冲再按 key 取 —— 免得 j_key 的 strstr 串到下一个对象里去。
+         * ★ 2026-10-31: 512 → 768。条目字段一直在加(name/label/desc/type/target/
+         *   requires/manifest/cat/path/size/crc32/ver/author/date/build), 原尺寸离
+         *   截断只差几十字节; 一旦截断, 排在后面的 key 直接读不到 —— 表现为
+         *   "某个包莫名其妙少了一条", 极难查。 */
+        char ob[1280];
         size_t olen = (size_t)(e - p);
         if (olen >= sizeof(ob)) olen = sizeof(ob) - 1;
         memcpy(ob, p, olen);
@@ -185,12 +189,21 @@ int am_store_json_parse(const char *txt,
         if (ok && v) j_str(v, rk.desc, sizeof(rk.desc));    /* 可选: 列表第二行文案 */
         v = j_key(ob, "type");
         if (v) j_str(v, rk.type, sizeof(rk.type));          /* 可选: app / asset */
+        /* ★ 2026-10-31: 显式依赖 "pkgs/x.zip[@ver]" —— 放在 desc 之后、cat 之前解析:
+         *   ob[] 只有 512 字节, 超长条目会被截断, 靠前的字段才是"一定读得到"的。 */
+        v = j_key(ob, "requires");
+        if (v) j_str(v, rk.requires, sizeof(rk.requires));  /* 可选: 依赖的资源包 */
         v = j_key(ob, "target");
         if (v) j_str(v, rk.target, sizeof(rk.target));      /* 可选: asset 解包目录 */
         v = j_key(ob, "cat");
         if (ok && (!v || !j_str(v, rk.cat, sizeof(rk.cat)) || !rk.cat[0])) ok = false;
         v = j_key(ob, "path");
         if (ok && (!v || !j_str(v, rk.path, sizeof(rk.path)) || !rk.path[0])) ok = false;
+        /* 可选: 资源包文件清单 (多文件直接下载用); 缺失 = 走原来的 zip 路径 */
+        if (ok) {
+            v = j_key(ob, "manifest");
+            if (v) j_str(v, rk.manifest, sizeof(rk.manifest));
+        }
         if (ok) {
             long n = 0;
             v = j_key(ob, "size");
@@ -204,6 +217,11 @@ int am_store_json_parse(const char *txt,
             if (rk.crc == 0) ok = false;
         }
         if (ok) {
+            /* ★ 2026-11-01: SHA-256（可选；新 LPK 必须提供，缺失按旧协议处理） */
+            v = j_key(ob, "sha256");
+            if (v) j_str(v, rk.sha256, sizeof(rk.sha256));
+        }
+        if (ok) {
             /* ★ 2026-10-27: 读版本号 (可选字段, 缺失 = 0 = 未知版本, 不参与"更新"判断) */
             long vv = 0;
             v = j_key(ob, "ver");
@@ -214,9 +232,14 @@ int am_store_json_parse(const char *txt,
             if (v) j_str(v, rk.author, sizeof(rk.author));
             v = j_key(ob, "date");
             if (v) j_str(v, rk.date, sizeof(rk.date));
-            /* ★ 2026-10-30: 构建时间 (更新判定依据)。缺失 = 空 = 退回按 ver 比较。 */
+            /* ★ 2026-10-30: 构建时间 (仅显示/诊断; 2026-11-02 起不再参与更新判定) */
             v = j_key(ob, "build");
             if (v) j_str(v, rk.build, sizeof(rk.build));
+            /* ★ 2026-11-02: 服务器文件的实际修改时间 —— **更新判定的唯一依据**。
+             *   缺失(老索引) = 0 ⇒ 设备端退回 size+CRC32 核对，不造"更新"。 */
+            long mt = 0;
+            v = j_key(ob, "mtime");
+            if (v && j_num(v, &mt) && mt > 0) rk.mtime = (uint32_t)mt;
         }
         if (ok) {
             if (!rk.label[0]) snprintf(rk.label, sizeof(rk.label), "%s", rk.name);

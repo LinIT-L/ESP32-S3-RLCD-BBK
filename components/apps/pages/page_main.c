@@ -23,11 +23,11 @@
 /* ============ 应用来源: 统一走 os_app 注册表 ============
  * 可见应用缓存: os_app_visible_at()/os_app_visible_count() 每次都读 NVS (flash 很慢),
  * 渲染每帧要调用十几次 → 一帧几十次 NVS ≈ 80ms 卡顿。进桌面时一次性构建成纯数组。 */
-static const os_app_t *s_apps_cache[64];
+static const os_app_t *s_apps_cache[96];   /* 与 OS_APP_MAX 一致 */
 static int s_apps_n = 0;
 static void main_rebuild_apps(void) {
     s_apps_n = 0;
-    for (int i = 0; i < os_app_count() && s_apps_n < 64; i++) {
+    for (int i = 0; i < os_app_count() && s_apps_n < (int)(sizeof(s_apps_cache)/sizeof(s_apps_cache[0])); i++) {
         const os_app_t *a = os_app_get(i);
         if (a && os_app_visible(a)) s_apps_cache[s_apps_n++] = a;
     }
@@ -72,6 +72,32 @@ static bool p_main_touch(ui_ctx_t *ctx, int x, int y) {
 }
 
 static void p_main_poll(ui_ctx_t *ctx) {
+    /* ★ 2026-11-01: 应用注册表会**异步增长** —— 开机后 am_lua 在后台扫 TF 卡/内置分区的
+     *   Lua 应用，扫完才逐个 os_app_register()。只在 on_enter 建一次缓存的话，
+     *   这些条目要等用户下次进桌面才出现（"我刚加的桌面图标，重启后不见了"）。
+     *   这里盯住注册表条数，一变就重建缓存。只比一个 int，几乎零开销；
+     *   重建读 NVS，但只在真的新增应用时发生。 */
+    {
+        /* ★ 2026-11-03: 应用表由**统一应用核心**异步填充（内置在开机注册，
+         *   TF/Flash 上的 Lua 与已装 LPK 在后台扫描后由 am_core_tick 注册进来）。
+         *   桌面必须自己"取货"，否则不进应用中心就永远看不到卡里的应用。 */
+        extern bool am_core_tick(void);
+        bool lu = am_core_tick();
+        static int s_last_cnt = -1;
+        static uint32_t s_last_gen = 0;
+        int cnt = os_app_count();
+        /* ★ 2026-11-01: 除了"条数变了"，还要看**可见性代次** —— 用户在应用中心
+         *   添加/删除桌面图标时，条目数一点没变（还是那些应用，只是显示/不显示）。
+         *   原来这里只比条数 ⇒ 删了图标回到桌面它还在（"删不掉"），加了的也不出现。
+         *   现在两个都盯：条数（新装应用） + 代次（图标的增删）。 */
+        uint32_t gen = os_app_vis_gen();
+        if (lu || cnt != s_last_cnt || gen != s_last_gen) {
+            s_last_cnt = cnt;
+            s_last_gen = gen;
+            main_rebuild_apps();
+            ctx->needs_redraw = true;
+        }
+    }
     /* ★ C5 连接后自动映射: 连上"名字从没见过"的手柄 → 自动跳到手柄页并打开映射向导。
      *   放在桌面的 poll 里: 后台自动回连通常都是在桌面完成的, 这里一定能接住。 */
     {
@@ -89,14 +115,20 @@ static void p_main_poll(ui_ctx_t *ctx) {
         }
     }
 
-    /* 错峰预热 — 开机 5 秒后才启动应用中心后台扫描, 避开开机瞬间的电流峰值 */
+    /* ★★★ 2026-11-01 linit：**恢复提前加载，但改用 PSRAM 承载**（不占核心内存）。
+     *   上一版删掉预热是因为它开机就吃掉 47KB **内部** RAM。
+     *   真正的根因是 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096 —— 所有 <4KB 的小块
+     *   被强制塞进内部堆，而商店/Lua 扫描恰好是几千个小分配堆出来的。
+     *   现在该阈值已置 0 ⇒ 普通 malloc 一律优先 PSRAM（要内部的驱动本来就显式用
+     *   heap_caps_malloc(MALLOC_CAP_INTERNAL/DMA)，不受影响）。
+     *   于是预热只花 PSRAM（7.3MB 池，给 256KB 都无所谓），换来进应用中心秒开。
+     *   延迟 8s 触发，避开开机瞬间的电流/CPU 峰值。 */
     {
         static bool s_warm_done = false;
-        if (!s_warm_done && os_millis() > 5000) {
+        if (!s_warm_done && os_millis() > 8000) {
             s_warm_done = true;
-            am_store_prefetch();          /* 商店包扫描 (SPIFFS + SD) */
-            am_lua_prefetch(am_cat());    /* 当前分类 Lua 扫描 */
-            ESP_LOGI("MAIN", "预热(错峰): 应用中心扫描已启动 (开机 5s 后)");
+            am_store_prefetch();          /* 统一应用核心 + 商店索引预扫描 —— 走 PSRAM */
+            ESP_LOGI("MAIN", "预热(PSRAM): 应用中心预扫描已启动, 不占核心内存");
         }
     }
     if (os_modal_active(ctx)) return;   /* 弹窗/覆盖期间禁止背景拖动 */

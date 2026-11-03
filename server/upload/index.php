@@ -1,16 +1,32 @@
 <?php
+/**
+ * index.php — 用户投稿页
+ *   未登录: 邮箱验证码登录（配好 SMTP 后可用）
+ *   已登录: 上传/填写/提交 + 我的投稿列表（状态、驳回原因、改后重投）
+ *   ?resub=N: 针对被驳回的投稿 #N 重新提交
+ */
+declare(strict_types=1);
 require __DIR__ . '/lib.php';
+
 $u = current_user();
 $flash = take_flash();
 $smtpReady = !empty(cfg('smtp')['user']) && !empty(cfg('smtp')['pass']);
 $cats = (array)cfg('cats');
 $mySubs = [];
+
+$resub = null;
+if ($u && isset($_GET['resub'])) {
+    $q = db()->prepare('SELECT * FROM subs WHERE id = ? AND uid = ?');
+    $q->execute([(int)$_GET['resub'], (int)$u['id']]);
+    $r = $q->fetch();
+    if ($r && status_can_resubmit((string)$r['status'])) $resub = $r;
+}
+
 if ($u) {
-    $st = db()->prepare('SELECT * FROM subs WHERE uid = ? ORDER BY id DESC LIMIT 30');
+    $st = db()->prepare('SELECT * FROM subs WHERE uid = ? ORDER BY id DESC LIMIT 40');
     $st->execute([(int)$u['id']]);
     $mySubs = $st->fetchAll();
 }
-$STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '已驳回'];
 ?>
 <!doctype html>
 <html lang="zh-CN">
@@ -32,7 +48,7 @@ $STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '�
     -webkit-font-smoothing:antialiased;padding:40px 20px}
   .wrap{max-width:680px;margin:0 auto}
   h1{font-size:32px;letter-spacing:-.02em;margin:0 0 6px;font-weight:700}
-  .lede{color:var(--sub);margin:0 0 28px;font-size:15px}
+  .lede{color:var(--sub);margin:0 0 22px;font-size:15px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px;margin-bottom:18px}
   .card h2{font-size:18px;margin:0 0 16px;font-weight:600}
   label{display:block;font-size:13px;color:var(--sub);margin:14px 0 6px;font-weight:500}
@@ -46,6 +62,8 @@ $STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '�
   button:hover{opacity:.86}
   button:disabled{opacity:.4;cursor:default}
   button.ghost{background:transparent;color:var(--accent);padding:8px 0}
+  button.small{font-size:13px;padding:6px 12px;border-radius:8px;background:var(--bg);
+    border:1px solid var(--line);color:var(--ink);font-weight:500}
   .row{display:flex;gap:12px;align-items:flex-end}
   .row>*{flex:1}
   .row .fix{flex:0 0 auto}
@@ -64,9 +82,9 @@ $STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '�
   .subs li{display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--line);font-size:14px}
   .subs li:first-child{border-top:0}
   .tag{font-size:12px;padding:3px 9px;border-radius:20px;white-space:nowrap}
-  .t-pending{background:rgba(178,80,0,.12);color:var(--warn)}
-  .t-approved{background:rgba(26,127,55,.12);color:var(--ok)}
-  .t-rejected{background:rgba(192,57,43,.12);color:var(--err)}
+  .tag.ok{background:rgba(26,127,55,.12);color:var(--ok)}
+  .tag.warn{background:rgba(178,80,0,.12);color:var(--warn)}
+  .tag.err{background:rgba(192,57,43,.12);color:var(--err)}
   .meta{color:var(--sub);font-size:12px;margin-top:2px}
   code{background:var(--bg);padding:2px 6px;border-radius:5px;font-size:13px}
   a{color:var(--accent);text-decoration:none}
@@ -76,22 +94,25 @@ $STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '�
 <body>
 <div class="wrap">
   <h1>提交一个应用</h1>
-  <p class="lede">上传单个 <code>.lua</code> 文件，会自动读出里面的应用名、分类、说明和版本号。提交后由站主审核，通过即进商店。</p>
+  <p class="lede">
+    上传单个 <code>.lua</code> 文件，系统会读出里面的应用名、分类、说明和版本号。
+    提交后由站主审核，通过即进商店。
+    <a href="spec.php">开发规范 →</a>
+  </p>
 
 <?php if ($flash): ?>
   <div class="bar <?= h($flash['t']) ?>"><?= h($flash['m']) ?></div>
 <?php endif; ?>
 
 <?php if (!$smtpReady): ?>
-  <div class="bar warn">提交功能暂未开放：站点还没配好邮件发送（收不到验证码）。</div>
+  <div class="bar warn">登录功能暂未开放：站点还没配好邮件发送（收不到验证码）。</div>
 <?php endif; ?>
 
 <?php if (!$u): ?>
-  <!-- ============ 登录 / 注册（邮箱验证码，一次搞定） ============ -->
   <div class="card">
     <h2>用邮箱登录</h2>
     <p class="hint" style="margin-top:-6px">第一次用某个邮箱会自动创建账号，不需要单独注册。</p>
-    <form method="post" action="auth.php" id="frm-login">
+    <form method="post" action="auth.php">
       <input type="hidden" name="_csrf" value="<?= h(csrf()) ?>">
       <input type="hidden" name="do" value="send">
       <label for="email">邮箱</label>
@@ -118,7 +139,6 @@ $STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '�
   </div>
 
 <?php else: ?>
-  <!-- ============ 已登录：上传 ============ -->
   <div class="card" style="display:flex;justify-content:space-between;align-items:center;padding:16px 24px">
     <div><strong><?= h($u['email']) ?></strong>
       <div class="meta">今日还可提交 <?= upload_quota_left((int)$u['id']) ?> 个</div></div>
@@ -129,13 +149,23 @@ $STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '�
     </form>
   </div>
 
+  <?php if ($resub): ?>
+    <div class="bar warn">
+      正在重投「<?= h($resub['label'] ?: $resub['name']) ?>」(v<?= (int)$resub['ver'] ?>)。
+      驳回原因：<?= h($resub['note'] ?: '未说明') ?>。
+      请改好文件后重新上传 —— <a href="index.php">取消重投</a>。
+    </div>
+  <?php endif; ?>
+
   <div class="card">
     <h2>选择应用文件</h2>
     <form method="post" action="submit.php" enctype="multipart/form-data" id="frm-up">
       <input type="hidden" name="_csrf" value="<?= h(csrf()) ?>">
+      <?php if ($resub): ?><input type="hidden" name="resub_of" value="<?= (int)$resub['id'] ?>"><?php endif; ?>
       <input type="file" id="file" name="lua" accept=".lua,text/plain" required
              style="width:100%;padding:14px;border:1.5px dashed var(--line);border-radius:12px;background:var(--bg)">
-      <p class="hint">单个 .lua 文件，≤ <?= (int)(cfg('limits')['max_bytes'] / 1024) ?> KB。选完会自动读出头部信息，下面可以改。</p>
+      <p class="hint">单个 .lua 文件，≤ <?= (int)(cfg('limits')['max_bytes'] / 1024) ?> KB，必须是 UTF-8 纯文本。
+        选完会自动读出头部信息，下面可以改。</p>
 
       <div id="preview" style="display:none">
         <div class="iconbox">
@@ -148,18 +178,20 @@ $STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '�
       </div>
 
       <label for="name">应用名称</label>
-      <input id="name" type="text" name="name" maxlength="24" placeholder="从文件头自动读取">
+      <input id="name" type="text" name="name" maxlength="24" placeholder="从文件头自动读取"
+             value="<?= h($resub['label'] ?? '') ?>">
       <label for="cat">分类</label>
       <select id="cat" name="cat">
         <option value="">请选择</option>
         <?php foreach ($cats as $c): ?>
-          <option value="<?= h($c) ?>"><?= h($c) ?></option>
+          <option value="<?= h($c) ?>" <?= ($resub && $resub['cat'] === $c) ? 'selected' : '' ?>><?= h($c) ?></option>
         <?php endforeach; ?>
       </select>
       <label for="descr">一句话说明</label>
-      <textarea id="descr" name="descr" maxlength="40" placeholder="商店列表里显示的第二行"></textarea>
+      <textarea id="descr" name="descr" maxlength="40" placeholder="商店列表里显示的第二行"><?= h($resub['descr'] ?? '') ?></textarea>
       <label for="ver">版本号（整数，发布新版时 +1）</label>
-      <input id="ver" type="text" name="ver" inputmode="numeric" pattern="\d{1,3}" placeholder="1">
+      <input id="ver" type="text" name="ver" inputmode="numeric" pattern="\d{1,3}" placeholder="1"
+             value="<?= $resub ? (int)$resub['ver'] + 1 : '' ?>">
 
       <div id="issues" style="margin-top:14px"></div>
       <div style="margin-top:20px"><button type="submit" id="btn-up">提交审核</button></div>
@@ -172,19 +204,24 @@ $STATUS = ['pending' => '待审核', 'approved' => '已上架', 'rejected' => '�
       <p class="hint" style="margin:0">还没有提交过。</p>
     <?php else: ?>
       <ul class="subs">
-      <?php foreach ($mySubs as $s): $st = $s['status']; ?>
+      <?php foreach ($mySubs as $s): $stt = (string)$s['status']; ?>
         <li>
           <div>
             <div><strong><?= h($s['label'] ?: $s['name']) ?></strong>
               <span class="meta">v<?= (int)$s['ver'] ?> · <?= h($s['cat']) ?> · <?= h(date('m-d H:i', (int)$s['created'])) ?></span>
             </div>
-            <?php if ($st === 'rejected' && $s['note']): ?>
+            <?php if ($stt === 'rejected' && $s['note']): ?>
               <div class="meta" style="color:var(--err)">驳回原因：<?= h($s['note']) ?></div>
-            <?php elseif ($st === 'approved' && $s['pub_ver']): ?>
-              <div class="meta">商店版本 v<?= (int)$s['pub_ver'] ?></div>
+            <?php elseif ($stt === 'published'): ?>
+              <div class="meta">商店版本 v<?= (int)($s['pub_ver'] ?: $s['ver']) ?> · 设备上刷新商店即可看到</div>
+            <?php elseif ($stt === 'unpublished'): ?>
+              <div class="meta">已从商店下架（原因可联系站主）</div>
+            <?php endif; ?>
+            <?php if (status_can_resubmit($stt)): ?>
+              <div style="margin-top:6px"><a href="index.php?resub=<?= (int)$s['id'] ?>">改好后重新提交 →</a></div>
             <?php endif; ?>
           </div>
-          <span class="tag t-<?= h($st) ?>"><?= h($STATUS[$st] ?? $st) ?></span>
+          <span class="tag <?= h(status_tone($stt)) ?>"><?= h(status_label($stt)) ?></span>
         </li>
       <?php endforeach; ?>
       </ul>
@@ -214,8 +251,6 @@ if (fileEl) {
       $('issues').innerHTML = '<div class="msg e">文件不是 UTF-8 编码，中文会显示成乱码，请另存为 UTF-8 再传。</div>';
       return;
     }
-    /* 解析头部：同时支持「一行多个 key=value」和「一行一个」两种写法。
-       不能按空格直接切 —— desc 里可能有空格，按空格切会截断。 */
     const parseKv = (body) => {
       const out = {}, hits = [];
       const re = /(?:^|\s)([A-Za-z_]+)=/g;
@@ -243,7 +278,6 @@ if (fileEl) {
 
     if (meta.name) $('name').value = meta.name;
     if (meta.cat) {
-      /* 与后端、与 tools/store_build.py 同一张归一化表（老应用常写 工具/程序/系统） */
       const CATMAP = {'程序':'软件','工具':'软件','应用':'软件','系统':'标准','设置':'标准','网络':'运维'};
       $('cat').value = CATMAP[meta.cat] || meta.cat;
       if (!$('cat').value) {
@@ -252,7 +286,6 @@ if (fileEl) {
       }
     }
     if (meta.desc) $('descr').value = meta.desc;
-    /* 版本号：1.0 / v2 一律取整数段，与后端一致 */
     const verRaw = meta.ver || meta.version || '';
     const verNum = (String(verRaw).match(/(\d{1,3})/) || [])[1];
     if (verNum) $('ver').value = verNum;
@@ -283,13 +316,12 @@ if (fileEl) {
     $('pv-name').textContent = meta.name || '（未命名）';
     $('pv-cat').textContent  = (meta.cat || '未分类') + (verNum ? ' · v' + verNum : '');
 
-    /* 危险能力提示（真正的判定以后端为准） */
+    /* 下面这些只是"前端提示"，真正的判定在服务端 */
     const RISK = [
-      ['app.hid.start', '能模拟 USB 键盘/鼠标（高危）'],
-      ['app.fs.remove', '能删除设备文件（高危）'],
+      ['app.hid.', '会控制 USB 键鼠（第三方应用不允许，见开发规范）'],
+      ['app.fs.remove', '能删除文件（沙箱内只限自身数据目录）'],
       ['app.net.http_get', '会联网'],
-      ['app.espnow', '使用 ESP-NOW 无线通信'],
-      ['app.rec.start', '会启用麦克风'],
+      ['app.rec.start', '会启用麦克风（第三方应用不允许）'],
     ];
     for (const [api, why] of RISK) if (text.includes(api)) issues.push(['w', '检测到 ' + api + '：' + why]);
 

@@ -11,6 +11,8 @@
  * ==========================================================================*/
 #include <stdbool.h>
 #include "board_pins.h"   /* ★按键引脚唯一真相源 */
+/* 功放使能脚（与 board_cfg.h 的 CFG_PA_EN 一致；这里不引该头，避免跨组件依赖） */
+#define PM_PA_EN_GPIO 46
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -256,21 +258,13 @@ void power_mgr_off(int origin)
         if (pr == ESP_ERR_NOT_FINISHED)
             ESP_LOGW(TAG, "GPS 停靠等待 8s 仍被占用(开机停靠未结束)");
 
-        for (int i = 0; i < 2 && pr != ESP_OK; i++) {
-            ESP_LOGW(TAG, "GPS 停靠失败(%s) ⇒ 第 %d 次重试", esp_err_to_name(pr), i + 1);
-            vTaskDelay(pdMS_TO_TICKS(800));
-            pr = gps_boot_park();
-        }
+        /* ★ 2026-11-02 linit：不要那套"失败再重试 2 次 + verified 复核"。
+         *   实测首次停靠就能落到 ESP_OK（撞 BUSY 时会等它做完，见上面的等待循环），
+         *   额外两轮只是把关机拖长 1.6~8 秒。这里只记结果。 */
         if (pr != ESP_OK)
-            ESP_LOGE(TAG, "GPS 最终仍未进待机(%s) ⇒ 深睡期间它会一直耗电, 只能靠硬件断电",
-                     esp_err_to_name(pr));
-        else if (!gps_sleep_verified())
-            /* ★ 2026-10-29: 只凭 sleep_verified 判断, 不引用 GPS 睡眠状态机(gps_sm_t) ——
-             *   状态机属于 GPS 驱动的独立改造, 本组件只依赖 gps.h 的既有接口,
-             *   否则电源模块会被迫连带整块 GPS 改动一起入库。 */
-            ESP_LOGW(TAG, "GPS 已省电但**未经确认** ⇒ 若为 PSMOO 则平均约 0.1mA, 需实测");
+            ESP_LOGW(TAG, "GPS 停靠未成功(%s)", esp_err_to_name(pr));
         else
-            ESP_LOGI(TAG, "GPS 已确认进入待机");
+            ESP_LOGI(TAG, "GPS 已进入待机");
         /* TX 钉高交给驱动统一做(幂等): 软件待机的唤醒源是 UART RX, pad 浮空即被叫醒 */
         gps_tx_hold_high();
     } else {
@@ -314,6 +308,19 @@ void power_mgr_off(int origin)
     if (s_stage_mask & 0x04) sd_unmount();
     /* ② 触摸 IC: RST 拉低 + hold。唤醒源是 EXT1 按键, 不靠触摸, 睡死没副作用。 */
     if (s_stage_mask & 0x08) touch_panel_power_down();
+    /* ★ 2026-11-01 linit「能关全关」: 音频功放断电。
+     *   PA_EN(GPIO46) 高=工作，拉低即关断；不关的话功放静态电流是 mA 级，
+     *   比深睡本身大几个数量级。这里直接拉低，不依赖音频模块当前状态。 */
+    {
+        gpio_config_t pa = {
+            .pin_bit_mask = 1ULL << PM_PA_EN_GPIO,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = 0, .pull_down_en = 0, .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&pa);
+        gpio_set_level(PM_PA_EN_GPIO, 0);
+        ESP_LOGI(TAG, "功放 PA_EN(GPIO%d) 已拉低断电", (int)PM_PA_EN_GPIO);
+    }
     /* ③ 屏: **完全关闭** (st7305_sleep_in, 默认 mode 2 = 0x28 + 0x10)。
      *    ★ 2026-10-26 linit「深睡完全关闭屏幕」: Display OFF + Sleep In ⇒ 连内部升压
      *    VGH/VGL 一起断, 面板待机 ~1-5µA。
@@ -384,9 +391,14 @@ void power_mgr_off(int origin)
         if (pd != ESP_OK)
             ESP_LOGE(TAG, "电源域 MODEM 断电失败(%s) ⇒ WiFi/BLE 射频可能仍供电(20mA 级!)",
                      esp_err_to_name(pd));
+        /* ⚠ IDF 6.0 已移除 ESP_PD_DOMAIN_RTC_SLOW_MEM / RTC_FAST_MEM（S3 上不可单独断电），
+         *   所以"RTC 内存也关"这条路走不通；能关的四个域已经全部 OFF 了。 */
         else
             ESP_LOGI(TAG, "电源域: RTC_PERIPH=ON, XTAL/VDDSDIO/MODEM=OFF 全部生效");
     }
+
+    /* ⚠ IDF 6.0 未公开 esp_brownout_disable()（无公开 API，需改私有实现），
+     *   这一项放弃；关机功耗主要靠关功放/外设，brownout 那 ~15µA 先留着。 */
 
     /* ★ 2026-10-24: 入睡前把 CPU 降到最低档。
      *   ⚠ 说清楚: **深睡期间 CPU 是断电的, 调频对深睡电流没有影响**。
@@ -427,10 +439,8 @@ void power_mgr_off(int origin)
      *   待机电流可达**几 mA**(来源: "SD 卡的待机电流可能很大(几十毫安!), 进入深睡前
      *   一定要正确卸载并切断电源")。卸载后卡进入 idle, 耗电降到 µA 级 ✓
      *   (深睡唤醒=完整重启 ⇒ 会重新 mount ✓) */
-    /* ★ 2026-10-28: 第二次卸载同样受 0x04 控制 —— 原先这里是**无条件**调用,
-     *   于是 `sleepstage 0x13` 照样把卡卸了, "只关屏+音频+GPS"根本不成立。 */
-    if (s_stage_mask & 0x04) sd_unmount();
-    else ESP_LOGW(TAG, "[stage] 跳过 SD 二次卸载 (0x04 未置位)");
+    /* ★ 2026-11-02 linit：SD 只卸载**一次**（上面 0x04 那块已经卸过），
+     *   这里再卸是空操作，纯属把关机流程拖长，删掉。 */
 
     /* ★ 2026-10-20: 触摸 IC 按入复位态 + I2C 上拉关掉。
      *   CST836U 常温工作电流 ~1mA 级, 深睡期间没人复位它就一直扫屏。

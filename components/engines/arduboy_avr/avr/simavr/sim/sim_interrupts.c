@@ -30,7 +30,9 @@
 
 #if defined(__XTENSA__) || defined(CONFIG_IDF_TARGET_ESP32S3)
 #include "esp_attr.h"
-#define AVR_IRAM IRAM_ATTR
+/* ★ 2026-11-02 linit: 不再钉在 IRAM —— 走 flash + I-cache, 把内部 RAM 让出来。
+ *   掉帧就把它改回 IRAM_ATTR(只影响本文件的 AVR 中断路径)。 */
+#define AVR_IRAM
 #else
 #define AVR_IRAM
 #endif

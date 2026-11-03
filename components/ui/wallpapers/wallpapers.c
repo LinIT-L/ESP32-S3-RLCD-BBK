@@ -190,8 +190,15 @@ static uint32_t wp_ss_run_ms(void)
  * 断言 → panic → 重启循环(正是本 bug). 预载后各 getter 仅返回缓存值, 不再碰 NVS. */
 static void wp_ss_prime(void)
 {
+    /* ★ 2026-11-02 linit「请你搞深度睡眠」: 放下就尽快睡, 别在屏保里空耗。
+     *   原默认 息屏10分 + 再播10分 才关机 = 放下后 20 分钟才真睡。
+     *   ⚠ 用户自己在「设置→显示」改过的值(NVS os_wp)仍然优先, 这里只改出厂默认。
+     * ★★ 2026-11-02 修正(linit「休眠和关机不按我设置来」):
+     *   这里曾把默认写成 3 分, 而设置页 sleep_min_get()/shutgrp_min_get() 的默认仍是 10 ——
+     *   用户没手动设过时, **界面显示 10 分钟、实际 3 分钟就睡了**, 看起来就是"设置不生效"。
+     *   默认值必须和设置页一致, 改回 10。要更快请去设置里自己改, 界面与行为就统一了。 */
     s_ss_delay_ms = (uint32_t)10 * 60000UL;  /* 壁纸(息屏)延时: 默认 10 分钟 */
-    s_ss_run_ms   = (uint32_t)10 * 60000UL;  /* 关机时间: 默认 10 分钟 → 屏保播满即自动关机 */
+    s_ss_run_ms   = (uint32_t)10 * 60000UL;  /* 关机时间: 屏保播满 10 分钟 → 自动关机 */
     s_touch_wake  = 0;                        /* 默认触摸不唤醒 */
     nvs_handle_t h;
     if (svc_nvs_open("os_wp", NVS_READONLY, &h) == ESP_OK) {
@@ -251,7 +258,7 @@ void wp_screensaver_set_touch_wake(bool en)
                                 * 实测(屏保未激活时)仅用 7.6KB。取 16KB = 历史爆掉值的 2 倍。
                                 * ★ 2026-10-26 linit「不用就不给」: 32KB→16KB, 省 16KB PSRAM。 */
 EXT_RAM_BSS_ATTR static StackType_t s_ss_stack[SS_SUPER_STACK];  /* 静态 PSRAM 栈(同 board_shim 视频任务模式) */
-static StaticTask_t s_ss_tcb;
+static StaticTask_t s_ss_tcb;   /* ⛔ 必须内部 RAM: xPortCheckValidTCBMem 校验 */
 static TaskHandle_t s_ss_task_h = NULL;  /* 深睡前 vTaskSuspend */
 static int s_ss_pm_mode = -1;      /* 屏保分档: -1=未定 0=静态省电 1=动态流畅 (退出时复位) */
 /* ★ 2026-10-26 linit「进屏保直接关 WiFi」: 射频 20~30mA。
@@ -356,6 +363,10 @@ static void ss_supervisor_task(void *arg) {
             }
             /* 屏保中: 独占渲染星空 (主循环可能正被游戏阻塞, 不能等它) */
             int drew = 0;
+            /* ★ 2026-10-31: 先取模块的静态间隔 —— 它决定"这一帧要不要升档"和"下一轮睡多久"。
+             *   idle_ms>0 = 静态壁纸(人生指南)；0 = 动态壁纸(星空) 或未注册。 */
+            const wp_module_t *ss_mod  = wp_get_module(s_ss_prog);
+            const uint32_t      idle_ms = ss_mod ? ss_mod->idle_ms : 0;
             if (s_ss_lcd) {
                 uint32_t t = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
                 /* ★ 只有"本帧有新内容"才送屏: 静态壁纸(人生指南)每分钟才刷一次,
@@ -379,16 +390,28 @@ static void ss_supervisor_task(void *arg) {
                  *   静态(人生指南, 大多数帧无变化) ⇒ 80MHz + 开浅睡, 1000ms 轮询(省电).
                  *   两种模式只在切换时调一次 esp_pm_configure, 不逐帧调。 */
                 /* s_ss_pm_mode: 文件作用域(-1=未定 0=静态 1=动态), 退出屏保时复位 */
-                int want = drew ? 1 : 0;
+                /* ★ 2026-10-31 修复「静态壁纸每分钟整机调频两次」:
+                 *   原式 want = drew ? 1 : 0 —— 人生指南每 60 秒换条的那一帧 drew=1,
+                 *   立刻 esp_pm_configure(240MHz)；62ms 后下一帧 drew=0 又切回 80MHz。
+                 *   画 20 行 16px 汉字在 80MHz 下不过几 ms，为这一帧升档完全不划算，
+                 *   而且 DFS 重配置 / 浅睡门控 SPI 都有代价。
+                 *   现在按**壁纸类型**定档：静态(idle_ms>0) 永远 80MHz + 浅睡；
+                 *   动态(星空) 保持原样 —— 有内容 240MHz，偶尔空帧才回落。 */
+                /* ★★★ 2026-11-02 linit「无论怎么样全部搞省电」★★★
+                 *   原来按壁纸类型分档：动态壁纸(星空) 走 **240MHz + 关浅睡 + 62ms/帧(16fps)**
+                 *   + 每帧刷 15000B。屏保一挂一整夜 ⇒ 60~80mA 常流、模组发烫，
+                 *   用户体感就是"明明息屏睡了，机器却一直烫、电掉 2/3"。
+                 *   反射屏静止画面根本不需要 16fps。现在**统一进省电档**：
+                 *   一律 80MHz + 开浅睡。
+                 *   ⚠ 帧率后来又被 linit 打回 16fps（4fps 观感太卡），见下方 dly 的注释；
+                 *     省电主要靠"关 WiFi + 80MHz + 浅睡"这三项，不靠压帧率。 */
+                int want = 0;
                 if (want != s_ss_pm_mode) {
                     s_ss_pm_mode = want;
-                    esp_pm_config_t pm = want
-                        ? (esp_pm_config_t){ .max_freq_mhz = 240, .min_freq_mhz = 80,  .light_sleep_enable = false }
-                        : (esp_pm_config_t){ .max_freq_mhz = 80,  .min_freq_mhz = 80,  .light_sleep_enable = true  };
+                    esp_pm_config_t pm = (esp_pm_config_t){ .max_freq_mhz = 80, .min_freq_mhz = 80,
+                                                            .light_sleep_enable = true };
                     esp_pm_configure(&pm);
-                    ESP_LOGI(WP_TAG, "屏保分档: %s (%dms/帧, 浅睡=%d)",
-                             want ? "动态流畅 240MHz" : "静态省电 80MHz",
-                             want ? 62 : 1000, want ? 0 : 1);
+                    ESP_LOGI(WP_TAG, "屏保省电档: 80MHz + 浅睡 (动态 62ms/帧 = 16fps)");
                 }
                 /* ★ 2026-10-26 linit「进入屏保直接关 WiFi」: 射频占 20~30mA, 是屏保期最大耗电项。
                  *   disable() = disconnect + stop + deinit(释放内部 RAM); 解锁后后台恢复(约 2s)。 */
@@ -397,7 +420,22 @@ static void ss_supervisor_task(void *arg) {
                     wifi_manager_disable();
                     ESP_LOGI(WP_TAG, "屏保: WiFi 已关闭 (省 20~30mA), 解锁后自动恢复");
                 }
-                uint32_t dly = drew ? 62u : 1000u;   /* ★ 2026-10-26 linit: 动态 16fps (62.5ms) */
+                /* 静态壁纸：固定按 idle_ms 轮询（不因"这帧画了"而缩短成 62ms）。
+                 * 动态壁纸：有内容 62ms，无内容回落到 1000ms（原行为）。 */
+                /* ★ 2026-11-02 linit「动态壁纸不要跑那么高的帧率」:
+                 *   原来 62ms(16fps) 是"要流畅"的老设定；屏保没人看时纯烧电。
+                 *   现在动态壁纸 250ms(4fps) 起步，进屏保满 60 秒后降到 1000ms(1fps)，
+                 *   画面仍在动，功耗再降一档。静态壁纸照旧按它自己的 idle_ms。 */
+                /* ★★ 2026-11-02 修正(linit「动态壁纸太卡」):
+                 *   上一版把动态壁纸压到 250ms(4fps)、进屏保 60 秒后再降到 1000ms(1fps),
+                 *   省电是省了, 但星空几乎是在"跳帧", 观感就是卡。
+                 *   反射屏静止画面不费力, 真正的耗电大头是射频和 CPU 满频 —— 这两项已单独处理
+                 *   (屏保关 WiFi + 80MHz 浅睡)。这里把帧率恢复到 16fps(62ms), 并去掉 1fps 降级。
+                 *   静态壁纸仍按自己的 idle_ms 轮询, 不受影响。 */
+                uint32_t dly;
+                if (idle_ms > 0)  dly = idle_ms;   /* 静态(人生指南): 按模块间隔 */
+                else if (!drew)   dly = 1000u;     /* 本帧没画成(被门禁挡): 别空转 */
+                else              dly = 62u;       /* 动态(星空): 16fps */
                 vTaskDelay(pdMS_TO_TICKS(dly));
             }
         } else {
@@ -458,6 +496,14 @@ static void ss_supervisor_task(void *arg) {
                     }
                 }
             }
+            /* ★ 2026-10-31: 收尾"已登记待释放"的壁纸数据。
+             *   走到这里说明：不在屏保（上面的 if 分支没进）⇒ render 没在跑，
+             *   是唯一能确认"屏保任务不再访问那 380KB"的时机。
+             *   真正的 free 在 wp_lifeguide_reap() 里，本任务栈虽在 PSRAM，
+             *   但 heap_caps_free 只操作堆结构（内部 RAM），不碰 flash，安全。
+             *   没有待释放项时它第一句就返回，每 250ms 一次的开销可忽略。 */
+            wp_lifeguide_reap();
+
             /* 空闲检测 (低频省电) —— USB 插着就不进屏保(也就不会连锁到自动关机) */
             bool usb = usb_hid_host_mounted();
             if (usb != s_usb_suppress_prev) {
@@ -505,6 +551,19 @@ void wp_screensaver_halt(void) {
 void wp_stars_register_module(void);       /* 星空, 见 wp_module_stars.c */
 void wp_lifeguide_register_module(void);   /* 人生指南, 见 wp_module_lifeguide.c */
 
+/* ★ 2026-10-31: 切换壁纸立即生效（见 wallpapers.h 的说明）。
+ *   屏保监督任务只在开机时读过一次 NVS，之后 s_ss_prog 就固定了；
+ *   壁纸设置页改完 NVS 后再调这里，下一帧屏保就会用新模块 —— 不用重启。
+ *   （放在本文件靠后: 要写 s_ss_pm_mode，它在上面才定义。）
+ *   传越界 id 收敛到星空，避免"选了不存在的模块 → 屏保一片空白"。 */
+void wp_set_program(int prog) {
+    s_ss_prog = wp_get_module(prog) ? prog : WP_PROG_STARS;
+    /* 让下一次进入屏保重新判定档位（静态 idle_ms / 动态 62ms + 对应频率），
+     * 否则会沿用上一个壁纸的档位，直到"本帧有无新内容"翻转才纠正。 */
+    s_ss_pm_mode = -1;
+    ESP_LOGI(WP_TAG, "屏保壁纸切换为: %s (id=%d)", wp_prog_name(s_ss_prog), s_ss_prog);
+}
+
 void wp_screensaver_supervisor_start(st7305_handle_t *lcd) {
     s_ss_lcd = lcd;
     wp_ss_prime();   /* 内部栈上下文预载 NVS 缓存(必须在创建 PSRAM 栈监督任务前) */
@@ -520,6 +579,16 @@ void wp_screensaver_supervisor_start(st7305_handle_t *lcd) {
             svc_nvs_close(h);
         }
         s_ss_prog = wp_get_module(p) ? p : WP_PROG_STARS;   /* 越界/模块不存在 → 回星空 */
+    }
+    /* ★ 2026-10-31: 上次选的是人生指南 ⇒ 在这里先把它读进 PSRAM。
+     *   本函数运行在**内部 RAM 栈**（os_init → app_main），可以安全碰 flash；
+     *   而真正渲染的屏保任务栈在 PSRAM，自己去 fopen 会触发 spi_flash 禁缓存断言。
+     *   预加载失败就回星空，不留"选了却没有画面"的状态。 */
+    if (s_ss_prog == WP_PROG_LIFEGUIDE) {
+        if (!wp_lifeguide_preload()) {
+            ESP_LOGW(WP_TAG, "人生指南数据预加载失败 ⇒ 本次开机回星空");
+            s_ss_prog = WP_PROG_STARS;
+        }
     }
     static bool started = false;
     if (started) return;

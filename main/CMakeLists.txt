@@ -1,6 +1,12 @@
 # Main 组件
 # BBK 游戏模拟器 - 菜单系统前端
 
+# 测试组件只在 LINTOS_LAVAX_BENCH=1 时挂上（默认不参与正式固件）
+set(BENCH_REQ "")
+if(LINTOS_LAVAX_BENCH)
+    list(APPEND BENCH_REQ lavax_bench)
+endif()
+
 idf_component_register(
     SRCS "main.c" "remcon.c" "lua_launch.c"
     INCLUDE_DIRS "."
@@ -19,6 +25,7 @@ idf_component_register(
         esp_driver_gpio esp_driver_i2c
         esp_timer
         nvs_flash svc_time svc_log svc_nvs
+        lpk
         esp_event
         board_battery
         book_reader
@@ -36,4 +43,10 @@ idf_component_register(
         nes_emu
         spiffs
         lua
+        ${BENCH_REQ}
 )
+
+# CMake 变量不会自动变成宏 —— main.c 里的 #ifdef LINTOS_LAVAX_BENCH 需要显式定义
+if(LINTOS_LAVAX_BENCH)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE LINTOS_LAVAX_BENCH=1)
+endif()

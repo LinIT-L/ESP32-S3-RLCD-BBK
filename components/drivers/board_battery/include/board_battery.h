@@ -36,7 +36,8 @@ esp_err_t board_battery_read_cached(board_battery_status_t *status);
  *   ③ 睡眠/关机没采的分钟 = 哨兵 `0xFF`(无数据), 画图时直接跨过去连上
  *   ⇒ 一天 1.44KB · **7 天 10KB** (旧方案带 u32 时间戳要 6B/条, 相差 6 倍)。保留期=7 天。
  * ⚠ 存储位置: 运行期数组在 **PSRAM**(10KB), 另按"天"分块**持久化到 NVS**(ns `batcal`, 7×1440B)。
- *   睡眠期间**不采样**(没有主循环), 醒来自动补成 0xFF ⇒ 波形中间断开、连线跨过去。 */
+ *   睡眠期间**不采样**(没有主循环), 醒来自动补成 0xFF ⇒ 波形中间断开、连线跨过去。
+ * ⚠ 这是**画图用的历史**，不参与电量计算（2026-10-31 精简后，电量只由当前电压查表得出）。 */
 typedef struct { uint32_t t; uint16_t mv; } bat_sample_t;
 #define BOARD_BATTERY_WAVE_MAX 720           /* 一次最多取多少点给绘制 (够 330px 屏) */
 /* ★ 2026-10-26 linit: 波形图最长只显示**最近 24 小时** (原来 7 天)。
@@ -49,20 +50,24 @@ uint32_t board_battery_hist_span_s(void);
 /* 取窗口 window_s 内的波形点 (自动抽稀到 ≤max 条), 按时间旧→新; 返回条数。
  * ⚠ 抽稀规则天然实现"近密远疏": 2 小时窗口 → 1 分钟一点; 7 天窗口 → 约 15 分钟一点。 */
 int board_battery_wave(bat_sample_t *out, int max, uint32_t window_s);
-
-/* ==== 一个月日档 (每天 min/max, 存 NVS, 断电不丢) ====
- * linit: "记住要把那才知道的信息都保存, 可以保存一个月 电池电压信息"。
- * 每天一条, 环形 31 天; 只在**跨天**时落盘一次 ⇒ 一个月 30 次 NVS 写, 无闪存磨损顾虑。 */
-#define BOARD_BATTERY_DAYS 31
-typedef struct { uint32_t day; uint16_t min_mv, max_mv; } bat_day_t;
-/* 取日档 (按时间旧→新), 返回条数; day 为"日号"(非日历日期, 见实现注释) */
-int board_battery_days_get(bat_day_t *out, int max);
-int board_battery_history(bat_sample_t *out, int max);   /* 按时间旧→新填, 返回条数 */
 uint32_t board_battery_clock_s(void);                    /* 当前 RTC 秒 (供窗口计算) */
 
-/* 运行时诊断 (remcon `bat` 命令): 打印 raw / 脚上 mV / 分压系数 / 换算 VBAT / 百分比。
- * 拿着万用表同时量 BAT_ADC 脚与 VBAT, 和这行对照即可判定分压系数是否需要校准。 */
+/* 运行时诊断 (remcon `bat`): raw / 校准后脚上电压 / 分压后 VBAT / 电量 / CHRG 状态 / 校准是否成功。
+ * 拿万用表同时量 VBAT 与这里的数字对照，即可判断分压系数要不要重新标 (batcal)。 */
 void board_battery_diag(void);
+
+/* ==== 真机测试记录 (remcon `batlog`) ====
+ * 每次真采样（60s 一次，和状态栏同一条路）记一条 12B 记录，事后 `batlog dump` 打出 CSV。
+ *   · **关闭时**只有一个判断 —— 不采样、不分配、不写 Flash；
+ *   · 开启时也不额外打 ADC，只搭车已有的那次采样；不建任务；
+ *   · 120 条 = 1.4KB，放 **PSRAM**，不占内部 RAM。
+ * ⚠ 纯诊断，**不参与任何电量计算**。 */
+#define BOARD_BATTERY_TRACE_MAX 120
+bool board_battery_trace_enable(bool on);   /* 返回设置后的状态 */
+bool board_battery_trace_is_on(void);
+int  board_battery_trace_count(void);       /* 已记录条数 */
+int  board_battery_trace_dump(void);        /* 打印全部记录（旧→新），返回条数 */
+void board_battery_trace_clear(void);       /* 清空记录（不清开关状态） */
 
 #ifdef __cplusplus
 }

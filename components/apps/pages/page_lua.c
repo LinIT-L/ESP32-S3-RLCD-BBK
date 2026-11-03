@@ -19,6 +19,8 @@
 #include "netscan.h"   /* V1.2: 端口探测/ARP解析/MAC厂商 (L1 服务) */
 #include "os_pane.h"
 #include "lua_bridge.h"   /* 模块化后: 桥 API 在 components/apps/lua_bridge/ */
+#include "lua_sandbox.h"  /* ★ 2026-10-31: 第三方应用信任级/路径/配额/时限 */
+#include "lua_quota.h"    /* 配额账本算术(纯 C, 与主机测试同一份) */
 #include "gps.h"        /* 退出应用时兜底关 GPS (见 lua_stop) */
 #include "gps_nmea.h"    /* gps_service_stop() */
 #include "ui_common.h"
@@ -39,6 +41,7 @@
 #include <time.h>
 
 #include "input.h"
+#include "virtual_keys.h" /* ★ 2026-10-31: Lua 应用可用系统虚拟手柄 (app.vk) */
 #include "esp_attr.h"      /* RTC_NOINIT_ATTR (崩溃定位探针) */
 #include "esp_system.h"    /* esp_reset_reason() */
 #include "esp_heap_caps.h" /* heap_caps_get_free_size (探针资源快照) */
@@ -124,6 +127,25 @@ static void lua_probe_delayed_cb(void *arg) {
     lua_probe_print_once();
 }
 
+/* ============================ 启动/退出分阶段计时 ============================
+ * 默认**关闭**；串口 `luaprof 1` 打开、`luaprof 0` 关闭，日志标签 LUAPROF。
+ * 只在开关打开时读时钟/打日志，正常运行时零开销（一次 bool 判断）。
+ * 用法：luaprof 1 → 打开应用 → 看每段 +xx us → 退出 → 看退出的分段。
+ * ========================================================================== */
+static bool    s_prof_on = false;
+static int64_t s_prof_t0 = 0;
+
+void lua_prof_set(int on) { s_prof_on = (on != 0); s_prof_t0 = esp_timer_get_time(); }
+int  lua_prof_get(void)    { return s_prof_on ? 1 : 0; }
+
+static inline void prof_mark(const char *tag)
+{
+    if (!s_prof_on) return;
+    int64_t now = esp_timer_get_time();
+    ESP_LOGI("LUAPROF", "%-14s +%6lld us", tag, (long long)(now - s_prof_t0));
+    s_prof_t0 = now;
+}
+
 void lua_probe_boot_report(void) {
     lua_probe_print_once();
     /* ⚠ 不在开机清零: 阶段号要一直保留到"下一次启动流程"覆盖它 ——
@@ -154,6 +176,29 @@ bool         g_lua_exit_ask = true;
 static bool  s_exit_dlg = false;   /* 确认框已弹出 → 防重复弹 (弹窗期间 BACK 归弹窗自己处理) */
 static bool  s_exit_pend = false;  /* 已请求退出, 待下一帧 poll 统一弹确认框 (避免回调里重入) */
 static bool  s_ran = false;        /* 应用是否真的跑起来过 (没跑起来 → 不弹确认, 直接退) */
+
+/* ==== 2026-10-31 系统虚拟手柄 (Lua 侧) ====
+ * 脚本用 app.vk(true) 声明"我要虚拟手柄"；本页负责 enable / 绘制 / 按键翻译。
+ * 脚本仍然只从 action(a) 收键 —— 不新增第二套输入路径，也不改游戏引擎的 vk 设置。 */
+extern bool lua_vk_want;              /* luat_lib_input.c: app.vk() */
+static bool     s_vk_on;              /* 本页是否已启用虚拟手柄 */
+static uint8_t  s_vk_prev = 0xFF;     /* 上一帧虚拟手柄掩码(边沿检测), 1=松开 */
+static uint8_t  s_vk_dir;             /* 当前按住的方向位(单一位), 用于长按重复 */
+static uint32_t s_vk_dir_t0, s_vk_dir_last;
+
+/* 虚拟手柄掩码位 → OS 动作 (位定义见 virtual_keys.h: 低电平有效) */
+static os_action_t vk_bit_to_action(uint32_t bit)
+{
+    switch (bit) {
+    case 1u << 0: return OS_ACTION_CONFIRM;   /* A */
+    case 1u << 1: return OS_ACTION_BACK;      /* B */
+    case 1u << 4: return OS_ACTION_RIGHT;
+    case 1u << 5: return OS_ACTION_LEFT;
+    case 1u << 6: return OS_ACTION_UP;
+    case 1u << 7: return OS_ACTION_DOWN;
+    default:      return OS_ACTION_NONE;      /* Select/Start 暂不映射 */
+    }
+}
 
 /* ---- 按键 FIFO: 承接 os action, 供 Lua app.key() 非阻塞读取 ---- */
 int g_lua_keys[KEY_FIFO_N];
@@ -190,7 +235,8 @@ static bool is_lua(const char *name) {
     return (len > 4) && (strcasecmp(name + len - 4, ".lua") == 0);
 }
 
-static void lua_stop(ui_ctx_t *ctx);
+static void lua_stop_ex(ui_ctx_t *ctx, bool leaving_page);
+static void lua_stop(ui_ctx_t *ctx) { lua_stop_ex(ctx, false); }
 
 /* ---- 报错策略: 不再"一报错就退出应用" ----
  * 旧行为: poll()/render()/action() 任何报错都 lua_stop() → 用户感受是"应用一打开就没了",
@@ -235,14 +281,16 @@ static void lua_report_error(ui_ctx_t *ctx, const char *name) {
     snprintf(s_err_banner, sizeof(s_err_banner), "%s(): %s", name, m ? m : "?");
     s_err_banner_until = now + LUA_ERR_BANNER_MS;      /* 每次出错都续期 */
     if (s_err_streak <= 1) {
-        ESP_LOGD(TAG, "Lua %s() 错误: %s", name, m ? m : "(null)");
+        /* ★ 2026-11-02: LOGD → LOGW。回调里的错误(render/action/on_enter)原来
+         * 在默认 INFO 等级下也是整级被过滤, 串口看不到任何线索。 */
+        ESP_LOGW(TAG, "Lua %s() 错误: %s", name, m ? m : "(null)");
         snprintf(s_err, sizeof(s_err), "%s: %s", name, m ? m : "?");
         s_err_pending = true;
     } else if ((s_err_streak % 30) == 0) {
-        ESP_LOGD(TAG, "Lua %s() 连续出错 %d 次: %s", name, s_err_streak, m ? m : "(null)");
+        ESP_LOGW(TAG, "Lua %s() 连续出错 %d 次: %s", name, s_err_streak, m ? m : "(null)");
     }
     if (s_err_streak >= LUA_ERR_MAX) {
-        ESP_LOGD(TAG, "Lua %s() 连续出错 %d 次 → 退回列表", name, s_err_streak);
+        ESP_LOGW(TAG, "Lua %s() 连续出错 %d 次 → 退回列表", name, s_err_streak);
         lua_stop(ctx);
     }
 }
@@ -261,11 +309,30 @@ static void lua_draw_err_banner(st7305_handle_t *lcd) {
 }
 
 
-/* ============ Lua 分配器: 全部走 PSRAM, 大块脚本/字符串不占内部 RAM ============ */
+/* ============ Lua 分配器: 全部走 PSRAM, 大块脚本/字符串不占内部 RAM ============
+ * ★ 2026-10-31: 同时做**内存配额统计** —— osize 是旧块大小(Lua 保证传入),
+ *   已用 = 已用 - osize + nsize, 释放时扣减。只统计 Lua 自己的分配, 不掺系统 PSRAM。
+ *   超额返回 NULL ⇒ Lua 抛 "not enough memory", 由 pcall 收住, 不会打崩系统。 */
+static size_t s_lua_mem_used;
 static void *lua_psram_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
-    (void)ud; (void)osize;
-    if (nsize == 0) { if (ptr) heap_caps_free(ptr); return NULL; }
-    return heap_caps_realloc(ptr, nsize, MALLOC_CAP_SPIRAM);
+    (void)ud;
+    if (nsize == 0) {
+        if (ptr) { heap_caps_free(ptr); s_lua_mem_used = lua_quota_after(s_lua_mem_used, ptr, osize, 0); }
+        return NULL;
+    }
+    /* ★ 账本算术统一走 lua_quota_after(): 与主机测试编译同一份源码,
+     *   扩容/缩容/释放三种情形的扣减都有断言覆盖(不再依赖"看着对")。 */
+    const size_t used = lua_quota_after(s_lua_mem_used, ptr, osize, nsize);
+    if (!lua_sandbox_mem_account(used)) {
+        ESP_LOGW("LSANDBOX", "Lua 内存超配额: 需要 %uB, 上限 %uB (峰值 %uB)",
+                 (unsigned)used, (unsigned)lua_sandbox_mem_limit(),
+                 (unsigned)lua_sandbox_mem_peak());
+        return NULL;
+    }
+    void *np = heap_caps_realloc(ptr, nsize, MALLOC_CAP_SPIRAM);
+    if (!np) return NULL;              /* 真失败: 不改计数 */
+    s_lua_mem_used = used;
+    return np;
 }
 void app_big_text(st7305_handle_t *lcd, int x, int y, const char *s, int scale, bool inv) {   /* [modsplit] 共享给 lua_bridge 各模块 */
     for (int i = 0; s[i]; i++) app_big_ascii(lcd, x + i * 8 * scale, y, s[i], scale, inv);
@@ -324,16 +391,23 @@ void kbd_lua_sync(void) {   /* [modsplit] 共享给 lua_bridge 各模块 */
 /* ---- app.nvs.* : 掉电保留键值 ---- */
 nvs_handle_t lua_nvs_h(void) {   /* [modsplit] 共享给 lua_bridge 各模块 */
     nvs_handle_t h;
-    if (svc_nvs_open("luaapp", NVS_READWRITE, &h) != ESP_OK) return 0;
+    /* ★ 2026-10-31: 第三方应用按 appid 分命名空间, 不能与其它应用共用 luaapp */
+    if (svc_nvs_open(lua_sandbox_ns("luaapp"), NVS_READWRITE, &h) != ESP_OK) return 0;
     return h;
 }
 
 /* ---- app.hid.* : 电脑键鼠 ---- */
-/* ================= app.db — 系统核心互通数据库 (nvs 命名空间 core_db) ================= */
-/* 存 金币/经验/玩家档案 等核心互通小KV; 键由调用方传 "ns:field" */
+/* ================= app.db — 应用键值库 ================= */
+/* 存 金币/经验/玩家档案 等核心互通小KV; 键由调用方传 "ns:field"。
+ *
+ * ★ 2026-10-31 越权修复(第二次): 这三个函数原来**硬编码 "core_db"**,
+ *   而写路径(app.db.set/seti)已经改走 lua_sandbox_ns()。结果:
+ *     - 第三方写进 appdb_xxxx, 读却读 core_db ⇒ 读不到自己刚写的值;
+ *     - app.db.del 直接**删系统 core_db 的键** ⇒ 这是真正的越权(P1)。
+ *   现在读写删三条全部走同一个命名空间解算, 官方应用仍得到 "core_db"(行为不变)。 */
 int os_core_db_get(const char *key, char *out, size_t cap){   /* [modsplit] 共享给 lua_bridge 各模块 */
     nvs_handle_t h;
-    if(svc_nvs_open("core_db", NVS_READWRITE, &h)!=ESP_OK) return -1;
+    if(svc_nvs_open(lua_sandbox_ns("core_db"), NVS_READWRITE, &h)!=ESP_OK) return -1;
     size_t len=0;
     if(svc_nvs_get_str(h,key,NULL,&len)!=ESP_OK){ svc_nvs_close(h); return -1; }
     if(cap>0 && len>=cap){ svc_nvs_close(h); return -1; }
@@ -343,7 +417,7 @@ int os_core_db_get(const char *key, char *out, size_t cap){   /* [modsplit] 共�
 }
 int os_core_db_set(const char *key, const char *val){   /* [modsplit] 共享给 lua_bridge 各模块 */
     nvs_handle_t h;
-    if(svc_nvs_open("core_db", NVS_READWRITE, &h)!=ESP_OK) return -1;
+    if(svc_nvs_open(lua_sandbox_ns("core_db"), NVS_READWRITE, &h)!=ESP_OK) return -1;
     esp_err_t e=svc_nvs_set_str(h,key,val);
     if(e==ESP_OK) e=svc_nvs_commit(h);
     svc_nvs_close(h);
@@ -351,7 +425,7 @@ int os_core_db_set(const char *key, const char *val){   /* [modsplit] 共享给 
 }
 int os_core_db_del(const char *key){   /* [modsplit] 共享给 lua_bridge 各模块 */
     nvs_handle_t h;
-    if(svc_nvs_open("core_db", NVS_READWRITE, &h)!=ESP_OK) return -1;
+    if(svc_nvs_open(lua_sandbox_ns("core_db"), NVS_READWRITE, &h)!=ESP_OK) return -1;
     esp_err_t e=svc_nvs_erase_key(h,key);
     if(e==ESP_OK) e=svc_nvs_commit(h);
     svc_nvs_close(h);
@@ -376,19 +450,31 @@ static void lua_setup_globals(lua_State *L) {
 /* 读取 SD 卡脚本到 PSRAM 并执行; 成功返回 true */
 static bool lua_load_run(const char *path) {
     lua_probe_stage(5, "load_run 入口");
+    if (s_prof_on) s_prof_t0 = esp_timer_get_time();
     if (s_L) lua_close(s_L);
+    prof_mark("close_old");
+    /* ★ 2026-10-31: 先定信任级/appid/数据目录; 推不出来就拒绝启动(不猜)。 */
+    if (!lua_sandbox_begin(path)) {
+        snprintf(s_err, sizeof(s_err), "应用路径非法");
+        s_err_pending = true; lua_close(s_L); s_L = NULL; return false;
+    }
+    s_lua_mem_used = 0;
     s_L = lua_newstate(lua_psram_alloc, NULL, (unsigned)esp_timer_get_time());
     if (!s_L) { ESP_LOGD(TAG, "lua_newstate 失败"); return false; }
     lua_probe_stage(6, "newstate 成功");
+    prof_mark("newstate");
     luaL_openlibs(s_L);
     lua_setup_globals(s_L);
+    lua_sandbox_apply(s_L);      /* 装死循环钩子; 权限已统一放开, 不再按信任级分级 */
     lua_probe_stage(7, "openlibs+bridge 成功");
+    prof_mark("openlibs+bridge");
 
     FILE *f = fopen(path, "rb");
     if (!f) { ESP_LOGD(TAG, "打开失败: %s", path);
         snprintf(s_err, sizeof(s_err), "\xe6\x97\xa0\xe6\xb3\x95\xe6\x89\x93\xe5\xbc\x80"); /* 无法打开 */
         s_err_pending = true; lua_close(s_L); s_L = NULL; return false; }
     lua_probe_stage(8, "fopen 成功");
+    prof_mark("fopen");
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     if (sz <= 0) { fclose(f); ESP_LOGD(TAG, "空文件: %s", path);
         snprintf(s_err, sizeof(s_err), "\xe7\xa9\xba\xe6\x96\x87\xe4\xbb\xb6"); /* 空文件 */
@@ -400,13 +486,20 @@ static bool lua_load_run(const char *path) {
     size_t rd = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     lua_probe_stage(9, "fread 完成");
+    prof_mark("fread");
 
     int rc = luaL_loadbuffer(s_L, buf, rd, "@app.lua");
     heap_caps_free(buf);
     lua_probe_stage(10, "loadbuffer 完成");
+    prof_mark("loadbuffer");
     if (rc != LUA_OK || lua_pcall(s_L, 0, 0, 0) != LUA_OK) {
         const char *m = lua_tostring(s_L, -1);
-        ESP_LOGD(TAG, "执行失败: %s", m ? m : "(null)");
+        /* ★ 2026-11-02: 原来是 ESP_LOGD —— 默认日志等级是 INFO, DEBUG 被整级过滤,
+         *   于是 Lua 语法错误/运行时错误**串口一条都看不到**, 只在屏幕上闪一下 toast,
+         *   排查时等于没有信息(录音机那次就卡在这里)。
+         *   改 WARN: 带脚本路径 + 完整错误串。chunkname 是 "@app.lua", 所以 m 里
+         *   已经含行号(形如 "app.lua:720: ..."), 原样输出即可。 */
+        ESP_LOGW(TAG, "Lua 执行失败 [%s]: %s", path, m ? m : "(null)");
         snprintf(s_err, sizeof(s_err), "%s", m ? m : "Lua error");
         s_err_pending = true;
         lua_close(s_L); s_L = NULL;
@@ -426,6 +519,9 @@ static bool lua_load_run(const char *path) {
  * 表现为 action() 回调报错/收到垃圾值(所有依赖按键的 Lua 应用失效)。 */
 static void lua_call_optional(ui_ctx_t *ctx, const char *name, int arg) {
     if (!s_L) return;
+    /* 每次回调重新计 10 秒: 超时钩子对所有应用生效后, 不重置会把
+     * 运行超过 10 秒的应用(游戏/阅读器)直接杀掉。 */
+    lua_sandbox_touch();
     lua_getglobal(s_L, name);
     if (!lua_isfunction(s_L, -1)) { lua_pop(s_L, 1); return; }
     int narg = 0;
@@ -443,13 +539,14 @@ static void lua_call_optional(ui_ctx_t *ctx, const char *name, int arg) {
  * 未定义 action 或未返回 true → 返回 false, 交回框架默认行为(退出)。对老脚本向后兼容。 */
 static bool lua_call_action_consumed(ui_ctx_t *ctx, int a) {
     if (!s_L) return false;
+    lua_sandbox_touch();          /* 同上: 每次回调独立计时 */
     lua_getglobal(s_L, "action");
     if (!lua_isfunction(s_L, -1)) { lua_pop(s_L, 1); return false; }
     lua_pushinteger(s_L, (lua_Integer)a);
     if (lua_pcall(s_L, 1, 1, 0) != LUA_OK) {
         lua_report_error(ctx, "action");
         /* action() 挂了就不能把 BACK 吞掉: 明确退出应用(否则用户被卡在里面出不来) */
-        if (s_mode == LUA_MODE_RUN) lua_stop(ctx);
+        if (s_mode == LUA_MODE_RUN) lua_stop_ex(ctx, true);
         return false;
     }
     s_err_streak = 0;
@@ -458,16 +555,22 @@ static bool lua_call_action_consumed(ui_ctx_t *ctx, int a) {
     return consumed;
 }
 
-/* ---- 退出 RUN 态: 调 on_exit + 释放 lua_State → 回 MODE_LIST ---- */
-static void lua_stop(ui_ctx_t *ctx) {
+/* ---- 退出 RUN 态: 调 on_exit + 释放 lua_State → 回 MODE_LIST ----
+ * leaving_page=true 表示页面马上要出栈（退出应用/页面被弹），此时**不重建**右栏列表：
+ *   os_pane_reset() 会把 built_folder 清掉，紧接着 os_pane_build_right() 必然重扫一遍
+ *   目录 —— 而用户根本看不到它。这就是"退出应用慢"里最冤枉的一段 IO。 */
+static void lua_stop_ex(ui_ctx_t *ctx, bool leaving_page) {
+    if (s_prof_on) s_prof_t0 = esp_timer_get_time();
     if (s_L) {
         lua_getglobal(s_L, "on_exit");
         if (lua_isfunction(s_L, -1)) {
+            lua_sandbox_touch();   /* on_exit 也可能长跑, 同样重置预算 */
             if (lua_pcall(s_L, 0, 0, 0) != LUA_OK)
-                ESP_LOGD(TAG, "on_exit 错误: %s", lua_tostring(s_L, -1) ? lua_tostring(s_L, -1) : "(null)");
+                ESP_LOGW(TAG, "on_exit 出错: %s", lua_tostring(s_L, -1) ? lua_tostring(s_L, -1) : "(null)");
         }
         lua_close(s_L);
     }
+    prof_mark("on_exit+close");
     /* ★ 2026-10-24 GPS 硬闸门: 任何 Lua 应用退出(码表/地图/…), 一律停解析任务
      *   并把模块送回 UBX-RXM-PMREQ 待机(46µA)。脚本自己调 app.gps.stop() 是"应该做的",
      *   但它可能忘记 / 崩了 / 没写 on_exit ⇒ 在这里兜底, 否则退出后 GPS 仍在
@@ -482,15 +585,28 @@ static void lua_stop(ui_ctx_t *ctx) {
     s_exit_dlg = false;
     s_exit_pend = false;
     s_ran = false;
+    /* ★ 2026-10-31: 退出应用 = 虚拟手柄一律关闭 + 边沿状态复位，
+     *   否则下一次进别的应用(或游戏)会带着残留的"按下态"和全局 enabled 标志。 */
+    if (s_vk_on) { s_vk_on = false; virtual_keys_set_enabled(false); }
+    lua_vk_want = false;
+    s_vk_prev = 0xFF;
+    s_vk_dir  = 0;
     g_lua_exit_ask = true;          /* 退出确认开关复位 → 下一个应用从"默认弹"开始 */
     s_err_streak = 0;               /* 换了应用/退出应用 → 报错计数归零 */
     os_notify_tone_stop();
     if (ctx) {
-        lua_probe_stage(14, "lua_stop: pane reset 前");
-        os_pane_reset(&s_pane);
-        s_pane.focus = 1;
-        os_pane_build_right(&s_pane);
-        ctx->needs_redraw = true;
+        if (leaving_page) {
+            /* 只清状态，不扫目录：页面紧接着就出栈了 */
+            os_pane_reset(&s_pane);
+            prof_mark("pane_reset(skip rescan)");
+        } else {
+            lua_probe_stage(14, "lua_stop: pane reset 前");
+            os_pane_reset(&s_pane);
+            s_pane.focus = 1;
+            os_pane_build_right(&s_pane);
+            ctx->needs_redraw = true;
+            prof_mark("pane_reset+rescan");
+        }
     }
 }
 
@@ -565,6 +681,9 @@ static void lua_render(ui_ctx_t *ctx) {
     if (s_mode == LUA_MODE_RUN) {
         lua_call_optional(ctx, "render", -1);   /* 出错已内部回列表 */
         lua_draw_err_banner(ctx->lcd);          /* ★ 出错时把原因画在屏上 (可截图), 不再只一闪 */
+        /* ★ 2026-10-31: 虚拟手柄线条叠加在应用画面之上（os_render 之后统一 flush，
+         *   所以必须画在这里，不能自己 flush）。线条式设计 => 下方 BIOS 菜单仍可读。 */
+        if (s_vk_on) virtual_keys_draw(ctx->lcd);
     } else {
         st7305_clear(ctx->lcd, ST7305_COLOR_WHITE);
         os_pane_render(ctx, &s_pane);
@@ -631,7 +750,7 @@ static void lua_action(ui_ctx_t *ctx, os_action_t a) {
     }
     if (s_exit_req) {
         s_exit_req = false;
-        lua_stop(ctx);
+        lua_stop_ex(ctx, true);
         /* ★ 2026-10-02 修「按返回退出 -> 白屏 + 一条竖直分割线, 再按一次才退出」:
          *   app.exit() 的语义是"退出应用", 必须把 Lua 页**弹出栈**。
          *   原来只 lua_stop() → 页面留在 LIST 态去扫 /sdcard/apps(空的) →
@@ -664,11 +783,61 @@ static void lua_poll(ui_ctx_t *ctx) {
     /* RUN 态: 先处理待办, 再转给 Lua poll() */
     if (s_exit_req) {
         s_exit_req = false;
-        lua_stop(ctx);
+        lua_stop_ex(ctx, true);
         for (int _i = 0; _i < 3 && ctx && ctx->current_page == OS_PAGE_LUA; _i++) os_pop(ctx);
         return;
     }
     if (s_err_pending) { s_err_pending = false; os_dialog_toast(ctx, s_err); }
+
+    /* ★ 2026-10-31: 系统虚拟手柄处理（仅当脚本用 app.vk(true) 声明时才启用）
+     *
+     * 为什么在这里做：虚拟手柄是 C 侧的线条覆盖 + hit-test，Lua 拿不到；
+     *   而脚本的按键入口只有 action(a)，所以在这里把"虚拟按键"翻译成同一个 action，
+     *   脚本完全不用区分 实体键 / 蓝牙手柄 / 虚拟按键 三种来源。
+     *
+     * ⚠ 只取 virtual_keys_get_joypad()（**仅虚拟手柄**），不取合并后的
+     *   input_get_held_gb_joypad() —— 后者含物理键(A/B)与蓝牙手柄，
+     *   直接转 action 会和 input_get_action() 的边沿重复触发（一按两下）。
+     *   这里先用合并查询驱动一次 hit-test（让组件内部刷新自己的掩码），再单独读它。 */
+    if (s_mode == LUA_MODE_RUN && lua_vk_want) {
+        if (!s_vk_on) {                       /* 进入时启用一次, 不逐帧切换 */
+            s_vk_on = true;
+            virtual_keys_set_enabled(true);
+            s_vk_prev = 0xFF;
+            s_vk_dir  = 0;
+        }
+        (void)input_get_held_gb_joypad();      /* 驱动 virtual_keys 本帧 hit-test */
+        uint8_t j = virtual_keys_get_joypad();
+        uint8_t pressed = (uint8_t)((uint8_t)~s_vk_prev & (uint8_t)~j);   /* 本帧新按下 */
+        s_vk_prev = j;
+        for (int b = 0; b < 8; b++) {
+            if (pressed & (1u << b)) {
+                os_action_t va = vk_bit_to_action(1u << b);
+                if (va != OS_ACTION_NONE) lua_action(ctx, va);   /* 单次边沿: 不会重复 */
+            }
+        }
+        /* 方向键长按重复: 按住 400ms 后每 120ms 重复一次(仅单方向时生效) */
+        uint8_t dir = (uint8_t)((uint8_t)~j & 0xF0);
+        if (dir && (dir & (uint8_t)(dir - 1)) == 0) {
+            uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            if (dir != s_vk_dir) {
+                s_vk_dir = dir; s_vk_dir_t0 = now; s_vk_dir_last = now;
+            } else if ((uint32_t)(now - s_vk_dir_t0) >= 400u &&
+                       (uint32_t)(now - s_vk_dir_last) >= 120u) {
+                s_vk_dir_last = now;
+                os_action_t va = vk_bit_to_action(dir);
+                if (va != OS_ACTION_NONE) lua_action(ctx, va);
+            }
+        } else {
+            s_vk_dir = 0;
+        }
+    } else if (s_vk_on) {                     /* 脚本撤销 / 退出应用 → 立刻关闭并复位 */
+        s_vk_on = false;
+        virtual_keys_set_enabled(false);
+        s_vk_prev = 0xFF;
+        s_vk_dir  = 0;
+    }
+
     if (s_L) {
         lua_util_tick(s_L);            /* ★ 2026-10-24: 驱动 app.util 的 after/every 定时器 */
     }
@@ -684,7 +853,7 @@ static void lua_poll(ui_ctx_t *ctx) {
 static void lua_on_exit(ui_ctx_t *ctx) {
     s_pane__free();   /* LINTOS: 页面退出归还列表 pane */
     /* 页面退栈 (BACK/HOME/回主菜单) 时兜底释放, 防止 lua_State 泄漏 */
-    if (s_mode == LUA_MODE_RUN) lua_stop(ctx);
+    if (s_mode == LUA_MODE_RUN) lua_stop_ex(ctx, true);
     s_lcd = NULL;
 }
 

@@ -105,7 +105,7 @@ static audio_state_t s_state = AUDIO_STATE_IDLE;
 static int  s_volume = 100;             /* 默认音量 100%, ES8311 映射到 0xC0(0dB) 不削波 */
 static bool s_muted = false;            /* V1.0.68: 全局强制静音 */
 static bool s_use_ns4168_ctrl = false;  /* NS4168 平台(无 ES8311) 才用 GPIO46 作 CTRL 静音 */
-static char s_filename[256] = "";
+EXT_RAM_BSS_ATTR static char s_filename[256];   /* 只在播放/录音时用 */
 static FILE *s_mp3_file = NULL;
 static TaskHandle_t s_task_handle = NULL;
 static SemaphoreHandle_t s_mutex = NULL;
@@ -196,7 +196,7 @@ static volatile uint32_t s_last_data_ms = 0;       /* 上次真正有 PCM 数据
 #define PCM_OUT_STACK_WORDS  6144   /* 24576 字节 */
 /* ★ LINTOS 2026-10-25: 任务栈原来静态常驻 PSRAM, 改成首次用到才分配 (不播放就不占) */
 static StackType_t *s_pcm_out_stack;
-static StaticTask_t s_pcm_out_tcb;
+static StaticTask_t s_pcm_out_tcb;   /* ⛔ 必须内部 RAM: xPortCheckValidTCBMem 校验 */
 /* V1.0.45: 共享采样率 — feed_pcm 设置, audio_out_task 读取.
  * 之前 audio_out_task 硬编码 44100 并每轮调用 i2s_init(44100),
  * 与 feed_pcm 的 i2s_init(24000) 冲突, 导致每帧都在重配 I2S+ES8311,
@@ -224,7 +224,9 @@ static void audio_out_task(void *arg) {
      *   原来只取 256 帧(5.8ms), 意味着每秒要成功调度 172 次才能喂满,
      *   任务被抢占几次就直接欠载(实测 play 掉到 705Hz)。
      *   local_buf 从栈上 512 改成静态 2048, 避免撑爆 audio_out 的栈。 */
-    static int16_t local_buf[2048];
+    /* ★ 2026-11-01 linit 内存规则：4KB 中间缓冲放 PSRAM。
+     *   它只是 CPU memcpy 的源缓冲（拷进 s_pcm_ring），不参与 DMA 描述符，可以进 PSRAM。 */
+    static EXT_RAM_BSS_ATTR int16_t local_buf[2048];
     bool primed = false;
     uint32_t underruns = 0;
     uint32_t iter = 0;
@@ -497,6 +499,18 @@ static void audio_out_stop(void) {
     }
     pa_enable(false);
     s_amp_on = false;   /* V1.7.x: 与空闲静音状态同步 (避免下一轮误判已开) */
+
+    /* ★★★ 2026-11-02 linit「音频全部关闭」：输出停掉后把 I2S 通道也 disable。
+     *   原来只关功放、通道一直 enable ⇒ MCLK/BCLK 持续输出、ES8311/ES7210 一直"有钟
+     *   无数据"地挂着（实测空闲时 tx=1 rx=1），白白耗十几 mA。
+     *   通道本身保留（不 del），下次播放由 ensure_out_active() 重新 enable，
+     *   不影响采样率重配与 MP3 直写路径。 */
+    if (s_i2s_mutex && xSemaphoreTake(s_i2s_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (s_tx_chan) i2s_channel_disable(s_tx_chan);
+        if (s_rx_chan && !s_mic_active) i2s_channel_disable(s_rx_chan);
+        xSemaphoreGive(s_i2s_mutex);
+        ESP_LOGD(TAG, "输出已停: I2S 通道 disable (编解码器不再有时钟)");
+    }
     ao_unlock();
 }
 
@@ -536,12 +550,25 @@ static int i2s_init_locked(int sample_rate) {
                                   * 3×576=1728 帧 ≈ 36ms@24kHz, 仍能吸收模拟器帧抖动 */
     chan_cfg.dma_frame_num = 576;
     chan_cfg.auto_clear = true;
-    esp_err_t ret = i2s_new_channel(&chan_cfg, &s_tx_chan, &s_rx_chan);
+    /* ★ 2026-10-31 修「标准版/无麦克风板播 MP3 没声音」：
+     *   原来无条件建 RX 通道。标准扩展版 din=-1（无麦克风），建 RX 会让 I2S0
+     *   进入 full-duplex，ESP-IDF 随即把 RX 从 master 切成 slave 并打印
+     *   "the rx channel on I2S0 is switched from master to slave for full-duplex mode"，
+     *   紧接着首帧重配时钟时 i2s_channel_enable() 报
+     *   "the channel has already enabled or not initialized" ⇒ BCLK/WS 时钟状态被切乱，
+     *   表现为：解码在跑、写入不报错、功放也开着，但喇叭一点声音都没有。
+     *   无麦克风的板子（din<0）只建 TX 单工，时钟不会被 RX 抢走。
+     *   有麦克风的板（小智 din=21 / 微雪 din=10）行为完全不变。 */
+    esp_err_t ret = i2s_new_channel(&chan_cfg, &s_tx_chan,
+                                    (s_din >= 0) ? &s_rx_chan : NULL);
     if (ret != ESP_OK) {
         ESP_LOGD(TAG, "I2S 创建通道失败: %s", esp_err_to_name(ret));
         s_tx_chan = NULL;
         s_rx_chan = NULL;
         return -1;
+    }
+    if (s_rx_chan == NULL) {
+        ESP_LOGI(TAG, "无麦克风板型(din=%d): I2S 走单 TX, 不进 full-duplex", (int)s_din);
     }
 
     /* 槽配置按平台区分:
@@ -580,20 +607,22 @@ static int i2s_init_locked(int sample_rate) {
     if (ret != ESP_OK) {
         ESP_LOGD(TAG, "I2S 初始化失败: %s", esp_err_to_name(ret));
         i2s_del_channel(s_tx_chan);
-        i2s_del_channel(s_rx_chan);
+        if (s_rx_chan) i2s_del_channel(s_rx_chan);   /* 无麦克风板型这里是 NULL */
         s_tx_chan = NULL;
         s_rx_chan = NULL;
         return -1;
     }
 
-    ret = i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGD(TAG, "I2S RX 初始化失败: %s", esp_err_to_name(ret));
-        i2s_del_channel(s_tx_chan);
-        i2s_del_channel(s_rx_chan);
-        s_tx_chan = NULL;
-        s_rx_chan = NULL;
-        return -1;
+    if (s_rx_chan) {                      /* 无麦克风板型没有 RX 通道, 跳过 */
+        ret = i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "I2S RX 初始化失败: %s", esp_err_to_name(ret));
+            i2s_del_channel(s_tx_chan);
+            i2s_del_channel(s_rx_chan);
+            s_tx_chan = NULL;
+            s_rx_chan = NULL;
+            return -1;
+        }
     }
 
     ret = i2s_channel_enable(s_tx_chan);
@@ -747,6 +776,14 @@ void audio_pa_set(bool on)
     } else {
         gpio_set_level(s_pa, 0);                   /* 先静音功放 */
         s_pa_on = false;
+        /* ★ 2026-10-31 修「播 MP3 没声音」：s_amp_on 表示"输出通路活跃"，
+         *   必须与功放实际状态同步。原来只有 2 处 pa_enable(false) 顺带清了它，
+         *   其余 4 处（MP3 结束 / audio_reap_task / init / 关机流程）只拉低引脚不清标志
+         *   ⇒ ensure_out_active() 第一行 `if (s_amp_on) return;` 永久短路，
+         *   功放再也不会被打开：表现就是 MP3 解码/进度全正常、就是没声，
+         *   而游戏走 PCM 路径会无条件 pa_enable(true)，所以"游戏有声、MP3 无声"。
+         *   在这里统一同步，任何调用点都不用再操心态。 */
+        s_amp_on = false;
         vTaskDelay(pdMS_TO_TICKS(PA_OFF_DELAY_MS));  /* 等它真的关断, 调用方再停 I2S */
         ESP_LOGI(TAG, "功放使能: GPIO%d=0 (静音)", (int)s_pa);
     }
@@ -778,7 +815,9 @@ static void pa_enable(bool on) { audio_pa_set(on); }
  *   写之前统一走这个函数把 通道+功放 拉起来。 */
 static void ensure_out_active(void)
 {
-    if (s_amp_on) return;
+    /* 双条件才算"已经开着"：只看 s_amp_on 会在标志与引脚不同步时
+     * 把功放永久挡在门外（MP3 无声的真凶，见 audio_pa_set 的说明）。 */
+    if (s_amp_on && s_pa_on) return;
     if (s_i2s_mutex) xSemaphoreTake(s_i2s_mutex, portMAX_DELAY);
     if (s_tx_chan) i2s_channel_enable(s_tx_chan);
     if (s_i2s_mutex) xSemaphoreGive(s_i2s_mutex);
@@ -881,7 +920,7 @@ static int64_t estimate_total_samples(FILE *f, int64_t file_size) {
 #define I2S_WRITE_TIMEOUT_MS   500     /* I2S 写入超时 */
 /* ★ LINTOS 2026-10-25: 同上, 64KB 解码任务栈改成首次播放时分配 */
 static StackType_t *s_audio_stack;
-static StaticTask_t s_audio_tcb;
+static StaticTask_t s_audio_tcb;     /* ⛔ 必须内部 RAM: xPortCheckValidTCBMem 校验 */
 static uint32_t s_task_stack_words = AUDIO_TASK_STACK_WORDS; /* 用于日志 */
 /* ★ 2026-10-28: MP3 解码用的两块帧缓冲(pcm/pcm_out)在任务里是**局部指针**。
  *   任务被 vTaskDelete 强制结束时(见 audio_reap_task), 指针随栈消失 ⇒ 这两块 PSRAM
@@ -1087,8 +1126,11 @@ static void audio_play_task(void *arg) {
             esp_err_t wret = i2s_channel_write(s_tx_chan, pcm_out, to_write,
                                                &bytes_written,
                                                pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
+            /* ★ 2026-10-31: 原来失败走 ESP_LOGD，而 sdkconfig 的 CONFIG_LOG_MAXIMUM_LEVEL=3
+             *   ⇒ 这句在编译期就被裁掉 ⇒ "I2S 写不进去却完全没有日志"。
+             *   改成 WARN（保留），失败原因/已写字节一律可见。 */
             if (wret != ESP_OK) {
-                ESP_LOGD(TAG, "I2S \u5199\u5165\u5931\u8D25: %s (\u5DF2\u5199 %u/%u)",
+                ESP_LOGW(TAG, "I2S 写入失败: %s (已写 %u/%u)",
                          esp_err_to_name(wret), (unsigned)bytes_written, (unsigned)to_write);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
@@ -1206,6 +1248,15 @@ static void audio_cfg_load(void)
         ESP_LOGI(TAG, "恢复声音开关: %s", s_muted ? "静音" : "开");
     }
     nvs_close(h);
+
+    /* ★ 2026-11-01: 音量为 0 时必须留下**可执行的恢复办法**。
+     *   实测踩过：全量烧录会把 NVS 一起写掉，某次存进去的 0 就成了永久静音，
+     *   用户只看到"没声音"，日志里也没有任何提示。
+     *   ⚠ 不在这里强行改音量 —— 0 可能是用户自己调的，覆盖用户设置更糟。 */
+    if (s_volume <= 0 || s_muted) {
+        ESP_LOGW(TAG, "当前是静音状态（音量=%d%% 静音=%d）⇒ 需要声音请执行: vol 100",
+                 s_volume, (int)s_muted);
+    }
 }
 
 int audio_player_init(void) {
@@ -1259,6 +1310,19 @@ int audio_player_init(void) {
     }
 
     pa_enable(false);
+
+    /* ★★★ 2026-11-02 linit「常开的 I2S 全部关掉」★★★
+     *   上面 i2s_init(44100) 会把 TX 通道 enable —— 于是**即使什么都不播**，
+     *   MCLK/BCLK 也一直在输出，ES8311/ES7210 永远"有钟无数据"地挂着
+     *   （真机实测空闲 tx=1 rx=1，PM 锁表里 i2s_driver APB_FREQ_MAX 常驻
+     *     ⇒ CPU 也降不到 80MHz）。初始化完就把通道 disable（只停时钟，不删通道），
+     *   首次播放由 ensure_out_active() 重新 enable，采样率重配也不受影响。 */
+    if (s_i2s_mutex && xSemaphoreTake(s_i2s_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (s_tx_chan) i2s_channel_disable(s_tx_chan);
+        if (s_rx_chan) i2s_channel_disable(s_rx_chan);
+        xSemaphoreGive(s_i2s_mutex);
+        ESP_LOGI(TAG, "音频空闲态: I2S 通道已 disable (不输出 MCLK/BCLK, 编解码器不再耗电)");
+    }
 
     s_hw_initialized = true;
     ESP_LOGI(TAG, "\u97F3\u9891\u786C\u4EF6\u521D\u59CB\u5316\u5B8C\u6210");
@@ -1827,13 +1891,13 @@ static void rec_agc_apply(int16_t *pcm, int frames, int ch)
 static uint64_t s_rec_sq[4] = {0,0,0,0};
 static uint32_t s_rec_nsamp = 0;
 static volatile uint8_t  s_spec[SPEC_BINS];
-static char s_rec_path[192] = "";
+EXT_RAM_BSS_ATTR static char s_rec_path[192];   /* 只在录音机里用 */
 
 static TaskHandle_t s_wav_task = NULL;
 static volatile bool s_wav_stop = false;
 static volatile uint32_t s_wav_ms = 0;
 static volatile uint32_t s_wav_total_ms = 0;
-static char s_wav_path[192] = "";
+EXT_RAM_BSS_ATTR static char s_wav_path[192];   /* 只在播放 WAV 时用 */
 
 static void wav_header(uint8_t *h, uint32_t data_bytes, int rate, int ch, int bits)
 {
