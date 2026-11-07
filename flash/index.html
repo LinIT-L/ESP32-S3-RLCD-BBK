@@ -23,6 +23,7 @@
            color: #fff; background: #2b6cb0; border: 0; border-radius: 8px; cursor: pointer; }
   button:disabled { background: #9bb7d4; cursor: not-allowed; }
   button.busy { background: #d69e2e; }
+  button.reset { background: #2f855a; margin-top: 10px; }
   #status { margin-top: 8px; font-size: 13px; min-height: 18px; }
   #pbar { height: 10px; background: #e3e6ea; border-radius: 5px; overflow: hidden; margin-top: 8px; display: none; }
   #pfill { height: 100%; width: 0%; background: #2b6cb0; transition: width .1s; }
@@ -32,16 +33,17 @@
 <body>
 <div class="wrap">
   <div class="card">
-    <div class="title">LinTOS 固件刷写</div>
-    <label><input type="radio" name="src" value="github" checked> GitHub 固件（默认）</label>
+    <div class="title">LinTOS 固件刷写 <span class="ver">v2.5</span></div>
+    <label><input type="radio" name="src" value="github" checked> GitHub Release 附件（推荐）</label>
     <label><input type="radio" name="src" value="site"> BBK.LinIT.cn 镜像（备用）</label>
     <select id="verSel"><option value="latest">最新版（加载中…）</option></select>
     <label><input type="radio" name="src" value="local"> 本地文件</label>
     <input type="file" id="fileInput" accept=".bin" hidden>
-    <p id="fwInfo">GitHub · 16MB</p>
+    <p id="fwInfo">GitHub Release · 16MB</p>
   </div>
 
   <button id="flashBtn">下载固件</button>
+  <button id="resetBtn" class="reset">重启设备</button>
   <p id="status"></p>
   <div id="pbar"><div id="pfill"></div></div>
   <p class="warn" id="warn" style="display:none"></p>
@@ -51,15 +53,20 @@
 import { ESPLoader, Transport } from './esptool-js.bundle.js';
 
 const REPO = 'LinIT-L/ESP32-S3-RLCD-BBK';
-/* ★ 2026-10-31 修正：删掉 FW_ASSET / FW_ASSET_LEGACY / FW_REPO_MIRROR / FW_URLS 四个死常量。
- *   它们写死了 'LinTOS-v1.4.2-16MB.bin' 和仓库内 flash/merged_16mb.bin，
- *   而 **merged_16mb.bin 被 .gitignore 第 102 行显式忽略**，从来没进过仓库 ⇒
- *   jsDelivr / raw 取它必然 404。常量本身也早已无人引用（主路径读 Release assets）。
+/* ★ 2026-11-07 linit: 「GitHub 源改走 Release 附件」。
  *
- *   固件真实分发路径（按可靠性排序）：
- *     1) 本站镜像 bbk.linit.cn/fw/ —— 已加 Access-Control-Allow-Origin: *，按 tag 命名
- *     2) GitHub Releases —— 附件域 release-assets.githubusercontent.com **没有 CORS 头**，
- *        浏览器 fetch 一定失败；只能让用户在浏览器里手动点，不能走 JS
+ *   旧实现的毛病：GitHub 源拉的是**仓库内** flash/merged_16mb.bin（经 jsDelivr）。
+ *   那个文件最后一次提交停在 v2.0，之后每次发新版都不更新 ⇒ 页面标着 2.1,
+ *   刷进去的却是 2.0 的内容（实测 sha256 7297d021 = v2.0 Release 附件）。
+ *
+ *   现在：用 GitHub Releases API 解析所选 tag 的真实附件 URL（不再拼死文件名、
+ *   不再读仓库内文件），下载时先直连该附件。
+ *
+ *   ⚠ CORS 实测（2026-11-07）：api.github.com 带 Access-Control-Allow-Origin: *，
+ *     但附件的最终响应域 release-assets.githubusercontent.com **没有任何 CORS 头**，
+ *     浏览器 fetch 直连必被拦。所以附件直连失败时自动回落到本站镜像 /fw/
+ *     （同一份 Release 附件的同步副本，已配 CORS: *）。页面会标明实际生效来源。
+ *     指定具体版本时**绝不回落 latest 别名**，避免刷错版本。
  */
 const FW_SITE_BASE = 'https://bbk.linit.cn/fw/';
 const FLASH_ADDR = 0x0;
@@ -71,8 +78,7 @@ function updateFwInfo() {
   const src = document.querySelector('input[name="src"]:checked').value;
   if (src === 'local') return;
   const ver = $('verSel').value || 'latest';
-  /* 默认源改成镜像后，这里不能再写死 "GitHub 固件" */
-  const label = (src === 'site') ? 'BBK.LinIT.cn' : 'GitHub';
+  const label = (src === 'site') ? 'BBK.LinIT.cn 镜像' : 'GitHub Release';
   $('fwInfo').textContent = label + ' · ' + (ver === 'latest' ? '最新版' : ver) + ' · 16MB';
 }
 
@@ -101,7 +107,7 @@ async function loadVersions() {
    * ⚠ 每发一个新版都要回来更新这一行，否则接口挂掉时列表里看不到新版本。
    *   （选「最新版」不受影响 —— 它走 LinTOS-latest-16MB.bin 别名） */
   if (tags.length === 0) {
-    tags = ['v2.0', 'v1.4.3', 'v1.4.2', 'v1.4.1'];
+    tags = ['v2.1.0', 'v2.0', 'v1.4.3', 'v1.4.2', 'v1.4.1'];
   }
   if (tags.length === 0) {
     sel.innerHTML = '<option value="latest">最新版（无法取版本列表，默认最新）</option>';
@@ -167,22 +173,26 @@ function hideProgress() {
 }
 
 
-/* ★ 2026-10-31: 删掉 releaseBinUrl()。它返回的 browser_download_url 指向
- *   release-assets.githubusercontent.com —— 该域**没有任何 Access-Control-Allow-Origin**，
- *   浏览器 fetch 必然被 CORS 拦掉；而且这个函数从来没有被调用过（纯死代码）。
- *   GitHub Releases 只能让用户在浏览器里手动点，不能走 JS。 */
-
-
-/* 取 latest 对应的真实 tag（本站镜像按 tag 命名文件） */
-async function latestTag() {
+/* 读取 Release 元数据：api.github.com 带 Access-Control-Allow-Origin: *，可前端直取。
+ * latest → /releases/latest；指定 tag → /releases/tags/<tag>。失败返回 null。 */
+async function fetchRelease(tag) {
+  const u = (tag === 'latest')
+    ? 'https://api.github.com/repos/' + REPO + '/releases/latest'
+    : 'https://api.github.com/repos/' + REPO + '/releases/tags/' + encodeURIComponent(tag);
   try {
-    const res = await fetch('https://api.github.com/repos/' + REPO + '/releases/latest');
-    if (res.ok) { const j = await res.json(); if (j && j.tag_name) return j.tag_name; }
-  } catch (e) { /* 忽略 */ }
-  /* ★ 2026-10-31: 原来兜底写死 'v1.4.1'，版本一升就指向过期文件（v2.0 发布后
-   *   一律拼出 404 的 LinTOS-v1.4.1-16MB.bin）。改返回 'latest' —— 镜像站有
-   *   LinTOS-latest-16MB.bin 别名，GitHub API 不通时也能拿到最新发布版。 */
-  return 'latest';
+    const res = await fetch(u);
+    if (res.ok) return await res.json();
+  } catch (e) { /* 忽略: 走镜像兜底 */ }
+  return null;
+}
+
+/* 从 Release 元数据里取 16MB 固件附件直链（不写死文件名，随发布自动适配）。 */
+function releaseBinUrls(rel) {
+  if (!rel || !Array.isArray(rel.assets)) return [];
+  return rel.assets
+    .filter(a => a && /\.bin$/i.test(a.name) && /16MB/i.test(a.name))
+    .map(a => a.browser_download_url)
+    .filter(Boolean);
 }
 /* ========== 阶段1: 下载固件 (结果为 Uint8Array) ========== */
 async function downloadFirmware() {
@@ -193,46 +203,27 @@ async function downloadFirmware() {
     const verLabel = (ver === 'latest') ? '最新版' : ver;
     let r = null;
     status.textContent = '正在解析 ' + verLabel + ' 固件地址…';
-    const tag = (ver === 'latest') ? await latestTag() : ver;
-    /* ★★ 2026-10-31 重写取址逻辑（原来"下载失败"的直接原因）：
-     *
-     *   旧逻辑：本站源只拼一个名字 'LinTOS-<tag>-16MB.bin'，拼错就 404 且无兜底；
-     *           GitHub 源指向仓库 flash/merged_16mb.bin，而该文件被 .gitignore
-     *           第 102 行忽略、从未入库 ⇒ jsDelivr 404 + raw 域国内不可达 ⇒ 必挂。
-     *
-     *   新逻辑：每个源都给多条候选，且 GitHub 失败后回落本站镜像，
-     *           任何一个域名抽风都不会让用户卡在"下载失败"。
-     */
+    /* ★ 2026-11-07: GitHub 源改为「该 Release 的附件清单」。
+     *   以前拉仓库内 flash/merged_16mb.bin（停在 v2.0），版本再新也刷不到。 */
+    const rel = await fetchRelease(ver);
+    const tag = (rel && rel.tag_name) ? rel.tag_name : ver;
     const t = String(tag);
-    const bare = t.replace(/^v/, '');                 /* v2.0 → 2.0 */
+    const bare = t.replace(/^v/, '');                 /* v2.1.0 → 2.1.0 */
     /* ⚠ 安全约束：**指定了具体版本时，绝不能回落到 latest 别名**。
-     *   否则某个版本文件缺失 → 拿到 latest → 用户以为刷的是 v1.4.3 其实是别的版本。
-     *   刷错固件比"下载失败"严重得多，所以这里只允许同版本的两种命名互相兜底。 */
-    const siteUrls = (t === 'latest')
-      ? [ FW_SITE_BASE + 'LinTOS-latest-16MB.bin' ]     /* 别名：永远指向最新发布 */
-      : [ FW_SITE_BASE + 'LinTOS-' + t + '-16MB.bin',   /* 标准命名 LinTOS-v2.0-16MB.bin */
-          FW_SITE_BASE + 'LinTOS-' + bare + '-16MB.bin' /* 兼容不带 v 的命名 */
-        ];
-    /* GitHub 源 = 仓库内 flash/merged_16mb.bin（已入库，jsDelivr 与 Pages 都带 CORS）。
-     *   ⚠ 不能走 Release 直链：release-assets.githubusercontent.com 没有任何
-     *     Access-Control-Allow-Origin，浏览器 fetch 必被 CORS 拦掉 —— 这正是原来
-     *     "下载失败"的主因之一。仓库内文件经 CDN 才是唯一可行路径。
-     *
-     *   顺序：jsDelivr（国内通常可达，且有强缓存）→ GitHub Pages（同源最近）→ 镜像兜底。 */
-    const ghUrls = [
-      'https://cdn.jsdelivr.net/gh/' + REPO + '@main/flash/merged_16mb.bin',
-      'https://linit-l.github.io/ESP32-S3-RLCD-BBK/flash/merged_16mb.bin'
-    ];
+     *   否则某个版本文件缺失 → 拿到 latest → 用户以为刷的是 v2.0 其实是别的版本。
+     *   刷错固件比"下载失败"严重得多，所以只允许同版本的两种命名互相兜底。 */
+    const sameTagUrls = [ FW_SITE_BASE + 'LinTOS-' + t + '-16MB.bin',
+                          FW_SITE_BASE + 'LinTOS-' + bare + '-16MB.bin' ];
+    const siteUrls = (ver === 'latest')
+      ? [ FW_SITE_BASE + 'LinTOS-latest-16MB.bin' ].concat(sameTagUrls)
+      : sameTagUrls;
 
     let urls;
-    if (src === 'site') {
-      urls = siteUrls;
-    } else if (t === 'latest') {
-      urls = ghUrls.concat(siteUrls);        /* GitHub 两条都失败再回落镜像 */
+    if (src === 'github') {
+      /* 先试 Release 附件直链；附件域无 CORS 会立刻失败 → 回落本站镜像
+       * (同一份附件的同步副本, 已配 CORS: *)。不再读仓库内的旧镜像文件。 */
+      urls = releaseBinUrls(rel).concat(siteUrls);
     } else {
-      /* ★ 安全：GitHub 仓库里只有「最新版」这一个文件。
-       *   用户指定了旧版本时**绝不能**拿 merged_16mb.bin 顶上 ——
-       *   那会让人以为刷 v1.4.3、实际刷成最新版。旧版本一律走镜像。 */
       urls = siteUrls;
     }
 
@@ -245,16 +236,17 @@ async function downloadFirmware() {
       } catch (e) { r = null; }
     }
     if (!r || !r.ok) {
-      const why = (t === 'latest')
-        ? '镜像与 GitHub 都不可达，可换网络后重试'
+      const why = (ver === 'latest')
+        ? 'GitHub Release 附件与镜像都不可达，可换网络后重试'
         : '该版本在镜像上没有对应文件（或网络不可达），请换一个版本';
       throw new Error(verLabel + ' 固件下载失败：' + why +
         '。也可到 https://github.com/' + REPO + '/releases 手动下载 .bin');
     }
     /* 标明实际生效的来源，避免"选了 GitHub 其实走镜像"却不知道 */
-    const srcLabel = (usedUrl.indexOf('bbk.linit.cn') >= 0) ? 'BBK.LinIT.cn'
-                   : (usedUrl.indexOf('jsdelivr') >= 0) ? 'jsDelivr'
-                   : (usedUrl.indexOf('github.io') >= 0) ? 'GitHub Pages' : 'GitHub';
+    const srcLabel = (usedUrl.indexOf('bbk.linit.cn') >= 0) ? 'BBK.LinIT.cn 镜像'
+                   : (usedUrl.indexOf('releases/download') >= 0 ||
+                      usedUrl.indexOf('release-assets') >= 0) ? 'GitHub Release 附件'
+                   : 'GitHub';
     $('fwInfo').textContent = srcLabel + ' · ' + verLabel + ' · 16MB';
     const total = Number(r.headers.get('Content-Length')) || 0;
     const reader = r.body.getReader();
@@ -434,6 +426,43 @@ document.querySelectorAll('input[name="src"]').forEach(r => {
       updateFwInfo();
     }
   });
+});
+
+/* ★ 一键重启：不烧录，只对串口做一次 RTS 脉冲硬复位。
+ *   用于"固件没变、只想让设备重开"的场景。
+ *   已经连过端口就直接用；没连过就先弹窗选端口（和烧录走同一套 Transport）。
+ *   两个刷机页（GitHub Pages / bbk.linit.cn）保持完全一致。 */
+$('resetBtn').addEventListener('click', async () => {
+  const btn = $('resetBtn');
+  const status = $('status');
+  const warn = $('warn');
+  warn.style.display = 'none';
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '重启中…';
+  status.textContent = '正在发送重启命令…';
+  try {
+    if (!transport) {
+      status.textContent = '请在弹出的窗口中选择设备端口…';
+      device = await navigator.serial.requestPort();
+      transport = new Transport(device, false);
+      await transport.connect(BAUD, {});
+    }
+    await transport.setRTS(true);
+    await sleep(150);
+    await transport.setRTS(false);
+    await sleep(900);              /* 给芯片时间真正启动 */
+    status.textContent = '✅ 已发送重启命令，设备正在重新启动';
+  } catch (e) {
+    console.error(e);
+    warn.style.display = 'block';
+    warn.textContent = '重启失败：' + (e.message || e) +
+      '（请确认 USB 已连接、串口没有被其它标签页占用）';
+    status.textContent = '❌ 重启失败';
+  } finally {
+    btn.textContent = oldText;
+    btn.disabled = false;
+  }
 });
 </script>
 </body>
