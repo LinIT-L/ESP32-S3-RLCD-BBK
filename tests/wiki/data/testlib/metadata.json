@@ -1,0 +1,10 @@
+{
+ "version": 2,
+ "articleCount": 31,
+ "chunks": {
+  "count": 1,
+  "pattern": "articles_%04d.dat"
+ },
+ "title": "测试库",
+ "built": "host-test"
+}

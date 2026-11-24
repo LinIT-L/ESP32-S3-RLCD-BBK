@@ -1,0 +1,4 @@
+#ifndef TEST_STUB_FREERTOS_SEMPHR_H
+#define TEST_STUB_FREERTOS_SEMPHR_H
+#include "FreeRTOS.h"
+#endif

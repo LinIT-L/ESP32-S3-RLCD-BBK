@@ -1,0 +1,555 @@
+{
+ "fmt": 1,
+ "pkg": "pal",
+ "title": "仙剑奇侠传",
+ "ver": 3,
+ "count": 109,
+ "total": 43718903,
+ "files": [
+  {
+   "path": "ABC.MKF",
+   "size": 1022564,
+   "crc32": "abcdb892"
+  },
+  {
+   "path": "BALL.MKF",
+   "size": 134704,
+   "crc32": "08a25bfc"
+  },
+  {
+   "path": "DATA.MKF",
+   "size": 66418,
+   "crc32": "d5aa5bdd"
+  },
+  {
+   "path": "F.MKF",
+   "size": 186966,
+   "crc32": "0bb9a298"
+  },
+  {
+   "path": "FANTI.FON",
+   "size": 77986,
+   "crc32": "305d59ff"
+  },
+  {
+   "path": "FBP.MKF",
+   "size": 1128064,
+   "crc32": "a990b9ae"
+  },
+  {
+   "path": "FIRE.MKF",
+   "size": 834728,
+   "crc32": "c0f9befc"
+  },
+  {
+   "path": "GOP.MKF",
+   "size": 11530322,
+   "crc32": "45523572"
+  },
+  {
+   "path": "M.MSG",
+   "size": 212668,
+   "crc32": "a28eb0dd"
+  },
+  {
+   "path": "MAP.MKF",
+   "size": 1532520,
+   "crc32": "60fe7545"
+  },
+  {
+   "path": "MGO.MKF",
+   "size": 1577442,
+   "crc32": "41cc8961"
+  },
+  {
+   "path": "MIDI.MKF",
+   "size": 762442,
+   "crc32": "12d7928e"
+  },
+  {
+   "path": "MUS.MKF",
+   "size": 331284,
+   "crc32": "68d56e3f"
+  },
+  {
+   "path": "PAT.MKF",
+   "size": 8488,
+   "crc32": "169ef6f2"
+  },
+  {
+   "path": "RGM.MKF",
+   "size": 453202,
+   "crc32": "9b4aa514"
+  },
+  {
+   "path": "RNG.MKF",
+   "size": 4546074,
+   "crc32": "d4f9628c"
+  },
+  {
+   "path": "SETUP.DAT",
+   "size": 20,
+   "crc32": "a67279af"
+  },
+  {
+   "path": "SSS.MKF",
+   "size": 569640,
+   "crc32": "b5d9d894"
+  },
+  {
+   "path": "VOC.MKF",
+   "size": 1997044,
+   "crc32": "b0e5ca1c"
+  },
+  {
+   "path": "WOR16.ASC",
+   "size": 5088,
+   "crc32": "b82cf820"
+  },
+  {
+   "path": "WOR16.FON",
+   "size": 77986,
+   "crc32": "3e554dfa"
+  },
+  {
+   "path": "WORD.DAT",
+   "size": 5650,
+   "crc32": "d3488ec3"
+  },
+  {
+   "path": "fontglyph.bin",
+   "size": 2162688,
+   "crc32": "c1d8833a"
+  },
+  {
+   "path": "music/1.mp3",
+   "size": 86745,
+   "crc32": "40b24050"
+  },
+  {
+   "path": "music/10.mp3",
+   "size": 196459,
+   "crc32": "69439f1c"
+  },
+  {
+   "path": "music/11.mp3",
+   "size": 63234,
+   "crc32": "6f60a2ea"
+  },
+  {
+   "path": "music/12.mp3",
+   "size": 240449,
+   "crc32": "1ec096e5"
+  },
+  {
+   "path": "music/13.mp3",
+   "size": 219969,
+   "crc32": "1229ec63"
+  },
+  {
+   "path": "music/14.mp3",
+   "size": 143065,
+   "crc32": "e610473d"
+  },
+  {
+   "path": "music/15.mp3",
+   "size": 240449,
+   "crc32": "11a208e4"
+  },
+  {
+   "path": "music/16.mp3",
+   "size": 235643,
+   "crc32": "71fa98cc"
+  },
+  {
+   "path": "music/17.mp3",
+   "size": 240449,
+   "crc32": "53be354a"
+  },
+  {
+   "path": "music/18.mp3",
+   "size": 240449,
+   "crc32": "3df19396"
+  },
+  {
+   "path": "music/19.mp3",
+   "size": 163754,
+   "crc32": "bc35c5fd"
+  },
+  {
+   "path": "music/2.mp3",
+   "size": 20080,
+   "crc32": "bb210730"
+  },
+  {
+   "path": "music/20.mp3",
+   "size": 143065,
+   "crc32": "4b6fa2fe"
+  },
+  {
+   "path": "music/21.mp3",
+   "size": 109210,
+   "crc32": "d9f40f04"
+  },
+  {
+   "path": "music/22.mp3",
+   "size": 240449,
+   "crc32": "0a74e538"
+  },
+  {
+   "path": "music/23.mp3",
+   "size": 116524,
+   "crc32": "9e5bbaff"
+  },
+  {
+   "path": "music/24.mp3",
+   "size": 240449,
+   "crc32": "bcc7a570"
+  },
+  {
+   "path": "music/25.mp3",
+   "size": 122794,
+   "crc32": "3a47a894"
+  },
+  {
+   "path": "music/26.mp3",
+   "size": 118614,
+   "crc32": "e729ac92"
+  },
+  {
+   "path": "music/27.mp3",
+   "size": 240449,
+   "crc32": "31b8768c"
+  },
+  {
+   "path": "music/28.mp3",
+   "size": 83087,
+   "crc32": "16e6d1b5"
+  },
+  {
+   "path": "music/3.mp3",
+   "size": 13184,
+   "crc32": "f9287cf0"
+  },
+  {
+   "path": "music/30.mp3",
+   "size": 131153,
+   "crc32": "6c743620"
+  },
+  {
+   "path": "music/31.mp3",
+   "size": 134287,
+   "crc32": "fd0a1aeb"
+  },
+  {
+   "path": "music/32.mp3",
+   "size": 196459,
+   "crc32": "e7a5056a"
+  },
+  {
+   "path": "music/33.mp3",
+   "size": 102627,
+   "crc32": "bd79cd61"
+  },
+  {
+   "path": "music/34.mp3",
+   "size": 120704,
+   "crc32": "a8e9a062"
+  },
+  {
+   "path": "music/35.mp3",
+   "size": 230836,
+   "crc32": "c164e1c5"
+  },
+  {
+   "path": "music/36.mp3",
+   "size": 230836,
+   "crc32": "83133c76"
+  },
+  {
+   "path": "music/37.mp3",
+   "size": 135332,
+   "crc32": "986d8977"
+  },
+  {
+   "path": "music/38.mp3",
+   "size": 225194,
+   "crc32": "52b1d200"
+  },
+  {
+   "path": "music/39.mp3",
+   "size": 135332,
+   "crc32": "5029b66b"
+  },
+  {
+   "path": "music/4.mp3",
+   "size": 131153,
+   "crc32": "df42a41e"
+  },
+  {
+   "path": "music/40.mp3",
+   "size": 92491,
+   "crc32": "11117d45"
+  },
+  {
+   "path": "music/41.mp3",
+   "size": 180263,
+   "crc32": "28780ceb"
+  },
+  {
+   "path": "music/42.mp3",
+   "size": 95522,
+   "crc32": "6d06908f"
+  },
+  {
+   "path": "music/43.mp3",
+   "size": 143065,
+   "crc32": "a1b4d91e"
+  },
+  {
+   "path": "music/44.mp3",
+   "size": 161350,
+   "crc32": "8398c688"
+  },
+  {
+   "path": "music/45.mp3",
+   "size": 98761,
+   "crc32": "89c03aa7"
+  },
+  {
+   "path": "music/46.mp3",
+   "size": 240449,
+   "crc32": "b92a615d"
+  },
+  {
+   "path": "music/47.mp3",
+   "size": 95522,
+   "crc32": "f40b3bf7"
+  },
+  {
+   "path": "music/48.mp3",
+   "size": 92491,
+   "crc32": "b7c0503b"
+  },
+  {
+   "path": "music/49.mp3",
+   "size": 123838,
+   "crc32": "a79c5d1d"
+  },
+  {
+   "path": "music/5.mp3",
+   "size": 240449,
+   "crc32": "9ef1aa16"
+  },
+  {
+   "path": "music/50.mp3",
+   "size": 214431,
+   "crc32": "92d7d157"
+  },
+  {
+   "path": "music/51.mp3",
+   "size": 125928,
+   "crc32": "ddc9be9c"
+  },
+  {
+   "path": "music/52.mp3",
+   "size": 240449,
+   "crc32": "927cfd07"
+  },
+  {
+   "path": "music/53.mp3",
+   "size": 240449,
+   "crc32": "91a4de5a"
+  },
+  {
+   "path": "music/54.mp3",
+   "size": 214431,
+   "crc32": "9d523995"
+  },
+  {
+   "path": "music/55.mp3",
+   "size": 240449,
+   "crc32": "7ff2eae1"
+  },
+  {
+   "path": "music/56.mp3",
+   "size": 240449,
+   "crc32": "50b11f2b"
+  },
+  {
+   "path": "music/57.mp3",
+   "size": 136482,
+   "crc32": "08661a7e"
+  },
+  {
+   "path": "music/58.mp3",
+   "size": 240449,
+   "crc32": "588519c7"
+  },
+  {
+   "path": "music/59.mp3",
+   "size": 240449,
+   "crc32": "d7a7254f"
+  },
+  {
+   "path": "music/6.mp3",
+   "size": 204818,
+   "crc32": "8b55c1fa"
+  },
+  {
+   "path": "music/60.mp3",
+   "size": 131153,
+   "crc32": "951cc7ec"
+  },
+  {
+   "path": "music/61.mp3",
+   "size": 17050,
+   "crc32": "a37b9085"
+  },
+  {
+   "path": "music/62.mp3",
+   "size": 145468,
+   "crc32": "ef4c9cc6"
+  },
+  {
+   "path": "music/63.mp3",
+   "size": 196459,
+   "crc32": "e3e9d985"
+  },
+  {
+   "path": "music/64.mp3",
+   "size": 109210,
+   "crc32": "2eff73dd"
+  },
+  {
+   "path": "music/65.mp3",
+   "size": 140557,
+   "crc32": "8eb034de"
+  },
+  {
+   "path": "music/66.mp3",
+   "size": 228642,
+   "crc32": "32b0649b"
+  },
+  {
+   "path": "music/67.mp3",
+   "size": 230836,
+   "crc32": "301190f7"
+  },
+  {
+   "path": "music/68.mp3",
+   "size": 240449,
+   "crc32": "ee674369"
+  },
+  {
+   "path": "music/69.mp3",
+   "size": 149961,
+   "crc32": "117b95e9"
+  },
+  {
+   "path": "music/7.mp3",
+   "size": 224671,
+   "crc32": "66a2791e"
+  },
+  {
+   "path": "music/70.mp3",
+   "size": 224567,
+   "crc32": "6f9f4f18"
+  },
+  {
+   "path": "music/71.mp3",
+   "size": 136377,
+   "crc32": "bc99e894"
+  },
+  {
+   "path": "music/72.mp3",
+   "size": 109210,
+   "crc32": "ffc781b1"
+  },
+  {
+   "path": "music/73.mp3",
+   "size": 240449,
+   "crc32": "c7221615"
+  },
+  {
+   "path": "music/74.mp3",
+   "size": 125928,
+   "crc32": "b83fdc90"
+  },
+  {
+   "path": "music/75.mp3",
+   "size": 240449,
+   "crc32": "aa0d9cc4"
+  },
+  {
+   "path": "music/76.mp3",
+   "size": 157275,
+   "crc32": "b1cc23c7"
+  },
+  {
+   "path": "music/77.mp3",
+   "size": 240449,
+   "crc32": "563d749d"
+  },
+  {
+   "path": "music/78.mp3",
+   "size": 149961,
+   "crc32": "167374f1"
+  },
+  {
+   "path": "music/79.mp3",
+   "size": 151006,
+   "crc32": "2f0c27e0"
+  },
+  {
+   "path": "music/8.mp3",
+   "size": 118614,
+   "crc32": "33f29b26"
+  },
+  {
+   "path": "music/80.mp3",
+   "size": 240449,
+   "crc32": "6ce359e6"
+  },
+  {
+   "path": "music/81.mp3",
+   "size": 149961,
+   "crc32": "7dad5b41"
+  },
+  {
+   "path": "music/82.mp3",
+   "size": 131153,
+   "crc32": "d43e80cc"
+  },
+  {
+   "path": "music/83.mp3",
+   "size": 114748,
+   "crc32": "06172927"
+  },
+  {
+   "path": "music/84.mp3",
+   "size": 240449,
+   "crc32": "089a49a0"
+  },
+  {
+   "path": "music/85.mp3",
+   "size": 97194,
+   "crc32": "69cc94ea"
+  },
+  {
+   "path": "music/86.mp3",
+   "size": 195936,
+   "crc32": "eb138932"
+  },
+  {
+   "path": "music/87.mp3",
+   "size": 180367,
+   "crc32": "01d6367a"
+  },
+  {
+   "path": "music/9.mp3",
+   "size": 240449,
+   "crc32": "e9565f92"
+  }
+ ]
+}

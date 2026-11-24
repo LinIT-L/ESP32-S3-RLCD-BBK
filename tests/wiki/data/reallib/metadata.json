@@ -1,0 +1,11 @@
+{
+ "version": 2,
+ "articleCount": 14,
+ "chunks": {
+  "count": 2,
+  "pattern": "articles_%04d.dat"
+ },
+ "title": "真实压缩测试库",
+ "built": "host-real-lz4",
+ "note": "lz4.block high_compression, 含坏帧条目"
+}
