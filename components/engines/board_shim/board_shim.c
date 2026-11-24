@@ -1,0 +1,1016 @@
+/**
+ * @file board_shim.c
+ * @brief board_rlcd + board_speaker 兼容层实现
+ *
+ * 适配 gb_emu (Peanut-GB) 到当前项目的 st7305 + audio_player.
+ * 直接使用参考项目 (esp32-s3-rlcd-gb-emulator) 的显示方案:
+ *   - GB: 2bit 色阶 (0-3) → 2x2 抖动 → 1bit, 2x 缩放
+ *
+ * 音频适配:
+ *   - board_speaker_write → audio_player_feed_pcm (int16_t 立体声)
+ */
+#pragma GCC optimize ("O3")
+#include "board_rlcd.h"
+#include "board_speaker.h"
+#include "audio_player.h"
+#include "virtual_keys.h"
+#include "cheat_float.h"
+#include "vid_tune.h"        /* 画面优化器 (shade→黑点数 可调) */
+#include "gray_quant.h"      /* ★ 2026-10-30 灰阶量化统一入口 (GB/GBC/NES 共用, 支持 Bayer 实验) */
+#include "input.h"           /* engine_overlay_quickbar: 游戏内下拉快捷栏 */
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "esp_attr.h"
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+static const char *TAG = "board_shim";
+
+/* NES 1x 逐行绘制到指定 fb (供视频任务内部使用) */
+esp_err_t board_rlcd_draw_nes_line_1x_to(uint8_t *fb, int x, int y,
+                                        const uint8_t *pixels, int width);
+esp_err_t board_rlcd_draw_gbc_line_2x_rgb565_be(int x, int y, const uint16_t *pixels, int width);
+esp_err_t board_rlcd_draw_gbc_line_2x_rgb565_be_to(uint8_t *fb, int x, int y,
+                                                   const uint16_t *pixels, int width);
+static uint8_t board_rlcd_rgb565_be_to_gbc_shade(uint16_t rgb565_be);
+esp_err_t board_rlcd_draw_gbc_stretch(const uint16_t *buf_le, int src_w, int src_h);
+esp_err_t board_rlcd_draw_gb_line_to(uint8_t *fb, int x, int y,
+                                     const uint8_t *pixels, int width);
+
+/* V1.0.46+: GB/GBC 灰度模式三档开关:
+ *   0 = 纯黑白 (简单 2x 放大, shade>=2 为黑)
+ *   1 = 4档点聚灰度 (黑点聚成实心块, 静态不发抖, 避免 1bit 屏低刷下抖动闪烁)
+ *   2 = 散点抖动 (黑点对角散开, 层次更细腻)
+ * 黑点数(每档 2x2 里画几个黑点)**不在这里定**, 由 vid_tune 曲线决定; 本开关只决定
+ * 黑点落哪几个象限 + 是否走曲线 (0 档直接用 s_cluster_bw). */
+static int g_gb_gray = 1;
+
+/* NES 全屏缩放: 2bit 打包帧 (每字节 4 像素) + 内部 RAM 显示缓冲.
+ * rowbits[local_y][py_parity][shade_pair] 预先把"2 个源像素 -> 2 个物理位"
+ * 合成字节片段, 视频任务每字节只需 1 次查表 + 1 次 OR, 不再逐像素查抖动图案.
+ * 定义放在抖动表之后, 这里只做前向声明. */
+#define NES_FB_BYTES       (ST7305_WIDTH * ST7305_HEIGHT / 8)   /* 15000 */
+#define NES_PACKED_256x224 (256 * 224 / 4)                       /* 14336 */
+static uint8_t s_rowbits[4][2][16][2];   /* ★ 末维 = x 相位(cp&1), Bayer 需要; cluster 两相位相同 */
+static void board_shim_rebuild_nes_rowbits(void);
+static void board_shim_apply_tune(void);
+
+void board_shim_set_gb_gray(int mode) {
+    if (mode < 0) mode = 0;
+    if (mode > 2) mode = 2;
+    g_gb_gray = mode;
+    board_shim_apply_tune();
+}
+
+/* st7305 句柄 (由 board_shim_set_lcd 设置) */
+static st7305_handle_t *s_lcd = NULL;
+
+/* === 异步刷新任务 (V1.0.53) ===
+ * GB/GBC 模拟任务 (core1, prio4) 若每 33ms 同步刷一次 12-15ms 的 LCD,
+ * 刷屏期间音频生产完全停摆, I2S 持续消耗 → 环形缓冲 ~2s 耗尽 → 声音卡顿.
+ * 这里把刷屏拆到 core0 独立任务: 模拟任务只画帧 + 通知, 刷新任务拷快照后
+ * SPI 发送, 模拟任务每帧仅多付出一次 memcpy 级锁等待 (~60us). */
+#define BOARD_VIDEO_FLUSH_INTERVAL_US  33000   /* ~30Hz, 与 gb/gbc 节流一致 */
+/* V1.0.55: 1536 字 (6KB) 在加入 flush 日志/60Hz 刷新时爆栈 (spi polling transmit
+ * 调用链 + ESP_LOGI 格式化), 任务栈在 PSRAM, 直接给 12KB 余量. */
+#define BOARD_VIDEO_STACK_WORDS        16384  /* 64KB (PSRAM): 需容纳独立修改机菜单/搜索栈帧 */
+static SemaphoreHandle_t s_fb_lock = NULL;      /* 保护整帧写入 vs 快照拷贝 */
+static SemaphoreHandle_t s_flush_sem = NULL;    /* 帧就绪通知 */
+static uint8_t *s_flush_snapshot = NULL;        /* 15KB PSRAM 快照缓冲 */
+static TaskHandle_t s_video_task = NULL;
+static volatile bool s_video_task_running = false;
+static volatile int s_video_task_refs = 0;   /* GB/GBC 模拟任务引用计数 */
+static volatile bool s_ss_lcd_hold = false;  /* 屏保独占: 冻结游戏帧刷屏, 让壁纸在最上层 */
+void board_rlcd_screensaver_set(bool active) { s_ss_lcd_hold = active; }
+static volatile uint32_t s_flush_interval_us = BOARD_VIDEO_FLUSH_INTERVAL_US;
+static int64_t s_last_flush_us = 0;
+EXT_RAM_BSS_ATTR static StackType_t s_video_stack[BOARD_VIDEO_STACK_WORDS];
+/* ⛔ 必须内部 RAM: xPortCheckValidTCBMem() 校验 TCB 所在内存, 放 PSRAM 会 assert (2026-10-09 教训) */
+static StaticTask_t s_video_tcb;
+
+/* === 缩放映射缓冲 (NES 拉伸 / GB·GBC 全屏) ===
+ * 只在游戏缩放路径里用: 进游戏才分配, 视频任务引用归零即释放 —— 待机零占用.
+ * 必须留在内部 RAM: 每帧每行随机读 400B 的 col_map, 放 PSRAM 会拖帧率.
+ * GBC 与 NES 不会同时运行, 两个绘制函数共用这一套, 不再各占一份. */
+#define BOARD_SCALE_MAP_BYTES  (ST7305_HEIGHT + ST7305_WIDTH * 2)   /* 1100 B */
+static uint8_t *s_scale_map = NULL;   /* [row_map 300][col_map 400][scaled_row 400] */
+static int s_scale_cached_w = -1, s_scale_cached_h = -1;
+
+static uint8_t *board_scale_map_ensure(void)
+{
+    if (s_scale_map) return s_scale_map;
+    s_scale_map = heap_caps_malloc(BOARD_SCALE_MAP_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s_scale_map) {
+        ESP_LOGE(TAG, "缩放映射分配失败 (%d B)", BOARD_SCALE_MAP_BYTES);
+        return NULL;
+    }
+    s_scale_cached_w = s_scale_cached_h = -1;
+    return s_scale_map;
+}
+
+void board_scale_map_release(void)
+{
+    if (!s_scale_map) return;
+    heap_caps_free(s_scale_map);
+    s_scale_map = NULL;
+    s_scale_cached_w = s_scale_cached_h = -1;
+}
+
+/* NES: 模拟任务输出 2bit 打包灰度帧 (PSRAM), 拷贝到内部 RAM 显示缓冲,
+ * 视频任务从内部 RAM 解包缩放 -> 写 FB -> SPI (全部在 core0, 不拖模拟帧). */
+static const uint8_t *s_nes_shade_src = NULL;  /* 模拟任务打包帧 (PSRAM) */
+static int s_nes_shade_w = 0, s_nes_shade_h = 0;
+static int s_nes_shade_mode = 2;   /* NES 显示模式: 0=点对点, 1=全屏, 2=拉伸 */
+static int s_nes_packed_bytes = 0;
+static uint8_t *s_nes_internal = NULL;   /* 内部 RAM 单块: [显示打包帧 | FB 暂存] */
+static uint8_t *s_nes_disp = NULL;
+static uint8_t *s_fb_stage = NULL;
+static bool     s_gb_stage_owned = false;  /* GB (Peanut-GB) 独占的 s_fb_stage */
+static int64_t s_nes_scale_us = 0;       /* 诊断: 最近一次缩放耗时 */
+
+/* GB/GBC (gnuboy): 模拟任务只产出 RGB565 双缓冲帧, 视频任务做 2x 灰度转换+SPI.
+ * s_gbc_src 指向 displayBuffer 当前帧, 双缓冲保证转换期间不会被覆盖. */
+static const uint16_t *s_gbc_src = NULL;
+static int s_gbc_w = 0, s_gbc_h = 0;
+static int s_gbc_mode = 1;   /* 0=1x点对点, 1=2x全屏, 2=拉伸400x300 */
+static int64_t s_gbc_conv_us = 0;    /* 诊断: 最近一次 GBC 转换耗时 */
+static int64_t s_gbc_spi_us = 0;     /* 诊断: 最近一次 SPI 耗时 */
+static int64_t s_gbc_pack_us = 0;    /* 诊断: 拉伸打包阶段耗时 */
+static int64_t s_gbc_scale_us = 0;   /* 诊断: 拉伸缩放阶段耗时 */
+
+void board_rlcd_set_nes_shade_source(const uint8_t *shade, int w, int h, int mode)
+{
+    if (shade && w > 0 && h > 0) {
+        int packed = w * h / 4;
+        if (!s_nes_internal || s_nes_packed_bytes != packed) {
+            if (s_nes_internal) heap_caps_free(s_nes_internal);
+            s_nes_internal = NULL;
+            s_nes_disp = NULL;
+            s_fb_stage = NULL;
+            s_nes_packed_bytes = 0;
+            s_nes_internal = heap_caps_malloc(packed + NES_FB_BYTES + 4,
+                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (!s_nes_internal) return;   /* 内部 RAM 不足时不启用 NES 缩放路径 */
+            s_nes_packed_bytes = packed;
+            s_nes_disp = s_nes_internal;
+            s_fb_stage = s_nes_internal + ((packed + 3) & ~3);
+        }
+        board_shim_rebuild_nes_rowbits();
+        s_nes_shade_src = shade;
+        s_nes_shade_w = w;
+        s_nes_shade_h = h;
+        if (mode < 0) mode = 0;
+        if (mode > 2) mode = 2;
+        s_nes_shade_mode = mode;
+    } else {
+        s_nes_shade_src = NULL;
+        s_nes_shade_w = 0;
+        s_nes_shade_h = 0;
+        /* s_fb_stage 延迟到 video_task_stop() 任务退出后再释放, 避免竞态 */
+    }
+}
+
+void board_rlcd_set_gbc_frame_source(const uint16_t *buf, int w, int h, int mode)
+{
+    if (mode < 0) mode = 0;
+    if (mode > 2) mode = 2;
+    s_gbc_src = buf;
+    s_gbc_w = w;
+    s_gbc_h = h;
+    s_gbc_mode = mode;
+    if (buf && (!s_nes_internal || s_nes_packed_bytes != (w * h / 4))) {
+        /* GB/GBC 转换需要内部暂存: [打包灰度 | FB 暂存].
+         * 拉伸模式把 RGB565 先打包成 2bit 灰度 (内部 RAM), 再查表拉伸,
+         * 避免逐像素读 PSRAM 拖垮 core0 (看门狗/蓝牙断开根因). */
+        if (s_nes_internal) heap_caps_free(s_nes_internal);
+        s_nes_internal = NULL;
+        s_nes_disp = NULL;
+        s_fb_stage = NULL;
+        s_nes_packed_bytes = 0;
+        int packed = w * h / 4;
+        s_nes_internal = heap_caps_malloc(packed + NES_FB_BYTES + 4,
+                                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!s_nes_internal) {
+            ESP_LOGD(TAG, "GBC 内部暂存分配失败 (%d B)", packed + NES_FB_BYTES + 4);
+            return;
+        }
+        s_nes_packed_bytes = packed;
+        s_nes_disp = s_nes_internal;
+        s_fb_stage = s_nes_internal + ((packed + 3) & ~3);
+        ESP_LOGI(TAG, "GBC 视频暂存就绪 mode=%d packed=%d", mode, packed);
+    }
+}
+
+/* 模拟任务把打包帧拷贝进内部 RAM 显示缓冲 (14336 字节, ~0.2ms) */
+uint8_t *board_rlcd_nes_disp_buffer(void)
+{
+    return s_nes_disp;
+}
+
+/* V1.0.61 原始单缓冲设计: 模拟任务直接写显示缓冲, 发布为无操作 */
+void board_rlcd_nes_disp_publish(void)
+{
+}
+
+void board_rlcd_fb_lock(void)
+{
+    if (s_fb_lock) xSemaphoreTake(s_fb_lock, portMAX_DELAY);
+}
+
+void board_rlcd_fb_unlock(void)
+{
+    if (s_fb_lock) xSemaphoreGive(s_fb_lock);
+}
+
+static void board_video_flush_task(void *arg)
+{
+    (void)arg;
+    while (s_video_task_running) {
+        if (xSemaphoreTake(s_flush_sem, portMAX_DELAY) != pdTRUE)
+            continue;
+        if (!s_video_task_running) break;
+        if (!s_lcd || !s_flush_snapshot) continue;
+        /* 屏保独占: 屏保激活时不刷游戏帧, 消费掉通知让信号量不堆积,
+         * 星空壁纸(由壁纸/引擎循环直接画到 LCD)保持最上层不被覆盖 */
+        if (s_ss_lcd_hold) continue;
+        /* 修改机任务独占屏幕/输入期间: 视频任务完全让渡 (不再画帧/flush,
+         * 避免覆盖修改机菜单; 模拟器已冻结, 无新帧产生) */
+        if (cheat_float_is_active()) continue;
+        /* 节流: 不到间隔的帧直接丢弃 (刷新任务始终发最新帧) */
+        int64_t now = esp_timer_get_time();
+        if (now - s_last_flush_us < s_flush_interval_us)
+            continue;
+        int64_t t0 = esp_timer_get_time();
+        if (s_nes_shade_src) {
+            /* NES: 灰度帧 -> 全屏缩放/点对点 -> FB, 全部在 core0 视频任务内完成 */
+            /* ★ 2026-10-31: 快捷栏「收手势/执行动作」必须在**帧锁之外** ——
+             *   点一下 Wi-Fi 走 esp_wifi_start() 要 1~3 秒, 占着锁会让模拟任务
+             *   一帧都提交不了 (用户报的"点 Wi-Fi 就卡死")。锁内只保留"画"。 */
+            if (!cheat_float_is_active()) engine_overlay_quickbar_tick();
+            board_rlcd_fb_lock();
+            if (s_nes_shade_mode != 0) {
+                /* 1=全屏 / 2=拉伸: 均走 scaled 拉伸到全屏 (400 宽) 归一处理 */
+                board_rlcd_draw_nes_scaled(s_nes_disp, s_nes_shade_w, s_nes_shade_h);
+            } else {
+                memset(s_fb_stage, 0xFF, ST7305_WIDTH * ST7305_HEIGHT / 8);   /* ★ 每帧重建底(白): 透明手柄残影必须被清掉 */
+                int x = (ST7305_WIDTH - s_nes_shade_w) / 2;
+                int y = (ST7305_HEIGHT - s_nes_shade_h) / 2;
+                for (int yy = 0; yy < s_nes_shade_h; yy++) {
+                    board_rlcd_draw_nes_line_1x_to(s_fb_stage, x, y + yy,
+                                                   s_nes_disp + ((yy * s_nes_shade_w) >> 2),
+                                                   s_nes_shade_w);
+                }
+                memcpy(s_lcd->fb, s_fb_stage, ST7305_WIDTH * ST7305_HEIGHT / 8);
+            }
+            virtual_keys_draw(s_lcd);
+            bool takeover = cheat_float_overlay_tick(s_lcd);
+            if (!takeover) vid_tune_overlay_tick(s_lcd);
+        if (!takeover) engine_overlay_quickbar_draw(s_lcd);   /* 锁内: 只画像素 */   /* ★ 游戏内下拉快捷栏 */
+            board_rlcd_fb_unlock();
+            if (!takeover) st7305_flush_from(s_lcd, s_lcd->fb);
+        } else if (s_gbc_src && s_gbc_w > 0 && s_gbc_h > 0) {
+            /* GB/GBC: RGB565 双缓冲帧 -> 按显示模式转 FB (core0, 不占模拟帧预算) */
+            if (!cheat_float_is_active()) engine_overlay_quickbar_tick();   /* 锁外: 收手势/慢动作 */
+            board_rlcd_fb_lock();
+            int64_t c0 = esp_timer_get_time();
+            if (s_gbc_mode == 2) {
+                board_rlcd_draw_gbc_stretch(s_gbc_src, s_gbc_w, s_gbc_h);
+            } else if (s_gbc_mode == 1) {
+                int gx = (ST7305_WIDTH - s_gbc_w * 2) / 2;
+                int gy = (ST7305_HEIGHT - s_gbc_h * 2) / 2;
+                uint16_t line_be[160];   /* 模拟帧为小端, 2x 绘制函数按大端解析 */
+                if (s_fb_stage) {
+                    /* 内部 RAM 暂存构建 2x 帧, 一次 memcpy 写回 PSRAM,
+                     * 避免 9 万次逐像素 PSRAM 读改写把 core0 拖到看门狗重启 */
+                    memset(s_fb_stage, 0xFF, NES_FB_BYTES);   /* ★ 每帧重建底(白): 同上 */
+                    for (int yy = 0; yy < s_gbc_h; yy++) {
+                        const uint16_t *row = s_gbc_src + yy * s_gbc_w;
+                        for (int xx = 0; xx < s_gbc_w; xx++)
+                            line_be[xx] = (uint16_t)((row[xx] << 8) | (row[xx] >> 8));
+                        board_rlcd_draw_gbc_line_2x_rgb565_be_to(s_fb_stage, gx, gy + yy * 2,
+                                                                 line_be, s_gbc_w);
+                    }
+                    memcpy(s_lcd->fb, s_fb_stage, NES_FB_BYTES);
+                } else {
+                    for (int yy = 0; yy < s_gbc_h; yy++) {
+                        const uint16_t *row = s_gbc_src + yy * s_gbc_w;
+                        for (int xx = 0; xx < s_gbc_w; xx++)
+                            line_be[xx] = (uint16_t)((row[xx] << 8) | (row[xx] >> 8));
+                        board_rlcd_draw_gbc_line_2x_rgb565_be(gx, gy + yy * 2,
+                                                              line_be, s_gbc_w);
+                    }
+                }
+            } else {
+                /* 1x 点对点: 160x144 居中 (同样走内部暂存, 避免直写 PSRAM) */
+                int gx = (ST7305_WIDTH - s_gbc_w) / 2;
+                int gy = (ST7305_HEIGHT - s_gbc_h) / 2;
+                uint8_t shade_row[160];
+                if (s_fb_stage) {
+                    memset(s_fb_stage, 0xFF, NES_FB_BYTES);   /* ★ 每帧重建底(白): 同上 */
+                    for (int yy = 0; yy < s_gbc_h; yy++) {
+                        const uint16_t *row = s_gbc_src + yy * s_gbc_w;
+                        for (int xx = 0; xx < s_gbc_w; xx++) {
+                            uint16_t be = (uint16_t)((row[xx] << 8) | (row[xx] >> 8));
+                            shade_row[xx] = board_rlcd_rgb565_be_to_gbc_shade(be);
+                        }
+                        board_rlcd_draw_gb_line_to(s_fb_stage, gx, gy + yy,
+                                                   shade_row, s_gbc_w);
+                    }
+                    memcpy(s_lcd->fb, s_fb_stage, NES_FB_BYTES);
+                } else {
+                    for (int yy = 0; yy < s_gbc_h; yy++) {
+                        const uint16_t *row = s_gbc_src + yy * s_gbc_w;
+                        for (int xx = 0; xx < s_gbc_w; xx++) {
+                            uint16_t be = (uint16_t)((row[xx] << 8) | (row[xx] >> 8));
+                            shade_row[xx] = board_rlcd_rgb565_be_to_gbc_shade(be);
+                        }
+                        board_rlcd_draw_gb_line(gx, gy + yy, shade_row, s_gbc_w);
+                    }
+                }
+            }
+            virtual_keys_draw(s_lcd);
+            bool takeover = cheat_float_overlay_tick(s_lcd);
+            if (!takeover) vid_tune_overlay_tick(s_lcd);
+        if (!takeover) engine_overlay_quickbar_draw(s_lcd);   /* 锁内: 只画像素 */   /* ★ 游戏内下拉快捷栏 */
+            board_rlcd_fb_unlock();
+            s_gbc_conv_us = esp_timer_get_time() - c0;
+            int64_t s0 = esp_timer_get_time();
+            if (!takeover) st7305_flush_from(s_lcd, s_lcd->fb);
+            s_gbc_spi_us = esp_timer_get_time() - s0;
+        } else {
+            /* GB/GBC: 快照拷贝 + SPI (模拟任务画完 FB 后通知) */
+            if (!cheat_float_is_active()) engine_overlay_quickbar_tick();   /* 锁外: 收手势/慢动作 */
+            board_rlcd_fb_lock();
+            virtual_keys_draw(s_lcd);
+            bool takeover = cheat_float_overlay_tick(s_lcd);
+            if (!takeover) vid_tune_overlay_tick(s_lcd);
+        if (!takeover) engine_overlay_quickbar_draw(s_lcd);   /* 锁内: 只画像素 */   /* ★ 游戏内下拉快捷栏 */
+            if (!takeover)
+                memcpy(s_flush_snapshot, s_lcd->fb, ST7305_WIDTH * ST7305_HEIGHT / 8);
+            board_rlcd_fb_unlock();
+            if (takeover) continue;
+            st7305_flush_from(s_lcd, s_flush_snapshot);
+        }
+        int64_t flush_us = esp_timer_get_time() - t0;
+        static int64_t flush_max_us = 0;
+        static uint32_t flush_cnt = 0;
+        static int64_t flush_total_us = 0;
+        flush_total_us += flush_us;
+        if (flush_us > flush_max_us) flush_max_us = flush_us;
+        if ((++flush_cnt % 120) == 0) {
+            ESP_LOGI(TAG, "LCD flush: avg=%dus max=%dus interval=%uus conv=%lldus spi=%lldus pack=%lldus scale=%lldus",
+                     (int)(flush_total_us / flush_cnt), (int)flush_max_us,
+                     (int)s_flush_interval_us,
+                     (long long)s_gbc_conv_us, (long long)s_gbc_spi_us,
+                     (long long)s_gbc_pack_us, (long long)s_gbc_scale_us);
+            flush_total_us = 0;
+            flush_cnt = 0;
+            flush_max_us = 0;
+        }
+        s_last_flush_us = now;
+    }
+    /* ★ 2026-11-22: 退出前**自己清 handle** —— board_rlcd_video_task_stop() 靠它判断
+     *   "任务真的停了"。原来只有 stop 会清, 于是那个等待循环永远跑满超时。 */
+    s_video_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* 供各引擎设置刷新间隔 (GB/GBC=33ms, NES 可设 16.7ms) */
+void board_rlcd_video_task_set_interval_us(uint32_t us)
+{
+    if (us >= 8000 && us <= 100000) s_flush_interval_us = us;
+}
+
+esp_err_t board_rlcd_flush_async(void)
+{
+    if (!s_flush_sem || !s_video_task_running) return ESP_ERR_INVALID_STATE;
+    xSemaphoreGive(s_flush_sem);
+    return ESP_OK;
+}
+
+void board_rlcd_video_task_start(void)
+{
+    if (s_video_task_running) {
+        s_video_task_refs++;
+        return;
+    }
+    /* ★ 2026-11-22: 上一个任务还没退干净 ⇒ 绝不能再用同一块静态栈/TCB 建新的
+     *   (两个任务共用 s_video_stack 会立刻踩栈崩溃)。stop() 超时时会保留 handle。 */
+    if (s_video_task) {
+        ESP_LOGE(TAG, "上一个视频任务仍在运行, 拒绝重建 (静态栈不可共用)");
+        return;
+    }
+    if (!s_flush_sem) {
+        s_flush_sem = xSemaphoreCreateBinary();
+        s_fb_lock = xSemaphoreCreateMutex();
+    }
+    if (!s_flush_snapshot) {
+        s_flush_snapshot = heap_caps_malloc(ST7305_WIDTH * ST7305_HEIGHT / 8,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_flush_snapshot) return;
+    }
+    s_video_task_running = true;
+    s_video_task_refs = 1;
+    s_last_flush_us = 0;
+    s_video_task = xTaskCreateStaticPinnedToCore(board_video_flush_task, "vid_flush",
+                                                 BOARD_VIDEO_STACK_WORDS, NULL, 6,
+                                                 s_video_stack, &s_video_tcb, 0);
+    if (!s_video_task) s_video_task_running = false;
+}
+
+void board_rlcd_video_task_stop(void)
+{
+    if (!s_video_task_running) { board_scale_map_release(); return; }
+    if (s_video_task_refs > 1) {
+        s_video_task_refs--;
+        return;
+    }
+    s_video_task_refs = 0;
+    s_video_task_running = false;
+    xSemaphoreGive(s_flush_sem);   /* 唤醒阻塞在 portMAX_DELAY 的任务, 让它看到 running=false */
+
+    /* ★ 2026-11-22: **真的**等任务退出。
+     *   原实现 `for (i<20 && s_video_task) delay(2)` —— 但 s_video_task 只有本函数会清,
+     *   任务自己退出时不动它, 所以循环必然跑满 40ms, 然后无条件 s_video_task=NULL。
+     *   若任务此刻正在送屏(单帧可达 60ms+), 40ms 后它其实还活着:
+     *     · 下次 start 用同一块静态栈/TCB 建新任务 ⇒ 两任务共用栈, 立刻崩;
+     *     · 下面又释放 s_nes_internal / s_fb_stage ⇒ 旧任务继续读, 悬空访问。
+     *   现在由任务退出前自己清 handle; 这里等不到就**一个字节都不释放**。 */
+    uint32_t t0 = xTaskGetTickCount();
+    while (s_video_task && (uint32_t)(xTaskGetTickCount() - t0) < pdMS_TO_TICKS(300))
+        vTaskDelay(pdMS_TO_TICKS(2));
+    if (s_video_task) {
+        ESP_LOGE(TAG, "视频任务 300ms 内未退出 —— 保留全部缓冲并放弃本次释放 (防悬空访问)");
+        return;
+    }
+
+    /* ★ 2026-11-22: 任务确已停止, 把本模块持有的帧源指针作废 —— 防御性。
+     *   (gbc_emu_unload() 自己会调 board_rlcd_set_gbc_frame_source(NULL,...) 清一遍,
+     *    但停止路径不保证一定走到那里; 视频任务已死, 这里清是零成本。)
+     *   ⚠ 不动 s_nes_shade_src: 那是 NES 引擎的财产, 由它自己的 set/unload 管理。
+     *   ⚠ "引擎是否还在跑"必须在清空**之前**判定, 否则下面会把引擎仍在用的共用暂存放掉。 */
+    bool engine_still_running = (s_nes_shade_src != NULL || s_gbc_src != NULL);
+    s_gbc_src = NULL;
+    s_gbc_w = s_gbc_h = 0;
+
+    if (!engine_still_running && s_nes_internal) {
+        heap_caps_free(s_nes_internal);
+        s_nes_internal = NULL;
+        s_nes_disp = NULL;
+        s_fb_stage = NULL;
+        s_nes_packed_bytes = 0;
+    }
+    /* 引擎已经退出, 缩放映射不会再用 —— 立即还给系统, 待机时内部 RAM 零占用 */
+    board_scale_map_release();
+}
+
+void board_shim_set_lcd(st7305_handle_t *lcd) {
+    s_lcd = lcd;
+    /* 画面优化器: 参数一变就重建 shade→黑点表 (回调里会立即跑一次) */
+    vid_tune_init();
+    vid_tune_set_rebuild_cb(board_shim_apply_tune);
+}
+
+st7305_handle_t *board_shim_get_lcd(void) {
+    return s_lcd;
+}
+
+/* === GB (Peanut-GB) 2x 绘制暂存 ===
+ * board_rlcd_draw_gb_line_2x 直接画到 s_fb_stage (内部 RAM), 需要显式分配.
+ * NES/GBC 路径用 s_nes_internal 里的暂存, 与本函数互斥 (各引擎不会同时运行). */
+esp_err_t board_shim_gb_stage_alloc(void)
+{
+    if (s_fb_stage) return ESP_OK;
+    uint8_t *m = heap_caps_malloc(ST7305_WIDTH * ST7305_HEIGHT / 8,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!m) {
+        /* 内部 RAM 不足时回退 PSRAM: Peanut-GB 单帧 <2ms, 放 PSRAM 性能余量充足 */
+        m = heap_caps_malloc(ST7305_WIDTH * ST7305_HEIGHT / 8,
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!m) {
+        ESP_LOGD(TAG, "GB stage 分配失败 (%d B)", ST7305_WIDTH * ST7305_HEIGHT / 8);
+        return ESP_ERR_NO_MEM;
+    }
+    s_fb_stage = m;
+    s_gb_stage_owned = true;
+    return ESP_OK;
+}
+
+void board_shim_gb_stage_free(void)
+{
+    if (s_gb_stage_owned && s_fb_stage) {
+        heap_caps_free(s_fb_stage);
+        s_gb_stage_owned = false;
+    }
+    s_fb_stage = NULL;
+}
+
+/* 返回 GB 2x 绘制暂存指针 (供 1x 模式 board_rlcd_draw_gb_line_to 使用) */
+uint8_t *board_shim_gb_stage_get(void)
+{
+    return s_fb_stage;
+}
+
+/* 提交 GB 暂存到 LCD FB (锁保护), 再调 board_rlcd_flush_async() 异步刷新 */
+void board_shim_gb_stage_commit(void)
+{
+    if (!s_lcd || !s_lcd->fb || !s_fb_stage) return;
+    board_rlcd_fb_lock();
+    memcpy(s_lcd->fb, s_fb_stage, ST7305_WIDTH * ST7305_HEIGHT / 8);
+    board_rlcd_fb_unlock();
+}
+
+/* === board_rlcd 兼容接口 === */
+
+bool board_rlcd_is_initialized(void) {
+    return s_lcd != NULL;
+}
+
+esp_err_t board_rlcd_clear(uint8_t color) {
+    if (!s_lcd) return ESP_ERR_INVALID_STATE;
+    st7305_clear(s_lcd, color);
+    return ESP_OK;
+}
+
+esp_err_t board_rlcd_flush(void) {
+    if (!s_lcd) return ESP_ERR_INVALID_STATE;
+    return st7305_flush(s_lcd);
+}
+
+/* === GB 2x2 抖动 (直接移植参考项目 board_rlcd.cpp) ===
+ *
+ * GB shade: 0=白(lightest), 1=浅灰, 2=深灰, 3=黑(darkest)
+ * 2x2 抖动模式 (模拟4级灰度):
+ *   shade 0: [W W]   shade 1: [B W]   shade 2: [B W]   shade 3: [B B]
+ *            [W W]            [W W]            [W B]            [B B]
+ *
+ * ST7305 fb: bit=1→白(屏幕亮), bit=0→黑(屏幕暗), with 0x21 inversion.
+ * fb 布局: 每字节 2列×4行, index=(x>>1)*(H>>2)+((H-1-y)>>2), bit=7-(((H-1-y)&3)<<1|(x&1))
+ */
+#define FB_HEIGHT_DIV_4  (ST7305_HEIGHT >> 2)  /* 75 */
+
+static inline void write_masked_pixel(uint8_t *fb, uint32_t index, uint8_t mask, uint8_t color) {
+    if (color == ST7305_COLOR_WHITE) {
+        fb[index] |= mask;
+    } else {
+        fb[index] &= (uint8_t)~mask;
+    }
+}
+
+/* 点聚(clustered)半色调表: 每个游戏像素占 2x2 物理点, 用"聚在一起的黑色点数"表达灰阶.
+ * 黑点聚成实心块 (非散点抖动), 静态图案 -> 低刷新率下不闪烁.
+ * 每个 shade 的行: [top-left, top-right, bottom-left, bottom-right] */
+/* 纯黑白: shade>=2 为黑, 否则白 */
+static const uint8_t s_cluster_bw[4][4] = {
+    { ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE },
+    { ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE, ST7305_COLOR_WHITE },
+    { ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK },
+    { ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK, ST7305_COLOR_BLACK },
+};
+
+/* ★★★ 2026-10-25 linit: 画面优化器 —— shade→黑点数 由用户曲线决定, 图案运行时生成.
+ *   "点聚/散点" 只决定**黑点落哪几个象限**, 黑点个数(0..4)来自 vid_tune 的曲线。
+ *   这样 GB/GBC/NES/MD/SMS 全部走同一张表, 一处可调处处生效。 */
+static uint8_t s_tune_pat[4][4];
+/* 档间门限 (灰阶 0..6368), 由**当前抖动图案的实际白点占比**反算, 见 apply_tune.
+ * 不能写死: 黑点数由 vid_tune 曲线决定, 曲线一变档位亮度就变, 门限必须跟着变.
+ * 初值 = dots{0,1,2,3} 对应的一组, 仅在 apply_tune 跑之前有效 (正常不会用到). */
+static uint16_t s_shade_thr[3] = { 5572, 3980, 2388 };
+static void board_shim_apply_tune(void)
+{
+    uint8_t dots[4] = { 0, 1, 2, 3 };
+    vid_tune_init();   /* 幂等: 保证 set_gb_gray 早于 set_lcd 时也能拿到默认曲线 */
+    vid_tune_get_dots(dots);
+    static const uint8_t ord_cluster[4] = { 0, 1, 2, 3 };   /* 左上 右上 左下 右下 (聚成块) */
+    static const uint8_t ord_scatter[4] = { 0, 3, 1, 2 };   /* 左上 右下 右上 左下 (对角散开) */
+    const uint8_t *ord = (g_gb_gray == 2) ? ord_scatter : ord_cluster;
+    for (int sh = 0; sh < 4; sh++) {
+        for (int q = 0; q < 4; q++) s_tune_pat[sh][q] = ST7305_COLOR_WHITE;
+        for (int k = 0; k < dots[sh] && k < 4; k++)
+            s_tune_pat[sh][ord[k]] = ST7305_COLOR_BLACK;
+    }
+
+    /* 档位实际亮度 = 6368 * 白点数 / 4 (白点 4-dots 个), 6368/4 = 1592 整除.
+     * 门限取相邻两档中点 ⇒ "离哪一档最近就归哪一档".
+     * 纯黑白档不吃曲线, 等效黑点数 0,0,4,4 ⇒ 门限 6368/3184/0 (= 原来的 3184 分界). */
+    uint8_t eff[4];
+    if (g_gb_gray == 0) {
+        eff[0] = 0; eff[1] = 0; eff[2] = 4; eff[3] = 4;
+    } else {
+        for (int sh = 0; sh < 4; sh++) eff[sh] = (uint8_t)(dots[sh] > 4 ? 4 : dots[sh]);
+    }
+    uint16_t lum[4];
+    for (int sh = 0; sh < 4; sh++) lum[sh] = (uint16_t)(1592U * (4U - eff[sh]));
+    for (int sh = 0; sh < 3; sh++)
+        s_shade_thr[sh] = (uint16_t)((lum[sh] + lum[sh + 1]) / 2U);
+    /* 防御: 曲线理论上单调 (vid_tune 已夹住), 真出现反向也不能让档位乱序 */
+    for (int sh = 1; sh < 3; sh++)
+        if (s_shade_thr[sh] > s_shade_thr[sh - 1]) s_shade_thr[sh] = s_shade_thr[sh - 1];
+
+    /* ★ 2026-10-30: 把同一条 dots 曲线交给 gray_quant，Bayer 的填充率也算成
+     *   dots*4/16（= dots/4），与 2x2 点聚**完全等价** ⇒ 换算法不改整体亮度，
+     *   A/B 对比才是公平的（不会"因为亮了所以觉得好看"）。 */
+    gray_quant_set_density(dots);
+    gray_quant_rebuild();
+
+    board_shim_rebuild_nes_rowbits();
+}
+
+/* 按当前灰度模式取 shade 对应的 2x2 图案:
+ *   0 = 纯黑白 → s_cluster_bw (不吃曲线)
+ *   1/2 = 点聚/散点 → s_tune_pat (位置无关)
+ *   Bayer 算法 → gray_quant_pat (位置相关, 见上)
+ * sx/sy 是**源像素的绝对屏幕坐标**, 不是"本行第几个"。 */
+static const uint8_t *board_shim_pat_get(uint8_t shade, int sx, int sy)
+{
+    shade &= 0x03;
+    if (g_gb_gray == 0) return s_cluster_bw[shade];
+    if (gray_quant_alg() == GRAY_ALG_BAYER_4X4) return gray_quant_pat(shade, sx, sy);
+    return s_tune_pat[shade];
+}
+
+/* 按当前灰度模式取 shade 对应的 2x2 图案: 0=纯黑白, 1=点聚灰度, 2=散点抖动 */
+/* (2026-10-30: 旧的 board_shim_cluster_get 已并入 board_shim_pat_get —— 全部绘制路径
+ *  都改成带位置参数的版本, 只留一个入口, 免得再出现"某条路径没跟上算法切换"。) */
+
+/* ★ 2026-10-30 灰阶算法切换 (remcon `gray 0|1`)。切完必须重建表 + 强制整屏重画,
+ *   否则屏上是旧算法的残留, 而指纹会判定"内容没变"直接跳过刷新。 */
+void board_shim_set_gray_alg(int alg)
+{
+    gray_quant_set_alg(alg == 1 ? GRAY_ALG_BAYER_4X4 : GRAY_ALG_CLUSTER_2X2);
+    gray_quant_rebuild();
+    board_shim_rebuild_nes_rowbits();
+    st7305_invalidate_frame();     /* 作废整帧/竖屏指纹 ⇒ 下一帧强制整屏发 */
+}
+
+int board_shim_get_gray_alg(void)
+{
+    return gray_quant_alg() == GRAY_ALG_BAYER_4X4 ? 1 : 0;
+}
+
+static void board_shim_rebuild_nes_rowbits(void)
+{
+    /* ★ 2026-10-30: 加一维 x 相位, 让 NES 也能用位置相关的 Bayer 图案。
+     *   cluster 模式两相位填同样的值 ⇒ 行为与改前逐字节一致(见 tests/gray_quant 的对照用例)。
+     *
+     * 相位换算(与两处热循环保持一致, 别单独改一边):
+     *   local_y = inv & 3 = (ST7305_HEIGHT-1-yy) & 3 = (3-yy)&3  ⇒  yy&3 = (3-local_y)&3
+     *   块内行偏移 dy = yy&1；块行奇偶 yph = (yy&3)>>1
+     *   字节覆盖物理列 2cp、2cp+1 ⇒ 同一块 sx=cp, xph = cp&1 */
+    for (int ly = 0; ly < 4; ly++) {
+        const int yph = ((3 - ly) & 3) >> 1;
+        for (int par = 0; par < 2; par++) {
+            for (int pair = 0; pair < 16; pair++) {
+                uint8_t s0 = (uint8_t)(pair >> 2);
+                uint8_t s1 = (uint8_t)(pair & 3);
+                uint8_t bit0 = (uint8_t)(7U - (ly << 1));
+                uint8_t bit1 = (uint8_t)(7U - ((ly << 1) | 1U));
+                for (int xph = 0; xph < 2; xph++) {
+                    const uint8_t *p0 = board_shim_pat_get(s0, xph, yph);
+                    const uint8_t *p1 = board_shim_pat_get(s1, xph, yph);
+                    uint8_t b = 0;
+                    if (p0[(par << 1) | 0] == ST7305_COLOR_WHITE) b |= (uint8_t)(1U << bit0);
+                    if (p1[(par << 1) | 1] == ST7305_COLOR_WHITE) b |= (uint8_t)(1U << bit1);
+                    s_rowbits[ly][par][pair][xph] = b;
+                }
+            }
+        }
+    }
+}
+
+esp_err_t board_rlcd_draw_gb_line_2x(int x, int y, const uint8_t *pixels, int width) {
+    if (!s_lcd || !s_lcd->fb || !pixels) return ESP_ERR_INVALID_ARG;
+
+    uint8_t *fb = s_fb_stage;
+    const uint16_t start_byte_x = (uint16_t)(x >> 1);
+
+    /* Row 0 (y) */
+    uint16_t inv_y0 = (uint16_t)(ST7305_HEIGHT - 1 - y);
+    uint16_t block_y0 = inv_y0 >> 2;
+    uint8_t local_y0 = inv_y0 & 3U;
+    uint8_t bit0 = (uint8_t)(7U - (local_y0 << 1));
+    uint8_t left_mask0 = (uint8_t)(1U << bit0);
+    uint8_t right_mask0 = (uint8_t)(1U << (bit0 - 1U));
+
+    /* Row 1 (y+1) */
+    uint16_t inv_y1 = (uint16_t)(ST7305_HEIGHT - 1 - (y + 1));
+    uint16_t block_y1 = inv_y1 >> 2;
+    uint8_t local_y1 = inv_y1 & 3U;
+    uint8_t bit1 = (uint8_t)(7U - (local_y1 << 1));
+    uint8_t left_mask1 = (uint8_t)(1U << bit1);
+    uint8_t right_mask1 = (uint8_t)(1U << (bit1 - 1U));
+
+    for (int dx = 0; dx < width; dx++) {
+        uint32_t index0 = (uint32_t)(start_byte_x + dx) * FB_HEIGHT_DIV_4 + block_y0;
+        uint32_t index1 = (uint32_t)(start_byte_x + dx) * FB_HEIGHT_DIV_4 + block_y1;
+
+        uint8_t shade = pixels[dx] & 0x03;
+        /* 位置用**源像素绝对屏幕坐标**: x 方向 = start_byte_x+dx, y 方向 = 块行 y>>1。
+         * CLUSTER 模式忽略这两个参数(图案与位置无关), 行为与改前一致。 */
+        const uint8_t *d = board_shim_pat_get(shade, start_byte_x + dx, y >> 1);
+
+        /* top-left, top-right */
+        write_masked_pixel(fb, index0, left_mask0, d[0]);
+        write_masked_pixel(fb, index0, right_mask0, d[1]);
+        /* bottom-left, bottom-right */
+        write_masked_pixel(fb, index1, left_mask1, d[2]);
+        write_masked_pixel(fb, index1, right_mask1, d[3]);
+    }
+
+    return ESP_OK;
+}
+
+
+/* V1.0.46: GB 模拟器 1x 点对点绘制 (游戏全屏关闭时用, 单行单列) */
+/* === GBC RGB565 (BE) → 1bit 绘制 (直接移植参考项目 board_rlcd.cpp) ===
+ *
+ * gnuboy 以 GB_PIXEL_565_BE 输出 RGB565; 这里把每像素转成 4 级灰度 shade,
+ * 再复用 GB 的 2x2 抖动表 (s_dither_table) 画到 1bit fb, 2x 缩放.
+ */
+static inline uint8_t board_rlcd_rgb565_be_to_gbc_shade(uint16_t rgb565_be)
+{
+    uint16_t rgb = (uint16_t)((rgb565_be >> 8) | (rgb565_be << 8));
+    uint8_t r5 = (uint8_t)((rgb >> 11) & 0x1FU);
+    uint8_t g6 = (uint8_t)((rgb >> 5) & 0x3FU);
+    uint8_t b5 = (uint8_t)(rgb & 0x1FU);
+    uint16_t gray = (uint16_t)(r5 * 38U + g6 * 75U + b5 * 15U);
+
+    /* 分界取"相邻两档实际显示亮度"的中点, 而不是把量程四等分.
+     * 每档 2x2 图案的白点占比决定其实际亮度 (量程满分 6368 = 31*38+63*75+31*15).
+     * 2026-10-28: 黑点数已由 vid_tune 曲线决定, 档位亮度随之变化, 故门限改为
+     *   board_shim_apply_tune() 里按当前 dots 反算的 s_shade_thr[3], 不再写死.
+     *   (原写死值 5572/3980/2388 对应 dots{0,1,2,3}; 默认曲线是 {0,1,3,4},
+     *    真实亮度 6368/4776/1592/0 ⇒ 门限应为 5572/3184/796, 写死会整体偏暗一档.) */
+    if (gray >= s_shade_thr[0]) return 0;
+    if (gray >= s_shade_thr[1]) return 1;
+    if (gray >= s_shade_thr[2]) return 2;
+    return 3;
+}
+
+esp_err_t board_rlcd_draw_gbc_line_2x_rgb565_be_to(uint8_t *fb, int x, int y,
+                                                   const uint16_t *pixels, int width) {
+    if (!fb || !pixels) return ESP_ERR_INVALID_ARG;
+    if ((x & 1U) != 0) return ESP_ERR_INVALID_ARG;
+
+    const uint16_t start_byte_x = (uint16_t)(x >> 1);
+
+    /* Row 0 (y) */
+    uint16_t inv_y0 = (uint16_t)(ST7305_HEIGHT - 1 - y);
+    uint16_t block_y0 = inv_y0 >> 2;
+    uint8_t local_y0 = inv_y0 & 3U;
+    uint8_t bit0 = (uint8_t)(7U - (local_y0 << 1));
+    uint8_t left_mask0 = (uint8_t)(1U << bit0);
+    uint8_t right_mask0 = (uint8_t)(1U << (bit0 - 1U));
+
+    /* Row 1 (y+1) */
+    uint16_t inv_y1 = (uint16_t)(ST7305_HEIGHT - 1 - (y + 1));
+    uint16_t block_y1 = inv_y1 >> 2;
+    uint8_t local_y1 = inv_y1 & 3U;
+    uint8_t bit1 = (uint8_t)(7U - (local_y1 << 1));
+    uint8_t left_mask1 = (uint8_t)(1U << bit1);
+    uint8_t right_mask1 = (uint8_t)(1U << (bit1 - 1U));
+
+    uint32_t index0 = (uint32_t)start_byte_x * FB_HEIGHT_DIV_4 + block_y0;
+    uint32_t index1 = (uint32_t)start_byte_x * FB_HEIGHT_DIV_4 + block_y1;
+    for (int dx = 0; dx < width; dx++) {
+        uint8_t shade = board_rlcd_rgb565_be_to_gbc_shade(pixels[dx]);
+        const uint8_t *d = board_shim_pat_get(shade, start_byte_x + dx, y >> 1);
+        write_masked_pixel(fb, index0, left_mask0, d[0]);
+        write_masked_pixel(fb, index0, right_mask0, d[1]);
+        write_masked_pixel(fb, index1, left_mask1, d[2]);
+        write_masked_pixel(fb, index1, right_mask1, d[3]);
+        index0 += FB_HEIGHT_DIV_4;
+        index1 += FB_HEIGHT_DIV_4;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t board_rlcd_draw_gbc_line_2x_rgb565_be(int x, int y, const uint16_t *pixels, int width)
+{
+    if (!s_lcd || !s_lcd->fb) return ESP_ERR_INVALID_ARG;
+    return board_rlcd_draw_gbc_line_2x_rgb565_be_to(s_lcd->fb, x, y, pixels, width);
+}
+
+/* GB/GBC 强制拉伸全屏: RGB565(小端) 160x144 -> 400x300 最近邻, 复用 rowbits 查表打包 */
+esp_err_t board_rlcd_draw_gbc_stretch(const uint16_t *buf_le, int src_w, int src_h)
+{
+    if (!s_lcd || !s_lcd->fb || !buf_le || !s_fb_stage || !s_nes_disp ||
+        src_w <= 0 || src_h <= 0)
+        return ESP_ERR_INVALID_ARG;
+
+    if (!board_scale_map_ensure()) return ESP_ERR_NO_MEM;
+    uint8_t *row_map    = s_scale_map;
+    uint8_t *col_map    = s_scale_map + ST7305_HEIGHT;
+    uint8_t *scaled_row = col_map + ST7305_WIDTH;
+    if (s_scale_cached_w != src_w || s_scale_cached_h != src_h) {
+        for (int y = 0; y < ST7305_HEIGHT; y++)
+            row_map[y] = (uint8_t)((uint32_t)y * (uint32_t)src_h / ST7305_HEIGHT);
+        for (int x = 0; x < ST7305_WIDTH; x++)
+            col_map[x] = (uint8_t)((uint32_t)x * (uint32_t)src_w / ST7305_WIDTH);
+        s_scale_cached_w = src_w;
+        s_scale_cached_h = src_h;
+    }
+
+    /* 1) 源帧 RGB565 -> 2bit 打包灰度, 放内部 RAM (逐行顺序读 PSRAM, 缓存友好) */
+    int64_t t_pack0 = esp_timer_get_time();
+    uint8_t *packed = s_nes_disp;
+    int pw = src_w >> 2;
+    for (int sy = 0; sy < src_h; sy++) {
+        const uint16_t *row = buf_le + sy * src_w;
+        uint8_t *pd = packed + sy * pw;
+        for (int px = 0; px < src_w; px += 4) {
+            uint8_t b = 0;
+            for (int k = 0; k < 4; k++) {
+                uint16_t be = (uint16_t)((row[px + k] << 8) | (row[px + k] >> 8));
+                b |= (uint8_t)(board_rlcd_rgb565_be_to_gbc_shade(be) << (k * 2));
+            }
+            pd[px >> 2] = b;
+        }
+    }
+
+    /* 2) 打包帧最近邻拉伸 -> 内部 FB 暂存 -> 一次写回 PSRAM */
+    s_gbc_pack_us = esp_timer_get_time() - t_pack0;
+    int64_t t_scale0 = esp_timer_get_time();
+    uint8_t *fb = s_fb_stage;
+    memset(fb, 0, NES_FB_BYTES);
+    int py = 0;
+    for (int sy = 0; sy < src_h; sy++) {
+        while (py < ST7305_HEIGHT && row_map[py] < sy) py++;
+        int py0 = py;
+        while (py < ST7305_HEIGHT && row_map[py] == sy) py++;
+        int py1 = py - 1;
+        if (py0 > py1) continue;
+
+        const uint8_t *prow = packed + sy * pw;
+        for (int px = 0; px < ST7305_WIDTH; px++) {
+            int sx = col_map[px];
+            scaled_row[px] = (uint8_t)((prow[sx >> 2] >> ((sx & 3) << 1)) & 3);
+        }
+
+        for (int yy = py0; yy <= py1; yy++) {
+            uint32_t inv = ST7305_HEIGHT - 1 - (uint32_t)yy;
+            uint32_t block_y = inv >> 2;
+            uint8_t local_y = inv & 3U;
+            const uint8_t (*rbt)[2] = s_rowbits[local_y][yy & 1];   /* [pair][xph] */
+            uint32_t idx = block_y;   /* 增量索引, 避免每字节乘 75 */
+            for (int cp = 0; cp < ST7305_WIDTH / 2; cp++) {
+                uint8_t pair = (uint8_t)((scaled_row[cp << 1] << 2) |
+                                         scaled_row[(cp << 1) | 1]);
+                fb[idx] |= rbt[pair][cp & 1];   /* xph = cp&1 (同一字节两列属同一块) */
+                idx += FB_HEIGHT_DIV_4;
+            }
+        }
+    }
+    memcpy(s_lcd->fb, fb, NES_FB_BYTES);
+    s_gbc_scale_us = esp_timer_get_time() - t_scale0;
+    return ESP_OK;
+}
+
+esp_err_t board_rlcd_draw_gb_line_to(uint8_t *fb, int x, int y,
+                                     const uint8_t *pixels, int width) {
+    if (!fb || !pixels) return ESP_ERR_INVALID_ARG;
+
+    uint16_t inv_y = (uint16_t)(ST7305_HEIGHT - 1 - y);
+    uint16_t block_y = inv_y >> 2;
+    uint8_t local_y = inv_y & 3U;
+
+    for (int dx = 0; dx < width; dx++) {
+        /* V1.0.53 修复: 1x 每像素占半个字节 (2列x4行布局),
+         * 字节索引 = (x>>1), 位 = 7-((y_sub<<1)|(x&1)).
+         * 旧实现按 dx 递增字节索引且固定左列位, 导致画面横向错位/花屏. */
+        int x_abs = x + dx;
+        uint32_t index = (uint32_t)(x_abs >> 1) * FB_HEIGHT_DIV_4 + block_y;
+        uint8_t bit = (uint8_t)(7U - ((local_y << 1) | (x_abs & 1)));
+        uint8_t mask = (uint8_t)(1U << bit);
+        uint8_t shade = pixels[dx] & 0x03;
+        /* 1x 点对点: 每像素仅 1 个物理点, 无法用 2x2 点聚, 直接取黑白档色 */
+        uint8_t color = s_cluster_bw[shade][0];
+        write_masked_pixel(fb, index, mask, color);
+    }
+    return ESP_OK;
+}
+
+esp_err_t board_rlcd_draw_gb_line(int x, int y, const uint8_t *pixels, int width)
+{
+    if (!s_lcd || !s_lcd->fb) return ESP_ERR_INVALID_ARG;
+    return board_rlcd_draw_gb_line_to(s_lcd->fb, x, y, pixels, width);
+}
+
+/* NES 拉伸全屏 (输入为 2bit 打包帧, 位于内部 RAM):
+ * 最近邻缩放 256x224 -> 400x300, 用 rowbits 查表把"2 像素"合成 2 个物理位,
+ * 在内部 FB 暂存里 OR 出整字节, 最后一次性 memcpy 到 PSRAM FB.
+ * FB 布局: index = (x>>1)*75 + ((HEIGHT-1-y)>>2), bit=1 白 / 0 黑. */
+esp_err_t board_rlcd_draw_nes_scaled(const uint8_t *shade, int src_w, int src_h)
+{
+    if (!s_lcd || !s_lcd->fb || !shade || !s_fb_stage || src_w <= 0 || src_h <= 0)
+        return ESP_ERR_INVALID_ARG;
+    int64_t t_scale0 = esp_timer_get_time();
+
+    if (!board_scale_map_ensure()) return ESP_ERR_NO_MEM;
+    uint8_t *row_map    = s_scale_map;
+    uint8_t *col_map    = s_scale_map + ST7305_HEIGHT;
+    uint8_t *scaled_row = col_map + ST7305_WIDTH;
+    if (s_scale_cached_w != src_w || s_scale_cached_h != src_h) {
+        for (int y = 0; y < ST7305_HEIGHT; y++)
+            row_map[y] = (uint8_t)((uint32_t)y * (uint32_t)src_h / ST7305_HEIGHT);
+        for (int x = 0; x < ST7305_WIDTH; x++)
+            col_map[x] = (uint8_t)((uint32_t)x * (uint32_t)src_w / ST7305_WIDTH);
+        s_scale_cached_w = src_w;
+        s_scale_cached_h = src_h;
+    }
+
+    uint8_t *fb = s_fb_stage;
+    memset(fb, 0, NES_FB_BYTES);
+
+    int py = 0;
+    for (int sy = 0; sy < src_h; sy++) {
+        while (py < ST7305_HEIGHT && row_map[py] < sy) py++;
+        int py0 = py;
+        while (py < ST7305_HEIGHT && row_map[py] == sy) py++;
+        int py1 = py - 1;
+        if (py0 > py1) continue;
+
+        const uint8_t *src_row = shade + ((size_t)sy * src_w >> 2);
+        for (int px = 0; px < ST7305_WIDTH; px++) {
+            int sx = col_map[px];
+            scaled_row[px] = (uint8_t)((src_row[sx >> 2] >> ((sx & 3) << 1)) & 3);
+        }
+
+        for (int yy = py0; yy <= py1; yy++) {
+            uint32_t inv = ST7305_HEIGHT - 1 - (uint32_t)yy;
+            uint32_t block_y = inv >> 2;
+            uint8_t local_y = inv & 3U;
+            const uint8_t (*rbt)[2] = s_rowbits[local_y][yy & 1];   /* [pair][xph] */
+            for (int cp = 0; cp < ST7305_WIDTH / 2; cp++) {
+                uint8_t pair = (uint8_t)((scaled_row[cp << 1] << 2) |
+                                         scaled_row[(cp << 1) | 1]);
+                fb[(uint32_t)cp * FB_HEIGHT_DIV_4 + block_y] |= rbt[pair][cp & 1];
+            }
+        }
+    }
+
+    memcpy(s_lcd->fb, fb, NES_FB_BYTES);
+    s_nes_scale_us = esp_timer_get_time() - t_scale0;
+    return ESP_OK;
+}
+
+/* NES 1x 点对点绘制 (非全屏): pixels 指向一行 2bit 打包数据 */
+esp_err_t board_rlcd_draw_nes_line_1x_to(uint8_t *fb, int x, int y,
+                                        const uint8_t *row_packed, int width)
+{
+    if (!fb || !row_packed) return ESP_ERR_INVALID_ARG;
+
+    uint16_t inv_y = (uint16_t)(ST7305_HEIGHT - 1 - y);
+    uint16_t block_y = inv_y >> 2;
+    uint8_t local_y = inv_y & 3U;
+
+    for (int dx = 0; dx < width; dx++) {
+        int x_abs = x + dx;
+        uint32_t index = (uint32_t)(x_abs >> 1) * FB_HEIGHT_DIV_4 + block_y;
+        uint8_t bit = (uint8_t)(7U - ((local_y << 1) | (x_abs & 1)));
+        uint8_t mask = (uint8_t)(1U << bit);
+        uint8_t shade = (uint8_t)((row_packed[dx >> 2] >> ((dx & 3) << 1)) & 3);
+        /* 1x 点对点: 每个物理像素取 2x2 图案里与自己位置相符的那一格。
+         * 用绝对坐标 (x_abs>>1, y>>1) 定位块 ⇒ Bayer 模式下阈值随屏幕位置走。 */
+        const uint8_t *d = board_shim_pat_get(shade, x_abs >> 1, y >> 1);
+        uint8_t pos = (uint8_t)(((y & 1) << 1) | (x_abs & 1));
+        write_masked_pixel(fb, index, mask, d[pos]);
+    }
+    return ESP_OK;
+}
+
+esp_err_t board_rlcd_flush_area(int x1, int y1, int x2, int y2) {
+    (void)x1; (void)y1; (void)x2; (void)y2;
+    if (!s_lcd) return ESP_ERR_INVALID_STATE;
+    return st7305_flush(s_lcd);
+}
+
+/* === board_speaker 兼容接口 === */
+
+esp_err_t board_speaker_init(const board_speaker_config_t *config) {
+    (void)config;
+    ESP_LOGI(TAG, "board_speaker_init (转发到 audio_player, 已初始化)");
+    return ESP_OK;
+}
+
+esp_err_t board_speaker_write(const void *pcm, size_t bytes, size_t *bytes_written, int timeout_ms) {
+    (void)timeout_ms;
+    size_t frames = bytes / 4;
+    size_t written = audio_player_feed_pcm((const int16_t *)pcm, frames, 24000);
+    if (bytes_written) *bytes_written = written * 4;
+    return ESP_OK;
+}
+
+esp_err_t board_speaker_set_volume(uint8_t volume) {
+    audio_player_set_volume(volume);
+    return ESP_OK;
+}
+
+esp_err_t board_speaker_self_test(void) {
+    return ESP_OK;
+}

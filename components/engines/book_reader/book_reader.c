@@ -1,0 +1,3757 @@
+/* 电子书阅读器 V3 (移植 libunibreak 排版内核)
+ * - 排版内核: libunibreak 7.0 (Unicode UAX#14 断行, KOReader 同款), 中文避头尾
+ * - 解码: UTF-8 / GBK / UTF-16 LE/BE (book_flow 内核, 固件与主机测试共用)
+ * - 不再整本载入: 流式索引页偏移表 + 按页窗口渲染, 后台渐进索引, sidecar 秒开
+ * - 进度/书签 (.pos): 断点续读 + 手动书签; 目录: 章节识别 (第X章/Chapter/Vol)
+ * - 按键: 右/下/确认 = 下一页, 左/上 = 上一页, BACK/HOME = 退出,
+ *         KEY 长按 (LONG_LEFT) = 阅读菜单 (目录/添加书签/书签列表/返回阅读)
+ */
+#include "book_reader.h"
+
+/* V1.0.68: 输入层屏幕旋转 (触摸跟随旋转) */
+extern void input_set_screen_rotation(int rot);
+/* 2026-10-30: 屏保进入时会把全局 UI 拉回 400×300 (os_screensaver_force_enter),
+ * 阅读器每帧重绘时把自己的方向同步回去, 否则唤醒后菜单/弹窗布局与正文方向不一致。
+ * ★ 2026-11-22: 改用 ui_set_rotation_mode(rot) —— 宽高判据在 ui_common 里唯一存在,
+ *   本文件不再自己写 `rot==2||rot==3`。 */
+extern void ui_set_portrait(bool on);
+extern void ui_set_rotation_mode(int rot);
+extern void input_set_swipe_turn(bool enable);   /* 阅读器横滑翻页开关 */
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include "esp_task_wdt.h"
+
+#include "svc_nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include "audio_player.h"
+#include "font_book.h"
+#include "lbf.h"      /* lbf_peek: 列表里读字体自报的名字 */
+#include "utf8_util.h" /* utf8_align/utf8_drop_last: 字符边界唯一实现 (fonts 组件) */
+#include "book_flow.h"
+#include "fb2_convert.h"
+#include "epub_convert.h"
+#include "input.h"
+#include "vibrator.h"    /* 2026-11-22: 「阅读优化 → 震动」= 阅读页点击/翻页静音闸门 */
+#include "ui_scroll.h"   /* 2026-11-22: 弹窗列表滚动统一走 ui_scroll (docs/规范/列表滚动规范.md) */
+
+static const char *TAG = "BOOK";
+
+/* 与 menu_system.h 的 menu_action_t 保持一致 (避免组件循环依赖) */
+enum {
+    BOOK_ACTION_NONE = 0,
+    BOOK_ACTION_UP = 1,
+    BOOK_ACTION_DOWN = 2,
+    BOOK_ACTION_LEFT = 3,
+    BOOK_ACTION_RIGHT = 4,
+    BOOK_ACTION_CONFIRM = 5,
+    BOOK_ACTION_BACK = 6,
+    BOOK_ACTION_HOME = 7,
+    BOOK_ACTION_LONG_LEFT = 8,
+};
+
+/* 上限 (防病态文件) */
+#define BOOK_MAX_FILE       (512u * 1024 * 1024)   /* 单本上限 512MB */
+#define BOOK_MAX_PAGES      (524288u)              /* B4: 页表上限 2MB PSRAM(524288×4B); 实际按需翻倍增长, 小书远小于此 */
+#define BOOK_MAX_CHAPTERS   3000u
+#define BOOK_MAX_BOOKMARKS  8u
+#define BOOK_WIN_SIZE       (64 * 1024)            /* 渲染窗口 (最大) */
+#define BOOK_MAX_WIN_READ   (8 * 1024)             /* 单次渲染 SD 读上限: 一屏仅数百字节, 8KB 足够且秒读 */
+#define BOOK_SCAN_CHUNK     (32 * 1024)            /* 索引读缓冲 */
+#define BOOK_SCAN_STEP      (256u * 1024)          /* 后台任务每步扫描量 */
+#define BOOK_FIRST_CHUNK    (48u * 1024)           /* 打开时同步索引量 (提速进入) */
+#define BOOK_TOC_REBUILD_MIN 5u                    /* 侧边索引目录数低于此视为旧缓存, 打开后后台重建目录 */
+
+#define BOOK_CONTENT_X0   8
+#define BOOK_CONTENT_Y0   2                    /* 全屏: 无标题栏 */
+/* 竖屏布局 (旋转 90/270): 逻辑 300 宽 x 400 高, 17 列 x 22 行 */
+#define BOOK_PORTRAIT_W      300
+#define BOOK_PORTRAIT_H      400
+
+#define FLOW_SCRATCH_SIZE   (BF_MAX_WIN * 8 + 8)
+
+/* === 阅读器状态 === */
+static bool         s_open = false;
+static FILE        *s_fp = NULL;          /* 渲染句柄 (整个阅读期间保持) */
+EXT_RAM_BSS_ATTR static char         s_path[256] = {0};
+EXT_RAM_BSS_ATTR static char         s_src_path[320] = {0}; /* 实际阅读源 (FB2 时为转换缓存) */
+static uint32_t     s_file_size = 0;
+static uint32_t     s_src_size = 0;         /* 实际阅读源字节数 (FB2 为缓存) */
+static uint32_t     s_mtime = 0;
+static uint32_t     s_file_start = 0;     /* BOM 跳过后的起始偏移 */
+static uint8_t      s_enc = BF_ENC_UTF8;
+
+static uint32_t    *s_page_off = NULL;    /* PSRAM 页偏移表 */
+static uint32_t     s_page_cap = 0;
+static uint32_t     s_page_count = 0;     /* 已索引页数 (锁保护) */
+static uint32_t     s_page = 0;
+static uint32_t     s_indexed_bytes = 0;  /* 索引已扫描字节 (进度显示) */
+static volatile bool s_index_done = false;
+static volatile bool s_index_error = false;
+static uint32_t     s_resume_off = 0;     /* 侧边索引断点续扫位置 */
+
+static uint8_t     *s_win = NULL;         /* 渲染窗口 PSRAM */
+static uint32_t     s_win_base = 0;
+static uint32_t     s_win_len = 0;
+
+/* 索引任务工作区 (与渲染工作区分离, 避免并发冲突) */
+static uint8_t     *s_scan_chunk = NULL;
+static bf_ch_t     *s_scan_win = NULL;
+static uint8_t     *s_scan_brk = NULL;
+static uint8_t     *s_scan_scratch = NULL;
+static uint32_t    *s_scan_off = NULL;
+/* 渲染工作区 */
+static bf_ch_t     *s_rwin = NULL;
+static uint8_t     *s_rbrk = NULL;
+static uint8_t     *s_rscratch = NULL;
+
+static char         s_title[64] = {0};
+
+/* === 章节表 === */
+typedef struct {
+    uint32_t off;
+    char     title[32];      /* 按文件原编码 (UTF-8 或 GBK) */
+} book_chapter_t;
+static book_chapter_t *s_chapters = NULL;
+static uint32_t s_chapter_cap = 0;
+static uint32_t s_chapter_count = 0;
+
+/* === 书签 === */
+typedef struct {
+    uint32_t off;
+    uint32_t page;
+    char     title[32];
+} book_bm_t;
+EXT_RAM_BSS_ATTR static book_bm_t   s_bms[BOOK_MAX_BOOKMARKS];
+static uint32_t    s_bm_count = 0;
+static uint32_t    s_loaded_page = 0;     /* 断点续读页 */
+static uint32_t    s_last_saved_page = 0; /* 上次落盘页 */
+/* ★ B5 (2026-10-30): 脏标记 + 保存节拍。策略 = 翻 3 页 或 距上次 20 秒 或 强制(退出/跳转) */
+static bool        s_prog_dirty = false;
+static uint32_t    s_last_save_ms = 0;
+#define PROG_SAVE_PAGES  3
+#define PROG_SAVE_MS     20000u
+
+/* === 索引任务同步 === */
+static SemaphoreHandle_t s_idx_mutex = NULL;
+static TaskHandle_t s_idx_task = NULL;
+static volatile bool s_idx_stop = false;
+static bool          s_toc_prescanned = false;   /* 章节目录已由预扫描填满, 分页不再重复追加 */
+
+/* === 阅读菜单 === */
+/* ★ 2026-10-31: 加 BM_SIZE —— 字号选择仍然放在阅读器二级弹窗里（linit 要求配置
+ *   全部留在弹窗内，不要搬到书库）。它读的是**当前字体的真实字号表**，
+ *   所以 8px 字体只会列出 8px / 16px。 */
+enum { BM_READ = 0, BM_MENU = 1, BM_TOC = 2, BM_BMKS = 3, BM_FONT = 4, BM_PCT = 5, BM_SIZE = 6 };
+static uint8_t      s_menu = BM_READ;
+static uint32_t     s_menu_sel = 0;
+/* ★ 2026-11-22 (linit): 纯触屏设备**默认不显示任何选中高亮**。
+ *   判据照全项目唯一口径 input_scheme_touch()（os_dialog / page_app_manager 都用它）:
+ *     · 接了手柄 → 手柄方案，一直画高亮 + 方向键移动（用户要求"手柄点完才算选中"）；
+ *     · 只有触屏 → 触屏方案，打开菜单时列表里没有黑底反白行（"当前章"方块属事实标记，保留）。
+ *   例外: 触屏方案下用户真按了方向键/确认键 ⇒ 打开高亮(s_menu_sel_on)，否则硬件键操作时
+ *   看不见光标。它只是"按键光标"开关，与"默认选中"无关。 */
+static bool         s_menu_sel_on = false;
+static bool bm_sel_visible(void) { return !input_scheme_touch() || s_menu_sel_on; }
+/* s_menu_scroll / s_menu_pix 是 ui_scroll 控制器的**镜像**, 不是第二份真相:
+ * 每帧由 bm_sc_read() 从 s_bm_sc.off 反算 (scroll=首行, pix=行内像素 0..row_h-1),
+ * 绘制与命中的行号都读它们。★ 2026-11-22 重写: 以前这三个量跟 s_drag_* 各写一套,
+ * 是"点了没反应/点错行"的根源。 */
+static uint32_t     s_menu_scroll = 0;
+static int          s_menu_pix = 0;
+static char         s_menu_msg[40] = {0};
+static bool         s_exit_confirm = false;   /* 返回菜单键退出确认 */
+/* 弹窗列表滚动物理 (与主界面列表/系统弹窗同一套: docs/规范/列表滚动规范.md) */
+static ui_scroll_t  s_bm_sc;
+static bool         s_bm_sc_rdy = false;
+static int          s_bm_sc_cnt = -1;         /* 控制器当前装载的条目数 */
+static int          s_bm_sc_vh  = -1;         /* 控制器当前装载的可视高 */
+static int          s_bm_sc_sel = -1;         /* 控制器上次见过的选中项 (判断"外部改了选中") */
+static bool         s_bm_armed = false;       /* 本次按下始于列表区 (只滚列表, 不抢框外手势) */
+#define TOC_PER_PAGE  50                      /* 目录每页显示章数 */
+#define TOC_PAGER_H   30                      /* 目录底部页码条高度 */
+static uint32_t     s_toc_page = 0;           /* 目录页码 (0 起) */
+
+/* V1.0.88: TF 卡字体 
+ * V1.0.96: s_sd_fonts 移到 PSRAM (仅在字体选择/扫描时用, 低频, 省 1KB 内部 RAM). */
+/* ★ 2026-10-30: 上限从写死的 16 提为宏，并扩到 32。
+ *   原来 16 刚好等于本地字体个数，往卡里再加一款就"看不见"了，像坏了。
+ *   占用都在 PSRAM（EXT_RAM_BSS_ATTR），内部 RAM 不受影响：
+ *     32*(64+40) = 3.3KB，比原来的 1.6KB 多 1.7KB PSRAM。
+ *   仍然只存"文件名 + 显示名"，不加载任何字形数据 —— 字体本体还是按需 fseek+fread。 */
+/* ★★★ 2026-10-31: 字体显示名中文化（只做显示层，不碰 LBF 文件、不改持久化路径）。
+ *   LBF 头里的 name 是制作者写的全名（"GNU Unifont16" / "文泉驿点阵宋16"），
+ *   在 400×300 的菜单里一眼放不下 8~9 个字；这里按来源换成 4~6 个汉字的短名，
+ *   数字后缀（字号）保留，因为同一字体不同尺寸必须能区分。
+ *   规则来自 linit 给的表：Fusion→融合像素、Unifont→通用点阵、文泉驿→文泉驿… */
+/* 2026-10-31: 短名映射已上移到 font_book.c (font_book_short_name) ——
+ *   书架「阅读优化 → 字体」滚轮要用同一份实现, 不能两处各写一套。 */
+
+#define SD_FONT_MAX 32
+EXT_RAM_BSS_ATTR static char s_sd_fonts[SD_FONT_MAX][64];      /* TF 卡字体文件名列表 */
+EXT_RAM_BSS_ATTR static char s_sd_font_names[SD_FONT_MAX][40];  /* 对应字体的显示名 (LBF 头里的 name) */
+static int          s_sd_font_count = 0;     /* TF 卡字体数量 */
+static bool         s_sd_font_scanned = false;
+
+/* 扫描 /sdcard/fonts 并逐个体检（只读 96 字节头，不加载字形）。
+ * ★ 2026-10-31 改成**懒执行 + 一次缓存**：
+ *   原来 book_reader_open() 里每次都扫一遍（readdir + 每个文件 fopen/fread/fclose），
+ *   而这份列表**只服务于字体选择菜单**。现在字体配置已挪到书库，阅读器不再需要它，
+ *   每开一本书都去读 10 个文件头纯属浪费 —— 改成第一次真正要用时才扫，之后复用。
+ *   字体安装/卸载后由 book_reader_close() 重置标记（下次进入重新扫）。 */
+static void sd_font_scan(void) {
+    if (s_sd_font_scanned) return;
+    s_sd_font_scanned = true;
+
+    int nr = font_book_scan_sd(s_sd_fonts, SD_FONT_MAX);
+    int keep = 0;
+    for (int i = 0; i < nr; i++) {
+        char full[128], disp[40] = {0};
+        /* 精度限定 %.63s / %.39s: 源数组是定长 [64]/[40]，不加精度 GCC 会按
+         * "最坏可达 1023 字节"报 -Wformat-truncation（本项目 -Werror）。 */
+        snprintf(full, sizeof(full), "/sdcard/fonts/%.63s", s_sd_fonts[i]);
+        if (!lbf_peek(full, disp, sizeof(disp), NULL, NULL)) {
+            ESP_LOGW(TAG, "跳过无法识别的字体: %.63s", s_sd_fonts[i]);
+            continue;
+        }
+        if (keep != i) snprintf(s_sd_fonts[keep], 64, "%.63s", s_sd_fonts[i]);
+        /* 扫描阶段就转成短中文名，菜单直接取指针 —— 避免在渲染里用 static 缓冲互相覆盖 */
+        {
+            char sn[40];
+            font_book_short_name(disp[0] ? disp : s_sd_fonts[keep], sn, sizeof(sn));
+            snprintf(s_sd_font_names[keep], sizeof(s_sd_font_names[0]), "%.39s", sn);
+        }
+        keep++;
+    }
+    s_sd_font_count = keep;
+    if (s_sd_font_count > 0) ESP_LOGI(TAG, "发现 %d 个 TF 卡字体", s_sd_font_count);
+}
+
+/* === 旋转/夜间 === */
+static uint8_t      s_rot = 0;            /* 0上 1下 2左 3右 */
+static bool         s_night = false;
+static bool         s_pagenum = false;    /* 默认不显示进度信息 */
+static uint32_t     s_open_tick_ms = 0;   /* 本次阅读会话起始时间 (ms, 用于"已读时长") */
+static uint8_t      s_fontstyle = 0;       /* 0=仿宋 1=黑体(菜单字体) */
+static uint8_t      s_fontsize = 1;       /* 字号档 0=16 1=24 2=32 3=48 (默认 24 档=1) */
+/* 字号档 → 实际像素 (font_book_select 按像素渲染/缩放) */
+/* 字号档 → 像素: 0=16(原生宋体) 1=20 2=24(原生粗宋) 3=28 4=32(16px×2)。
+ * 书架只暴露 0/2/4 三档 (16/24/32); 20/28 仍在表内但已无入口。 */
+/* 字号档 → 像素。四档，严格从小到大：16 / 24 / 32 / 48。
+ *   16 = 原生 font_zh16 ｜ 24 = 原生 font_zh ｜ 32 = 16px×2 ｜ 48 = 24px×2
+ * ⚠ 2026-10-30 修：旧表是 {16,16,24,24,32} 且 s_fontsize 被夹在 0..3 ——
+ *   书架传进来的 32px 档(索引 4)会被夹成 3，落在 24px 上 ⇒ **菜单显示 32、实际画 24**。
+ *   现在档位与像素一一对应（0..3 → 16/24/32/48），不再有夹值，也没有重复项。 */
+static int book_reader_size_px(int id) {
+    /* 2026-10-31: 改为按**当前字体真实支持的字号**取档（font_book_size_px_at）。
+     *   内置 = 16/24/32/48；TF 卡 LBF = 原生 N 与 2N（如 8px 字体只有 8/16）。
+     *   原来的写死表在选了 8px 字体后仍给出 24/32/48，与实际渲染错位。 */
+    return font_book_size_px_at(id);
+}
+static uint8_t      s_margin_id = 1;      /* 0=窄 1=中 2=宽 */
+static uint8_t      s_lineh_id = 1;       /* 0=紧凑 1=标准 2=宽松 */
+static uint8_t      s_gap_id = 0;         /* 0=标准 1=宽松 */
+static bool         s_indent = true;      /* 段落首行缩进两全角空格 (开/关) */
+/* ★ 2026-11-22 linit: 「阅读优化 → 震动」. 关掉后阅读页内点按/翻页不震
+ *   (触摸翻页的反馈来自 main 的 vibrator_click, 所以这里翻译成 vibrator 的
+ *    阅读页静音闸门; 退出阅读器必须复位, 否则回到书架/设置也不震). */
+static bool         s_page_vib = true;
+static bool         s_inverted = false;
+static st7305_handle_t *s_lcd = NULL;
+static uint8_t     *s_rot_buf = NULL;     /* 180° 旋转输出备用缓冲 */
+static uint8_t     *s_pfb = NULL;         /* 竖屏逻辑缓冲 (1bpp 行序) */
+
+/* === 布局度量 (随旋转方向变化) === */
+static inline bool book_is_portrait(void) {
+    return (s_rot == 2 || s_rot == 3);
+}
+/* 边距 (字离边框距离) */
+static inline int book_margin(void) {
+    static const int m[3] = { 4, 8, 14 };
+    return m[s_margin_id > 2 ? 1 : s_margin_id];
+}
+/* 行高 = 字高 + 行距 */
+static inline int book_line_h(void) {
+    static const int e[3] = { 0, 4, 8 };
+    return font_book_cell_h() + e[s_lineh_id > 2 ? 1 : s_lineh_id];
+}
+/* 字间距: 0=紧凑(-2px) 1=标准(0) 2=宽松(+2px) */
+static inline int book_gap(void) {
+    static const int g[3] = { -2, 0, 2 };
+    return g[s_gap_id > 2 ? 1 : s_gap_id];
+}
+static inline int book_line_max(void) {
+    if (book_is_portrait()) {
+        int cw = font_book_cell_w();
+        if (cw < 8) cw = 16;
+        return (BOOK_PORTRAIT_W - 2 * book_margin()) / cw * cw;
+    }
+    return ST7305_WIDTH - 2 * book_margin();
+}
+/* ★ B1 (2026-10-30): 底部信息条占用的高度 —— 正文必须扣掉它, 否则最后一行被压。
+ *   开启"显示页码"时底部画百分比(左)+阅读时长(右), 字高 = font_book_ascii_h()
+ *   (实测 = 字号 px, 24px 字号下就是 24px; 早先误以为 12 才导致 10px 重叠)。 */
+static inline int book_foot_h(void) {
+    if (!s_pagenum && !s_index_error) return 0;   /* 进度条 或 索引受限提示 都要占高度 */
+    return font_book_ascii_h() + 2;
+}
+/* 正文可用高度: 屏幕高 - 上下边距 - 底部信息条 */
+static inline int book_avail_h(void) {
+    int H = book_is_portrait() ? BOOK_PORTRAIT_H : ST7305_HEIGHT;
+    int h = H - 2 * book_margin() - book_foot_h();
+    return (h > 0) ? h : 0;
+}
+static inline int book_rows(void) {
+    int lh = book_line_h();
+    if (lh < 12) lh = 16;
+    int rows = book_avail_h() / lh;
+    if (rows < 1) rows = 1;              /* 极小屏/极大字号兜底: 至少 1 行 */
+    if (rows > BF_MAX_LINES) rows = BF_MAX_LINES;
+    return rows;
+}
+
+/* === 竖屏逻辑缓冲 (1bpp, 位=1 黑字, 行序, 行宽 40 字节) === */
+#define PFB_ROW_BYTES 40
+static void pfb_clear(uint8_t *fb) {
+    memset(fb, 0, PFB_ROW_BYTES * BOOK_PORTRAIT_H);
+}
+static void pfb_px(uint8_t *fb, int x, int y, int v) {
+    if (x < 0 || x >= BOOK_PORTRAIT_W || y < 0 || y >= BOOK_PORTRAIT_H) return;
+    uint8_t *p = &fb[(size_t)y * PFB_ROW_BYTES + (size_t)(x >> 3)];
+    uint8_t m = (uint8_t)(1u << (7 - (x & 7)));
+    if (v) *p |= m; else *p &= (uint8_t)~m;
+}
+static int pfb_get(const uint8_t *fb, int x, int y) {
+    return (int)((fb[(size_t)y * PFB_ROW_BYTES + (size_t)(x >> 3)] >> (7 - (x & 7))) & 1u);
+}
+static void pfb_blit(uint8_t *fb, int x, int y, const book_glyph_t *g) {
+    if (!g || !g->bitmap) return;
+    int row_bytes = (g->w + 7) / 8;
+    for (int row = 0; row < g->h; row++) {
+        const uint8_t *src = g->bitmap + row * row_bytes;
+        for (int col = 0; col < g->w; col++) {
+            if (src[col >> 3] & (1u << (7 - (col & 7)))) {
+                pfb_px(fb, x + col, y + row, 1);
+            }
+        }
+    }
+}
+
+/* 写 ST7305 横屏帧缓冲像素 (与 st7305_draw_pixel 同格式, bit=1 白) */
+static inline void fb_set_px_landscape(uint8_t *fb, int x, int y, int black) {
+    if (x < 0 || x >= ST7305_WIDTH || y < 0 || y >= ST7305_HEIGHT) return;
+    int inv_y = ST7305_HEIGHT - 1 - y;
+    uint32_t idx = (uint32_t)(x >> 1) * (ST7305_HEIGHT >> 2) + (uint32_t)(inv_y >> 2);
+    uint8_t bit = 7u - (uint8_t)(((inv_y & 3) << 1) | (x & 1));
+    if (black) fb[idx] &= (uint8_t)~(1u << bit);
+    else       fb[idx] |= (uint8_t)(1u << bit);
+}
+
+/* ============ 绘图工具 ============ */
+
+static void draw_missing_glyph(st7305_handle_t *lcd, int x, int y) {
+    int cw = font_book_cell_w(), chh = book_line_h();
+    for (int i = 0; i < cw; i++) {
+        st7305_draw_pixel(lcd, x + i, y, ST7305_COLOR_BLACK);
+        st7305_draw_pixel(lcd, x + i, y + chh - 1, ST7305_COLOR_BLACK);
+    }
+    for (int i = 0; i < chh; i++) {
+        st7305_draw_pixel(lcd, x, y + i, ST7305_COLOR_BLACK);
+        st7305_draw_pixel(lcd, x + cw - 1, y + i, ST7305_COLOR_BLACK);
+    }
+}
+
+static inline int ch_width(const bf_ch_t *ch) {
+    return ((ch->kind == BF_CH_ASCII) ? font_book_ascii_w() : font_book_cell_w()) + book_gap();
+}
+
+/* 空白/不可见/格式控制码点: 无条件跳过, 绝不画方框
+ * (字库里 U+FEFF/U+200B/U+202F 等字形在部分字体里是"空心方块",
+ *  只靠"字形缺失才跳过"不够, 必须无条件不画) */
+static bool is_ws_cp(uint32_t cp) {
+    if (cp == 0x0020 || cp == 0x00A0 || cp == 0x1680 || cp == 0x202F ||
+        cp == 0x205F || cp == 0x3000 || cp == 0xFEFF || cp == 0xFFFD ||
+        cp == 0xFFFE || cp == 0xFFFF || cp == 0x00AD || cp == 0x180E ||
+        cp == 0x200B || cp == 0x2028 || cp == 0x2029) return true;
+    if (cp >= 0x2000 && cp <= 0x200F) return true;   /* 各宽度空格 + 零宽 + LRM/RLM */
+    if (cp >= 0x202A && cp <= 0x202E) return true;   /* 双向文本控制 */
+    if (cp >= 0x2060 && cp <= 0x206F) return true;   /* 词连字符/不可见操作符 */
+    if (cp >= 0xFE00 && cp <= 0xFE0F) return true;   /* 变体选择符 */
+    if (cp == 0xE0001) return true;
+    if (cp >= 0xE0020 && cp <= 0xE007F) return true; /* 标签字符 */
+    return false;
+}
+
+/* V1.1.0: 文本块在内容区水平/垂直居中, 消除四边距不均 (字符按整格/整行排,
+ * 取整产生的余量只有右侧/下侧, 导致左右、上下的留白不一样). 居中后对称. */
+/* 版心定位 (linit 2026-10-14 修"左右边距不平均 / 还能再塞一个字")
+ *  ⛔ 原来第 3 个形参叫 maxw_cells, 里面又 `* (cw + cg)`, 但**调用方传的是像素**
+ *     (book_line_max() 已是像素宽) ⇒ block_w 被算成几千像素、被 content_w 夹住 ⇒ xoff=0
+ *     ⇒ 左边距只剩 marg(8px), 右边却剩 28px —— 左右相差一个汉字, 看着就是"右边能再塞一个"。
+ *  ✅ 现在直接按**像素块宽**居中 ⇒ 左右边距严格相等。
+ *  ✅ 纵向改为**顶部对齐**: 原来按本页实际行数垂直居中 ⇒ 每页首行 y 会随行数浮动,
+ *     翻页时正文上下跳, 观感也是"不平均"。定死 y0=marg 后每页首行同一位置。 */
+static void book_center(int *x0, int *y0, int block_px, int rows, bool portrait) {
+    int marg = book_margin();
+    int W = portrait ? BOOK_PORTRAIT_W : ST7305_WIDTH;
+    int content_w = W - 2 * marg;
+    int block_w = block_px;
+    if (block_w > content_w) block_w = content_w;
+    int xoff = (content_w - block_w) / 2; if (xoff < 0) xoff = 0;
+    *x0 = marg + xoff;
+    /* ★ F5 (2026-10-30): 垂直居中。
+     *   · 只用"本页实际行数"算, 不缩字号、不压行距、不裁字;
+     *   · 满页时 (rows*line_h 已接近可用高度) 偏移自然趋近 0, 等价于原来的顶部对齐;
+     *   · 可用高度已由 book_avail_h() 扣掉底部信息条 (B1), 不会压到进度条。
+     *   · 放不下 (yoff<0) 就退回顶部, 绝不为居中牺牲内容。 */
+    int avail   = book_avail_h();
+    int block_h = rows * book_line_h();
+    int yoff    = (avail - block_h) / 2;
+    if (yoff < 0) yoff = 0;
+    *y0 = marg + yoff;
+}
+
+/* 绘制一个解码后的字符 (utf8/utf16 模式用 cp; gbk 模式用 hi/lo), 返回像素宽 */
+static int draw_decoded_char(st7305_handle_t *lcd, int x, int y,
+                             const bf_ch_t *ch) {
+    int w = ch_width(ch);
+    /* 换行/控制符: 不占像素 */
+    if (ch->kind == BF_CH_NEWLINE || ch->kind == BF_CH_SKIP) return 0;
+    /* 空白/不可见字符: 无条件留白 (utf8/utf16 模式) */
+    if (s_enc != BF_ENC_GBK && is_ws_cp(ch->cp)) return w;
+    /* GBK 全角空格 A1A1: 即使字库缺失也留白 */
+    if (s_enc == BF_ENC_GBK && ch->kind == BF_CH_CJK &&
+        ch->hi == 0xA1 && ch->lo == 0xA1) return w;
+    book_glyph_t g;
+    bool ok = false;
+    if (s_enc == BF_ENC_GBK) {
+        if (ch->kind == BF_CH_ASCII) {
+            ok = font_book_glyph_ascii((uint8_t)ch->cp, &g);
+        } else {
+            ok = font_book_glyph_gb(ch->hi, ch->lo, &g);
+        }
+    } else if (ch->cp < 0x80) {
+        ok = font_book_glyph_ascii((uint8_t)ch->cp, &g);
+    } else {
+        ok = font_book_glyph_unicode(ch->cp, &g);
+    }
+    if (ok && g.bitmap) {
+        st7305_blit_1bit(lcd, x, y, g.w, g.h, g.bitmap);
+    } else {
+        draw_missing_glyph(lcd, x, y);
+    }
+    return w;
+}
+
+/* ============ 索引表 ============ */
+
+/* ★ B4: 索引失败原因 —— 以前只有 s_index_error 一个 bool, 用户完全看不到发生了什么 */
+enum {
+    IDX_FAIL_NONE = 0,
+    IDX_FAIL_TOO_BIG,     /* 页数到达 BOOK_MAX_PAGES 上限 = 文件太大 */
+    IDX_FAIL_NOMEM,       /* PSRAM 不够扩容 */
+    IDX_FAIL_IO,          /* 读文件失败(拔卡/坏块) */
+};
+static volatile uint8_t s_idx_fail = IDX_FAIL_NONE;
+
+static int idx_pages_append(uint32_t off) {
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    if (s_page_count >= BOOK_MAX_PAGES) {
+        s_idx_fail = IDX_FAIL_TOO_BIG;
+        if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+        return -1;
+    }
+    if (s_page_count == s_page_cap) {
+        uint32_t nc = s_page_cap ? s_page_cap * 2 : 2048;
+        if (nc > BOOK_MAX_PAGES) nc = BOOK_MAX_PAGES;
+        /* ★ B4: 扩容前先查 PSRAM 余量。
+         *   heap_caps_realloc 在无法原地扩时会"新块 + memcpy + 释放旧块",
+         *   瞬时峰值 ≈ 新块大小(旧块直到 free 前都占着, 故按 need×2 保守估计)。
+         *   留 256KB 给渲染窗口/字体/系统, 不足就优雅失败 ——
+         *   绝不硬撑到 malloc 返回 NULL 把系统其它模块拖下水。
+         *   realloc 失败时旧指针保持有效(代码用 np 暂存), 已有索引不会丢。 */
+        size_t need = (size_t)nc * sizeof(uint32_t);
+        size_t free_p = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (free_p < need + 256 * 1024) {
+            ESP_LOGW(TAG, "页表扩容被内存挡住: 需 %u KB, PSRAM 空闲 %u KB",
+                     (unsigned)(need / 1024), (unsigned)(free_p / 1024));
+            s_idx_fail = IDX_FAIL_NOMEM;
+            if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+            return -1;
+        }
+        uint32_t *np = heap_caps_realloc(s_page_off, need, MALLOC_CAP_SPIRAM);
+        if (!np) {
+            s_idx_fail = IDX_FAIL_NOMEM;
+            if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+            return -1;
+        }
+        s_page_off = np;
+        s_page_cap = nc;
+    }
+    s_page_off[s_page_count++] = off;
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    return 0;
+}
+
+static int idx_chapters_append(uint32_t off, const uint8_t *title, uint8_t tlen) {
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    if (s_chapter_count >= BOOK_MAX_CHAPTERS) { if (s_idx_mutex) xSemaphoreGive(s_idx_mutex); return 0; }
+    /* 截断回退: 避免标题末尾是半个 UTF-8/GBK 字符。
+     * ★ 2026-11-21: 原来这里手写的退字节链有错 (3 字节字符只留首字节), 换成共享实现。 */
+    if (s_enc == BF_ENC_GBK) {
+        if (tlen > 0 && title[tlen - 1] >= 0x81) tlen--;
+    } else {
+        tlen = (uint8_t)utf8_align((const char *)title, tlen);
+    }
+    if (tlen > 31) tlen = 31;
+    if (s_chapter_count == s_chapter_cap) {
+        uint32_t nc = s_chapter_cap ? s_chapter_cap * 2 : 128;
+        if (nc > BOOK_MAX_CHAPTERS) nc = BOOK_MAX_CHAPTERS;
+        book_chapter_t *np = heap_caps_realloc(s_chapters, (size_t)nc * sizeof(book_chapter_t),
+                                               MALLOC_CAP_SPIRAM);
+        if (!np) { if (s_idx_mutex) xSemaphoreGive(s_idx_mutex); return -1; }
+        s_chapters = np;
+        s_chapter_cap = nc;
+    }
+    book_chapter_t *c = &s_chapters[s_chapter_count++];
+    c->off = off;
+    memcpy(c->title, title, tlen);
+    c->title[tlen] = 0;
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    return 0;
+}
+
+/* ---- 章节标题匹配 ---- */
+/* 规则集参考 Legado txtTocRule.json (精选高频规则), 行首 ^ 锚定:
+ *   A: 第X章/节/卷/回/话/部/篇
+ *   B: 特殊章节名 (序章/楔子/正文/终章/后记/尾声/番外/前言/简介)
+ *   C: 数字/中文数字 + 分隔符/括号 + 标题  (1、xxx / 一、xxx / 24章 xxx / (12)xxx / 【第一章 xxx】)
+ *   D: 英文 Part/Episode/No./Chapter/Volume/Section
+ *   F: 兜底字数分节 (无任何章节时, 见 book_toc_fallback) */
+
+static bool utf8_num_word(const uint8_t *p) {
+    /* 0-9/十百千万两 + 财务大写壹贰叁... 拾佰仟 + 〇.
+     * 注意: 与 utf8_suffix 一致, 数组里存的是 UTF-8 三字节码(如 一=E4B880),
+     * 不是 Unicode 码点(一=4E00). 旧实现误用码点导致中文数字永不匹配. */
+    static const uint32_t words[] = {
+        0xE99BB6, 0xE4B880, 0xE4BA8C, 0xE4B889, 0xE59B9B, 0xE4BA94, 0xE585AD,
+        0xE4B883, 0xE585AB, 0xE4B99D, 0xE58D81, 0xE799BE, 0xE58D83, 0xE4B887, 0xE4B8A4,
+        0xE38087, 0xE5A3B9, 0xE8B4B0, 0xE58F81, 0xE88286, 0xE4BC8D, 0xE99986,
+        0xE69F92, 0xE68D8C, 0xE78E96, 0xE68BBE, 0xE4BDB0, 0xE4BB9F
+    };
+    uint32_t cp = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        if (cp == words[i]) return true;
+    }
+    return false;
+}
+
+static bool gbk_num_word(const uint8_t *p) {
+    /* 0-9/十百千万两 + 财务大写壹贰叁... 拾佰仟 + 〇 (与 utf8_num_word 对齐的 GBK 码) */
+    static const uint16_t words[] = {
+        0xC1E3, 0xD2BB, 0xB6FE, 0xC8FD, 0xCBC4, 0xCEE5, 0xC1F9, 0xC6DF,
+        0xB0CB, 0xBEC5, 0xCAAE, 0xB0D9, 0xC7A7, 0xCDF2, 0xC1BD,
+        0xA996, 0xD2BC, 0xB7A1, 0xC8FE, 0xCBC1, 0xCEE9, 0xC2BD, 0xC6E2,
+        0xB0C6, 0xBEC1, 0xCAB0, 0xB0DB, 0xC7AA
+    };
+    uint16_t w = (uint16_t)((p[0] << 8) | p[1]);
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        if (w == words[i]) return true;
+    }
+    return false;
+}
+
+/* 章节单位后缀: 章/回/节/卷/部/话/集/篇 */
+static bool utf8_suffix(const uint8_t *p) {
+    static const uint32_t suf[] = {
+        0xE7ABA0, 0xE59B9E, 0xE88A82, 0xE58DB7, 0xE983A8, 0xE8AF9D, 0xE99B86, 0xE7AF87
+    };
+    uint32_t cp = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+    for (size_t i = 0; i < sizeof(suf) / sizeof(suf[0]); i++) {
+        if (cp == suf[i]) return true;
+    }
+    return false;
+}
+
+static bool gbk_suffix(const uint8_t *p) {
+    static const uint16_t suf[] = {
+        0xB5C2, 0xBBD8, 0xBDDA, 0xBEED, 0xB2BF, 0xBBB0, 0xBCAF, 0xC6AA
+    };
+    uint16_t w = (uint16_t)((p[0] << 8) | p[1]);
+    for (size_t i = 0; i < sizeof(suf) / sizeof(suf[0]); i++) {
+        if (w == suf[i]) return true;
+    }
+    return false;
+}
+
+static bool ascii_prefix_cmp(const uint8_t *p, int n, const char *word) {
+    int wl = (int)strlen(word);
+    if (n < wl) return false;
+    for (int k = 0; k < wl; k++) {
+        char a = (char)p[k];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != word[k]) return false;
+    }
+    return true;
+}
+
+/* 单元后缀后紧跟常见正文字 → 判定非章节 (Legado 负向预查: 部+分赛游帮 = 部分/比赛/游戏/部队) */
+static bool toc_suffix_bad_follow(const uint8_t *s, bool gbk) {
+    if (gbk) {
+        if (s[0] == 0xB2 && s[1] == 0xBF) {   /* 部 */
+            if (s[2] == 0xB7 && s[3] == 0xD6) return true;   /* 分 */
+            if (s[2] == 0xC8 && s[3] == 0xFC) return true;   /* 赛 */
+            if (s[2] == 0xD3 && s[3] == 0xCE) return true;   /* 游 */
+            if (s[2] == 0xB0 && s[3] == 0xEF) return true;   /* 帮 */
+        }
+    } else {
+        if (s[0] == 0xE9 && s[1] == 0x83 && s[2] == 0xA8) { /* 部 */
+            if (s[3] == 0xE5 && s[4] == 0x88 && s[5] == 0x86) return true; /* 分 */
+            if (s[3] == 0xE8 && s[4] == 0xB5 && s[5] == 0x9B) return true; /* 赛 */
+            if (s[3] == 0xE6 && s[4] == 0xB8 && s[5] == 0xB8) return true; /* 游 */
+            if (s[3] == 0xE5 && s[4] == 0xB8 && s[5] == 0xAE) return true; /* 帮 */
+        }
+    }
+    return false;
+}
+
+/* 规则 A: 第X章/节/卷/回/话/部/篇 (行首), 含反证排除 (Legado 负向预查, 防"第一部分"误判) */
+static bool toc_rule_a(const uint8_t *p, int n, bool gbk) {
+    if (gbk) {
+        if (n >= 2 && p[0] == 0xB5 && p[1] == 0xDA) {
+            int j = 2, nd = 0;
+            while (j < n) {
+                if (p[j] >= '0' && p[j] <= '9') { j++; nd++; }
+                else if (j + 1 < n && gbk_num_word(p + j)) { j += 2; nd++; }
+                else break;
+            }
+            if (nd > 0 && j + 1 < n && gbk_suffix(p + j)) {
+                /* 部 + 分/赛/游/帮 → 非章节 */
+                if (j + 3 < n && toc_suffix_bad_follow(p + j, true)) return false;
+                return true;
+            }
+        }
+    } else {
+        if (n >= 3 && p[0] == 0xE7 && p[1] == 0xAC && p[2] == 0xAC) {
+            int j = 3, nd = 0;
+            while (j < n) {
+                if (p[j] >= '0' && p[j] <= '9') { j++; nd++; }
+                else if (j + 2 < n && utf8_num_word(p + j)) { j += 3; nd++; }
+                else break;
+            }
+            if (nd > 0 && j + 2 < n && utf8_suffix(p + j)) {
+                /* 第X部 + (分/赛/游/帮) → "第一部分/比赛/游戏" 非章节 */
+                if (j + 5 < n && toc_suffix_bad_follow(p + j, false)) return false;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* 规则 B: 特殊章节名 (行首独立成章) */
+static bool toc_special(const uint8_t *p, int n, bool gbk) {
+    static const uint8_t *const W[][2] = {
+        { (const uint8_t *)"\xE5\xBA\x8F\xE7\xAB\xA0", (const uint8_t *)"\xD0\xF2\xD5\xC2" }, /* 序章 */
+        { (const uint8_t *)"\xE6\xA5\x94\xE5\xAD\x90", (const uint8_t *)"\xD0\xA8\xD7\xD3" }, /* 楔子 */
+        { (const uint8_t *)"\xE6\xAD\xA3\xE6\x96\x87", (const uint8_t *)"\xD5\xFD\xCE\xC4" }, /* 正文 */
+        { (const uint8_t *)"\xE7\xBB\x88\xE7\xAB\xA0", (const uint8_t *)"\xD6\xD5\xD5\xC2" }, /* 终章 */
+        { (const uint8_t *)"\xE5\x90\x8E\xE8\xAE\xB0", (const uint8_t *)"\xBA\xF3\xBC\xC7" }, /* 后记 */
+        { (const uint8_t *)"\xE5\xB0\xBE\xE5\xA3\xB0", (const uint8_t *)"\xCE\xB2\xC9\xF9" }, /* 尾声 */
+        { (const uint8_t *)"\xE7\x95\xAA\xE5\xA4\x96", (const uint8_t *)"\xB7\xAC\xCD\xE2" }, /* 番外 */
+        { (const uint8_t *)"\xE5\x89\x8D\xE8\xA8\x80", (const uint8_t *)"\xC7\xB0\xD1\xD4" }, /* 前言 */
+        { (const uint8_t *)"\xE7\xAE\x80\xE4\xBB\x8B", (const uint8_t *)"\xBC\xF2\xBD\xE9" }, /* 简介 */
+    };
+    for (size_t w = 0; w < sizeof(W) / sizeof(W[0]); w++) {
+        const uint8_t *seq = gbk ? W[w][1] : W[w][0];
+        int l = gbk ? 4 : 6;
+        if (n >= l && memcmp(p, seq, (size_t)l) == 0) return true;
+    }
+    return false;
+}
+
+/* 规则 C: 数字/中文数字 + 分隔符/括号 + 标题 (行首) */
+static bool toc_numbered(const uint8_t *p, int n, bool gbk) {
+    int i = 0;
+    /* 可选左括号: 【（[ ( */
+    int open = 0;
+    if (i < n) {
+        if (!gbk && n - i >= 3 &&
+            ((p[i] == 0xE3 && p[i + 1] == 0x80 && p[i + 2] == 0x90) ||   /* 【 */
+             (p[i] == 0xEF && p[i + 1] == 0xBC && p[i + 2] == 0x88))) {  /* （ */
+            i += 3; open = 1;
+        } else if (gbk && n - i >= 2 &&
+                   ((p[i] == 0xA1 && p[i + 1] == 0xBE) ||                 /* 【 */
+                    (p[i] == 0xA3 && p[i + 1] == 0xA8))) {                /* （ */
+            i += 2; open = 1;
+        } else if (p[i] == '(' || p[i] == '[') { i++; open = 1; }
+    }
+    /* 括号内可能直接是 第X章 (如【第一章 xxx】) → 走规则 A */
+    if (open) {
+        if (toc_rule_a(p + i, n - i, gbk)) return true;
+    }
+    /* 数字: 半角数字 或 中文数字 */
+    int nd = 0;
+    while (i < n) {
+        if (p[i] >= '0' && p[i] <= '9') { i++; nd++; continue; }
+        if (gbk) {
+            if (n - i >= 2 && gbk_num_word(p + i)) { i += 2; nd++; continue; }
+        } else if (n - i >= 3 && utf8_num_word(p + i)) { i += 3; nd++; continue; }
+        break;
+    }
+    if (nd == 0) return false;
+    /* 可选章节单位 */
+    int unit = 0;
+    if (gbk) {
+        if (n - i >= 2 && gbk_suffix(p + i)) {
+            /* 一"部"分 → 非章节 (负向预查) */
+            if (n - i >= 4 && toc_suffix_bad_follow(p + i, true)) return false;
+            i += 2; unit = 1;
+        }
+    } else if (n - i >= 3 && utf8_suffix(p + i)) {
+        if (n - i >= 6 && toc_suffix_bad_follow(p + i, false)) return false;
+        i += 3; unit = 1;
+    }
+    /* 可选右括号: 】）] ) */
+    int close = 0;
+    if (i < n) {
+        if (!gbk && n - i >= 3 &&
+            ((p[i] == 0xE3 && p[i + 1] == 0x80 && p[i + 2] == 0x91) ||   /* 】 */
+             (p[i] == 0xEF && p[i + 1] == 0xBC && p[i + 2] == 0x89))) {  /* ） */
+            i += 3; close = 1;
+        } else if (gbk && n - i >= 2 &&
+                   ((p[i] == 0xA1 && p[i + 1] == 0xBF) ||                 /* 】 */
+                    (p[i] == 0xA3 && p[i + 1] == 0xA9))) {                /* ） */
+            i += 2; close = 1;
+        } else if (p[i] == ')' || p[i] == ']') { i++; close = 1; }
+    }
+    /* 分隔符: 半角 . : 空格 tab - = _ / 全角 、 ． ： 。 */
+    int sep = 0;
+    if (i < n) {
+        uint8_t c = p[i];
+        if (c == '.' || c == ':' || c == ' ' || c == '\t' ||
+            c == '-' || c == '=' || c == '_') { i++; sep = 1; }
+        else if (!gbk && n - i >= 3 &&
+                 ((p[i] == 0xE3 && p[i + 1] == 0x80 && p[i + 2] == 0x81) ||   /* 、 */
+                  (p[i] == 0xEF && p[i + 1] == 0xBC && p[i + 2] == 0x8E) ||   /* ． */
+                  (p[i] == 0xEF && p[i + 1] == 0xBC && p[i + 2] == 0x9A) ||   /* ： */
+                  (p[i] == 0xE3 && p[i + 1] == 0x80 && p[i + 2] == 0x82))) {  /* 。 */
+            i += 3; sep = 1;
+        } else if (gbk && n - i >= 2 &&
+                   ((p[i] == 0xA1 && p[i + 1] == 0xA2) ||   /* 、 */
+                    (p[i] == 0xA3 && p[i + 1] == 0xAE) ||   /* ． */
+                    (p[i] == 0xA3 && p[i + 1] == 0xBA) ||   /* ： */
+                    (p[i] == 0xA1 && p[i + 1] == 0xA3))) {  /* 。 */
+            i += 2; sep = 1;
+        }
+    }
+    if (i >= n) return false;                 /* 数字后必须有标题内容 */
+    if (!sep && !unit && !open && !close) return false;
+    return true;
+}
+
+/* 判断 line[0..len) 是否为章节标题行 (按原编码匹配) */
+static bool toc_match(const uint8_t *s, int len, bool gbk) {
+    int i = 0;
+    while (i < len) {
+        if (s[i] == ' ' || s[i] == '\t' || s[i] == '\r') { i++; continue; }
+        if (!gbk && i + 2 < len && s[i] == 0xEF && s[i + 1] == 0xBC && s[i + 2] == 0x80) {
+            i += 3; continue;
+        }
+        break;
+    }
+    if (i >= len) return false;
+    const uint8_t *p = s + i;
+    int n = len - i;
+
+    if (toc_rule_a(p, n, gbk)) return true;   /* 规则 A */
+    if (toc_special(p, n, gbk)) return true;   /* 规则 B */
+    if (toc_numbered(p, n, gbk)) return true;  /* 规则 C */
+
+    const char *prefixes[] = { "chapter", "chap", "volume", "vol", "section", "sec",
+                               "part", "episode", "no", "prologue", "story", "act" };
+    for (size_t pi = 0; pi < sizeof(prefixes) / sizeof(prefixes[0]); pi++) {
+        if (!ascii_prefix_cmp(p, n, prefixes[pi])) continue;
+        int j = (int)strlen(prefixes[pi]);
+        while (j < n && (p[j] == ' ' || p[j] == '\t' || p[j] == ':' || p[j] == '-' ||
+                         p[j] == '.')) j++;
+        if (j < n && p[j] >= '0' && p[j] <= '9') return true;
+        break;
+    }
+    /* 规则 E: 卷 前缀式 (卷X/卷一, 无"第", Legado rule 17 对齐). 仅卷: 章/节前缀与正文(如人名"章三三")易误判 */
+    int j = 0;
+    if (gbk) {
+        if (n >= 2 && p[0] == 0xBE && p[1] == 0xED) j = 2;                        /* 卷 */
+        else j = 0;
+    } else {
+        if (n >= 3 && p[0] == 0xE5 && p[1] == 0x8D && p[2] == 0xB7) j = 3;        /* 卷 */
+        else j = 0;
+    }
+    if (j > 0 && j < n) {
+        int nd = 0;
+        while (j < n) {
+            if (p[j] >= '0' && p[j] <= '9') { j++; nd++; }
+            else if (gbk && j + 1 < n && gbk_num_word(p + j)) { j += 2; nd++; }
+            else if (!gbk && j + 2 < n && utf8_num_word(p + j)) { j += 3; nd++; }
+            else break;
+        }
+        if (nd > 0) {
+            /* 卷 + 数字 + 分/赛/游 → "卷一分" 非章节 */
+            if (gbk && j + 1 < n && p[j] == 0xB7 && p[j + 1] == 0xD6) return false;
+            if (!gbk && j + 2 < n && p[j] == 0xE5 && p[j + 1] == 0x88 && p[j + 2] == 0x86) return false;
+            return true;
+        }
+    }
+    if (!gbk) {
+        /* 俄语章节: Глава / Часть + 数字或罗马数字 (参考 Porfiry 项目) */
+        static const uint8_t glava[] = { 0xD0,0x93,0xD0,0xBB,0xD0,0xB0,0xD0,0xB2,0xD0,0xB0 };
+        static const uint8_t chast[] = { 0xD0,0xA7,0xD0,0xB0,0xD1,0x81,0xD1,0x82,0xD1,0x8C };
+        const uint8_t *words[] = { glava, chast };
+        const int wlens[] = { 10, 8 };
+        for (int wi = 0; wi < 2; wi++) {
+            if (n >= wlens[wi] && memcmp(p, words[wi], wlens[wi]) == 0) {
+                int j = wlens[wi];
+                while (j < n && (p[j] == ' ' || p[j] == '\t')) j++;
+                if (j < n &&
+                    ((p[j] >= '0' && p[j] <= '9') || strchr("IVXLCDM", p[j]))) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/* ---- 扫描上下文 ---- */
+
+typedef struct {
+    FILE   *fp;
+    uint32_t fsz;
+    uint32_t cur;
+    bool    resume;         /* 续扫: 起始页已记录, 不再重复 */
+    bool    at_line_start;  /* 章节行跟踪 */
+    bool    at_para;        /* 段落首行状态 (跨步持续跟踪, 与分页一致) */
+    uint32_t line_off;
+    uint8_t line[40];
+    uint8_t line_len;
+} idx_ctx_t;
+
+static idx_ctx_t s_idx;
+
+static size_t scan_read_at(void *ud, uint32_t pos, uint8_t *buf, size_t want) {
+    idx_ctx_t *c = (idx_ctx_t *)ud;
+    if (!c->fp || pos >= c->fsz) return 0;
+    /* V1.0.68 fix: 退出阅读器时立即中断索引扫描.
+     * 返回 0 (=EOF) 让 bf_paginate 提前结束当前步, 索引任务随即退出,
+     * book_reader_close 不再干等 1-2 秒 (旧: 256KB/步扫完才停). */
+    if (s_idx_stop) return 0;
+    uint32_t w = (uint32_t)want;
+    if (w > c->fsz - pos) w = c->fsz - pos;
+    if (fseek(c->fp, (long)pos, SEEK_SET) != 0) return 0;
+    return fread(buf, 1, w, c->fp);
+}
+
+static int scan_add_page(void *ud, uint32_t off) {
+    (void)ud;
+    return idx_pages_append(off);
+}
+
+static void toc_track(idx_ctx_t *c, const bf_ch_t *ch, uint32_t pos) {
+    if (c->at_line_start) {
+        c->line_off = pos;
+        c->line_len = 0;
+        c->at_line_start = false;
+    }
+    if (ch->kind == BF_CH_NEWLINE) {
+        if (c->line_len > 0) {
+            uint8_t *s = c->line;
+            int n = c->line_len;
+            while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) n--;
+            /* 目录已由预扫描填满 → 分页不再重复追加 (s_toc_prescanned) */
+            if (!s_toc_prescanned && n > 0 && toc_match(s, n, s_enc == BF_ENC_GBK)) {
+                idx_chapters_append(c->line_off, s, (uint8_t)n);
+            }
+        }
+        c->at_line_start = true;
+        return;
+    }
+    if (ch->kind == BF_CH_SKIP) return;
+    if (c->line_len >= sizeof(c->line)) return;
+    if (s_enc == BF_ENC_GBK) {
+        if (ch->kind == BF_CH_CJK) {
+            c->line[c->line_len++] = ch->hi;
+            c->line[c->line_len++] = ch->lo;
+        } else {
+            c->line[c->line_len++] = (uint8_t)ch->cp;
+        }
+    } else {
+        uint8_t tmp[4];
+        int kn = bf_cp_to_utf8(ch->cp, tmp);
+        for (int k = 0; k < kn && c->line_len < sizeof(c->line); k++) {
+            c->line[c->line_len++] = tmp[k];
+        }
+    }
+}
+
+static void scan_on_char(void *ud, const bf_ch_t *ch, uint32_t pos) {
+    toc_track((idx_ctx_t *)ud, ch, pos);
+}
+
+/* 从 c->cur 扫到 limit (阶段性上限), 更新 cur/page_open */
+static int book_scan_run(idx_ctx_t *c, uint32_t limit) {
+    if (c->cur >= limit || c->cur >= c->fsz) return 0;
+    if (!s_scan_chunk || !s_scan_win || !s_scan_brk || !s_scan_scratch || !s_scan_off) return -1;
+    bf_src_t src = { scan_read_at, c };
+    uint32_t next;
+    int r = bf_paginate(src, c->fsz, s_enc, c->cur,
+                        book_rows(), book_line_max(),
+                        font_book_ascii_w() + book_gap(), font_book_cell_w() + book_gap(),
+                        scan_add_page, NULL, scan_on_char, c,
+                        s_scan_chunk, BOOK_SCAN_CHUNK,
+                        s_scan_win, s_scan_brk, s_scan_scratch, FLOW_SCRATCH_SIZE,
+                        s_scan_off,
+                        &c->at_para,
+                        s_indent ? 2 * (font_book_cell_w() + book_gap()) : 0,
+                        limit, c->resume, &next);
+    if (r != 0) return -1;
+    c->cur = next;
+    c->resume = false;
+    return 0;
+}
+
+/* ============ 侧边索引 / 进度持久化 ============ */
+
+typedef struct __attribute__((packed)) {
+    char     magic[8];
+    uint32_t fsz;
+    uint32_t mtime;
+    uint8_t  enc;
+    uint8_t  layout;
+    uint8_t  font_w;
+    uint8_t  font_h;
+    uint8_t  margin;
+    uint8_t  lineh;
+    uint8_t  gap;
+    uint8_t  indent;
+    uint32_t font_id;        /* ★ v09: 字体身份（换字体但字号像素相同也必须失效） */
+    uint32_t indexed_bytes;
+    uint32_t pages;
+    uint32_t chapters;
+} sidx_hdr_t;
+
+typedef struct __attribute__((packed)) {
+    char     magic[8];
+    uint32_t fsz;
+    uint32_t mtime;
+    uint8_t  layout;
+    uint8_t  bm_count;
+    uint8_t  font_w;
+    uint8_t  font_h;
+    uint8_t  margin;
+    uint8_t  lineh;
+    uint8_t  gap;
+    uint8_t  indent;
+    uint8_t  fontsize;
+    uint32_t font_id;        /* ★ v06: 字体身份 */
+    uint32_t last_page;
+    uint32_t last_off;   /* V1.0.68 fix: 当前页字节偏移 (布局/字体变化时按偏移恢复) */
+} prog_hdr_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t off;
+    uint32_t page;
+    uint16_t tlen;
+    char     title[32];
+} prog_bm_t;
+
+static uint32_t fnv1a(const char *s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+
+static uint8_t book_layout_id(void) {
+    return book_is_portrait() ? 1 : 0;
+}
+
+/* ★★★ 2026-10-31: 字体身份（缓存键必须带它）★★★
+ *   原来 .idx / .pos 的失效条件只看 font_w / font_h（像素）——
+ *   从 hzk24 换成 fusion12 再换回 24px，像素一样但**半角宽度和基线不同**
+ *   （s_lbf_ascii_w 是按字体实测的），页边界随之改变，旧页表却仍被判为有效 ⇒
+ *   翻到某页会错位、书签/进度落在别处。这里把"哪个字体 + 原生尺寸"一起哈希进去。 */
+static uint32_t book_font_id(void) {
+    char key[160];
+    const char *f = font_book_current_file();
+    snprintf(key, sizeof(key), "%s|%d", (f && f[0]) ? f : "builtin", font_book_native_px());
+    return fnv1a(key);
+}
+
+static void book_save_sidecar(void) {
+    if (!s_path[0] || s_page_count == 0) return;
+    char path[300];
+    snprintf(path, sizeof(path), "%s.idx", s_path);
+    FILE *f = fopen(path, "wb");
+    if (!f) { ESP_LOGD(TAG, "侧边索引写入失败"); return; }
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    sidx_hdr_t h;
+    memset(&h, 0, sizeof(h));
+    memcpy(h.magic, "BBKIDX09", 8);   /* v09(2026-10-31): 缓存键加"字体身份", 换字体必须失效 */
+    h.fsz = s_file_size;
+    h.mtime = s_mtime;
+    h.enc = s_enc;
+    h.layout = book_layout_id();
+    h.font_w = (uint8_t)font_book_cell_w();
+    h.font_h = (uint8_t)font_book_cell_h();
+    h.margin = s_margin_id;
+    h.lineh = s_lineh_id;
+    h.gap = s_gap_id;
+    h.indent = s_indent ? 1 : 0;
+    h.font_id = book_font_id();
+    h.indexed_bytes = s_indexed_bytes;
+    h.pages = s_page_count;
+    h.chapters = s_chapter_count;
+    fwrite(&h, 1, sizeof(h), f);
+    if (s_page_count) fwrite(s_page_off, 4, s_page_count, f);
+    for (uint32_t i = 0; i < s_chapter_count; i++) {
+        uint32_t off = s_chapters[i].off;
+        uint16_t tl = (uint16_t)strlen(s_chapters[i].title);
+        fwrite(&off, 4, 1, f);
+        fwrite(&tl, 2, 1, f);
+        fwrite(s_chapters[i].title, 1, tl, f);
+    }
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    fclose(f);
+    ESP_LOGI(TAG, "侧边索引已保存: %s (%lu 页, %lu 章)", path,
+             (unsigned long)s_page_count, (unsigned long)s_chapter_count);
+}
+
+/* 返回 true 表示加载成功 (page_off/chapters 已就绪) */
+static bool book_load_sidecar(void) {
+    if (!s_path[0]) return false;
+    char path[300];
+    snprintf(path, sizeof(path), "%s.idx", s_path);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    sidx_hdr_t h;
+    if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
+        memcmp(h.magic, "BBKIDX09", 8) != 0 ||
+        h.fsz != s_file_size || h.mtime != s_mtime || h.enc != s_enc ||
+        h.layout != book_layout_id() ||
+        h.font_w != (uint8_t)font_book_cell_w() ||
+        h.font_h != (uint8_t)font_book_cell_h() ||
+        h.font_id != book_font_id() ||
+        h.margin != s_margin_id || h.lineh != s_lineh_id || h.gap != s_gap_id ||
+        h.indent != (s_indent ? 1 : 0) ||
+        h.indexed_bytes > s_src_size ||
+        h.pages == 0 ||
+        h.pages > BOOK_MAX_PAGES || h.chapters > BOOK_MAX_CHAPTERS) {
+        fclose(f);
+        return false;
+    }
+    uint32_t *po = heap_caps_malloc((size_t)h.pages * 4, MALLOC_CAP_SPIRAM);
+    if (!po) { fclose(f); return false; }
+    if (fread(po, 4, h.pages, f) != h.pages) {
+        free(po);
+        fclose(f);
+        return false;
+    }
+    book_chapter_t *ch = NULL;
+    if (h.chapters) {
+        ch = heap_caps_malloc((size_t)h.chapters * sizeof(book_chapter_t), MALLOC_CAP_SPIRAM);
+        if (!ch) { free(po); fclose(f); return false; }
+        for (uint32_t i = 0; i < h.chapters; i++) {
+            uint32_t off;
+            uint16_t tl;
+            if (fread(&off, 4, 1, f) != 1 || fread(&tl, 2, 1, f) != 1 || tl > 31) {
+                free(po); free(ch); fclose(f);
+                return false;
+            }
+            if (fread(ch[i].title, 1, tl, f) != tl) {
+                free(po); free(ch); fclose(f);
+                return false;
+            }
+            ch[i].off = off;
+            ch[i].title[tl] = 0;
+        }
+    }
+    fclose(f);
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    if (s_page_off) free(s_page_off);
+    if (s_chapters) free(s_chapters);
+    s_page_off = po;
+    s_page_cap = h.pages;
+    s_page_count = h.pages;
+    s_chapters = ch;
+    s_chapter_cap = h.chapters;
+    s_chapter_count = h.chapters;
+    s_indexed_bytes = h.indexed_bytes;
+    s_index_done = (h.indexed_bytes >= s_src_size);
+    s_resume_off = s_index_done ? 0 : s_indexed_bytes;
+    s_index_error = false; s_idx_fail = IDX_FAIL_NONE;
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    ESP_LOGI(TAG, "侧边索引加载: %s (%lu 页, %lu 章)", path,
+             (unsigned long)s_page_count, (unsigned long)s_chapter_count);
+    return true;
+}
+
+static void book_progress_path(char *out, size_t n) {
+    snprintf(out, n, "/sdcard/books/.progress/bk_%08lx.pos",
+             (unsigned long)fnv1a(s_path));
+}
+
+static void book_save_progress(void) {
+    if (!s_path[0]) return;
+    char dir[128], path[300];
+    snprintf(dir, sizeof(dir), "/sdcard/books/.progress");
+    mkdir(dir, 0755);
+    book_progress_path(path, sizeof(path));
+    /* ★ B5 (2026-10-30): 先写 .tmp, 校验长度后再换新 —— 任何一步断电都不会毁掉唯一有效进度。
+     *   FATFS 的 f_rename 在目标已存在时是"删目标 + 改目录项", 本身不是严格原子,
+     *   所以这里保留 .old 作为回滚点: 读取时 .pos 坏/缺失会回落 .old。 */
+    char tmp[320], bak[320];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    snprintf(bak, sizeof(bak), "%s.old", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    prog_hdr_t h;
+    memset(&h, 0, sizeof(h));
+    memcpy(h.magic, "BBKPOS06", 8);
+    h.fsz = s_file_size;
+    h.mtime = s_mtime;
+    h.layout = book_layout_id();
+    h.font_w = (uint8_t)font_book_cell_w();
+    h.font_h = (uint8_t)font_book_cell_h();
+    h.margin = s_margin_id;
+    h.lineh = s_lineh_id;
+    h.gap = s_gap_id;
+    h.indent = s_indent ? 1 : 0;
+    h.fontsize = s_fontsize;
+    h.font_id = book_font_id();
+    h.bm_count = (uint8_t)s_bm_count;
+    h.last_page = s_page;
+    h.last_off = (s_page_off && s_page < s_page_count) ? s_page_off[s_page] : 0;
+    fwrite(&h, 1, sizeof(h), f);
+    for (uint32_t i = 0; i < s_bm_count; i++) {
+        prog_bm_t b;
+        memset(&b, 0, sizeof(b));
+        b.off = s_bms[i].off;
+        b.page = s_bms[i].page;
+        b.tlen = (uint16_t)strlen(s_bms[i].title);
+        memcpy(b.title, s_bms[i].title, sizeof(b.title));
+        fwrite(&b, 1, sizeof(b), f);
+    }
+    size_t want = sizeof(h) + (size_t)s_bm_count * sizeof(prog_bm_t);
+    fflush(f);
+    fclose(f);
+
+    /* 校验落盘长度: 不完整就丢掉 tmp, 旧 .pos 原封不动 */
+    struct stat st;
+    if (stat(tmp, &st) != 0 || (size_t)st.st_size != want) {
+        ESP_LOGW(TAG, "进度写入不完整, 保留旧进度 (期望 %u B)", (unsigned)want);
+        remove(tmp);
+        return;
+    }
+    /* 换新: .pos → .pos.old, .tmp → .pos。任一步断电都还有 .old 可读 */
+    remove(bak);
+    rename(path, bak);
+    if (rename(tmp, path) != 0) {
+        ESP_LOGW(TAG, "进度换新失败, 回滚旧文件");
+        rename(bak, path);
+        remove(tmp);
+        return;
+    }
+    s_prog_dirty = false;
+    s_last_saved_page = s_page;
+    s_last_save_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+    /* 设备级兜底: 记录最近阅读的书+页, TF 卡损坏/换卡后可回到最近这本 */
+    nvs_handle_t nh;
+    if (svc_nvs_open("os_book", NVS_READWRITE, &nh) == ESP_OK) {
+        svc_nvs_set_str(nh, "last_path", s_path);
+        svc_nvs_set_i32(nh, "last_page", (int32_t)s_page);
+        svc_nvs_commit(nh);
+        svc_nvs_close(nh);
+    }
+    ESP_LOGI(TAG, "进度已保存: 页 %lu 书签 %lu", (unsigned long)s_page, (unsigned long)s_bm_count);
+}
+
+/* ★ B5 (2026-10-30): 统一的保存调度。
+ *   · 每次位置变化先置脏;
+ *   · 满足「翻够 PROG_SAVE_PAGES 页」或「距上次落盘 >= PROG_SAVE_MS」才真写盘;
+ *   · force=true 用于退出/切书/跳转这类关键点, 立即落盘。
+ *   这样既把丢页数从 4 页压到 2 页, 又不会每翻一页就写一次 TF 卡。 */
+static void book_progress_maybe_save(bool force) {
+    if (!s_path[0]) return;
+    s_prog_dirty = true;
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    uint32_t dpg = (s_page > s_last_saved_page) ? (s_page - s_last_saved_page)
+                                                : (s_last_saved_page - s_page);
+    bool due = (dpg >= PROG_SAVE_PAGES) || (now - s_last_save_ms >= PROG_SAVE_MS);
+    if (force || due) book_save_progress();
+}
+
+/* V1.0.68 fix: 布局变化时记录的字节偏移, 页表就绪后按偏移恢复最近页 */
+static uint32_t s_pending_last_off = 0;
+static bool     s_pending_layout_diff = false;
+
+static void book_load_progress(void) {
+    s_bm_count = 0;
+    s_loaded_page = 0;
+    s_pending_last_off = 0;
+    s_pending_layout_diff = false;
+    char dir[128], path[300];
+    snprintf(dir, sizeof(dir), "/sdcard/books/.progress");
+    mkdir(dir, 0755);
+    book_progress_path(path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        /* ★ B5: .pos 缺失/损坏时回落 .pos.old（B5 换新过程中断电可能只留下 .old） */
+        char bak[320];
+        snprintf(bak, sizeof(bak), "%s.old", path);
+        f = fopen(bak, "rb");
+        if (f) ESP_LOGI(TAG, "主进度文件缺失, 已回落到 .old");
+    }
+    if (!f) {
+        /* TF 卡无 .pos (损坏/换卡): 仅当这本书就是"最近阅读"时, 用 NVS 页号兜底 */
+        nvs_handle_t h;
+        if (svc_nvs_open("os_book", NVS_READONLY, &h) == ESP_OK) {
+            char last_path[256] = {0};
+            size_t lp_len = sizeof(last_path);
+            int32_t lp = 0;
+            if (svc_nvs_get_str(h, "last_path", last_path, &lp_len) == ESP_OK &&
+                strcmp(last_path, s_path) == 0 &&
+                svc_nvs_get_i32(h, "last_page", &lp) == ESP_OK && lp > 0) {
+                s_loaded_page = (uint32_t)lp;
+                ESP_LOGI(TAG, "NVS 兜底恢复页 %lu", (unsigned long)s_loaded_page);
+            }
+            svc_nvs_close(h);
+        }
+        return;
+    }
+    prog_hdr_t h;
+    if (fread(&h, 1, sizeof(h), f) == sizeof(h) &&
+        memcmp(h.magic, "BBKPOS06", 8) == 0 &&
+        h.fsz == s_file_size && h.mtime == s_mtime) {
+        /* 始终记录最近字节偏移, 重开时按偏移恢复 (页号因重开页数可能不同而不可靠) */
+        if (h.last_off > 0) s_pending_last_off = h.last_off;
+        /* 布局/字体一致 → 直接恢复页号; 不一致 → 记录字节偏移, 页表就绪后换算 */
+        bool layout_match =
+            h.layout == book_layout_id() &&
+            h.font_w == (uint8_t)font_book_cell_w() &&
+            h.font_h == (uint8_t)font_book_cell_h() &&
+            h.font_id == book_font_id() &&
+            h.margin == s_margin_id && h.lineh == s_lineh_id &&
+            h.gap == s_gap_id && h.fontsize == s_fontsize &&
+            h.indent == (s_indent ? 1 : 0);
+        if (layout_match) {
+            s_loaded_page = h.last_page;
+            ESP_LOGI(TAG, "进度已加载: 页 %lu (布局一致)", (unsigned long)s_loaded_page);
+        } else if (h.last_off > 0) {
+            s_pending_layout_diff = true;
+            ESP_LOGI(TAG, "布局已变化, 待按字节偏移 %lu 恢复", (unsigned long)h.last_off);
+        }
+        /* ★★★ 2026-11-01 linit「调整阅读优化后书签消失」的根因修复 ★★★
+         *
+         * 原来这一行是 `if (layout_match && h.bm_count <= BOOK_MAX_BOOKMARKS)`：
+         * 只要字体/字号/行距/边距/字距/缩进/旋转动过任意一项，layout_match 为假，
+         * **一条书签都不读进内存**（s_bm_count 保持 0）。而退出阅读器时
+         * book_save_progress() 会用 s_bm_count=0 整份重写 .pos
+         * ⇒ 磁盘上的书签区被真正抹掉。先"看不见"、再"真没了"，两步丢数据。
+         *
+         * 书签存的 off 是**源文件字节偏移**，与排版无关、永远有效：
+         *   · 布局一致  → 直接用记录的页号
+         *   · 布局已变  → 页号置 UINT32_MAX，跳转时走 book_page_for_offset(off) 重算
+         *     (BM_BMKS 分支本来就有 `p >= s_page_count` 兜底，这里主动触发它，
+         *      避免"旧页号碰巧没越界、却指向错误位置"这种更隐蔽的错位)
+         * 所以书签必须**无条件读入**，只有"页号能否直接用"才依赖 layout_match。 */
+        if (h.bm_count <= BOOK_MAX_BOOKMARKS) {
+            s_bm_count = h.bm_count;
+            for (uint32_t i = 0; i < s_bm_count; i++) {
+                prog_bm_t b;
+                memset(&b, 0, sizeof(b));
+                if (fread(&b, 1, sizeof(b), f) != sizeof(b)) { s_bm_count = i; break; }
+                if (b.tlen > 31) b.tlen = 31;
+                s_bms[i].off = b.off;
+                /* 布局一致才敢用旧页号；变了就置无效，跳转按字节偏移重算 */
+                s_bms[i].page = layout_match ? b.page : 0xFFFFFFFFu;
+                memcpy(s_bms[i].title, b.title, 32);
+                s_bms[i].title[31] = 0;
+            }
+            ESP_LOGI(TAG, "书签已加载: %lu 条%s",
+                     (unsigned long)s_bm_count,
+                     layout_match ? "" : " (布局已变 → 按字节偏移重新定位)");
+        }
+    }
+    fclose(f);
+}
+
+/* ============ 索引任务 ============ */
+
+/* 规则 F: 兜底字数分节 — 无任何规则命中时按 5000 字自动分节, 保证有目录可跳.
+ * 在索引完成后调用 (仅在 s_chapter_count==0 时生效), 按行起始位置插入 "第N节". */
+#define TOC_FALLBACK_CHARS 5000
+static void book_toc_fallback(void) {
+    if (s_chapter_count > 0 || !s_src_path[0]) return;
+    FILE *fp = fopen(s_src_path, "rb");
+    if (!fp) return;
+    uint8_t *buf = heap_caps_malloc(BOOK_SCAN_CHUNK, MALLOC_CAP_SPIRAM);
+    if (!buf) { fclose(fp); return; }
+    uint32_t pos = s_file_start;
+    uint32_t line_off = s_file_start;
+    bool at_line_start = true;
+    uint32_t chars = 0, marker = 0;
+    uint8_t enc = s_enc;
+    while (pos < s_src_size) {
+        uint32_t want = BOOK_SCAN_CHUNK;
+        if (want > s_src_size - pos) want = s_src_size - pos;
+        if (fseek(fp, (long)pos, SEEK_SET) != 0) break;
+        size_t got = fread(buf, 1, want, fp);
+        if (got == 0) break;
+        const uint8_t *p = buf, *end = buf + got;
+        while (p < end) {
+            bf_ch_t ch = bf_next_ch(p, end, enc);
+            if (ch.adv == 0) break;
+            if (ch.kind == BF_CH_NEWLINE) {
+                at_line_start = true;
+            } else if (ch.kind != BF_CH_SKIP) {
+                if (at_line_start) {
+                    line_off = pos + (uint32_t)(p - buf);
+                    at_line_start = false;
+                }
+                chars++;
+                if (chars >= TOC_FALLBACK_CHARS) {
+                    chars = 0;
+                    marker++;
+                    char title[24];
+                    if (s_enc == BF_ENC_GBK)
+                        snprintf(title, sizeof(title), "\xB5\xDA%lu\xBD\xDA", (unsigned long)marker); /* 第N节 */
+                    else
+                        snprintf(title, sizeof(title), "\xE7\xAC\xAC%lu\xE8\x8A\x82", (unsigned long)marker);
+                    idx_chapters_append(line_off, (const uint8_t *)title, (uint8_t)strlen(title));
+                }
+            }
+            p += ch.adv;
+        }
+        pos += got;
+    }
+    free(buf);
+    fclose(fp);
+    if (s_chapter_count) ESP_LOGI(TAG, "兜底分节: %lu 章", (unsigned long)s_chapter_count);
+}
+
+/* 定义为 book_index_task 之前的前向声明 (定义在下方) */
+static void book_toc_pre_scan(FILE *fp);
+
+static void book_index_task(void *arg) {
+    (void)arg;
+    FILE *fp = fopen(s_path, "rb");
+    if (!fp) {
+        s_index_error = true;
+        s_idx_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    idx_ctx_t c = s_idx;
+    c.fp = fp;
+    /* 目录先行: 改用本任务独立句柄逐行扫描整本书填满章节目录 (不阻塞主线程).
+     * 必须在分页追加入目录之前完成, 并把 s_toc_prescanned 置真, 使分页不再重复追加. */
+    if (!s_toc_prescanned) {
+        book_toc_pre_scan(fp);
+        s_toc_prescanned = true;
+    }
+    int64_t step_t0 = esp_timer_get_time();
+    int step_count = 0;
+    /* ★★★ 2026-10-31: 喂狗前**必须先订阅**。
+     *   原实现直接调 esp_task_wdt_reset() —— 但本任务从未 esp_task_wdt_add(),
+     *   于是每次调用都打一条 `E task_wdt: esp_task_wdt_reset(707): task not found`,
+     *   既是刷屏噪声, 又是**假喂狗**(实际没有喂到任何东西)。
+     *   gam4980 那边早踩过同一个坑(见 gam4980_emu.c 的注释), 这里同样处理:
+     *   订阅成功才喂, 退出时反订阅。 */
+    bool wdt_sub = (esp_task_wdt_add(NULL) == ESP_OK);
+    while (!s_idx_stop && c.cur < c.fsz) {
+        if (wdt_sub) esp_task_wdt_reset();   /* 喂任务看门狗: 长索引不触发 WDT */
+        uint32_t lim = c.cur + BOOK_SCAN_STEP;
+        if (lim > c.fsz) lim = c.fsz;
+        if (book_scan_run(&c, lim) != 0) { s_index_error = true; break; }
+        s_indexed_bytes = c.cur;
+        step_count++;
+        if ((step_count % 15) == 0) {
+            /* 周期性部分落盘: 中途关闭也不丢进度 */
+            book_save_sidecar();
+        }
+        int64_t step_dt = esp_timer_get_time() - step_t0;
+        if (step_dt > 150000) {
+            ESP_LOGD(TAG, "索引步 %lu->%lu 耗时 %lld ms", (unsigned long)(lim - BOOK_SCAN_STEP),
+                     (unsigned long)lim, (long long)step_dt / 1000);
+        }
+        step_t0 = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    fclose(fp);
+    if (!s_idx_stop && !s_index_error) {
+        s_index_done = true;
+        book_toc_fallback();   /* 规则 F: 无章节时兜底字数分节 */
+        ESP_LOGI(TAG, "后台索引完成: %lu 页, %lu 章",
+                 (unsigned long)s_page_count, (unsigned long)s_chapter_count);
+        book_save_sidecar();
+    }
+    if (wdt_sub) esp_task_wdt_delete(NULL);
+    s_idx_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static bool book_index_stop(void) {
+    if (!s_idx_task) return true;
+    s_idx_stop = true;
+    uint32_t t0 = xTaskGetTickCount();
+    while (s_idx_task && (uint32_t)(xTaskGetTickCount() - t0) < pdMS_TO_TICKS(8000)) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_idx_task) {
+        ESP_LOGD(TAG, "索引任务停止超时, 放弃释放以避免悬空访问");
+        return false;
+    }
+    s_idx_stop = false;
+    return true;
+}
+
+/* 后台目录重建任务: 侧边索引页表已完备但目录缺失/过少(旧缓存)时,
+ * 后台逐行重扫全书生成完整目录并回写 .idx, 全程让出CPU+喂看门狗, 不阻塞阅读. */
+static void book_toc_rebuild_task(void *arg) {
+    (void)arg;
+    FILE *fp = fopen(s_path, "rb");
+    if (!fp) { s_idx_task = NULL; vTaskDelete(NULL); return; }
+    /* 同 book_index_task: 未订阅就喂只会打 "task not found"。先订阅再喂。 */
+    bool wdt_sub = (esp_task_wdt_add(NULL) == ESP_OK);
+    if (!s_toc_prescanned) {
+        book_toc_pre_scan(fp);   /* 分步逐行扫描(内部让出CPU), 填满章节目录 */
+        s_toc_prescanned = true;
+    }
+    fclose(fp);
+    if (!s_idx_stop) {
+        if (wdt_sub) esp_task_wdt_reset();
+        book_save_sidecar();     /* 把完整目录回写 .idx, 下次秒开 */
+        ESP_LOGI(TAG, "目录后台重建完成: %lu 章, 已回写 sidecar", (unsigned long)s_chapter_count);
+    }
+    if (wdt_sub) esp_task_wdt_delete(NULL);
+    s_idx_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* 启动后台目录重建 (已在跑则跳过) */
+static void book_toc_rebuild_start(void) {
+    if (s_idx_task) return;   /* 已在跑 */
+    s_idx_stop = false;
+    if (xTaskCreate(book_toc_rebuild_task, "book_toc", 8192, NULL, 1, &s_idx_task) != pdPASS) {
+        ESP_LOGD(TAG, "目录重建任务创建失败");
+        s_idx_task = NULL;
+    }
+}
+
+/* 页首是否段落首行: 检查页起点前是否有空行 (>=2 连续换行) 或书首.
+ * 与扫描器在页边界处的段落状态一致 (仅取决于前一页末行是否空行). */
+static uint32_t s_para_off = 0xFFFFFFFF;
+static bool     s_para_val = false;
+static bool book_page_para_compute(uint32_t off) {
+    if (off <= s_file_start) return true;
+    uint32_t want = 48;
+    uint32_t base = (off > want) ? (off - want) : s_file_start;
+    if (base < s_file_start) base = s_file_start;
+    want = off - base;
+    uint8_t buf[64];
+    if (fseek(s_fp, (long)base, SEEK_SET) != 0) return false;
+    size_t got = fread(buf, 1, want, s_fp);
+    if (got == 0) return true;
+    int nls = 0;
+    if (s_enc == BF_ENC_UTF16LE || s_enc == BF_ENC_UTF16BE) {
+        size_t i = got;
+        while (i >= 2) {
+            uint16_t u = (s_enc == BF_ENC_UTF16LE)
+                ? (uint16_t)(buf[i - 2] | (uint16_t)(buf[i - 1] << 8))
+                : (uint16_t)((buf[i - 2] << 8) | buf[i - 1]);
+            if (u == '\n' || u == '\r') { nls++; i -= 2; }
+            else break;
+        }
+    } else {
+        size_t i = got;
+        while (i > 0) {
+            uint8_t c = buf[i - 1];
+            if (c == '\n') { nls++; i--; }
+            else if (c == '\r') { nls++; i--; if (i > 0 && buf[i - 1] == '\n') i--; }
+            else break;
+        }
+    }
+    return nls >= 2;
+}
+static bool book_page_para(uint32_t off) {
+    if (off == s_para_off) return s_para_val;
+    s_para_off = off;
+    s_para_val = book_page_para_compute(off);
+    return s_para_val;
+}
+
+/* 目录先行预扫描: 不等完整分页, 先用快速逐行扫描识别所有章节标题行, 尽快填满章节目录.
+ * 与分页索引解耦 (不做排版分页, 只按换行切行 + toc_match), 大幅提速"目录生成".
+ * 复用 idx_chapters_append (含锁/上限/截断回退). 仅支持 UTF-8 / GBK (UTF-16 少见, 交分页后台). */
+static void book_toc_pre_scan(FILE *fp) {
+    if (!fp || s_src_size == 0) return;
+    if (s_enc == BF_ENC_UTF16LE || s_enc == BF_ENC_UTF16BE) return;
+    bool gbk = (s_enc == BF_ENC_GBK);
+    /* 用堆分配读缓冲 (栈上放 32KB 会溢出任务栈导致崩溃) */
+    uint8_t *chunk = heap_caps_malloc(BOOK_SCAN_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!chunk) { ESP_LOGD(TAG, "目录预扫描缓冲分配失败, 跳过"); return; }
+    /* 目录以预扫描结果为准: 清空分页同步首段可能已追加入的重复章节 (避免重复目录项) */
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    s_chapter_count = 0;
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    uint32_t off = s_file_start;          /* 跳过 BOM */
+    size_t carry = 0;                     /* 跨块残留半行 */
+    int64_t t0 = esp_timer_get_time();
+    uint32_t hits = 0;
+    uint32_t throt = 0;
+    uint32_t di_lines = 0;                       /* 行数统计 (收尾日志用) */
+    while (off < s_src_size && !s_idx_stop) {
+        /* 每块最多读到缓冲尾部, 防止跨块残留(carry)大到把 fread 写越界到堆, 腐蚀 PSRAM 堆 → 后续 free 崩溃 */
+        uint32_t want = s_src_size - off;
+        if (carry < BOOK_SCAN_CHUNK) {
+            uint32_t room = BOOK_SCAN_CHUNK - (uint32_t)carry;
+            if (want > room) want = room;
+        } else {
+            want = 0;   /* 单行超过整个缓冲(>32KB 无换行): 无法安全预扫描, 结束, 目录交兜底分节 */
+        }
+        if (want == 0) break;
+        if (fseek(fp, (long)off, SEEK_SET) != 0) break;
+        size_t got = fread(chunk + carry, 1, want, fp);
+        if (got == 0) break;
+        size_t len = carry + got;
+        size_t line_start = 0;
+        for (size_t i = 0; i < len; i++) {
+            if (chunk[i] == '\n') {
+                di_lines++;
+                /* 行范围 [line_start, i) 去除行尾 \r */
+                size_t e = i;
+                if (e > line_start && chunk[e - 1] == '\r') e--;
+                if (e > line_start) {
+                    const uint8_t *ln = chunk + line_start;
+                    int ll = (int)(e - line_start);
+                    if (toc_match(ln, ll, gbk)) {
+                        /* 标题去行首空格 (存干净的「第一卷/第一节:x」而非含缩进) */
+                        const uint8_t *tl = ln;
+                        int tll = ll;
+                        while (tll > 0 && (tl[0]==' ' || tl[0]=='\t' || tl[0]=='\r')) { tl++; tll--; }
+                        /* 屏蔽书籍简介类噪声 */
+                        bool is_intro = (tll == 6 && memcmp(tl, "\xE7\xAE\x80\xE4\xBB\x8B", 6) == 0); /* 简介 */
+                        /* 屏蔽裸「第X」(第+单数字, 无 卷/节/章 后缀) */
+                        bool is_bare = (tll == 6 && tl[0]==0xE7 && tl[1]==0xAC && tl[2]==0xAC &&
+                                        utf8_num_word(tl + 3));
+                        if (!is_intro && !is_bare) {
+                            idx_chapters_append(off + (uint32_t)(line_start + (tl - ln)), tl,
+                                                (uint8_t)(tll > 30 ? 30 : tll));
+                            hits++;
+                        }
+                    }
+                }
+                line_start = i + 1;
+            }
+        }
+        /* 保留不完整尾行到下一块 (carry 恒 < BOOK_SCAN_CHUNK, 不越界) */
+        carry = len - line_start;
+        if (carry) memmove(chunk, chunk + line_start, carry);
+        off += want;
+        /* 温柔让出 CPU+SD: 每 2 块 yield 一次, 避免后台预扫描霸占读卡, 卡住首屏/翻页 */
+        if ((++throt & 0x1) == 0) vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    /* 处理文件末尾残行 */
+    if (carry > 0 && toc_match(chunk, (int)carry, gbk)) {
+        idx_chapters_append(off, chunk, (uint8_t)carry);
+        hits++;
+    }
+    heap_caps_free(chunk);
+    int64_t dt = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG, "目录预扫描完成: %lu 章, 共%lu 行, 命中%lu, 耗时 %lld ms",
+             (unsigned long)s_chapter_count, (unsigned long)di_lines, (unsigned long)hits, (long long)dt / 1000);
+    (void)hits;
+}
+
+/* 初始化索引并开始 (同步扫首段 + 后台任务), 返回 0 成功 */
+static int book_scan_start(void) {
+    if (!s_scan_chunk || !s_scan_win || !s_scan_brk || !s_scan_scratch || !s_scan_off) return -1;
+    memset(&s_idx, 0, sizeof(s_idx));
+    s_idx.fp = s_fp;
+    s_idx.fsz = s_src_size;
+    s_idx.cur = (s_resume_off > s_file_start) ? s_resume_off : s_file_start;
+    s_idx.resume = (s_resume_off > s_file_start);
+    s_idx.at_line_start = true;
+    s_idx.at_para = book_page_para(s_idx.cur);   /* 续扫时按页前空行恢复段落状态 */
+    /* 目录预扫描已移至后台索引任务 (book_index_task), 主线程不做整本扫描, 避免打开大书卡死 */
+    uint32_t first = s_file_start + BOOK_FIRST_CHUNK;
+    if (first > s_src_size) first = s_src_size;
+    if (book_scan_run(&s_idx, first) != 0) return -1;
+    s_indexed_bytes = s_idx.cur;
+    if (s_idx.cur >= s_src_size) {
+        s_index_done = true;
+        book_toc_fallback();
+        book_save_sidecar();
+        return 0;
+    }
+    s_idx_stop = false;
+    s_idx_task = NULL;
+    if (xTaskCreate(book_index_task, "book_idx", 8192, NULL, 1, &s_idx_task) != pdPASS) {
+        /* 后台任务创建失败: 仅同步扫书首一小段, 保证至少第1页可显示 (有界且快, 不触发任务看门狗) */
+        ESP_LOGD(TAG, "后台索引任务创建失败, 仅同步扫书首");
+        uint32_t first = s_file_start + BOOK_FIRST_CHUNK;
+        if (first > s_src_size) first = s_src_size;
+        if (book_scan_run(&s_idx, first) != 0) return -1;
+        s_indexed_bytes = s_idx.cur;
+        s_index_done = (s_idx.cur >= s_src_size);
+        if (s_index_done) { book_toc_fallback(); book_save_sidecar(); }
+    }
+    /* 主线程不再做任何同步索引: 立即返回, 用户先进书先看, 剩余分页/目录由后台任务分步完成 */
+    return 0;
+}
+
+/* 等待索引覆盖到第 p 页 (超时/出错返回) */
+static void book_wait_indexed_page(uint32_t p) {
+    uint32_t t0 = xTaskGetTickCount();
+    while (!s_index_done && !s_index_error && s_page_count <= p &&
+           (uint32_t)(xTaskGetTickCount() - t0) < pdMS_TO_TICKS(4000)) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* 旋转布局变化 → 重新分页 */
+static void book_restart_index(void) {
+    if (!book_index_stop()) {
+        ESP_LOGD(TAG, "索引任务未停止, 取消重新分页");
+        return;
+    }
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    if (s_page_off) { free(s_page_off); s_page_off = NULL; }
+    if (s_chapters) { free(s_chapters); s_chapters = NULL; }
+    s_page_cap = s_page_count = 0;
+    s_chapter_cap = s_chapter_count = 0;
+    s_index_done = false;
+    s_index_error = false; s_idx_fail = IDX_FAIL_NONE;
+    s_indexed_bytes = 0;
+    s_toc_prescanned = false;   /* 需要重新预扫描目录 */
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    if (!book_load_sidecar()) {
+        if (book_scan_start() != 0) {
+            ESP_LOGD(TAG, "重新索引失败");
+            book_reader_close();
+            return;
+        }
+    }
+    s_page = 0;
+    s_menu = BM_READ;
+}
+
+/* ============ 渲染 ============ */
+
+static bool book_load_win(uint32_t start, uint32_t need) {
+    if (!s_win) return false;
+    if (start >= s_win_base && start + need <= s_win_base + s_win_len) return true;
+    if (start >= s_src_size || !s_fp) return false;
+    uint32_t want = need + 4096;                /* 按需读 + 余量, 避免整窗 */
+    if (want > BOOK_MAX_WIN_READ) want = BOOK_MAX_WIN_READ;   /* 单次渲染读上限(快) */
+    if (want > BOOK_WIN_SIZE) want = BOOK_WIN_SIZE;
+    if (want > s_src_size - start) want = s_src_size - start;
+    if (want < 256) want = 256;
+    int64_t t0 = esp_timer_get_time();
+    if (fseek(s_fp, (long)start, SEEK_SET) != 0) return false;
+    size_t n = fread(s_win, 1, want, s_fp);
+    int64_t dt = esp_timer_get_time() - t0;
+    if (dt > 20000) {
+        ESP_LOGD(TAG, "窗口读取 %u B 耗时 %lld ms (start=%u)", (unsigned)n, (long long)dt / 1000, start);
+    }
+    s_win_base = start;
+    s_win_len = (uint32_t)n;
+    return (s_win_len > 0);   /* 读到数据即可渲染 (粗分页页较大时按需读上限内先显示, 不整页空白) */
+}
+
+/* 从渲染窗口解码当前页正文 (win_off = 当前页在窗口内的字节偏移)
+ * 修复: 旧代码固定从 win[0] 解码, 窗口缓存命中时永远显示窗口第一页! */
+static int render_decode_window(bf_ch_t *win, uint32_t win_off, int max_chars) {
+    int n = 0;
+    uint32_t pos = win_off;
+    const uint8_t *pend = s_win + s_win_len;
+    while (n < max_chars && pos < s_win_len) {
+        bf_ch_t ch = bf_next_ch(s_win + pos, pend, s_enc);
+        if (ch.adv == 0) break;
+        win[n++] = ch;
+        pos += ch.adv;
+    }
+    return n;
+}
+
+/* 两段对齐: 把本行剩余空间均匀分到字间距, 保证左右边距一致.
+ * 以下行不拉伸 (左对齐): 段落末行 (含换行符/页底窗口边界)、单字行、
+ * 填充率不足 2/3 的短行 (最后只剩两三个字时避免出现巨大字缝).
+ * 输出 gaps/每间隙增量/余数. */
+static void line_justify(const bf_ch_t *win, int start, int end, int line_max,
+                         int *gaps, int *per_gap, int *rem, bool *justify) {
+    int used = 0, nchars = 0;
+    for (int j = start; j < end; j++) {
+        const bf_ch_t *ch = &win[j];
+        if (ch->kind == BF_CH_NEWLINE || ch->kind == BF_CH_SKIP) continue;
+        int w = (ch->kind == BF_CH_ASCII) ? font_book_ascii_w() : font_book_cell_w();
+        used += w + book_gap();
+        nchars++;
+    }
+    *gaps = 0; *per_gap = 0; *rem = 0; *justify = false;
+    if (nchars <= 1) return;
+    bool last_of_para = (end > start) && (win[end - 1].kind == BF_CH_NEWLINE);
+    if (last_of_para) return;
+    if (used >= line_max) return;
+    /* V1.0.68 fix: 少于 2/3 满的行不拉伸 (段末只剩两三个字/页底短行) */
+    if (used * 3 < line_max * 2) return;
+    int extra = line_max - used;
+    *gaps = nchars - 1;
+    *per_gap = extra / *gaps;
+    *rem = extra % *gaps;
+    *justify = true;
+}
+
+/* 横屏渲染 (旋转 上/下) */
+/* ★ B4: 索引受限提示（实现放在菜单绘制区之后，那里才有中文画字与编码适配） */
+static void draw_idx_warn(st7305_handle_t *lcd);
+static int  book_cur_chapter(void);            /* fwd: F7 目录高亮要用, 实现在菜单区 */
+
+static void render_landscape(st7305_handle_t *lcd) {
+    if (!s_open || !lcd) return;
+    int64_t rt0 = esp_timer_get_time();
+    s_lcd = lcd;
+    st7305_clear(lcd, ST7305_COLOR_WHITE);
+
+    if (s_index_error) {
+        draw_idx_warn(lcd);
+    } else if (s_pagenum) {
+        /* 底部进度条: 左下角百分比(阅读进度), 右下角本次阅读时长 */
+        uint32_t cur_off = (s_page < s_page_count) ? s_page_off[s_page] : s_src_size;
+        uint32_t pct = s_src_size ? (cur_off * 100 / s_src_size) : 100;
+        if (pct > 100) pct = 100;
+        char pct_str[8];
+        snprintf(pct_str, sizeof(pct_str), "%u%%", (unsigned)pct);
+        /* 本次阅读时长: 会话开始至今 (mm:ss, 超过 99 分用 h:mm) */
+        uint32_t elapsed = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - s_open_tick_ms;
+        elapsed /= 1000;
+        char dur_str[16];
+        uint32_t min = elapsed / 60, sec = elapsed % 60;
+        if (min >= 60) snprintf(dur_str, sizeof(dur_str), "%lu:%02lu:%02lu", (unsigned long)(min / 60), (unsigned long)(min % 60), (unsigned long)sec);
+        else           snprintf(dur_str, sizeof(dur_str), "%lu:%02lu", (unsigned long)min, (unsigned long)sec);
+        int py = ST7305_HEIGHT - font_book_ascii_h() - 2;
+        /* 左下角: 百分比 (从左边距起) */
+        int px_left = book_margin();
+        for (int i = 0; pct_str[i]; i++) {
+            book_glyph_t g;
+            if (font_book_glyph_ascii((uint8_t)pct_str[i], &g))
+                st7305_blit_1bit(lcd, px_left + i * font_book_ascii_w(), py, g.w, g.h, g.bitmap);
+        }
+        /* 右下角: 阅读时长 */
+        int dw = (int)strlen(dur_str) * font_book_ascii_w();
+        int px_right = ST7305_WIDTH - book_margin() - dw;
+        for (int i = 0; dur_str[i]; i++) {
+            book_glyph_t g;
+            if (font_book_glyph_ascii((uint8_t)dur_str[i], &g))
+                st7305_blit_1bit(lcd, px_right + i * font_book_ascii_w(), py, g.w, g.h, g.bitmap);
+        }
+    }
+
+    uint32_t start = 0, end = s_src_size;
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    uint32_t pg = s_page;
+    if (pg < s_page_count) start = s_page_off[pg];
+    if (pg + 1 < s_page_count) end = s_page_off[pg + 1];
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    if (s_page_count == 0) { start = s_file_start; end = start + 8192; if (end > s_src_size) end = s_src_size; }
+    uint32_t pagelen = end - start;
+    if (!book_load_win(start, pagelen + 8)) return;
+    if (!s_rwin || !s_rbrk || !s_rscratch) return;
+
+    int n = render_decode_window(s_rwin, start - s_win_base, BF_MAX_WIN);
+    if (n == 0) return;
+    int64_t t_flow0 = esp_timer_get_time();
+    bf_breaks(s_rwin, n, s_enc, s_rbrk, s_rscratch, FLOW_SCRATCH_SIZE);
+    bool para = book_page_para(start);           /* 页首是否段落首行 */
+    int indent_px = s_indent ? 2 * (font_book_cell_w() + book_gap()) : 0;
+    uint8_t line_indent[BF_MAX_LINES];
+    int line_end[BF_MAX_LINES], lc, boundary;
+    bf_layout(s_rwin, n, s_rbrk, book_rows(), book_line_max(),
+              font_book_ascii_w() + book_gap(), font_book_cell_w() + book_gap(),
+              &para, indent_px, line_end, line_indent, &lc, &boundary);
+    int64_t t_flow1 = esp_timer_get_time();
+    int actual = lc; if (actual > book_rows()) actual = book_rows();
+    int x0, y0; book_center(&x0, &y0, book_line_max(), actual, false);   /* V1.1.0 居中 */
+    int prev = 0, y = y0;
+    for (int k = 0; k < lc && k < book_rows(); k++) {
+        int endk = line_end[k];
+        int ind = line_indent[k] ? indent_px : 0;
+        int lm = book_line_max() - ind;
+        int gaps, per_gap, rem;
+        bool justify;
+        line_justify(s_rwin, prev, endk, lm, &gaps, &per_gap, &rem, &justify);
+        int x = ind, gi = 0;
+        for (int j = prev; j < endk; j++) {
+            const bf_ch_t *ch = &s_rwin[j];
+            if (ch->kind == BF_CH_TAB) { x += font_book_cell_w() + book_gap(); gi++; continue; }
+            if (ch->kind == BF_CH_NEWLINE || ch->kind == BF_CH_SKIP) continue;
+            int w = ch_width(ch);
+            draw_decoded_char(lcd, x0 + x, y, ch);
+            x += w;
+            if (justify && gi < gaps) x += per_gap + (gi < rem ? 1 : 0);
+            gi++;
+        }
+        prev = endk;
+        y += book_line_h();
+    }
+    int64_t t_draw1 = esp_timer_get_time();
+    int64_t rt1 = esp_timer_get_time();
+    if (rt1 - rt0 > 20000) {
+        /* ★ 2026-11-01 临时开成 WARN：用户反馈"阅读界面弹窗很卡"，需要实测哪一段慢 */
+        ESP_LOGW(TAG, "渲染耗时 %lld ms (flow=%lld 绘制=%lld) menu=%d",
+                 (long long)(rt1 - rt0) / 1000,
+                 (long long)(t_flow1 - t_flow0) / 1000,
+                 (long long)(t_draw1 - t_flow1) / 1000, (int)s_menu);
+    }
+}
+
+/* 竖屏渲染 (旋转 左/右): 画进逻辑缓冲, 软件旋转映射回横屏帧缓冲 */
+static void render_portrait(st7305_handle_t *lcd) {
+    if (!s_open || !lcd || !s_pfb) return;
+    s_lcd = lcd;
+    uint8_t *fb = s_pfb;
+    pfb_clear(fb);
+
+    if (s_index_error) {
+        draw_idx_warn(lcd);
+    } else if (s_pagenum) {
+        /* 底部进度条: 左下角百分比(阅读进度), 右下角本次阅读时长 */
+        uint32_t cur_off = (s_page < s_page_count) ? s_page_off[s_page] : s_src_size;
+        uint32_t pct = s_src_size ? (cur_off * 100 / s_src_size) : 100;
+        if (pct > 100) pct = 100;
+        char pct_str[8];
+        snprintf(pct_str, sizeof(pct_str), "%u%%", (unsigned)pct);
+        uint32_t elapsed = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - s_open_tick_ms;
+        elapsed /= 1000;
+        char dur_str[16];
+        uint32_t min = elapsed / 60, sec = elapsed % 60;
+        if (min >= 60) snprintf(dur_str, sizeof(dur_str), "%lu:%02lu:%02lu", (unsigned long)(min / 60), (unsigned long)(min % 60), (unsigned long)sec);
+        else           snprintf(dur_str, sizeof(dur_str), "%lu:%02lu", (unsigned long)min, (unsigned long)sec);
+        int py = BOOK_PORTRAIT_H - font_book_ascii_h() - 2;
+        /* 左下角: 百分比 */
+        int px_left = book_margin();
+        for (int i = 0; pct_str[i]; i++) {
+            book_glyph_t g;
+            if (font_book_glyph_ascii((uint8_t)pct_str[i], &g)) pfb_blit(fb, px_left + i * font_book_ascii_w(), py, &g);
+        }
+        /* 右下角: 阅读时长 */
+        int dw = (int)strlen(dur_str) * font_book_ascii_w();
+        int px_right = BOOK_PORTRAIT_W - book_margin() - dw;
+        for (int i = 0; dur_str[i]; i++) {
+            book_glyph_t g;
+            if (font_book_glyph_ascii((uint8_t)dur_str[i], &g)) pfb_blit(fb, px_right + i * font_book_ascii_w(), py, &g);
+        }
+    }
+
+    uint32_t start = 0, end = s_src_size;
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    uint32_t pg = s_page;
+    if (pg < s_page_count) start = s_page_off[pg];
+    if (pg + 1 < s_page_count) end = s_page_off[pg + 1];
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    /* 无页表(首次打开/换布局): 立即渲染文件开头第一屏, 后台索引慢慢补分页 */
+    if (s_page_count == 0) { start = s_file_start; end = start + 8192; if (end > s_src_size) end = s_src_size; }
+    uint32_t pagelen = end - start;
+    if (!book_load_win(start, pagelen + 8)) return;
+    if (!s_rwin || !s_rbrk || !s_rscratch) return;
+
+    int n = render_decode_window(s_rwin, start - s_win_base, BF_MAX_WIN);
+    if (n == 0) return;
+    bf_breaks(s_rwin, n, s_enc, s_rbrk, s_rscratch, FLOW_SCRATCH_SIZE);
+    bool para = book_page_para(start);           /* 页首是否段落首行 */
+    int indent_px = s_indent ? 2 * (font_book_cell_w() + book_gap()) : 0;
+    uint8_t line_indent[BF_MAX_LINES];
+    int line_end[BF_MAX_LINES], lc, boundary;
+    bf_layout(s_rwin, n, s_rbrk, book_rows(), book_line_max(),
+              font_book_ascii_w() + book_gap(), font_book_cell_w() + book_gap(),
+              &para, indent_px, line_end, line_indent, &lc, &boundary);
+    int actual = lc; if (actual > book_rows()) actual = book_rows();
+    int x0, y0; book_center(&x0, &y0, book_line_max(), actual, true);       /* V1.1.0 居中 */
+    int prev = 0, y = y0;
+    for (int k = 0; k < lc && k < book_rows(); k++) {
+        int endk = line_end[k];
+        int ind = line_indent[k] ? indent_px : 0;
+        int lm = book_line_max() - ind;
+        int gaps, per_gap, rem;
+        bool justify;
+        line_justify(s_rwin, prev, endk, lm, &gaps, &per_gap, &rem, &justify);
+        int x = ind, gi = 0;
+        for (int j = prev; j < endk; j++) {
+            const bf_ch_t *ch = &s_rwin[j];
+            if (ch->kind == BF_CH_TAB) { x += font_book_cell_w() + book_gap(); gi++; continue; }
+            if (ch->kind == BF_CH_NEWLINE || ch->kind == BF_CH_SKIP) continue;
+            int w = ch_width(ch);
+            int yy = y;
+            book_glyph_t g;
+            bool ok;
+            if (s_enc == BF_ENC_GBK) {
+                ok = (ch->kind == BF_CH_ASCII) ? font_book_glyph_ascii((uint8_t)ch->cp, &g)
+                                               : font_book_glyph_gb(ch->hi, ch->lo, &g);
+            } else if (ch->cp < 0x80) {
+                ok = font_book_glyph_ascii((uint8_t)ch->cp, &g);
+            } else {
+                ok = font_book_glyph_unicode(ch->cp, &g);
+            }
+            if ((s_enc != BF_ENC_GBK && is_ws_cp(ch->cp)) ||
+                (s_enc == BF_ENC_GBK && ch->kind == BF_CH_CJK &&
+                 ch->hi == 0xA1 && ch->lo == 0xA1)) {
+                x += w;
+                continue;
+            }
+            if (ok) pfb_blit(fb, x0 + x, yy, &g);
+            else {
+                for (int i = 0; i < 16; i++) {
+                    pfb_px(fb, x0 + x, yy + i, 1);
+                    pfb_px(fb, x0 + x + 15, yy + i, 1);
+                    pfb_px(fb, x0 + x + i, yy, 1);
+                    pfb_px(fb, x0 + x + i, yy + 15, 1);
+                }
+            }
+            x += w;
+            if (justify && gi < gaps) x += per_gap + (gi < rem ? 1 : 0);
+            gi++;
+        }
+        prev = endk;
+        y += book_line_h();
+    }
+
+}
+
+/* 竖屏旋转已交驱动 st7305_set_rotation+flush 统一处理 (与书架同套), 此软件旋转已删除. */
+
+/* ============ 阅读菜单 ============ */
+
+static const char *menu_str(const char *utf8, const char *gbk) {
+    return (s_enc == BF_ENC_GBK) ? gbk : utf8;
+}
+
+#define M_READ_MENU   menu_str("\xE9\x98\x85\xE8\xAF\xBB\xE8\x8F\x9C\xE5\x8D\x95", "\xD4\xC4\xB6\xC1\xB2\xCB\xB5\xA5")
+#define M_TOC         menu_str("\xE7\xAB\xA0\xE8\x8A\x82\xE7\x9B\xAE\xE5\xBD\x95", "\xD5\xC2\xBD\xDA\xC4\xBF\xC2\xBC")  /* 章节目录 */
+#define M_ADD_BM      menu_str("\xE6\xB7\xBB\xE5\x8A\xA0\xE4\xB9\xA6\xE7\xAD\xBE", "\xCC\xED\xBC\xD3\xCA\xE9\xC7\xA9")
+#define M_BM_LIST     menu_str("\xE4\xB9\xA6\xE7\xAD\xBE\xE5\x88\x97\xE8\xA1\xA8", "\xCA\xE9\xC7\xA9\xC1\xD0\xB1\xED")
+#define M_BACK_READ   menu_str("\xE8\xBF\x94\xE5\x9B\x9E\xE9\x98\x85\xE8\xAF\xBB", "\xB7\xB5\xBB\xD8\xD4\xC4\xB6\xC1")
+#define M_BACK_LIB    menu_str("\xE8\xBF\x94\xE5\x9B\x9E\xE4\xB9\xA6\xE5\xBA\x93", "\xB7\xB5\xBB\xD8\xCA\xE9\xBF\xE2")  /* 返回书库 */
+#define M_CONT_READ   menu_str("\xE7\xBB\xA7\xE7\xBB\xAD\xE9\x98\x85\xE8\xAF\xBB", "\xBC\xCD\xD0\xF8\xD4\xC4\xB6\xC1")  /* 继续阅读 */
+#define M_BACK        menu_str("\xE8\xBF\x94\xE5\x9B\x9E", "\xB7\xB5\xBB\xD8")
+#define M_CLEAR_BM    menu_str("\xE6\xB8\x85\xE7\xA9\xBA\xE4\xB9\xA6\xE7\xAD\xBE", "\xC7\xE5\xBF\xD5\xCA\xE9\xC7\xA9")
+#define M_NO_TOC      menu_str("\xE6\x97\xA0\xE7\xAB\xA0\xE8\x8A\x82", "\xCE\xDE\xD5\xC2\xBD\xDA")
+#define M_NO_BM       menu_str("\xE6\x97\xA0\xE4\xB9\xA6\xE7\xAD\xBE", "\xCE\xDE\xCA\xE9\xC7\xA9")
+#define M_ADDED       menu_str("\xE5\xB7\xB2\xE6\xB7\xBB\xE5\x8A\xA0", "\xD2\xD1\xCC\xED\xBC\xD3")
+#define M_BM_FULL     menu_str("\xE4\xB9\xA6\xE7\xAD\xBE\xE5\xB7\xB2\xE6\xBB\xA1", "\xCA\xE9\xC7\xA9\xD2\xD1\xC2\xFA")
+#define M_FONT_SEL    menu_str("\xE5\xAD\x97\xE4\xBD\x93\xE9\x80\x89\xE6\x8B\xA9", "\xD7\xD6\xCC\xE5\xD1\xA1\xD4\xF1")  /* 字体选择 */
+#define M_EMB_FS      menu_str("\xE5\x86\x85\xE7\xBD\xAE\xE5\xAD\x97\xE4\xBD\x93", "\xC4\xDA\xD6\xC3\xD7\xD6\xCC\xE5")  /* 内置字体 */
+#define M_SIZE        menu_str("\xE5\xAD\x97\xE5\x8F\xB7", "\xD7\xD6\xBA\xC5")                                  /* 字号 */
+#define M_EMB_HT      M_EMB_FS
+#define M_CLEARED     menu_str("\xE5\xB7\xB2\xE6\xB8\x85\xE7\xA9\xBA", "\xD2\xD1\xC7\xE5\xBF\xD5")
+#define M_EXIT_ASK    menu_str("\xE7\xA1\xAE\xE5\xAE\x9A\xE9\x80\x80\xE5\x87\xBA\xE9\x98\x85\xE8\xAF\xBB\xEF\xBC\x9F", "\xC8\xB7\xB6\xA8\xCD\xCB\xB3\xF6\xD4\xC4\xB6\xC1\xA3\xBF")
+#define M_CONFIRM     menu_str("\xE7\xA1\xAE\xE5\xAE\x9A", "\xB6\xC8\xB6\xA8")   /* 确定 */
+#define M_CANCEL      menu_str("\xE5\x8F\x96\xE6\xB6\x88", "\xC8\xA1\xCF\xFB")   /* 取消 */
+/* ★ F2/F7 (2026-10-30) 新增菜单项 */
+#define M_PREV_CH     menu_str("\xE4\xB8\x8A\xE4\xB8\x80\xE7\xAB\xA0", "\xC9\xCF\xD2\xBB\xD5\xC2")
+#define M_NEXT_CH     menu_str("\xE4\xB8\x8B\xE4\xB8\x80\xE7\xAB\xA0", "\xCF\xC2\xD2\xBB\xD5\xC2")
+#define M_GOTO_PCT    menu_str("\xE8\xB7\xB3\xE5\x88\xB0\xE8\xBF\x9B\xE5\xBA\xA6", "\xCC\xF8\xB5\xBD\xBD\xF8\xB6\xC8")
+#define M_PCT_TITLE   menu_str("\xE8\xB7\xB3\xE5\x88\xB0\xE7\x99\xBE\xE5\x88\x86\xE6\xAF\x94", "\xCC\xF8\xB5\xBD\xB0\xD9\xB7\xD6\xB1\xC8")
+#define M_IDX_HINT    menu_str("\xE7\xB4\xA2\xE5\xBC\x95\xE4\xB8\xAD\x20\xE5\x8F\xAA\xE8\x83\xBD\xE8\xB7\xB3\xE5\x88\xB0", "\xCB\xF7\xD2\xFD\xD6\xD0\x20\xD6\xBB\xC4\xDC\xCC\xF8\xB5\xBD")   /* "索引中 只能跳到" */
+
+/* ★ 2026-11-22: 绘制裁剪区 (弹窗专用)。
+ *   弹窗里的文字/反白块必须被"框"和"列表可视区"裁掉, 否则:
+ *     · 长章节名会越过右边框画到框外 (旧实现靠 ui_draw_text 里写死的 W-44 挡,
+ *       而那个值与弹窗右边界无关, 换个字号/竖屏就漏);
+ *     · 拖动时半可见的最上/最下一行的字形会溢到标题分隔线或底部返回行上。
+ *   clip 关闭(-1)时零行为变化, 正文绘制完全不受影响。 */
+static int s_clip_x0 = -1, s_clip_y0 = -1, s_clip_x1 = -1, s_clip_y1 = -1;
+static void clip_set(int x0, int y0, int x1, int y1) { s_clip_x0 = x0; s_clip_y0 = y0; s_clip_x1 = x1; s_clip_y1 = y1; }
+static void clip_clear(void) { s_clip_x0 = s_clip_y0 = s_clip_x1 = s_clip_y1 = -1; }
+
+static void menu_fb_px(st7305_handle_t *lcd, int x, int y, bool black) {
+    if (s_clip_x0 >= 0) {
+        if (x < s_clip_x0 || x > s_clip_x1 || y < s_clip_y0 || y > s_clip_y1) return;
+    }
+    if (book_is_portrait() && s_pfb) {
+        pfb_px(s_pfb, x, y, black ? 1 : 0);
+    } else {
+        fb_set_px_landscape(lcd->fb, x, y, black ? 1 : 0);
+    }
+}
+
+/* 阅读平面文字 (正文/页码/进度/章节): **跟随阅读字体**, 按原编码绘制。
+ * invert=白字黑底。菜单/弹窗**不要**用这个 —— 见下面的 ui_draw_text。 */
+static void read_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bool invert) {
+    const uint8_t *p = (const uint8_t *)s;
+    int cx = x;
+    int x1 = (book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH) - 44;
+    while (*p) {
+        int w;
+        book_glyph_t g;
+        bool ok = false;
+        if (s_enc == BF_ENC_GBK && p[0] >= 0x81 && p[1]) {
+            ok = font_book_glyph_gb(p[0], p[1], &g);
+            w = font_book_cell_w();
+            p += 2;
+        } else if (p[0] < 0x80) {
+            ok = font_book_glyph_ascii(p[0], &g);
+            w = font_book_ascii_w();
+            p++;
+        } else {
+            const uint8_t *q = p;
+            uint32_t cp = *q++;
+            int extra = 0;
+            if ((cp & 0xE0) == 0xC0) { extra = 1; cp &= 0x1F; }
+            else if ((cp & 0xF0) == 0xE0) { extra = 2; cp &= 0x0F; }
+            else if ((cp & 0xF8) == 0xF0) { extra = 3; cp &= 0x07; }
+            else { p++; continue; }
+            for (int k = 0; k < extra && *q; k++) {
+                cp = (cp << 6) | (*q++ & 0x3F);
+            }
+            p = q;
+            ok = font_book_glyph_unicode(cp, &g);
+            w = font_book_cell_w();
+        }
+        if (cx + w > x1) break;
+        if (ok && g.bitmap) {
+            int rb = (g.w + 7) / 8;
+            for (int row = 0; row < g.h; row++) {
+                const uint8_t *src = g.bitmap + row * rb;
+                for (int col = 0; col < g.w; col++) {
+                    if (src[col >> 3] & (1u << (7 - (col & 7)))) {
+                        menu_fb_px(lcd, cx + col, y + row, invert ? false : true);
+                    }
+                }
+            }
+        } else if (invert) {
+            int cw = font_book_cell_w(), chh = font_book_cell_h();
+            for (int i = 0; i < cw; i++) {
+                menu_fb_px(lcd, cx + i, y, false);
+                menu_fb_px(lcd, cx + i, y + chh - 1, false);
+            }
+            for (int i = 0; i < chh; i++) {
+                menu_fb_px(lcd, cx, y + i, false);
+                menu_fb_px(lcd, cx + cw - 1, y + i, false);
+            }
+        }
+        cx += w;
+    }
+}
+
+/* ★★★ 2026-10-31 字体隔离（本轮核心）★★★
+ *   UI 层（菜单 / 目录 / 书签列表 / 确认框 / 底部返回 / 滚动页码）**固定用系统
+ *   16px 宋体 + 8×16 ASCII**，与当前阅读字体彻底无关。
+ *
+ *   原来的菜单走 font_book_glyph_*（= 当前阅读字体），于是：
+ *     · 换成 TF 卡字体后，菜单/弹窗二手跟着变；
+ *     · 阅读字号 48 时菜单字大到放不下，还得靠
+ *       `font_book_select(32)` … `font_book_select(24)` 临时改全局再改回来
+ *       —— 既有闪烁风险，也违反"不许改全局字体"的约束。
+ *   现在两条绘制通路彻底分开：
+ *     阅读平面 → read_draw_text  (跟随阅读字体)
+ *     操作界面 → ui_draw_text    (系统字体，永远是 16px)
+ */
+static void ui_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bool invert) {
+    const uint8_t *p = (const uint8_t *)s;
+    int cx = x;
+    int x1 = (book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH) - 44;
+    const int cw = font_book_ui_cell_w();
+    const int aw = font_book_ui_ascii_w();
+
+    while (*p) {
+        int w = cw;
+        book_glyph_t g;
+        bool ok = false;
+        if (s_enc == BF_ENC_GBK && p[0] >= 0x81 && p[1]) {
+            ok = font_book_ui_glyph_gb(p[0], p[1], &g);
+            p += 2;
+        } else if (p[0] < 0x80) {
+            ok = font_book_ui_glyph_unicode(p[0], &g);
+            w = aw;
+            p++;
+        } else {
+            const uint8_t *q = p;
+            uint32_t cp = *q++;
+            int extra = 0;
+            if ((cp & 0xE0) == 0xC0) { extra = 1; cp &= 0x1F; }
+            else if ((cp & 0xF0) == 0xE0) { extra = 2; cp &= 0x0F; }
+            else if ((cp & 0xF8) == 0xF0) { extra = 3; cp &= 0x07; }
+            else { p++; continue; }
+            for (int k = 0; k < extra && *q; k++) cp = (cp << 6) | (*q++ & 0x3F);
+            p = q;
+            ok = font_book_ui_glyph_unicode(cp, &g);
+        }
+        if (cx + w > x1) break;
+        if (ok && g.bitmap) {
+            int rb = (g.w + 7) / 8;
+            for (int row = 0; row < g.h; row++) {
+                const uint8_t *src = g.bitmap + row * rb;
+                for (int col = 0; col < g.w; col++) {
+                    if (src[col >> 3] & (1u << (7 - (col & 7))))
+                        menu_fb_px(lcd, cx + col, y + row, invert ? false : true);
+                }
+            }
+        } else if (invert) {
+            int chh = font_book_ui_cell_h();
+            for (int i = 0; i < w; i++) {
+                menu_fb_px(lcd, cx + i, y, false);
+                menu_fb_px(lcd, cx + i, y + chh - 1, false);
+            }
+            for (int i = 0; i < chh; i++) {
+                menu_fb_px(lcd, cx, y + i, false);
+                menu_fb_px(lcd, cx + w - 1, y + i, false);
+            }
+        }
+        cx += w;
+    }
+}
+
+static int ui_text_width(const char *s) {
+    const uint8_t *p = (const uint8_t *)s;
+    int w = 0;
+    while (*p) {
+        if (p[0] < 0x80) { w += font_book_ui_ascii_w(); p++; }
+        else if ((p[0] & 0xE0) == 0xC0) { w += font_book_ui_cell_w(); p += 2; }
+        else if ((p[0] & 0xF0) == 0xE0) { w += font_book_ui_cell_w(); p += 3; }
+        else if ((p[0] & 0xF8) == 0xF0) { w += font_book_ui_cell_w(); p += 4; }
+        else p++;
+    }
+    return w;
+}
+
+/* 目录分页 (50章/页): 当前页 global 起始下标、当前页章数、总页数 */
+static uint32_t toc_page_base(void)   { return s_toc_page * TOC_PER_PAGE; }
+static uint32_t toc_pages_count(void) {
+    if (s_chapter_count == 0) return 1;
+    return (s_chapter_count + TOC_PER_PAGE - 1) / TOC_PER_PAGE;
+}
+static uint32_t toc_page_items(void) {
+    uint32_t base = toc_page_base();
+    if (base >= s_chapter_count) return 0;
+    uint32_t n = s_chapter_count - base;
+    return (n > TOC_PER_PAGE) ? (uint32_t)TOC_PER_PAGE : n;
+}
+static const char *toc_display_title(uint32_t gi);   /* 章题转数字 (定义在后) */
+
+static int read_text_width(const char *s);   /* fwd: 实现在菜单绘制区 */
+
+/* ★ B4 (2026-10-30): 索引受限时在底部条位置显示原因 + 已索引百分比。
+ *   以前 s_index_error 只影响内部逻辑, 用户只看到"翻到某页突然翻不动", 完全不知道发生了什么。 */
+static void draw_idx_warn(st7305_handle_t *lcd) {
+    const char *why;
+    switch (s_idx_fail) {
+        case IDX_FAIL_NOMEM:   why = menu_str("内存不足", "\xC4\xDA\xB4\xE6\xB2\xBB\xD7\xE3"); break;
+        case IDX_FAIL_IO:      why = menu_str("读取失败", "\xB6\xC1\xC8\xA1\xCA\xA7\xB0\xDC"); break;
+        case IDX_FAIL_TOO_BIG:
+        default:               why = menu_str("文件过大", "\xCE\xC4\xBC\xFE\xB9\xFD\xB4\xF3"); break;
+    }
+    char buf[64];
+    uint32_t pct = s_src_size ? (uint32_t)(((uint64_t)s_indexed_bytes * 100u) / s_src_size) : 0;
+    if (pct > 100) pct = 100;
+    snprintf(buf, sizeof(buf), "%s %u%%", why, (unsigned)pct);
+    int tw = read_text_width(buf);      /* 与页码/进度同一平面 → 跟随阅读字体 */
+    int y  = ST7305_HEIGHT - font_book_ascii_h() - 2;
+    if (y < 0) y = 0;
+    int x  = (ST7305_WIDTH - tw) / 2;
+    if (x < 0) x = 0;
+    read_draw_text(lcd, x, y, buf, false);
+}
+
+static int menu_item_count(void) {
+    switch (s_menu) {
+        /* ★ 2026-10-31: 保留「字体选择」入口（linit 要求阅读器内直接能换字体）。
+         *   ⚠ 它和 书库 →「阅读优化 → 字体」是**同一份状态**：两边都写 NVS 的
+         *   ftn（字体文件名，空=内置），所以哪儿改都一样，不会各存一套。
+         *   字号仍然只在书库「阅读优化 → 字号大小」里改（阅读菜单无字号项）。 */
+        /* ★ 2026-11-22 linit: 阅读菜单精简 —— 去掉「上一章/下一章」。
+         *   翻章走目录，翻页用按键/点击，菜单只留真正需要"进弹窗"的动作。
+         *   现在 7 项: 目录/跳到进度/加书签/书签列表/字体/字号/返回书库
+         *   ⇒ 横屏 400×300 也一屏放得下(7×32+50=274 ≤ 292), 主菜单不再需要滚动。 */
+        case BM_MENU: return 7;
+        case BM_PCT:  return 21;  /* 0%,5%,...,100% */
+        case BM_TOC:  return (s_chapter_count == 0) ? 1 : (int)toc_page_items();
+        case BM_BMKS: return (s_bm_count == 0) ? 1 : (int)s_bm_count + 1;   /* ... + 清空 */
+        case BM_FONT: sd_font_scan(); return s_sd_font_count + 1;  /* TF 卡 LBF 字体 + 内置字体 */
+        case BM_SIZE: return font_book_size_count();               /* 当前字体真实支持的档数 */
+        default: return 0;
+    }
+}
+
+/* "字号 24px" —— 选项上直接显示当前生效值，不用点进去才知道 */
+static char s_size_lbl[24];
+static const char *size_menu_label(void) {
+    snprintf(s_size_lbl, sizeof(s_size_lbl), "%s %dpx", M_SIZE, font_book_cell_w());
+    return s_size_lbl;
+}
+
+static const char *menu_item_text(int i) {
+    switch (s_menu) {
+        case BM_MENU:
+            /* 目录/跳到进度/加书签/书签列表/字体/字号/返回书库
+             * (旋转方向统一由书架"阅读优化"设置) */
+            switch (i) {
+                case 0: return M_TOC;
+                case 1: return M_GOTO_PCT;
+                case 2: return M_ADD_BM;
+                case 3: return M_BM_LIST;
+                case 4: return M_FONT_SEL;    /* 字体选择（与书库同一份状态） */
+                case 5: return size_menu_label();
+                case 6: return M_BACK_LIB;
+            }
+            return "";
+        case BM_PCT: {
+            /* 静态表, 避免返回函数内局部缓冲被后续调用覆盖 */
+            static const char *t[21] = {
+                "0%","5%","10%","15%","20%","25%","30%","35%","40%","45%",
+                "50%","55%","60%","65%","70%","75%","80%","85%","90%","95%","100%" };
+            return (i >= 0 && i < 21) ? t[i] : "";
+        }
+        case BM_TOC:
+            if (s_chapter_count == 0) return M_NO_TOC;
+            { uint32_t gi = toc_page_base() + (uint32_t)i;
+              return (gi < s_chapter_count) ? toc_display_title(gi) : ""; }
+        case BM_BMKS:
+            if (s_bm_count == 0) return M_NO_BM;
+            if (i < (int)s_bm_count) return s_bms[i].title;
+            return M_CLEAR_BM;
+        case BM_FONT:
+            /* 优先显示字体自报的名字；LBF 头里没写名字才回落到文件名 */
+            if (i < s_sd_font_count)
+                return s_sd_font_names[i][0] ? s_sd_font_names[i] : s_sd_fonts[i];
+            return M_EMB_FS;
+        case BM_SIZE: {
+            /* 字号列表 = 当前字体的真实规格（内置 16/24/32/48；8px 字体只有 8/16） */
+            static char t[4][8];
+            int n = font_book_size_count();
+            if (i < 0 || i >= n) return "";
+            snprintf(t[i], sizeof(t[0]), "%dpx", font_book_size_px_at(i));
+            return t[i];
+        }
+        default: return "";
+    }
+}
+
+static const char *menu_title_text(void) {
+    switch (s_menu) {
+        case BM_MENU: return "";   /* V1.0.68: 不显示"阅读菜单"标题 */
+        case BM_TOC:  return M_TOC;
+        case BM_BMKS: return M_BM_LIST;
+        case BM_FONT: return M_FONT_SEL;
+        case BM_SIZE: return M_SIZE;
+        case BM_PCT:  return M_PCT_TITLE;
+        default: return "";
+    }
+}
+
+/* 菜单文字宽度 (当前激活字号) */
+static int read_text_width(const char *s) {
+    const uint8_t *p = (const uint8_t *)s;
+    int w = 0;
+    while (*p) {
+        if (p[0] < 0x80) { w += font_book_ascii_w(); p++; }
+        else if ((p[0] & 0xE0) == 0xC0) { w += font_book_cell_w(); p += 2; }
+        else if ((p[0] & 0xF0) == 0xE0) { w += font_book_cell_w(); p += 3; }
+        else if ((p[0] & 0xF8) == 0xF0) { w += font_book_cell_w(); p += 4; }
+        else p++;
+    }
+    return w;
+}
+
+/* ★★★ 2026-10-31 三类字体绘制上下文（本轮核心）★★★
+ *
+ *   ① FCTX_CONTENT  阅读内容平面：正文 / 页码 / 进度百分比 / 章节名 / 索引提示
+ *                   → read_draw_text()  跟随当前阅读字体
+ *   ② FCTX_READNAV  阅读导航弹窗：章节目录(章节选择)、跳到进度(阅读位置)、
+ *                   书签列表、以及承载「上一章 / 下一章 / 跳到进度」的阅读菜单
+ *                   → 与 ① **同一个字体来源**（阅读字体），只是画在弹窗里
+ *   ③ FCTX_SYS      系统操作与配置 UI：字体选择、字号设置、退出确认、Toast、书库
+ *                   → ui_draw_text()    永远系统 16px 宋体 + 8×16 ASCII
+ *
+ *   为什么要分三层而不是"全部系统字体"：linit 2026-10-31 明确要求阅读导航弹窗
+ *   必须跟随阅读字体（否则正文换成像素字体、点开目录还是宋体，割裂感很重）；
+ *   但配置类界面必须稳定用系统字体 —— 它们和"看什么字体读书"无关。
+ *
+ *   字体上下文只决定"从哪个后端取字形"，**不改动任何全局字体状态**
+ *   （旧实现靠 font_book_select(24) 临时改全局再改回来，已删除）。 */
+typedef enum { FCTX_CONTENT = 0, FCTX_READNAV = 1, FCTX_SYS = 2 } font_ctx_t;
+
+/* ★ 2026-10-31 最终决定（linit 选定 B 方案 = Kindle / 微信读书 风格）：
+ *   所有弹窗（阅读菜单 / 字体 / 字号 / 目录 / 跳进度 / 书签 / 退出确认）统一用
+ *   **系统字体**；只有 正文、页码、进度百分比、章节名 这些"阅读平面"文字跟随阅读字体。
+ *
+ *   依据：主流阅读器里带配置项的菜单一律用 UI 字体 —— 否则把字体切成 8px 点阵后，
+ *   连"字体选择"面板本身都变成 8px 点阵，会互相影响、且 48px 时菜单一行要 64px，
+ *   在 400×300 上必须滚动才看得全。
+ *
+ *   这里保留三态枚举而不是删掉分支：将来若要改成"目录跟阅读字体"（多看风格），
+ *   只改下面这一处返回值即可，绘制/命中/几何全都自动跟着走。 */
+static font_ctx_t menu_font_ctx(void) {
+    return FCTX_SYS;
+}
+static bool menu_read_font(void) { return menu_font_ctx() == FCTX_READNAV; }
+
+/* 行高 / 标题高 / 底部返回行高都跟着当前上下文**实际字高**走：
+ *   16px 系统字 → 32 / 26 / 44（与改造前完全一致，视觉不变）
+ *   24px 阅读字 → 40 / 34 / 44    48px → 64 / 58 / 60
+ *   8px 点阵字  → 24 / 18 / 44（下限保护，否则点不中） */
+static int menu_cell_h(void) {
+    return menu_read_font() ? font_book_cell_h() : font_book_ui_cell_h();
+}
+static int menu_row_h(void) {
+    int h = menu_cell_h() + 16;
+    if (h < 24) h = 24;
+    if (h > 72) h = 72;
+    return h;
+}
+static int menu_title_h(void) { return menu_cell_h() + 10; }
+static int menu_foot_h(void) {
+    int h = menu_cell_h() + 12;
+    return (h < 44) ? 44 : h;
+}
+static int toc_pager_h(void) {
+    int h = menu_cell_h() + 6;
+    return (h < TOC_PAGER_H) ? TOC_PAGER_H : h;
+}
+static void menu_draw_text(st7305_handle_t *lcd, int x, int y, const char *s, bool invert) {
+    if (menu_read_font()) read_draw_text(lcd, x, y, s, invert);
+    else                  ui_draw_text(lcd, x, y, s, invert);
+}
+static int menu_text_w(const char *s) {
+    return menu_read_font() ? read_text_width(s) : ui_text_width(s);
+}
+
+/* ============================================================================
+ * 阅读器弹窗：统一布局 (2026-11-22 重写)
+ *
+ * 规范依据（照抄系统弹窗那一套，不再自己发明）：
+ *   ① `docs/规范/列表滚动规范.md` —— 列表滚动**只允许** ui_scroll，
+ *      页面禁止自己算 off / 判 dy / 写吸附。这里用 UI_SCROLL_LIST + SNAP_INSTANT
+ *      （+ NO_BOUNCE：弹窗是嵌入小窗的局部滚动，规范里点名这种用硬边界）。
+ *   ② `os_dialog.c` 的 dlg_layout —— 弹窗几何由**一个**函数产出，
+ *      绘制与触摸都读它，底部"返回"行与内容区在几何上就分开了。
+ *
+ * 旧实现的病灶（所以才"点哪都不对"）：
+ *   · 几何在书里算了三份（绘制一份、命中一份、拖动一份），缩放/余数带各算各的；
+ *   · 拖动状态 `s_menu_dragged` 只在被消费时才清 ⇒ 一次真拖动会吞掉**下一次**点击；
+ *   · 余数带（content_bot-ty 不能被行高整除）里 `return false` —— 不消费、不反馈；
+ *   · 列表命中用 `y-ty+pix`，而 pix 由另一套拖动公式写，两者有时序差 ⇒ 点错行。
+ * 现在：布局→bm_layout()，滚动→ui_scroll，镜像→bm_sc_read()，命中→同一条公式。
+ * ========================================================================== */
+
+typedef struct {
+    int W, H;            /* 逻辑屏 (竖屏 300×400 / 横屏 400×300) */
+    int bx, by, bw, bh;  /* 弹窗外框 (含 2px 边框) */
+    int title_h;         /* 标题区高, 0 = 无标题 */
+    int list_y0;         /* 列表可视区顶 (含) */
+    int list_y1;         /* 列表可视区底 (不含); 目录时上面还有页码条 */
+    int foot_y;          /* 底部"返回"行顶 (含) */
+    int foot_y1;         /* 底部行底 (不含) */
+    int row_h;           /* 行高 */
+    int count;           /* 条目数 */
+    int vis;             /* 一屏可见行数 */
+} bm_geo_t;
+
+/* 唯一布局来源：绘制、命中、滚动三处都调它。
+ * 结构: 顶距6 + 标题区 + 列表 + [目录页码条] + 底部返回行 + 底距6 */
+static void bm_layout(bm_geo_t *g) {
+    int W = book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH;
+    int H = book_is_portrait() ? BOOK_PORTRAIT_H : ST7305_HEIGHT;
+    const char *title = menu_title_text();
+    int title_h = title[0] ? menu_title_h() : 0;
+    int n    = menu_item_count();
+    int row  = menu_row_h();
+    int foot = menu_foot_h();
+    int w, h;
+    if (s_menu == BM_TOC) {
+        /* 目录 = 超长窗口: 占满整屏(扣除边距), 一次拖动可看/选更多章节 */
+        w = W - 8;
+        h = H - 8;
+    } else {
+        w = 200;
+        for (int i = 0; i < n; i++) {                 /* 窄了会被截字，按最长项放宽 */
+            int m = menu_text_w(menu_item_text(i)) + 28;   /* +28: 左右留白 + 选中块不贴字 */
+            if (m > w) w = m;
+        }
+        if (w > W - 8) w = W - 8;
+        h = 6 + title_h + n * row + foot + 6;
+        if (h > H - 8) h = H - 8;   /* 长列表超高时裁到屏内, 内部滚动 */
+        if (h < 120) h = 120;
+    }
+    g->W = W; g->H = H;
+    g->bx = (W - w) / 2;
+    g->by = (H - h) / 2;
+    g->bw = w;
+    g->bh = h;
+    g->title_h = title_h;
+    g->row_h   = row;
+    g->count   = n;
+    g->list_y0 = g->by + 6 + title_h;
+    g->foot_y1 = g->by + h - 6;                      /* 底距 6 */
+    g->foot_y  = g->foot_y1 - foot;
+    g->list_y1 = g->foot_y - ((s_menu == BM_TOC) ? toc_pager_h() : 0);  /* 目录预留页码条 */
+    int vis = (g->list_y1 - g->list_y0) / row;
+    g->vis = (vis < 1) ? 1 : vis;
+}
+
+/* 控制器状态清零 (换菜单 / 关闭弹窗时调) */
+static void bm_sc_reset(void) {
+    ui_scroll_cancel(&s_bm_sc);
+    s_bm_sc_rdy = false;
+    s_bm_sc_cnt = -1;
+    s_bm_sc_vh  = -1;
+    s_bm_sc_sel = -1;
+    s_bm_armed  = false;
+    s_menu_scroll = 0;
+    s_menu_pix    = 0;
+    /* 菜单换页/重开 = 回到"触屏态": 不显示选中高亮 (只有按键导航才打开, 见 handle_action) */
+    s_menu_sel_on = false;
+}
+
+/* 控制器 → s_menu_scroll / s_menu_pix 镜像 (纯函数, 只读 off, 不推进惯性) */
+static void bm_sc_read(const bm_geo_t *g) {
+    int off = ui_scroll_offset(&s_bm_sc);
+    int maxrow = g->count - g->vis;
+    if (maxrow < 0) maxrow = 0;
+    int row = off / g->row_h;
+    if (row < 0) row = 0;
+    if (row > maxrow) row = maxrow;
+    int px = off - row * g->row_h;
+    if (px < 0) px = 0;
+    if (px > g->row_h - 1) px = g->row_h - 1;
+    s_menu_scroll = (uint32_t)row;
+    s_menu_pix    = px;
+}
+
+/* 与控制器对账 (装载/换内容/外部改选中项)。★ 必须每帧调, 但幂等:
+ *   · 条目数或可视高变了 ⇒ ui_scroll_init + 对齐到当前选中项;
+ *   · 选中项被键盘/跳章**改动过** ⇒ 最小滚动把它带进视野 (ensure_visible)。
+ *     只在"选中项变了"这一刻做, 不能每帧做 —— 否则用户拖动列表后会被一帧拉回原处。 */
+static void bm_sc_sync(const bm_geo_t *g) {
+    int view = g->vis * g->row_h;
+    if (!s_bm_sc_rdy) {
+        ui_scroll_config(&s_bm_sc, UI_SCROLL_LIST,
+                         UI_SCROLL_F_SNAP_INSTANT | UI_SCROLL_F_NO_BOUNCE);
+        s_bm_sc_rdy = true;
+    }
+    if (s_bm_sc_cnt != g->count || s_bm_sc_vh != view) {
+        /* ★ 2026-11-23: 条目数/视口变化改走 ui_scroll_update —— 手势进行中不再
+         *   被 init 清掉(原写法换内容时会打断拖动); 定位改走 set_offset(会夹紧)。 */
+        ui_scroll_update(&s_bm_sc, g->row_h, view, g->count * g->row_h);
+        s_bm_sc_cnt = g->count;
+        s_bm_sc_vh  = view;
+        if (!s_bm_sc.pressed && !s_bm_sc.dragging) {
+            ui_scroll_set_offset(&s_bm_sc, (int)s_menu_sel * g->row_h);
+            s_bm_sc_sel = (int)s_menu_sel;
+        }
+    } else if (!ui_scroll_busy(&s_bm_sc) && !s_bm_sc.pressed && (int)s_menu_sel != s_bm_sc_sel) {
+        ui_scroll_ensure_visible(&s_bm_sc, (int)s_menu_sel * g->row_h, g->row_h);
+        s_bm_sc_sel = (int)s_menu_sel;
+    }
+    bm_sc_read(g);
+}
+
+/* ---- 章页标题整理: "第一千一百一十一章" -> "第1111章" (省宽度) ---- */
+static const uint32_t k_cnu[] = { 0xE5A3B9,0xE8B4B0,0xE58F81,0xE88286,0xE4BC8D,0xE99986,0xE69F92,0xE68D8C,0xE78E96 }; /* 壹贰叁肆伍陆柒捌玖 */
+static const uint32_t k_cn[] = { 0xE99BB6,0xE4B880,0xE4BA8C,0xE4B889,0xE59B9B,0xE4BA94,0xE585AD,0xE4B883,0xE585AB,0xE4B99D, /* 零一二三四五六七八九 */
+                                 0xE4B8A4 /*两*/ ,0xE58097 /*两*/ };
+static bool cn_is_digit(const uint8_t*p, int *d) {
+    uint32_t c=((uint32_t)p[0]<<16)|((uint32_t)p[1]<<8)|p[2];
+    for (int i=0;i<10;i++) if(c==k_cn[i]){*d=i;return true;}
+    for (int i=0;i<9;i++)  if(c==k_cnu[i]){*d=i+1;return true;}
+    if(c==0xE4B8A4||c==0xE58097){*d=2;return true;}   /* 两 */
+    return false;
+}
+/* 解析 "第X章"(X=中文/数字) -> 数值, 失败返回 -1 */
+static long toc_chap_num(const uint8_t*t) {
+    if (!(t[0]==0xE7&&t[1]==0xAC&&t[2]==0xAC)) return -1;   /* 第 */
+    t += 3;
+    long total=0, sec=0, num=0; bool any=false;
+    while (t[0]) {
+        int d; uint32_t c=((uint32_t)t[0]<<16)|((uint32_t)t[1]<<8)|t[2];
+        if (cn_is_digit(t, &d)) { num=d; any=true; t+=3; continue; }
+        if (c==0xE58D81||c==0xE68B // 十/拾
+            )              { sec += (num?num:1)*10;  num=0; any=true; t+=3; continue; }
+        else if (c==0xE799BE||c==0xE4BDB0) { sec += (num?num:1)*100; num=0; any=true; t+=3; continue; }
+        else if (c==0xE58D83||c==0xE8B4AC) { sec += (num?num:1)*1000; num=0; any=true; t+=3; continue; }
+        else if (c==0xE4B887) { total += (sec+num)*10000; sec=num=0; any=true; t+=3; continue; }
+        else break;
+    }
+    if (!any) return -1;
+    long v = total + sec + num;
+    return v;
+}
+/* 目录显示标题: 数字章转 "第N章", 再拼接原章节名称 (省去长中文数字, 保留原名) */
+static char s_toc_title_buf[64];
+static const char *toc_display_title(uint32_t gi) {
+    const uint8_t*raw = (const uint8_t*)s_chapters[gi].title;
+    /* 后缀字 (章回节卷部话集篇) */
+    static const uint32_t suf[] = {0xE7ABA0,0xE59B9E,0xE88A82,0xE58DB7,0xE983A8,0xE8AF9D,0xE99B86,0xE7AF87};
+    long v = toc_chap_num(raw);
+    int used = 0;
+    if (v >= 0) {
+        /* 找后缀字 */
+        const uint8_t*p=raw+3;
+        /* 跳过数字字符得到后缀位置 */
+        while (p[0]) {
+            int d; uint32_t c=((uint32_t)p[0]<<16)|((uint32_t)p[1]<<8)|p[2];
+            if (cn_is_digit(p,&d)) { p+=3; continue; }
+            if (c==0xE58D81||c==0xE68B||c==0xE799BE||c==0xE4BDB0||c==0xE58D83||c==0xE8B4AC||c==0xE4B887){ p+=3; continue; }
+            break;
+        }
+        int sl=0;
+        for (int i=0;i<8;i++){ uint32_t c=((uint32_t)p[0]<<16)|((uint32_t)p[1]<<8)|p[2];
+            if (c==suf[i]){ sl=3; break; } }
+        if (sl==3) {
+            used=(int)(p+3-raw);
+            int hn=snprintf(s_toc_title_buf,sizeof(s_toc_title_buf),"\xE7\xAC\xAC%ld",v);
+            char sufs[4]={(char)p[0],(char)p[1],(char)p[2],0};
+            hn+=snprintf(s_toc_title_buf+hn,sizeof(s_toc_title_buf)-hn,"%s",sufs);
+            snprintf(s_toc_title_buf+hn,sizeof(s_toc_title_buf)-hn,"%.*s",(int)sizeof(s_toc_title_buf)-hn,(const char*)(raw+used));
+            return s_toc_title_buf;
+        }
+    }
+    snprintf(s_toc_title_buf,sizeof(s_toc_title_buf),"%.*s",(int)sizeof(s_toc_title_buf)-1,(const char*)raw);
+    return s_toc_title_buf;
+}
+
+/* 目录页码条按钮布局 (绘制与触摸共用). hit: -1=上一页 <, -2=下一页 >, 0..=页码 */
+#define TOC_PAGER_MAX 16
+static int toc_pager_layout(int bx, int bw, int top, int out[][3]) {
+    (void)top;
+    uint32_t P = toc_pages_count(); if (P == 0) P = 1;   /* 目录未读完也先画 < 页 >, 中间随加载填充 */
+    int asc = font_book_ascii_w();
+    int gap = 4;
+    int idx = 0;
+    /* < 贴最左 */
+    int left = bx + 1;
+    out[idx][0] = -1; out[idx][1] = left; out[idx][2] = left + asc; idx++;
+    /* > 贴最右 (内缩 2px 避免被边缘裁掉) */
+    int right = bx + bw - 2 - asc;
+    out[idx][0] = -2; out[idx][1] = right; out[idx][2] = right + asc; idx++;
+    /* 页码在中间均匀铺满 */
+    int midL = left + asc + gap;
+    int midR = right - gap;
+    char buf[16]; snprintf(buf,sizeof(buf),"%u",(unsigned)(P-1)); int digits=(int)strlen(buf);
+    int per = digits*asc + gap;
+    int span = midR - midL;
+    int cnt = span / per; if (cnt < 1) cnt = 1;
+    uint32_t cur = s_toc_page;
+    uint32_t first = (cur >= (uint32_t)(cnt/2)) ? (cur - cnt/2) : 0;
+    uint32_t last = first + (uint32_t)cnt - 1;
+    if (last >= P) { last = P - 1; first = (last >= (uint32_t)cnt-1) ? (last-(uint32_t)cnt+1) : 0; }
+    int total_w = (int)(last-first+1) * per - gap;
+    int xs = midL + (span - total_w)/2;           /* 居中铺满 */
+    for (uint32_t p = first; p <= last && idx < TOC_PAGER_MAX; p++) {
+        out[idx][0]=(int)p; out[idx][1]=xs; out[idx][2]=xs+digits*asc; xs+=per; idx++;
+    }
+    return idx;
+}
+static void toc_pager_draw(st7305_handle_t *lcd, int bx, int by, int bw, int top) {
+    if (s_chapter_count == 0 && !s_open) return;   /* 无章节时也画 < 页 >, 仅不影响元素 */
+    int b[TOC_PAGER_MAX][3]; int n = toc_pager_layout(bx, bw, top, b);
+    const int ph = toc_pager_h();
+    int y = top + (ph - menu_cell_h()) / 2;
+    for (int i = 0; i < n; i++) {
+        bool cur_page = (b[i][0] == (int)s_toc_page);
+        if (cur_page)
+            for (int yy = top; yy < top + ph; yy++)
+                for (int xx = b[i][1]; xx < b[i][2]; xx++)
+                    menu_fb_px(lcd, xx, yy, true);
+        if (b[i][0] == -1) {
+            menu_draw_text(lcd, b[i][1], y, "<", cur_page);
+        } else if (b[i][0] == -2) {
+            menu_draw_text(lcd, b[i][1], y, ">", cur_page);
+        } else {
+            char txt[16]; snprintf(txt,sizeof(txt),"%u",(unsigned)b[i][0]+1);
+            menu_draw_text(lcd, b[i][1], y, txt, cur_page);
+        }
+    }
+    for (int x = by + 1; x <= by + bw - 2; x++) menu_fb_px(lcd, x, top - 1, true);
+}
+
+/* 统一滚动条的像素回调 (阅读器画布可能是竖屏 pfb, 不是 lcd->fb) */
+static void bm_px_fn(void *ud, int x, int y, bool black) {
+    menu_fb_px((st7305_handle_t *)ud, x, y, black);
+}
+
+/* 标准列表弹窗: 白底 + 2px 边框 + [标题/分隔线] + 列表 + [统一滚动条] + [页码条] + 底行"返回".
+ * 与 os_dialog 的列表弹窗同一观感; 几何全部来自 bm_layout(), 命中判定读同一份。 */
+static void draw_reader_menu(st7305_handle_t *lcd) {
+    bm_geo_t g;
+    bm_layout(&g);
+    if (g.count <= 0) return;
+    bm_sc_sync(&g);                      /* 先与滚动控制器对账, 再画 */
+
+    const int cell_h = menu_cell_h();
+    const char *title = menu_title_text();
+    const int bx = g.bx, by = g.by, bw = g.bw, bh = g.bh;
+
+    /* ① 底板 + 2px 粗边框 (不裁剪, 要盖满整框) */
+    for (int y = by; y < by + bh; y++)
+        for (int x = bx; x < bx + bw; x++)
+            menu_fb_px(lcd, x, y, false);
+    for (int k = 0; k < 2; k++) {
+        for (int x = bx + k; x < bx + bw - k; x++) { menu_fb_px(lcd, x, by + k, true); menu_fb_px(lcd, x, by + bh - 1 - k, true); }
+        for (int y = by + k; y < by + bh - k; y++) { menu_fb_px(lcd, bx + k, y, true); menu_fb_px(lcd, bx + bw - 1 - k, y, true); }
+    }
+
+    /* ② 标题 (居中 + 下方分隔线) */
+    if (title[0]) {
+        int tw = menu_text_w(title);
+        int tx = bx + (bw - tw) / 2;
+        if (tx < bx + 3) tx = bx + 3;
+        for (int x = bx + 2; x <= bx + bw - 3; x++) menu_fb_px(lcd, x, by + g.title_h - 2, true);
+        clip_set(bx + 3, by + 2, bx + bw - 4, by + g.title_h - 3);
+        menu_draw_text(lcd, tx, by + 2, title, false);
+    }
+
+    /* ③ 列表: 内容起点 = 可视区顶 - 行内像素偏移 (§规范: 1:1 跟手, 不做二次缓动) */
+    {
+        const int base = g.list_y0 - s_menu_pix;
+        /* 有滚动条时右边留出条列(4px)+1px 间隙, 让 1px 主线在反白行上也看得见;
+         * 没滚动条时选中块直接贴到内边框, 不要留一条突兀的白边。 */
+        const bool hasbar = (g.count > g.vis);
+        const int sel_x1 = hasbar ? (bx + bw - 8) : (bx + bw - 3);
+        clip_set(bx + 2, g.list_y0, sel_x1, g.list_y1 - 1);
+        for (int k = 0; k <= g.vis; k++) {
+            int idx = (int)s_menu_scroll + k;
+            if (idx < 0 || idx >= g.count) break;
+            int row_y = base + k * g.row_h;
+            if (row_y >= g.list_y1) break;
+            if (row_y + g.row_h <= g.list_y0) continue;
+            bool sel = bm_sel_visible() && (idx == (int)s_menu_sel);
+            int y0 = row_y < g.list_y0 ? g.list_y0 : row_y;
+            int y1 = row_y + g.row_h > g.list_y1 ? g.list_y1 : row_y + g.row_h;
+            if (sel)
+                for (int yy = y0; yy < y1; yy++)
+                    for (int xx = bx + 2; xx <= sel_x1; xx++)
+                        menu_fb_px(lcd, xx, yy, true);
+            const char *text = menu_item_text(idx);
+            int tw = menu_text_w(text);
+            /* 目录左对齐(为"当前章"标记留 8px 槽位); 其余居中 */
+            int tx = (s_menu == BM_TOC) ? (bx + 11) : (bx + (bw - tw) / 2);
+            if (tx < bx + 3) tx = bx + 3;
+            int texty = row_y + (g.row_h - cell_h) / 2;
+            /* 当前正在阅读的章节: 行首 4×4 实心方块 (反白行里反向取色) */
+            if (s_menu == BM_TOC && s_chapter_count > 0) {
+                uint32_t gi = toc_page_base() + (uint32_t)idx;
+                if (gi == (uint32_t)book_cur_chapter()) {
+                    int m0 = texty + cell_h / 2 - 2;
+                    for (int yy = m0; yy < m0 + 4; yy++)
+                        for (int xx = bx + 3; xx < bx + 7; xx++)
+                            menu_fb_px(lcd, xx, yy, !sel);
+                }
+            }
+            menu_draw_text(lcd, tx, texty, text, sel);
+        }
+    }
+
+    /* ④ 滚动条: 统一 ui_scroll 样式 (1px 主线 + 两端点阵渐隐), 位置由控制器算 */
+    if (g.count > g.vis)
+        ui_scroll_drawbar_px(&s_bm_sc, bx + bw - 5, g.list_y0, g.list_y1 - 1, bm_px_fn, lcd);
+
+    /* ⑤ 目录页码条 (位于列表与"返回"之间) */
+    if (s_menu == BM_TOC) {
+        clip_set(bx + 2, g.list_y1 - 1, bx + bw - 2, g.foot_y - 1);
+        toc_pager_draw(lcd, bx, by, bw, g.list_y1);
+    }
+
+    /* ⑥ 底部返回行: 分隔线 + 居中"返回"; 左侧显示一次性提示(已添加/已清空/书签已满)
+     * ★ 2026-11-22 (linit): 分隔线画不出来 —— 上一段裁剪区是"列表区"/"页码条区",
+     *   而线画在 g.foot_y, 落在裁剪区外被 menu_fb_px 直接丢掉。裁剪区必须从 foot_y 起,
+     *   并且**在画线之前**设好。 */
+    clip_set(bx + 2, g.foot_y, bx + bw - 3, g.foot_y1 - 1);
+    for (int x = bx + 2; x <= bx + bw - 3; x++) menu_fb_px(lcd, x, g.foot_y, true);
+    const char *back = M_BACK;
+    int bw2 = menu_text_w(back);
+    int by2 = g.foot_y + (menu_foot_h() - cell_h) / 2;
+    if (s_menu_msg[0]) {
+        int avail = (bx + (bw - bw2) / 2 - 8) - (bx + 6);
+        char tmp[48];
+        snprintf(tmp, sizeof(tmp), "%s", s_menu_msg);
+        size_t tl = strlen(tmp);
+        while (tl > 0 && avail > 0 && menu_text_w(tmp) > avail) {
+            tl = utf8_drop_last(tmp, tl);
+            tmp[tl] = 0;
+        }
+        if (tmp[0] && avail > 0) menu_draw_text(lcd, bx + 6, by2, tmp, false);
+    }
+    int bx2 = bx + (bw - bw2) / 2;
+    if (bx2 < bx + 3) bx2 = bx + 3;
+    menu_draw_text(lcd, bx2, by2, back, false);
+
+    clip_clear();
+}
+
+/* ============ 退出确认弹窗 ============
+ * ★ 2026-11-22 规范化: 几何、按钮区、左右分界全部由 exit_layout() 产出,
+ *   绘制与触摸只读它 —— 与 bm_layout() 同一套做法(照抄 os_dialog 的 dlg_layout)。
+ *   旧代码绘制里算的是 `y1-1-40`, 命中里写的是 `Y1-1-40`, 两处各写一份常量,
+ *   改按钮高度就会"画一个地方、点另一个地方"。 */
+#define EXIT_BTN_H 40
+typedef struct {
+    int x0, y0, x1, y1;     /* 外框 (含 2px 边框) */
+    int btn_y0, btn_y1;     /* 按钮行 (btn_y0 是那条 2px 分隔线) */
+    int mid;                /* 左右分界: 左=确定 右=取消 */
+} exit_geo_t;
+
+static void exit_layout(exit_geo_t *e) {
+    int W = book_is_portrait() ? BOOK_PORTRAIT_W : ST7305_WIDTH;
+    int H = book_is_portrait() ? BOOK_PORTRAIT_H : ST7305_HEIGHT;
+    int bw = W - 40;                       /* 横向宽条 */
+    /* 用系统字高算(框里画的是 16px 系统字), 不能用阅读字体行高 ——
+     * 否则阅读字号 8px 时框比字还矮, 提示文字被按钮压住。 */
+    int bh = font_book_ui_cell_h() + 18 + EXIT_BTN_H;
+    e->x0 = (W - bw) / 2;
+    e->x1 = e->x0 + bw - 1;
+    e->y0 = (H - bh) / 2;
+    e->y1 = e->y0 + bh - 1;
+    e->btn_y0 = e->y1 - 1 - EXIT_BTN_H;
+    e->btn_y1 = e->y1 - 2;
+    e->mid = (e->x0 + e->x1) / 2;
+}
+
+static void draw_exit_confirm(st7305_handle_t *lcd) {
+    exit_geo_t e;
+    exit_layout(&e);
+    const int X0 = e.x0, y0 = e.y0, X1 = e.x1, y1 = e.y1;
+    /* 实心白底 */
+    for (int y = y0; y <= y1; y++)
+        for (int x = X0; x <= X1; x++)
+            menu_fb_px(lcd, x, y, false);
+    /* 2px 粗黑边框 */
+    for (int x = X0; x <= X1; x++) { menu_fb_px(lcd, x, y0, true); menu_fb_px(lcd, x, y1, true); }
+    for (int y = y0; y <= y1; y++) { menu_fb_px(lcd, X0, y, true); menu_fb_px(lcd, X1, y, true); }
+    for (int x = X0; x <= X1; x++) { menu_fb_px(lcd, x, y0 + 1, true); menu_fb_px(lcd, x, y1 - 1, true); }
+    for (int y = y0; y <= y1; y++) { menu_fb_px(lcd, X0 + 1, y, true); menu_fb_px(lcd, X1 - 1, y, true); }
+    clip_set(X0 + 3, y0 + 3, X1 - 3, e.btn_y0 - 1);
+    ui_draw_text(lcd, X0 + 8, y0 + 6, M_EXIT_ASK, false);
+
+    /* 按钮行: 上方 2px 分隔线 + 左右两半对称 (与全项目弹窗同一观感) */
+    for (int x = X0 + 2; x <= X1 - 2; x++) { menu_fb_px(lcd, x, e.btn_y0, true); menu_fb_px(lcd, x, e.btn_y0 + 1, true); }
+    for (int y = e.btn_y0 + 2; y <= e.btn_y1; y++) { menu_fb_px(lcd, e.mid, y, true); menu_fb_px(lcd, e.mid + 1, y, true); }
+    const char *ok = M_CONFIRM, *cc = M_CANCEL;
+    int ty = e.btn_y0 + 2 + ((e.btn_y1 - (e.btn_y0 + 2) + 1) - font_book_ui_cell_h()) / 2;
+    clip_set(X0 + 3, e.btn_y0 + 2, e.mid - 2, e.btn_y1);
+    ui_draw_text(lcd, (X0 + e.mid) / 2 - 16, ty, ok, false);   /* 左半: 确定退出 */
+    clip_set(e.mid + 3, e.btn_y0 + 2, X1 - 3, e.btn_y1);
+    ui_draw_text(lcd, (e.mid + X1) / 2 - 16, ty, cc, false);   /* 右半: 取消 */
+    clip_clear();
+}
+
+/* ============ 渲染入口 ============ */
+
+void book_reader_render(st7305_handle_t *lcd) {
+    if (!s_open || !lcd) return;
+    /* V1.0.68 fix: 每 30s 自动保存, 慢读/长停留崩溃也不丢进度 */
+    static uint32_t s_last_auto_save = 0;
+    uint32_t now_tick = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (now_tick - s_last_auto_save >= 30000) {
+        s_last_auto_save = now_tick;
+        s_last_saved_page = s_page;
+        book_save_progress();
+    }
+    /* ★ 2026-10-30 修复「休眠唤醒后阅读器方向丢失/错位」:
+     *   屏保进入时 os_screensaver_force_enter() 会把显示栈整体复位成系统横屏
+     *   (st7305_reset_rotation + ui_set_portrait(false) + input 旋转 0), 那是强制的、
+     *   也是必须的 —— 休眠界面不能继承阅读器方向。
+     *   唤醒后阅读器继续显示时, 由这里把自己的方向状态**每帧同步回去**:
+     *     · ui_set_rotation_mode → 菜单/弹窗按阅读器的 300×400 布局
+     *     · input 旋转           → 触摸坐标跟随
+     *   都是纯全局赋值, 无分配无系统调用, 每帧调代价可忽略。
+     *   st7305_set_rotation 在下面两个分支里各自设置, 不用重复。
+     * ★ 2026-11-22: 直接传旋转方向, 不再由本文件推导 `==2||==3` (判据收进 ui_common)。 */
+    ui_set_rotation_mode(s_rot);
+    input_set_screen_rotation(s_rot);
+
+    if (book_is_portrait()) {
+        render_portrait(lcd);
+        /* 覆盖层画进竖屏画布, 随正文一起旋转。
+         * ★ 2026-11-22: 顺序改成"菜单 → 退出确认", 与命中优先级一致
+         *   (book_reader_handle_touch 里先判 s_exit_confirm) —— 否则会出现
+         *   "看到的是菜单、点到的是确认框"的错位。 */
+        if (s_menu != BM_READ) draw_reader_menu(lcd);
+        if (s_exit_confirm) draw_exit_confirm(lcd);
+        /* 旋转全部交驱动底层统一处理 (与书架同套 set_rotation+flush), 消除两套逻辑 */
+        st7305_set_rotation(lcd, s_rot, s_pfb);
+    } else {
+        render_landscape(lcd);
+        if (s_menu != BM_READ) draw_reader_menu(lcd);
+        if (s_exit_confirm) draw_exit_confirm(lcd);
+        if (s_rot == 1 && !s_rot_buf) {
+            s_rot_buf = heap_caps_malloc(15000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        st7305_set_rotation(lcd, s_rot, (s_rot == 1) ? s_rot_buf : NULL);
+    }
+    if (s_night && !s_inverted) {
+        st7305_set_inversion(lcd, true);
+        s_inverted = true;
+    } else if (!s_night && s_inverted) {
+        st7305_set_inversion(lcd, false);
+        s_inverted = false;
+    }
+    st7305_flush(lcd);   /* 驱动按当前旋转 (0横 / 1内存180 / 2,3竖屏) 送屏 */
+}
+
+/* ============ 文件加载 ============ */
+
+static const char *base_name(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static bool is_book_ext(const char *path, const char *ext) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return false;
+    return strcasecmp(dot, ext) == 0;
+}
+
+/* 识别编码 + BOM 偏移 (返回后文件指针复位到 0) */
+static uint8_t book_sniff_enc(FILE *f, uint32_t *bom) {
+    uint8_t b[4] = {0};
+    size_t n = fread(b, 1, 4, f);
+    *bom = 0;
+    if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) { *bom = 3; fseek(f, 0, SEEK_SET); return BF_ENC_UTF8; }
+    if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE) { *bom = 2; fseek(f, 0, SEEK_SET); return BF_ENC_UTF16LE; }
+    if (n >= 2 && b[0] == 0xFE && b[1] == 0xFF) { *bom = 2; fseek(f, 0, SEEK_SET); return BF_ENC_UTF16BE; }
+    uint8_t *smp = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM);
+    if (!smp) { fseek(f, 0, SEEK_SET); return BF_ENC_UTF8; }
+    size_t sn = fread(smp, 1, 16384, f);
+    bool v = bf_utf8_valid(smp, sn);
+    free(smp);
+    fseek(f, 0, SEEK_SET);
+    return v ? BF_ENC_UTF8 : BF_ENC_GBK;
+}
+
+/* 章节标题 (书签用): 返回当前页所在章节标题, 无则 NULL */
+static const char *book_chapter_title_at(uint32_t off) {
+    if (s_chapter_count == 0) return NULL;
+    int lo = 0, hi = (int)s_chapter_count - 1, ans = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (s_chapters[mid].off <= off) { ans = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    return (ans >= 0) ? s_chapters[ans].title : NULL;
+}
+
+static uint32_t book_page_for_offset(uint32_t off) {
+    if (s_page_count == 0) return 0;
+    int lo = 0, hi = (int)s_page_count - 1, ans = 0;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (s_page_off[mid] <= off) { ans = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    return (uint32_t)ans;
+}
+
+static void book_add_bookmark(void) {
+    if (s_bm_count >= BOOK_MAX_BOOKMARKS) {
+        /* ★ 2026-11-21: 原来这里静默 return —— 用户点"添加书签"什么都没发生,
+         *   以为功能坏了。M_BM_FULL 早就定义好, 只是从没被用过。 */
+        snprintf(s_menu_msg, sizeof(s_menu_msg), "%s", M_BM_FULL);
+        return;
+    }
+    uint32_t off = 0;
+    if (s_idx_mutex) xSemaphoreTake(s_idx_mutex, portMAX_DELAY);
+    if (s_page < s_page_count) off = s_page_off[s_page];
+    if (s_idx_mutex) xSemaphoreGive(s_idx_mutex);
+    /* ★ 2026-11-21: 同一页反复点"添加书签"原本会不断塞重复条目, 上限只有 8 条,
+     *   点几下就满了。命中已有书签就只提示, 不再新增。 */
+    for (uint32_t i = 0; i < s_bm_count; i++) {
+        if (s_bms[i].off == off) {
+            snprintf(s_menu_msg, sizeof(s_menu_msg), "%s", M_ADDED);
+            return;
+        }
+    }
+    char title[32];
+    const char *ct = book_chapter_title_at(off);
+    if (ct) {
+        snprintf(title, sizeof(title), "%s", ct);
+    } else if (s_enc == BF_ENC_GBK) {
+        snprintf(title, sizeof(title), "\xB5\xDA%lu\xD2\xB3", (unsigned long)(s_page + 1));
+    } else {
+        snprintf(title, sizeof(title), "\xE7\xAC\xAC%lu\xE9\xA1\xB5", (unsigned long)(s_page + 1));
+    }
+    s_bms[s_bm_count].off = off;
+    s_bms[s_bm_count].page = s_page;
+    snprintf(s_bms[s_bm_count].title, sizeof(s_bms[s_bm_count].title), "%s", title);
+    s_bm_count++;
+    book_save_progress();
+    snprintf(s_menu_msg, sizeof(s_menu_msg), "%s", M_ADDED);   /* ★ 2026-11-21: 成功也要有反馈 */
+}
+
+/* ★ F2/F7 (2026-10-30): 统一定位 —— 百分比/章节/书签跳转都走这一套。
+ *   只依赖已有页表 s_page_off[]（按源文件字节偏移升序），二分定位，不额外扫描、不建第二套索引。 */
+static bool book_goto_off(uint32_t off) {
+    if (!s_page_off || s_page_count == 0) return false;
+    if (s_src_size == 0) return false;
+    if (off >= s_src_size) off = s_src_size - 1;
+    uint32_t lo = 0, hi = s_page_count - 1, best = 0;
+    while (lo <= hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1);
+        if (s_page_off[mid] <= off) { best = mid; lo = mid + 1; }
+        else { if (mid == 0) break; hi = mid - 1; }
+    }
+    s_page = best;
+    return true;
+}
+/* 按百分比跳转。依据 = **源文件字节偏移**：
+ *   TXT 直接是文件偏移; EPUB/FB2 先被转成 TXT 缓存, 索引也建在那个 TXT 上, 故三者语义一致。
+ *   精度 = 页粒度（24px 中文约 480 B/页），对 10MB 书单页 ≈ 0.005%。 */
+static bool book_goto_pct(int pct) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (s_src_size == 0 || !s_page_off || s_page_count == 0) return false;
+    uint32_t off = (uint32_t)(((uint64_t)s_src_size * (uint32_t)pct) / 100u);
+    /* 索引没跑完时不许"假装精确": 超出已索引范围就夹到已索引末尾 */
+    if (!s_index_done && s_indexed_bytes > 0 && off > s_indexed_bytes) {
+        off = s_indexed_bytes;
+        snprintf(s_menu_msg, sizeof(s_menu_msg), "%s %u%%",
+                 M_IDX_HINT,
+                 (unsigned)((uint64_t)s_indexed_bytes * 100u / s_src_size));
+    }
+    return book_goto_off(off);
+}
+/* 当前阅读位置所属章节下标（未索引/无章节返回 -1） */
+static int book_cur_chapter(void) {
+    if (!s_chapters || s_chapter_count == 0 || !s_page_off || s_page_count == 0) return -1;
+    uint32_t off = (s_page < s_page_count) ? s_page_off[s_page] : 0;
+    int best = -1;
+    uint32_t lo = 0, hi = s_chapter_count - 1;
+    while (lo <= hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1);
+        if (s_chapters[mid].off <= off) { best = (int)mid; lo = mid + 1; }
+        else { if (mid == 0) break; hi = mid - 1; }
+    }
+    return best;
+}
+/* 跳到第 k 章 */
+static bool book_goto_chapter(int k) {
+    if (k < 0 || k >= (int)s_chapter_count) return false;
+    if (!book_goto_off(s_chapters[k].off)) return false;
+    book_save_progress();
+    return true;
+}
+
+/* ===== 2026-10-30: 字体选择持久化 ======================================
+ * 存在现有 os_book 分组里，不新建 NVS 命名空间（体积与兼容性都最小）：
+ *   br_font  字符串：选中的 LBF 完整路径；空串 = 内置字库
+ *   br_style int   ：字体样式档（0 = 内置默认）
+ * ⚠ 不存"字体序号"——TF 卡上增删一个文件序号就全错位了，必须存文件名/路径。
+ *   读回时路径不存在/文件损坏 ⇒ 自动回退内置并**清掉这个键**，
+ *   否则每次开书都要白试一次打不开的文件。 */
+static void book_font_save(const char *lbf_path)
+{
+    nvs_handle_t nh;
+    if (svc_nvs_open("os_book", NVS_READWRITE, &nh) != ESP_OK) return;
+    svc_nvs_set_str(nh, "br_font", (lbf_path && lbf_path[0]) ? lbf_path : "");
+    svc_nvs_set_i32(nh, "br_style", (int32_t)s_fontstyle);
+
+    /* ★★★ 2026-10-31: 与 书库 →「阅读优化 → 字体」共用**同一份**状态 ★★★
+     *   书库那边持久化的是文件名 ftn（空串=内置）+ ft 标记；这里在阅读器内换字体
+     *   必须写同样的键，否则两处各存一套：阅读器里换成 A，回书库仍显示 B，
+     *   再开书又被 B 盖回去。ftn 存**文件名**而不是路径/序号 —— 序号会随目录变化错位，
+     *   路径又绑死了 /sdcard 前缀。 */
+    {
+        const char *base = "";
+        if (lbf_path && lbf_path[0]) {
+            const char *sl = strrchr(lbf_path, '/');
+            base = sl ? sl + 1 : lbf_path;
+        }
+        svc_nvs_set_str(nh, "ftn", base);
+        svc_nvs_set_i32(nh, "ft", base[0] ? 1 : 0);
+    }
+    svc_nvs_commit(nh);
+    svc_nvs_close(nh);
+}
+
+/* 字号持久化（2026-10-31）：与书库「阅读优化 → 字号大小」共用同一个键 fs，
+ * 存的是**档位下标**（该字体字号表里的第几档）。读回时按当前字体重新解释 ——
+ * 因为不同字体的表长不同（内置 4 档 / 8px 字体 2 档），下标越界会收敛到最大合法档。 */
+static void book_size_save(int idx)
+{
+    nvs_handle_t nh;
+    if (svc_nvs_open("os_book", NVS_READWRITE, &nh) != ESP_OK) return;
+    svc_nvs_set_i32(nh, "fs", (int32_t)idx);
+    svc_nvs_commit(nh);
+    svc_nvs_close(nh);
+}
+
+/* 2026-10-31: book_font_restore() 已删除 —— 字体来源改为**书库单一权威**
+ * （书库 NVS 的 ftn，bs_apply() 在开书前选好字）。阅读器再按 br_font 恢复
+ * 会和书库互相覆盖：在书库选「内置字体」后一开书又被拉回旧 TF 字体。
+ * book_font_save() 现在被阅读器内「字体选择」调用，写的也是同一组键（ftn/ft）。 */
+
+static void book_menu_select(void) {
+    int idx = (int)s_menu_sel;
+    int count = menu_item_count();
+    if (idx < 0 || idx >= count) return;
+    switch (s_menu) {
+        case BM_MENU:
+            switch (idx) {
+                case 0: s_menu = BM_TOC;  s_menu_sel = 0; bm_sc_reset(); break;      /* 章节目录 */
+                case 1: s_menu = BM_PCT;  s_menu_sel = 0; bm_sc_reset(); break;      /* 跳到进度 */
+                case 2: book_add_bookmark(); break;                                  /* 添加书签 */
+                case 3: s_menu = BM_BMKS; s_menu_sel = 0; bm_sc_reset(); break;      /* 书签列表 */
+                case 4: sd_font_scan();                                              /* 字体选择 */
+                        s_menu = BM_FONT; s_menu_sel = 0; bm_sc_reset(); break;
+                case 5: {                                                            /* 字号 */
+                        int n = font_book_size_count();
+                        if (n < 1) break;
+                        if ((int)s_fontsize >= n) s_fontsize = (uint8_t)(n - 1);   /* 换过小字库后可能越界 */
+                        s_menu = BM_SIZE;
+                        bm_sc_reset();
+                        s_menu_sel = (uint32_t)s_fontsize;    /* 复位后再定位, 顺序不能反 */
+                        } break;
+                case 6: book_reader_close(); break;                                  /* 返回书库 */
+            }
+            return;
+        case BM_PCT:
+            if (book_goto_pct(idx * 5)) book_save_progress();
+            s_menu = BM_READ;
+            return;
+        case BM_SIZE: {
+            /* ★ 2026-10-31: 字号选择。列表本身就来自当前字体的真实规格
+             *   （font_book_size_count / px_at），所以点第几档就是第几档像素 ——
+             *   不会出现"菜单写 32px、正文画 24px"。改完写 NVS 的 fs（与书库同一个键），
+             *   重新分页，回二级菜单时高亮停在"字号"这一项。 */
+            int cnt = font_book_size_count();
+            if (idx >= 0 && idx < cnt) {
+                int px = font_book_size_px_at(idx);
+                s_fontsize = (uint8_t)idx;
+                font_book_select(s_fontstyle, px);
+                book_size_save(idx);
+                book_restart_index();
+                ESP_LOGI(TAG, "字号切换: %dpx (第 %d/%d 档)", px, idx + 1, cnt);
+            }
+            s_menu = BM_MENU;
+            bm_sc_reset();
+            s_menu_sel = 5;              /* 回到主菜单并停在「字号」项 (7 项列表里 0..6) */
+            return;
+        }
+        case BM_FONT: {
+            bool font_changed = false;
+            if (idx < s_sd_font_count) {
+                /* TF 卡 LBF 字体: 构造完整路径并加载。
+                 * 失败时 font_book_error() 给出原因，当前字体保持不变（不静默替换）。 */
+                char path[128];
+                snprintf(path, sizeof(path), "/sdcard/fonts/%s", s_sd_fonts[idx]);
+                if (font_book_select_file(path)) {
+                    font_changed = true;
+                    book_font_save(path);       /* ★ 记住这次选择 */
+                } else {
+                    ESP_LOGW(TAG, "字体加载失败 %s: %s", path, font_book_error());
+                }
+            } else {
+                /* 内置字体 */
+                font_book_select_embedded(0, book_reader_size_px(s_fontsize));
+                font_changed = true;
+                book_font_save(NULL);           /* ★ 内置 = 清掉记忆 */
+            }
+            if (font_changed) {
+                /* 字体变了, 重新分页 */
+                book_restart_index();
+            }
+            s_menu = BM_MENU;
+            bm_sc_reset();
+            s_menu_sel = 4;              /* 回到主菜单并停在「字体」项 */
+            return;
+        }
+        case BM_TOC:
+            if (s_chapter_count == 0) return;
+            { uint32_t gi = toc_page_base() + (uint32_t)idx;
+              if (gi < s_chapter_count) {
+                  uint32_t off = s_chapters[gi].off;
+                  /* 等索引扫过该章节偏移, 确保能正确映射到具体页 */
+                  if (s_indexed_bytes < off && !s_index_done) {
+                      uint32_t t0 = xTaskGetTickCount();
+                      while (!s_index_done && !s_index_error && s_indexed_bytes < off &&
+                             (uint32_t)(xTaskGetTickCount() - t0) < pdMS_TO_TICKS(5000))
+                          vTaskDelay(pdMS_TO_TICKS(10));
+                  }
+                  uint32_t p = book_page_for_offset(off);
+                  book_wait_indexed_page(p);
+                  if (!s_index_error && s_page_count > p) { s_page = p; s_menu = BM_READ; }
+              } }
+            return;
+        case BM_BMKS:
+            if (s_bm_count == 0) return;
+            if (idx < (int)s_bm_count) {
+                uint32_t p = s_bms[idx].page;
+                if (p >= s_page_count) p = book_page_for_offset(s_bms[idx].off);
+                book_wait_indexed_page(p);
+                if (!s_index_error && s_page_count > p) {
+                    s_page = p;
+                    s_menu = BM_READ;
+                }
+            } else if (idx == (int)s_bm_count) {
+                s_bm_count = 0;
+                book_save_progress();
+                snprintf(s_menu_msg, sizeof(s_menu_msg), "%s", M_CLEARED);   /* ★ 2026-11-21: 清空要有反馈 */
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+bool book_reader_open(const char *path) {
+    if (!path) return false;
+    if (s_open) book_reader_close();
+    s_lcd = NULL;
+
+    /* ★ 2026-10-31: 打开耗时分解（字体 / 文件+首屏），一行给出可直接对比的数字。 */
+    int64_t t_open0 = esp_timer_get_time();
+
+    if (!font_book_init()) {
+        ESP_LOGD(TAG, "字库初始化失败: %s", font_book_error());
+        return false;
+    }
+    font_book_select(s_fontstyle, book_reader_size_px(s_fontsize));   /* 按设置切换字号 */
+
+    /* ★ 2026-10-31: 这里原来每次都做「TF 字体全量体检」+「恢复上次字体」两件事，
+     *   现在两件都删除：
+     *   ① 字体列表只服务字体选择菜单 → 改成 sd_font_scan() 懒扫（进菜单才扫，一次会话一次）；
+     *   ② 「恢复上次字体」读的是 NVS 的 br_font，而书库有自己的 ftn 记录 ——
+     *      两套持久化会互相覆盖：在书库选了「内置字体」，一开书又被 br_font 拉回 TF 字体。
+     *      现在**书库/阅读器共用 ftn 一个键**（on_book_select 里 bs_apply() 先选好字再开书）。 */
+    int64_t t_font0 = esp_timer_get_time();
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        ESP_LOGD(TAG, "stat 失败: %s (errno=%d)", path, errno);
+        return false;
+    }
+    uint32_t fsz = (uint32_t)st.st_size;
+    if (fsz == 0 || fsz > BOOK_MAX_FILE) {
+        ESP_LOGD(TAG, "文件大小非法: %s size=%ld (上限 %u) mode=%o", path,
+                 (long)st.st_size, BOOK_MAX_FILE, (unsigned)st.st_mode);
+        return false;
+    }
+    snprintf(s_path, sizeof(s_path), "%s", path);
+    snprintf(s_src_path, sizeof(s_src_path), "%s", path);
+    if (is_book_ext(path, ".fb2")) {
+        /* FB2: 流式转换为缓存 TXT (按 路径+大小+时间 命名, 变更自动重建) */
+        char dir[128];
+        snprintf(dir, sizeof(dir), "/sdcard/books/.cache");
+        mkdir(dir, 0755);
+        char cache[320];
+        snprintf(cache, sizeof(cache), "/sdcard/books/.cache/fb2_%08lx_%08lx_%08lx.txt",
+                 (unsigned long)fnv1a(path), (unsigned long)(uint32_t)st.st_mtime,
+                 (unsigned long)fsz);
+        struct stat cst;
+        if (stat(cache, &cst) != 0) {
+            char bt[96] = {0};
+            if (fb2_convert(path, cache, bt, sizeof(bt)) != 0) {
+                ESP_LOGD(TAG, "FB2 转换失败: %s", path);
+                return false;
+            }
+            if (bt[0]) ESP_LOGI(TAG, "FB2 书名: %s", bt);
+        }
+        snprintf(s_src_path, sizeof(s_src_path), "%s", cache);
+    } else if (is_book_ext(path, ".epub")) {
+        char dir[128];
+        snprintf(dir, sizeof(dir), "/sdcard/books/.cache");
+        mkdir(dir, 0755);
+        char cache[320];
+        snprintf(cache, sizeof(cache), "/sdcard/books/.cache/epub_%08lx_%08lx_%08lx.txt",
+                 (unsigned long)fnv1a(path), (unsigned long)(uint32_t)st.st_mtime,
+                 (unsigned long)fsz);
+        struct stat cst;
+        if (stat(cache, &cst) != 0) {
+            char bt[96] = {0};
+            if (epub_convert(path, cache, bt, sizeof(bt)) != 0) {
+                ESP_LOGD(TAG, "EPUB 转换失败: %s", path);
+                return false;
+            }
+            if (bt[0]) ESP_LOGI(TAG, "EPUB 书名: %s", bt);
+        }
+        snprintf(s_src_path, sizeof(s_src_path), "%s", cache);
+    }
+    FILE *f = fopen(s_src_path, "rb");
+    if (!f) {
+        ESP_LOGD(TAG, "打开失败: %s", path);
+        s_src_path[0] = 0;
+        return false;
+    }
+    s_fp = f;
+    s_file_size = fsz;
+    struct stat sst;
+    s_src_size = (stat(s_src_path, &sst) == 0) ? (uint32_t)sst.st_size : fsz;
+    s_mtime = (uint32_t)st.st_mtime;
+    s_enc = book_sniff_enc(f, &s_file_start);
+    ESP_LOGI(TAG, "打开 %s: %lu 字节, 编码=%d, 起点=%lu",
+             base_name(path), (unsigned long)fsz, s_enc, (unsigned long)s_file_start);
+
+    if (!s_idx_mutex) s_idx_mutex = xSemaphoreCreateMutex();
+    if (!s_win) {
+        s_win = heap_caps_malloc(BOOK_WIN_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_win) { fclose(f); s_fp = NULL; ESP_LOGD(TAG, "渲染窗口分配失败"); return false; }
+    }
+    s_win_base = 0;
+    s_win_len = 0;
+    if (!s_scan_chunk) s_scan_chunk = heap_caps_malloc(BOOK_SCAN_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_scan_win)   s_scan_win   = heap_caps_malloc(sizeof(bf_ch_t) * BF_MAX_WIN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_scan_brk)   s_scan_brk   = heap_caps_malloc(BF_MAX_WIN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_scan_scratch) s_scan_scratch = heap_caps_malloc(FLOW_SCRATCH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_scan_off)   s_scan_off   = heap_caps_malloc(BF_MAX_WIN * 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_rwin)       s_rwin       = heap_caps_malloc(sizeof(bf_ch_t) * BF_MAX_WIN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_rbrk)       s_rbrk       = heap_caps_malloc(BF_MAX_WIN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_rscratch)   s_rscratch   = heap_caps_malloc(FLOW_SCRATCH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_scan_chunk || !s_scan_win || !s_scan_brk || !s_scan_scratch || !s_scan_off ||
+        !s_rwin || !s_rbrk || !s_rscratch) {
+        ESP_LOGD(TAG, "排版内核工作区分配失败");
+        fclose(f);
+        s_fp = NULL;
+        return false;
+    }
+
+    if (s_rot == 1 && !s_rot_buf) {
+        s_rot_buf = heap_caps_malloc(15000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (book_is_portrait() && !s_pfb) {
+        s_pfb = heap_caps_malloc(PFB_ROW_BYTES * BOOK_PORTRAIT_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+
+    s_page_off = NULL;
+    s_page_cap = s_page_count = 0;
+    s_chapters = NULL;
+    s_chapter_cap = s_chapter_count = 0;
+    s_index_done = false;
+    s_index_error = false; s_idx_fail = IDX_FAIL_NONE;
+    s_indexed_bytes = 0;
+    s_page = 0;
+    s_resume_off = 0;
+    s_toc_prescanned = false;   /* 每次打开都重建完整目录 */
+    s_menu = BM_READ;
+    s_exit_confirm = false;
+    s_menu_msg[0] = 0;
+
+    bool sidecar_loaded = book_load_sidecar();   /* 先载页表, 供偏移恢复 */
+    /* 侧车已含完整目录 → 直接用缓存, 不再每次进入重新全本扫描 */
+    if (sidecar_loaded && s_chapter_count >= BOOK_TOC_REBUILD_MIN) {
+        s_toc_prescanned = true;
+        ESP_LOGI(TAG, "目录命中缓存: %lu 章", (unsigned long)s_chapter_count);
+    }
+    book_load_progress();                          /* 再载进度 */
+    if (s_pending_last_off > 0 && s_page_off && s_page_count) {
+        /* 始终按字节偏移换算回最近页 (页号在重开后页数不同时会失效) */
+        s_loaded_page = book_page_for_offset(s_pending_last_off);
+        if (s_loaded_page >= s_page_count) s_loaded_page = s_page_count - 1;
+        ESP_LOGI(TAG, "按偏移 %lu 恢复至页 %lu/%lu",
+                 (unsigned long)s_pending_last_off, (unsigned long)s_loaded_page, (unsigned long)s_page_count);
+        s_pending_layout_diff = false;
+    }
+    if (!sidecar_loaded || !s_index_done) {
+        if (book_scan_start() != 0) {
+            ESP_LOGD(TAG, "索引失败");
+            fclose(f);
+            s_fp = NULL;
+            s_path[0] = 0;
+            if (s_page_off) { free(s_page_off); s_page_off = NULL; }
+            if (s_chapters) { free(s_chapters); s_chapters = NULL; }
+            s_page_count = s_chapter_count = 0;
+            s_bm_count = 0;
+            return false;
+        }
+    } else if (s_chapter_count < BOOK_TOC_REBUILD_MIN) {
+        /* 页表完备但目录几乎为空(旧 .idx 未存目录) → 后台重建完整目录, 不阻塞阅读 */
+        ESP_LOGI(TAG, "侧边目录过少(%lu 章), 后台重建", (unsigned long)s_chapter_count);
+        book_toc_rebuild_start();
+    }
+
+    if (s_loaded_page < s_page_count) s_page = s_loaded_page;
+    s_last_saved_page = s_page;
+
+    /* 立即进入阅读: 不做任何阻塞等待. 页表未就绪时后台分页填充, 渲染到可用即显示 */
+
+    const char *bn = base_name(path);
+    snprintf(s_title, sizeof(s_title), "%.63s", bn);
+    char *dot = strrchr(s_title, '.');
+    if (dot && strcasecmp(dot, ".txt") == 0) *dot = '\0';
+
+    s_open = true;
+    vibrator_set_reader_mute(!s_page_vib);   /* ★ 2026-11-22: 进入阅读页时按「阅读优化 → 震动」生效 */
+    s_open_tick_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);   /* 记录本次阅读起点 */
+    input_set_screen_rotation(s_rot);   /* V1.0.68: 触摸跟随当前旋转方向 */
+    input_set_swipe_turn(true);          /* 阅读器内横滑翻页 */
+    ESP_LOGI(TAG, "阅读器就绪: %s, %lu 页, 断点=%lu",
+             s_title, (unsigned long)s_page_count, (unsigned long)s_page);
+    /* 耗时分解（ms）：字体=切字/预加载（命中缓存则≈0），其余=开文件+首屏排版 */
+    {
+        int64_t t_end = esp_timer_get_time();
+        ESP_LOGI(TAG, "打开耗时 %lld ms (字体 %lld / 文件+首屏 %lld)",
+                 (long long)((t_end - t_open0) / 1000),
+                 (long long)((t_font0 - t_open0) / 1000),
+                 (long long)((t_end - t_font0) / 1000));
+    }
+
+    return true;
+}
+
+bool book_reader_is_open(void) {
+    return s_open;
+}
+
+/* 阅读页震动开关 (「书库 → 阅读优化 → 震动」).
+ * 只影响阅读器打开期间的点击/翻页反馈, 不写 NVS (NVS 键 vb 由书库那边管),
+ * 也不改设置页的「UI 震动」开关 —— 两者互不干扰. */
+void book_reader_set_page_vib(bool en) {
+    s_page_vib = en;
+    vibrator_set_reader_mute(s_open && !s_page_vib);
+}
+bool book_reader_page_vib(void) { return s_page_vib; }
+
+void book_reader_close(void) {
+    if (!s_open) return;
+    if (!book_index_stop()) {
+        ESP_LOGD(TAG, "索引任务未退出, 保留页表避免崩溃");
+        s_page_off = NULL;
+        s_page_cap = s_page_count = 0;
+        s_chapters = NULL;
+        s_chapter_cap = s_chapter_count = 0;
+    }
+    book_save_progress();
+    if (!s_index_done && s_page_count > 0) {
+        /* 未完成也落盘部分索引, 下次断点续扫 */
+        book_save_sidecar();
+    }
+    if (s_inverted && s_lcd) {
+        st7305_set_inversion(s_lcd, false);
+        s_inverted = false;
+    }
+    if (s_page_off) { free(s_page_off); s_page_off = NULL; }
+    if (s_chapters) { free(s_chapters); s_chapters = NULL; }
+    if (s_win) { free(s_win); s_win = NULL; }
+    if (s_rot_buf) { free(s_rot_buf); s_rot_buf = NULL; }
+    if (s_pfb) { free(s_pfb); s_pfb = NULL; }
+    if (s_fp) { fclose(s_fp); s_fp = NULL; }
+    if (s_scan_chunk) { free(s_scan_chunk); s_scan_chunk = NULL; }
+    if (s_scan_win) { free(s_scan_win); s_scan_win = NULL; }
+    if (s_scan_brk) { free(s_scan_brk); s_scan_brk = NULL; }
+    if (s_scan_scratch) { free(s_scan_scratch); s_scan_scratch = NULL; }
+    if (s_scan_off) { free(s_scan_off); s_scan_off = NULL; }
+    if (s_rwin) { free(s_rwin); s_rwin = NULL; }
+    if (s_rbrk) { free(s_rbrk); s_rbrk = NULL; }
+    if (s_rscratch) { free(s_rscratch); s_rscratch = NULL; }
+    s_page_cap = s_page_count = 0;
+    s_chapter_cap = s_chapter_count = 0;
+    s_page = 0;
+    s_index_done = false;
+    s_index_error = false; s_idx_fail = IDX_FAIL_NONE;
+    s_indexed_bytes = 0;
+    s_loaded_page = 0;
+    s_bm_count = 0;
+    s_exit_confirm = false;
+    s_open = false;
+    vibrator_set_reader_mute(false);   /* ★ 2026-11-22: 关书必须解除阅读页静音, 否则书架/设置也点不震 */
+    s_sd_font_scanned = false;   /* 下次进入/下次要用字体列表时重新扫（字体可能刚装/卸过） */
+    s_path[0] = 0;
+    s_src_path[0] = 0;
+    input_set_screen_rotation(0);   /* V1.0.68: 退出阅读器, 触摸恢复横屏 */
+    input_set_swipe_turn(false);   /* 关闭阅读器横滑翻页 (恢复其它界面拖动) */
+    /* ★ 2026-10-31 改：**关书不释放字体**。
+     *   字体整块映像(最大 1.23MB×2)唯一一次预加载要 ~1.1s（TF 卡 537KB 实测），
+     *   关书就放掉的话，「看完一本换一本」每次都要再等 1.1s —— 这正是"打开慢"的
+     *   主要来源。现在改为：关书保留，**离开书架页**时由 page_book 调
+     *   font_book_release_all() 统一释放（见 p_book_exit）。同一会话内换书 ≈ 0 IO。 */
+    ESP_LOGI(TAG, "阅读器已关闭, 内存已释放");
+}
+
+const char *book_reader_title(void) {
+    return s_title;
+}
+
+bool book_reader_knock_active(void) {
+    return false;   /* 敲击翻页功能已删除 (V1.0.64) */
+}
+
+/* 2026-10-31: 字体/字号变化后重新排版 + 重新分页，并给出可对比的耗时。
+ * 只重算必要的东西：字号/字体变了才重排，单纯的边距/行高变化也在 layout_changed 里
+ * 一起走这里 —— 但字体实例本身由 font_book 复用（命中则零 IO）。 */
+static void book_relayout_after_font_change(void) {
+    int64_t t0 = esp_timer_get_time();
+    font_book_select(s_fontstyle, book_reader_size_px(s_fontsize));
+    book_restart_index();
+    ESP_LOGI(TAG, "字体/字号切换: 显示 %dpx, 重新分页耗时 %lld ms",
+             font_book_cell_w(), (long long)((esp_timer_get_time() - t0) / 1000));
+}
+
+void book_reader_set_settings(bool knock, int sens, bool night, bool pagenum, int rot,
+                              int fontstyle, int fontsize, int margin, int lineh, int gap,
+                              int indent) {
+    bool was_portrait = book_is_portrait();
+    (void)knock;
+    (void)sens;
+    s_night = night;
+    s_pagenum = pagenum;
+    bool layout_changed = (s_open &&
+        (fontsize != (int)s_fontsize || margin != (int)s_margin_id ||
+         lineh != (int)s_lineh_id || gap != (int)s_gap_id ||
+         (indent >= 0 && indent != (int)s_indent)));
+    bool style_changed = (s_open && fontstyle >= 0 && fontstyle != (int)s_fontstyle);
+    s_fontstyle = (uint8_t)((fontstyle < 0) ? 0 : (fontstyle > 1) ? 1 : fontstyle);
+    s_fontsize = (uint8_t)((fontsize < 0) ? 1 : (fontsize > 3) ? 3 : fontsize);   /* 档 0..3 = 16/24/32/48px */
+    s_margin_id = (uint8_t)((margin < 0) ? 1 : (margin > 2) ? 2 : margin);
+    s_lineh_id = (uint8_t)((lineh < 0) ? 1 : (lineh > 2) ? 2 : lineh);
+    s_gap_id = (uint8_t)((gap < 0) ? 0 : (gap > 2) ? 2 : gap);
+    if (indent >= 0) s_indent = (indent != 0);
+    uint8_t new_rot = (uint8_t)((rot < 0) ? 0 : (rot > 3) ? 3 : rot);
+    if (s_open && new_rot != s_rot) {
+        s_rot = new_rot;
+        bool now_portrait = book_is_portrait();
+        if (s_rot == 1 && !s_rot_buf) {
+            s_rot_buf = heap_caps_malloc(15000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        } else if (s_rot != 1 && s_rot_buf) {
+            free(s_rot_buf);
+            s_rot_buf = NULL;
+        }
+        if (now_portrait && !s_pfb) {
+            s_pfb = heap_caps_malloc(PFB_ROW_BYTES * BOOK_PORTRAIT_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        } else if (!now_portrait && s_pfb) {
+            free(s_pfb);
+            s_pfb = NULL;
+        }
+        if (now_portrait != was_portrait || layout_changed) {
+            if (layout_changed || style_changed) book_relayout_after_font_change();
+            else                                 book_restart_index();
+        } else {
+            s_page = 0;
+        }
+        /* 旋转后一律关闭菜单回阅读页, 否则菜单挡住正文, 视觉上"没旋转" */
+        s_menu = BM_READ;
+        s_exit_confirm = false;
+        s_menu_msg[0] = 0;
+    } else {
+        s_rot = new_rot;
+        if (layout_changed || style_changed) book_relayout_after_font_change();
+    }
+    /* V1.0.68: 旋转方向变化时同步输入层, 触摸跟随旋转.
+     * 仅阅读器打开时生效: 否则会把竖屏旋转泄漏到书籍二级菜单/主菜单的触摸坐标,
+     * 导致点击位置偏移、返回主菜单后左右反向/反应迟钝 (重启才恢复). */
+    if (s_open) input_set_screen_rotation(s_rot);
+}
+
+/* ============ 按键 ============ */
+
+static void book_reader_prev_page(void) {
+    if (s_page > 0) s_page--;
+    /* ★ B5: 统一走调度（翻 3 页 / 20 秒） */
+    if (s_page != s_last_saved_page) book_progress_maybe_save(false);
+}
+
+static void book_reader_next_page(void) {
+    if (s_page + 1 < s_page_count) {
+        s_page++;
+        ESP_LOGI(TAG, "翻页 -> %lu/%lu", (unsigned long)(s_page + 1), (unsigned long)s_page_count);
+    } else if (!s_index_done && !s_index_error) {
+        book_wait_indexed_page(s_page + 1);
+        if (!s_index_error && s_page + 1 < s_page_count) {
+            s_page++;
+            ESP_LOGI(TAG, "翻页 -> %lu/%lu", (unsigned long)(s_page + 1), (unsigned long)s_page_count);
+        } else {
+            ESP_LOGD(TAG, "翻页被边界挡住: 页 %lu (已索引 %lu 页)", (unsigned long)(s_page + 1), (unsigned long)s_page_count);
+            return;
+        }
+    } else {
+        return;
+    }
+    /* ★ B5: 统一走调度（翻 3 页 / 20 秒） */
+    if (s_page != s_last_saved_page) book_progress_maybe_save(false);
+}
+
+bool book_reader_handle_action(int action) {
+    if (!s_open) return false;
+    if (s_exit_confirm) {
+        switch (action) {
+            case BOOK_ACTION_CONFIRM:
+                book_reader_close();
+                return true;
+            case BOOK_ACTION_BACK:
+            case BOOK_ACTION_HOME:
+                s_exit_confirm = false;
+                return true;
+            default:
+                s_exit_confirm = false;   /* 其他键取消确认 */
+                return true;
+        }
+    }
+    if (s_menu != BM_READ) {
+        switch (action) {
+            case BOOK_ACTION_UP:
+            case BOOK_ACTION_LEFT:
+                /* 选中项变化后由 bm_sc_sync() 的 ensure_visible 最小滚动把它带进视野,
+                 * 不在这里动滚动量(那是 ui_scroll 的职责, 双写会互相打架) */
+                if (!bm_sel_visible()) {
+                    /* 触屏态 → 首次按键: 高亮从"当前顶端可见行"起算, 不跳回第 0 行 */
+                    s_menu_sel_on = true;
+                    s_menu_sel = s_menu_scroll;
+                } else if (s_menu_sel > 0) {
+                    s_menu_sel--;
+                }
+                s_menu_msg[0] = 0;   /* ★ 2026-11-21: 一次性提示, 一导航就清 */
+                return true;
+            case BOOK_ACTION_DOWN:
+                if (!bm_sel_visible()) {
+                    s_menu_sel_on = true;
+                    s_menu_sel = s_menu_scroll;
+                } else if (s_menu_sel + 1 < (uint32_t)menu_item_count()) {
+                    s_menu_sel++;
+                }
+                s_menu_msg[0] = 0;
+                return true;
+            case BOOK_ACTION_RIGHT:
+            case BOOK_ACTION_CONFIRM:
+                /* 触屏态(无高亮)下第一次按确认键: 先把光标立在当前顶端可见行, 不直接执行 ——
+                 * 否则会对一个用户根本没看见高亮的行做动作(拖过列表后尤其危险)。
+                 * 手柄方案下高亮一直在, 直接执行。 */
+                if (!bm_sel_visible()) {
+                    s_menu_sel_on = true;
+                    s_menu_sel = s_menu_scroll;
+                    return true;
+                }
+                book_menu_select();
+                return true;
+            case BOOK_ACTION_BACK:
+            case BOOK_ACTION_HOME:
+            case BOOK_ACTION_LONG_LEFT:
+                s_menu = BM_READ;
+                s_menu_msg[0] = 0;
+                return true;
+            default:
+                return false;
+        }
+    }
+    switch (action) {
+        case BOOK_ACTION_DOWN:
+            book_reader_next_page();
+            if (s_page != s_last_saved_page) book_progress_maybe_save(false);
+            return true;
+        case BOOK_ACTION_RIGHT:
+            /* V1.0.68: 左旋 (s_rot==2) 时 BOOT 键(右向) = 上一页, 与确定键对调 */
+            if (s_rot == 2) {
+                book_reader_prev_page();
+            } else {
+                book_reader_next_page();
+                if (s_page != s_last_saved_page) book_progress_maybe_save(false);
+            }
+            return true;
+        case BOOK_ACTION_CONFIRM:
+            /* V1.0.68: 竖屏方向决定确定键翻页方向: 左旋=下一页, 右旋=上一页 (两键对调) */
+            if (s_rot == 3) {
+                book_reader_prev_page();
+            } else {
+                book_reader_next_page();
+                if (s_page != s_last_saved_page) book_progress_maybe_save(false);
+            }
+            return true;
+        case BOOK_ACTION_LEFT:
+        case BOOK_ACTION_UP:
+            book_reader_prev_page();
+            return true;
+        case BOOK_ACTION_BACK:
+            /* ★★★ 2026-11-01 linit：**返回键改为翻页**，不再直接退出阅读器。
+             *   · 旋转方向左 (s_rot==2) → 上一页
+             *   · 旋转方向右 (s_rot==3) / 不旋转 → 下一页
+             *   退出阅读器改走 HOME 键（见下面 BOOK_ACTION_HOME）或菜单里的「退出阅读」。 */
+            if (s_rot == 2) {
+                book_reader_prev_page();
+            } else {
+                book_reader_next_page();
+                if (s_page != s_last_saved_page) book_progress_maybe_save(false);
+            }
+            return true;
+        case BOOK_ACTION_HOME:
+            /* 退出确认是覆盖全屏的模态提示: 先把阅读菜单收掉,
+             * 否则"看到菜单、点到确认框"或反之 (两者的命中优先级本来就不一样)。 */
+            s_menu = BM_READ;
+            bm_sc_reset();
+            s_exit_confirm = true;
+            return true;
+        case BOOK_ACTION_LONG_LEFT:
+            s_menu = BM_MENU;
+            s_menu_sel = 0;
+            bm_sc_reset();
+            s_menu_msg[0] = 0;
+            s_exit_confirm = false;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* 阅读器弹窗触摸命中 (2026-11-22 重写).
+ * 与 draw_reader_menu 读**同一个** bm_layout() 和同一组镜像变量 (s_menu_scroll/s_menu_pix),
+ * 命中公式与绘制公式逐像素相同: base = list_y0 - px, k = (y-base)/row_h。
+ * 规则(与系统弹窗一致): 框外=退一级; 底行=返回; 其余一律消费 —— 不再有"点了没反应"的死区。 */
+static bool book_menu_handle_touch(int x, int y) {
+    bm_geo_t g;
+    bm_layout(&g);
+    if (g.count <= 0) return false;
+
+    /* 框外: 退一级 (子菜单回主菜单, 主菜单回阅读) */
+    if (x < g.bx || x >= g.bx + g.bw || y < g.by || y >= g.by + g.bh) {
+        s_menu = (s_menu == BM_MENU) ? BM_READ : BM_MENU;
+        s_menu_sel = 0;
+        bm_sc_reset();
+        s_menu_msg[0] = 0;
+        return true;
+    }
+
+    /* 底部返回行: 与渲染同一条边界 (g.foot_y .. g.foot_y1) */
+    if (y >= g.foot_y) {
+        s_menu = (s_menu == BM_MENU) ? BM_READ : BM_MENU;
+        s_menu_sel = 0;
+        bm_sc_reset();
+        s_menu_msg[0] = 0;
+        return true;
+    }
+
+    /* 目录页码条: 位于 [list_y1, foot_y) */
+    if (s_menu == BM_TOC && y >= g.list_y1) {
+        int b[TOC_PAGER_MAX][3];
+        int n = toc_pager_layout(g.bx, g.bw, g.list_y1, b);
+        uint32_t P = toc_pages_count();
+        for (int i = 0; i < n; i++) {
+            if (x >= b[i][1] && x < b[i][2]) {
+                int hit = b[i][0];
+                uint32_t np = s_toc_page;
+                if (hit == -1)      np = (np == 0) ? 0 : np - 1;
+                else if (hit == -2) np = (np + 1 >= P) ? np : np + 1;
+                else if (hit >= 0 && (uint32_t)hit < P) np = (uint32_t)hit;
+                if (np != s_toc_page) {
+                    s_toc_page = np;
+                    s_menu_sel = 0;
+                    bm_sc_reset();
+                }
+                return true;
+            }
+        }
+        return true;   /* 页码条空白同样消费, 不落到列表 */
+    }
+
+    /* 标题区: 消费但不动作 (以前这里会落到"点框外关闭", 误触率很高) */
+    if (y < g.list_y0) return true;
+
+    /* 列表: 与绘制同一公式。底部余数带(可视高不能整除行高)夹到最后一行,
+     * 不再 return false —— 那正是用户报的"点了什么都没发生"。 */
+    int rel = y - (g.list_y0 - s_menu_pix);
+    int k = rel / g.row_h;
+    if (k < 0) k = 0;
+    if (k >= g.vis) k = g.vis - 1;
+    int idx = (int)s_menu_scroll + k;
+    if (idx < 0) idx = 0;
+    if (idx >= g.count) idx = g.count - 1;
+    s_menu_sel = (uint32_t)idx;
+    book_menu_select();
+    return true;
+}
+
+bool book_reader_handle_touch(int x, int y) {
+    if (!s_open) return false;
+    /* ★★ 2026-10-14 修"旋转后点确定退不出去" ★★
+     * 原来这里 `|| s_exit_confirm` 直接把触摸全丢了, 而确认条又没画按钮 ⇒ 只有硬件确认键能退,
+     * 手指点哪都没反应。现在按 exit_confirm_rect() 的**同一套几何**命中: 左半=确定退出, 右半=取消,
+     * 点框外=取消。(x/y 已由 input 层按旋转映射到阅读器逻辑坐标, 与绘制同系。) */
+    if (s_exit_confirm) {
+        exit_geo_t e;
+        exit_layout(&e);
+        /* 点框外 = 取消 (与 os_dialog 的"点外面不动作"取一致语义: 这里更保守, 直接关掉) */
+        if (x < e.x0 || x > e.x1 || y < e.y0 || y > e.y1) { s_exit_confirm = false; return true; }
+        if (y >= e.btn_y0) {                            /* 按钮行 (几何与绘制同源) */
+            if (x <= e.mid) book_reader_close();        /* 左半 = 确定退出 */
+            else            s_exit_confirm = false;     /* 右半 = 取消 */
+        }
+        return true;
+    }
+
+    if (s_menu != BM_READ) {
+        /* 二级菜单: 点菜单项 */
+        return book_menu_handle_touch(x, y);
+    }
+
+    /* ★ B3 (2026-10-30): 翻页区域重划。
+     *   旧实现只看 y 三段的 1/3 划分(横坐标被 (void)x 丢弃), 想点中间偏上会误翻页,
+     *   横屏左右两侧的横向空间完全没用上。
+     *   新规则(逻辑坐标, input 层已按 s_screen_rot 旋转好):
+     *     · 左半屏            → 上一页
+     *     · 右半屏            → 下一页
+     *     · 正中间小块(宽 1/4 × 高 1/3) → 阅读菜单
+     *   中间块必须"同时"满足横向与纵向条件, 所以正常翻页几乎不会误触到菜单。 */
+    int lw = (s_rot == 2 || s_rot == 3) ? BOOK_PORTRAIT_W : ST7305_WIDTH;
+    int lh = (s_rot == 2 || s_rot == 3) ? BOOK_PORTRAIT_H : ST7305_HEIGHT;
+    bool mid_x = (x > lw * 3 / 8 && x < lw * 5 / 8);
+    bool mid_y = (y > lh / 3 && y < lh * 2 / 3);
+
+    if (mid_x && mid_y) {
+        /* 正中 → 阅读菜单 */
+        s_menu = BM_MENU;
+        s_menu_sel = 0;
+        bm_sc_reset();
+        s_menu_msg[0] = 0;
+        s_exit_confirm = false;
+    } else if (x < lw / 2) {
+        book_reader_prev_page();
+    } else {
+        book_reader_next_page();
+        if (s_page != s_last_saved_page) book_progress_maybe_save(false);
+    }
+    return true;
+}
+
+/* 弹窗滚动 (2026-11-22 重写: 物理全交给 ui_scroll, 本函数只负责
+ * "把这一帧的触摸喂进去 + 把结果镜像出来")。
+ * 规范: docs/规范/列表滚动规范.md —— 页面不得自己算 off/dy/吸附/惯性。
+ * 行为与系统弹窗(os_dialog)完全一致: 12px 判定拖动 / 惯性 ×0.86 / 松手吸附整行。 */
+bool book_reader_poll(void) {
+    /* 只有弹窗打开、且是列表型弹窗才滚 (退出确认/阅读页不动) */
+    if (!s_open || s_menu == BM_READ || s_exit_confirm) {
+        if (s_bm_sc_rdy) bm_sc_reset();     /* 集中清状态: 任何关闭路径都不会遗留 pressed */
+        return false;
+    }
+    bm_geo_t g;
+    bm_layout(&g);
+    if (g.count <= 0) return false;
+    bm_sc_sync(&g);
+    if (g.count <= g.vis) return false;     /* 内容不足一屏: 不滚, 与 os_dialog 一致 */
+
+    int tx, ty;
+    bool down = input_get_touch_pos(&tx, &ty);   /* 已旋转到逻辑坐标 */
+    bool moved = false;
+
+    /* 只接管"始于列表区"的按下: 框外按下不抢, 避免在弹窗外滑动把列表带跑 */
+    if (down) {
+        if (!s_bm_armed) {
+            s_bm_armed = (tx >= g.bx && tx < g.bx + g.bw &&
+                          ty >= g.list_y0 && ty < g.list_y1);
+        }
+        if (s_bm_armed) moved |= ui_scroll_touch_xy(&s_bm_sc, tx, ty, true);
+    } else if (s_bm_armed) {
+        moved |= ui_scroll_touch_xy(&s_bm_sc, tx, ty, false);
+        s_bm_armed = false;
+    }
+
+    moved |= ui_scroll_poll(&s_bm_sc);
+    bm_sc_read(&g);
+    return moved || ui_scroll_busy(&s_bm_sc);
+}

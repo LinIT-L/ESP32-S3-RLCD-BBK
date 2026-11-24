@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2015 李杰
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+来源说明 (LinTOS)
+
+本组件的 VM 核心来自 LavaX 语言作者李杰的 LavaXVM 项目：
+  https://github.com/leesoft-mirage/LavaXVM   (master 分支, MIT)
+
+原样引入的是解释器内核 (core/source/lava.c、file.c、hardware.c、lcd.c、
+gmode16.c、pinyin.c、py2gb.c、myctype.c 及其头文件)。LinTOS 侧新增/改造的部分
+(lavax_emu.c、platform.c、lavax_platform_api.c、core/source/main.c 的
+lavaxvm_* 生命周期、lavax_platform_api.c 中的 rg_* 平台桩) 由 LinTOS 项目
+以同一 MIT 条款维护。
+
+字库 lav_font.bin 来自同一上游的 LVM.bin (未修改)，运行时由 appdata 分区映射。
+
+引入时**没有**使用 C1-Slim-Ports 的移植层 (其 port/ 目录为 GPL-3.0)，
+只把它的设计取舍当作参考，未复制其代码。
