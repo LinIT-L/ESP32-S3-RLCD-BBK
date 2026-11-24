@@ -1,0 +1,16 @@
+menu "Self Test"
+    config APP_AUTOTEST
+        bool "开机运行自动化自测 (SELF-TEST)"
+        default n
+        help
+            启动完成后自动运行 components/self_test 的场景测试,
+            串口输出 SELF-TEST [PASS|FAIL] 汇总, 用于回归验证。
+endmenu
+
+menu "Display Test"
+    config DISPLAY_REFRESH_TEST
+        bool "开机运行显示刷新自检 (DISPLAY_TEST)"
+        default n
+        help
+            启动后运行固定图案 x 不同刷新率的自检, 用于排查整屏刷新闪烁。
+endmenu

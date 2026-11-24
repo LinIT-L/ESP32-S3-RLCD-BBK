@@ -1,0 +1,13 @@
+# components/apps/linker.lf — 把 L4 应用层各页面的 .bss 迁到 PSRAM (V1.2)
+# 背景: EPS32-S3 上 IRAM 与 DRAM 共享同一块物理 SRAM, 内部堆紧张 (main_free ≈10KB).
+#       apps 组件的 .dram0.bss 实测 36,689 B (占全 DRAM .bss 的 62.8%), 是最大单一来源.
+# 做法: 复用 esp_wifi/linker.lf 定义的**全局** extram_bss 方案 (切勿重复定义同名 scheme, 会破坏 ldgen);
+#       本组件所有静态/全局变量被 @extram_bss 标记 → 由 sections.ld 收集进 PSRAM 的 .ext_ram.bss.
+# 安全性: 应用页面持有的是 UI 缓冲 (列表/文本/图标暂存), 不进 ISR, 不在禁 cache 路径
+#       (NVS 写是先 memcpy 到内部再 commit)。项目内已有先例: am_store.c 的 s_pkg[] 本就显式 EXT_RAM_BSS_ATTR。
+# 回滚: 删除本文件 + 去掉 CMakeLists 的 LDFRAGMENTS "linker.lf" 即可 (逐组件独立)。
+[mapping:apps_extram_bss]
+archive: libapps.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
