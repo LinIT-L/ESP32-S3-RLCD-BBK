@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "sd_scan.h"
+#include "sd_arb.h"         /* ★ 2026-11-24: 交卡窗口里不许碰 VFS */
 #include "svc_log.h"
 #include "svc_logring.h"    /* ★ 2026-11-22: 格式化完成后把这一行抄进 RTC 崩溃日志环 */
 
@@ -118,6 +119,13 @@ esp_err_t svc_log_flush_once(void)
     if (xSemaphoreTake(s_log_lock, pdMS_TO_TICKS(50)) != pdTRUE)
         return ESP_ERR_TIMEOUT;                           /* 拿不到锁: 不阻塞调用方 */
 
+    /* ★ 2026-11-24: 过 SD 仲裁 —— USB MSC 交卡窗口 / 卡在电脑手里时一律不写。
+     *   本函数会 stat+fopen+fwrite 一路碰 VFS, 而交卡会 free 掉 VFS 上下文。 */
+    if (!sd_arb_enter()) {
+        xSemaphoreGive(s_log_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     s_log_skip = true;
     esp_err_t ret = ESP_OK;
     size_t len = s_log_len;
@@ -170,6 +178,7 @@ esp_err_t svc_log_flush_once(void)
     }
 
 done:
+    sd_arb_leave();          /* 与上面的 sd_arb_enter() 成对 (所有 goto done 都会走到这里) */
     s_log_skip = false;
     xSemaphoreGive(s_log_lock);
     return ret;

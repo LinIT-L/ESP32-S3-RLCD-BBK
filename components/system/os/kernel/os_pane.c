@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "sd_arb.h"     /* ★ 2026-11-24: SD 访问仲裁 (USB MSC 交卡期间不碰 VFS) */
 #include <math.h>
 
 #define TAG "PANE"
@@ -82,8 +83,12 @@ static void pane_name_short(char *dst, size_t dstsz, const char *src, int max_ch
 
 /* 根目录是否有直接文件 (不含子目录): 无 → 隐藏左栏"全部"项 */
 static bool pane_root_has_item(const os_pane_t *p) {
+    /* ★ 2026-11-24: SD 仲裁 —— USB MSC 交卡/接管期间不碰 VFS。
+     *   只对 /sdcard 下的路径生效 (pane 也可能指向 SPIFFS 等其它卷)。 */
+    bool gated = (p->root && strncmp(p->root, "/sdcard", 7) == 0);
+    if (gated && !sd_arb_enter()) return false;
     DIR *d = opendir(p->root);
-    if (!d) return false;
+    if (!d) { if (gated) sd_arb_leave(); return false; }
     bool found = false;
     int scanned = 0;
     struct dirent *e;
@@ -93,6 +98,7 @@ static bool pane_root_has_item(const os_pane_t *p) {
         if (p->is_item && p->is_item(e->d_name)) found = true;
     }
     closedir(d);
+    if (gated) sd_arb_leave();
     return found;
 }
 
@@ -160,6 +166,12 @@ void os_pane_reset(os_pane_t *p) {
         p->folder_count = 0;
         p->hide_all = true;
     } else {
+    /* ★ 2026-11-24: 整个"扫子目录"过程包在 SD 仲裁里 —— 交卡窗口直接按空目录处理 */
+    bool gated = (p->root && strncmp(p->root, "/sdcard", 7) == 0);
+    if (gated && !sd_arb_enter()) {
+        p->folder_count = 0;
+        p->hide_all = true;
+    } else {
     DIR *dir = opendir(p->root);
     p->folder_count = 0;
     if (dir) {
@@ -186,6 +198,8 @@ void os_pane_reset(os_pane_t *p) {
         p->folder_count = n;
     }
     p->hide_all = !pane_root_has_item(p);
+    if (gated) sd_arb_leave();
+    }
     }
 
     p->settings_mode = false;
@@ -299,6 +313,14 @@ void os_pane_build_right(os_pane_t *p) {
     char path[128];
     if (dir[0]) snprintf(path, sizeof(path), "%s/%s", p->root, dir);
     else        snprintf(path, sizeof(path), "%s", p->root);
+    /* ★ 2026-11-24: 右栏扫描同样过 SD 仲裁 (交卡期间按空列表处理) */
+    bool gated = (p->root && strncmp(p->root, "/sdcard", 7) == 0);
+    if (gated && !sd_arb_enter()) {
+        p->item_count = 0;
+        if (p->sel_item >= p->item_count) p->sel_item = 0;
+        p->item_off = 0;
+        return;
+    }
     DIR *d = opendir(path);
     p->item_count = 0;
     if (d) {
@@ -326,6 +348,7 @@ void os_pane_build_right(os_pane_t *p) {
         closedir(d);
         p->item_count = n;
     }
+    if (gated) sd_arb_leave();
     if (p->sel_item >= p->item_count) p->sel_item = 0;
     if (p->item_scroll > p->sel_item) p->item_scroll = p->sel_item;
     p->item_off = 0;
@@ -603,6 +626,11 @@ bool os_pane_action(ui_ctx_t *ctx, os_pane_t *p, os_action_t a) {
             }
         }
         return true;
+    case OS_ACTION_KEY_FAV:
+        /* ★ 2026-11-24: 实体手柄"收藏键"长按 (input 层投递 KEY_FAV) —— 与触摸长按
+         * **完全同一条处理链**: 同一处 favorites_add/remove、同一套 toast 与震动反馈。
+         * 单独一个动作码而不是复用 LONG_PRESS: LONG_PRESS 是全系统长按语义, 其它页面
+         * (应用管家/存储/白板)都有自己的长按操作, 复用它会让"长按收藏键"在那些页面乱弹。 */
     case OS_ACTION_LONG_PRESS:
         /* 长按(约1s,按住即弹提示,不必松手) 收藏/取消收藏. 仅收藏支持页面生效 */
         if (p->focus == 1 && !p->settings_mode && p->fav_enabled) {

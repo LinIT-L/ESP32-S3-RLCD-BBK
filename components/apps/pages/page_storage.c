@@ -239,6 +239,7 @@ static void open_sd_format(ui_ctx_t *ctx) {
 #define M_MOUNT_FAIL2 2
 #define M_CANCELLED   3
 #define M_UNMOUNTED   4
+#define M_MOUNT_BUSY  5   /* ★ 2026-11-24: 网页共享还在传文件, 不能交卡 */
 static volatile int  s_mount_result  = M_IDLE;
 static volatile bool s_mount_cancel  = false;
 static volatile bool s_unmounting    = false;   /* 后台正执行卸载 (UI 不卡顿) */
@@ -249,6 +250,7 @@ static void mount_teardown(void) {
     usbh_msc_stop();
     sd_remount_vfs_from_card();
     sd_watcher_set_paused(false);
+    web_files_resume();        /* ★ 卡回到本机: 恢复受理网页请求 */
 }
 
 /* 后台任务: 真实执行挂载, 并记录"内部速度/挂载耗时"供串口核对 */
@@ -257,10 +259,26 @@ static void mount_worker_task(void *arg) {
     sd_watcher_set_paused(true);          /* 先暂停 SD watcher (VFS 卸载后 PC 读写扇区) */
     int64_t t0 = esp_timer_get_time();
 
+    /* ★★ 2026-11-24 交卡前必须先让网页文件服务清场。
+     *   原来这里直接 sd_unmount_vfs_keep_card() —— 如果此刻浏览器正在下载/上传
+     *   (用户恰恰就是先传文件、再点挂载), httpd 的 handler 手里握着 /sdcard 上的
+     *   FILE*, 而交卡会把 VFS 上下文 free 掉 ⇒ 下一次 fread/fwrite 就是悬垂指针,
+     *   设备立刻重启。这一条就是"电脑一访问就重启"的第二个入口。
+     *   清不掉(真的在传大文件)就**不交卡**, 明确告诉用户, 而不是赌它刚好传完。 */
+    if (!web_files_quiesce(3000)) {
+        sd_watcher_set_paused(false);
+        web_files_resume();          /* 没交卡 ⇒ 立刻让网页共享恢复受理 */
+        s_mount_result = M_MOUNT_BUSY;
+        ESP_LOGW(TAG, "挂载中止: 网页共享仍在传输文件");
+        vTaskDelete(NULL);
+        return;
+    }
+
     int rc1 = sd_unmount_vfs_keep_card();               /* 卸载 VFS, 保留 card */
     int64_t t1 = esp_timer_get_time();
     if (rc1 != 0) {
         sd_watcher_set_paused(false);
+        web_files_resume();
         s_mount_result = M_MOUNT_FAIL1;
         ESP_LOGD(TAG, "挂载失败: 卸载 VFS 失败");
         vTaskDelete(NULL);
@@ -277,6 +295,7 @@ static void mount_worker_task(void *arg) {
     if (rc2 != ESP_OK) {
         sd_remount_vfs_from_card();
         sd_watcher_set_paused(false);
+        web_files_resume();            /* 交卡失败, 卡回到本机 ⇒ 恢复网页访问 */
         s_mount_result = M_MOUNT_FAIL2;
         ESP_LOGD(TAG, "挂载失败: usbh_msc_start %s", esp_err_to_name(rc2));
         vTaskDelete(NULL);
@@ -301,6 +320,7 @@ static void unmount_worker_task(void *arg) {
     usbh_msc_stop();
     sd_remount_vfs_from_card();
     sd_watcher_set_paused(false);
+    web_files_resume();                /* ★ 卡回到本机: 恢复受理网页请求 */
     int64_t t1 = esp_timer_get_time();
     ESP_LOGI(TAG, "[卸载耗时] 停止MSC+重挂VFS %lldms (内部速度)",
              (long long)((t1 - t0) / 1000));
@@ -323,6 +343,9 @@ static void mount_state_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
     } else if (st == M_UNMOUNTED) {
         os_dialog_pop(ctx);
         os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8d\xb8\xe8\xbd\xbd"); /* 已卸载 */
+    } else if (st == M_MOUNT_BUSY) {
+        os_dialog_pop(ctx);
+        os_dialog_toast(ctx, "正在传输文件，请稍后再试");   /* 网页共享还在传, 没交卡 */
     } else { /* M_MOUNT_FAIL1 / M_MOUNT_FAIL2 */
         os_dialog_pop(ctx);
         os_dialog_toast(ctx, (st == M_MOUNT_FAIL1)
@@ -1139,6 +1162,10 @@ static void p_sto_exit(ui_ctx_t *ctx) {
         usbh_msc_stop();
         sd_remount_vfs_from_card();
     }
+    /* ★ 2026-11-24: 卡已回到本机 ⇒ 解除网页共享的暂停。
+     *   漏了这一句就是"直接从存储页退出后, /files/ 一直 503 busy"
+     *   —— 因为交卡前 web_files_quiesce() 把受理开关关掉了。 */
+    if (web_files_is_running()) web_files_resume();
     /* ★ 2026-11-22: 与 mount_worker_task/unmount_worker_task 对齐 ——
      *   它们各自负责恢复 watcher, 而我们这里也要恢复: 否则一旦挂载路径走到一半
      *   就退出页面, watcher 会永远停在 paused (watcher 现在被禁用, 属潜在隐患)。 */

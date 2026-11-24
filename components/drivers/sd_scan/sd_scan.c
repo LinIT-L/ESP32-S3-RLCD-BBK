@@ -6,6 +6,7 @@
  * 自己的 opendir 实现, 不要把扫描逻辑再塞回驱动。
  */
 #include "sd_scan.h"
+#include "sd_arb.h"          /* ★ 2026-11-24: 访问仲裁状态机 (见 sd_arb.h) */
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_vfs_fat.h"
@@ -318,6 +319,14 @@ static void sd_probe_task(void *arg)
 /* 后台补探一次 (低优先级一次性任务; 已挂载/已在探测/格式化中 ⇒ 直接返回 false) */
 bool sd_probe_async(void)
 {
+    /* ★ 2026-11-24: 卡在电脑手里 / 正在交接时**不许**补探 —— 补探会跑去 sd_mount(),
+     *   而挂载要重新 init SDMMC 主机; 即使 sd_mount 内部有闸, 也没必要白建任务。
+     *   (这条原来漏了 s_usb_owned, 是审计发现的绕过入口之一。) */
+    if (s_usb_owned) return false;
+    {
+        sd_arb_state_t as = sd_arb_state();
+        if (as == SD_ARB_HANDOFF || as == SD_ARB_USB || as == SD_ARB_RESTORE) return false;
+    }
     if (sd_is_mounted() || s_probe_running || sd_format_is_running()) return false;
     s_probe_running = true;
     if (xTaskCreate(sd_probe_task, "sd_probe", 4096, NULL, 1, NULL) != pdPASS) {
@@ -366,6 +375,16 @@ esp_err_t sd_mount(void)
     if (s_usb_owned) {
         ESP_LOGD(TAG, "卡已挂载到电脑 (USB MSC) ⇒ 本机不挂载 VFS");
         return ESP_ERR_INVALID_STATE;
+    }
+    /* ★ 2026-11-24: 交卡/收卡过渡窗口同样不许重挂 —— 这段时间 VFS 正在被注销/重建,
+     *   任何挂载动作都会与 sd_unmount_vfs_keep_card()/sd_remount_vfs_from_card()
+     *   抢同一套 SDMMC 主机与 VFS 注册项。 */
+    {
+        sd_arb_state_t as = sd_arb_state();
+        if (as == SD_ARB_HANDOFF || as == SD_ARB_RESTORE) {
+            ESP_LOGD(TAG, "卡正在交接 (%s) ⇒ 本次挂载请求被拒绝", sd_arb_state_str());
+            return ESP_ERR_INVALID_STATE;
+        }
     }
     /* ★★ 2026-11-21 linit「没卡就当作无卡, 别再每次去读」★★
      *   这里原来**没有任何短路**: 只要 s_mounted==false 就重跑整套探测
@@ -748,6 +767,7 @@ static esp_err_t sd_mount_body(void) {
         if (ret == ESP_OK) {
             s_mounted = true;
             s_mnt_state = SD_MNT_OK;
+            /* ⚠ 仲裁状态等确认 card 非空、目录补齐之后再置 LOCAL (见下面 return 前) */
             /* 2026-09-30: 先判空再解引用 —— IDF 在 ESP_OK 时保证回填 card, 但崩一次代价太大,
              * 这里补一道防线 (s_cid_name / 容量 / print_info 三处都要用 s_card)。 */
             if (!s_card) {
@@ -774,6 +794,10 @@ static esp_err_t sd_mount_body(void) {
             /* 补齐标准目录 (与格式化共用 k_sd_dirs[], 见 sd_ensure_dirs) */
             sd_ensure_dirs();
 
+            /* ★ 2026-11-24: 卡确实可用、目录也补齐了, 这时才对本机开放访问。
+             *   (放在 !s_card 的失败分支之后 —— 否则"挂载返回 OK 但 card 为空"
+             *    那条路上会把闸门开在一个没有卡的卷上。) */
+            sd_arb_set_state(SD_ARB_LOCAL);
             return ESP_OK;
         }
 
@@ -828,6 +852,7 @@ void sd_unmount(void) {
     s_mounted = false;
     s_card = NULL;
     s_mnt_state = SD_MNT_UNKNOWN;   /* 卸载后卡状态未知 ⇒ 允许下次重新探测 */
+    sd_arb_set_state(SD_ARB_OFF);   /* ★ 本机已无卡可用: 仲裁闸门同步关掉 */
     mnt_unlock();
     ESP_LOGI(TAG, "SD 卡已卸载 (SDMMC host 已释放)");
 }
@@ -853,21 +878,39 @@ int sd_unmount_vfs_keep_card(void) {
     if (!s_mounted || !s_card) {
         /* 本来就没有本地 VFS: 有 card ⇒ 可以直接交给电脑; 没 card ⇒ 失败 */
         s_usb_owned = (s_card != NULL);
+        if (s_card) sd_arb_set_state(SD_ARB_USB);
         mnt_unlock();
         return s_card ? 0 : -1;
     }
 
     ESP_LOGI(TAG, "[卸载VFS] 开始 (保留 SDMMC 主机和 card 句柄)");
 
-    esp_err_t ret = esp_vfs_fat_unregister_path(s_mount_point);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "[卸载VFS] 注销 VFS 失败: %s (0x%x) ⇒ 中止交卡 (本地仍挂载)",
-                 esp_err_to_name(ret), ret);
-        mnt_unlock();
-        return -2;
-    }
+    /* ★★ 2026-11-24 交卡四步 —— 顺序不能换, 每一步都在关掉一个真实的崩溃窗口:
+     *   ① 先切 HANDOFF: 此后本机新访问被 sd_arb_enter() 一律拒绝 (封新入口);
+     *   ② 立刻卸卷 f_mount(NULL): 已经进到 FatFs 里的调用在下一次访卷时拿到
+     *      FR_NOT_ENABLED 快速失败, **不再触碰磁盘**; 手上还开着的 FILE* 也立刻
+     *      变成"无效对象"而不是悬垂指针;
+     *   ③ 等 in-flight 归零: 这是**唯一**能安全销毁 VFS 上下文的时刻;
+     *   ④ 最后才注销 VFS (它内部 _lock_close + free(fat_ctx))。
+     *
+     *   原来的顺序是"先注销、后卸卷", ②③ 根本不存在 ⇒ 只要此刻别的任务正在
+     *   f_open/f_read/f_write (持有卷互斥量), fat_ctx 被 free、互斥量被删除,
+     *   下一次 xSemaphoreTake 就踩已释放内存 → 直接重启。
+     *   这就是"USB MSC 一访问就重启"的根因, 不是 FatFs 重入锁能解决的问题。
+     */
+    sd_arb_set_state(SD_ARB_HANDOFF);
 
-    f_mount(NULL, "", 0);
+    FRESULT fr = f_mount(NULL, "", 0);
+    if (fr != FR_OK)
+        ESP_LOGD(TAG, "[卸载VFS] f_mount(NULL) 返回 %d (无卷可卸, 继续)", fr);
+
+    if (!sd_arb_wait_idle(3000)) {
+        /* 有模块把访问括起来却没退出(或还没接入仲裁)。记下来仍继续:
+         * 继续的代价 = 那一路拿到 I/O 错误; 中止的代价 = 卡交不出去、只能重启。 */
+        ESP_LOGW(TAG, "[卸载VFS] 仍有 %d 个在途访问未退出 ⇒ 强制继续 (它们会收到 I/O 错误)",
+                 sd_arb_inflight());
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
 
     BYTE pdrv = ff_diskio_get_pdrv_card(s_card);
     if (pdrv < FF_VOLUMES) {
@@ -876,8 +919,23 @@ int sd_unmount_vfs_keep_card(void) {
         ESP_LOGD(TAG, "[卸载VFS] card 未注册 diskio (pdrv=0x%x) ⇒ 跳过状态检查开关", pdrv);
     }
 
+    esp_err_t ret = esp_vfs_fat_unregister_path(s_mount_point);
+    if (ret != ESP_OK) {
+        /* 注册项还在, 但卷已被 ② 卸掉 ⇒ 不能假装"本地仍挂载"(那样上层会以为卡可用,
+         * 实际每次访问都失败)。状态归 OFF, 所有权放回本机, 由上层重新 sd_mount()。 */
+        ESP_LOGW(TAG, "[卸载VFS] 注销 VFS 失败: %s (0x%x) ⇒ 中止交卡, 卡转为未挂载",
+                 esp_err_to_name(ret), ret);
+        s_mounted = false;
+        s_usb_owned = false;
+        s_mnt_state = SD_MNT_UNKNOWN;
+        sd_arb_set_state(SD_ARB_OFF);
+        mnt_unlock();
+        return -2;
+    }
+
     s_mounted = false;
     s_usb_owned = true;      /* ★ 卡从此归电脑: 本机所有挂载/格式化都必须让路 */
+    sd_arb_set_state(SD_ARB_USB);
     mnt_unlock();
 
     ESP_LOGI(TAG, "[卸载VFS] 完成, card=%p 仍然有效, SDMMC 主机保持运行", s_card);
@@ -888,14 +946,21 @@ int sd_remount_vfs_from_card(void) {
     mnt_lock();
     if (s_mounted) {
         s_usb_owned = false;
+        sd_arb_set_state(SD_ARB_LOCAL);
         mnt_unlock();
         return 0;
     }
     if (!s_card) {
         s_usb_owned = false;
+        sd_arb_set_state(SD_ARB_OFF);
         mnt_unlock();
         return -1;
     }
+
+    /* ★ 2026-11-24: 收卡期间保持 RESTORE —— 本机访问继续被拒, 直到卷重新挂上。
+     *   否则"USB 已释放、VFS 还没挂好"这段窗口里, 任何任务 fopen 都会拿到
+     *   ENOENT 并被上层当成"卡没了", 状态被错误锁存。 */
+    sd_arb_set_state(SD_ARB_RESTORE);
 
     ESP_LOGI(TAG, "[重挂VFS] 从已有 card=%p 重新挂载 FAT/VFS", s_card);
 
@@ -926,6 +991,7 @@ int sd_remount_vfs_from_card(void) {
          *   (s_mnt_state 还停在 OK ⇒ sd_mount() 的两道短路都不生效却又不锁存"无卡")。 */
         s_usb_owned = false;
         s_mnt_state = SD_MNT_UNKNOWN;
+        sd_arb_set_state(SD_ARB_OFF);
         mnt_unlock();
         return -2;
     }
@@ -936,6 +1002,7 @@ int sd_remount_vfs_from_card(void) {
         esp_vfs_fat_unregister_path(s_mount_point);
         s_usb_owned = false;
         s_mnt_state = SD_MNT_UNKNOWN;
+        sd_arb_set_state(SD_ARB_OFF);
         mnt_unlock();
         return -3;
     }
@@ -943,6 +1010,7 @@ int sd_remount_vfs_from_card(void) {
     s_mounted = true;
     s_mnt_state = SD_MNT_OK;      /* 状态单一真相源: 挂上就必须同步, 否则 UI 显示"未知" */
     s_usb_owned = false;
+    sd_arb_set_state(SD_ARB_LOCAL);   /* ★ 卷已就绪, 这才放开本机访问 */
     mnt_unlock();
     ESP_LOGI(TAG, "[重挂VFS] 成功 @ %s", s_mount_point);
     return 0;
@@ -1049,6 +1117,12 @@ static void sd_full_unmount(void) {
     ESP_LOGI(TAG, "[卸载] 开始, s_mounted=%d, s_card=%p", s_mounted, s_card);
     mnt_lock();   /* ★ 2026-10-28: 与 sd_mount() 互斥, 防止并发改 s_card / deinit host */
 
+    /* ★ 2026-11-24: 销毁 VFS 上下文 (sd_vfs_unmount_force 内部会 free fat_ctx) 之前,
+     *   同样要"封新 + 等在途" —— 和交卡走同一条规矩, 否则本机另一个任务正在
+     *   f_read/f_write 时被 free 掉卷, 一样是悬垂指针崩溃。 */
+    sd_arb_set_state(SD_ARB_HANDOFF);
+    (void)sd_arb_wait_idle(300);        /* 短超时: 本函数也可能被"自己持锁"的调用方间接触发 */
+
     /* 1. 卸载 VFS (如果还挂着) */
     if (s_mounted && s_card) {
         sd_vfs_unmount_force();     /* 失败时强制注销, 避免"路径已注册"卡死后续挂载 */
@@ -1056,6 +1130,7 @@ static void sd_full_unmount(void) {
     s_mounted = false;
     s_card = NULL;
     s_mnt_state = SD_MNT_UNKNOWN;   /* 卸载后卡状态未知 ⇒ 允许下次重新探测 */
+    sd_arb_set_state(SD_ARB_OFF);   /* 本机无卡可用 */
 
     /* 2. 彻底释放 SDMMC host + DMA buffer (关键!) */
     sd_host_release();
@@ -1079,6 +1154,7 @@ static int sd_full_remount(uint8_t format_if_needed) {
      *   ESP_ERR_INVALID_STATE, 而下面失败分支会把 s_card 置 NULL —— 那样 VFS 还注册着、
      *   我们却认为"没卡", 后续所有读卡都失败(必须重启才能恢复)。 */
     if (s_mounted && s_card) {
+        sd_arb_set_state(SD_ARB_LOCAL);   /* 已挂载: 保证闸门是开的 */
         mnt_unlock();
         return 0;
     }
@@ -1114,11 +1190,14 @@ static int sd_full_remount(uint8_t format_if_needed) {
     if (ret != ESP_OK) {
         ESP_LOGD(TAG, "挂载失败: %s (0x%x)", esp_err_to_name(ret), ret);
         s_card = NULL;
+        s_mnt_state = SD_MNT_UNKNOWN;
+        sd_arb_set_state(SD_ARB_OFF);     /* 挂不上就不许本机访问 */
         mnt_unlock();
         return -2;
     }
     s_mounted = true;
     s_mnt_state = SD_MNT_OK;      /* 状态单一真相源: 挂上就必须同步 */
+    sd_arb_set_state(SD_ARB_LOCAL);   /* ★ 2026-11-24: 重挂成功 ⇒ 放开本机访问 */
     mnt_unlock();
     ESP_LOGI(TAG, "挂载成功 @ %s, card=%p (SDMMC 1-bit, 格式化=%d)",
              s_mount_point, s_card, format_if_needed);
@@ -1177,6 +1256,14 @@ bool sd_format_start_async(void)
         ESP_LOGW(TAG, "卡已挂载到电脑 ⇒ 拒绝格式化 (请先卸载)");
         return false;
     }
+    /* ★ 2026-11-24: 交卡/收卡窗口同样拒绝 —— 整卡擦除与 VFS 注销/重建不能交错。 */
+    {
+        sd_arb_state_t as = sd_arb_state();
+        if (as == SD_ARB_HANDOFF || as == SD_ARB_RESTORE) {
+            ESP_LOGW(TAG, "卡正在交接 (%s) ⇒ 拒绝格式化", sd_arb_state_str());
+            return false;
+        }
+    }
     s_fmt_running = true;
     s_fmt_pct = 0;
     s_fmt_result = 0;
@@ -1200,6 +1287,13 @@ int sd_format_and_create_dirs(void) {
     if (s_usb_owned) {
         ESP_LOGW(TAG, "格式化为空: 卡已挂载到电脑 (USB MSC) ⇒ 拒绝执行");
         return -7;
+    }
+    {
+        sd_arb_state_t as = sd_arb_state();
+        if (as == SD_ARB_HANDOFF || as == SD_ARB_RESTORE) {
+            ESP_LOGW(TAG, "卡正在交接 (%s) ⇒ 拒绝格式化", sd_arb_state_str());
+            return -7;
+        }
     }
     ESP_LOGD(TAG, "[进度 ⑧] 完全卸载旧挂载...");
     s_fmt_pct = 3; s_fmt_stage = "\xe5\x8d\xb8\xe8\xbd\xbd\xe4\xb8\xad";  /* 卸载中 */
@@ -1346,6 +1440,16 @@ int sd_get_info(uint64_t *total_bytes, uint64_t *free_bytes) {
         ESP_LOGD(TAG, "[卡信息] 卡已挂载到电脑 (USB MSC) ⇒ 不查询容量");
         return -1;
     }
+    /* ★ 2026-11-24: 交卡/收卡窗口也不许进来 —— 本函数后半段会
+     *   sd_full_unmount() + sd_full_remount(), 那会在 VFS 注销/重建的中途
+     *   重新 init SDMMC 主机并抢卡 (审计发现的绕过入口)。 */
+    {
+        sd_arb_state_t as = sd_arb_state();
+        if (as == SD_ARB_HANDOFF || as == SD_ARB_RESTORE) {
+            ESP_LOGD(TAG, "[卡信息] 卡正在交接 (%s) ⇒ 不查询容量", sd_arb_state_str());
+            return -1;
+        }
+    }
 
     /* ★ 2026-11-21 linit「没卡就别再读」: 已确认没有可用卡 ⇒ 不做重挂尝试。
      *   原来无卡时点开"存储信息"每次都会 sd_full_unmount + sd_full_remount
@@ -1371,6 +1475,14 @@ int sd_get_info(uint64_t *total_bytes, uint64_t *free_bytes) {
     }
 
     /* 2. 未挂载 或 VFS info 失败: 重新挂载 */
+    /* ★ 2026-11-24: 有在途访问时**不要**走"卸载 + 重挂"这条重路径 ——
+     *   它会销毁并重建 VFS 上下文, 而调用方自己可能正握着句柄
+     *   (典型: 网页列目录里调本函数), 那等于自己把脚下的东西拆掉。
+     *   容量未知就返回 -1, UI 显示"--"即可。 */
+    if (sd_arb_inflight() > 0) {
+        ESP_LOGD(TAG, "[卡信息] 有 %d 个在途访问 ⇒ 不重挂, 返回未就绪", sd_arb_inflight());
+        return -1;
+    }
     ESP_LOGD(TAG, "[卡信息] 重新挂载中...");
     sd_full_unmount();
     int rc = sd_full_remount(0);  /* format_if_needed=0, 不自动 mkfs */

@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_timer.h"
+#include "sd_arb.h"     /* ★ 2026-11-24: SD 访问仲裁 */
 #include <string.h>
 
 #define TAG "OSAPP"
@@ -196,7 +197,14 @@ static bool apath_exists_raw(const char *path)
 static bool apath_exists(const char *path)
 {
     apath_lock();
-    bool r = apath_exists_raw(path);
+    /* ★ 2026-11-24: 只有 /sdcard 下的路径需要 SD 仲裁 —— 应用资源也可能在
+     *   SPIFFS(/store), 那条路与 TF 卡无关, 不能被"卡没挂"连坐隐藏。
+     *   本函数会被 UI 线程和 am_core 后台扫描任务同时调用 —— 正是"USB 交卡时
+     *   后台还在 opendir/stat"的典型来源, 也是 sd_arb 要收进来的入口之一。 */
+    bool need_sd = (path != NULL && strncmp(path, "/sdcard", 7) == 0);
+    bool entered = need_sd ? sd_arb_enter() : true;
+    bool r = entered ? apath_exists_raw(path) : false;
+    if (need_sd && entered) sd_arb_leave();
     apath_unlock();
     return r;
 }

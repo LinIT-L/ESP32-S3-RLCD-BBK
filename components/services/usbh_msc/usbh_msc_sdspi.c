@@ -17,6 +17,7 @@
 #include "sdmmc_cmd.h"
 #include "tinyusb_msc.h"
 #include "usb_hid.h"
+#include "sd_arb.h"       /* ★ 2026-11-24: 交卡前必须确认本机已放手 */
 
 extern sdmmc_card_t *sd_get_card(void);   /* sd_scan 提供: 当前已初始化的卡 */
 #include "svc_log.h"
@@ -43,6 +44,21 @@ static void msc_abort_exit(const char *why, esp_err_t orig)
  * 调用方负责先 sd_unmount_vfs_keep_card() (释放 VFS, 保留 card). */
 esp_err_t usbh_msc_start(void) {
     if (s_running) return ESP_OK;
+
+    /* ★★ 2026-11-24 交卡前置校验 (最后一道闸):
+     *   必须有卡, 且本机**已经**把卡让出来 (sd_unmount_vfs_keep_card() 会把仲裁
+     *   状态切到 USB)。如果还停在 LOCAL, 说明调用方顺序错了 —— 此时把同一个
+     *   SDMMC 卡同时给 VFS 和 TinyUSB 用, 就是"两边一起写同一张卡"的数据损坏。
+     *   OFF = 没有可用卡, 不让挂 (否则 PC 端看到 0 字节盘)。 */
+    if (sd_get_card() == NULL) {
+        ESP_LOGE(TAG, "没有可交出的 card 句柄 ⇒ 拒绝挂载");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (sd_arb_state() != SD_ARB_USB) {
+        ESP_LOGE(TAG, "本机仍持有 TF 卡 (%s) ⇒ 拒绝挂载 (调用方必须先 sd_unmount_vfs_keep_card)",
+                 sd_arb_state_str());
+        return ESP_ERR_INVALID_STATE;
+    }
 
     svc_log_console_suspend(true);   /* 挂载期间只写文件日志, 不碰串口 */
 
