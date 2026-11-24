@@ -13,4 +13,6 @@ idf_component_register(
         heap                 # heap_caps_malloc（搬运缓冲放 PSRAM）
         esp_hw_support       # esp_random
         freertos
+    PRIV_REQUIRES
+        nvs_flash            # ★ 2026-11-24: 记住"共享开着"状态, 重启后自动恢复
 )

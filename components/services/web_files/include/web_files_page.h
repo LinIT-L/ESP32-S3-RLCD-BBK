@@ -68,7 +68,11 @@ static const char *wf_page_html(void)
     "<script>"
     "const $=id=>document.getElementById(id),E=encodeURIComponent;"
     "let TOK=sessionStorage.getItem('wftok')||'',CUR='/sdcard',NAMES=new Set();"
-    "function hdr(){return TOK?{'Authorization':'Bearer '+TOK}:{}}"
+    /* ★ 2026-11-24: 每个请求都带上 X-Path 头。
+     *   原因: query 串受 CONFIG_HTTPD_MAX_URI_LEN(512) 限制, 深目录/长中文名
+     *   (UTF-8 汉字编码后 9 字节/字) 会被截断; 服务端 wf_arg() 在 query 解析失败时
+     *   会退回读这个头, 于是长路径也能正常列目录/下载。 */
+    "function hdr(){const h=TOK?{'Authorization':'Bearer '+TOK}:{};h['X-Path']=E(CUR);return h}"
     "function fmt(n){n=+n||0;if(n<=0)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0,v=n;"
     "while(v>=1024&&i<u.length-1){v/=1024;i++}return (i===0?v.toFixed(0):v.toFixed(v>=100?0:1))+' '+u[i]}"
     "function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')"
@@ -94,22 +98,26 @@ static const char *wf_page_html(void)
     "function join(p,n){return (p==='/sdcard'?p:p)+'/'+n}"
     "function goUp(){if(CUR==='/sdcard'){load();return}const i=CUR.lastIndexOf('/');"
     "load(i<=7?'/sdcard':CUR.slice(0,i))}"
-    "async function load(p){if(typeof p==='string')CUR=p;$('msg2').textContent='';"
+    "async function load(p){const prev=CUR;if(typeof p==='string')CUR=p;$('msg2').textContent='';"
     "try{const j=await api('api/list?p='+E(CUR));if(j.p)CUR=j.p;$('path').textContent=CUR;"
     "if(!j.mounted){$('stat').textContent='TF 卡未挂载';"
     "$('list').innerHTML='<tr><td class=mut>TF 卡未挂载：请在掌机「存储」里重新挂载后再刷新。</td></tr>';return}"
     "const e=j.e||[];$('stat').textContent='共 '+e.length+' 项 · 剩余 '+fmt(j.free)+' / 共 '+fmt(j.total)"
     "+(j.more?' · 条目过多只显示了一部分，请进子目录管理':'');"
-    "NAMES=new Set(e.map(x=>x.n));render(e)}catch(e){$('msg2').textContent=e.message}}"
+    "NAMES=new Set(e.map(x=>x.n));render(e)}catch(e){CUR=prev;$('msg2').textContent=e.message}}"
+    /* ★ 2026-11-24: data-n 的值必须用引号包起来。
+     *   encodeURIComponent 不转义单引号('), 文件名里有 ' 时无引号属性会被截断,
+     *   dataset.n 只剩前半截 ⇒ 点"删除/改名/下载"会作用到**另一个文件**上。
+     *   k 里不可能出现双引号(会被编码成 %22), 所以用双引号是安全的。 */
     "function render(e){if(!e.length){$('list').innerHTML='<tr><td class=mut>（空目录）</td></tr>';return}"
     "let h='';for(const x of e){const k=E(x.n);"
-    "if(x.d){h+='<tr><td class=n><span class=dirc data-act=enter data-n='+k+'>[目录] '+esc(x.n)+'</span></td>"
-    "<td class=s>—</td><td class=a><button class=g data-act=rn data-n='+k+'>改名</button>"
-    "<button class=r data-act=del data-n='+k+'>删除</button></td></tr>'}"
+    "if(x.d){h+='<tr><td class=n><span class=dirc data-act=enter data-n=\"'+k+'\">[目录] '+esc(x.n)+'</span></td>"
+    "<td class=s>—</td><td class=a><button class=g data-act=rn data-n=\"'+k+'\">改名</button>"
+    "<button class=r data-act=del data-n=\"'+k+'\">删除</button></td></tr>'}"
     "else{h+='<tr><td class=n>'+esc(x.n)+'</td><td class=s>'+fmt(x.s)+'</td><td class=a>"
-    "<button class=g data-act=dl data-n='+k+'>下载</button>"
-    "<button class=g data-act=rn data-n='+k+'>改名</button>"
-    "<button class=r data-act=del data-n='+k+'>删除</button></td></tr>'}}"
+    "<button class=g data-act=dl data-n=\"'+k+'\">下载</button>"
+    "<button class=g data-act=rn data-n=\"'+k+'\">改名</button>"
+    "<button class=r data-act=del data-n=\"'+k+'\">删除</button></td></tr>'}}"
     "$('list').innerHTML=h}"
     "async function enter(n){load(join(CUR,n))}"
     "async function newDir(){const n=prompt('新建文件夹名称');if(!n)return;"

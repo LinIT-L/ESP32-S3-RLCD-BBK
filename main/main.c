@@ -55,6 +55,7 @@ void settings_font_apply(void);   /* 字体族(宋/黑)开机恢复, 见 page_se
 #include "espsdr.h"        /* espsdr_reclaim_boot: 频谱仪禁用则回收 64KB 采集区 */
 #include "remcon.h"        /* 串口远程控制台 (远程自动化测试/排障) */
 #include "min_boot.h"      /* 最小系统诊断 (只 LCD+触摸, NVS 开关) */
+#include "web_files.h"     /* ★ 2026-11-24: 开机自动恢复「网络访问存储」 */
 #include "tone_player.h"   /* V1.0.68: 方波直驱音调播放器 (开机音/按键音) */
 #include "engine_manager.h" /* V1.0.98: 主菜单定时复核引擎残留 (unload_all 幂等) */
 #include "vibrator.h"
@@ -1194,6 +1195,15 @@ void app_main(void)
       } }
     hw_cfg_init();
     boot_ts("NVS + hw_cfg");
+
+    /* ★ 2026-11-24: 「网络访问存储」开机自动恢复 —— 若上次是"开着共享"关机的,
+     *   等 WiFi(STA) 连上后自动重新拉起。原来完全没有持久化: s_running 是静态变量,
+     *   一重启就是 false, 而唯一启动入口是存储页那个按钮 ⇒ 异常重启后网页服务
+     *   "永远不再起来", 现象看起来像"服务挂了", 实际是没人再启动它。
+     *   ⚠ 必须排在 nvs_flash_init() 之后 (本函数要读 NVS 里的开关);
+     *     只建一个低优先级等待任务, 没开过共享则什么都不做。 */
+    web_files_boot_restore();
+    boot_ts("web_files_boot_restore");
 
     /* ★ 2026-11-22: 关机唤醒门控 —— 位置从 app_main 开头挪到这里, 因为
      *   wake_key_mask() 依赖 board_pins 的**当前板型**, 而板型是 hw_cfg_init() 从 NVS 恢复的。

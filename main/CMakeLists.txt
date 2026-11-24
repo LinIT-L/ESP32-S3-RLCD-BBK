@@ -57,6 +57,7 @@ idf_component_register(
         usb_hid        # main.c: USB HID 模式
         wifi_manager   # main.c: 网络状态
         haptic         # main.c: 触觉效果库开机初始化 (注册'基础反馈→效果'钩子)
+        web_files      # main.c: web_files_boot_restore() —— 异常重启后恢复网页共享
 )
 
 # CMake 变量不会自动变成宏 —— main.c 里的 #ifdef LINTOS_LAVAX_BENCH 需要显式定义
