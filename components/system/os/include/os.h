@@ -397,7 +397,12 @@ typedef bool (*os_dlg_key_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, vo
 typedef void (*os_dlg_poll_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);   /* 每帧轮询 (按键映射捕获等) */
 typedef bool (*os_dlg_touch_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud); /* 可选: 自定义整层触摸(点列/按钮), true=已消费 */
 struct os_dlg_stack {
-    char  title[32];
+    /* ★ 2026-11-24: 32 → 48。原 32 字节装不下「是否连接网络更新应用？」(33 B),
+     *   snprintf 按**字节**截断, 恰好切在 "？"(EF BC 9F) 的第一个字节上 ⇒ 残留半个字符,
+     *   draw_text 把它当三字节汉字去查库, 查不到就画"叉形占位", 而且指针 +=3 越过 '\0'
+     *   读进紧邻的 items[0]("确定") ⇒ 标题后面多冒出一个"定"(商店联网确认框实测)。
+     *   48 字节够 15 个汉字, 给常见提示留足余量; 4 层栈只多 64 B (在 PSRAM)。 */
+    char  title[48];
     char  items[60][30];   /* 列表项 (支持数值选择等长列表, 弹窗栈 4 层共 ~7.2KB) */
     int   count;
     int   sel;

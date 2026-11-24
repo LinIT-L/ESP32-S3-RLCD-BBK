@@ -1462,8 +1462,10 @@ static void nd_clearpass_cb(ui_ctx_t*ctx,int result,void*ud){
     ctx->needs_redraw=true;
 }
 static void nd_ask_clearpass(ui_ctx_t*ctx){
-    os_dialog_confirm_ex(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x8c\xe6\x98\xaf\xe5\x90\xa6\xe6\xb8\x85\xe7\xa9\xba\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98\xe5\xaf\x86\xe7\xa0\x81\xe9\x87\x8d\xe6\x96\xb0\xe8\xbe\x93\xe5\x85\xa5\xef\xbc\x9f", 0, 0, nd_clearpass_cb, NULL);
-} /* 连接失败，是否清空已保存密码重新输入？ */
+    /* ★ 2026-11-24: 原「连接失败，是否清空已保存密码重新输入？」57B 超过 title 上限,
+     *   按字节截断会切在汉字中间 → 绘制出叉形占位。缩短到 36B。 */
+    os_dialog_confirm_ex(ctx, "\xe8\xbf\x9e\xe6\x8e\xa5\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x8c\xe6\xb8\x85\xe7\xa9\xba\xe5\xaf\x86\xe7\xa0\x81\xe9\x87\x8d\xe8\xaf\x95\xef\xbc\x9f", 0, 0, nd_clearpass_cb, NULL);
+} /* 连接失败，清空密码重试？ */
 static bool netdect_touch(ui_ctx_t*ctx,int x,int y){
     if(x<0||y<0) return false;
     if(s_wait_start){

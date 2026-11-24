@@ -48,7 +48,11 @@ static bool s_scroll_suppress_tap = false;
 static ui_col_t s_pcol;
 static int      s_pcol_n = -1;
 static char     s_pcol_head[64] = {0};
-static void pane_col_invalidate(void) { s_pcol_n = -1; s_pcol_head[0] = 0; }
+/* ★ 2026-11-24 linit「设置小了, 游戏列表名称还是 24px」:
+ *   整列缓冲原来固定用 ui_col_text24 写入, 缓存键又只有 (项数, 首项文字),
+ *   因此字号改了既不重画、也不会重画成新字号。现在把字号并进缓存键。 */
+static int      s_pcol_sz = -1;
+static void pane_col_invalidate(void) { s_pcol_n = -1; s_pcol_head[0] = 0; s_pcol_sz = -1; }
 
 /* 扫描目录项上限: 防止巨目录 (数千文件) 全量遍历拖慢切换 */
 #define PANE_SCAN_MAX 512
@@ -380,14 +384,16 @@ void os_pane_draw_left(st7305_handle_t *lcd, os_pane_t *p) {
     }
     int sel_top = -1, sel_bot = -1;
     int y = list_y;
+    int lfsz = ui_menu_font_size();            /* 2026-11-24: 字号跟随设置, 居中与行内偏移一起折算 */
+    int lty  = (ROW_H - lfsz) / 2; if (lty < 0) lty = 0;
     for (int i = 0; i < max_vis && (p->folder_scroll + i) < total; i++) {
         int idx = p->folder_scroll + i;
         char short_name[64];
         pane_left_name(p, idx, short_name, sizeof(short_name));
-        int tw = text_width(short_name);
+        int tw = text_width(short_name) * lfsz / 24;
         int tx = lx0 + (lw - tw) / 2;
         if (tx < lx0 + 2) tx = lx0 + 2;
-        draw_text(lcd, tx, y + 4, short_name, false);   /* 24px 字在 32px 行垂直居中 */
+        draw_text(lcd, tx, y + lty, short_name, false);   /* 行内垂直居中 (24px→+4, 16px→+8) */
         if (idx == p->sel_folder) { sel_top = y; sel_bot = y + ROW_H - 1; }   /* 当前分类始终显示选中框 (与焦点无关) */
         y += ROW_H;
     }
@@ -452,7 +458,11 @@ void os_pane_render(ui_ctx_t *ctx, os_pane_t *p) {
     int col_w  = RIGHT_EDGE - rx0 + 1;
     if (col_w > 0 && p->item_count > 0) {
         const char *pfirst = p->items[0];
-        if (s_pcol_n != p->item_count || strcmp(s_pcol_head, pfirst) != 0) {   /* ★ 只在内容变化时重建 */
+        int fsz = ui_menu_font_size();                  /* 16 / 24, 跟随「字体:大小」 */
+        int ty_off = (ROW_H - fsz) / 2;                  /* 24→4, 16→8: 行内垂直居中 */
+        if (ty_off < 0) ty_off = 0;
+        if (s_pcol_n != p->item_count || s_pcol_sz != fsz ||
+            strcmp(s_pcol_head, pfirst) != 0) {          /* ★ 内容或字号变化才重建 */
             int need_h = p->item_count * ROW_H;
             if (need_h < view_h) need_h = view_h;
             if (ui_col_init(&s_pcol, col_w, need_h)) {
@@ -461,20 +471,21 @@ void os_pane_render(ui_ctx_t *ctx, os_pane_t *p) {
                     bool sel = (p->focus == 1 && i == p->sel_item);
                     int y = i * ROW_H;
                     if (sel) ui_col_fill(&s_pcol, 0, y, col_w - 1, y + ROW_H - 2, true);
-                    /* 超宽截断: 用 24px 宽度 (ASCII=16/CJK=24) 累加, 超出 col_w-4 就停 */
+                    /* 超宽截断: 用 24px 宽度 (ASCII=16/CJK=24) 累加后按字号折算, 超 col_w-4 就停 */
                     char tb[128]; tb[0] = 0; int bn = 0;   /* ★ 必须先置空: text_width(tb) 会读它 */
                     for (const char *q = p->items[i]; *q && bn < (int)sizeof(tb) - 1;) {
                         int adv = ((uint8_t)*q < 0x80) ? 1 : ((((uint8_t)*q & 0xF0) == 0xE0) ? 3 : 2);
                         char tmp[8]; memcpy(tmp, q, adv); tmp[adv] = 0;
-                        if (text_width(tb) + text_width(tmp) > col_w - 4) break;
+                        if ((text_width(tb) + text_width(tmp)) * fsz / 24 > col_w - 4) break;
                         memcpy(tb + bn, q, adv); bn += adv; tb[bn] = 0; q += adv;
                     }
-                    int tw = text_width(tb);
+                    int tw = text_width(tb) * fsz / 24;
                     int tx = (col_w - tw) / 2;
                     if (tx < 0) tx = 0;
-                    ui_col_text24(&s_pcol, tx, y + 4, tb, sel);
+                    ui_col_text_sz(&s_pcol, tx, y + ty_off, tb, sel, fsz);
                 }
                 s_pcol_n = p->item_count;
+                s_pcol_sz = fsz;
                 snprintf(s_pcol_head, sizeof(s_pcol_head), "%s", pfirst);
             }
         }
@@ -485,10 +496,10 @@ void os_pane_render(ui_ctx_t *ctx, os_pane_t *p) {
                 int sy = list_y + p->sel_item * ROW_H - p->item_off;
                 if (sy + ROW_H > list_y && sy < pane_bottom(p)) {
                     fill_rect(lcd, rx0, sy, RIGHT_EDGE, sy + ROW_H - 2, ST7305_COLOR_BLACK);
-                    int tw = text_width(p->items[p->sel_item]);
+                    int tw = text_width(p->items[p->sel_item]) * fsz / 24;
                     int tx = rx0 + (col_w - tw) / 2;
                     if (tx < rx0) tx = rx0;
-                    draw_text(lcd, tx, sy + 4, p->items[p->sel_item], true);
+                    draw_text(lcd, tx, sy + ty_off, p->items[p->sel_item], true);
                 }
             }
         }

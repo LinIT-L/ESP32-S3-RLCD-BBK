@@ -14,7 +14,7 @@
 #include "theme_renderer.h"
 #include "ui_common.h"
 #include "font_zh16.h"
-#include "glyph.h"       /* ★ 2026-11-22: 汉字取模统一入口 (宋体/黑体可切) */
+#include "glyph.h"       /* 汉字取模统一入口 (2026-11-24: 按字号取原生宋体) */
 #include "input.h"
 #include "vibrator.h"
 #include "esp_timer.h"
@@ -200,12 +200,11 @@ static void car_draw_label(st7305_handle_t *l, int cx, int y, const char *s, int
     int x = cx - w/2; if (x < 0) x = 0; if (x + w > UI_SCREEN_W) x = UI_SCREEN_W - w;
     for (const unsigned char *p = (const unsigned char*)s; *p;) {
         int ul = car_utf8_len(*p);
-        if (ul == 3) {                                    /* 中文: 统一走 glyph (宋体/黑体可切) */
-            /* ★ 2026-11-22: 字体族切换后, 主菜单标签也跟随。
-             *   glyph 内部决定源字库与缩放方向:
-             *     宋体 → 16px 原生点阵宋 (24px 时放大)
-             *     黑体 → 24px 原生点阵   (16px 时缩小)
-             *   缩放一律 OR 聚合, 不会再出现"丢行导致横画断"。 */
+        if (ul == 3) {                                    /* 中文: 统一走 glyph (按目标字号取原生宋体) */
+            /* ★ 2026-11-24: glyph 现在**按目标字号**选源, 与字体族无关:
+             *   gsz<20 → 16px 原生宋体 (文泉驿点阵宋16)
+             *   gsz≥20 → 24px 原生宋体 (HZK24S)
+             *   字库没有的字才退另一套再 OR 聚合缩放。 */
             int gsz = (sz > 24) ? 24 : sz;
             int stride = (gsz + 7) >> 3;
             uint8_t g[24 * 3];

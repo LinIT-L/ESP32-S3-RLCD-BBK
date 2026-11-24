@@ -7,7 +7,7 @@
 #include <math.h>
 #include "esp_heap_caps.h"   /* ui_icon_register_extra: 外来图标放 PSRAM */
 #include "font_zh16.h"
-#include "glyph.h"           /* ★ 2026-11-22: 汉字取模唯一入口 (宋体/黑体 × 16/24) */
+#include "glyph.h"           /* 汉字取模唯一入口 (16px/24px 各取原生宋体) */
 
 /* 当前逻辑屏幕尺寸: 默认横屏 400×300; 书库旋转左/右时切为竖屏 300×400 (os_pane/os_dialog 布局按此重排). */
 static int s_ui_w = UI_SCREEN_W;
@@ -319,8 +319,8 @@ void draw_ascii_t(st7305_handle_t *lcd, int x, int y, char c, bool inverted) {
 }
 
 void draw_zh(st7305_handle_t *lcd, int x, int y, const char *str, bool inverted, int scale) {
-    /* ★ 2026-11-22: 取模改走 glyph (宋体/黑体可切), 不再直接读 zh_font_data。
-     *   scale>1 仍是块放大, 但源字形已经是"当前字体族 24px"合成结果。 */
+    /* 取模走 glyph, 不再直接读 zh_font_data。
+     *   ★ 2026-11-24: 这里固定取 24px 原生宋体(HZK24S) 作源, scale>1 仍是块放大。 */
     st7305_color_t bg = inverted ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE;
     st7305_color_t fg = inverted ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK;
     int sz = 24 * scale;
@@ -395,10 +395,26 @@ void draw_ascii_sb(st7305_handle_t *lcd, int x, int y, char c, bool inverted) {
 #define ZH_SB_OFFSET   ((ZH_FONT_H - ZH_SB_GLYPH) / 2)
 
 /* ===== mini-UI 文本控件 (统一 16px: 中文 font_zh16 + 英文 8×16, 与 app_manager/netdect 同款) ===== */
+/* 残缺/非法多字节序列判定 (2026-11-24)。
+ *
+ * 串被"按字节"截断时会留下半个汉字 (只剩首字节), 这时**不能**按声明长度前进:
+ * 越过结尾 '\0' 会继续读相邻内存 —— 商店联网确认框的标题曾因此在末尾多画一个"定"
+ * (dlg.title 后面紧挨着 dlg.items[0] = "确定")。统一规则: 残缺序列只前进 1 字节,
+ * 且不推进光标。 */
+static inline bool utf8_seq_ok(const char *s, int len)
+{
+    for (int i = 1; i < len; i++)
+        if (((unsigned char)s[i] & 0xC0) != 0x80) return false;
+    return true;
+}
+
 int ui_text16w(const char *s) {
     int w = 0;
     for (const unsigned char *p = (const unsigned char *)s; *p;) {
-        if ((*p & 0xe0) == 0xe0) { w += ZH16_FONT_W; p += 3; } else { w += 8; p++; }
+        if ((*p & 0xe0) == 0xe0) {
+            if (!utf8_seq_ok((const char *)p, 3)) { p++; continue; }   /* 残缺序列: 只跳 1 字节 */
+            w += ZH16_FONT_W; p += 3;
+        } else { w += 8; p++; }
     }
     return w;
 }
@@ -421,6 +437,7 @@ void ui_text16(st7305_handle_t *lcd, int x, int y, const char *s, bool inverted)
             /* ★ 2026-11-22 linit「其他内置应用和 Lua 应用字体不要修改」:
              *   这里**不经过 glyph** —— 直读 font_zh16 原生字模, 与字体切换
              *   功能上线前逐像素一致。字体族切换只对主菜单/游戏选择/阅读器生效。 */
+            if (!utf8_seq_ok((const char *)p, 3)) { p++; continue; }   /* 残缺序列: 只跳 1 字节 */
             int idx = font_zh16_find_utf8((const char *)p);
             if (idx >= 0) {
                 const uint8_t *b = font_zh16_get_bitmap_by_index(idx);
@@ -529,14 +546,17 @@ void draw_text(st7305_handle_t *lcd, int x, int y, const char *str, bool inverte
             cursor_x += cw_as;
             str++;
         } else if ((c & 0xE0) == 0xC0) {
+            if (!utf8_seq_ok(str, 2)) { str++; continue; }   /* 残缺序列: 只跳 1 字节 */
             cursor_x += cw_as;
             str += 2;
         } else if ((c & 0xF0) == 0xE0) {
+            if (!utf8_seq_ok(str, 3)) { str++; continue; }   /* 残缺序列: 只跳 1 字节 */
             if (sz != 24) ui_draw_zh_sz(lcd, cursor_x, y, str, inverted, sz);
             else          draw_zh(lcd, cursor_x, y, str, inverted, 1);
             cursor_x += cw_zh;
             str += 3;
         } else if ((c & 0xF8) == 0xF0) {
+            if (!utf8_seq_ok(str, 4)) { str++; continue; }   /* 残缺序列: 只跳 1 字节 */
             cursor_x += cw_zh;
             str += 4;
         } else {
@@ -557,15 +577,18 @@ void draw_text_capped(st7305_handle_t *lcd, int x, int y, const char *str,
             cursor_x += 16;
             str++;
         } else if ((c & 0xE0) == 0xC0) {
+            if (!utf8_seq_ok(str, 2)) { str++; continue; }   /* 残缺序列: 只跳 1 字节 */
             if (cursor_x + 16 > x + max_w) break;
             cursor_x += 16;
             str += 2;
         } else if ((c & 0xF0) == 0xE0) {
+            if (!utf8_seq_ok(str, 3)) { str++; continue; }   /* 残缺序列: 只跳 1 字节 */
             if (cursor_x + 24 > x + max_w) break;
             draw_zh(lcd, cursor_x, y, str, inverted, 1);
             cursor_x += 24;
             str += 3;
         } else if ((c & 0xF8) == 0xF0) {
+            if (!utf8_seq_ok(str, 4)) { str++; continue; }   /* 残缺序列: 只跳 1 字节 */
             if (cursor_x + 24 > x + max_w) break;
             cursor_x += 24;
             str += 4;
@@ -611,11 +634,12 @@ void draw_label(st7305_handle_t *lcd, int x, int y, const char *str, bool invert
             cursor_x += ascii_w;
             str++;
         } else if ((c & 0xF0) == 0xE0) {
+            if (!utf8_seq_ok(str, 3)) { str++; continue; }
             draw_zh(lcd, cursor_x, y, str, inverted, scale);
             cursor_x += zh_w;
             str += 3;
         } else {
-            str += 3;
+            str++;                                          /* 非法首字节: 只跳 1 */
         }
     }
 }
@@ -624,9 +648,11 @@ int text_width(const char *str) {
     while (*str) {
         uint8_t c = (uint8_t)*str;
         if (c < 0x80) { w += 16; str++; }
-        else if ((c & 0xE0) == 0xC0) { w += 16; str += 2; }
-        else if ((c & 0xF0) == 0xE0) { w += 24; str += 3; }
-        else if ((c & 0xF8) == 0xF0) { w += 24; str += 4; }
+        /* 残缺序列 (被按字节截断) 只前进 1 字节, 否则会越过结尾 '\0' 继续算宽度,
+         * 居中位置随之偏左 —— 与 draw_text 的规则保持一致 (2026-11-24)。 */
+        else if ((c & 0xE0) == 0xC0) { if (!utf8_seq_ok(str,2)) { str++; continue; } w += 16; str += 2; }
+        else if ((c & 0xF0) == 0xE0) { if (!utf8_seq_ok(str,3)) { str++; continue; } w += 24; str += 3; }
+        else if ((c & 0xF8) == 0xF0) { if (!utf8_seq_ok(str,4)) { str++; continue; } w += 24; str += 4; }
         else str++;
     }
     return w;
@@ -678,8 +704,11 @@ int label_width(const char *str) {
     while (*str) {
         uint8_t c = (uint8_t)*str;
         if (c < 0x80) { w += 16 * scale; str++; }
-        else if ((c & 0xF0) == 0xE0) { w += 24 * scale; str += 3; }
-        else str += 3;
+        else if ((c & 0xF0) == 0xE0) {
+            if (!utf8_seq_ok(str, 3)) { str++; continue; }   /* 残缺序列: 只跳 1 字节 */
+            w += 24 * scale; str += 3;
+        }
+        else str++;
     }
     return w;
 }

@@ -42,6 +42,11 @@ void ui_col_fill(ui_col_t *c, int x0, int y0, int x1, int y1, bool black);
 void ui_col_hline(ui_col_t *c, int x0, int x1, int y, bool black);
 void ui_col_text16(ui_col_t *c, int x, int y, const char *s, bool inverted);
 void ui_col_text24(ui_col_t *c, int x, int y, const char *s, bool inverted);   /* 24px (设置/分类列表) */
+/* ★ 2026-11-24 linit「设置小了游戏列表还是 24px」：整列缓冲原来只有 16/24 两个写死的入口。
+ *   这里按**目标字号**出字, 步进与 draw_text() 完全一致 (CJK=sz, ASCII=sz*16/24),
+ *   于是同一个列表按设置切 16/24 都能对齐、居中不错位。
+ *   sz==24 时内部直接转发 ui_col_text24, 保证现有页面逐像素不变。 */
+void ui_col_text_sz(ui_col_t *c, int x, int y, const char *s, bool inverted, int sz);
 void ui_col_icon(ui_col_t *c, int cx, int cy, int size, int icon_idx);            /* 64px 主图标表 */
 void ui_col_icon32(ui_col_t *c, int cx, int cy, int size, const uint8_t *bmp32);  /* 32×32 自定义图标 */
 

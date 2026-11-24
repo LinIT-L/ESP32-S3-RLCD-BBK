@@ -201,7 +201,7 @@ static void am_store_wifi_gate(ui_ctx_t *ctx) {
 
     s_am_op++;
     net_set(AMNET_ASKING, "未连接 → 弹确认框");
-    os_dialog_confirm_ex(ctx, "\xe6\x98\xaf\xe5\x90\xa6\xe8\xbf\x9e\xe6\x8e\xa5\xe7\xbd\x91\xe7\xbb\x9c\xe6\x9b\xb4\xe6\x96\xb0\xe5\xba\x94\xe7\x94\xa8\xef\xbc\x9f", 0, -1, am_wifi_gate_cb, NULL); /* 是否连接网络更新应用？ */
+    os_dialog_confirm_ex(ctx, "\xe6\x98\xaf\xe5\x90\xa6\xe8\x81\x94\xe7\xbd\x91\xef\xbc\x9f", 0, -1, am_wifi_gate_cb, NULL); /* 是否联网？ */
 }
 
 /* ==== 页面状态 ==== */

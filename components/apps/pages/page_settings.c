@@ -2,8 +2,8 @@
  * page_settings.c — 设置 页面模块.
  *
  * 用 os_dialog 弹窗栈呈现: 主菜单 4 项 (显示配置/声音调整/无线连接/系统信息).
- *   - 显示与声音: 黑暗模式 / 声音开关 / 调整日期 / 修改时间
- *     (★ 2026-10-31: 字体入口已移除, 系统 UI 字体改由应用中心管理)
+ *   - 显示与声音: 声音开关 / 字体字号 / 黑暗模式 / 调整日期 / 修改时间
+ *     (★ 2026-11-24: 「字体修改」二级入口与宋/黑体切换已删除, 字号直接在主菜单)
  *   - 声音调整: 声音开关 / 音量设置 / 震动开关
  *   - 无线连接: 蓝牙开关 / WiFi 开关 (开后显示"连接WiFi") / 连接WiFi → WiFi 键盘页
  *   - 系统信息: CPU/Flash/RAM/电池等
@@ -21,7 +21,7 @@
 #include "input.h"       /* input_consume_tap / input_get_touch_pos (时间滚轮), esp_util.h */
 #include "esp_attr.h"
 #include "font_zh.h"
-#include "glyph.h"       /* ★ 2026-11-22: 字体修改 — 宋体/黑体切换 (统一字形入口) */
+#include "glyph.h"       /* 统一字形入口 (2026-11-24: 字号 16/24 各取原生宋体) */
 #include "audio_player.h"
 #include "vibrator.h"
 #include "haptic.h"      /* ★ 2026-11-24: 「丰富震动」开关 (效果库唯一归属, 含 NVS 持久化) */
@@ -631,8 +631,9 @@ void settings_font_size_set(int v) {
 }
 int settings_font_size(void) { return font_size_get(); }   /* 档位 0..4 供主菜单标签调字号 */
 
-/* 字体族 (宋体/黑体) 的开机恢复 —— 必须在**第一次绘制之前**调用,
- * 否则桌面会先按默认黑体画一帧再跳变。main.c 里和 settings_apply_dark() 同一处调用。
+/* 字体族开机恢复 —— 必须在**第一次绘制之前**调用。
+ * ★ 2026-11-24: 族已不参与选源 (glyph 现在按目标字号取原生宋体), 这里保留只为
+ *   兼容 NVS 里可能存着的 font_fam 值; 调不调都不再影响任何字形。
  * 字体族本身存在 glyph 模块内存里, NVS 读写留在本文件 (apps 层), 保持分层单向。 */
 void settings_font_apply(void) {
     uint8_t v = GLYPH_FAM_HEI;
@@ -983,70 +984,41 @@ static void open_snd_dlg(ui_ctx_t *ctx, int sel) {
  * 深色模式仍是三态 (关/暗黑UI/全部), 复用 s_dark + open_dark_dlg, 未改底层。 */
 static void open_av_dlg(ui_ctx_t *ctx, int sel);
 static void open_touchfb_dlg(ui_ctx_t *ctx, int sel);
-static void open_font_dlg(ui_ctx_t *ctx, int sel);
 
-/* ===== 字体修改 (2026-11-22 linit) =====
- * 两项, 点一下当场切换并刷新本层, 不需要"确认":
- *   ① 字体: 宋体 ⇄ 黑体
- *        宋体 = 16px 原生点阵宋为源 (24px 时放大)
- *        黑体 = 24px 原生点阵为源   (16px 时缩小)
- *   ② 字号: 16px ⇄ 24px
- * 字号走 settings_font_size_set (写 NVS font_size, 0/4 两档);
- * 字体族走 glyph_set_family (自己写 NVS font_fam)。
- * 两者都只改"下一次取模的行为", 屏幕靠 needs_redraw 立刻重绘。 */
-static void on_font_select(ui_ctx_t *ctx, int result, void *ud)
-{
-    (void)ud;
-    if (result == 0) {
-        glyph_fam_t nf = (glyph_get_family() == GLYPH_FAM_SONG) ? GLYPH_FAM_HEI : GLYPH_FAM_SONG;
-        glyph_set_family(nf);
-        settings_save_u8("font_fam", (uint8_t)nf);     /* 持久化: 本文件负责 NVS, glyph 只管内存 */
-    } else if (result == 1) {
-        settings_font_size_set(font_size_get() == 0 ? 4 : 0);
-    } else {
-        return;
-    }
-    ctx->needs_redraw = true;
-    os_dialog_pop(ctx);
-    open_font_dlg(ctx, result);        /* 重开本级, 立刻显示新状态 */
-}
-
-static void open_font_dlg(ui_ctx_t *ctx, int sel)
-{
-    char items[2][32];
-    const char *ptrs[2];
-    snprintf(items[0], sizeof(items[0]), "\xe5\xad\x97\xe4\xbd\x93:%s",       /* 字体:%s */
-             glyph_get_family() == GLYPH_FAM_SONG ? "\xe5\xae\x8b\xe4\xbd\x93"  /* 宋体 */
-                                                  : "\xe9\xbb\x91\xe4\xbd\x93");/* 黑体 */
-    snprintf(items[1], sizeof(items[1]), "\xe5\xad\x97\xe5\x8f\xb7:%dpx",     /* 字号:%dpx */
-             font_size_get() == 0 ? 16 : 24);
-    ptrs[0] = items[0]; ptrs[1] = items[1];
-    sel = (sel < 0) ? 0 : (sel > 1 ? 1 : sel);
-    os_dialog_list(ctx, "", ptrs, 2, sel, on_font_select, NULL);
-}
+/* ===== 「字体修改」二级入口已删除 (2026-11-24 linit) =====
+ * 原二级弹窗有两项: ①字体: 宋体 ⇄ 黑体   ②字号: 16px ⇄ 24px。
+ * 按要求:
+ *   · 宋/黑体切换项整个删掉。而且后续查清: 24px 那套原生点阵(HZK24S)本来就是
+ *     **宋体**, 固件里从来没有过黑体字库 —— 那个选项的命名一直是错的;
+ *   · 字号保留, 不再套二级弹窗, 直接放在「显示与声音」主菜单点一下切换;
+ *     标签直接显示档位:「字体:大」=24px /「字体:小」=16px。两档各自命中自己的原生宋体 (16px=文泉驿点阵宋16, 24px=HZK24S),
+ *     全程不缩放 (见 glyph.c 的选源逻辑)。
+ * 因此 on_font_select() / open_font_dlg() 两个函数已一并删除。 */
 
 static void on_av_select(ui_ctx_t *ctx, int result, void *ud) {
     (void)ud;
     switch (result) {
-    case 0: open_dark_dlg(ctx); return;          /* 黑暗模式: 压三级弹窗, 本层保持 */
-    case 1: {                                    /* 声音开关 */
+    case 0: {                                    /* 声音开关 */
         bool m = !audio_player_is_muted();
         audio_player_set_muted(m);
         /* ★ 2026-11-22: 持久化已由 audio_player 自己负责, 此处不再重复写 snd_on */
         break;
     }
-    case 2: case 3: {                            /* 调整日期 / 修改时间 (原样逻辑) */
+    case 1:                                      /* 字体:大小 —— 点一下 16px ⇄ 24px */
+        settings_font_size_set(font_size_get() == 0 ? 4 : 0);
+        break;
+    case 2: open_dark_dlg(ctx); return;          /* 黑暗模式: 压三级弹窗, 本层保持 */
+    case 3: case 4: {                            /* 调整日期 / 修改时间 (原样逻辑) */
         if (!s_edit_valid) {
             time_t t = time(NULL); struct tm *ct = localtime(&t);
             if (ct) s_edit_tm = *ct;
             s_edit_valid = true;
         }
-        s_time_mode  = (result == 2) ? 0 : 1;
+        s_time_mode  = (result == 3) ? 0 : 1;
         s_time_field = tm_first();
         open_time_wheel_dlg(ctx);
         return;
     }
-    case 4: open_font_dlg(ctx, 0); return;       /* 字体修改: 压二级弹窗, 本层保持 */
     default: return;
     }
     os_dialog_pop(ctx);
@@ -1056,16 +1028,19 @@ static void on_av_select(ui_ctx_t *ctx, int result, void *ud) {
 static void open_av_dlg(ui_ctx_t *ctx, int sel) {
     char items[5][40];
     const char *ptrs[5];
-    /* 2026-10-29 linit: 标签不再带状态后缀(如":关"), 状态由子弹窗里的选中项表达;
-     * 音量调节项已按要求删除 (全局音量在快捷栏下拉里调, 不在这里重复)。 */
-    snprintf(items[0], sizeof(items[0]), "\xe9\xbb\x91\xe6\x9a\x97\xe6\xa8\xa1\xe5\xbc\x8f");      /* 黑暗模式 */
-    snprintf(items[1], sizeof(items[1]), "\xe5\xa3\xb0\xe9\x9f\xb3:%s",                            /* 声音:%s */
-             audio_player_is_muted() ? "\xe5\x85\xb3" : "\xe5\xbc\x80");
-    snprintf(items[2], sizeof(items[2]), "\xe8\xb0\x83\xe6\x95\xb4\xe6\x97\xa5\xe6\x9c\x9f");      /* 调整日期 */
-    snprintf(items[3], sizeof(items[3]), "\xe4\xbf\xae\xe6\x94\xb9\xe6\x97\xb6\xe9\x97\xb4");      /* 修改时间 */
-    snprintf(items[4], sizeof(items[4]), "\xe5\xad\x97\xe4\xbd\x93\xe4\xbf\xae\xe6\x94\xb9");      /* 字体修改 */
-    /* ★ 2026-11-22 linit: 「字体修改」重新回到设置 (宋体/黑体 + 16/24 两档)。
-     *   2026-10-31 曾移除入口改成"应用中心管理", 现在按要求放回这里。 */
+    /* ★ 2026-11-24 linit: ①「字体修改」二级入口删除, 字号直接进主菜单;
+     *   ②宋体/黑体切换项删除; ③顺序 = 声音 → 字体 → 黑暗模式 → 日期 → 时间。
+     *   ④标签**直接显示当前档位**:「字体:大」=24px /「字体:小」=16px。
+     *     两档各自命中自己的原生宋体 (16px=文泉驿点阵宋16, 24px=HZK24S), 见 glyph.c;
+     *     点一下在大小之间切换, 切完整屏立即按新字号重绘。 */
+    snprintf(items[0], sizeof(items[0]), "\xe5\xa3\xb0\xe9\x9f\xb3:%s",                            /* 声音:%s */
+             audio_player_is_muted() ? "\xe5\x85\xb3" : "\xe5\xbc\x80");                           /* 关 / 开 */
+    /* 字体:大/小 —— font_size_get() 0=16px, 4=24px (与 settings_font_size 的档位表一致) */
+    snprintf(items[1], sizeof(items[1]), "\xe5\xad\x97\xe4\xbd\x93:%s",                            /* 字体:%s */
+             font_size_get() == 0 ? "\xe5\xb0\x8f" : "\xe5\xa4\xa7");                              /* 小(16px) / 大(24px) */
+    snprintf(items[2], sizeof(items[2]), "\xe9\xbb\x91\xe6\x9a\x97\xe6\xa8\xa1\xe5\xbc\x8f");      /* 黑暗模式 */
+    snprintf(items[3], sizeof(items[3]), "\xe8\xb0\x83\xe6\x95\xb4\xe6\x97\xa5\xe6\x9c\x9f");      /* 调整日期 */
+    snprintf(items[4], sizeof(items[4]), "\xe4\xbf\xae\xe6\x94\xb9\xe6\x97\xb6\xe9\x97\xb4");      /* 修改时间 */
     for (int i = 0; i < 5; i++) ptrs[i] = items[i];
     sel = (sel < 0) ? 0 : (sel > 4 ? 4 : sel);
     os_dialog_list(ctx, "", ptrs, 5, sel, on_av_select, NULL);

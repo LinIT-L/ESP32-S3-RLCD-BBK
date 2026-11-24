@@ -1269,7 +1269,9 @@ static void sdr_action(ui_ctx_t *ctx, os_action_t a)
             /* 已占用 64KB: 退出前提示"重启释放"。选取消则留在本页 (返回键可再提示)。 */
             if (!s_need_release) {
                 s_need_release = true;
-                os_dialog_confirm_ex(ctx, "退出并重启?\n将释放频谱仪占用的64KB内部内存", 0, 0, sdr_release_cb, NULL);
+                /* ★ 2026-11-24: 原文案 60B 且带换行(小确认框只有单行标题, 换行会画成 '?'),
+                 *   超 title 上限按字节截断 → 汉字切半 → 叉形占位。压缩成单行 35B。 */
+                os_dialog_confirm_ex(ctx, "退出并重启以释放64KB内存?", 0, 0, sdr_release_cb, NULL);
             }
         } else {
             os_request_exit_confirm(ctx);      /* 未占用: 普通退出确认 */
@@ -1339,7 +1341,9 @@ static void sdr_poll(ui_ctx_t *ctx)
     }
     if (s_need_enable) {
         s_need_enable = false;
-        os_dialog_confirm_ex(ctx, "频谱仪需占用64KB内部内存\n启用后需重启生效\n是否启用?", 0, 0, sdr_enable_cb, NULL);
+        /* ★ 2026-11-24: 原文案 73B + 两处换行, 既超 title 上限又被画成 '?';
+         *   压成单行 39B, 意思不变 (占用 64KB / 启用后要重启)。 */
+        os_dialog_confirm_ex(ctx, "频谱仪需64KB内存,启用后重启?", 0, 0, sdr_enable_cb, NULL);
         return;
     }
     if (!espsdr_usable()) return;   /* 未启用: 空页, 等用户按返回离开 */

@@ -1067,6 +1067,28 @@ void os_dialog_mark_handled(ui_ctx_t *ctx) {
 }
 
 /* ============ 旧 API (单层快捷方式, 复用弹窗栈) ============ */
+
+/* UTF-8 安全截断拷贝 (2026-11-24)。
+ *
+ * 为什么不能用 snprintf: 它按**字节**截断, 遇到中文就会切在字符中间, 留下半个
+ * 多字节序列。绘制层看到首字节 0xEF 会认为"这是三字节汉字", 去字库查当然查不到,
+ * 于是 draw_zh 走兜底画一个**叉形占位**; 更糟的是随后指针 +=3 直接越过结尾的 '\0',
+ * 读进紧随其后的 items[0] —— 商店联网确认框就是这样在标题后面多画出一个"定"。
+ *
+ * 这里保证: 结果一定是完整字符的序列, 且长度 < cap。截断点退到字符边界。 */
+static void dlg_copy_utf8(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0) return;
+    if (!src) { dst[0] = 0; return; }
+    size_t n = strlen(src);
+    if (n >= cap) {
+        n = cap - 1;
+        /* 0b10xxxxxx = 续字节, 一路退到这个字符的首字节之前 */
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
+    }
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
 void os_dialog_list(ui_ctx_t *ctx, const char *title,
                     const char *const *items, int count, int sel,
                     os_dialog_cb_t cb, void *ud) {
@@ -1080,11 +1102,11 @@ void os_dialog_list_corner(ui_ctx_t *ctx, const char *title,
                            const char *corner, os_dialog_cb_t cb, void *ud) {
     os_dlg_stack_t dlg;
     memset(&dlg, 0, sizeof(dlg));
-    snprintf(dlg.title, sizeof(dlg.title), "%s", title ? title : "");
+    dlg_copy_utf8(dlg.title, sizeof(dlg.title), title);
     dlg.count = count < DLG_MAX_ITEMS ? count : DLG_MAX_ITEMS;
     if (dlg.count < 0) dlg.count = 0;
     for (int i = 0; i < dlg.count; i++)
-        snprintf(dlg.items[i], DLG_ITEM_LEN, "%s", items[i]);
+        dlg_copy_utf8(dlg.items[i], DLG_ITEM_LEN, items[i]);
     dlg.sel = sel < 0 ? 0 : sel;
     if (dlg.sel >= dlg.count) dlg.sel = 0;
     if (corner && corner[0]) snprintf(dlg.corner, sizeof(dlg.corner), "%s", corner);
@@ -1099,10 +1121,10 @@ void os_dialog_confirm_ex(ui_ctx_t *ctx, const char *msg, uint32_t timeout_ms,
     const char *items[2] = { "\xe7\xa1\xae\xe5\xae\x9a", "\xe5\x8f\x96\xe6\xb6\x88" }; /* 确定/取消 */
     os_dlg_stack_t dlg;
     memset(&dlg, 0, sizeof(dlg));
-    snprintf(dlg.title, sizeof(dlg.title), "%s", msg ? msg : "");
+    dlg_copy_utf8(dlg.title, sizeof(dlg.title), msg);
     dlg.count = 2;
-    snprintf(dlg.items[0], DLG_ITEM_LEN, "%s", items[0]);
-    snprintf(dlg.items[1], DLG_ITEM_LEN, "%s", items[1]);
+    dlg_copy_utf8(dlg.items[0], DLG_ITEM_LEN, items[0]);
+    dlg_copy_utf8(dlg.items[1], DLG_ITEM_LEN, items[1]);
     dlg.sel = 0;
     dlg.no_footer = true;
     dlg.small = true;    /* 小自适应 */
@@ -1246,7 +1268,7 @@ void os_dialog_wheel(ui_ctx_t *ctx, const char *const *items, int n, int sel,
     memset(&dlg, 0, sizeof(dlg));
     int c = n > 60 ? 60 : n;
     for (int i = 0; i < c; i++)
-        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", items[i] ? items[i] : "");
+        dlg_copy_utf8(dlg.items[i], sizeof(dlg.items[i]), items[i]);
     dlg.count = c;
     dlg.sel = (sel < 0) ? 0 : (sel >= c ? c - 1 : sel);
     dlg.no_footer = true;

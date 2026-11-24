@@ -1,23 +1,23 @@
 /**
- * glyph.h — 统一汉字字形入口 (字体族 × 目标像素)
+ * glyph.h — 统一汉字字形入口 (目标像素 → 原生点阵)
  *
- * 2026-11-22 linit「设置里加字体修改: 宋体/黑体 + 16px/24px」
+ * 2026-11-24 linit「设置里只保留一个字体项」后改定的行为:
+ * 系统里只有两套原生点阵字库, 尺寸固定:
+ *   · font_zh16.bin  16×16  文泉驿点阵宋  → **16px 的源**
+ *   · font_zh.bin    24×24  HZK24S 宋     → **24px 的源**
  *
- * 背景: 系统里只有两套原生点阵字库, 尺寸固定, 不能凭空多出 22px 那种档位:
- *   · font_zh16.bin  16×16  文泉驿点阵宋  → **宋体的源**
- *   · font_zh.bin    24×24  HZK24S (笔画粗) → **黑体的源**
- * 因此四个组合按下面的对应关系合成, 不新增任何字库、不占额外 flash:
+ *   16px → font_zh16 原生**直拷**
+ *   24px → font_zh   原生**直拷**
  *
- *   宋体 16px = 16px 原生直拷
- *   宋体 24px = 16px **放大**到 24      ← linit 指定
- *   黑体 24px = 24px 原生直拷
- *   黑体 16px = 24px **缩小**到 16      ← linit 指定
+ * 也就是说「字体:大小」这一项切的是**两套原生字库**, 两个档位都不缩放。
+ * (2026-11-22 曾经用"字体族"决定源: 黑体→24px 源、宋体→16px 源, 于是
+ *  16px 变成把 24px 缩小、24px 变成把 16px 放大; 宋/黑切换入口删除后,
+ *  族不再参与选源, 见 glyph.c 的说明。)
  *
+ * 其它字号: ≥20px 用 24px 源, <20px 用 16px 源, 缺字才退另一套再缩放。
  * 缩放一律用「源区间 OR 聚合」, 不用最近邻丢弃:
  *   最近邻在 24→16 时会整行整列跳过, 横画/竖画成条消失(2026-11-22 已实证);
  *   OR 聚合把被覆盖的像素全部并进来, 笔画只会略粗, 绝不会断。
- *
- * 字体族在首次调用时从 NVS 懒加载, 改完设置立刻生效, 不需要任何初始化调用点。
  */
 #ifndef FONT_GLYPH_H
 #define FONT_GLYPH_H
@@ -30,8 +30,8 @@ extern "C" {
 #endif
 
 typedef enum {
-    GLYPH_FAM_SONG = 0,   /* 宋体: 以 16px 原生点阵宋为源 */
-    GLYPH_FAM_HEI  = 1,   /* 黑体: 以 24px 原生点阵(笔画粗)为源 */
+    GLYPH_FAM_SONG = 0,   /* 16px 源 (文泉驿点阵宋 16) —— 历史枚举值, 已不参与选源 */
+    GLYPH_FAM_HEI  = 1,   /* 24px 源 (HZK24S 宋, 笔画较粗) —— 名字是历史误称, 实为宋体 */
     GLYPH_FAM_MAX
 } glyph_fam_t;
 
@@ -39,19 +39,16 @@ typedef enum {
 void        glyph_set_family(glyph_fam_t f);
 glyph_fam_t glyph_get_family(void);
 
-/* ★ 2026-11-22 linit「字体切换只作用于主菜单 / 游戏选择引擎菜单 / 阅读器,
- *   其他内置应用和 Lua 应用一律不动」。
+/* ⚠ 2026-11-24: 字体族 API 与作用域开关都**保留但已不影响选源**。
+ *   设置里的宋/黑切换入口已删除, 用户无法再选族; 但 os_core 每帧仍会按页面白名单
+ *   调一次 glyph_set_family_scope(), main 开机仍会调 glyph_set_family()。
+ *   保留它们的唯一理由是"删掉要动 os_core / main / page_settings 三处跨层代码,
+ *   收益为零"。取哪个点阵请按 glyph_render() 的目标字号判断, 不要再依赖族。
  *
- *   这是**作用域开关**, 和上面的字体族是两个独立维度:
- *     · glyph_set_family   = 用户选了什么 (持久化, 长期有效)
- *     · glyph_family_scope = 当前这段绘制允不允许用用户选的那个族
+ *   · glyph_set_family   = 用户曾经选了什么 (NVS font_fam, 已无 UI 入口)
+ *   · glyph_family_scope = 当前页面是否在白名单 (os_core 每帧设置, 现已无效果)
  *
- *   由 OS 层在每帧渲染前按当前页面设一次 (os_render)。scope=false 时
- *   glyph_render 一律按黑体(= 24px 原生字库, 也就是字体切换功能上线前的
- *   唯一行为) 出字, 用户在设置里切成宋体也不会渗透到这些页面。
- *
- *   默认 false: 任何**没被 OS 显式打开**的绘制路径 (含开机首帧、异常兜底)
- *   都退回历史基线, 不会出现"切了宋体结果全系统都变"的事故。 */
+ *   默认 false: 任何**没被 OS 显式打开**的绘制路径都落到"不跟随"这一侧。 */
 void glyph_set_family_scope(bool on);
 bool glyph_get_family_scope(void);
 

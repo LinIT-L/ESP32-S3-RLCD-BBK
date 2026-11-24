@@ -3,6 +3,7 @@
  */
 #include "ui_col.h"
 #include "ui_common.h"
+#include "glyph.h"
 #include "font_zh16.h"
 #include "font_zh.h"
 #include "esp_heap_caps.h"
@@ -226,6 +227,67 @@ void ui_col_text24(ui_col_t *c, int x, int y, const char *s, bool inverted)
                 }
             }
             x += 16; p++;
+        }
+    }
+}
+
+/* ★ 2026-11-24: 按目标字号写整列缓冲。步进与 draw_text() 严格一致:
+ *     CJK  → 前进 sz      (glyph 按字号取原生宋体: <20px 用 16px 源)
+ *     ASCII→ 前进 sz*16/24 (24px 字库字形采样到该尺寸, 与 ui_draw_ascii_sz 同参数)
+ *   sz==24 直接转发 ui_col_text24, 保证 os_pane 主列表逐像素不变。 */
+void ui_col_text_sz(ui_col_t *c, int x, int y, const char *s, bool inverted, int sz)
+{
+    if (!c || !c->buf || !s) return;
+    if (sz < 8)  sz = 8;
+    if (sz > 24) sz = 24;
+    if (sz == 24) { ui_col_text24(c, x, y, s, inverted); return; }
+
+    int stride = (sz + 7) >> 3;
+    int aw = sz * 16 / 24;                 /* ASCII 步进 (draw_text 同式) */
+    if (aw < 1) aw = 1;
+    uint8_t g[24 * 3];
+
+    for (const unsigned char *p = (const unsigned char *)s; *p;) {
+        if ((*p & 0xE0) == 0xE0) {                     /* 3 字节: 汉字 */
+            char u3[4] = { (char)p[0], (char)p[1], (char)p[2], 0 };
+            if (!glyph_render(u3, sz, g)) memset(g, 0, (size_t)stride * sz);
+            for (int r = 0; r < sz; r++)
+                for (int cc = 0; cc < sz; cc++) {
+                    bool on = (g[r * stride + (cc >> 3)] & (0x80u >> (cc & 7))) != 0;
+                    ui_col_px(c, x + cc, y + r, inverted ? !on : on);
+                }
+            x += sz; p += 3;
+        } else if ((*p & 0xE0) == 0xC0) {              /* 2 字节 UTF-8: 只占位 */
+            x += aw; p += 2;
+        } else {
+            if (*p >= 0x20 && *p <= 0x7E) {
+                int ridx = font_zh_find_ascii((uint8_t)*p);
+                const uint8_t *zb = (ridx >= 0) ? font_zh_get_bitmap_by_index(ridx) : NULL;
+                if (zb) {          /* 24px ASCII 字形采样到 aw×sz */
+                    for (int dy = 0; dy < sz; dy++) {
+                        int sr = dy * 24 / sz;
+                        for (int dx = 0; dx < aw; dx++) {
+                            int sc = dx * 24 / aw;
+                            bool on = (zb[sr * 3 + (sc >> 3)] & (0x80u >> (sc & 7))) != 0;
+                            ui_col_px(c, x + dx, y + dy, inverted ? !on : on);
+                        }
+                    }
+                } else {           /* 兜底: FONT8X12 按 24 行排版带缩放到 sz */
+                    const uint8_t *b = FONT8X12[*p - 0x20];
+                    for (int cy = 0; cy < 16; cy++) {
+                        int y0, y1;
+                        ui_ascii_band_span(cy, sz, &y0, &y1);
+                        for (int cc = 0; cc < 8; cc++) {
+                            if (!(b[cy] & (0x80u >> cc))) continue;
+                            int x0 = cc * aw / 8, x1 = (cc + 1) * aw / 8;
+                            for (int dy = y0; dy < y1; dy++)
+                                for (int dx = x0; dx < x1; dx++)
+                                    ui_col_px(c, x + dx, y + dy, !inverted);
+                        }
+                    }
+                }
+            }
+            x += aw; p++;
         }
     }
 }
