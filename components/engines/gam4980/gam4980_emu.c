@@ -1761,14 +1761,23 @@ game_exit_result_t gam4980_emu_run(void) {
         /* V1.0.68: 每帧轮询设备物理键 + 触摸手势 (手柄导航键在游戏内已禁用):
          *  - 软关机键(POWER_LOCK/POWER_RELEASE) 是系统级锁屏/关机动作, 不经游戏循环,
          *    不充当退出回桌面通道, 此处一律忽略.
-         *  - HOME = 手柄退出到菜单(F_EXIT) 的重复路径 → 统一弹确认退出
-         *  - BACK (实体返回/底部上滑) → 统一弹确认退出 */
+         *  - ★ 2026-11-24: 手柄"退出到菜单"键(F_EXIT) 已在 input 层改投 BACK
+         *    (原来投 HOME ⇒ 通用引擎走"逃生口"无确认直接退出)。BBK 这里 HOME/BACK
+         *    本来都统一弹确认, 保留 HOME 分支兼容物理返回键长按 3s 的逃生口。
+         *  - BACK (手柄退出键 / 实体返回 / 底部上滑) → 统一弹确认退出 */
         menu_action_t action = input_get_action();
         if (action == MENU_ACTION_HOME ||
             action == MENU_ACTION_BACK || action == MENU_ACTION_LONG_LEFT) {
             ESP_LOGI(TAG, "退出键 -> 请求退出游戏(弹确认)");
             exit_requested = true;
         }
+        /* ★ 2026-11-24 linit「开了自动隐藏, 用手柄时虚拟手柄还显示」:
+         *   上面进循环前只判了一次 `!bt_manager_is_connected()` —— 而这一刻蓝牙往往
+         *   还在连接中(游戏入口刚 os_hw_lease_acquire 拉起栈, 握手要 1~2s), 判定必然
+         *   为"未连接" ⇒ 虚拟手柄显示出来; 之后手柄连上了也没人再评估, 就一直挂着。
+         *   自动档(2) 每帧跟随: 连上即收起, 断开即恢复。手动开(1)/关(0) 不受影响。 */
+        if (s_vkey == 2)
+            virtual_keys_set_enabled(!bt_manager_is_connected());
         if (virtual_keys_is_enabled()) {
             /* 多点触控: 第一指控方向/摇杆, 第二指只控 A/B/SEL/STA (与通用模拟器一致) */
             tp_point_t pts[TP_MAX_POINTS];

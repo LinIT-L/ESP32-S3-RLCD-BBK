@@ -315,6 +315,15 @@ static void eng_settings_select(ui_ctx_t *ctx, os_pane_t *p, int item) {
     egs_save(); ctx->needs_redraw = true;
 }
 
+/* ★ 2026-11-24 linit「开了虚拟手柄自动隐藏, 用手柄时虚拟手柄还显示」:
+ *   虚拟按键"自动"档 = 没有实体手柄连接时才显示 —— 必须**每帧跟随**, 不能只在进游戏
+ *   那一刻判一次: 进游戏时蓝牙往往还在握手(连接要 1~2s), 那一刻必然判成"未连接"
+ *   ⇒ 虚拟手柄显示出来, 之后手柄连上了也没人再评估, 就一直挂着。
+ *   只在 s_evk==2 生效: 手动开(1)即使接着手柄也照用户设置显示, 手动关(0)永不显示。 */
+static void evk_auto_follow(void) {
+    if (s_evk == 2) virtual_keys_set_enabled(!bt_manager_is_connected());
+}
+
 /* 文曲星引擎资源目录: 精确名单, **不做 contains 匹配** ——
  * 避免把名字里恰好含 "lava" 的合法游戏 (如 "LavaBattle") 一起屏蔽掉。
  *   Lava     : 游戏内/根目录的 .lav 程序目录 (wqx_resolve_lav 会进去找)
@@ -426,8 +435,11 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
     if (bt_manager_has_saved_pad()) os_hw_lease_acquire(&s_bt_lease, OS_HW_BT);
     input_set_gamepad_nav_enabled(false);
     input_set_gamepad_gamemode(true);   /* V1.2.x: 标记真正进入游戏, 允许手柄返回/退出键退出 */
-    /* 屏幕虚拟按键: 引擎优化"虚拟按键"设置 (0=关 1/2=开) */
-    virtual_keys_set_enabled(s_evk != 0);
+    /* 屏幕虚拟按键: 引擎优化"虚拟按键"设置 0=关 1=开 2=自动。
+     * ★ 2026-11-24 linit「开了自动隐藏, 用手柄时虚拟手柄还显示」: 原来这里只判
+     *   `s_evk != 0`, **自动档等于永远显示**(根本没看手柄) —— 自动形同虚设。
+     *   自动 = 没有实体手柄连接时才显示; 手柄连/断由下面循环里每帧跟随。 */
+    virtual_keys_set_enabled(s_evk == 1 || (s_evk == 2 && !bt_manager_is_connected()));
     /* 应用引擎优化: 灰度总开关 + 抗锯齿档位.
      * 灰度开 → 按抗锯齿选 4档(aa=0)/5档(aa=1)点聚灰度; 灰度关 → 纯黑白.
      * GB/GBC/NES 共用 board_shim 灰度. */
@@ -447,6 +459,7 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
          * 独立监视任务据此强制进壁纸. 本循环不再自己判定空闲, 也不渲染屏保. */
         uint8_t j = input_get_held_gb_joypad();
         ops->set_joypad(j);
+        evk_auto_follow();   /* 自动档: 手柄连上即收起虚拟按键, 断开即恢复 */
         os_action_t a = (os_action_t)input_get_action();
         { int tx, ty; if (input_get_touch_pos(&tx, &ty)) {} }
 
@@ -587,6 +600,10 @@ bool menu_wqx_confirm_asked(void) { return s_wqx_exit_asked; }  /* 保留历史�
 static st7305_handle_t *s_wqx_lcd = NULL;
 
 static bool lavax_host_exit_check(void) {
+    /* ★ 2026-11-24: 文曲星自驱动阻塞运行(不走 eng_task_run_loop), 这里由
+     *   lavax_platform_poll 每帧调用一次 ⇒ 借用这个"每帧钩子"做虚拟按键自动档跟随,
+     *   否则自动隐藏对文曲星完全不生效 (lavax 内部 start 时无条件 set_enabled(true))。 */
+    evk_auto_follow();
     /* ★★ 2026-11-22 修「同一个动作被取两次」: 原来写成
      *      (input_get_action()==BACK) || (input_get_action()==HOME)
      *   本函数由 lavax_platform_poll **每帧**调用, 于是每帧至少消耗 1 个、最多 2 个

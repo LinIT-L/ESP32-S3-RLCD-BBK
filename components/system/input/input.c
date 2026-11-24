@@ -1769,9 +1769,41 @@ menu_action_t input_get_action(void) {
         ESP_LOGD(TAG, "ACT %s -> %d (第 %u 个)", kname, (int)a, (unsigned)s_act_cnt);
         return a;
     }
-    /* 游戏中 (nav 关闭 且 gamemode 生效): 手柄"退出到菜单"键(F_EXIT→HOME)仍常开,
-     * 作为游戏退出键. 手柄"返回"键(F_BACK)在游戏内不作为退出键, 不映射成 BACK
-     * (用户规范: 遥控返回键 ≠ 硬件返回键; 退出确认只由 F_EXIT 与硬件返回键触发).
+    /* ★★★ 2026-11-24 linit「实体手柄长按收藏键无效」: 手柄功能键里只有下面 nav[] 那 7 个
+     *   进了导航表, **F_FAV(多功能/收藏键) 一个动作都不产生** —— 长按既收藏不了, 也没有
+     *   任何提示, 因为压根没有事件上行。这里补一条独立的长按检测:
+     *     · 只在 nav 开启且非游戏态生效: 游戏内 F_FAV 是引擎的功能键(SELECT/START/F 等),
+     *       绝不能吞; 按键映射向导(nav 关闭)时保持原样, 长按的正是"要映射的那个键"。
+     *     · 短按不发动作(与原行为一致), 按住 ≥700ms 投递一次 KEY_FAV。
+     *     · 投 KEY_FAV 而不是 LONG_PRESS: 后者是全系统"长按"语义(应用管家长按弹窗、
+     *       存储页长按删除…), 拿它当收藏键会在别的页面误触发别的长按操作。
+     *   收藏结果(已收藏/收藏失败/已取消收藏 + 震动)由 os_pane 统一给出, 不在这里重复。 */
+    if (s_gamepad_nav_enabled && !s_gamepad_gamemode && bt_manager_is_connected()) {
+        static bool     fav_prev  = false;
+        static bool     fav_fired = false;
+        static uint32_t fav_t0    = 0;
+        uint32_t tn = now_ms();
+        bool f = bt_manager_is_key_pressed(F_FAV);
+        if (f && !fav_prev) { fav_t0 = tn; fav_fired = false; }
+        if (f && !fav_fired && (int32_t)(tn - fav_t0) >= 700) {
+            fav_fired = true;                    /* 长按只发一次, 松手后才能再发 */
+            s_tap_x = s_tap_y = -1;
+            s_last_any_ms = tn;
+            ESP_LOGD(TAG, "手柄收藏键长按 -> KEY_FAV");
+            return MENU_ACTION_KEY_FAV;
+        }
+        if (!f) fav_fired = false;
+        fav_prev = f;
+    }
+    /* 游戏中 (nav 关闭 且 gamemode 生效): 手柄"退出到菜单"键(F_EXIT) 作为游戏退出键。
+     * ★★★ 2026-11-24 linit「退出键行为不一致」: 原来这里返回 **HOME**, 而 HOME 是
+     *   "长按返回 3s 逃生口"的语义 —— os_core 里 HOME 直接 os_force_home(不询问),
+     *   eng_task_run_loop 里 home_hard ⇒ 不弹确认直接 break。于是**短按手柄退出键会
+     *   绕过确认框直接退出游戏**, 与界面退出(短按返回 → 弹「退出程序?」)是两套行为。
+     *   现在改投 BACK: 与 F_BACK/物理返回键**完全同路**, 由引擎统一走 exit_confirm,
+     *   该弹框就弹框, 一套逻辑。
+     * 手柄"返回"键(F_BACK)在游戏内仍不作为退出键, 不映射成 BACK
+     * (用户规范: 遥控返回键 ≠ 硬件返回键)。
      * 仅真正进入游戏(引擎置 gamemode=true)才允许; 按键映射(只关 nav、不置 gamemode)
      * 时 F_EXIT 照常被当作被映射的键捕获, 绝不误触发退出.
      * 边沿触发 + released 守卫(防连接伊始卡键); 菜单模式则交给下方导航块统一处理.
@@ -1783,7 +1815,7 @@ menu_action_t input_get_action(void) {
         if (e && !e_prev && e_released) {
             e_released = false; s_tap_x = s_tap_y = -1;
             s_last_any_ms = now_ms();
-            fb_game_exit_vib(MENU_ACTION_HOME, NULL); return MENU_ACTION_HOME;
+            fb_game_exit_vib(MENU_ACTION_BACK, NULL); return MENU_ACTION_BACK;
         }
         e_prev = e;
     }
