@@ -1,0 +1,460 @@
+/**
+ * ui_scroll.c — 全项目统一「跟手滚动」控制器（纯逻辑，不画内容）
+ *
+ * 物理参数与 components/system/os/kernel/os_dialog.c 的列表完全一致
+ * （那套手感是 linit 验收过的"最流畅那档"），2026-10-24 提取成可复用组件。
+ *
+ * ★ 三种模式（LIST 行吸附 / PIXEL 像素自由 / PAGE 整页翻）× 四个开关
+ *   （无惯性 / 无回弹 / 横向 / 循环），页面只调 ui_scroll_config() 选择，
+ *   手感参数一律不开放 —— 发布版必须全项目一致。
+ *
+ * ⛔ 不要在这里加页面相关的东西（列表项怎么画是页面的事）。
+ * ⛔ 页面 poll 里必须每帧调 ui_scroll_poll()，否则惯性/回弹不会走。
+ */
+#include "ui_scroll.h"
+#include "st7305.h"
+#include "esp_timer.h"
+
+/* 触摸静默多久算"手指早就不在了"(ms)。组件级兜底: 页面切走/事件丢失时
+ * pressed 会一直挂着 true, 下次进页面第一次拖动就会拿旧基准 ⇒ 弹回。 */
+#define TOUCH_IDLE_MS  600
+
+#define DRAG_THRESH    12      /* 认拖动的位移阈值（与商店 AM_DRAG_THRESH 一致） */
+#define FLING_DECAY    0.86f   /* 惯性每帧衰减 */
+#define FLING_MIN      0.4f    /* 惯性停止阈值 px/帧 */
+#define FLING_MAX      60.0f   /* 单帧最大速度（防止一甩到底） */
+#define BOUNCE_DECAY   0.8f    /* 越界余量每帧衰减 */
+#define BOUNCE_MIN     2       /* 余量 <2px 归零 */
+/* ★ 2026-10-28: 吸附从"一帧瞬跳"改成"每帧逼近"。参考 OLED_UI 的缓动思路，
+ *   但不抄它的 PID —— 列表吸附**不能过冲**（吸过去再弹回来很难看），
+ *   所以只要纯比例逼近：每帧走剩余距离的 1/SNAP_DIV，约 3~4 帧(50~66ms@60FPS)停稳。 */
+#define SNAP_DIV       3       /* 每帧走 1/3 剩余距离（越大越慢：3≈3帧, 4≈4帧） */
+#define SNAP_MIN       2       /* 剩余 <=2px 直接归位，避免 1px 慢移 */
+
+/* 主轴取值: 横向模式读 x，否则读 y */
+static inline int axis_of(const ui_scroll_t *s, int x, int y)
+{
+    return (s->flags & UI_SCROLL_F_HORIZ) ? x : y;
+}
+
+/* 吸附步长: PAGE=整屏, LIST=行高, PIXEL=不吸附 */
+static int snap_step(const ui_scroll_t *s)
+{
+    if (s->mode == UI_SCROLL_PAGE) return s->view_px > 1 ? s->view_px : 1;
+    if (s->mode == UI_SCROLL_LIST) return s->row_px  > 1 ? s->row_px  : 1;
+    return 1;
+}
+
+void ui_scroll_config(ui_scroll_t *s, ui_scroll_mode_t mode, uint8_t flags)
+{
+    if (!s) return;
+    s->mode  = (uint8_t)mode;
+    s->flags = flags;
+    s->sub   = 0;
+    s->snapping = false;
+    s->fling = 0.0f;
+    int m = ui_scroll_max(s);
+    if (s->off > m) s->off = m;
+    if (s->off < 0) s->off = 0;
+}
+
+int ui_scroll_max(const ui_scroll_t *s)
+{
+    if (!s) return 0;
+    int m = s->content_px - s->view_px;
+    return m < 0 ? 0 : m;
+}
+
+void ui_scroll_init(ui_scroll_t *s, int row_px, int view_px, int content_px)
+{
+    if (!s) return;
+    s->row_px     = row_px  > 0 ? row_px  : 1;
+    s->view_px    = view_px > 0 ? view_px : 1;
+    s->content_px = content_px;
+    s->anchor     = 0;
+    s->base_off   = s->off;
+    s->dragging   = false;
+    s->pressed    = false;
+    s->sub        = 0;
+    s->snapping   = false;
+    s->fling      = 0.0f;
+    s->last_axis  = 0;
+    if (s->off < 0) s->off = 0;
+    int m = ui_scroll_max(s);
+    if (s->off > m) s->off = m;
+}
+
+void ui_scroll_set_content(ui_scroll_t *s, int content_px)
+{
+    if (!s) return;
+    s->content_px = content_px;
+    int m = ui_scroll_max(s);
+    if (s->off > m) s->off = m;
+    if (s->off < 0) s->off = 0;
+}
+
+/* ★ 2026-11-23: 标准"内容/几何变化"入口（见头文件）。 */
+bool ui_scroll_update(ui_scroll_t *s, int row_px, int view_px, int content_px)
+{
+    if (!s) return false;
+    if (row_px  <= 0) row_px  = 1;
+    if (view_px <= 0) view_px = 1;
+
+    bool geom = (s->row_px != row_px) || (s->view_px != view_px);
+    bool cont = (s->content_px != content_px);
+    if (!geom && !cont) return false;
+
+    if (geom) {
+        /* 行高/视口变了 ⇒ 映射整体变化。若正在手势中，只换参数、保留手势
+         * （吸附目标作废），否则按常规重配。 */
+        if (s->dragging || s->pressed) {
+            s->row_px     = row_px;
+            s->view_px    = view_px;
+            s->content_px = content_px;
+            s->snapping   = false;
+            s->sub        = 0;
+            int m = ui_scroll_max(s);
+            if (s->off > m) s->off = m;
+            if (s->off < 0) s->off = 0;
+            return true;
+        }
+        ui_scroll_init(s, row_px, view_px, content_px);
+        return true;
+    }
+    /* 只有条目数/内容长度变了 ⇒ 软更新: 不动 pressed/dragging/fling/吸附目标 */
+    ui_scroll_set_content(s, content_px);
+    return true;
+}
+
+/* ★ 2026-11-23: 外部定位标准入口（见头文件）。 */
+bool ui_scroll_set_offset(ui_scroll_t *s, int off)
+{
+    if (!s) return false;
+    if (s->dragging || s->pressed) return false;   /* 手势优先, 不打断用户 */
+    int m = ui_scroll_max(s);
+    if (off < 0) off = 0;
+    if (off > m) off = m;
+    bool ch = (s->off != off) || (s->sub != 0);
+    s->off      = off;
+    s->sub      = 0;
+    s->fling    = 0.0f;
+    s->snapping = false;
+    return ch;
+}
+
+void ui_scroll_to_top(ui_scroll_t *s)
+{
+    if (!s) return;
+    s->off = 0;
+    s->sub = 0;
+    s->fling = 0.0f;
+    s->snapping = false;
+    s->dragging = false;
+    s->pressed = false;
+    s->anchor = s->last_axis = 0;
+}
+
+void ui_scroll_cancel(ui_scroll_t *s)
+{
+    if (!s) return;
+    s->fling = 0.0f;
+    s->sub = 0;
+    s->snapping = false;
+    s->dragging = false;
+    s->pressed = false;
+    s->anchor = s->last_axis = 0;
+}
+
+bool ui_scroll_dragging(const ui_scroll_t *s) { return s && s->dragging; }
+
+bool ui_scroll_busy(const ui_scroll_t *s)
+{
+    if (!s) return false;
+    return s->dragging || s->sub != 0 || s->snapping ||
+           (s->fling > FLING_MIN || s->fling < -FLING_MIN);
+}
+
+int ui_scroll_offset(const ui_scroll_t *s)
+{
+    if (!s) return 0;
+    return s->off + s->sub;
+}
+
+int ui_scroll_first_row(const ui_scroll_t *s)
+{
+    if (!s) return 0;
+    int step = snap_step(s);
+    if (step <= 0) step = 1;
+    int o = ui_scroll_offset(s);
+    return o > 0 ? (o / step) : 0;
+}
+
+/* ★★★ 2026-11-23: 命中判定的唯一正确反算（见头文件注释）。
+ *   与应用中心渲染 am_col_present(): src_y = lroundf(相机行 * row_h) 完全同源，
+ *   相机是小数行时也不会差行 —— 修「滑动后点击打开了相邻的应用」。 */
+int ui_scroll_row_at(int y, int content_top, int off_px, int row_h, int extra_top)
+{
+    if (row_h <= 0) return -1;
+    int dy = off_px + (y - content_top) - extra_top;
+    if (dy < 0) return (dy + row_h > 0) ? 0 : -1;   /* 顶行上沿的内边距仍算第 0 行 */
+    return dy / row_h;
+}
+
+bool ui_scroll_ensure_visible(ui_scroll_t *s, int item_y, int item_h)
+{
+    if (!s) return false;
+    if (item_h < 1) item_h = 1;
+    int m = ui_scroll_max(s);
+    if (m <= 0) return false;
+    int want = s->off;
+    if (item_y < s->off) {
+        want = item_y;
+    } else if (item_y + item_h > s->off + s->view_px) {
+        want = item_y + item_h - s->view_px;
+    }
+    if (want < 0) want = 0;
+    if (want > m) want = m;
+    if (want == s->off) return false;
+    s->off = want;
+    s->sub = 0;
+    s->fling = 0.0f;
+    s->snapping = false;     /* 直接改 off ⇒ 丢弃未完成的吸附 */
+    return true;
+}
+
+bool ui_scroll_touch(ui_scroll_t *s, int y, bool down)
+{
+    return ui_scroll_touch_xy(s, 0, y, down);
+}
+
+bool ui_scroll_touch_xy(ui_scroll_t *s, int x, int y, bool down)
+{
+    if (!s) return false;
+    s->last_touch_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    const int a = axis_of(s, x, y);
+
+    /* ---- 松手 ---- */
+    if (!down) {
+        bool was = s->dragging;
+        s->dragging  = false;
+        s->pressed   = false;
+        s->anchor    = 0;
+        s->last_axis = 0;
+        if (s->flags & UI_SCROLL_F_NO_FLING) s->fling = 0.0f;
+        return was;            /* 交给 ui_scroll_poll() 走惯性/回弹/吸附 */
+    }
+
+    /* ---- 按下 ---- */
+    if (!s->pressed) {
+        s->pressed   = true;
+        s->anchor    = a;
+        s->base_off  = s->off;
+        s->last_axis = a;
+        s->dragging  = false;
+        s->fling     = 0.0f;
+        s->sub       = 0;
+        return false;
+    }
+
+    /* ---- 移动 ---- */
+    int moved = a - s->anchor;
+    if (moved < 0) moved = -moved;
+    if (!s->dragging && moved >= DRAG_THRESH) {
+        s->dragging  = true;
+        s->base_off  = s->off;      /* 从越过阈值这一刻重新起算, 避免前 12px 跳一下 */
+        s->anchor    = a;
+        s->last_axis = a;
+        s->snapping  = false;       /* 用户接手 ⇒ 丢弃未完成的吸附 */
+    }
+    if (!s->dragging) return false;
+
+    /* 惯性速度: 主轴减小(手指上滑/左滑) ⇒ 内容前进 ⇒ off 增大 */
+    int d = a - s->last_axis;
+    s->last_axis = a;
+    if (!(s->flags & UI_SCROLL_F_NO_FLING)) {
+        s->fling = s->fling * 0.45f + (float)(-d) * 0.55f;
+        if (s->fling >  FLING_MAX) s->fling =  FLING_MAX;
+        if (s->fling < -FLING_MAX) s->fling = -FLING_MAX;
+    }
+
+    /* 跟手: 越界不硬夹零, 超出部分记进 sub 交给松手回弹 */
+    int raw = s->base_off - (a - s->anchor);
+    int m   = ui_scroll_max(s);
+    int old_off = s->off, old_sub = s->sub;
+
+    if (s->flags & UI_SCROLL_F_LOOP) {
+        /* 循环: 位移直接绕回, 不留余量 */
+        if (m > 0) {
+            while (raw < 0)   raw += m;
+            while (raw > m)   raw -= m;
+        } else raw = 0;
+        s->off = raw;
+        s->sub = 0;
+    } else if (s->flags & UI_SCROLL_F_NO_BOUNCE) {
+        /* 硬边界: 直接夹紧, 拉不动 */
+        s->off = raw < 0 ? 0 : (raw > m ? m : raw);
+        s->sub = 0;
+    } else {
+        int lim = s->view_px / 2;   /* 最多拉出半屏 */
+        if (raw < 0)      { s->off = 0; s->sub = raw; if (s->sub < -lim) s->sub = -lim; }
+        else if (raw > m) { s->off = m; s->sub = raw - m; if (s->sub > lim) s->sub = lim; }
+        else              { s->off = raw; s->sub = 0; }
+    }
+    return (s->off != old_off) || (s->sub != old_sub);
+}
+
+bool ui_scroll_poll(ui_scroll_t *s)
+{
+    if (!s) return false;
+
+    /* ★★★ 2026-10-25 组件级兜底: 600ms 没收到任何触摸却还挂着 pressed
+     *   ⇒ 手指早就不在了(页面被切走 / 事件丢失)。不清的话下次进页面第一次拖动
+     *   会沿用旧基准点(base_off/anchor) ⇒ 一上手就弹回原位。
+     *   放在这里而不是每个页面的 on_exit，一次修全部调用方。 */
+    if (s->pressed && s->last_touch_ms &&
+        (uint32_t)(esp_timer_get_time() / 1000) - s->last_touch_ms > TOUCH_IDLE_MS) {
+        s->pressed = false;
+        s->dragging = false;
+        s->anchor = 0;
+        s->fling = 0.0f;
+    }
+
+    if (s->dragging) return false;
+    bool changed = false;
+
+    /* ---- 1) 惯性滑行 ---- */
+    if (s->fling > FLING_MIN || s->fling < -FLING_MIN) {
+        int step = (int)s->fling;
+        if (step == 0) step = (s->fling > 0) ? 1 : -1;
+        int m  = ui_scroll_max(s);
+        int ns = s->off + step;
+
+        if ((s->flags & UI_SCROLL_F_LOOP) && m > 0) {
+            while (ns < 0) ns += m;
+            while (ns > m) ns -= m;
+            s->off = ns;
+        } else if (ns < 0) {
+            if (s->flags & UI_SCROLL_F_NO_BOUNCE) { s->off = 0; s->sub = 0; }
+            else                                  { s->sub += ns; s->off = 0; }
+            s->fling = 0.0f;
+        } else if (ns > m) {
+            if (s->flags & UI_SCROLL_F_NO_BOUNCE) { s->off = m; s->sub = 0; }
+            else                                  { s->sub += ns - m; s->off = m; }
+            s->fling = 0.0f;
+        } else {
+            s->off = ns;
+        }
+        s->fling *= FLING_DECAY;
+        if (s->fling < FLING_MIN && s->fling > -FLING_MIN) s->fling = 0.0f;
+        changed = true;
+    }
+
+    /* ---- 2) 越界回弹 ---- */
+    if (!(s->flags & UI_SCROLL_F_NO_BOUNCE) && s->fling == 0.0f && s->sub != 0) {
+        s->sub = (int)((float)s->sub * BOUNCE_DECAY);
+        if (s->sub > -BOUNCE_MIN && s->sub < BOUNCE_MIN) s->sub = 0;
+        changed = true;
+    }
+
+    /* ---- 3) 吸附（LIST 行 / PAGE 页；PIXEL 不吸附）----
+     * ★ 2026-10-28 改成缓动: 原来一帧就 off=snap(瞬跳)，现在是每帧走剩余
+     *   距离的 1/SNAP_DIV，约 3~4 帧停稳。惯性/回弹期间(fling!=0 或 sub!=0)
+     *   不吸附，等它俩归零后才开始贴行 —— 否则会被惯性拽着反复改目标。 */
+    int step_snap = snap_step(s);
+    if (s->fling == 0.0f && s->sub == 0 && step_snap > 1) {
+        if (s->flags & UI_SCROLL_F_SNAP_INSTANT) {
+            /* ★★★ 2026-10-28 linit「硬件管理上下拖动一直闪、卡回去」根因修复 ★★★
+             *   弹窗列表把偏移反算成 sel = off / 行高(整除) + scroll_px 再做渲染.
+             *   吸附一旦改成逐帧缓动, off 在中途会跨过行高整数倍 ⇒ sel 在两行之间
+             *   反复跳 ⇒ 高亮块跟着闪; 松手后缓动目标又被下一帧的重算覆盖 ⇒ "卡回去".
+             *   所以**带镜像反算的调用方(弹窗列表)必须用瞬跳**, 让 off 一次落到行边界,
+             *   sel 只变一次。其它 7 个页面没有镜像反算, 继续用缓动。 */
+            int half = step_snap / 2;
+            int snap = ((s->off + half) / step_snap) * step_snap;
+            int m = ui_scroll_max(s);
+            if (snap > m) snap = m;
+            if (snap < 0) snap = 0;
+            s->snapping = false;
+            if (snap != s->off) { s->off = snap; changed = true; }
+        } else {
+            if (!s->snapping) {
+                int half = step_snap / 2;
+                int snap = ((s->off + half) / step_snap) * step_snap;
+                int m = ui_scroll_max(s);
+                if (snap > m) snap = m;
+                if (snap < 0) snap = 0;
+                if (snap != s->off) { s->snap_to = snap; s->snapping = true; }
+            }
+            if (s->snapping) {
+                int d = s->snap_to - s->off;
+                if (d >= -SNAP_MIN && d <= SNAP_MIN) {
+                    s->off      = s->snap_to;    /* 收敛 */
+                    s->snapping = false;
+                } else {
+                    int step = d / SNAP_DIV;
+                    if (step == 0) step = (d > 0) ? 1 : -1;
+                    s->off += step;
+                }
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+/* 统一滚动条: 1px 主线 + 两端 6px 点阵渐隐（视觉铁律: 不画整条实线）。
+ * 内容不足一屏 ⇒ 什么都不画（"没有滚动条"本身就是"这页不用滚"）。
+ *
+ * ★ 2026-11-22: 拆出 drawbar_px —— 电子书阅读器竖屏时把画面画在**自有 1bpp 缓冲**
+ *   (pfb, 与 lcd->fb 的 4bit 竖排编码完全不同), 没法走 st7305_draw_pixel。
+ *   以前它只能自己写一套 20px 宽"Windows 式"滚动条(违反本文件开头定的视觉铁律),
+ *   现在传一个像素回调就能复用同一套比例/样式, 全项目仍然只有一份滚动条实现。 */
+static void bar_px_lcd(void *ud, int x, int y, bool black)
+{
+    st7305_draw_pixel((st7305_handle_t *)ud, x, y,
+                      black ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+}
+
+void ui_scroll_drawbar(const ui_scroll_t *s, void *lcd, int a0, int a1, int a2)
+{
+    if (!lcd) return;
+    ui_scroll_drawbar_px(s, a0, a1, a2, bar_px_lcd, lcd);
+}
+
+void ui_scroll_drawbar_px(const ui_scroll_t *s, int a0, int a1, int a2,
+                          ui_scroll_px_fn fn, void *ud)
+{
+    if (!s || !fn) return;
+    int m = ui_scroll_max(s);
+    if (m <= 0) return;
+    bool horiz = (s->flags & UI_SCROLL_F_HORIZ) != 0;
+
+    int track = a2 - a1;
+    if (track < 8) return;
+
+    int thumb = track * s->view_px / s->content_px;
+    if (thumb < 6) thumb = 6;
+    if (thumb > track) thumb = track;
+    int travel = track - thumb;
+    int pos = travel * s->off / m;
+    int t0 = a1 + pos;
+    int t1 = t0 + thumb;
+
+    if (horiz) {
+        for (int x = t0; x < t1; x++) fn(ud, x, a0, true);
+        for (int i = 1; i <= 6; i++) {
+            if ((i % 2) == 0) {
+                if (t0 - i >= a1) fn(ud, t0 - i, a0, true);
+                if (t1 + i <= a2) fn(ud, t1 + i, a0, true);
+            }
+        }
+    } else {
+        for (int y = t0; y < t1; y++) fn(ud, a0, y, true);
+        for (int i = 1; i <= 6; i++) {
+            if ((i % 2) == 0) {
+                if (t0 - i >= a1) fn(ud, a0, t0 - i, true);
+                if (t1 + i <= a2) fn(ud, a0, t1 + i, true);
+            }
+        }
+    }
+}

@@ -1,0 +1,8 @@
+# V2.x 内存精简: 整库 BSS/common 段搬到 PSRAM (IDF 内置 extram_bss 方案)。
+# 本组件的 .bss 主要是字库点阵索引缓存 (s_zh_b0_cnt/start, s_zh16_* 等, 约 2.3KB)。
+# 需 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y (本项目已开)。
+[mapping:fonts_extram_bss]
+archive: libfonts.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
