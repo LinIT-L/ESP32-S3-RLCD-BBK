@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "app_id": "com.lintos.wifidict",
+  "name": "WiFiDict",
+  "label": "Wi-Fi 字典工具",
+  "description": "离线字典文件管理与随机测试字符串生成；不联网、不含认证尝试",
+  "category": "运维",
+  "package_type": "app",
+  "runtime": "lua",
+  "entry": "app/entry.lua",
+  "version": "1.1.0",
+  "build": "202611081022",
+  "author": "linit",
+  "icon": "icon.bin",
+  "data_policy": "preserve",
+  "min_firmware": "2.0.0"
+}
