@@ -1,0 +1,2668 @@
+/**
+ * remcon.c — 串口远程控制台实现.
+ *
+ * 命令格式 (一行一命令, 一行内可用 ';' 分隔多条, 大小写不敏感):
+ *   hello                        → 回 SHOOT "REMOCON_READY <api>" (握手, PC 判定就绪)
+ *   echo <text>                  → 回显 text
+ *   help                         → 列出全部命令
+ *   reboot | reset               → esp_restart()
+ *   loglevel <0..5>              → 设置全局日志级别 (0=无 5=详细)
+ *   heap                         → 打印 内部/PSRAM 空闲 + 最大块
+ *   stack                        → 打印本任务栈高水位 (排障栈溢出用)
+ *   uptime                       → 开机时长 (s)
+ *   tasks                        → 全部任务名/状态/栈水位 (vTaskList)
+ *   ls <dir>                     → 列目录 (默认 /sdcard)
+ *   cat <file>                   → 打印文本文件前 400 行
+ *   rm <file>                    → 删除文件 (清坏配置/日志)
+ *   cp <src> <dst>               → 复制文件 (日志转存备份)
+ *   diag                         → 综合诊断: uptime+内存+任务栈表+根目录
+ *   page                         → 列出全部可用页面 id
+ *   page <id>                    → 打开指定页面 (os_push)
+ *   app <lua path>               → 直接拉起 Lua 应用 (等价应用管家点击, 供自动化回归)
+ *   key <action>                 → 注入按键动作 (os_handle_action)
+ *   tap <x> <y>                  → 注入触摸点击 (os_handle_touch)
+ *   fbinfo                       → 帧缓冲指针/字节数/CRC (确认抓屏是否可用)
+ *   fbdump                       → **抓屏**: 把 400×300 1bpp 帧缓冲以 base64 打印
+ *                                  (主机侧 tools/fb_png.py 解码成 PNG)
+ *   audio                        → 音频链路诊断: 音量/静音/功放/平台/I2S 状态 + ES8311 全寄存器回读
+ *                                  (排查"芯片认到了但没声音"; 输出带 ADIAG / ESREG 前缀)
+ *   vol [0-100]                  → 读音量; 带参数则现场设音量 (分辨"音量=0"还是"通路没开")
+ *   esr <reg>                    → 回读 ES8311 单个寄存器
+ *   esw <reg> <val>              → 写 ES8311 寄存器 (现场试听定位)
+ *   es7 [reg]                    → 回读 **ES7210**(麦克风 ADC) 寄存器; 不带参数 = 全量 0x00~0x4C
+ *   es7w <reg> <val>             → 写 ES7210 寄存器
+ *   mic [ms]                     → **麦克风链路一条龙诊断**: 起麦(16k)→连抓样点→报 peak/min/max/rms
+ *                                  (分离"起麦失败" / "样点恒 0" / "样点极弱" 三种故障)
+ *   beep [freq] [ms]             → **纯音测试**: 绕过 MP3/解码/SD 直接让 codec 出声,
+ *                                  用来一刀切开"固件问题"与"喇叭/功放硬件问题"
+ *   gps                          → GPS 电源状态 (待机 46µA / 跟踪 ~10mA) + 引脚
+ *   wifi [on|off|status|conn|set &lt;ssid&gt; &lt;pass&gt;]
+ *                                → 射频开关 / 状态 / 用 NVS 已存配置连 / **写入凭据并连接**
+ *                                  (set 是"掌机上打密码太痛苦"的免打字配网入口)
+ *   pm                           → 电源管理诊断: DFS 目标频率 + **PM 锁表**
+ *                                  (有 API 锁=降不了频, 有 SLEEP 锁=进不了浅睡)
+ *   nes <path>                   → 直接拉起 NES ROM (自动复现崩溃)
+ *   scan                         → 扫描 /sdcard/nes 下列出 .nes
+ *   wait <ms>                    → 读任务 sleep ms (脚本节奏)
+ *
+ * 页面 id 名映射数名同 os_page_t, 见 s_pages 表.
+ * 动作名同 os_action_t, 见 s_actions 表 (如 confirm/back/home/up/down/left/right).
+ *
+ * ==== fbdump 的数据格式 (主机侧解码依据) ====
+ * ST7305 帧缓冲不是逐行 1bpp, 而是面板原生的"2 列 × 4 行 / 字节"打包 (见 st7305_draw_pixel):
+ *     idx = (x >> 1) * 75 + ((299 - y) >> 2)        // 75 = H/4 列内 stride, 200 个字节列
+ *     bit = 7 - ((((299 - y) & 3) << 1) | (x & 1))
+ *     位 = 1 → 白(背景), 位 = 0 → 黑(笔画)
+ * 共 200 × 75 = 15000 字节。y 是上下翻转的 (字节行 0 在屏幕最底部)。
+ * 输出:
+ *     FB_BEGIN 400 300 15000 <crc32-8hex>\\r\\n
+ *     <base64 每行 76 字符>\\r\\n
+ *     FB_END\\r\\n
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <math.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <time.h>      /* ★ 2026-11-21 rtcdump: gmtime_r 拆 UTC 时间 */
+#include "sd_scan.h"   /* sd_is_mounted: logsave 前判断卡是否挂着 */
+#include "svc_log.h"   /* svc_log_flush_once(): logsave 要按真实返回值报告 (2026-10-29) */
+#include "svc_logring.h"   /* crash 命令顺带打崩溃前日志环 (2026-11-22) */
+#include "svc_crash.h" /* ★ 2026-11-22: crash 命令 (读取上次 panic 现场) */
+#include "bt_manager.h"     /* ★ 2026-10-27: bt 命令诊断用 */
+#include "lpk1.h"           /* ★ 2026-11-01: lpk 命令 (自包含包读取自检) */
+#include "lpk_vfs.h"        /* ★ 2026-11-01: lpkv 命令 (/lpk 挂载 + 真机自检) */
+#include "lpk_mode.h"
+#include "am_lpkg.h"        /* ★ 2026-11-01: lpkinst/lpklist/lpkrm */       /* ★ 2026-11-01: lpkmode 命令 (模式判定 / 安装记录) */
+#include "os.h"             /* ★ 2026-11-01: apps 命令 (桌面图标归属诊断) */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/idf_additions.h"   /* ★ 2026-11-23: xTaskCreateWithCaps (rc_put 栈必须内部 RAM) */
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "esp_rom_crc.h"
+#include "mbedtls/base64.h"
+#include "remcon.h"
+#include "hw_cfg.h"
+#include "gps.h"        /* remcon gps: 电源/引脚 */
+#include "gps_nmea.h"   /* remcon gps: 定位快照 + 链路统计 */
+#include "svc_nvs.h"
+#include "wallpapers.h"   /* remcon wpss: 现场改息屏时长 */
+#include "os_sources.h"   /* ★ 2026-11-08: store src 私有源 */
+#include "espnow_link.h"   /* remcon `now` 命令: ESP-NOW 现场诊断 */
+#include "nes_emu.h"
+#include "st7305.h"      /* 抓屏: 帧缓冲布局 + 面板尺寸 */
+#include "os_hw.h"       /* wifi 命令: 走资源管家开/关射频 (与页面同一记账) */
+#include "driver/gpio.h"
+#include "board_pins.h"     /* ★ 2026-11-21: pbsim 要取本板 btn_pwr 的真实脚号 */
+#include "driver/i2c_master.h"
+
+void rc_touch_scan(void);   /* 定义在文件末尾: 触摸 I2C 总线扫描 */
+#include "wifi_manager.h"
+#include "input.h"   /* input_mark_activity(): remcon 注入按键也算"有人在用" */
+#include "audio_player.h"  /* audio/vol: 音频链路诊断 + 音量现场调节 (2026-10-09) */
+#include "es8311.h"        /* esr/esw: ES8311 寄存器现场回读/改写 */
+#include "es7210.h"        /* es7/es7w/mic: ES7210 (麦克风 ADC) 寄存器回读 + 录音链路诊断 */
+#include "tone_player.h"   /* beep: 纯音测试 (绕过 MP3/解码/SD, 分离固件 vs 喇叭硬件) */
+#include "svc_backup.h"    /* bkp: 通用备份策略服务的现场验证入口 (2026-11-22) */
+#include "gps.h"           /* gps: 查 GPS 电源状态 (待机 46µA / 跟踪 ~10mA) */
+#include "esp_pm.h"        /* pm: 打印 PM 配置 + 锁表 (看 DFS/浅睡是否被驱动锁住) */
+#include "power_mgr.h"     /* sleepstage: 分阶段功耗诊断掩码 (2026-10-28 从 sleep.h 迁出) */
+#include "ltc2954.h"       /* ★ 2026-11-20 hwoff: 硬件关机开关现场切换/查状态 (真断电 vs 深睡) */
+#include "board_battery.h" /* bat: 电池 raw/脚上mV/分压系数/VBAT 现场核对 (2026-10-14) */
+#include "svc_time.h"      /* timed: 时间服务状态诊断 (2026-11-01) */
+#include "svc_rtc.h"       /* ★ 2026-11-21 rtcset: 手动写 DS3231 并清 OSF(断电保持验证) */
+#include "am_store_json.h"   /* ★ am_rpkg_t (storedl 命令用) */
+#include "min_boot.h"        /* ★ 2026-11-08 最小系统: minboot / add 命令 */
+
+#define RC_TAG      "remcon"
+#define RC_LINE_MAX 256
+#define RC_QUEUE_LEN 32
+
+/* ---- 注入命令类型 ---- */
+enum { RC_KEY = 1, RC_TAP, RC_PAGE, RC_APP };
+typedef struct {
+    uint8_t type;
+    int a;   /* key=os_action_t / page=os_page_t ; tap=x */
+    int b;   /* tap=y */
+} rc_cmd_t;
+
+static QueueHandle_t s_q;
+
+/* RC_APP 的参数暂存 (Lua 脚本路径). 队列是异步派发的, 用静态缓冲避免动态分配;
+ * 一次只会拉起一个应用, 无并发写。 */
+static char s_rc_app_path[128];
+
+/* 主屏句柄 (main.c 在 LCD 初始化后经 remcon_set_lcd 绑定) —— 抓屏命令用 */
+static st7305_handle_t *s_lcd;
+
+/* ST7305 帧缓冲字节数 = W/2 个字节列 × H/4 行 = 200 × 75 = 15000 */
+#define RC_FB_BYTES  ((ST7305_WIDTH / 2) * (ST7305_HEIGHT / 4))
+
+void remcon_set_lcd(void *lcd) { s_lcd = (st7305_handle_t *)lcd; }
+
+/* ===== 页面 id 名映射 (与 os.h 的 os_page_t 一一对应, 便于全功能测试) ===== */
+static const struct { const char *name; os_page_t page; } s_pages[] = {
+    {"main", OS_PAGE_MAIN},
+    {"select_game", OS_PAGE_SELECT_GAME},
+    {"settings", OS_PAGE_SETTINGS},
+    {"gamepad", OS_PAGE_GAMEPAD},
+    /* ★ 2026-11-24: 删除 display/time/bt/sd/info/btinfo/key_config/volume/return_game/
+     *   game_settings/meshtasic 共 11 条 —— 这些页面 id 早已没有模块注册 (设置项改成设置页
+     *   内的弹窗), `page display` 之类只会打 "not registered" 然后什么都不做, 属无效入口。 */
+    {"mp3", OS_PAGE_MP3_PLAYER},
+    {"gb", OS_PAGE_GB_GAME},
+    {"book", OS_PAGE_BOOK},
+    {"wallpaper", OS_PAGE_WALLPAPER},
+    {"pomodoro", OS_PAGE_POMODORO},
+    {"usb_hid", OS_PAGE_USB_HID},
+    {"app_manager", OS_PAGE_APP_MANAGER},
+    {"storage", OS_PAGE_STORAGE},
+    {"gbc", OS_PAGE_GBC_GAME},
+    {"nes", OS_PAGE_NES_GAME},
+    {"md", OS_PAGE_MD_GAME},
+    {"sms", OS_PAGE_SMS_GAME},
+    {"arduboy", OS_PAGE_ARDUBOY_GAME},
+    {"diagnosis", OS_PAGE_DIAGNOSIS},
+    {"wqx", OS_PAGE_WQX},
+    {"vpet", OS_PAGE_VPET},
+    {"pal", OS_PAGE_PAL},   /* 仙剑: 抓屏/回归要用 (之前只能从桌面点图标) */
+    {"whiteboard", OS_PAGE_WHITEBOARD},
+    {"terminal", OS_PAGE_TERMINAL},
+    {"sponsor", OS_PAGE_SPONSOR},
+    {"usb_bt", OS_PAGE_USB_BT},
+    {"usb_net", OS_PAGE_USB_NET},
+    {"winassist", OS_PAGE_WINASSIST},
+    {"modtool", OS_PAGE_MODTOOL},
+    {"logdiag", OS_PAGE_LOGDIAO},
+    {"calc", OS_PAGE_CALC},
+    {"wifiprobe", OS_PAGE_WIFIPROBE},
+    {"morse", OS_PAGE_MORSE},
+    {"netdect", OS_PAGE_NETDECT},
+    {"fav", OS_PAGE_FAV},
+    { "sdr",        OS_PAGE_SDR },      /* 频谱仪 (2026-10-01 新增, 便于远程 page sdr 驱动) */
+};
+
+/* ===== 动作名映射 ===== */
+static const struct { const char *name; os_action_t act; } s_actions[] = {
+    {"up", OS_ACTION_UP},
+    {"down", OS_ACTION_DOWN},
+    {"left", OS_ACTION_LEFT},
+    {"right", OS_ACTION_RIGHT},
+    {"confirm", OS_ACTION_CONFIRM},
+    {"enter", OS_ACTION_CONFIRM},
+    {"ok", OS_ACTION_CONFIRM},
+    {"back", OS_ACTION_BACK},
+    {"cancel", OS_ACTION_BACK},
+    {"home", OS_ACTION_HOME},
+    /* 2026-10-02: 加锁屏动作 —— 否则**远程无法进入屏保**,
+     * "屏保按一次键不返回"这类 bug 就设法远程回归(输入注入不走 input 层, 不会自己进屏保)。 */
+    {"lock",   OS_ACTION_POWER_LOCK},
+    {"unlock", OS_ACTION_POWER_RELEASE},
+    {"long_left", OS_ACTION_LONG_LEFT},
+    {"long_press", OS_ACTION_LONG_PRESS},
+    {"fav", OS_ACTION_KEY_FAV},
+    {"power_lock", OS_ACTION_POWER_LOCK},
+    {"power_hint", OS_ACTION_POWER_HINT},
+    {"power_release", OS_ACTION_POWER_RELEASE},
+    {"bt_search", OS_ACTION_BT_SEARCH},
+};
+
+/* ===== 字符串工具 ===== */
+static void rc_lower(char *s){ for (; *s; s++) *s = (char)tolower((unsigned char)*s); }
+/* 取下一个 token (以空白分隔), 修改 s, 返回 token 或 NULL; head=返回指向下一段的指针 */
+static char *rc_next(char **rest){
+    char *s = *rest;
+    if (!s) return NULL;
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (!*s) { *rest = NULL; return NULL; }
+    char *tok = s;
+    while (*s && !isspace((unsigned char)*s)) s++;
+    if (*s) { *s = 0; *rest = s + 1; } else *rest = NULL;
+    return tok;
+}
+
+/* ===== 麦克风链路诊断 (2026-10-14) =====
+ * 小智模块是 **ES8311(喇叭 DAC) + ES7210(麦克风 ADC) 两颗独立芯片**, 共一条 I2S 总线:
+ *   "ES7210 初始化完成" 只证明 **I2C 通**, 完全不代表 ADC 有数据往 ESP32 送。
+ * 本命令把"有没有数据"和"数据是什么"一次量出来 —— 只报事实, 不做推断。 */
+static void rc_mic_probe(int ms)
+{
+    static int16_t *buf;
+    /* ⚠ 需求字节 = frames × 2(立体声) × 2(int16) = frames × 4 —— 申请时别漏了立体声那 2 倍,
+     *   否则 audio_player_mic_read() 会往堆里多写 8KB (我第一版就踩了, 直接 StoreProhibited)。 */
+    if (!buf) buf = heap_caps_malloc(4096 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!buf) { printf("MIC_ERR no mem\r\n"); return; }
+
+    bool was = audio_player_mic_active();
+    if (!was && audio_player_mic_start(16000) != 0) {
+        printf("MIC_ERR start fail (es7210 addr=0x%02X)\r\n", es7210_address());
+        return;
+    }
+    int64_t t0 = esp_timer_get_time() / 1000;
+    long n = 0;
+    int64_t ss = 0;                      /* ⚠ 必须 64 位: 32767² × 40960 早已超 int32 (ESP32 的 long) */
+    int pk = 0, mn = 0, mx = 0, reads = 0, empty = 0;
+    /* 分声道统计: ES7210 非 TDM 时 SDOUT1 左槽 = MIC1 / 右槽 = MIC2,
+     * 两路幅度差很多 ⇒ 说明只焊了一个咪头(另一个槽是空脚/噪声)。 */
+    long ln = 0, rn = 0;
+    int64_t lss = 0, rss = 0, ldc = 0, rdc = 0;
+    int lpk = 0, rpk = 0;
+    while (esp_timer_get_time() / 1000 - t0 < ms) {
+        int g = audio_player_mic_read(buf, 4096, 50);
+        if (g <= 0) { empty++; continue; }
+        reads++;
+        for (int k = 0; k < g; k++) {
+            int vl = buf[2 * k], vr = buf[2 * k + 1];
+            ldc += vl; rdc += vr;
+            lss += (int64_t)vl * vl; rss += (int64_t)vr * vr;
+            int al = vl < 0 ? -vl : vl;
+            int ar = vr < 0 ? -vr : vr;
+            if (al > lpk) lpk = al;
+            if (ar > rpk) rpk = ar;
+            ln++; rn++;
+            if (vl < mn) mn = vl;
+            if (vl > mx) mx = vl;
+            if (vr < mn) mn = vr;
+            if (vr > mx) mx = vr;
+            int a = al > ar ? al : ar;
+            if (a > pk) pk = a;
+            ss += (int64_t)vl * vl + (int64_t)vr * vr;
+            n += 2;
+        }
+    }
+    printf("MIC addr=0x%02X %ldms n=%ld reads=%d empty=%d peak=%d min=%d max=%d rms=%ld\r\n",
+           es7210_address(), (long)(esp_timer_get_time() / 1000 - t0), n, reads, empty,
+           pk, mn, mx, n ? (long)sqrtf((float)((double)ss / (double)n)) : -1L);
+    printf("MICCH L(dBFS)=%.1f rms=%ld dc=%ld peak=%d | R(dBFS)=%.1f rms=%ld dc=%ld peak=%d\r\n",
+           ln ? 20.0f * log10f(sqrtf((float)((double)lss / (double)ln)) / 32768.0f + 1e-9f) : -99.0f,
+           ln ? (long)sqrtf((float)((double)lss / (double)ln)) : -1L, ln ? (long)(ldc / ln) : 0L, lpk,
+           rn ? 20.0f * log10f(sqrtf((float)((double)rss / (double)rn)) / 32768.0f + 1e-9f) : -99.0f,
+           rn ? (long)sqrtf((float)((double)rss / (double)rn)) : -1L, rn ? (long)(rdc / rn) : 0L, rpk);
+    if (!was) audio_player_mic_stop();
+}
+
+/* ===== 立即执行 (在字符串读任务上下文, 不外发到 UI) =====
+ * 注意: 必须在内部复制一份再用 —— 调用方 rc_exec 里的 buf 已被 rc_next 在
+ * 命令名后写过 '\0', 直接传进去会丢掉后面所有参数(如 "shutdown auto" 变成 "shutdown")。 */
+extern bool board_battery_calibrate(uint32_t real_mv);   /* ★ 电池分压标定 */
+
+/* ★ 2026-10-27: GPS 诊断/送睡的任务壳 —— 见调用处注释(remcon 栈不够, 会溢出重启) */
+static void rc_task_gpsdiag(void *arg)
+{
+    extern void gps_diag(void);
+    (void)arg;
+    gps_diag();
+    printf("GPSDIAG_DONE\r\n");
+    vTaskDelete(NULL);
+}
+static void rc_task_gpssleep(void *arg)
+{
+    extern esp_err_t gps_boot_park(void);
+    extern bool gps_sleep_verified(void);
+    (void)arg;
+    esp_err_t r = gps_boot_park();
+    printf("GPSSLEEP ret=%s verified=%d\r\n", esp_err_to_name(r), (int)gps_sleep_verified());
+    vTaskDelete(NULL);
+}
+
+/* ★★★ 2026-10-28: 关机任务壳 —— 与 gpsdiag 同一个坑。
+ *   实测(2026-10-28): 直接在 remcon 任务里调 os_remote_shutdown → wp_power_off,
+ *   日志打出 "***ERROR*** A stack overflow in task remcon has been detected." 然后复位重启。
+ *   原因: wp_power_off 里要跑 GPS 停靠(装 UART + 听 1.8s + 发 PMREQ + 静默复核)、
+ *   遍历 49 个引脚做 isolate、并且大量日志格式化, remcon 那几 KB 栈根本装不下。
+ *   所以关机必须扔到独立大栈任务里跑(8KB, 深睡路径调用链最深)。 */
+static void rc_task_shutdown(void *arg)
+{
+    int auto_mode = (int)(intptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(200));   /* 先把串口回显送出去, 再开始关外设 */
+    os_remote_shutdown(auto_mode);    /* 不返回 */
+    vTaskDelete(NULL);
+}
+
+static void rc_cmd_immediate(const char *line){
+    char args[RC_LINE_MAX];
+    snprintf(args, sizeof(args), "%s", line);
+    char *rest = args;
+    char cmd[32];
+    const char *c = rc_next(&rest);
+    if (!c) c = "";
+    snprintf(cmd, sizeof(cmd), "%s", c);
+    rc_lower(cmd);
+
+    /* ★ 2026-10-22: 触摸总线诊断 (同步执行, 只读)。必须放这里 ——
+     *   原来加在 rc_cmd_immediate() 里, 那条路不负责分发普通命令 ⇒ 永远 unknown。 */
+    if (strcmp(cmd, "tpscan") == 0) {
+        rc_touch_scan();
+        printf("TPSCAN done\r\n");
+        return;
+    }
+    if (strcmp(cmd, "tpnaked") == 0) {
+        extern void rc_tp_naked(void);
+        rc_tp_naked();
+        return;
+    }
+
+    if (strcmp(cmd, "hello") == 0) {
+        printf("REMOCON_READY v1\r\n");
+    } else if (strcmp(cmd, "keys") == 0) {
+        /* ★ 2026-11-22: 按键现场快照 —— 排"确认/返回按下去没反应"。
+         * 看 level / dir / state 三项即可定性:
+         *   level 恒 0 + dir=1  ⇒ 引脚被别的驱动配成输出(按键读不到)
+         *   level 全 0 + dir=0  ⇒ 上拉丢失/输入通路被切断(hold 或 isolate 残留)
+         *   自愈次数 >0         ⇒ 固件已自动重配过(说明确实发生过整组失效) */
+        input_keys_dump();
+        /* ★ 2026-11-22: 主循环心跳 —— 必查。串口命令由 remcon 独立任务处理, 主循环
+         *   卡死也照样能回命令; 所以"命令能回、按键没反应"要先分清是哪个:
+         *   心跳 +0 ⇒ 主循环停了(触摸 I2C 挂死/某页 poll 死循环), 按键本身没坏;
+         *   心跳 +N ⇒ 主循环在跑, 问题在按键引脚/分发层, 看上面 KEYS 快照定性。 */
+        {
+            extern volatile uint32_t g_os_loop_beat;
+            uint32_t b0 = g_os_loop_beat;
+            vTaskDelay(pdMS_TO_TICKS(300));
+            uint32_t b1 = g_os_loop_beat;
+            ESP_LOGW("RC", "=== 主循环心跳: +%u / 300ms ⇒ %s ===",
+                     (unsigned)(b1 - b0), (b1 == b0) ? "主循环卡死!" : "主循环正常");
+        }
+        /* ★ 2026-11-22: 再打一层 OS 状态 —— 按键"没反应"未必是引脚问题。
+         * 最典型的是**屏保标志残留**: os_screensaver_active() 若在壁纸已退出后仍为 true,
+         * os_handle_action() 每次进来都只做 reset 然后 return, 页面永远收不到动作 ⇒
+         * 表现同样是"确认/返回按了没反应", 且**重启即恢复**。这两项一起看才能定性。 */
+        {
+            int ss = (int)os_screensaver_active();
+            int fb = (int)st7305_get_flush_blocked();
+            ESP_LOGW("RC", "=== OS 状态: page=%d dlg_depth=%d toast=%d 屏保=%d 刷屏门禁=%d ===",
+                     os_current_page(), os_dialog_depth(),
+                     (int)os_dialog_toast_active(), ss, fb);
+            /* ★ 2026-11-22 修: 这行原来是无条件打印, 门禁正常时也照样喊"残留", 会误导排查。
+             *   改成只在真的不一致时输出。 */
+            if (!ss && fb) {
+                ESP_LOGW("RC", "  判读: 屏保=0 但门禁=1 ⇒ 门禁残留(画面冻住, 看着像按键没反应)");
+            } else if (ss && !fb) {
+                ESP_LOGW("RC", "  判读: 屏保=1 但门禁=0 ⇒ 屏保期间未关门禁(省电/残影风险)");
+            }
+        }
+        printf("KEYS done\r\n");
+    } else if (strcmp(cmd, "crash") == 0) {
+        /* ★ 2026-11-22: 读上次崩溃现场（svc_crash 的 RTC/NVS 自留证）。
+         * 串口没接着也能事后查 —— 地址用 addr2line 对照 LinTOS.elf 即可定位。 */
+        svc_crash_rec_t cr;
+        if (!svc_crash_get(&cr)) {
+            printf("CRASH: 无记录\r\n");
+        } else {
+            printf("CRASH rst=%u uptime=%ums\r\n",
+                   (unsigned)cr.reset_reason, (unsigned)cr.uptime_ms);
+            printf("CRASH reason=%s | %s\r\n",
+                   cr.reason[0] ? cr.reason : "?", cr.desc[0] ? cr.desc : "?");
+            printf("CRASH task=%s core=%u exc=%u addr=0x%08x frames=%u\r\n",
+                   cr.task[0] ? cr.task : "?", (unsigned)cr.core, (unsigned)cr.exception,
+                   (unsigned)cr.addr, (unsigned)cr.nframes);
+            for (int i = 0; i < cr.nframes && i < SVC_CRASH_FRAMES; i++)
+                printf("CRASH #%d 0x%08x\r\n", i, (unsigned)cr.frames[i]);
+            printf("CRASH tip: xtensa-esp32s3-elf-addr2line -pfiaC -e LinTOS.elf <addr...>\r\n");
+        }
+        /* ★ 崩溃前日志环：不管有没有崩溃记录都打一遍，这是定位"当时在干什么"的关键 */
+        svc_logring_dump("crash 命令");
+        printf("CRASH done\r\n");
+    } else if (strcmp(cmd, "logring") == 0) {
+        /* 只看日志环（不关心崩溃记录时用） */
+        svc_logring_dump("logring 命令");
+        printf("LOGRING done\r\n");
+    } else if (strcmp(cmd, "logring_clear") == 0) {
+        svc_logring_clear();
+        printf("LOGRING cleared\r\n");
+    } else if (strcmp(cmd, "echo") == 0) {
+        printf("ECHO %s\r\n", rest ? rest : "");
+    } else if (strcmp(cmd, "hwoff") == 0) {
+        /* ★ 2026-11-20 linit: 硬件关机(LTC2954 真断电)开关的现场查看/切换。
+         *   hwoff            只报告当前状态
+         *   hwoff on|1       开  ⇒ 之后的 shutdown/长按 走"拉低 KILL 真断电"
+         *   hwoff off|0      关  ⇒ 回到原深睡路径
+         *   为什么要这个: 开关存在 NVS(hw_off)默认关, 不打开的话
+         *   `shutdown` 永远只是深睡, 硬件断电链路根本没被触发过。 */
+        char *av = rc_next(&rest);
+        if (av && *av) {
+            bool en = (strcmp(av, "on") == 0 || strcmp(av, "1") == 0);
+            ltc2954_set_enabled(en);
+        }
+        printf("HWOFF enabled=%d hw_available=%d (1=真断电 0=深睡)\r\n",
+               (int)ltc2954_is_enabled(), (int)ltc2954_is_hw_available());
+    } else if (strcmp(cmd, "pwrstate") == 0) {
+        /* ★ 2026-11-21 linit「先确认硬件断电是真断还是假睡」:
+         *   两条互相印证的判据 ——
+         *   ① reset 原因: POWERON(1)=真断过电   DEEPSLEEP(8)=只是深睡
+         *   ② last_off_origin: s_off_origin 在 RTC_NOINIT 段, 真断电会丢。
+         *      >=0 = 还留着上次关机的记录 ⇒ RTC 域没掉电 ⇒ 假睡
+         *      -1  = 记录没了 ⇒ 真断电过
+         *   两条一致才可信; 不一致时以 ② 为准(它是掉电的直接证据)。 */
+        esp_reset_reason_t rr = esp_reset_reason();
+        /* reset 原因全表(esp_reset_reason_t 0..15): 原表缺 USB(11), 导致插 USB 复位时
+         *   打印 "reset=11(?)" —— 正是之前误判"关机后被 USB 救回"的那次。 */
+        static const char *RN[] = { "UNKNOWN","POWERON","EXT","SW","PANIC",
+                                    "INT_WDT","TASK_WDT","WDT","DEEPSLEEP","BROWNOUT",
+                                    "SDIO","USB","JTAG","EFUSE","PWR_GLITCH","CPU_LOCKUP" };
+        const char *rn = ((int)rr >= 0 && (int)rr < (int)(sizeof(RN) / sizeof(RN[0])))
+                         ? RN[(int)rr] : "?";
+        int wo = power_mgr_wake_origin();   /* >=0: EXT1 深睡唤醒 & 有本模块关机记录 */
+        printf("PWRSTATE reset=%d(%s) wake_origin=%d hwoff=%d hw_ok=%d\r\n",
+               (int)rr, rn, wo,
+               (int)ltc2954_is_enabled(), (int)ltc2954_is_hw_available());
+        /* ★★★ 2026-11-21 修: 原来的判据是 `rr == POWERON || wo < 0` —— **wo<0 单独就能
+         *   判"真断电", 这是错的**。s_off_origin 在正常开机时本来就是 -1(这次开机还没关过机),
+         *   于是 esp_restart / 崩溃 / USB 复位 全都被报成"真断电", 实测 reset=3(SW) 也照报。
+         *   这条命令正是用来区分"真断电 or 假睡"的, 误报会直接把结论带偏。
+         *   现在的判据只看 reset 原因 —— 只有 POWERON 才证明 RTC 域掉过电:
+         *     POWERON(1)    ⇒ 冷启动, 唯一能证明"真断电"的原因
+         *     DEEPSLEEP(8)  ⇒ 深睡唤醒, 只断 CPU; wo>=0 还能说明是本模块关的机
+         *     SW(3)         ⇒ esp_restart 主动重启, 与断电无关
+         *     PANIC/WDT(4~7)⇒ 崩溃复位
+         *     其它(USB/JTAG)⇒ 下载/调试复位
+         *   wo 仍然打出来, 只作辅助(它证明"上次是不是走深睡关的机")。 */
+        const char *verdict;
+        switch (rr) {
+        case ESP_RST_POWERON:
+            verdict = "真断电 (POWERON: RTC 域已丢失, 冷启动)";
+            break;
+        case ESP_RST_DEEPSLEEP:
+            verdict = (wo >= 0) ? "深睡唤醒 (只断 CPU; 有本周期的关机记录)"
+                                : "深睡唤醒 (只断 CPU; 无本模块关机记录)";
+            break;
+        case ESP_RST_SW:
+            verdict = "软件复位 esp_restart (与断电无关, 不能证明断过电)";
+            break;
+        case ESP_RST_PANIC:
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:
+        case ESP_RST_BROWNOUT:
+            verdict = "崩溃/看门狗复位 (不是正常关机, 查 panic 日志)";
+            break;
+        default:
+            verdict = "其它复位 (USB/JTAG/未知, 不能证明断过电)";
+            break;
+        }
+        if (rr == ESP_RST_POWERON && wo >= 0)
+            verdict = "真断电 (但残留关机记录 ⇒ 复位前刚走过深睡关机路径)";
+        printf("VERDICT: %s\r\n", verdict);
+    } else if (strcmp(cmd, "kill") == 0) {
+        /* ★ 2026-11-21 linit「一条命令让机器关机」。
+         *
+         * 历史教训(2026-11-20 实测): 这里原来只是裸调 gpio_set_level(42, 0) 就返回。
+         *   结果: 串口 0.4s 内消失→又回来, pwrstate 报 reset=11(USB) uptime 只有 5.5s
+         *   ⇒ **机器没关掉, 是被 USB 复位后重启了**。原因两条:
+         *     ① 裸拉低不 hold、不等 512ms 内部定时, LTC2954 看到的只是一段毛刺;
+         *     ② (历史误判, 已证伪) 曾以为"插着 USB 时 VBUS 仍给系统供电 ⇒ 断电立刻被救回";
+         *        实测 Q1 一断就是彻底没电(pwrstate reset=1 / RTC 域丢失)。
+         *   所以"关机"不能只动一根脚, 必须走完整关机流程, 让硬件断电与深睡互为兜底。
+         *
+         * 现在的语义:
+         *   kill        = 强制执行一次硬件关机
+         *                 → ltc2954_force_cut_once() 打开"本次真断电"
+         *                 → power_mgr_off(): 先存 RTC 时间, 再 ltc2954_power_cut()
+         *                   (拉低 GPIO42 + gpio_hold_en + 等 800ms > 512ms 内部定时)
+         *                 → 真断电则永不返回; 没断(未接硬件/KILL 线断)才继续走完整深睡
+         *   kill 1      = 只把 KILL 拉高(释放), 不关机 —— 反向验证用
+         *
+         * ⚠ GPIO42 必须接 TSOT-23-8 的 8 脚 KILL。接成 5 脚(INT)则拉低只是拽住
+         *   芯片的输出脚, 断不了电, 还会两个输出对打。
+         * ⚠ 必须起独立大栈任务: remcon 只有 9KB, power_mgr_off 的调用链装不下
+         *   (2026-10-28 实测直接调会 "A stack overflow in task remcon" 然后重启)。 */
+        char *av = rc_next(&rest);
+        int lvl = 0;                                  /* 默认真关机 */
+        if (av && (strcmp(av, "1") == 0 || strcmp(av, "high") == 0 ||
+                   strcmp(av, "on") == 0)) lvl = 1;
+
+        gpio_config_t o = {
+            .pin_bit_mask = 1ULL << LTC2954_KILL_GPIO,
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&o);
+        gpio_set_level((gpio_num_t)LTC2954_KILL_GPIO, 1);   /* 先回安全电平, 防配置顺带拉低 */
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        if (lvl) {
+            /* 反向验证: 只释放 KILL, 不关机 */
+            gpio_set_level((gpio_num_t)LTC2954_KILL_GPIO, 1);
+            printf("KILL GPIO%d -> 高 (释放, 电源保持)\r\n", LTC2954_KILL_GPIO);
+            fflush(stdout);
+            return;
+        }
+
+        const bool hw_ok = ltc2954_is_hw_available();
+        if (hw_ok) {
+            /* 只需"本次强制真断电"。原命令关机锁(NVS cmd_off)已删除:
+             * 实测 Q1 断开 = 彻底断电(POWERON 复位、RTC 域丢失), 不存在"自动复电"，
+             * 那个锁只会让下一轮开机行为诡异。 */
+            ltc2954_force_cut_once();   /* 本次强制真断电, 不写设置页开关 */
+        }
+        printf("KILL 关机: GPIO%d 拉低 + 保持, hw_ok=%d, hwoff=%d\r\n",
+               LTC2954_KILL_GPIO, (int)hw_ok, (int)ltc2954_is_enabled());
+        fflush(stdout);
+
+        BaseType_t ok = xTaskCreate(rc_task_shutdown, "killoff", 8192,
+                                    (void *)(intptr_t)0, 3, NULL);
+        if (ok != pdPASS) printf("KILLERR 任务创建失败(内存不足)\r\n");
+    } else if (strcmp(cmd, "pbsim") == 0) {
+        /* ⛔ 2026-11-21 下线: 本命令原本靠"把 GPIO1 拉低、经 D1 把 /PB 拽低"来模拟按键。
+         *   现接法: D1 已拆、SW1 飞线直连 /PB; GPIO1 仍是**按键焊盘所在网络**(真按键),
+         *   2954 的 /INT 输出接在 GPIO44(固件不读)。
+         *   模块不该去驱动 /PB —— 强行推 GPIO1 只会和物理按键对打, 也模拟不出 PDT。
+         *   要验硬件强制断电, 直接长按物理电源键 3 秒。 */
+        printf("PBSIM 已下线: 按键直连 /PB, 模块不参与按键通路。"
+               "验硬件强制断电请长按电源键 3 秒\r\n");
+    } else if (strcmp(cmd, "sleepstage") == 0) {
+        /* ★ 2026-10-28 分阶段深睡诊断 (任务书第五步):
+         *   sleepstage 0x13   ⇒ 只关 屏(0x01)+音频(0x02)+GPS(0x10), SD/触摸/震动保持原状, 立刻深睡
+         *   sleepstage 0x7F   ⇒ 全关(等同正常关机)
+         *   sleepstage 0      ⇒ 什么都不关, 只让 ESP 深睡 (测"ESP 自己"的底)
+         * 用法: 每档配外接电流表, 逐项对账谁在耗电。位:
+         *   0x01屏 0x02音频 0x04SD 0x08触摸 0x10GPS 0x20震动 0x40引脚隔离 */
+        char *av = rc_next(&rest);
+        uint32_t m = av ? (uint32_t)strtoul(av, NULL, 0) : 0x7Fu;
+        power_mgr_set_stage(m);
+        printf("SLEEPSTAGE mask=0x%02X ⇒ 立即深睡 (01屏 02音频 04SD 08触摸 10GPS 20震动 40隔离)\r\n",
+               (unsigned)(m & 0x7Fu));
+        printf("⚠ 唤醒后 mask 复位 0x7F; 本模式只用于测量, 不要作为正式关机路径\r\n");
+        fflush(stdout);
+        xTaskCreate(rc_task_shutdown, "shutdn", 8192, (void *)(intptr_t)0, 3, NULL);
+    } else if (strcmp(cmd, "shutdown") == 0 || strcmp(cmd, "pwr") == 0 ||
+               strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "sleep") == 0) {
+        /* 关机 = 深度休眠(复位式)。shutdown [auto|manual]:
+         *   省略/manual → 手动关机路径(仅 PWR 键 + 按住 0.5s 开机, 显示 Logo)
+         *   auto        → 模拟"休眠时间到点自动关机"(任意键唤醒, 不显示 Logo) */
+        int auto_mode = (rest && strstr(rest, "auto") != NULL) ? 1 : 0;
+        printf("REMOCON_SHUTDOWN %s\r\n", auto_mode ? "auto" : "manual");
+        fflush(stdout);
+        /* ★ 2026-10-28: 改到独立 8KB 任务执行。原来在这里直接调 os_remote_shutdown,
+         *   remcon 栈装不下 wp_power_off 的调用链 ⇒ stack overflow ⇒ 复位重启,
+         *   看起来像"发 shutdown 只是重启了一下"。 */
+        BaseType_t ok = xTaskCreate(rc_task_shutdown, "shutdn", 8192,
+                                    (void *)(intptr_t)auto_mode, 3, NULL);
+        if (ok != pdPASS) printf("SHUTDOWNERR 任务创建失败(内存不足)\r\n");
+    } else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0) {
+        printf("REMOCON_REBOOT\r\n");
+        printf("REMOCON_REBOOT\r\n");
+        fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    } else if (strcmp(cmd, "store") == 0) {
+        /* store src [url|clear] —— **私有应用源**。
+         *   URL 只写进本机 NVS, 不进源码/不进固件常量 (项目开源, 写代码里等于公开)。
+         *   设置后商店第 0 优先级就用它; clear 回到公开源。重启生效。 */
+        char *sub = rc_next(&rest);
+        if (!sub || strcmp(sub, "src") != 0) {
+            printf("STORE 用法: store src <url>  |  store src  |  store src clear\r\n");
+            return;
+        }
+        char *v = rc_next(&rest);
+        if (!v) {
+            const char *cur = os_sources_private();
+            printf("STORE priv_src=%s\r\n", cur[0] ? cur : "(未设置, 走公开源)");
+        } else if (strcmp(v, "clear") == 0) {
+            os_sources_set_private(NULL);
+            printf("STORE priv_src 已清除 (重启后回公开源)\r\n");
+        } else {
+            os_sources_set_private(v);
+            printf("STORE priv_src=%s (重启生效)\r\n", os_sources_private());
+        }
+    } else if (strcmp(cmd, "storedl") == 0) {
+        /* ★ 2026-10-18: 串口触发商店下载(绕过 UI, 用于自动化测试)。
+         *   用法: storedl [包名]   不带参数则列出索引里的包 */
+        extern int  am_rstore_count(void);
+        extern const am_rpkg_t *am_rstore_get(int i);
+        extern bool am_rstore_dl_start(int i);
+        extern const char *am_rstore_dl_name(void);
+        extern int  am_rstore_dl_permille(void);
+        extern void am_rstore_prefetch(void);
+        extern bool am_rstore_tick(void);
+        int n = am_rstore_count();
+        if (n == 0) {
+            /* 索引还没加载(平时只在进商店时加载) ⇒ 主动拉一次内置索引 */
+            am_rstore_prefetch();
+            for (int w = 0; w < 20 && am_rstore_count() == 0; w++) vTaskDelay(pdMS_TO_TICKS(100));
+            am_rstore_tick();
+            n = am_rstore_count();
+            printf("STORE_LOADED %d\r\n", n);
+        }
+        if (!rest || !*rest) {
+            printf("STORE_PKGS %d\r\n", n);
+            for (int i = 0; i < n; i++) {
+                const am_rpkg_t *rp = am_rstore_get(i);
+                if (rp) printf("PKG %d %s\r\n", i, rp->name);
+            }
+            return;
+        }
+        const char *want = rest;
+        while (*want == ' ') want++;
+        int idx = -1;
+        for (int i = 0; i < n; i++) {
+            const am_rpkg_t *rp = am_rstore_get(i);
+            if (rp && strcmp(rp->name, want) == 0) { idx = i; break; }
+        }
+        if (idx < 0) { printf("STORE_ERR 找不到包 '%s' (共 %d 个)\r\n", want, n); return; }
+        bool ok = am_rstore_dl_start(idx);
+        printf("STORE_DL %s idx=%d -> %s\r\n", want, idx, ok ? "已启动" : "启动失败");
+        if (ok) {
+            for (int t = 0; t < 60; t++) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                int pm = am_rstore_dl_permille();
+                const char *dn = am_rstore_dl_name();
+                printf("STORE_PROGRESS %d %d%%\r\n", t, pm < 0 ? -1 : pm / 10);
+                if (!dn || !dn[0]) {
+                    /* ★ 2026-11-01: **只对普通 .lua 包**做这一步。
+                     *   资源包 / LPK 在下载任务里已经自己装完了（am_lpk_finish → 安装器 /
+                     *   解包到 target），这里再拼一个 "<名字>.lua" 去 auto_install 会把
+                     *   商店源目录里的旧残留重新复制进 /sdcard/apps/app ⇒ 白捡出一条
+                     *   重复的 .lua 行（录音机/航班雷达 当时就是这么又冒出来的）。
+                     *   判据用索引里的 type，与商店保持一致。 */
+                    const am_rpkg_t *rp = am_rstore_get(idx);
+                    if (rp && am_pkg_is_res(rp->type)) {
+                        printf("STORE_INSTALL SKIP (资源包/LPK 由下载任务自行安装)\r\n");
+                        printf("STORE_DONE\r\n");
+                        break;
+                    }
+                    extern bool am_store_auto_install(const char *fname);
+                    char fn[56];
+                    snprintf(fn, sizeof(fn), "%s.lua", want);
+                    bool inst = am_store_auto_install(fn);
+                    printf("STORE_INSTALL %s\r\n", inst ? "OK" : "FAIL");
+                    printf("STORE_DONE\r\n");
+                    break;
+                }
+            }
+        }
+    } else if (strcmp(cmd, "loglevel") == 0) {
+        char *lvl = rc_next(&rest); int v = -1;
+        if (lvl) {
+            /* ★ 支持名字: `loglevel debug` 以前被 atoi 成 0(=NONE) ⇒ 整个日志静默,
+             *   排查时看起来像"设备死了"。数字 0..5 仍然可用。 */
+            rc_lower(lvl);
+            if      (strcmp(lvl, "none") == 0 || strcmp(lvl, "off") == 0) v = 0;
+            else if (strcmp(lvl, "err")  == 0 || strcmp(lvl, "error") == 0) v = 1;
+            else if (strcmp(lvl, "warn") == 0) v = 2;
+            else if (strcmp(lvl, "info") == 0) v = 3;
+            else if (strcmp(lvl, "debug") == 0) v = 4;
+            else if (strcmp(lvl, "verbose") == 0) v = 5;
+            else v = atoi(lvl);
+        }
+        if (v >= 0 && v <= 5) {
+            esp_log_level_set("*", (esp_log_level_t)v);
+            /* ★★★ 2026-11-21 linit「无法获取日志, 赶紧解决掉」★★★
+             *   原因不是串口坏了, 而是 os_shell_loop 主动 esp_log_level_set("*", NONE)
+             *   (2026-11-02 的省电决定), 且**只改运行期** ⇒ 重启立刻又静默,
+             *   于是"开机 → 进桌面"这段最该看的日志永远抓不到, 现场就只剩一片空白。
+             *   现在把级别**固化进 NVS**: 发一次 `loglevel info` 就永久生效,
+             *   排查完发 `loglevel none` 关掉(同样固化), 不额外占运行开销。 */
+            nvs_handle_t h;
+            if (svc_nvs_open("dbg", NVS_READWRITE, &h) == ESP_OK) {
+                svc_nvs_set_i8(h, "loglvl", (int8_t)v);
+                svc_nvs_commit(h);
+                svc_nvs_close(h);
+                printf("LOGLEVEL %d (已固化, 重启后仍生效)\r\n", v);
+            } else {
+                printf("LOGLEVEL %d (固化失败: NVS 打不开, 仅本次生效)\r\n", v);
+            }
+        }
+        else printf("LOGLEVEL ERR (0..5 | none/err/warn/info/debug/verbose)\r\n");
+    } else if (strcmp(cmd, "wifi") == 0) {
+        /* 调试/回归用: `wifi [on|off|status]` (默认 on)。
+         * 为什么需要: 联网类 Lua 应用 (如航班雷达) 必须"已联网"才能跑 ——
+         * lwip 是 wifi_manager_enable() 里 esp_netif_init() 建的, 没联过网时
+         * 任何 socket 调用都会 assert 崩机。远程回归时用本命令先把网连上。
+         * 走 os_hw_request/release, 与页面共用同一个引用计数。 */
+        char *wa = rc_next(&rest);
+        if (wa) rc_lower(wa);
+        if (wa && strcmp(wa, "off") == 0) {
+            /* ★ 2026-11-08: 只 release 关不掉。开机 autostart 走的是
+             *   wifi_manager_enable()，**不占 os_hw 计数** ⇒ s_ref 恒 0，
+             *   os_hw_release() 第一行 `if (s_ref <= 0) return;` 直接退出，射频照开。
+             *   真机实测：`wifi off` 之后 wifi/tcpip 任务仍在。
+             *   这里改成强制关（不看标志、直接问驱动）+ 计数归零。 */
+            wifi_manager_set_want_on(false);   /* 串口关也算用户意愿: 重启后别自己开 */
+            wifi_manager_force_off();
+            os_hw_reset(OS_HW_WIFI);
+            printf("WIFI off (force_off + ref reset + want_on=0)\r\n");
+        } else if (wa && strcmp(wa, "status") == 0) {
+            printf("WIFI active=%d connected=%d\r\n",
+                   (int)os_hw_is_active(OS_HW_WIFI), (int)wifi_manager_is_connected());
+        } else if (wa && strcmp(wa, "conn") == 0) {
+            /* 用 NVS 里已存的 SSID/密码直接连 —— 远程回归没法人肉输密码,
+             * 这是"不碰设备就能进联网态"的唯一入口。 */
+            char ssid[33] = "", pass[65] = "";
+            wifi_manager_get_saved(ssid, sizeof(ssid), pass, sizeof(pass));
+            if (!ssid[0]) printf("WIFI conn: 无已存配置\r\n");
+            else { (void)os_hw_request(OS_HW_WIFI);   /* 占住引用计数, 否则连上后没人持有会被拆掉 */
+                   printf("WIFI conn %s ok=%d\r\n", ssid, (int)wifi_manager_connect(ssid, pass)); }
+        } else if (wa && strcmp(wa, "ps") == 0) {
+            /* ★ 2026-11-07 linit「统一极致省电」: `wifi ps 0/1` 的**写**能力已删除 ——
+             *   省电档只由 wifi_manager 独家管理, 串口也不再例外。
+             *   现在 `wifi ps` 是**只读查询**: 报出编译期统一档 + 驱动里真实生效的档。 */
+            printf("WIFI ps base=%s now=%s auto=%d measure=%d\r\n",
+                   wifi_manager_ps_name(), wifi_manager_ps_current(),
+                   (int)wifi_manager_ps_auto_enabled(),
+                   (int)wifi_manager_rf_measure_active());
+        } else if (wa && strcmp(wa, "psauto") == 0) {
+            /* wifi psauto 0|1 —— 开关"空闲 20s 自动降 MAX_MODEM"。
+             *   默认开: 待机降温, 有请求自动回档。关 = 恒 MIN_MODEM(旧行为)。 */
+            char *v = rc_next(&rest);
+            if (!v) {
+                printf("WIFI psauto=%d (0=恒 MIN_MODEM, 1=空闲自动深省电)\r\n",
+                       (int)wifi_manager_ps_auto_enabled());
+            } else {
+                wifi_manager_set_ps_auto(atoi(v) != 0);
+                printf("WIFI psauto=%d\r\n", (int)wifi_manager_ps_auto_enabled());
+            }
+        } else if (wa && strcmp(wa, "psmode") == 0) {
+            /* wifi psmode max|min —— 现场切省电档(不写 NVS, 重启回默认)。
+             *   max = MAX_MODEM 深省电(beacon 间隔拉长, 延迟↑);
+             *   min = MIN_MODEM 默认(本机实测更稳)。 */
+            char *v = rc_next(&rest);
+            if (!v) {
+                printf("WIFI psmode 用法: psmode max|min\r\n");
+            } else {
+                int maxm = (strcmp(v, "max") == 0);
+                wifi_manager_set_ps_mode(maxm);
+                printf("WIFI psmode=%s (本次运行有效)\r\n", maxm ? "MAX_MODEM" : "MIN_MODEM");
+            }
+        } else if (wa && strcmp(wa, "set") == 0) {
+            /* wifi set <ssid> <pass>  (2026-10-09)
+             * 用途: 在掌机上用软键盘打 WiFi 密码很痛苦; 烧过整片镜像清了 nvs 之后
+             * 更是必须重配。直接从串口写凭据 + 连接, 配完即用。
+             * ⚠ 密码会进 NVS 也会出现在串口日志里 —— 仅调试用, 别在公开环境跑。 */
+            char *ss = rc_next(&rest), *ps = rc_next(&rest);
+            if (!ss || !ps) {
+                printf("RC_ERR wifi set <ssid> <pass>\r\n");
+            } else {
+                printf("WIFI set ssid='%s' 连接中...\r\n", ss);
+                fflush(stdout);
+                (void)os_hw_request(OS_HW_WIFI);   /* 占住引用计数, 否则连上后没人持有会被拆掉 */
+                bool ok = wifi_manager_connect(ss, ps);
+                /* 连接是异步的: 轮询最多 ~20s, 好让串口一次看到结果 */
+                for (int i = 0; i < 80 && !wifi_manager_is_connected(); i++)
+                    vTaskDelay(pdMS_TO_TICKS(250));
+                char ip[20] = "-";
+                wifi_manager_get_ip(ip, sizeof(ip));
+                printf("WIFI set '%s' start=%d connected=%d ip=%s\r\n",
+                       ss, (int)ok, (int)wifi_manager_is_connected(), ip);
+            }
+        } else {
+            printf("WIFI on ok=%d\r\n", (int)os_hw_request(OS_HW_WIFI));
+        }
+    } else if (strcmp(cmd, "audio") == 0) {
+        /* 音频链路诊断 (2026-10-09): 软件状态 + ES8311 全寄存器回读, 排"没声音"用 */
+        audio_player_diag();
+    } else if (strcmp(cmd, "vol") == 0) {
+        /* vol            → 读当前音量(0-100)
+         * vol <0..100>   → 现场设音量 (用来分辨"音量=0"还是"通路没开") */
+        char *vs = rc_next(&rest);
+        if (!vs) printf("AUDIOVOL %d\r\n", audio_player_get_volume());
+        else {
+            audio_player_set_volume(atoi(vs));
+            printf("AUDIOVOL set %s -> %d\r\n", vs, audio_player_get_volume());
+        }
+    } else if (strcmp(cmd, "esr") == 0) {
+        /* esr <reg> → 回读 ES8311 单个寄存器; reg 收 十进制/0x 十六进制 */
+        char *rs = rc_next(&rest);
+        if (!rs) { printf("RC_ERR esr <reg>\r\n"); }
+        else {
+            uint8_t v = 0;
+            int reg = (int)strtol(rs, NULL, 0);
+            if (es8311_peek((uint8_t)reg, &v) == 0) printf("ESREG %02X=%02X\r\n", reg & 0xFF, v);
+            else                                   printf("RC_ERR esr i2c %02X\r\n", reg & 0xFF);
+        }
+    } else if (strcmp(cmd, "esw") == 0) {
+        /* esw <reg> <val> → 写 ES8311 寄存器 (现场试听定位用) */
+        char *rs = rc_next(&rest), *vs = rc_next(&rest);
+        if (!rs || !vs) { printf("RC_ERR esw <reg> <val>\r\n"); }
+        else {
+            int reg = (int)strtol(rs, NULL, 0), val = (int)strtol(vs, NULL, 0);
+            int rc = es8311_poke((uint8_t)reg, (uint8_t)val);
+            printf("ESW %02X=%02X -> %s\r\n", reg & 0xFF, val & 0xFF, rc == 0 ? "ok" : "fail");
+        }
+    } else if (strcmp(cmd, "es7") == 0) {
+        /* es7 [reg] → 回读 ES7210 (麦克风 ADC) 寄存器; 不带参数 = 全部 0x00~0x4C */
+        char *rs = rc_next(&rest);
+        if (!rs) {
+            es7210_dump_regs();
+        } else {
+            uint8_t v = 0;
+            int reg = (int)strtol(rs, NULL, 0);
+            if (es7210_peek((uint8_t)reg, &v) == 0) printf("ES7210REG %02X=%02X\r\n", reg & 0xFF, v);
+            else                                   printf("RC_ERR es7 i2c %02X\r\n", reg & 0xFF);
+        }
+    } else if (strcmp(cmd, "es7w") == 0) {
+        /* es7w <reg> <val> → 写 ES7210 寄存器 (现场试) */
+        char *rs = rc_next(&rest), *vs = rc_next(&rest);
+        if (!rs || !vs) { printf("RC_ERR es7w <reg> <val>\r\n"); }
+        else {
+            int reg = (int)strtol(rs, NULL, 0), val = (int)strtol(vs, NULL, 0);
+            int rc = es7210_poke((uint8_t)reg, (uint8_t)val);
+            printf("ES7210W %02X=%02X -> %s\r\n", reg & 0xFF, val & 0xFF, rc == 0 ? "ok" : "fail");
+        }
+    } else if (strcmp(cmd, "mic") == 0) {
+        /* mic [ms] → **麦克风链路一条龙诊断**: 起麦(16k) → 连续抓样点 → 报峰值/最小/最大/有效值。
+         *   一刀切开三种"没数据": ①起麦失败 ②I2S RX 拿到的样点恒 0 (codec→ESP 的数据线没波形)
+         *   ③有样点但幅度极低 (增益/偏置问题)。 */
+        char *ms = rc_next(&rest);
+        rc_mic_probe(ms ? atoi(ms) : 400);
+    } else if (strcmp(cmd, "beep") == 0) {        /* beep [freq] [ms] [amp] → 纯音测试 (2026-10-09)
+         * 走 tone_player → audio_player_feed_pcm → I2S → codec → 功放 → 喇叭,
+         * **完全绕过 MP3 解码与 TF 卡**。用途: 一刀切开"固件问题"与"喇叭/功放硬件问题"。
+         * 默认 1000Hz / 300ms / amp=6000(最大), **连响 5 次**(每次间隔 200ms) —— 
+         * 音量拉满 + 五连响, 现场绝不会听漏。 */
+        char *fs = rc_next(&rest), *ms = rc_next(&rest), *as = rc_next(&rest);
+        int f   = fs ? atoi(fs) : 1000;
+        int d   = ms ? atoi(ms) : 300;
+        int amp = as ? atoi(as) : 6000;
+        if (f   < 50   || f   > 8000) f   = 1000;
+        if (d   < 50   || d   > 3000) d   = 300;
+        if (amp < 1    || amp > 6000) amp = 6000;
+        printf("BEEP %dHz %dms amp=%d x5 ready=%d\r\n", f, d, amp, (int)tone_player_ready());
+        fflush(stdout);
+        for (int i = 0; i < 5; i++) {
+            tone_beep_amp(f, d, amp);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        printf("BEEP_END\r\n");
+    } else if (strcmp(cmd, "lpkstat") == 0) {
+        /* lpkstat [0|1|r] —— /lpk 的 I/O 与 PSRAM 缓存计数。
+         *   不带参数: 打印   0/1: 关/开整资源缓存   r: 清零计数
+         * 用途: 判断"载入慢"是慢在读卡(SD) 还是慢在 CPU —— 看 KB/s 与毫秒直接得结论。 */
+        char *a = rc_next(&rest);
+        if (a && (*a == '0' || *a == '1')) {
+            lpk_vfs_cache_set(*a == '1');
+            if (*a == '0') lpk_vfs_cache_flush();
+            printf("LPKSTAT 缓存=%s\r\n", *a == '1' ? "开" : "关");
+        } else if (a && (*a == 'r' || *a == 'R')) {
+            lpk_vfs_stats_reset();
+            printf("LPKSTAT 计数已清零\r\n");
+        } else {
+            uint32_t reads = 0, bytes = 0, us = 0, hits = 0, loads = 0, cb = 0;
+            lpk_vfs_stats(&reads, &bytes, &us, &hits, &loads, &cb);
+            uint32_t kbps = us ? (uint32_t)(((uint64_t)bytes * 1000 / 1024) / us) : 0;
+            printf("LPKSTAT 挂载=%d 缓存=%s(%u KB, 预载 %u 次, 命中 %u 次)\r\n",
+                   (int)lpk_vfs_is_mounted(), lpk_vfs_cache_get() ? "开" : "关",
+                   (unsigned)(cb / 1024), (unsigned)loads, (unsigned)hits);
+            printf("LPKSTAT 读卡 %u 次 / %u KB / %u ms ⇒ %u KB/s\r\n",
+                   (unsigned)reads, (unsigned)(bytes / 1024), (unsigned)us, (unsigned)kbps);
+        }
+    } else if (strcmp(cmd, "sdb") == 0) {
+        /* sdb [MB] —— SD 卡**裸读吞吐**基准：同一个文件用 4K/16K/64K/256K 分块各读一遍。
+         * 为什么需要它: "载入一分钟"到底是卡在 SD 还是卡在 CPU，靠猜没意义；
+         * 顺便验证"加大单次读长度能不能提速"（决定要不要做预读）。 */
+        char *a = rc_next(&rest);
+        int mb = (a && *a) ? atoi(a) : 4;
+        if (mb < 1) mb = 1;
+        if (mb > 16) mb = 16;
+        const char *fp = "/sdcard/apps/app/pal/pal.lpk";
+        static const int CH[] = { 4096, 16384, 65536 };
+        /* ★ 2026-11-01 修正测量方法：IDF 的 sdmmc_read_sectors() 只在**缓冲可直接 DMA** 时
+         *   走单次 DMA；否则每次都要 malloc 一块 DMA 缓冲 + 拷贝（sdmmc_cmd.c:660）。
+         *   上一轮用 PSRAM 缓冲测，正好落进慢分支，430 KB/s 低估了真实文件读。
+         *   这里**两种缓冲都测**，并明确标出来，避免再拿错数据下结论。 */
+        uint8_t *dma = heap_caps_malloc(65536, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        uint8_t *ps  = heap_caps_malloc(65536, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!dma) printf("SDB_ERR 内部 DMA 缓冲分配失败\r\n");
+        if (!dma && !ps) printf("SDB_ERR 缓冲分配失败\r\n");
+        else {
+            printf("SDB %s, 每次读 %d MB (缓冲: 内部DMA=%s PSRAM=%s)\r\n",
+                   fp, mb, dma ? "有" : "无", ps ? "有" : "无");
+            size_t want = (size_t)mb * 1024 * 1024;
+            for (int pass = 0; pass < 2; pass++) {
+                uint8_t *buf = pass == 0 ? dma : ps;
+                if (!buf) continue;
+                printf("SDB --- 缓冲=%s ---\r\n", pass == 0 ? "内部DMA" : "PSRAM");
+                for (int k = 0; k < 3; k++) {
+                    FILE *f = fopen(fp, "rb");
+                    if (!f) { printf("SDB_ERR 打不开 %s\r\n", fp); break; }
+                    int64_t t0 = esp_timer_get_time();
+                    size_t got = 0, chunk = (size_t)CH[k];
+                    while (got < want) {
+                        size_t n = fread(buf, 1, chunk, f);
+                        if (n == 0) break;
+                        got += n;
+                    }
+                    int64_t dt = esp_timer_get_time() - t0;
+                    fclose(f);
+                    uint32_t kbps = dt ? (uint32_t)(((uint64_t)got * 1000000 / 1024) / (uint64_t)dt) : 0;
+                    printf("SDB chunk=%6u B: %u KB in %d ms ⇒ %u KB/s\r\n",
+                           (unsigned)chunk, (unsigned)(got / 1024), (int)(dt / 1000), (unsigned)kbps);
+                }
+            }
+            free(dma);
+            free(ps);
+        }
+    } else if (strcmp(cmd, "lpkinst") == 0) {
+        /* lpkinst <file.lpk> —— 走**设备端真实安装器**（不与打包工具共用代码）：
+         *   验 manifest → 解包到 staging → 原子切换 → installed/<app_id>/ → 注册 */
+        char *p = rc_next(&rest);
+        if (!p || !*p) { printf("RC_ERR lpkinst <file.lpk>\r\n"); return; }
+        char why[160] = {0};
+        esp_err_t e = am_lpkg_install(p, why, sizeof(why));
+        if (e == ESP_OK) printf("LPKINST OK %s\r\n", p);
+        else             printf("LPKINST ERR %s: %s\r\n", esp_err_to_name(e), why);
+    } else if (strcmp(cmd, "lpklist") == 0) {
+        /* ★ 2026-11-01: 同时打印**两套版本**，这是商店更新判定是否正确的现场依据：
+         *   pkg=  包内 manifest 自称的版本   store= 商店索引交付时的版本
+         *   两行不一致 ⇒ 服务器只抬了索引没重新打包（商店按 store 判定，不会无限更新，
+         *   但索引应该重新生成）。MISMATCH 就是那个告警的落地标记。 */
+        int n = am_lpkg_scan();
+        printf("LPKLIST %d\r\n", n);
+        for (int i = 0; i < n; i++) {
+            const char *id = am_lpkg_id_at(i);
+            am_lpkg_info_t inf;
+            if (am_lpkg_info(id, &inf)) {
+                printf("LPKAPP %s pkg=%s/%s store=%s/%s%s\r\n",
+                       id, inf.mf_ver, inf.mf_build, inf.ver, inf.build,
+                       inf.meta_mismatch ? " MISMATCH" : "");
+            } else {
+                printf("LPKAPP %s pkg=%s (registry 不可读)\r\n", id, am_lpkg_ver_at(i));
+            }
+        }
+    } else if (strcmp(cmd, "lpkrm") == 0) {
+        /* lpkrm <app_id> [purge]  —— purge 才会删用户数据 */
+        char *p = rc_next(&rest);
+        char *k = rc_next(&rest);
+        if (!p || !*p) { printf("RC_ERR lpkrm <app_id> [purge]\r\n"); return; }
+        bool keep = !(k && strcmp(k, "purge") == 0);
+        char why[160] = {0};
+        esp_err_t e = am_lpkg_uninstall(p, keep, why, sizeof(why));
+        if (e == ESP_OK) printf("LPKRM OK %s (data %s)\r\n", p, keep ? "kept" : "purged");
+        else             printf("LPKRM ERR %s: %s\r\n", esp_err_to_name(e), why);
+    } else if (strcmp(cmd, "pal") == 0) {
+        /* ★ 2026-10-24 linit 定: 仙剑引擎**不在任何界面显示**, 只从终端敲 `pal` 启动。
+         *   这里给串口留同一条入口 (远程自测用)。数据目录必须是 /sdcard/pal。 */
+        extern bool pal_launch(void);
+        extern const char *pal_entry_datadir(void);
+        /* ★ 2026-11-01: 原来这里硬写着 /sdcard/pal（2026-10-25 之前的旧目录）。
+         *   实际数据目录早已是 /sdcard/apps/app/pal，且现在可能是单文件 LPK 模式 ——
+         *   报错时指错目录会直接把排查带偏，所以统一从 pal_entry_datadir() 取。 */
+        printf("RC_OK pal (data=%s)\r\n", pal_entry_datadir());
+        if (!pal_launch())
+            printf("RC_ERR pal 启动失败: 检查 %s（lpkmode 可看模式与原因）\r\n",
+                   pal_entry_datadir());
+    } else if (strcmp(cmd, "gps") == 0) {
+        /* gps → GPS (MAX-M10S) 电源状态 + 引脚 (排查耗电: 待机 46µA vs 跟踪 ~10mA/峰值25mA) */
+        const gps_config_t *gc = gps_default_config();
+        gps_power_state_t st = gps_power_state();
+        const char *sn = (st == GPS_POWER_ACTIVE) ? "ACTIVE(~10mA,peak25mA)"
+                       : (st == GPS_POWER_SLEEP)  ? "SLEEP(46uA)" : "UNKNOWN";
+        printf("GPS pwr=%s ready=%d tx=%d rx=%d extint=%d baud=%lu\r\n",
+               sn, (int)gps_is_ready(), gc ? gc->pin_tx : -1, gc ? gc->pin_rx : -1,
+               gc ? gc->pin_extint : -1, (unsigned long)(gc ? gc->baud : 0));
+        /* 链路 + 定位快照: "模块通不通 / 有没有定位" 全看这几行 */
+        gps_fix_t f;
+        if (gps_nmea_get(&f)) {
+            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+            printf("GPS link: rx=%lu ubx=%lu sentences=%lu badcs=%lu age_rx=%ld ms proto=%s\r\n",
+                   (unsigned long)f.rx_bytes, (unsigned long)f.ubx_frames,
+                   (unsigned long)f.sentences, (unsigned long)f.bad_checksum,
+                   (long)(f.last_rx_ms ? (now - f.last_rx_ms) : -1),
+                   f.sentences ? "NMEA" : (f.ubx_frames ? "UBX" : "-"));
+            printf("GPS fix: valid=%d demo=%d dim=%d quality=%d sats=%d hdop=%.1f alt=%.0fm\r\n",
+                   (int)f.valid, (int)f.demo, (int)f.fix_dim, (int)f.fix_quality,
+                   (int)f.sats_used, f.hdop, f.alt_m);
+            printf("GPS pos: lat=%.6f lon=%.6f speed=%.1fkm/h course=%.0f age=%ld ms\r\n",
+                   f.lat, f.lon, f.speed_mps * 3.6f, f.course_deg,
+                   (long)(f.last_fix_ms ? (now - f.last_fix_ms) : -1));
+            printf("GPS time: %04d-%02d-%02d %02d:%02d:%02d UTC\r\n",
+                   (int)f.year, (int)f.month, (int)f.day, (int)f.hour, (int)f.min, (int)f.sec);
+        } else {
+            printf("GPS fix: (无快照, 服务未启动或没收到过句子)\r\n");
+        }
+        {
+            gps_sat_t sl[40];
+            int nv = gps_nmea_sats(sl, 40);          /* GSV 里的可见星 (与定位无关) */
+            static const char *SN[7] = { "GP", "GL", "GA", "GB", "GQ", "GI", "GN" };
+            printf("GPS sats: visible=%d", nv);
+            for (int i = 0; i < nv && i < 8; i++)
+                printf(" [%s%02d el%02d az%03d snr%02d%s]",
+                       SN[sl[i].sys < 7 ? sl[i].sys : 6], (int)sl[i].prn,
+                       (int)sl[i].elev, (int)sl[i].azim, (int)sl[i].snr,
+                       sl[i].used ? "*" : "");
+            printf("\r\n");
+        }
+        printf("GPS_END\r\n");
+    } else if (strcmp(cmd, "pm") == 0) {
+        /* pm → 电源管理诊断 (2026-10-09): DFS 目标频率 + **当前锁表**。
+         * 锁表里出现 API 级锁 = CPU 降不了频; 出现 SLEEP 锁 = 进不了浅睡。
+         * 这是"待机耗电大"最直接的证据来源。 */
+        esp_pm_config_t pcfg;
+        memset(&pcfg, 0, sizeof(pcfg));
+        if (esp_pm_get_configuration(&pcfg) == ESP_OK) {
+            printf("PM max_freq=%dMHz min_freq=%dMHz light_sleep=%d\r\n",
+                   pcfg.max_freq_mhz, pcfg.min_freq_mhz, (int)pcfg.light_sleep_enable);
+        } else {
+            printf("PM not enabled\r\n");
+        }
+        esp_pm_dump_locks(stdout);
+        printf("PM_END\r\n");
+    } else if (strcmp(cmd, "audit") == 0) {
+        /* 内存详细审计 (并入资源管家): 分类堆积 + 所有任务栈水位 + 堆块 */
+        os_housekeeper_mem_audit();
+    } else if (strcmp(cmd, "heap") == 0 || strcmp(cmd, "mem") == 0) {
+        /* 整机内存概览: 内部/PSRAM 总量、空闲、最大连续块 */
+        uint32_t it = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+        uint32_t iu = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        uint32_t il = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        uint32_t pt = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        uint32_t pu = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        uint32_t pl = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        uint32_t in_used = it - iu;
+        uint32_t pr_used = pt - pu;
+        printf("MEM internal total=%u free=%u used=%u largest=%u | psram total=%u free=%u used=%u largest=%u\r\n",
+               (unsigned)it, (unsigned)iu, (unsigned)in_used, (unsigned)il,
+               (unsigned)pt, (unsigned)pu, (unsigned)pr_used, (unsigned)pl);
+        printf("HEAP internal=%u psram=%u\r\n", (unsigned)iu, (unsigned)pu);
+    } else if (strcmp(cmd, "blk") == 0) {
+        /* 内部堆块级 dump: 定位具体模块/静态缓冲占用 */
+        heap_caps_dump(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    } else if (strcmp(cmd, "stack") == 0) {
+        printf("STACK mine=%u\r\n",
+               (unsigned)uxTaskGetStackHighWaterMark(xTaskGetCurrentTaskHandle()));
+    } else if (strcmp(cmd, "uptime") == 0) {
+        printf("UPTIME %.1fs\r\n", (double)esp_timer_get_time() / 1e6);
+    } else if (strcmp(cmd, "batdiag") == 0) {
+        /* ★ 2026-10-31: `batdiag` = `bat` 的别名（精简后两者输出同一行）。
+         *   保留这个名字是因为脚本/习惯里已经写了它；输出见 board_battery_diag()。 */
+        board_battery_diag();
+        fflush(stdout);
+    } else if (strcmp(cmd, "batlog") == 0) {
+        /* ★ 2026-10-31: 真机测试记录 (默认关).
+         *   batlog            查状态 (是否在记 / 已记几条 / 容量)
+         *   batlog on|off     开关
+         *   batlog dump       按时间旧→新把记录打成 CSV (t_s,mv_raw,mv_f,mv_p,anchor,soc_raw,soc,flags,chg)
+         *   batlog clear      清空记录 (不动开关)
+         * ⚠ 记录本身不额外采样: 只搭 60s 那一拍的便车。 */
+        char *av = rc_next(&rest);
+        if (!av) {
+            printf("BATLOG %s 条数=%d/%d (chg: 0=未充电 1=充电中)\r\n",
+                   board_battery_trace_is_on() ? "ON" : "OFF",
+                   (int)board_battery_trace_count(), (int)BOARD_BATTERY_TRACE_MAX);
+            printf("用法: batlog on|off|dump|clear\r\n");
+        } else if (strcmp(av, "on") == 0) {
+            board_battery_trace_enable(true);
+            printf("BATLOG ON (每 60s 一条, 最多 %d 条)\r\n", (int)BOARD_BATTERY_TRACE_MAX);
+        } else if (strcmp(av, "off") == 0) {
+            board_battery_trace_enable(false);
+            printf("BATLOG OFF 条数=%d\r\n", (int)board_battery_trace_count());
+        } else if (strcmp(av, "dump") == 0) {
+            printf("BATLOG_CSV t_s,mv,soc,flags,chg\r\n");
+            int n = board_battery_trace_dump();
+            printf("BATLOG_END %d 条\r\n", n);
+        } else if (strcmp(av, "clear") == 0) {
+            board_battery_trace_clear();
+            printf("BATLOG CLEARED\r\n");
+        } else {
+            printf("BATLOG_ERR 用法: batlog on|off|dump|clear\r\n");
+        }
+    } else if (strcmp(cmd, "timed") == 0) {
+        /* ★ 2026-11-01: 时间服务状态一行诊断 (remcon 命令白名单里必须同时放行)。
+         *   看 state / 本地时间 / 上次校准 / 距上次多久 / 成功次数 / 判定原因。 */
+        char b[192];
+        printf("TIMED %s\r\n", svc_time_diag(b, (int)sizeof(b)));
+        printf("TIMED 有效=%d (可用于显示/证书)\r\n", (int)svc_time_is_valid());
+    } else if (strcmp(cmd, "rtcdump") == 0) {
+        /* ★ 2026-11-21 诊断: 原样读出 DS3231 的 7 字节时间 + 状态寄存器(0x0F)。
+         *   分辨两件事:
+         *     · 芯片时间是"停在某个时刻" ⇒ VBAT 那一路没电, 关机期间没走
+         *     · 芯片时间"跟着走"但 OSF=1 ⇒ 有瞬间掉电/写坏状态, 走时本身没坏
+         *   ⛔ 只读, 不写不清, 不影响在线状态。 */
+        uint8_t rg[7] = {0}, st = 0;
+        if (!svc_rtc_present() && !svc_rtc_read(NULL)) {
+            printf("RTCDUMP_ERR 芯片不在线 (0x68 无应答)\r\n");
+        } else if (!svc_rtc_dump(rg, &st)) {
+            printf("RTCDUMP_ERR I2C 读失败\r\n");
+        } else {
+            /* 原始 BCD: 秒 分 时 周 日 月 年 */
+            printf("RTCDUMP raw=%02X %02X %02X %02X %02X %02X %02X status=0x%02X OSF=%d\r\n",
+                   rg[0], rg[1], rg[2], rg[3], rg[4], rg[5], rg[6], st, (st & 0x80) ? 1 : 0);
+            int64_t ep = 0;
+            if (svc_rtc_read(&ep)) {
+                time_t t = (time_t)ep;
+                struct tm g;
+                gmtime_r(&t, &g);
+                printf("RTCDUMP bcd=%02d-%02d-%02d %02d:%02d:%02d (UTC) epoch=%lld\r\n",
+                       g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
+                       g.tm_hour, g.tm_min, g.tm_sec, (long long)ep);
+            }
+            printf("RTCDUMP sys=%lld now=%lld lost_power=%d\r\n",
+                   (long long)time(NULL), (long long)time(NULL),
+                   (int)svc_rtc_lost_power());
+        }
+    } else if (strcmp(cmd, "rtcset") == 0) {
+        /* ★ 2026-11-21: rtcset <epoch秒> —— 设系统时间 + 写进 DS3231(顺带清 OSF)。
+         *   用途: 没网也能验"断电后芯片还能不能保持时间":
+         *     rtcset <now> → kill 断电 → 按电源键开机 → timed 看时间是否≈当时。
+         *   ⛔ 只为调试; 正常路径是联网 SNTP 校时(成功后会自己写芯片并清 OSF)。 */
+        char *av = rc_next(&rest);
+        long long ep = av ? strtoll(av, NULL, 10) : 0;
+        if (ep <= 0) {
+            printf("RTCSET_ERR 用法: rtcset <epoch秒>  (macOS 上用 date +%%s 取)\r\n");
+        } else {
+            svc_time_set_from_rtc((int64_t)ep);
+            bool wok = svc_rtc_write((int64_t)ep);
+            printf("RTCSET epoch=%lld ⇒ 系统时间已设置, 写芯片%s (OSF 随之清除)\r\n",
+                   ep, wok ? "成功" : "失败(0x68 没应答?)");
+        }
+    } else if (strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0) {
+        /* 电池分压/满量程校准用: raw / 脚上 mV / 系数 / VBAT / 百分比 (日志行前缀 BATDIAG) */
+        board_battery_diag();
+        /* ★ 2026-10-18 linit: 同时报**醒着/睡眠累计时长** —— 判断"到底睡没睡"的直接证据
+         *   (linit: 500mAh 12 小时耗光 ⇒ 需要看真实睡眠占比) */
+        {
+            extern void power_stat_get(void *out);
+            extern void power_stat_diag(void);
+            power_stat_diag();      /* 有则打印, 无则忽略 */
+        }
+    } else if (strcmp(cmd, "gpsrecheck") == 0) {
+        char *av = rc_next(&rest);
+        int sec = av ? atoi(av) : 0;
+        if (sec <= 0) {
+            printf("GPSRECHECK 用法: gpsrecheck <秒>  (默认 600)\r\n");
+        } else {
+            extern void board_gps_set_recheck_sec(int);
+            board_gps_set_recheck_sec(sec);
+            printf("GPSRECHECK 已设为 %d 秒\r\n", sec);
+        }
+    } else if (strcmp(cmd, "gpssleep") == 0 || strcmp(cmd, "gpsrecheck") == 0 || strcmp(cmd, "gpsdiag") == 0 ||
+               strcmp(cmd, "gpsprobe") == 0) {
+        /* ★★★ 2026-10-27 linit: **必须扔到独立任务里跑**。
+         *   实测: 直接在 remcon 任务里调用 → "A stack overflow in task remcon has been
+         *   detected" → 板子重启。remcon 栈只有几 KB, 而诊断要 160B 缓冲 + 一大堆日志格式化,
+         *   装 UART/autobaud 还会再吃栈。这也是之前 gpsprobe "一按就重启"的真因(不是 UART 抢用)。 */
+        extern void gps_diag(void);
+        bool want_diag = (strcmp(cmd, "gpssleep") != 0);
+        printf("GPS%s 已启动, 请等 15 秒...\r\n", want_diag ? "DIAG" : "SLEEP");
+        BaseType_t ok = xTaskCreate(want_diag ? rc_task_gpsdiag : rc_task_gpssleep,
+                                    want_diag ? "gpsdiag" : "gpssleep",
+                                    6144, NULL, 3, NULL);
+        if (ok != pdPASS) printf("GPSERR 任务创建失败(内存不足)\r\n");
+    } else if (strcmp(cmd, "gpsprobe_old") == 0) {
+        /* 逐档波特率试听 300ms, 判定 GPS 接线/供电是否正常 (只读, 不发任何命令) */
+        extern void gps_probe_bauds(void);
+        gps_probe_bauds();
+        printf("GPSPROBE_END\r\n");
+    } else if (strcmp(cmd, "bt") == 0) {
+        /* ★ 2026-10-27 linit「蓝牙显示开且关不掉」诊断用。
+         *   bt            打印状态 (enabled/ready/connected/scanning)
+         *   bt on / off   等价于点设置页的开关 (走同一组 bt_manager_* API) */
+        char *av = rc_next(&rest);
+        if (!av || !*av) {
+            printf("BT enabled=%d ready=%d connected=%d scanning=%d\r\n",
+                   (int)bt_manager_is_enabled(), (int)bt_manager_is_ready(),
+                   (int)bt_manager_is_connected(), (int)bt_manager_is_scanning());
+        } else if (strcmp(av, "on") == 0) {
+            bt_manager_enable();
+            printf("BT on -> enabled=%d ready=%d\r\n",
+                   (int)bt_manager_is_enabled(), (int)bt_manager_is_ready());
+        } else if (strcmp(av, "off") == 0) {
+            bt_manager_disable();
+            printf("BT off -> enabled=%d ready=%d\r\n",
+                   (int)bt_manager_is_enabled(), (int)bt_manager_is_ready());
+        } else {
+            printf("BT_ERR 用法: bt | bt on | bt off\r\n");
+        }
+    } else if (strcmp(cmd, "perf") == 0) {
+        /* ★ 2026-11-01 linit：任务性能表 —— 名称 / CPU% / 栈余 / 位置(核心|PSRAM)。
+         *   与设置页「性能监视」同源，供串口侧直接定位"谁在吃核心内存、谁在占 CPU"。
+         *   用法: perf     （一行一任务，末行给全局空闲） */
+        static EXT_RAM_BSS_ATTR TaskStatus_t ts[24];   /* 24×~40B 放 PSRAM，不占核心 RAM */
+        UBaseType_t tn = uxTaskGetSystemState(ts, 24, NULL);
+        uint64_t tot = 0;
+        for (UBaseType_t i = 0; i < tn; i++) tot += (uint64_t)ts[i].ulRunTimeCounter;
+        printf("\r\nTASK                CPU%%   STK_FREE  LOC\r\n");
+        for (UBaseType_t i = 0; i < tn; i++) {
+            uint32_t pm = tot ? (uint32_t)((uint64_t)ts[i].ulRunTimeCounter * 1000u / tot) : 0u;
+            printf("%-18s %2u.%u%% %7uB  %s\r\n",
+                   ts[i].pcTaskName,
+                   (unsigned)(pm / 10u), (unsigned)(pm % 10u),
+                   (unsigned)(ts[i].usStackHighWaterMark * sizeof(StackType_t)),
+                   esp_ptr_external_ram(ts[i].pxStackBase) ? "PSRAM" : "CORE");
+        }
+        printf("PERF CORE_FREE=%u PSRAM_FREE=%u\r\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    } else if (strcmp(cmd, "lsleep") == 0) {
+        /* lsleep [auto|0|1] —— 桌面档浅睡控制。
+         *   auto(默认): 插着电脑不浅睡(保串口), 拔线允许浅睡
+         *   0: 永久禁浅睡(回到旧行为)   1: 强制开(插着线也睡, 串口会断) */
+        char *v = rc_next(&rest);
+        if (!v) {
+            printf("LSLEEP mode=%d (%s) effective=%d usb=%d\r\n",
+                   wallpapers_light_sleep_mode(),
+                   wallpapers_light_sleep_mode() < 0 ? "auto" :
+                   (wallpapers_light_sleep_mode() ? "force-on" : "force-off"),
+                   wallpapers_light_sleep_effective(),
+                   wallpapers_usb_connected());
+        } else if (strcmp(v, "auto") == 0) {
+            wallpapers_set_light_sleep(-1);
+            printf("LSLEEP auto (按USB自动)\r\n");
+        } else {
+            wallpapers_set_light_sleep(atoi(v) != 0);
+            printf("LSLEEP %s\r\n", atoi(v) ? "force-on (串口会断)" : "force-off");
+        }
+    } else if (strcmp(cmd, "pwrbin") == 0) {
+        /* ★ 2026-11-08 linit「二分定位发热源」: 运行期逐项关模块，重启即完全恢复。
+         *   位: 0x01 WiFi · 0x02 音频+功放 · 0x04 SD · 0x08 降频80M · 0x10 允许浅睡
+         *   用法（叠加，每加一位摸一次温度/看电流）:
+         *     pwrbin 1     只关 WiFi
+         *     pwrbin 3     再关音频/功放
+         *     pwrbin 7     再卸 SD
+         *     pwrbin 0xF   再降到 80MHz
+         *     pwrbin 0x1F  再允许浅睡
+         *     pwrbin 0     恢复频率/浅睡（WiFi/音频/SD 需重启才回来）
+         *   不带参数 = 只读，打印当前掩码。 */
+        static uint32_t cur = 0;
+        char *av = rc_next(&rest);
+        uint32_t want = av ? (uint32_t)strtoul(av, NULL, 0) : cur;
+        want &= 0x1Fu;
+
+        if ((want & 0x01) && !(cur & 0x01)) {
+            wifi_manager_force_off();
+            os_hw_reset(OS_HW_WIFI);
+            printf("PWRBIN 0x01 WiFi 已强制关 (射频停 + 计数归零)\r\n");
+        }
+        if ((want & 0x02) && !(cur & 0x02)) {
+            audio_player_stop();
+            audio_pa_init();              /* PA_EN(GPIO46) 拉低 */
+            printf("PWRBIN 0x02 音频已停 + 功放拉低\r\n");
+        }
+        if ((want & 0x04) && !(cur & 0x04)) {
+            sd_unmount();
+            printf("PWRBIN 0x04 SD 已卸载\r\n");
+        }
+        {
+            int maxf = (want & 0x08) ? 80 : 240;
+            esp_pm_config_t pm = { .max_freq_mhz = maxf, .min_freq_mhz = 80,
+                                   .light_sleep_enable = (want & 0x10) != 0 };
+            esp_err_t pe = esp_pm_configure(&pm);
+            printf("PWRBIN PM max=%dMHz light_sleep=%d (%s)\r\n",
+                   maxf, (want & 0x10) ? 1 : 0, esp_err_to_name(pe));
+        }
+        cur = want;
+        printf("PWRBIN mask=0x%02X (01WiFi 02音频 04SD 08降频 10浅睡)\r\n", (unsigned)cur);
+    } else if (strcmp(cmd, "minboot") == 0) {
+        /* minboot <0|1> —— 最小系统开关 (只保留 LCD+触摸)。写 NVS, 重启生效。
+         *   minboot 1 → 重启进"只剩屏幕和触摸"; minboot 0 → 回正常系统。 */
+        char *av = rc_next(&rest);
+        min_boot_set_flag(av ? atoi(av) : 1);
+    } else if (strcmp(cmd, "add") == 0) {
+        /* add <mask> —— 最小系统里逐项加回功能 (叠加, 重启复位):
+         *   0x01 WiFi · 0x02 音频 · 0x04 SD · 0x08 GPS · 0x10 震动 */
+        char *av = rc_next(&rest);
+        min_boot_add(av ? (uint32_t)strtoul(av, NULL, 0) : 0);
+    } else if (strcmp(cmd, "temp") == 0) {
+        /* temp —— 片内温度 (S3 内置, ±5°C 绝对值, 看相对变化)。排查发热用。 */
+        int t10 = min_boot_temp10();
+        if (t10 <= -1000) printf("TEMP n/a (传感器不可用)\r\n");
+        else              printf("TEMP %d.%d C\r\n", t10 / 10, t10 % 10);
+    } else if (strcmp(cmd, "cpufreq") == 0) {
+        /* cpufreq <80|160|240> —— 现场改 CPU 上限频率(不浅睡), 用来称"降频换温度"
+         *   与"操作跟手性"的平衡点。重启/进屏保会重新配置。 */
+        char *av = rc_next(&rest);
+        int f = av ? atoi(av) : 0;
+        if (f != 80 && f != 160 && f != 240) {
+            printf("CPUFREQ 用法: cpufreq 80|160|240  (当前配置见 pm)\r\n");
+        } else {
+            esp_pm_config_t pm = { .max_freq_mhz = f, .min_freq_mhz = 80,
+                                   .light_sleep_enable = false };
+            esp_err_t e = esp_pm_configure(&pm);
+            printf("CPUFREQ max=%dMHz light_sleep=0 (%s)\r\n", f, esp_err_to_name(e));
+        }
+    } else if (strcmp(cmd, "batcal") == 0) {
+        /* ★ 2026-10-27: 用外部仪表(万用表/INA226)的真实 VBAT 标定分压比。
+         *   用法: batcal <真实mV>   例: batcal 4038
+         *   内部取**同一时刻**脚上 mV 反算 k = 真实/脚上, 写 NVS 后立即生效。
+         *   ⚠ 要在电池电压稳定时标 (充电中/大负载时 VBAT 本身在变)。 */
+        char *av = rc_next(&rest);
+        uint32_t real_mv = av ? (uint32_t)atoi(av) : 0;
+        if (real_mv == 0) {
+            printf("BATCAL_ERR 用法: batcal <真实mV>  (例 batcal 4038)\r\n");
+        } else {
+            bool ok = board_battery_calibrate(real_mv);
+            printf("BATCAL %s\r\n", ok ? "OK" : "FAIL");
+            board_battery_diag();     /* 标完立刻打一遍新读数, 便于核对 */
+        }
+    } else if (strcmp(cmd, "batstat") == 0 || strcmp(cmd, "standby") == 0) {
+        /* ==== 待机(深睡)耗电实测 ====
+         * 用法: 拔掉 USB 放置一段时间 → 插上后立刻发 batstat。
+         * 打印三个窗口的电压斜率 mV/h (跨深睡段的空白由首末两点自动跨过去算)。
+         * 折算: 电池 500mAh / 满空电压差 ~900mV ⇒ 1mA ≈ 1.8mV/h。 */
+        /* ★ 2026-11-01 linit 内存规则：5.6KB 波形缓冲默认放 PSRAM。
+         *   只有手敲 batstat 命令才用到，却常驻内部 RAM 一整个固件生命周期，不划算。 */
+        static EXT_RAM_BSS_ATTR bat_sample_t bw[BOARD_BATTERY_WAVE_MAX];
+        const uint32_t win[3] = { 3600u, 6u * 3600u, 24u * 3600u };
+        board_battery_status_t bs;
+        if (board_battery_read_cached(&bs) == ESP_OK)
+            printf("BATSTAT  当前=%u mV %u%%  历史跨度=%lu s\r\n",
+                   (unsigned)bs.voltage_mv, (unsigned)bs.percent,
+                   (unsigned long)board_battery_hist_span_s());
+        else
+            printf("BATSTAT  当前电压读取失败  历史跨度=%lu s\r\n",
+                   (unsigned long)board_battery_hist_span_s());
+        for (int k = 0; k < 3; k++) {
+            int n = board_battery_wave(bw, BOARD_BATTERY_WAVE_MAX, win[k]);
+            if (n < 2) { printf("BATSTAT %2luh: 数据不足 (%d 点)\r\n", (unsigned long)(win[k]/3600), n); continue; }
+            int mv0 = bw[0].mv, mv1 = bw[n-1].mv;
+            uint32_t dt = (bw[n-1].t > bw[0].t) ? (bw[n-1].t - bw[0].t) : 1;
+            float mvph = (float)(mv1 - mv0) * 3600.0f / (float)dt;
+            printf("BATSTAT %2luh: %d→%d mV  跨 %lu s  %+.1f mV/h  ≈ %.1f mA\r\n",
+                   (unsigned long)(win[k]/3600), mv0, mv1, (unsigned long)dt,
+                   mvph, -mvph / 1.8f);
+        }
+        {
+            extern void power_stat_diag(void);
+            power_stat_diag();
+        }
+    } else if (strcmp(cmd, "rst") == 0) {
+        /* rst —— 读"最近几次异常复位原因"(NVS 环形, 只记非 USB 复位)。
+         * 收藏夹会开 USB HID ⇒ 串口没了, 崩了看不到 panic; 重启后发这条即可取证。 */
+        static const char *nm[] = {"UNKNOWN","POWERON","EXT","SW","PANIC","INT_WDT",
+                                   "TASK_WDT","WDT","DEEPSLEEP","BROWNOUT","SDIO","USB",
+                                   "JTAG","EFUSE","PWR_GLITCH","CPU_LOCKUP"};
+        nvs_handle_t h;
+        uint8_t hist[8] = {0}; size_t n = sizeof(hist);
+        if (svc_nvs_open("pst", NVS_READONLY, &h) == ESP_OK) {
+            svc_nvs_get_blob(h, "rst", hist, &n);
+            svc_nvs_close(h);
+        }
+        printf("RST_HIST idx=%u:", (unsigned)hist[0]);
+        for (int i = 0; i < 7; i++) {   /* hist[0]=写指针, 记录只有 hist[1..7] 七个 ⇒ 原 i<8 会读 hist[8] 越界 */
+            if (!hist[1+i]) continue;
+            int v = hist[1+i];
+            printf(" %s", (v >= 0 && v < 16) ? nm[v] : "?");
+        }
+        printf("\r\n");
+    } else if (strcmp(cmd, "wpss") == 0) {
+        /* wpss <息屏分钟> [休眠分钟] —— 现场改屏保/自动关机时长(只影响本次运行, 不写 NVS)。
+         * 排查"放一会儿就重启/息屏"时用: 设 1 分钟即可在几十秒内复现。 */
+        char *a1 = rc_next(&rest);
+        char *a2 = rc_next(&rest);
+        int m1 = a1 ? atoi(a1) : -1;
+        if (m1 < 0) { printf("WPSS_ERR 用法: wpss <息屏分钟> [休眠分钟]\r\n"); }
+        else {
+            wp_screensaver_set_delay_ms((uint32_t)m1 * 60000u);
+            if (a2) wp_screensaver_set_run_ms((uint32_t)atoi(a2) * 60000u);
+            printf("WPSS 息屏=%d 分 休眠=%s 分\r\n", m1, a2 ? a2 : "不变");
+        }
+    } else if (strcmp(cmd, "now") == 0 || strcmp(cmd, "espnow") == 0) {
+        /* `now` 系列 —— ESP-NOW 现场诊断 (双机联机前先在这验证通路):
+         *   now start | stop | info
+         *   now send <mac> <text>    点对点 (先 start; 会自动 add_peer)
+         *   now bcast <text>         广播
+         *   now recv                 取一条 (打印 mac + 内容), 没有则报空
+         *   now stats                收发计数 */
+        char *sub = rc_next(&rest);
+        if (!sub) { printf("NOW_ERR 用法: now start|stop|info|send|bcast|recv|stats\r\n"); }
+        else if (strcmp(sub, "start") == 0) {
+            printf("NOW_START %d\r\n", (int)espnow_link_start());
+        } else if (strcmp(sub, "stop") == 0) {
+            espnow_link_stop(); printf("NOW_STOP\r\n");
+        } else if (strcmp(sub, "info") == 0 || strcmp(sub, "mac") == 0) {
+            uint8_t m[6] = {0};
+            espnow_link_self_mac(m);
+            printf("NOW mac=%02X:%02X:%02X:%02X:%02X:%02X ch=%u run=%d peers=%d\r\n",
+                   m[0],m[1],m[2],m[3],m[4],m[5],
+                   (unsigned)espnow_link_channel(), (int)espnow_link_is_running(),
+                   espnow_link_peer_count());
+        } else if (strcmp(sub, "bcast") == 0) {
+            char *txt = rc_next(&rest);
+            if (!txt) printf("NOW_ERR bcast 缺内容\r\n");
+            else printf("NOW_BCAST %d\r\n", (int)espnow_link_broadcast(txt, (int)strlen(txt)));
+        } else if (strcmp(sub, "send") == 0) {
+            char *macs = rc_next(&rest);
+            char *txt  = rc_next(&rest);
+            unsigned v[6];
+            if (!macs || !txt ||
+                sscanf(macs, "%x:%x:%x:%x:%x:%x", &v[0],&v[1],&v[2],&v[3],&v[4],&v[5]) != 6) {
+                printf("NOW_ERR 用法: now send aa:bb:cc:dd:ee:ff <text>\r\n");
+            } else {
+                uint8_t m[6] = { (uint8_t)v[0],(uint8_t)v[1],(uint8_t)v[2],
+                                 (uint8_t)v[3],(uint8_t)v[4],(uint8_t)v[5] };
+                espnow_link_add_peer(m, NULL);
+                printf("NOW_SEND %d\r\n", (int)espnow_link_send(m, txt, (int)strlen(txt)));
+            }
+        } else if (strcmp(sub, "recv") == 0) {
+            uint8_t m[6]; static char buf[ESPNOW_MAX_PAYLOAD + 1];
+            int n = espnow_link_recv(m, buf, ESPNOW_MAX_PAYLOAD);
+            if (n <= 0) printf("NOW_RECV 空\r\n");
+            else {
+                buf[n] = 0;
+                printf("NOW_RECV from=%02X:%02X:%02X:%02X:%02X:%02X len=%d [%s]\r\n",
+                       m[0],m[1],m[2],m[3],m[4],m[5], n, buf);
+            }
+        } else if (strcmp(sub, "stats") == 0) {
+            espnow_link_stats_t st; espnow_link_get_stats(&st);
+            printf("NOW_STATS rx=%lu drop=%lu tx=%lu fail=%lu rssi=%d pending=%d\r\n",
+                   (unsigned long)st.rx_ok, (unsigned long)st.rx_drop,
+                   (unsigned long)st.tx_ok, (unsigned long)st.tx_fail,
+                   (int)st.last_rssi, espnow_link_pending());
+        } else {
+            printf("NOW_ERR 未知子命令 %s\r\n", sub);
+        }
+    } else if (strcmp(cmd, "luaprof") == 0) {
+        /* luaprof [0|1] —— 打开/关闭 Lua 应用启动与退出的分阶段计时 (默认关)。
+         *   开: luaprof 1 → 进任意 .lua 应用 → 串口看 LUAPROF 行 (每段 +xx us)
+         *   关: luaprof 0 */
+        extern void lua_prof_set(int on);
+        extern int  lua_prof_get(void);
+        char *a = rc_next(&rest);
+        int on = a ? atoi(a) : 1;
+        lua_prof_set(on);
+        printf("LUAPROF %s\r\n", lua_prof_get() ? "ON" : "OFF");
+    } else if (strcmp(cmd, "luasmoke") == 0) {
+        /* Lua 冒烟自检 (原开机自动跑, 占 248ms 启动时间 → 2026-10-20 改成手动触发):
+         * 挂 SPIFFS + 加载执行 /store/test.lua, 结果只看串口 LUA 行。 */
+        extern void lua_smoke_test(void);
+        lua_smoke_test();
+    } else if (strcmp(cmd, "tasks") == 0) {
+        char *buf = (char *)malloc(4096 * 2);
+        if (!buf) printf("RC_ERR tasks oom\r\n");
+        else {
+            vTaskList(buf);
+            printf("TASKS\r\n%sTASKS_END\r\n", buf);
+            free(buf);
+        }
+    } else if (strcmp(cmd, "fps") == 0) {
+        /* fps [reset] → 累计帧数 + 区间真实帧率 + 上帧"绘制 vs 送屏"拆分
+         * 用法: `fps reset` → 操作 → `fps`, 得到这段时间**真正画了多少帧/秒**。 */
+        void os_get_render_stats(uint32_t*, uint32_t*, uint32_t*, uint32_t*);
+        void os_get_frame_gap(uint32_t*, uint32_t*, uint32_t*);
+        void os_reset_frame_gap(void);
+        uint32_t n = 0, avg = 0, ld = 0, lf = 0, gapmax = 0, slow = 0, cur = 0;
+        os_get_render_stats(&n, &avg, &ld, &lf);
+        os_get_frame_gap(&gapmax, &slow, &cur);
+        static uint32_t snap_n = 0;
+        static int64_t  snap_us = 0;
+        char *a = rc_next(&rest);
+        if (a && !strcmp(a, "reset")) {
+            snap_n = n; snap_us = esp_timer_get_time();
+            os_reset_frame_gap();
+            printf("FPS reset @frames=%lu (现在开始操作, 完事再发 fps)\r\n", (unsigned long)n);
+        } else if (snap_us) {
+            int64_t dt = esp_timer_get_time() - snap_us;
+            uint32_t dn = n - snap_n;
+            printf("FPS 区间: %lu 帧 / %.2fs = %.1f fps\r\n",
+                   (unsigned long)dn, (double)dt / 1e6,
+                   dt > 0 ? (double)dn * 1e6 / (double)dt : 0.0);
+            printf("FPS 累计: frames=%lu avg=%luus (%.1f fps) last: draw=%luus flush=%luus\r\n",
+                   (unsigned long)n, (unsigned long)avg,
+                   avg ? 1000000.0 / (double)avg : 0.0,
+                   (unsigned long)ld, (unsigned long)lf);
+            printf("FPS 抖动: 最大间隔=%luus, >30ms 的帧=%lu 次\r\n",
+                   (unsigned long)gapmax, (unsigned long)slow);
+        } else {
+            printf("FPS frames=%lu avg=%luus (%.1f fps) last: draw=%luus flush=%luus\r\n",
+                   (unsigned long)n, (unsigned long)avg,
+                   avg ? 1000000.0 / (double)avg : 0.0,
+                   (unsigned long)ld, (unsigned long)lf);
+        }
+    } else if (strcmp(cmd, "pin") == 0) {
+        /* pin <n> [up|down|none] → 把某个 GPIO 配成输入(指定上下拉)并读电平。
+         * 专门用来判断"这个脚到底能不能当输入用"(浮空+上拉应读到 1)。 */
+        char *a = rc_next(&rest); char *b = rc_next(&rest);
+        if (!a) printf("RC_ERR pin <n> [up|down|none]\r\n");
+        else {
+            int n = (int)strtol(a, NULL, 0);
+            gpio_config_t io = {
+                .pin_bit_mask = (1ULL << n),
+                .mode         = GPIO_MODE_INPUT,
+                .pull_up_en   = (b && !strcmp(b, "down")) ? GPIO_PULLUP_DISABLE : GPIO_PULLUP_ENABLE,
+                .pull_down_en = (b && !strcmp(b, "down")) ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
+                .intr_type    = GPIO_INTR_DISABLE,
+            };
+            esp_err_t e = gpio_config(&io);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            printf("PIN %d cfg=%s level=%d\r\n", n, esp_err_to_name(e),
+                   e == ESP_OK ? gpio_get_level((gpio_num_t)n) : -1);
+        }
+    } else if (strcmp(cmd, "gray") == 0) {
+        /* gray [0|1] → 灰阶算法: 0 = 点聚 2x2 (默认, 原实现) / 1 = 4x4 Bayer (实验)。
+         * 两个模拟器(GB/GBC 与 NES)共用 board_shim 里同一套表 ⇒ 一次切换同时生效;
+         * 切换会重建三张表并作废帧指纹, 下一次 flush 强制整屏重画。
+         * 两者填充率相同(dots/4), 整体亮度不变, 可直接肉眼 A/B。 */
+        extern void board_shim_set_gray_alg(int alg);
+        extern int  board_shim_get_gray_alg(void);
+        char *a = rc_next(&rest);
+        if (!a || !*a) {
+            printf("GRAY %d (0=cluster 1=bayer)\r\n", board_shim_get_gray_alg());
+        } else {
+            board_shim_set_gray_alg((int)strtol(a, NULL, 0) != 0);
+            printf("GRAY %d -> ok (下一次刷屏整屏重画)\r\n", board_shim_get_gray_alg());
+        }
+    } else if (strcmp(cmd, "lcdperf") == 0) {
+        /* lcdperf → ST7305 flush 分段耗时汇总 (命令段/数据段/总耗时 的 avg·min·max)。
+         * 需编译期把 components/drivers/st7305/st7305.c 的 ST7305_PERF_STATS 改成 1;
+         * 关闭时这里只打印"未启用", 不占任何静态 RAM。
+         * `lcdperf reset` 清零后重新采样。 */
+        char *a = rc_next(&rest);
+        if (a && (!strcmp(a, "reset") || !strcmp(a, "0"))) {
+            st7305_perf_reset();
+            printf("LCDPERF reset ok\r\n");
+        } else {
+            st7305_perf_dump();
+            printf("LCDPERF dump (详见日志)\r\n");
+        }
+    } else if (strcmp(cmd, "partial") == 0) {
+        /* partial [0|1] → 局刷开关(默认 0=整帧)。开之前先确认不会出现"某几行横移"。 */
+        char *a = rc_next(&rest);
+        if (!a || !*a) printf("PARTIAL %d\r\n", st7305_get_partial());
+        else { st7305_set_partial((int)strtol(a, NULL, 0) != 0);
+               printf("PARTIAL %d -> ok\r\n", st7305_get_partial()); }
+    } else if (strcmp(cmd, "chrg") == 0) {
+        /* chrg → 打 CHRG 脚原始电平和判定结果。
+         * ★ 2026-11-21 定案: 只有一根 CHRG(模组 29 脚 → GPIO44, 开漏低有效)。
+         *   低 = 充电中; 高 = 没插线或已充满(后者看 batstat 的电压, ≥4150mV 即充满)。 */
+        int board_battery_chrg_pin(void);
+        bat_chg_state_t board_battery_charge_state(void);
+        int dpin = board_battery_chrg_pin();
+        if (dpin < 0) {
+            printf("CHRG 本板未接 (GPIO=-1)\r\n");
+        } else {
+            int lvl = gpio_get_level((gpio_num_t)dpin);
+            static const char *st[] = { "未充电", "充电中", "已充满" };
+            int s = (int)board_battery_charge_state();
+            printf("CHRG GPIO%d 电平=%d => %s\r\n", dpin, lvl,
+                   (s >= 0 && s <= 2) ? st[s] : "?");
+        }
+    } else if (strcmp(cmd, "pace") == 0) {
+        /* pace [ms] → UI 产帧间隔。0=自动(默认): 操作中 1ms / 惯性 8ms / 静止 33ms。
+         * 固定值只用于对比: 1=最跟手, 32=省电但明显卡。 */
+        void os_ui_set_pace(int); int os_ui_get_pace(void);
+        char *a = rc_next(&rest);
+        if (!a || !*a) printf("PACE %s (%d ms)\r\n",
+                              os_ui_get_pace() ? "固定" : "自动", os_ui_get_pace());
+        else { os_ui_set_pace((int)strtol(a, NULL, 0));
+               printf("PACE %s -> ok\r\n", os_ui_get_pace() ? "固定" : "自动(0)"); }
+    } else if (strcmp(cmd, "logsave") == 0) {
+        /* logsave → 把内存里的日志缓冲**一次性**追加写入 /sdcard/data/log/bbk.log。
+         * 平时不再自动写卡(省电/护卡/保数据), 只有需要备份或排查时手动触发。
+         * ★ 2026-10-29: 必须按真实返回值报告 —— 原来无条件打 "LOGSAVE ok",
+         *   即使 fopen 失败 / 文件已到 1MB 也报成功, 排查会被彻底带偏。 */
+        esp_err_t lr = svc_log_flush_once();
+        if (lr == ESP_OK)
+            printf("LOGSAVE ok -> /sdcard/data/log/bbk.log\r\n");
+        else if (lr == ESP_ERR_INVALID_STATE)
+            printf("RC_ERR logsave: TF 未挂载 (缓冲保留)\r\n");
+        else if (lr == ESP_ERR_INVALID_SIZE)
+            printf("RC_ERR logsave: 文件已达 1MB, 先 rm /sdcard/data/log/bbk.log (旧日志未删)\r\n");
+        else if (lr == ESP_ERR_TIMEOUT)
+            printf("RC_ERR logsave: 等锁超时 (缓冲保留, 稍后重试)\r\n");
+        else
+            printf("RC_ERR logsave: %s (缓冲视情况保留, 可重试)\r\n", esp_err_to_name(lr));
+    } else if (strcmp(cmd, "ls") == 0) {
+        char *d = rc_next(&rest); if (!d || !*d) d = "/sdcard";
+        DIR *dd = opendir(d);
+        if (!dd) printf("RC_ERR ls %s\r\n", d);
+        else {
+            struct dirent *e;
+            while ((e = readdir(dd)) != NULL) {
+                if (e->d_name[0] == '.') continue;
+                printf("LS %s/%s%s\r\n", d, e->d_name,
+                       (e->d_type == DT_DIR) ? "/" : "");
+            }
+            closedir(dd);
+            printf("LS_DONE\r\n");
+        }
+    } else if (strcmp(cmd, "lpk") == 0) {
+        /* lpk <file.lpk> [v] —— 打开自包含包并打印摘要(只读)。
+         * v = 额外做整包 CRC 校验(41MB 约几秒)。真机验证 LPK 读取就靠它。 */
+        char *p = rc_next(&rest);
+        char *v = rc_next(&rest);
+        if (!p || !*p) { printf("RC_ERR lpk <file.lpk> [v]\r\n"); }
+        else {
+            lpk_t h;
+            int rc = lpk_open(&h, p, NULL, 0);        /* 先只读头, 拿到条数 */
+            if (rc != 0) {
+                printf("LPK_ERR rc=%d (%s)\r\n", rc, p);
+            } else {
+                printf("LPK %s: files=%u lua=%u B total=%u data_off=%u pkg_crc=%08x\r\n",
+                       p, (unsigned)h.count, (unsigned)h.lua_size,
+                       (unsigned)h.total_size, (unsigned)h.data_off, (unsigned)h.pkg_crc);
+                uint32_t cnt = h.count;
+                lpk_close(&h);
+                if (cnt > 0) {
+                    lpk_entry_t *tab = heap_caps_malloc((size_t)cnt * sizeof(lpk_entry_t),
+                                                        MALLOC_CAP_SPIRAM);
+                    if (!tab) {
+                        printf("LPK_ERR 内存不足(表 %u 条)\r\n", (unsigned)cnt);
+                    } else {
+                        rc = lpk_open(&h, p, tab, (int)cnt);
+                        if (rc != 0) {
+                            printf("LPK_ERR 读索引 rc=%d\r\n", rc);
+                        } else {
+                            int show = cnt < 8 ? (int)cnt : 8;
+                            for (int i = 0; i < show; i++)
+                                printf("  [%d] %-24s %9u B @%u crc=%08x\r\n", i, tab[i].name,
+                                       (unsigned)tab[i].size, (unsigned)tab[i].off,
+                                       (unsigned)tab[i].crc32);
+                            if ((int)cnt > show) printf("  ... 共 %u 条\r\n", (unsigned)cnt);
+                            if (h.lua_size) {
+                                char *lb = heap_caps_malloc(h.lua_size + 1, MALLOC_CAP_SPIRAM);
+                                uint32_t got = 0;
+                                if (lb && lpk_read_lua(&h, lb, h.lua_size, &got) == LPK_OK) {
+                                    lb[got < h.lua_size ? got : h.lua_size] = 0;
+                                    printf("LUA_HEAD: %.40s\r\n", lb);
+                                }
+                                if (lb) free(lb);
+                            }
+                            if (v && (*v == 'v' || *v == 'V'))
+                                printf("PKG_CRC %s\r\n", lpk_verify_pkg(&h) == LPK_OK ? "OK" : "MISMATCH");
+                            lpk_close(&h);
+                        }
+                        free(tab);
+                    }
+                }
+                printf("LPK_DONE\r\n");
+            }
+        }
+    } else if (strcmp(cmd, "lpkv") == 0) {
+        /* lpkv [lpk路径] [base目录] [c] —— 把 LPK 挂到 /lpk 并跑**真机**自检。
+         *   c = 逐条 CRC(慢, 41 MB 几十秒)：证明"读出来的每个字节都对"。
+         * 不带参数用仙剑默认位置: /sdcard/apps/app/pal/pal.lpk + 同目录当可写旁路。
+         * 输出逐行 PASS/FAIL, 末尾 SUMMARY。跑完自动卸载, 不影响游戏。 */
+        extern esp_err_t lpk_vfs_mount(const char *, const char *, const lpk_vfs_wr_t *, int);
+        extern esp_err_t lpk_vfs_unmount(void);
+        extern int       lpk_vfs_selftest(bool, char *, size_t);
+
+        char *p    = rc_next(&rest);
+        char *b    = rc_next(&rest);
+        char *fl   = rc_next(&rest);
+        char defp[160], defb[128];
+        if (!p || !*p) { snprintf(defp, sizeof(defp), "/sdcard/apps/app/pal/pal.lpk"); p = defp; }
+        if (!b || !*b) { snprintf(defb, sizeof(defb), "/sdcard/apps/app/pal");         b = defb; }
+        bool full = (fl && (*fl == 'c' || *fl == 'C'));
+
+        static const lpk_vfs_wr_t W[] = { { "save/", true }, { "screenshot/", true }, { "sdlpal.cfg", false } };
+        esp_err_t e = lpk_vfs_mount(p, b, W, (int)(sizeof(W) / sizeof(W[0])));
+        if (e != ESP_OK) {
+            printf("LPKV_ERR mount %s -> %s\r\n", p, esp_err_to_name(e));
+        } else {
+            size_t cap = 6144;
+            char *out = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+            if (!out) out = malloc(cap);
+            if (!out) printf("LPKV_ERR 输出缓冲分配失败\r\n");
+            else {
+                int fails = lpk_vfs_selftest(full, out, cap);
+                /* 逐行打印（串口一屏一屏刷，比一坨 printf 更好读） */
+                char *s = out;
+                while (s && *s) {
+                    char *nl = strchr(s, '\n');
+                    if (nl) *nl = 0;
+                    if (*s) printf("LPKV %s\r\n", s);
+                    if (!nl) break;
+                    s = nl + 1;
+                }
+                printf("LPKV_EXIT fails=%d\r\n", fails);
+                free(out);
+            }
+            lpk_vfs_unmount();
+        }
+    } else if (strcmp(cmd, "lpkmode") == 0) {
+        /* lpkmode [dir] [auto|lpk|zip] —— 看/改"资源模式"。
+         *   auto(默认) = 只跑判定并打印（不改任何东西）；
+         *   lpk / zip  = 写安装记录 <dir>/.install_mode（**将来商店安装器调的就是这一条**）。
+         * 写 lpk 之前会用同一套自检验包：缺资源/截断包一律拒绝，不会"装了个打不开的模式"。
+         * 判定与记录格式见 components/services/lpk/lpk_mode.c。 */
+        char *d = rc_next(&rest);
+        char *m = rc_next(&rest);
+        char defd[128];
+        if (!d || !*d) { snprintf(defd, sizeof(defd), "/sdcard/apps/app/pal"); d = defd; }
+        char why[160] = {0};
+
+        lpk_entry_t *tab = NULL; int cnt = 0;
+        char lp[200]; snprintf(lp, sizeof(lp), "%s/pal.lpk", d);
+        lpk_t h;
+        if (lpk_open(&h, lp, NULL, 0) == LPK_OK) { cnt = (int)h.count; lpk_close(&h); }
+
+        if (m && (*m == 'l' || *m == 'L')) {
+            if (!lpk_mode_lpk_ready(lp, NULL, 0, why, sizeof(why))) {
+                printf("LPMODE_ERR 拒绝写 lpk: %s\r\n", why);
+            } else if (lpk_mode_record_write(d, 1) != 0) {
+                printf("LPMODE_ERR 写 %s/%s 失败\r\n", d, LPK_MODE_RECORD);
+            } else {
+                printf("LPMODE ok 已记录 lpk → %s（%d 条资源）\r\n", d, cnt);
+            }
+        } else if (m && (*m == 'z' || *m == 'Z')) {
+            if (!lpk_mode_dir_ready(d, why, sizeof(why))) {
+                printf("LPMODE_ERR 拒绝写 zip: %s\r\n", why);
+            } else if (lpk_mode_record_write(d, 0) != 0) {
+                printf("LPMODE_ERR 写 %s/%s 失败\r\n", d, LPK_MODE_RECORD);
+            } else {
+                printf("LPMODE ok 已记录 zip → %s\r\n", d);
+            }
+        } else {
+            int rec = lpk_mode_record_read(d);
+            lpk_res_mode_t got = lpk_mode_decide(d, tab, 0, why, sizeof(why));
+            printf("LPMODE dir=%s 记录=%s 判定=%s\r\n", d,
+                   rec == 1 ? "lpk" : (rec == 0 ? "zip" : "无"),
+                   lpk_mode_str(got));
+            printf("LPMODE 原因: %s | 包内 %d 条 | 包=%s\r\n", why, cnt, lp);
+        }
+    } else if (strcmp(cmd, "mf") == 0) {
+        /* mf <mirror> <manifest_rel> <target> [zip_path] —— 多文件直接下载自测。
+         * 例: mf http://10.10.10.103:8899 manifest.json /sdcard/apps/app/mftest pkgs/pal.zip
+         * 只读调试入口(与 asset 命令同级), 用于验证清单拉取/逐文件下载/连接复用/续传。 */
+        extern int am_asset_multi_install_cli(const char *mirror, const char *rel,
+                                             const char *target, const char *zip);
+        char *m  = rc_next(&rest);
+        char *mr = rc_next(&rest);
+        char *tg = rc_next(&rest);
+        char *zp = rc_next(&rest);
+        if (!m || !*m || !mr || !*mr || !tg || !*tg) {
+            printf("RC_ERR mf <mirror> <manifest_rel> <target> [zip_path]\r\n");
+        } else {
+            int r = am_asset_multi_install_cli(m, mr, tg, (zp && *zp) ? zp : "pal.zip");
+            printf("MF rc=%d\r\n", r);
+        }
+    } else if (strcmp(cmd, "mfun") == 0) {
+        /* mfun <target> <zip_path> —— 按安装清单卸载(与商店"卸载"同一函数) */
+        extern bool am_asset_uninstall_cli(const char *target, const char *zip);
+        char *tg = rc_next(&rest);
+        char *zp = rc_next(&rest);
+        if (!tg || !*tg) printf("RC_ERR mfun <target> [zip_path]\r\n");
+        else printf("MFUN %s : %s\r\n", tg,
+                    am_asset_uninstall_cli(tg, (zp && *zp) ? zp : "pal.zip") ? "OK" : "FAIL");
+    } else if (strcmp(cmd, "asset") == 0) {
+        /* asset <zip> <target> —— 资源包解包自测 (不联网也能验证 am_asset) */
+        extern bool am_asset_install(const char *zip_path, const char *target_dir);
+        char *z = rc_next(&rest);
+        char *t = rc_next(&rest);
+        if (!z || !*z || !t || !*t) printf("RC_ERR asset <zip> <dir>\r\n");
+        else printf("ASSET %s -> %s : %s\r\n", z, t,
+                    am_asset_install(z, t) ? "OK" : "FAIL");
+    } else if (strcmp(cmd, "cat") == 0) {
+        char *p = rc_next(&rest);
+        if (!p || !*p) { printf("RC_ERR cat <file>\r\n"); }
+        else {
+            FILE *f = fopen(p, "r");
+            if (!f) printf("RC_ERR cat open %s\r\n", p);
+            else {
+                char line[256]; int n = 0;
+                printf("CAT %s\r\n", p);
+                while (fgets(line, sizeof line, f) && n < 400) {
+                    char *s = line; printf("%s", s); n++;
+                }
+                printf("\r\nCAT_END\r\n");
+                fclose(f);
+            }
+        }
+    } else if (strcmp(cmd, "rm") == 0) {
+        char *p = rc_next(&rest);
+        if (!p || !*p) printf("RC_ERR rm <file>\r\n");
+        else printf("RM %s -> %s\r\n", p, remove(p) == 0 ? "ok" : "fail");
+    } else if (strcmp(cmd, "cp") == 0) {
+        char *s = rc_next(&rest), *d = rc_next(&rest);
+        if (!s || !d) { printf("RC_ERR cp <src> <dst>\r\n"); }
+        else {
+            FILE *fs = fopen(s, "rb");
+            if (!fs) printf("RC_ERR cp open %s\r\n", s);
+            else {
+                FILE *fd = fopen(d, "wb");
+                if (!fd) { printf("RC_ERR cp open %s\r\n", d); fclose(fs); }
+                else {
+                    char buf[1024]; size_t n; size_t tot = 0;
+                    while ((n = fread(buf, 1, sizeof buf, fs)) > 0) { fwrite(buf, 1, n, fd); tot += n; }
+                    fclose(fs); fclose(fd);
+                    printf("CP %s -> %s (%u B)\r\n", s, d, (unsigned)tot);
+                }
+            }
+        }
+    } else if (strcmp(cmd, "tpscan") == 0) {
+        /* tpscan —— 触摸 I2C 总线诊断: 两组候选引脚各扫一遍全地址.
+         * 输出: 引脚电平 + 每个应答的地址 + 是否随 RST 变化. */
+        extern void rc_touch_scan(void);
+        rc_touch_scan();
+        printf("TPSCAN done\r\n");
+    } else if (strcmp(cmd, "ftaxis") == 0 || strncmp(cmd, "ftaxis ", 7) == 0) {
+        /* ftaxis [0..3] —— FT6236 方向参数: bit0 交换XY, bit1 Y取反。落盘, 不重编。
+         * 只对 FT6236 生效; CST836U/GT911 完全不受影响。 */
+        extern uint8_t touch_panel_get_ft_axis(void);
+        extern void    touch_panel_set_ft_axis(uint8_t v);
+        const char *a = cmd + 6;
+        while (*a == ' ') a++;
+        if (*a >= '0' && *a <= '3') {
+            touch_panel_set_ft_axis((uint8_t)(*a - '0'));
+            printf("FTAXIS 已设为 %c (bit0 交换XY, bit1 Y取反) → 摸一下屏幕试方向\r\n", *a);
+        } else {
+            uint8_t v = touch_panel_get_ft_axis();
+            printf("FTAXIS 当前=%u (bit0 交换XY=%u, bit1 Y取反=%u)\r\n"
+                   "  用法: ftaxis 0..3   0=不动 1=换XY 2=Y取反 3=换XY+Y取反\r\n",
+                   v, v & 1, (v >> 1) & 1);
+        }
+    } else if (strcmp(cmd, "diag") == 0) {
+        /* 综合诊断: uptime + 内部内存 + 任务栈表 + 根目录 */
+        printf("DIAG\r\n");
+        printf("uptime=%.1fs\r\n", (double)esp_timer_get_time() / 1e6);
+        printf("mem_internal_free=%u\r\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        {
+            char *buf = (char *)malloc(8192);
+            if (buf) { vTaskList(buf); printf("%s", buf); free(buf); }
+        }
+        {
+            DIR *d = opendir("/sdcard");
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d))) if (e->d_name[0] != '.')
+                    printf("LSROOT %s%s\r\n", e->d_name, (e->d_type == DT_DIR) ? "/" : "");
+                closedir(d);
+            }
+        }
+        printf("DIAG_END\r\n");
+    } else if (strcmp(cmd, "fbinfo") == 0) {
+        /* 抓屏前置检查: 确认主屏句柄已绑定、帧缓冲已分配 */
+        if (!s_lcd || !s_lcd->fb) {
+            printf("FB_NONE lcd=%p fb=%p\r\n", (void *)s_lcd, s_lcd ? (void *)s_lcd->fb : NULL);
+        } else {
+            uint32_t crc = esp_rom_crc32_le(0, s_lcd->fb, RC_FB_BYTES);
+            printf("FB %dx%d bytes=%d crc=%08x ptr=%p\r\n",
+                   ST7305_WIDTH, ST7305_HEIGHT, RC_FB_BYTES, (unsigned)crc, (void *)s_lcd->fb);
+        }
+    } else if (strcmp(cmd, "fbdump") == 0) {
+        /* 抓屏: 帧缓冲 → base64 → 串口。15000B → 20000 字符 → 264 行。
+         * 缓冲区从堆上取 (20KB, 不能放 5120B 的读任务栈); 编码用 IDF 自带 mbedtls。
+         *
+         * ★ 2026-10-03 修「CRC 恒定不符, 长度却精确」:
+         *   原来 base64 与 CRC32 各自**直接读 s_lcd->fb**。当画面在逐帧重绘时
+         *   (例如全屏刷新的游戏), 这两次读之间缓冲已经被改写 —— 症状是每次都
+         *   "长度=15000 正确, CRC 不符, 且三次抓到三个不同的 CRC"(实测), 很容易
+         *   被误判成"串口丢字节"或"固件坏了"。
+         *   正确做法: **先 memcpy 一份快照, 编码与 CRC 都只认这份快照**, 并顺手把
+         *   fb 指针固定下来 (渲染侧若换过缓冲, 两次读会指向不同内存)。 */
+        if (!s_lcd || !s_lcd->fb) { printf("FB_NONE\r\n"); }
+        else {
+            size_t b64_cap = 4 * ((RC_FB_BYTES + 2) / 3) + 8;
+            char *b64 = (char *)heap_caps_malloc(b64_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!b64) b64 = (char *)malloc(b64_cap);
+            uint8_t *snap = (uint8_t *)heap_caps_malloc(RC_FB_BYTES, MALLOC_CAP_SPIRAM);
+            if (!snap) snap = (uint8_t *)malloc(RC_FB_BYTES);
+            const uint8_t *src = s_lcd->fb;
+            if (snap) { memcpy(snap, src, RC_FB_BYTES); src = snap; }
+            size_t b64_len = 0;
+            if (!b64) {
+                printf("FB_ERR no mem (%u B)\r\n", (unsigned)b64_cap);
+            } else if (mbedtls_base64_encode((unsigned char *)b64, b64_cap, &b64_len,
+                                             src, RC_FB_BYTES) != 0) {
+                printf("FB_ERR base64 encode failed\r\n");
+            } else {
+                uint32_t crc = esp_rom_crc32_le(0, src, RC_FB_BYTES);
+                printf("FB_BEGIN %d %d %d %08x\r\n",
+                       ST7305_WIDTH, ST7305_HEIGHT, RC_FB_BYTES, (unsigned)crc);
+                for (size_t i = 0; i < b64_len; i += 76) {
+                    size_t n = b64_len - i; if (n > 76) n = 76;
+                    fwrite(b64 + i, 1, n, stdout);
+                    fwrite("\r\n", 1, 2, stdout);
+                }
+                printf("FB_END\r\n");
+            }
+            free(b64);
+            free(snap);
+            fflush(stdout);
+        }
+    } else if (strcmp(cmd, "help") == 0) {
+        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait bat batdiag batlog esr esw es7 es7w mic help\r\n");
+    }
+    fflush(stdout);
+}
+
+/* ===== 注入队列 ===== */
+static void rc_enqueue(const rc_cmd_t *c){
+    if (s_q) xQueueSend(s_q, c, pdMS_TO_TICKS(100));
+}
+
+/* 递归扫描目录下所有 .nes 并打印完整路径 */
+static void scan_nes_tree(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) { printf("SCAN open fail: %s\r\n", dir); return; }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char p[RC_LINE_MAX];
+        int pl = snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);   /* -Werror 截断: 检查返回值 */
+        if (pl < 0 || (size_t)pl >= sizeof(p)) continue;
+        if (e->d_type == DT_DIR) {
+            scan_nes_tree(p);
+        } else {
+            size_t n = strlen(e->d_name);
+            if (n > 4 && strcasecmp(e->d_name + n - 4, ".nes") == 0)
+                printf("NES %s\r\n", p);
+        }
+    }
+    closedir(d);
+}
+
+/* 解析并派发一条命令: 立即命令直执行; UI 命令入队 */
+static void rc_exec(const char *line){
+    /* ★ 2026-10-09: 任何一条 remcon 命令都算"有人在用", 刷新空闲计时。
+     * 背景: 原来只有 `key` 命令调 input_mark_activity() ⇒ 远程跑回归时
+     * page/nes/app/音频诊断等**不刷新**, 设备按"最后一次物理按键"起算 5 分钟
+     * 空闲超时 → 自动关机(深睡), USB 串口直接消失, 把长会话打断(实测踩了两次)。
+     * 这里放在入口, 一劳永逸覆盖全部命令(含尚未新增的)。
+     * input_mark_activity() 只是两次赋值, 任意任务上下文安全。 */
+    input_mark_activity();
+    char buf[RC_LINE_MAX];
+    snprintf(buf, sizeof(buf), "%s", line);
+    char *rest = buf;
+    char cmd[32];
+    const char *c = rc_next(&rest);
+    if (!c) return;
+    snprintf(cmd, sizeof(cmd), "%s", c);
+    rc_lower(cmd);
+
+    /* ★ 2026-10-22: 触摸总线诊断 (只读, 同步)。必须放在 rc_exec 入口 ——
+     *   文件里有两段一模一样的 cmd 解析, 前一段在 rc_cmd_immediate(死路)。 */
+    if (strcmp(cmd, "tpscan") == 0) {
+        rc_touch_scan();
+        printf("TPSCAN done\r\n");
+        return;
+    }
+
+    if (strcmp(cmd, "wait") == 0) {
+        char *ms = rc_next(&rest); int m = ms ? atoi(ms) : 0;
+        if (m > 0 && m < 120000) vTaskDelay(pdMS_TO_TICKS(m));
+        return;
+    }
+    if (strcmp(cmd, "amgeo") == 0) {
+        extern void am_debug_geo(void);
+        am_debug_geo();
+        return;
+    }
+    if (strcmp(cmd, "amcat") == 0) {
+        /* amcat <0引擎|1应用|2运维|3商店> —— 调试: 切应用管家分类(验证渲染不死机) */
+        extern void am_debug_set_cat(int c);
+        int c = rest ? atoi(rest) : 3;
+        am_debug_set_cat(c);
+        printf("AMCAT %d\r\n", c);
+        return;
+    }
+    if (strcmp(cmd, "bkp") == 0) {
+        /* bkp — 通用备份策略服务 (svc_backup) 的现场验证入口
+         *   bkp                       用法
+         *   bkp list <item>           列出该 item 现有备份
+         *   bkp save <item>           备份 (策略/命名/轮转全由服务决定)
+         *   bkp load <item> [slot]    恢复; slot 省略 = 最新一份
+         *   bkp rm   <item> [slot]    删除一份
+         *
+         * ⚠ 本命令只是**调用方之一**, 不是备份的必经之路:
+         *   任何模块 include "svc_backup.h" 后调 bkp_save()/bkp_load() 就能
+         *   备份自己的字节流, 不需要在这里登记。这里放 item 映射表,
+         *   只是把"要备份某类数据"这一步在调试通道上跑通、可验证。
+         *
+         * item 目前只有 set = 系统设置 (NVS 命名空间 os_settings)。
+         * 收藏/书签不走这里: 收藏有 page_fav 自己的加密包(旧包要能读),
+         * 书签是随书走的 .pos 旁路文件。 */
+        static const struct {
+            const char *name;   /* 命令里用的短名 */
+            const char *bid;    /* 备份 id (决定文件名) */
+            const char *ns;     /* NVS 命名空间 */
+        } items[] = {
+            { "set", "settings", "os_settings" },
+        };
+        const int nitems = (int)(sizeof(items) / sizeof(items[0]));
+
+        char *sub = rc_next(&rest);
+        char *itn = rc_next(&rest);
+
+        if (!sub || strcmp(sub, "help") == 0) {
+            printf("BKP usage:\r\n");
+            printf("  bkp list [set]\r\n");
+            printf("  bkp save <set>\r\n");
+            printf("  bkp load <set> [slot]\r\n");
+            printf("  bkp rm   <set> [slot]\r\n");
+            printf("  item: set = system settings (NVS os_settings)\r\n");
+            printf("  dir : %s  ext: .bkp\r\n", BKP_DIR_DEFAULT);
+            return;
+        }
+
+        const char *bid = NULL, *ns = NULL;
+        if (!itn) {                       /* 省略 item → 默认 set */
+            bid = items[0].bid; ns = items[0].ns;
+        } else {
+            for (int i = 0; i < nitems; i++) {
+                if (strcmp(itn, items[i].name) == 0) { bid = items[i].bid; ns = items[i].ns; break; }
+            }
+        }
+        if (!bid) { printf("BKP unknown item: %s\r\n", itn); return; }
+
+        if (strcmp(sub, "save") == 0) {
+            esp_err_t r = bkp_save_nvs(bid, ns);
+            printf("BKP save %s: %s\r\n", bid, esp_err_to_name(r));
+        } else if (strcmp(sub, "load") == 0) {
+            char *sv = rc_next(&rest);
+            int slot = sv ? atoi(sv) : 0;
+            esp_err_t r = bkp_load_nvs(bid, slot, ns);
+            printf("BKP load %s slot=%d: %s\r\n", bid, slot, esp_err_to_name(r));
+        } else if (strcmp(sub, "list") == 0) {
+            bkp_entry_t e[BKP_SLOT_MAX];
+            int n = bkp_list(bid, e, BKP_SLOT_MAX);
+            printf("BKP list %s: %d\r\n", bid, n);
+            for (int i = 0; i < n; i++)
+                printf("  _%02d  %u B  mtime=%u  %s\r\n", e[i].slot,
+                       (unsigned)e[i].size, (unsigned)e[i].mtime, e[i].name);
+        } else if (strcmp(sub, "rm") == 0) {
+            char *sv = rc_next(&rest);
+            int slot = sv ? atoi(sv) : 0;
+            esp_err_t r = bkp_remove(bid, slot);
+            printf("BKP rm %s slot=%d: %s\r\n", bid, slot, esp_err_to_name(r));
+        } else {
+            printf("BKP unknown sub: %s\r\n", sub);
+        }
+        return;
+    }
+    /* ==== 仙剑画面曲线旋钮 (2026-10-25) ====
+     * ⚠ 必须放在 rc_exec 里: 文件前面那段 rc_cmd_immediate() 是**死路**,
+     *   命令写在那里等于没写 (之前 palgray/palcon 全都没反应就是这个原因)。 */
+    if (strcmp(cmd, "palgam") == 0) {
+        extern void pal_port_set_gamma(int x100);
+        extern int  pal_port_get_gamma(void);
+        char *v = rc_next(&rest);
+        if (v) pal_port_set_gamma(atoi(v));
+        printf("PALGAM %d\r\n", pal_port_get_gamma());
+        return;
+    }
+    if (strcmp(cmd, "palcon") == 0) {
+        extern void pal_port_set_contrast(int x100);
+        extern int  pal_port_get_contrast(void);
+        char *v = rc_next(&rest);
+        if (v) pal_port_set_contrast(atoi(v));
+        printf("PALCON %d\r\n", pal_port_get_contrast());
+        return;
+    }
+    if (strcmp(cmd, "palwhite") == 0) {
+        extern void pal_port_set_white_point(int pt);
+        extern int  pal_port_get_white_point(void);
+        char *v = rc_next(&rest);
+        if (v) pal_port_set_white_point(atoi(v));
+        printf("PALWHITE %d\r\n", pal_port_get_white_point());
+        return;
+    }
+    if (strcmp(cmd, "palbr") == 0) {
+        extern void pal_port_set_brightness(int pct);
+        extern int  pal_port_get_brightness(void);
+        char *v = rc_next(&rest);
+        if (v) pal_port_set_brightness(atoi(v));
+        printf("PALBR %d\r\n", pal_port_get_brightness());
+        return;
+    }
+    if (strcmp(cmd, "palgray") == 0) {
+        extern void pal_port_set_auto_level(bool on);
+        extern bool pal_port_get_auto_level(void);
+        char *v = rc_next(&rest);
+        if (v) pal_port_set_auto_level(atoi(v) != 0);
+        printf("PALGRAY %d\r\n", pal_port_get_auto_level() ? 1 : 0);
+        return;
+    }
+    if (strcmp(cmd, "palblack") == 0) {
+        extern void pal_port_set_black_point(int pt);
+        extern int  pal_port_get_black_point(void);
+        char *v = rc_next(&rest);
+        if (v) pal_port_set_black_point(atoi(v));
+        printf("PALBLACK %d\r\n", pal_port_get_black_point());
+        return;
+    }
+    if (strcmp(cmd, "paldump") == 0) {
+        extern void pal_port_dump_frame(void);
+        pal_port_dump_frame();
+        return;
+    }
+    if (strcmp(cmd, "palstats") == 0) {
+        extern void pal_port_dump_stats(void);
+        pal_port_dump_stats();
+        return;
+    }
+    if (strcmp(cmd, "palmus") == 0) {
+        /* palmus [0|1] —— 仙剑音乐总开关(默认 0; OPL 软合成在本机跑不动),
+         * 下次进游戏生效。无参 = 查询。音效(VOC)不受影响。 */
+        extern void pal_music_enable(bool on);
+        extern bool pal_music_enabled(void);
+        char *v = rc_next(&rest);
+        if (!v) { printf("PALMUS %d\r\n", pal_music_enabled() ? 1 : 0); return; }
+        pal_music_enable(atoi(v) != 0);
+        printf("PALMUS %d (下次进游戏生效)\r\n", pal_music_enabled() ? 1 : 0);
+        return;
+    }
+    if (strcmp(cmd, "palaud") == 0) {
+        /* palaud —— 仙剑音频链路状态 (音乐/音效播放器 + 音量 + RIX 探针) */
+        extern void pal_audio_diag(void);
+        pal_audio_diag();
+        return;
+    }
+    if (strcmp(cmd, "hello") == 0 || strcmp(cmd, "echo") == 0 ||
+        strcmp(cmd, "keys") == 0 ||      /* ★ 2026-11-22: 按键现场快照 (排"按了没反应") */
+        strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0 ||
+        strcmp(cmd, "store") == 0 ||      /* ★ 2026-11-08: 私有应用源设置 */
+        strcmp(cmd, "storedl") == 0 ||   /* ★ 商店下载测试 (2026-10-18) */
+        strcmp(cmd, "loglevel") == 0 || strcmp(cmd, "heap") == 0 ||
+        strcmp(cmd, "mem") == 0 || strcmp(cmd, "blk") == 0 ||
+        strcmp(cmd, "audit") == 0 || strcmp(cmd, "stack") == 0 ||
+        strcmp(cmd, "uptime") == 0 || strcmp(cmd, "tasks") == 0 ||
+        strcmp(cmd, "bat") == 0 || strcmp(cmd, "battery") == 0 || strcmp(cmd, "batcal") == 0 ||
+        /* ★ 2026-10-31: batdiag/batlog 的处理在 rc_cmd_immediate() 里 ——
+         *   必须**同时**出现在本白名单，否则 command 走不到那里（前一段 sleepstage
+         *   就是这么"上线即不可用"的，实测才发现）。 */
+        strcmp(cmd, "batdiag") == 0 || strcmp(cmd, "batlog") == 0 || strcmp(cmd, "timed") == 0 ||
+        strcmp(cmd, "bt") == 0 || strcmp(cmd, "gpsprobe") == 0 || strcmp(cmd, "gpsdiag") == 0 || strcmp(cmd, "gpssleep") == 0 ||
+        strcmp(cmd, "ls") == 0 || strcmp(cmd, "asset") == 0 || strcmp(cmd, "mf") == 0 || strcmp(cmd, "lpk") == 0 || strcmp(cmd, "lpkv") == 0 || strcmp(cmd, "lpkmode") == 0 || strcmp(cmd, "lpkstat") == 0 || strcmp(cmd, "lpkinst") == 0 || strcmp(cmd, "lpklist") == 0 || strcmp(cmd, "lpkrm") == 0 || strcmp(cmd, "sdb") == 0 || strcmp(cmd, "mfun") == 0 || strcmp(cmd, "wifi") == 0 ||
+        strcmp(cmd, "cat") == 0 || strcmp(cmd, "rm") == 0 ||
+        strcmp(cmd, "cp") == 0 || strcmp(cmd, "diag") == 0 ||
+        strcmp(cmd, "help") == 0 || strcmp(cmd, "shutdown") == 0 ||
+        strcmp(cmd, "fbinfo") == 0 || strcmp(cmd, "fbdump") == 0 ||
+        strcmp(cmd, "audio") == 0 || strcmp(cmd, "vol") == 0 ||
+        strcmp(cmd, "esr") == 0 || strcmp(cmd, "esw") == 0 ||
+        strcmp(cmd, "es7") == 0 || strcmp(cmd, "es7w") == 0 || strcmp(cmd, "mic") == 0 ||
+        strcmp(cmd, "beep") == 0 ||
+        strcmp(cmd, "gps") == 0 || strcmp(cmd, "pal") == 0 || strcmp(cmd, "pm") == 0 ||
+        strcmp(cmd, "pwrbin") == 0 ||   /* ★ 2026-11-08: 二分关模块测发热 */
+        strcmp(cmd, "lsleep") == 0 ||   /* ★ 2026-11-08: 桌面档浅睡开关 */
+        strcmp(cmd, "minboot") == 0 || strcmp(cmd, "add") == 0 ||   /* ★ 最小系统开关/加功能 */
+        strcmp(cmd, "temp") == 0 || strcmp(cmd, "cpufreq") == 0 ||  /* ★ 温度 / 现场降频 */
+        /* ⛔ 2026-11-23: "app" **不能**放这里。它的实现是 rc_exec 后段的分支(≈2374 行),
+         *   而本白名单会把命令转给 rc_cmd_immediate —— 那里没有 app 分支, 于是
+         *   "命令被接受但什么也不做, 连错误都不回"(实测: 发 app 后 0 行输出)。
+         *   原来那条"漏登记导致 unknown cmd"的注释是上一轮的误判, 已按实测更正。 */
+        strcmp(cmd, "hwoff") == 0 ||    /* ★ 2026-11-20: 硬件关机开关查看/切换.
+                                         *   同 sleepstage 的坑: 只加 rc_cmd_immediate 不加这里
+                                         *   ⇒ 永远 "RC_ERR unknown cmd"。 */
+        strcmp(cmd, "crash") == 0 ||    /* ★ 2026-11-22: 读上次 panic 现场(RTC/NVS 自留证)。
+                                         *   同 sleepstage/hwoff 的坑: 只写 dispatch 不加这里
+                                         *   ⇒ 永远 "RC_ERR unknown cmd" (本轮又踩了一次)。 */
+        strcmp(cmd, "logring") == 0 ||       /* 只看崩溃前日志环 */
+        strcmp(cmd, "logring_clear") == 0 || /* 清空日志环(自测用) */
+        strcmp(cmd, "pwrstate") == 0 || /* ★ 2026-11-21: 真断电 or 深睡 的复位原因判读 */
+        strcmp(cmd, "rtcset") == 0 ||   /* ★ 2026-11-21: 写 DS3231 + 清 OSF(断电保持验证) */
+        strcmp(cmd, "rtcdump") == 0 ||  /* ★ 2026-11-21: 只读原样 dump 芯片寄存器+OSF */
+        strcmp(cmd, "pbsim") == 0 ||    /* 2026-11-21 下线: 只打印"已下线"提示(按键已直连 /PB) */
+        strcmp(cmd, "kill") == 0 ||     /* ★ 2026-11-21: 直接拉低 KILL(GPIO42) 断电, 不走收尾 */
+        strcmp(cmd, "pwr") == 0 || strcmp(cmd, "poweroff") == 0 ||
+        strcmp(cmd, "perf") == 0 ||   /* ★ 2026-11-01: 任务性能表(CPU%/栈余/位置) */
+        strcmp(cmd, "batstat") == 0 || strcmp(cmd, "standby") == 0 ||
+        strcmp(cmd, "luasmoke") == 0 ||
+        strcmp(cmd, "luaprof") == 0 ||  /* ★ 2026-11-23: Lua 应用启动分段计时 (排查"点开卡一会")
+                                         *   同 sleepstage/hwoff/crash 的坑: dispatch 里实现了,
+                                         *   白名单漏登记 ⇒ 一直 "RC_ERR unknown cmd 'luaprof'"。 */
+        strcmp(cmd, "wpss") == 0 ||
+        strcmp(cmd, "rst") == 0 ||
+        strcmp(cmd, "now") == 0 || strcmp(cmd, "espnow") == 0 ||
+        strcmp(cmd, "logsave") == 0 || strcmp(cmd, "fps") == 0 ||
+        strcmp(cmd, "pace") == 0 || strcmp(cmd, "chrg") == 0 || strcmp(cmd, "pin") == 0 ||         strcmp(cmd, "partial") == 0 ||
+        strcmp(cmd, "lcdperf") == 0 ||   /* ★ 2026-10-30: flush 分段耗时汇总 */
+        strcmp(cmd, "gray") == 0 ||      /* ★ 2026-10-30: 灰阶算法 cluster/bayer 切换 */
+        strcmp(cmd, "sleepstage") == 0 ||   /* ★ 2026-10-29: 原先只加进 rc_cmd_immediate,
+                                             *   但本白名单没放行 ⇒ 一直 "unknown cmd"。
+                                             *   分阶段诊断从上线起就是不可用的, 实测才发现。 */
+        strcmp(cmd, "sleep") == 0) {
+        rc_cmd_immediate(line);   /* 传原始行(含参数); buf 已被 rc_next 截断 */
+        return;
+    }
+    if (strcmp(cmd, "key") == 0) {
+        char *an = rc_next(&rest);
+        if (!an) { printf("RC_ERR key? action\r\n"); return; }
+        rc_lower(an);
+        for (unsigned i = 0; i < sizeof(s_actions)/sizeof(s_actions[0]); i++)
+            if (strcmp(an, s_actions[i].name) == 0) {
+                rc_cmd_t m = { RC_KEY, (int)s_actions[i].act, 0 };
+                /* ⚠ remcon 注入的按键**不走 input_get_action()**, 所以不会刷新空闲计时 →
+                 *   远程跑长回归时会撞上屏保/自动休眠, 表现为"设备突然黑屏没反应"。
+                 *   这里显式标一次"有人在用"。 */
+                input_mark_activity();
+                rc_enqueue(&m); return;
+            }
+        printf("RC_ERR unknown action '%s'\r\n", an);
+    } else if (strcmp(cmd, "sdrstat") == 0) {
+        extern void sdr_test_stat(void);
+        sdr_test_stat();
+    } else if (strcmp(cmd, "sdrpan") == 0) {
+        /* 测试钩子: 注入"上方拖动调频"(谱线跟手平移) */
+        char *v = rc_next(&rest);
+        extern void sdr_test_pan(int dx);
+        sdr_test_pan(v ? atoi(v) : 100);
+        printf("SDRPAN %d\r\n", v ? atoi(v) : 100);
+    } else if (strcmp(cmd, "sdrslide") == 0) {
+        /* 测试钩子: 注入"下方拖动翻页"(整页预渲染+合成); 0 = 结束并恢复实时 */
+        char *v = rc_next(&rest);
+        extern void sdr_test_slide(int dx);
+        sdr_test_slide(v ? atoi(v) : -80);
+        printf("SDRSLIDE %d\r\n", v ? atoi(v) : -80);
+    } else if (strcmp(cmd, "tap") == 0) {
+        char *sx = rc_next(&rest), *sy = rc_next(&rest);
+        if (!sx || !sy) { printf("RC_ERR tap <x> <y>\r\n"); return; }
+        rc_cmd_t m = { RC_TAP, atoi(sx), atoi(sy) };
+        rc_enqueue(&m);
+    } else if (strcmp(cmd, "nes") == 0) {
+        /* 直接拉起指定 NES ROM (整行剩余作路径, 支持含空格, 如含空格名 ROM).
+         * 模拟任务独立运行 → 崩溃 panic 打到同串口, 便于自动化复现/回归. */
+        char *p = rest;
+        while (p && *p && (isspace((unsigned char)*p))) p++;
+        if (!p || !*p) { printf("RC_ERR nes <path>\r\n"); return; }
+        size_t pl = strlen(p);
+        while (pl && (p[pl-1]=='\r' || p[pl-1]=='\n' || isspace((unsigned char)p[pl-1]))) p[--pl]=0;
+        esp_err_t e = nes_emu_start(p);
+        printf("NESSTART '%s' -> %d (%s)\r\n", p, (int)e, esp_err_to_name(e));
+    } else if (strcmp(cmd, "scan") == 0) {
+        /* 递归扫描 /sdcard/nes 下所有 .nes, 打印路径 (定位霸王的大陆等独立 ROM) */
+        scan_nes_tree("/sdcard/roms/nes");
+        printf("SCAN_DONE\r\n");
+    } else if (strcmp(cmd, "favweb") == 0) {
+        extern void fav_web_debug_start(void);
+        fav_web_debug_start();
+        printf("FAVWEB start requested\r\n");
+    } else if (strcmp(cmd, "favclean") == 0) {
+        extern void fav_debug_clean_empty(void);
+        fav_debug_clean_empty();
+        printf("FAVCLEAN ok\r\n");
+    } else if (strcmp(cmd, "kbdshow") == 0) {
+        char *a = rc_next(&rest);
+        extern void fav_debug_kbd_show(int which);
+        fav_debug_kbd_show(a ? atoi(a) : 0);
+        printf("KBDSHOW ok\r\n");
+    } else if (strcmp(cmd, "favedit") == 0) {
+        /* favedit [idx] —— 打开收藏夹编辑页 (抓图/回归用, 跳过 PIN) */
+        char *a = rc_next(&rest);
+        extern void fav_debug_edit(int idx);
+        fav_debug_edit(a ? atoi(a) : 0);
+        printf("FAVEDIT ok\r\n");
+    } else if (strcmp(cmd, "slptest") == 0) {
+        /* slptest [0|1|2] —— 画睡壁纸 + 按指定方式关屏, 看画面能不能留住。
+         *   0 = 不发关屏命令(面板继续自刷新) 1 = 只 Sleep In 2 = Display OFF + Sleep In
+         * 不带参数 = 沿用当前默认。测试后屏可能停在关屏态, 再发一次 slptest 会先唤醒。 */
+        char *a = rc_next(&rest);
+        if (a) st7305_set_sleep_mode(atoi(a));
+        extern void wp_sleep_wallpaper_draw(st7305_handle_t *lcd);
+        st7305_wake_out(s_lcd);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        wp_sleep_wallpaper_draw(s_lcd);
+        st7305_sleep_in(s_lcd);
+        printf("SLPTEST mode=%d (0=不关屏 1=只SLPIN 2=28+10)\r\n", st7305_get_sleep_mode());
+    } else if (strcmp(cmd, "sleepwp") == 0) {
+        /* 预览"休眠壁纸": 不动电源, 只把那一帧画到屏上 (真睡下去就看不到串口了)。
+         * 休眠到点(AUTO) 走的就是这个函数; 长按关机(MANUAL) 仍是白屏。 */
+        extern void wp_sleep_wallpaper_draw(st7305_handle_t *lcd);
+        wp_sleep_wallpaper_draw(s_lcd);
+        printf("SLEEPWP drawn\r\n");
+    } else if (strcmp(cmd, "board") == 0) {
+        /* 串口切板型: board            → 打印当前
+         *            board xiaozhi|weixue|std → 手动指定
+         *            board auto       → 重新自检(I2C 指纹) */
+        char *a = rc_next(&rest);
+        if (!a) {
+            printf("BOARD id=%d %s det=0x%02X\r\n", hw_cfg_board_id(), hw_cfg_board_name(), hw_cfg_det_mask());
+        } else {
+            rc_lower(a);
+            if      (strcmp(a, "auto")    == 0) hw_cfg_rescan();
+            else if (strcmp(a, "xiaozhi") == 0 || strcmp(a, "0") == 0) hw_cfg_set_board(HW_BOARD_XIAOZHI);
+            else if (strcmp(a, "weixue")  == 0 || strcmp(a, "1") == 0) hw_cfg_set_board(HW_BOARD_WEIXUE);
+            else if (strcmp(a, "std")     == 0 || strcmp(a, "2") == 0) hw_cfg_set_board(HW_BOARD_STD);
+            else { printf("RC_ERR board xiaozhi|weixue|std|auto\r\n"); fflush(stdout); return; }
+            printf("BOARD id=%d %s det=0x%02X (reboot 后完全生效)\r\n",
+                   hw_cfg_board_id(), hw_cfg_board_name(), hw_cfg_det_mask());
+        }
+    } else if (strcmp(cmd, "tpraw") == 0) {
+        extern void touch_panel_debug_dump(void);
+        touch_panel_debug_dump();
+    } else if (strcmp(cmd, "favexp") == 0) {
+        extern int fav_debug_export(void);
+        fav_debug_export();
+    } else if (strcmp(cmd, "favimp") == 0) {
+        extern int fav_debug_import(void);
+        int r = fav_debug_import();
+        printf("FAVIMP rc=%d (0=ok -1=no file -3=bad format)\r\n", r);
+    } else if (strcmp(cmd, "favopen") == 0) {
+        extern void fav_web_debug_open(void);
+        fav_web_debug_open();
+        printf("FAVWEB opened\r\n");
+    } else if (strcmp(cmd, "page") == 0) {
+        char *pn = rc_next(&rest);
+        if (!pn) {   /* page 无参 → 打印可用页列表 */
+            for (unsigned i = 0; i < sizeof(s_pages)/sizeof(s_pages[0]); i++)
+                printf("PAGE %s\r\n", s_pages[i].name);
+            fflush(stdout);
+            return;
+        }
+        rc_lower(pn);
+        int found = 0;
+        for (unsigned i = 0; i < sizeof(s_pages)/sizeof(s_pages[0]); i++)
+            if (strcmp(pn, s_pages[i].name) == 0) {
+                rc_cmd_t m = { RC_PAGE, (int)s_pages[i].page, 0 };
+                rc_enqueue(&m); found = 1; break;
+            }
+        if (!found) printf("RC_ERR unknown page '%s'\r\n", pn);
+    } else if (strcmp(cmd, "apps") == 0) {
+        /* ★ 2026-11-01: 桌面图标归属诊断（只读）。
+         *   打印注册表里每条应用对"桌面可见性"的四个判据，回答"为什么它还在桌面上"：
+         *     vis  = os_app_visible() 最终结果（桌面/主菜单是否显示）
+         *     mm   = 在 mainmenu 列表里（用户显式添加过）
+         *     mh   = 在 mmhide   列表里（用户显式删除过）
+         *     dh   = 应用自带的 hidden 默认值（第三方应用现在默认 1=不占桌面）
+         *     req  = requires 路径（- 表示无；不存在时 vis 必为 0）
+         *   用法: apps [id 前缀]  —— 带参只打印匹配项。
+         */
+        const char *pfx = rc_next(&rest);
+        int n = os_app_count();
+        int shown = 0;
+        printf("APPS %d gen=%lu\r\n", n, (unsigned long)os_app_vis_gen());
+        for (int i = 0; i < n; i++) {
+            const os_app_t *a = os_app_get(i);
+            if (!a || !a->id) continue;
+            if (pfx && pfx[0] && strncmp(a->id, pfx, strlen(pfx)) != 0) continue;
+            const char *req = (a->requires && a->requires[0]) ? a->requires : "-";
+            printf("APP %s vis=%d mm=%d mh=%d dh=%d cat=%s req=%s\r\n",
+                   a->id, (int)os_app_visible(a),
+                   (int)os_app_in_mainmenu(a->id), (int)os_app_in_hidden(a->id),
+                   (int)a->hidden, a->cat ? a->cat : "-", req);
+            shown++;
+        }
+        printf("APPS_DONE %d\r\n", shown);
+    } else if (strcmp(cmd, "app") == 0) {
+        /* 直接拉起指定 Lua 应用 (等价于在应用管家点这一项):
+         * 设置 boot 路径 + 进 Lua 页。用途 = 自动化回归: 远程打开应用后
+         * 注入按键 + fbdump 抓屏, 验证能导航、不崩溃。 */
+        char *p = rest;
+        while (p && *p && isspace((unsigned char)*p)) p++;
+        if (!p || !*p) { printf("RC_ERR app <lua path>\r\n"); return; }
+        size_t pl = strlen(p);
+        while (pl && (p[pl-1] == '\r' || p[pl-1] == '\n' ||
+                      isspace((unsigned char)p[pl-1]))) p[--pl] = 0;
+        snprintf(s_rc_app_path, sizeof(s_rc_app_path), "%s", p);
+        rc_cmd_t m = { RC_APP, 0, 0 };
+        rc_enqueue(&m);
+    } else {
+        printf("RC_ERR unknown cmd '%s' (help)\r\n", cmd);
+    }
+}
+
+
+/* ===== put: 串口上传文件 =====
+ * 主机: put <path> <总字节>\r\n → 设备回 RC_PUT_READY
+ *       每 <=4096 字节一块, 设备每块回 RC_PUT_ACK <已收>
+ *       收满回 RC_PUT_DONE <字节> <crc32>
+ *
+ * ⚠ 2026-10-24: 原来直接在 remcon 任务(5KB 栈)里 fwrite 到 SD, 传几 KB 后
+ *   **整机静默死掉**(连串口都不回)。SD/FATFS + stdio 的栈开销远超 5KB。
+ *   现在: 单开一个 12KB 栈的上传任务, 用无缓冲 POSIX write(), remcon 任务
+ *   只阻塞等它结束(不能并发读 stdin, 否则会抢走数据字节)。
+ *
+ * ⚠ 2026-11-23 linit 报障「每次 hw_put 上传后设备 PANIC 一次」—— 根因在本配置下
+ *   两个"想当然"同时踩中:
+ *     ① CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0 ⇒ malloc 全部**优先 PSRAM**,
+ *        所以下面 4KB 接收 buf 落在 PSRAM;
+ *     ② CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y ⇒ xTaskCreate 的 12KB 栈
+ *        也可能落 PSRAM。
+ *   而 write() 走 SPIFFS ⇒ esp_partition_write ⇒ esp_flash_write, 后者**必须先关
+ *   cache**, 关 cache 期间 PSRAM 完全不可访问。于是: 源数据读不出(还是 PSRAM)、
+ *   或者连取栈帧都失效 ⇒ IllegalInstruction, 任务=rc_put, 出错地址落在 panic_abort。
+ *   修法: buf 与**任务栈**都显式锁到内部 RAM(4KB + 12KB, 上传期间临时占用,
+ *   任务删掉即还)。绝不退化成 PSRAM —— 那等于把 bug 留着。
+ */
+#define RC_PUT_CHUNK 4096
+
+typedef struct { char path[128]; long total; } rc_put_arg_t;
+
+/* 上传任务的完成标志。任务**不自杀**, 置完标志就挂起, 由 rc_put() 回收 ——
+ * 这样 handle 始终有效, 也保证上一份上传彻底结束才可能开始下一份(串行)。
+ * 不用 eTaskGetState(h)!=eDeleted 等待: WithCaps 栈要被回收, TCB 会被释放,
+ * 再去摸已失效的 handle 是野指针。 */
+static volatile bool s_put_done = false;
+
+static void rc_put_task(void *p)
+{
+    rc_put_arg_t *a = (rc_put_arg_t *)p;
+    /* ★ 必须内部 RAM: esp_flash_write 关 cache 期间要读这块数据 */
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(RC_PUT_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf) { printf("RC_ERR nomem(internal)\r\n"); printf("RC_PUT_END\r\n"); s_put_done = true; vTaskSuspend(NULL); return; }
+
+    /* 父目录逐级建 */
+    {
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "%s", a->path);
+        for (char *q = tmp + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(tmp, 0777); *q = '/'; }
+    }
+    int fd = open(a->path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        printf("RC_ERR open %s (%d)\r\n", a->path, errno);
+        printf("RC_PUT_END\r\n");
+        free(buf); s_put_done = true; vTaskSuspend(NULL); return;
+    }
+    printf("RC_PUT_READY %ld\r\n", a->total);
+    fflush(stdout);
+
+    long got = 0;
+    uint32_t crc = 0xFFFFFFFFu;
+    while (got < a->total) {
+        size_t want = (size_t)((a->total - got) > RC_PUT_CHUNK ? RC_PUT_CHUNK : (a->total - got));
+        size_t have = 0;
+        int idle = 0;
+        while (have < want) {
+            ssize_t r = read(STDIN_FILENO, buf + have, want - have);
+            if (r > 0) { have += (size_t)r; idle = 0; }
+            else { vTaskDelay(pdMS_TO_TICKS(5)); if (++idle > 1200) break; }   /* 6s */
+        }
+        if (have == 0) {
+            printf("RC_ERR timeout at %ld\r\n", got);
+            printf("RC_PUT_END\r\n");
+            break;
+        }
+        if (write(fd, buf, have) != (ssize_t)have) {
+            printf("RC_ERR write at %ld\r\n", got);
+            printf("RC_PUT_END\r\n");
+            break;
+        }
+        for (size_t i = 0; i < have; i++) {
+            crc ^= buf[i];
+            for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+        }
+        got += (long)have;
+        printf("RC_PUT_ACK %ld\r\n", got);
+        fflush(stdout);
+    }
+    close(fd);
+    if (got == a->total) printf("RC_PUT_DONE %ld %08x\r\n", got, (unsigned)(crc ^ 0xFFFFFFFFu));
+    printf("RC_PUT_END\r\n");
+    printf("RC_PUT_STACK %u\r\n", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    fflush(stdout);
+    free(buf);
+    /* ⚠ 绝不能 free(a): a 是 rc_put() 里的 **static** 变量, 地址不在堆上。
+     *   free() 一个静态地址会把堆链表写坏 —— 之后任意一次 malloc/free 就会
+     *   触发 heap assert → abort → IllegalInstruction。
+     *   2026-11-23 linit 报"每次上传后 PANIC 一次", 这是主因之一(一直存在)。 */
+    s_put_done = true;          /* 交给 rc_put() 回收栈与 TCB, 自杀会让 handle 失效 */
+    vTaskSuspend(NULL);
+}
+
+static void rc_put(const char *args)
+{
+    static rc_put_arg_t a;
+    if (sscanf(args, "%127s %ld", a.path, &a.total) != 2 || a.total <= 0) {
+        printf("RC_ERR put <path> <bytes>\r\n"); return;
+    }
+    TaskHandle_t h = NULL;
+    s_put_done = false;
+    /* ★ 栈也必须锁内部 RAM: SPIFFS 写盘关 cache 期间 PSRAM 完全不可访问,
+     *   栈若落在 PSRAM, 连取栈帧都会 IllegalInstruction。本板
+     *   CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y 且 ALWAYSINTERNAL=0,
+     *   所以必须显式指定, 不能靠默认。 */
+    if (xTaskCreateWithCaps(rc_put_task, "rc_put", 12 * 1024, &a, 3, &h,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+        printf("RC_ERR task\r\n"); return;
+    }
+    /* 等上传任务收尾; 期间 remcon 任务不得再读 stdin (会抢字节) */
+    while (!s_put_done) vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDeleteWithCaps(h);          /* 回收那 12KB 内部 RAM 栈 (任务已挂起, 安全) */
+}
+
+/* ===== stdin 读任务: 逐行(含 ';' 分隔)读取并派发 ===== */
+static void rc_task(void *arg){
+    (void)arg;
+    char acc[RC_LINE_MAX]; size_t n = 0;
+    for (;;) {
+        char ch;
+        ssize_t r = read(STDIN_FILENO, &ch, 1);
+        if (r <= 0) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        /* '\n'、'\r'、';' 均视为命令分隔 */
+        if (ch == '\n' || ch == '\r' || ch == ';') {
+            if (n > 0) {
+                acc[n] = 0;
+                char *p = acc;
+                /* 跳过前导空白 */
+                while (*p && isspace((unsigned char)*p)) p++;
+                if (strncmp(p, "put ", 4) == 0) rc_put(p + 4);   /* 二进制上传, 不按行解析 */
+                else if (*p) rc_exec(p);
+                n = 0;
+            }
+        } else if (n < RC_LINE_MAX - 1) {
+            acc[n++] = ch;
+        }
+    }
+}
+
+/* ===== 主循环派发: 取出队列内命令交给 os 内核 ===== */
+void remcon_tick(ui_ctx_t *ctx){
+    rc_cmd_t m;
+    if (s_q && xQueueReceive(s_q, &m, 0) == pdTRUE) {
+        switch (m.type) {
+        case RC_KEY:  os_handle_action(ctx, (os_action_t)m.a); break;
+        case RC_TAP:  os_handle_touch(ctx, m.a, m.b);          break;
+        case RC_PAGE: os_push(ctx, (os_page_t)m.a);            break;
+        case RC_APP:  os_page_lua_set_boot(s_rc_app_path);      /* 先设 boot 路径 */
+                      /* ★ 2026-11-23 linit 报障: 「退出远程控制测试应用后连着几个空白页,
+                       *   每按一次返回才退一层」。
+                       *   根因 = 这里无条件 os_push(OS_PAGE_LUA): 已经在 Lua 页时再 push
+                       *   就多压一层返回栈, 连执行几次 app 命令就堆几层; 每层都是 LIST 态、
+                       *   扫不到应用 ⇒ 画面是空壳列表/白屏, 要一层层按返回才退干净。
+                       *   修法: 已在 Lua 页 ⇒ 只重载 (层数不变), 不在才 push 一层。 */
+                      if (os_current_page() == OS_PAGE_LUA)
+                          os_page_lua_reload(ctx);
+                      else
+                          os_push(ctx, OS_PAGE_LUA);
+                      break;
+        }
+    }
+}
+
+/* ★ 2026-10-29 修复栈溢出: 原来写 4096 且注释写"16KB/峰值12.2KB", 但 **ESP-IDF 的
+ *   usStackDepth 单位是字节**(task.h: "NUMBER OF BYTES. Note that this differs from
+ *   vanilla FreeRTOS") ⇒ 实际只有 4KB。真机实测 `ls /sdcard` 后 uxTaskGetStackHighWaterMark
+ *   只剩 140B、最低 92B, 下一条命令行即触发 "A stack overflow in task remcon" 整机重启。
+ *   调用链: rc_task(acc[256]) → rc_exec(buf[256]+cmd[32]) → rc_cmd_immediate(args[256]+
+ *   cp 分支 buf[1024]) → printf/vfs/usb_serial_jtag, 叠加后约 4KB。
+ *   改 16KB(4 倍余量), 代价内部 RAM −12KB(桌面基线 205.9KB → 约 193.6KB)。 */
+/* ★ 2026-11-01：16384 → 12288。实测栈余 12,416B（只用了约 3.9KB），
+ *   16KB 纯属浪费。⚠ 不能搬到 PSRAM —— remcon 会执行 ls/cat/rm/reboot 等
+ *   flash 操作，栈在 PSRAM 时 flash 操作期间访问自身栈会直接崩。
+ *   shutdown/gpsdiag 这类深调用链已经另开 8KB 独立任务，不占这条栈。 */
+#define RC_TASK_STACK   9216
+
+void remcon_init(void){
+    s_q = xQueueCreate(RC_QUEUE_LEN, sizeof(rc_cmd_t));
+    if (!s_q) { ESP_LOGD(RC_TAG, "queue create failed"); return; }
+    BaseType_t ok = xTaskCreatePinnedToCore(rc_task, "remcon", RC_TASK_STACK, NULL, 2, NULL, 1);
+    if (ok != pdPASS) {
+        /* 任务没起来就没人消费队列: 直接把队列还回去, 别留个空壳 + 白占 384B。 */
+        vQueueDelete(s_q); s_q = NULL;
+        ESP_LOGE(RC_TAG, "remote console task create failed (stack=%d B)", RC_TASK_STACK);
+        return;
+    }
+    ESP_LOGI(RC_TAG, "remote console up, stack=%d B, task=ok", RC_TASK_STACK);
+}
+
+/* ===== tpscan: 触摸 I2C 总线诊断 (只读, 不改任何配置) =====
+ * 两组候选引脚各扫一遍 0x08~0x77, 带 RST 上电时序. 用于区分
+ *   "芯片不在这两根线上 / 接线问题" 还是 "固件没去读". */
+void rc_touch_scan(void)
+{
+    static const struct { const char *n; int sda, scl, intr, rst; } B[] = {
+        { "\xe5\xb0\x8f\xe6\x99\xba 5/13/12/6",  5, 13, 12, 6 },   /* 小智 5/13/12/6 */
+        { "\xe6\xa0\x87\xe5\x87\x86 15/7/17/2", 15,  7, 17, 2 },   /* 标准 15/7/17/2 */
+    };
+    /* ⛔ 2026-10-22: **只扫当前板型的触摸组**。
+     *   跨板扫会碰对方的 LCD 引脚 (小智 GPIO7=LCD DC / 标准&微雪 GPIO5=LCD DC),
+     *   `gpio_reset_pin()` 归还成输入后 LCD 驱动不会重配 ⇒ 当场花屏。
+     *   要强扫另一组: `tpscan all` (提示: 大概率花屏, 需重启恢复)。 */
+    int only = hw_cfg_board_id();
+    int b0   = (only == HW_BOARD_XIAOZHI) ? 0 : 1;   /* 0=小智组 1=标准组 */
+    for (int b = b0; b <= b0; b++) {
+        printf("TPSCAN[%s]\r\n", B[b].n);
+
+        /* ① 引脚电平: 先关内部上拉(看外部有没有上拉/芯片), 再开上拉 */
+        gpio_config_t g = {
+            .pin_bit_mask = (1ULL << B[b].sda) | (1ULL << B[b].scl) | (1ULL << B[b].intr),
+            .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE, .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&g); vTaskDelay(pdMS_TO_TICKS(8));
+        printf("  \xe6\xb5\xae\xe7\xa9\xba: SDA=%d SCL=%d INT=%d\r\n",
+               gpio_get_level(B[b].sda), gpio_get_level(B[b].scl), gpio_get_level(B[b].intr));
+        g.pull_up_en = GPIO_PULLUP_ENABLE; gpio_config(&g); vTaskDelay(pdMS_TO_TICKS(8));
+        printf("  \xe4\xb8\x8a\xe6\x8b\x89: SDA=%d SCL=%d INT=%d\r\n",
+               gpio_get_level(B[b].sda), gpio_get_level(B[b].scl), gpio_get_level(B[b].intr));
+
+        /* ② RST: 低 12ms -> 高 120ms (释放复位) */
+        gpio_config_t r = {
+            .pin_bit_mask = (1ULL << B[b].rst), .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&r);
+        gpio_set_level(B[b].rst, 0); vTaskDelay(pdMS_TO_TICKS(12));
+        gpio_set_level(B[b].rst, 1); vTaskDelay(pdMS_TO_TICKS(120));
+
+        /* ③ 全地址扫描 */
+        i2c_master_bus_config_t bc = {
+            .i2c_port = -1, .sda_io_num = B[b].sda, .scl_io_num = B[b].scl,
+            .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        i2c_master_bus_handle_t bus = NULL;
+        if (i2c_new_master_bus(&bc, &bus) != ESP_OK) {
+            printf("  I2C \xe6\x80\xbb\xe7\xba\xbf\xe5\x88\x9b\xe5\xbb\xba\xe5\xa4\xb1\xe8\xb4\xa5\r\n");
+            continue;
+        }
+        int n = 0;
+        for (int a = 0x08; a < 0x78; a++) {
+            if (i2c_master_probe(bus, (uint16_t)a, 15) == ESP_OK) { printf("  ACK 0x%02X\r\n", a); n++; }
+        }
+        i2c_del_master_bus(bus);
+        printf("  \xe5\xba\x94\xe7\xad\x94\xe6\x95\xb0=%d\r\n", n);
+    }
+}
+
+/* ===== tpnaked: 最原始探测 (不碰 RST/不碰 INT, 只建总线问地址) =====
+ * 用途: 和 probe_touch_on 对照。若这里也无 ACK ⇒ 触摸硬件确实没通(固件无辜);
+ *       若这里有 ACK 而板级探测没有 ⇒ 探测逻辑有问题。 */
+void rc_tp_naked(void)
+{
+    static const struct { const char *n; int sda, scl; } G[] = {
+        { "\xe5\xb0\x8f\xe6\x99\xba 5/13",  5, 13 },
+    };
+    static const uint8_t CA[] = { 0x15, 0x5D, 0x14, 0x38, 0x70, 0x48 };
+    for (int g = 0; g < 1; g++) {
+        printf("TPNAKED[%s]\r\n", G[g].n);
+        i2c_master_bus_config_t bc = {
+            .i2c_port = -1, .sda_io_num = G[g].sda, .scl_io_num = G[g].scl,
+            .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        i2c_master_bus_handle_t bus = NULL;
+        esp_err_t e = i2c_new_master_bus(&bc, &bus);
+        printf("  bus=%s\r\n", esp_err_to_name(e));
+        if (e != ESP_OK) continue;
+        for (size_t i = 0; i < sizeof(CA); i++) {
+            esp_err_t r = i2c_master_probe(bus, CA[i], 50);
+            printf("  0x%02X -> %s\r\n", CA[i], r == ESP_OK ? "ACK" : "no");
+        }
+        i2c_del_master_bus(bus);
+    }
+    printf("TPNAKED done\r\n");
+}
