@@ -1,0 +1,124 @@
+#ifndef TOUCH_PANEL_H
+#define TOUCH_PANEL_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "driver/gpio.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @file touch_panel.h
+ * @brief 电容触摸屏驱动 (自动识别 GT911 / CST816 / FT6236)
+ *
+ * 接线 (TP-VDD=3.3V, TP-GND=GND, 另外 TP-SDA/SCL 需 4.7~10k 上拉到 3.3V,
+ * 若面板自带则无需外加):
+ *   TP-SDA   -> GPIO 15
+ *   TP-SCL   -> GPIO 7
+ *   TP-INT   -> GPIO 17
+ *   TP-RESET -> GPIO 2
+ *
+ * 坐标是面板原始分辨率, 本驱动只负责读点; 手势方向由调用方(input.c)按增量判定,
+ * 因此无需映射到 400x300 屏幕坐标.
+ */
+
+/* ==== 触摸面板引脚 ====
+ * ★ 2026-10-16: 引脚改由**上层**在 init 前设定 (见 board_pins.h 的板型表),
+ *   驱动自己不关心"哪块板" —— 这样也避免 drivers 反向依赖 system。
+ *   下面这组只是**默认值** (不调 set_pins 时用它, 等于原来的小智模块板接线)。 */
+#define TP_SDA_PIN   (-1)   /* ⛔ 默认"未配置": 以前是 5, 恰好=微雪 LCD RS! 由上层 set_pins 下发 */
+#define TP_SCL_PIN   (-1)
+#define TP_INT_PIN   (-1)   /* ⛔ 以前是 12, 恰好=微雪 LCD MOSI! */
+#define TP_RST_PIN   (-1)
+
+typedef struct {
+    int sda, scl, intr, rst;
+} tp_pins_t;
+
+/* 设定本板触摸引脚 (必须在 touch_panel_init() 之前调; 不调则用上面默认值) */
+void touch_panel_set_pins(const tp_pins_t *pins);
+
+/* ==== 面板分辨率默认值 (原始坐标最大值) ====
+ * GT911 会从配置寄存器 0x8048/0x804A 精确读出, 覆盖此默认值;
+ * CST816/FT6236 无标准分辨率寄存器, 用此默认值映射到 400x300 屏幕.
+ * 本机实测: 这块 CST816 面板 = 400x300 (与屏幕 1:1), 见 HANDOVER 6.12. */
+#define TP_DEFAULT_RES_X   400
+#define TP_DEFAULT_RES_Y   300
+
+/* ==== 芯片类型 ==== */
+typedef enum {
+    TP_CHIP_NONE = 0,   /* 未检测到触摸芯片 */
+    TP_CHIP_GT911,      /* Goodix GT911 (4.2"/4.3" 常见, 带 RESET) */
+    TP_CHIP_CST816,     /* Hynitron CST816S/T */
+    TP_CHIP_FT6236,     /* FocalTech FT6236 */
+} tp_chip_t;
+
+/* ==== 单个触摸点 ==== */
+typedef struct {
+    bool    pressed;   /* 是否有手指按下 */
+    int16_t x;         /* 原始 X 坐标 */
+    int16_t y;         /* 原始 Y 坐标 */
+} tp_point_t;
+
+/* 最大支持的触点 (GT911 每点 8 字节, 最多 5 点; CST816=1 / FT6236=2 硬件上限更低).
+ * 本机为 CST816, 实测硬件只支持 2 点. 驱动读到多少就报多少, 调用方按 count 逐个取用. */
+#define TP_MAX_POINTS 2
+
+/* 初始化: 配置 I2C + RESET/INT GPIO, 复位 GT911, 探测芯片型号.
+ * 返回探测到的芯片类型; TP_CHIP_NONE 表示未检测到 (之后 read 恒返回 false). */
+tp_chip_t touch_panel_init(void);
+
+/* 读取一个触摸点 (每帧轮询一次). 返回 false 表示读取失败/无有效数据. */
+bool touch_panel_read(tp_point_t *pt);
+
+/* 读取多点触摸 (最多 TP_MAX_POINTS=5 点; GT911 支持满 5 点, CST816/FT6236 更少).
+ * pts[0..n-1] 各点 (未按压的置 pressed=false), count 返回实际点数 (0..TP_MAX_POINTS).
+ * 返回 false 表示读取失败/无有效数据. */
+bool touch_panel_read_points(tp_point_t pts[TP_MAX_POINTS], int *count);
+
+/* V1.0.68: 禁用触摸屏: 卸载 I2C 驱动(释放内存), 之后 read 恒 false. 可重新 init. */
+void touch_panel_deinit(void);
+
+/* V1.0.68 fix: 连续 I2C 读失败(芯片挂死/总线卡住)时自动恢复:
+ * RST 脉冲复位芯片 + 重装 I2C 驱动 + 重新探测. 由后台看门狗判定并执行;
+ * 开机没找到芯片时由 main 的 touch_retry_task 周期调用。 */
+void touch_panel_recover(void);
+
+/* 深睡前关断触摸 IC（RST 拉低 + hold） */
+void touch_panel_power_down(void);
+
+/* 返回当前检测到的芯片类型 (调试/日志用). */
+tp_chip_t touch_panel_get_chip(void);
+
+/* V1.0.69: 是否检测到触摸屏 (有触摸机型 = true, 无触摸机型 = false).
+ * 供 input.c 判"此刻能不能读触摸"用; **不再**用于决定物理键语义
+ * (键位已由固化板型在 input_init 定死)。 */
+bool touch_panel_is_present(void);
+
+/* ★ FT6236 方向参数 (运行时, NVS 落盘): bit0 = 交换 XY, bit1 = Y 取反。
+ *   只对 FT6236 生效; CST836U / GT911 的读点路径完全不同, 不受影响。
+ *   串口: `ftaxis 0..3` 可实时切换并保存, 不用重编固件。 */
+uint8_t touch_panel_get_ft_axis(void);
+void    touch_panel_set_ft_axis(uint8_t v);
+
+/* ★ I2C 总线代次 (2026-11-22)。触摸恢复/禁用时会把整条 I2C 主总线删掉重建,
+ *   同一总线上的其它器件 (DS3231 RTC 等) 持有的 i2c_master_dev_handle_t 随即失效
+ *   ⇒ 再用就是 use-after-free。共享这条总线的模块在每次访问前比对这个值,
+ *   发现变了就先丢句柄再重新挂。返回 0 表示总线从未被重建过。 */
+uint32_t touch_panel_bus_gen(void);
+
+/* 深睡前调用: 把触摸 IC 按进复位态并把 I2C 上拉关掉 (省掉睡眠期间的扫描电流).
+ * 唤醒是完整重启, 无需还原. */
+void touch_panel_sleep(void);
+
+/* 返回面板分辨率 (原始坐标最大值), 用于把触摸点映射到屏幕坐标.
+ * GT911 从寄存器读出; 其它芯片返回 TP_DEFAULT_RES_X/Y. */
+void touch_panel_get_resolution(int *max_x, int *max_y);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* TOUCH_PANEL_H */
