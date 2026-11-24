@@ -23,10 +23,10 @@
 
 set -e
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"   # ★ 脚本已移入 tools/: 上一级才是项目根
 # ★ 2026-10-30: BUILD_DIR / OUT_FILE 允许被环境变量覆盖 —— 模拟器构建用
-#   BUILD_DIR=build_emu OUT_FILE=build_emu/emu_flash.bin bash merge_flash.sh
-#   不改这两行默认值, 真机构建 (bash merge_flash.sh) 行为完全不变。
+#   BUILD_DIR=build_emu OUT_FILE=build_emu/emu_flash.bin bash tools/merge_flash.sh
+#   不改这两行默认值, 真机构建 (bash tools/merge_flash.sh) 行为完全不变。
 BUILD_DIR="${BUILD_DIR:-${PROJECT_DIR}/build}"
 SYS_IMG_DIR="${PROJECT_DIR}/system_image"
 OUT_DIR="${PROJECT_DIR}/dist"
@@ -205,13 +205,13 @@ APPS_SRC="${PROJECT_DIR}/apps/lua"
 # APPS_SIZE / APPS_OFF 已由上方 partitions.csv 解析得出
 # ★★ 2026-10-14 linit: **默认不把 Lua 应用打进 16MB 固件** ——
 #   Lua 应用走 TF 卡 / 应用商店**后装**, 固件里 apps 分区保持空 SPIFFS。
-#   需要出"预置演示机/测试机"固件时才显式开:  LINTOS_BAKE_LUA_APPS=1 ./build.sh
+#   需要出"预置演示机/测试机"固件时才显式开:  LINTOS_BAKE_LUA_APPS=1 ./tools/build.sh
 # ⚠ 陷阱 (2026-09-29 排查发现): 源目录不在时**不能默默沿用上一版 apps_l.bin** ——
 #   那会把早已下架的应用/旧脚本一起烧回设备 (应用管家会多出"C版+Lua版"重复条目), 而且没有提示。
 if [ "${LINTOS_BAKE_LUA_APPS:-0}" = "1" ] && [ -d "${APPS_SRC}" ]; then
     echo "[提示] LINTOS_BAKE_LUA_APPS=1 → 预置 Lua 应用进 apps 分区"
 else
-    echo "[提示] 默认不预置 Lua 应用 (要预置: LINTOS_BAKE_LUA_APPS=1 ./build.sh) → 生成空 apps 镜像"
+    echo "[提示] 默认不预置 Lua 应用 (要预置: LINTOS_BAKE_LUA_APPS=1 ./tools/build.sh) → 生成空 apps 镜像"
     APPS_SRC="$(mktemp -d)"
     trap 'rm -rf "${APPS_SRC}"' EXIT
 fi

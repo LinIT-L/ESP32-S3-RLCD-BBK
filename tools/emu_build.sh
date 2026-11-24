@@ -76,7 +76,7 @@ python3 "${IDF_PATH}/tools/idf.py" -B build_emu \
 echo "[merge] build_emu/emu_flash.bin"
 BUILD_DIR="${PROJECT_DIR}/build_emu" \
 OUT_FILE="${PROJECT_DIR}/build_emu/emu_flash.bin" \
-    bash merge_flash.sh
+    bash "${PROJECT_DIR}/tools/merge_flash.sh"
 
 echo
 echo "✅ 完成: build_emu/emu_flash.bin"

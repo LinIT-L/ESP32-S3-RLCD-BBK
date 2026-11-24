@@ -29,7 +29,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VER_H = os.path.join(ROOT, "components/system/os/include/lintos_version.h")
-CHANGELOG = os.path.join(ROOT, "CHANGELOG.md")
+CHANGELOG = os.path.join(ROOT, "docs", "CHANGELOG.md")
 
 
 def esc_utf8(s: str) -> str:

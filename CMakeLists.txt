@@ -47,6 +47,12 @@ endif()
 
 # === V1.x: 方案还原 — 使用官方 esp-idf 蓝牙 (Bluedroid + esp_hid), 移除 bluepad32/btstack ===
 
+# ★ sdkconfig.defaults 已移入 tools/ —— 用 ESP-IDF 官方 SDKCONFIG_DEFAULTS 机制指定,
+#   使直接 `idf.py build` 与 tools/build.sh 都无需额外参数。命令行 -D 仍可覆盖。
+if(NOT SDKCONFIG_DEFAULTS)
+    set(SDKCONFIG_DEFAULTS "${CMAKE_CURRENT_LIST_DIR}/tools/sdkconfig.defaults")
+endif()
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # ★ 模拟器模式 (2026-10-25): 必须在 project() 之前用 idf_build_set_property 挂全局

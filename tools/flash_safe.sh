@@ -11,11 +11,11 @@
 #   · 改了分区表 / bootloader / apps 分区布局  → 才需要整片烧 0x0 (见 merge_flash.sh 末尾提示)
 #
 # 用法:
-#   bash flash_safe.sh            # 自动探测串口
-#   bash flash_safe.sh /dev/cu.usbmodem*   # 指定端口（按本机实际）
+#   bash tools/flash_safe.sh            # 自动探测串口
+#   bash tools/flash_safe.sh /dev/cu.usbmodem*   # 指定端口（按本机实际）
 set -e
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"   # ★ 脚本已移入 tools/: 上一级才是项目根
 BUILD_DIR="${PROJECT_DIR}/build"
 # esptool 用哪个 Python：优先环境变量 PYTHON，其次当前 PATH 的 python3。
 # 只要 ESP-IDF 环境已 export（含 esptool），当前 python3 即可；不写死个人路径。
@@ -32,7 +32,7 @@ if [ -z "$PORT" ]; then
 fi
 
 # 分区偏移从 partitions.csv 读 (单一真相源)
-eval "$(${PY} - "$PROJECT_DIR/partitions.csv" <<'PYEOF'
+eval "$(${PY} - "$PROJECT_DIR/tools/partitions.csv" <<'PYEOF'
 import sys
 for ln in open(sys.argv[1]):
     ln = ln.split('#')[0].strip()

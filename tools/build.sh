@@ -13,7 +13,7 @@ export IDF_SKIP_CHECK_SUBMODULES=1
 export ESP_ROM_ELF_DIR="${HOME}/.espressif/tools/esp-rom-elfs/20260528"
 
 # 项目根目录 (脚本所在)
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"   # ★ 脚本已移入 tools/: 上一级才是项目根
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 
 # === v6.0.3 工具链 + Python 环境 (LinTOS 2.0) ===
@@ -136,7 +136,7 @@ fi
 
 echo "Merging 16MB Flash image (bootloader + partition + app + system)..."
 cd "${PROJECT_DIR}"
-bash merge_flash.sh
+bash "${PROJECT_DIR}/tools/merge_flash.sh"
 
 echo "Build completed!"
 ls -la "${PROJECT_DIR}/build/LinTOS.bin"

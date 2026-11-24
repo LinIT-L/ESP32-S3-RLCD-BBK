@@ -36,7 +36,7 @@ def apps_part():
 
     历史上这里硬编码 0x5A0000, 后来分区改成 5MB 而脚本没改 →
     spiffsgen 会按错的大小生成镜像, dd 进去后 SPIFFS 挂载失败。"""
-    csv_path = os.path.join(ROOT, "partitions.csv")
+    csv_path = os.path.join(ROOT, "tools", "partitions.csv")
     for ln in open(csv_path, encoding="utf-8"):
         ln = ln.split("#")[0].strip()
         if not ln:
