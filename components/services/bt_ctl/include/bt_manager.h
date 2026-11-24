@@ -1,0 +1,320 @@
+#ifndef BT_MANAGER_H
+#define BT_MANAGER_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>   /* size_t（去掉 FreeRTOS.h 后需显式包含） */
+#include "sdkconfig.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ *  蓝牙手柄模块 (全新重写, 底稿 = ESP-IDF 官方 examples/bluetooth/esp_hid_host)
+ *  ---------------------------------------------------------------------------
+ *  本头文件只定义对外接口 (供菜单/游戏调用). 内部实现分层:
+ *    bt_core.c  : 官方 esp_hid_host 连接核心 (扫描/连接/INPUT 事件/记录/自动重连)
+ *    bt_map.c   : 通用 HID 报告解码 + 按键映射表 + NVS 存档 + 摇杆校准
+ *    bt_manager.c: 对外壳, 桥接 bt_core + bt_map, 实现本头文件声明的所有接口.
+ *  不再依赖任何蓝方(BTstack/Bluepad32)或历史打补丁代码.
+ */
+
+/* ========================================================================
+ *  按键映射 - 物理输入 / 逻辑功能 定义
+ * ======================================================================== */
+
+/* 10 个逻辑功能 (按键映射的目标): 上下左右/确认/返回/回到菜单/多功能键 + Start/Select */
+typedef enum {
+    F_UP = 0,
+    F_DOWN,
+    F_LEFT,
+    F_RIGHT,
+    F_CONFIRM,    /* 确定 */
+    F_BACK,       /* 返回 */
+    F_EXIT,       /* 退出到菜单 */
+    F_FAV,        /* 多功能键 (收藏) */
+    F_START,      /* Start 键 */
+    F_SELECT,     /* Select 键 */
+    FUNC_MAX = 10
+} func_t;
+
+/* 物理输入: 4 方向 + 通用按钮 1~N.
+ * 通用化原因: 不同手柄按钮数/布局各异, 不绑定 A/B/X/Y 等固定命名,
+ * 按钮按每台手柄 report descriptor 的按钮序号统一编号, 兼容任意手柄. */
+#ifndef PHYS_T_DEFINED
+#define PHYS_T_DEFINED
+typedef enum {
+    P_HAT_UP = 0, P_HAT_DOWN, P_HAT_LEFT, P_HAT_RIGHT,  /* 方向 0..3 */
+    P_BTN_1 = 4, P_BTN_2, P_BTN_3, P_BTN_4, P_BTN_5,    /* 通用按钮 4.. */
+    P_BTN_6, P_BTN_7, P_BTN_8, P_BTN_9, P_BTN_10,
+    P_BTN_11, P_BTN_12, P_BTN_13, P_BTN_14, P_BTN_15, P_BTN_16,
+    P_BTN_17, P_BTN_18, P_BTN_19, P_BTN_20,
+    /* ★ 2026-10-27: 16 个按钮不够用 —— 带背键/额外肩键的手柄(常见 17~20 个按钮)
+     *   第 17 个以后的键 raw_to_phys 会返回 -1, 映射向导里"按了没反应"。
+     *   bt_map 的按钮位图本来就有 32 位, 这里把可映射上限放到 20 个。
+     *   ⚠ phys_t 的既有取值不变(0..19), 只是上限扩大 ⇒ NVS 里旧的按键映射继续有效。 */
+    PHYS_MAX = 24
+} phys_t;
+#endif
+
+/* 物理输入的人类可读名称 (用于 UI 显示) */
+extern const char *bt_manager_phys_name(phys_t p);
+extern const char *bt_manager_func_name(func_t f);
+
+/* ========================================================================
+ *  补充按键映射 (4 个逻辑功能 → 任意物理输入, 独立持久化)
+ *  用途: 电子词典游戏设置里把任意手柄按键映射成 BBK 的 F/G/Shift/空格 四个功能键.
+ * ======================================================================== */
+#define SUP_MAX 4
+typedef enum {
+    SUP_F = 0,      /* 功能1 (F) */
+    SUP_G,          /* 功能2 (G) */
+    SUP_SHIFT,      /* 功能3 (Shift) */
+    SUP_SPACE,      /* 功能4 (空格) */
+} sup_func_t;
+
+extern const char *bt_manager_sup_func_name(int idx);
+
+/* ========================================================================
+ *  按键状态查询 (状态式, 不带边沿检测; 消费者自己负责边沿)
+ * ======================================================================== */
+bool bt_manager_is_key_pressed(func_t f);
+
+/* ========================================================================
+ *  手柄功能键"上升沿锁存" (2026-11-24)
+ * ------------------------------------------------------------------------
+ *  用途: 让手柄导航**不再依赖主循环电平采样**。
+ *  背景: 主循环空闲时 60ms 一帧 (main.c 的 budget_ms), 输入层还有 30ms 稳定窗;
+ *        一次短促点击若整段落在两次采样之间就被彻底丢弃, 点得越快丢得越多 ——
+ *        用户体感"连点没反应, 越快越慢"。
+ *  现在: HID 报告回调(≈60~100Hz, 与 UI 帧率无关)里做一次短稳定确认, 确认到
+ *        功能键上升沿就锁一位; 输入层用 bt_manager_take_key_edge() 取走即投递。
+ *  ⛔ 映射算法未变: 仍然走 s_map[f] → phys_pressed() 同一套查表。
+ *  取用方: input.c 的导航块 (手柄/键盘导航的"快路")。 */
+typedef void (*bt_key_edge_cb_t)(void);
+void bt_manager_set_key_edge_cb(bt_key_edge_cb_t cb); /* 注册"有边沿"通知 (唤醒主循环) */
+bool bt_manager_take_key_edge(func_t f);              /* 取走一次上升沿 (一次性) */
+void bt_manager_clear_key_edges(void);                /* 清空锁存 (映射/游戏/断连切换时) */
+
+/* ★ 2026-11-22: **任意**物理键是否按着 (不限那 7 个映射功能键).
+ * 用途: 屏保/动态壁纸态"按任意硬件键退出" —— 肩键/Start/Select 这类
+ *   没有映射成功能键的按钮按下去也要能唤醒, 否则用户觉得"手柄按了没反应"。
+ * 覆盖 P_HAT_* 与 P_BTN_1..20 全部 phys_t (0..PHYS_MAX-1)。 */
+bool bt_manager_any_key_pressed(void);
+
+/* ========================================================================
+ *  按键映射 (8 个功能 → 物理输入)
+ * ======================================================================== */
+void bt_manager_poll_new_press_reset(void);
+void bt_manager_poll_auto_reconnect(void);
+/* 立即唤醒自动回连任务 (断连等需要即时重连时调用). */
+void bt_manager_wake_reconnect(void);
+/* 取一帧新物理按键边沿并写入 s_map[f].
+ * 返回: 1=已映射, 0=无新按键, -1=按键已被其它功能占用(重复映射, 拒绝). */
+int bt_manager_poll_new_press(func_t f);
+void bt_manager_save_key_map(void);
+void bt_manager_reset_key_map(void);   /* 清空并恢复默认 */
+/* ★ 2026-10-27: 映射向导是"边按边写内存映射"的。进入向导前 backup，中途取消/超时
+ *   调 restore 回滚 —— 否则会留下半套映射(方向键错乱)，直到重连/重启才恢复。 */
+void bt_manager_backup_key_map(void);
+void bt_manager_restore_key_map(void);
+void bt_manager_set_key_map(func_t f, phys_t p);
+phys_t bt_manager_get_key_map(func_t f);
+/* 当前是否有任意物理输入处于按下状态 (映射启动时等待松开用). */
+bool bt_manager_any_phys_down(void);
+
+/* ========================================================================
+ *  补充按键映射 (4 个功能 → 物理输入, 独立持久化)
+ * ======================================================================== */
+bool bt_manager_poll_sup_capture(phys_t *out);
+bool bt_manager_is_phys_pressed(phys_t p);
+bool bt_manager_is_sup_pressed(int idx);
+void bt_manager_set_sup_map(int idx, phys_t p);
+phys_t bt_manager_get_sup_map(int idx);
+void bt_manager_save_sup_map(void);
+void bt_manager_reset_sup_map(void);
+
+/* ========================================================================
+ *  GB 辅助按键映射 (2 个功能: SELECT/START → 物理输入, 独立持久化)
+ *  只在 GB 游戏二级菜单及游戏中生效.
+ * ======================================================================== */
+#define GB_MAP_MAX 2
+typedef enum {
+    GB_SELECT = 0,   /* SELECT 键 */
+    GB_START,        /* START 键 */
+} gb_func_t;
+
+bool bt_manager_poll_gb_capture(phys_t *out);
+bool bt_manager_is_gb_pressed(int idx);
+void bt_manager_set_gb_map(int idx, phys_t p);
+phys_t bt_manager_get_gb_map(int idx);
+void bt_manager_save_gb_map(void);
+void bt_manager_reset_gb_map(void);
+/* SELECT 或 START 是否已有任一映射 (用于进入 GB 菜单时判断是否提示映射). */
+bool bt_manager_gb_map_set(void);
+const char *bt_manager_gb_func_name(int idx);
+
+/* ========================================================================
+ *  蓝牙基础 API
+ * ======================================================================== */
+#ifndef BT_DEVICE_T_DEFINED
+#define BT_DEVICE_T_DEFINED
+typedef struct {
+    uint8_t bd_addr[6];
+    uint8_t addr_type;
+    char name[32];
+    int8_t rssi;
+    bool has_name;
+} bt_device_t;
+#endif
+
+typedef void (*bt_scan_callback_t)(bt_device_t *results, int count);
+typedef void (*bt_device_found_cb_t)(bt_device_t *results, int count, bool updated);
+typedef void (*bt_connect_cb_t)(bool connected);
+typedef void (*bt_connect_progress_cb_t)(const char *stage);
+
+/* ========================================================================
+ *  设备信息 (供"设备信息"页展示; 由 bt_manager_get_conn_info() 返回)
+ * ======================================================================== */
+typedef struct {
+    char    model[24];   /* 控制器型号字符串 */
+    char    name[32];    /* 设备名 */
+    uint8_t battery;     /* 0=空 .. 254=满, 255=不可用 */
+    uint16_t vid;
+    uint16_t pid;
+    bool     available;  /* 是否有有效信息 (连接中) */
+} btm_conn_info_t;
+
+/* ========================================================================
+ *  摇杆自适应校准
+ *  - 连接成功后自动采样摇杆/十字键静止中性值作为校准基准, 并加死区抑制漂移.
+ *  - 运行时可按一次"校准键"触发 bt_manager_calibrate() 重新采样.
+ * ======================================================================== */
+void bt_manager_calibrate(void);                 /* 重新采样中性值 */
+bool bt_manager_calibration_done(void);          /* 首次校准是否完成 */
+uint8_t bt_manager_calibration_neutral(void);    /* 当前中性值 */
+
+void bt_manager_init(void);
+/* 创建 bt_init 任务（内部 RAM 动态栈；任务初始化完自删即归还，PSRAM 栈会断言不可用）。 */
+bool bt_manager_start_init_task(void);
+const char *bt_manager_get_status(void);
+void bt_manager_start_scan(bt_scan_callback_t callback);
+void bt_manager_start_scan_continuous(bt_device_found_cb_t callback);
+bool bt_manager_is_scanning(void);
+void bt_manager_stop_scan(void);
+bool bt_manager_is_connected(void);
+int bt_manager_get_scan_results(bt_device_t **results);
+const char *bt_manager_get_device_name(const bt_device_t *dev);
+const char *bt_manager_get_connected_device_name(void);
+bool bt_manager_connect_device(const bt_device_t *dev);
+void bt_manager_disconnect(void);
+/* V1.6.x: 蓝牙是否已启用 (供「蓝牙HID键盘↔连手柄」二选一切换时记录原状态/恢复) */
+bool bt_manager_is_enabled(void);
+/* 连接前清理: 删除与该设备同名/同地址的历史记录, 重置其按键配置为默认并保存,
+ * 并清除输入残留状态 (防"不按任何键映射就自动完成"的幽灵输入). */
+void bt_manager_reset_pad_clean(const bt_device_t *dev);
+/* 清除手柄输入残留状态 (虚拟按键/方向/按下锁/差分基线) */
+void bt_manager_reset_input_state(void);
+/* 设备信息页: 取当前已连接设备信息. 返回 NULL 表示无连接. */
+const btm_conn_info_t *bt_manager_get_conn_info(void);
+void bt_manager_set_connect_callback(bt_connect_cb_t cb);
+void bt_manager_set_connect_progress_cb(bt_connect_progress_cb_t cb);
+const char *bt_manager_get_connect_error(void);
+bool bt_manager_last_connect_was_new(void);
+bool bt_manager_is_connecting(void);
+/* UI 停止等待 (超时/用户返回)。**不影响底层连接事务** —— 事务仍可能成功,
+ * 成功后照常走 connect 回调; 真正失败由 esp_hidh_dev_open 返回值收敛。 */
+void bt_manager_cancel_connect(void);
+void bt_manager_enable(void);
+/* ⚠ 轻量关射频: 只关射频, **栈结构全部保留** (下次 enable 毫秒级复用).
+ *   因此内部 RAM 不会归还 —— 用户可见现象就是"关了蓝牙, 内存没恢复"。
+ *   适合"临时让出射频、马上还要用"的场景 (SDR 频谱扫描等)。
+ *   设置页/快捷栏这类"用户主动关"必须用下面的 disable_release。 */
+void bt_manager_disable(void);
+/* ★ 2026-10-30 按需加载: 最后使用者退出时调这个 —— 除了关射频, 还会**真拆栈**
+ * 归还 controller/Bluedroid/esp_hidh 占的约 67KB 内部 RAM.
+ * 由 os_hw 引用计数归零路径 (bt_stop) 调用, 多模块共用时不会被先退出者误关。
+ * 失败兜底 = 退回只关射频 (栈保留, 功能不坏), 与改造前行为一致。 */
+void bt_manager_disable_release(void);
+/* ★ 2026-11-24 省电模式「蓝牙闲置自动关闭」配套 (见 wallpapers.c 的 wp_eco_tick):
+ *   is_busy()      只读: 已连接/连接中/扫描/配对/开机回连窗口/事务在飞/收尾中 任一成立 ⇒ true。
+ *                  闲置计时必须从 false 开始算, 所以回连窗口期内绝不会误判闲置。
+ *   release_async() 异步深拆栈(内部 RAM 临时任务)。判定点在 PSRAM 栈的屏保任务里,
+ *                  不能直接调 disable_release(拆栈会关 cache ⇒ 断言)。返回 false = 已在跑/建任务失败。 */
+bool bt_manager_is_busy(void);
+bool bt_manager_release_async(void);
+/* 是否配对过手柄 (只读 NVS, 不初始化蓝牙核心) — 入口据此决定要不要拉起蓝牙栈 */
+bool bt_manager_has_saved_pad(void);
+/* ★ 2026-11-24: 「开机自动回连」开关的底层存取 (只读 NVS, 不初始化核心)。
+ *   推荐业务层用下面的 bt_manager_is/set_boot_auto_reconnect(), 别直接碰这两个。 */
+bool bt_manager_is_user_off(void);
+/* 底层写入: off=true ⇒ 开机自动回连关; false ⇒ 开。 */
+void bt_manager_set_user_off(bool off);
+/* ★ 2026-11-24: 「开机自动回连」开关 (手柄页可切换, **默认开**)。
+ *   语义: 开机时是否用 60s 窗口去抓上次的手柄; 底层复用 uoff 字节 (0=开, 1=关)。
+ *   只影响**开机**那一次: 关掉后, 「添加设备」/手动开蓝牙/进游戏·手柄页仍照常
+ *   按 30s 窗口试回连 (那些是用户当下明确要用手柄的场景)。
+ *   为什么要有: uoff 原来是隐形持久标记 (设置页关一次蓝牙就永久锁死开机回连),
+ *   现在换成手柄页里看得见、随时能改的开关。 */
+bool bt_manager_is_boot_auto_reconnect(void);
+void bt_manager_set_boot_auto_reconnect(bool on);
+/* V1.5.x: 开机自动回连窗口 — 有已配对手柄时短窗口内低占空比直连上次手柄,
+ * 连上即保持; 窗口超时未连上自动关栈回按需省电 (main.c 开机时调用, 0=默认30s). */
+void bt_manager_start_boot_reconnect(uint32_t window_ms);
+bool bt_manager_is_ready(void);
+bool bt_manager_is_stack_ready(void);
+/* 屏保软挂起: 断开连接 + 停止扫描, 协议栈保持存活 */
+void bt_manager_suspend(void);
+void bt_manager_resume(void);
+bool bt_manager_is_suspended(void);
+
+/* ========================================================================
+ *  连接记录 (NVS 持久化, 上限 4 条)
+ * ======================================================================== */
+#define BT_HISTORY_MAX  4
+int bt_manager_get_history_count(void);
+const bt_device_t *bt_manager_get_history_at(int index);
+bool bt_manager_remove_history_at(int index);
+void bt_manager_clear_paired(void);
+bool bt_manager_is_paired_device(const uint8_t *bd_addr);
+/* ★ 2026-10-02: 身份判定改为"名字优先" (手柄会变 MAC, 只按地址比会误判成新手柄) —— 参照 Bluepad32 */
+bool bt_manager_is_known_device(const uint8_t *bd_addr, const char *name);
+/* 取走"待做按键映射"待办(一次性)。
+ * ★ 2026-11-24: 待办只在**用户主动点选连接**一只未映射手柄时才挂 —— 后台自动回连
+ *   (开机窗口/扫描窗等待/唤醒) 不挂。所以它应由**手柄页的连接窗**取用并衔接映射向导,
+ *   不要再在桌面等"任意页面"里取走并跳页 (那会让后台回连顶掉用户正在看的界面)。 */
+bool bt_manager_take_map_pending(char *out, size_t n);
+
+/* ★ C7 (2026-10-02): 忘记手柄 —— 按**名字**(身份, 与 MAC 无关)清掉连接记录 +
+ * 手柄档案(gpm 映射), 并停止对它的自动回连。名字为空返回 false。 */
+bool bt_manager_forget_device(const char *name);
+void bt_manager_add_to_history(const bt_device_t *dev);
+bool bt_manager_get_connected_addr(uint8_t *out_addr6);
+bool bt_manager_has_last_conn(void);   /* V1.5.x: 是否有上次连接设备 (扫描自动回连判定) */
+
+/* ========================================================================
+ *  蓝牙键盘 1:1 输入通道 (2026-11-22)
+ * ------------------------------------------------------------------------
+ *  键盘的字符/动作**不在这里处理**, 只负责"翻译并转发"给输入层:
+ *      bt_hid 报告 → bt_kbd 解析(逐键边沿) → 本模块转动作码 → sink
+ *  这样 bt_ctl 不需要依赖 input 组件 (input 已依赖 bt_ctl, 反向会循环依赖)。
+ *  注册方: input_init() 注册 input_kbd_event。
+ *
+ *  act 取值 bt_kbd_act_t (bt_kbd.h); ch 仅 BTK_ACT_CHAR 时有效。 */
+typedef void (*bt_manager_kbd_sink_t)(int act, char ch, bool pressed);
+void bt_manager_set_kbd_sink(bt_manager_kbd_sink_t cb);
+
+/* 当前连接的是否为键盘 (描述符判定). 键盘连着时 bt_manager_is_connected() 返回 false,
+ * 用本函数或 bt_manager_any_connected() 区分。 */
+bool bt_manager_is_keyboard_connected(void);
+
+/* **任意** HID 设备是否连着 (手柄或键盘)。仅用于"蓝牙已连接"这类状态展示;
+ * ⛔ 判断"有没有手柄可用"必须用 bt_manager_is_connected() —— 那是手柄专属语义。 */
+bool bt_manager_any_connected(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* BT_MANAGER_H */

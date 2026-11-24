@@ -1,0 +1,9 @@
+# 开机常驻模块 .bss 迁 PSRAM (2026-11-07 核心内存优化)
+# 复用 IDF 全局 extram_bss scheme; 只迁 .bss/.common, 不改 .data/代码/DMA/TCB。
+# 前置: CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y (本项目已开)。
+# 排除依据: 本库无 StaticTask_t / portMUX / DMA 描述符 / ISR 访问变量。
+[mapping:net_client_extram_bss]
+archive: libnet_client.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
