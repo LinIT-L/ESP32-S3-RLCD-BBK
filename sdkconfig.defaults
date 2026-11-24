@@ -1,0 +1,370 @@
+# ESP32-S3-RLCD-4.2 步步高模拟器配置
+# 芯片: ESP32-S3-WROOM-1-N16R8 (16MB Flash, 8MB PSRAM)
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# 分区表 (自定义,容纳大应用)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 控制台: USB Serial/JTAG (便于从 USB 口直接看 panic/日志).
+# 浅睡前已由 log_console_suspend(true) 挂起日志输出, 不会触发 #5097 abort.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# PSRAM (8MB 八线, 80MHz) — gam4980 的 6MB ROM 数据必须放 PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+# 允许 BSS 段放 PSRAM (sys 结构体 ~6MB)
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# V1.0.64: 关闭 SPIRAM_RODATA (字库等 rodata 保持 Flash XIP, 不进 PSRAM).
+# 之前=y 时开机把全部字库(~4.9MB)复制进 PSRAM, 堆只剩 3.1MB,
+# gam4980 需要 6MB PSRAM -> 分配失败 -> 进游戏 5% 时写空指针崩溃重启.
+# 现在字库按需从 Flash 缓存读取, PSRAM 堆恢复到 ~7.4MB, BBK 正常.
+# CONFIG_SPIRAM_RODATA=y
+# 非必要数据尽量放 PSRAM: ALWAYSINTERNAL 阈值调小 (≤此值才保留内部), 内部预留调小
+# 以腾出 ≥32KB 连续内部块给 BBK 引擎 sys_ram (动态分配).
+# ★ 2026-10-25 linit「解决内存 RAM 不够」: 门槛 16384 → 4096。
+#   原来 malloc <16KB 一律进**内部** RAM; 仙剑(SDLPal)有几千个这种小块,
+#   实测把内部 RAM 从 122KB 吃到只剩 9.8KB ⇒ WiFi/SPI/任务栈这类"只能内部"的
+#   分配开始失败, 表现就是画面卡死/异常。
+#   现在只有 <4KB 的小对象留内部(快), 4KB 以上一律走 8MB PSRAM。
+#   ⚠ 驱动要内部/DMA 内存时本来就显式用 heap_caps_malloc(MALLOC_CAP_DMA/INTERNAL),
+#     不受这一项影响。回滚: 改回 16384 重新编译烧录即可。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
+# V2.x 内存精简: WiFi/lwIP 的收发缓冲优先分配到 PSRAM (分配失败自动回退内部 RAM),
+# 从而释放内部 DRAM 给 BBK/模拟器。S3 的 PSRAM 支持 DMA, 功能不受影响, 仅有极微延迟。
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# 允许 FreeRTOS 任务栈放 PSRAM (音频解码任务栈 60KB, 蓝牙任务栈也需要)
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+# V2.x 内存精简: WiFi 的收发/管理代码默认常驻 IRAM 以提速; 关闭后挪回 Flash,
+# 牺牲 WiFi 吞吐/延迟换内部 RAM (IRAM 与 DRAM 同块物理 SRAM, 每 1KB IRAM = 1KB 堆).
+# WiFi 在本机是"按需开关"的辅助功能, 非常驻, 故代价可忽略。
+# CONFIG_ESP_WIFI_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+# V2.x 内存精简: 非 ISR 的 FreeRTOS 函数从 IRAM 挪到 Flash (官方称最多省 8KB IRAM).
+# ISR 上下文调用的函数仍留 IRAM, 不违反禁 cache 约束。
+# ★ 2026-10-29 ESP-IDF 6.0 迁移: CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH 已被官方删除
+#   (6.0 默认就把 FreeRTOS 函数放 Flash)。6.0 新增的 CONFIG_FREERTOS_IN_IRAM 反而会把
+#   整个 FreeRTOS 拉进 IRAM —— 与本节意图相反, 本机内部 RAM 极紧, 必须显式保持 n。
+#   实测: 该保持 y 时 .iram0.text 115,415 B; 置 n 后 102,359 B (比 5.5.5 的 103,263 还少 904 B)。
+# CONFIG_FREERTOS_IN_IRAM is not set
+
+# === V1.6.x: 浅睡(light sleep)稳定性 ===
+# Octal PSRAM+Flash 共享总线: 浅睡时若 flash 断电, 唤醒瞬间 cache 访问会 panic
+# (官方 Techpedia Guru Meditation 调试指南明确建议禁用此项).
+# CONFIG_ESP_SLEEP_POWER_DOWN_FLASH is not set
+# PSRAM 浅睡时不进半睡眠: 保持自刷新, 唤醒零等待, 避免 Octal PSRAM 唤醒时序问题.
+CONFIG_PM_SLP_SPIRAM_HALFSLEEP_ENABLED=y
+# 启用 cache safe 断言: 若有任务栈在 PSRAM, 浅睡前直接报错而非静默崩溃.
+CONFIG_ESP_SLEEP_CACHE_SAFE_ASSERTION=y
+
+# FAT 文件系统 (SD 卡读 ROM, 支持中文长文件名)
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_CODEPAGE_936=y
+CONFIG_FATFS_CODEPAGE=936
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+
+# 模块化 OS 内核 (components/os): 当前主系统就是新 OS, 必须启用
+CONFIG_OS=y
+
+# === 蓝牙手柄 Host: 官方 esp_hid_host (Bluedroid). ESP32-S3 仅 BLE. ===
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+# CONFIG_BT_NIMBLE_ENABLED is not set
+# esp32s3 需显式开 BLE4.2 特性 (ADV/SCAN 被裁剪则 esp_ble_gap_* 链接缺失)
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_42_ADV_EN=y
+CONFIG_BT_BLE_42_SCAN_EN=y
+# 控制器 BLE 配置 (S3 单模): 活动连接只需 2 条 (单手柄, 冗余一条), 省内部 RAM
+CONFIG_BT_CTRL_BLE_MAX_ACT=6
+CONFIG_BT_ACL_CONNECTIONS=2
+# 广播/扫描去重过滤缓存降低 (内部 RAM)
+CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=30
+# V2.x 内存精简: 扫描去重缓存 100->40。只影响"同一设备重复上报"的去重条目数,
+# 不影响设备发现能力 (缓存小反而更多上报, 不会漏设备)。
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=100
+
+# ★ 2026-11-22 功耗: 蓝牙 modem sleep (BLE 事件间休眠, 省 5~15mA)。
+#   时钟源必须选 Main crystal —— 板子 RTC 是 INT_RC 无外部 32K, RTC_SLOW 精度不够;
+#   官方说明主晶振是唯一能与 DFS / light sleep 共存的低功耗时钟。
+CONFIG_BT_CTRL_MODEM_SLEEP=y
+CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
+CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
+
+# 禁用 secure boot (避免依赖 micro-ecc submodule)
+CONFIG_SECURE_BOOT=n
+CONFIG_SECURE_BOOT_V2_ENABLED=n
+
+# lwip 已从 gitee 镜像克隆, 启用网络栈 (esp_http_server 等组件依赖)
+# CONFIG_LWIP_ENABLE 默认为 y (SOC_WIFI_SUPPORTED)
+
+# 启用 mbedTLS 证书包 (V1.0.68 天气时钟 HTTPS 需要 esp_crt_bundle)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# 关闭 mbedTLS 硬件加速 (上游 mbedtls 不含 espressif 的 soft fallback 类型)
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+CONFIG_MBEDTLS_HARDWARE_GCM=n
+CONFIG_MBEDTLS_HARDWARE_ECC=n
+CONFIG_MBEDTLS_HARDWARE_ECDSA_SIGN=n
+CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY=n
+CONFIG_MBEDTLS_GCM_SUPPORT_NON_AES_CIPHER=n
+CONFIG_TINYUSB_MSC_ENABLED=y
+# USB 挂载 TF 卡速度优化: MSC FIFO 默认仅 512B (=1 扇区), 导致 PC 每次
+# USB 事务只传 1 块, 全速 USB 吞吐被逐块往返开销卡在 ~40KB/s.
+# 2026-11-07 核心内存优化: 8192 -> 4096 (8 扇区), 省 4096 B 内部 RAM。
+# 4096 是 Kconfig 下限(CONFIG_WL_SECTOR_SIZE=4096), 仍是多块传输;
+# 代价: USB 挂载 TF 卡大文件吞吐约降三成, 功能与 DMA 约束不变。
+CONFIG_TINYUSB_MSC_BUFSIZE=4096
+# USB HID 复合设备: 2 个 HID 接口 (键盘 + 鼠标)
+CONFIG_TINYUSB_HID_COUNT=2
+# V2.0 复合设备方案: 控制台走 TinyUSB CDC 串口 (常驻 MSC+CDC / 键鼠 HID+CDC)
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=256
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=256
+CONFIG_TINYUSB_CDC_EP_BUFSIZE=64
+# USB-BT 蓝牙适配器 (BTH): 设备模拟成 USB 蓝牙 HCI 适配器, 电脑可用其蓝牙
+CONFIG_TINYUSB_BTH_ENABLED=y
+# 必须为 >=1: TinyUSB 的 BTH 驱动 btd_open() 在 HCI 主接口后会无条件解析
+# 第二个 ISO 接口(bNumEndpoints==2), 且 usb_hid.c 的 TUD_BTH_DESCRIPTOR IAD
+# 硬编码 bInterfaceCount=2。若设为 0, ISO 接口描述符不生成, 驱动 open 失败,
+# Windows 枚举失败报"未知设备"。参考 esp-iot-solution usb_dongle 取 1(支持 SCO 音频)。
+CONFIG_TINYUSB_BTH_ISO_ALT_COUNT=1
+# USB 网卡共享 (ECM/RNDIS): 设备枚举为电脑 USB 有线网卡 (RNDIS, Windows 原生识别)
+CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y
+
+# CPU 频率: 240MHz (默认 160MHz, 提升 50% 性能)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# 编译器优化: 速度优先 (-O2 替代默认 -Og)
+# v5.5 起选项名由 COMPILER_OPTIMIZATION_SPEED 改为 COMPILER_OPTIMIZATION_PERF,
+# 旧名已失效被静默忽略 (曾导致整个固件以 -Og 调试级优化编译, 引擎性能偏低)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# WiFi 联网 (V1.0.46 起启用: STA 连接, 设置中心扫描并输入密码)
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_COEX_ENABLED=y
+# V1.0.67: 蓝牙+音频占用大量 DMA 后, WiFi 16KB 静态 RX 缓冲分不到导致 init 失败,
+# 减小缓冲降低 DMA 需求 (网页手柄/天气小数据足够)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=6
+
+# main 任务栈: 默认 3584 对引擎启动/加载链(在 main 任务上运行)太浅,
+# 打开任意引擎会触发 "stack overflow in task main" 重启。
+# 调到 12288, 为 NES/GB/Arduboy start 与 gam4980 libretro 初始化链提供充足栈。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
+
+# esp_timer 任务栈: 默认 3584 太浅。打开大书(蛊真人等)时, SDK 层
+# (flash/mmap 缓存、NVS 等)会在 esp_timer 回调里走深调用, 默认栈触发
+# "stack overflow in task esp_timer" 直接重启。放大到 8192 (内部空闲 ~114KB 够用)。
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=2048
+
+# === V1.0.9x: 精简 WiFi 内存 ===
+# WiFi 目前只两个用途: ①STA 联网(天气/同步) ②softAP 开热点当网页手柄.
+# 都是小数据量, 默认 16 动态收发缓冲/32 管理短缓冲对我们是浪费,
+# 下发后可腾出数千字节内部 DMA, 避免 WiFi 手柄启动时与蓝牙争 DMA 失败.
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=32
+CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=10
+# IEEE802.11 接收去重共缓存降到 256 (小热点场景够用, 省 DMA)
+CONFIG_ESP32_WIFI_RX_BA_WIN=6
+CONFIG_ESP_WIFI_RX_BA_WIN=8
+
+# V1.1.x: 精简 WiFi: WiFi 仅 STA(天气/同步) + softAP(网页手柄), 无企业/证书登录
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=y
+CONFIG_WPA_MBEDTLS_TLS_CLIENT=n
+
+# === V1.5.x: 省电 — PM 自动降频 (DFS) ===
+# 开启电源管理: 空闲时 CPU 自动降到 XTAL(40MHz), 忙时升回 240MHz.
+# PM_DFS_INIT_AUTO 默认 n, 须显式开启让启动代码自动配置 DFS (max=240, min=40).
+# 游戏/模拟器运行期间由 input.c 用 esp_pm_lock(CPU_FREQ_MAX) 锁 240MHz 防掉帧.
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+
+# === V1.6.x: 内存审计 — 开启 heap 追踪转储 (standalone) ===
+# remcon `audit` 可输出内部/PSRAM 分类堆积 + 所有任务栈水位 + 各堆块明细,
+# 用于定位"谁占用内部 RAM". standalone 模式无需宿主 init, 转储即用.
+CONFIG_HEAP_TRACING=y
+CONFIG_HEAP_TRACING_STANDALONE=y
+# vTaskList/任务栈水位审计依赖 (内存审计工具用)
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# ---- Lua 用 SPIFFS (appdata 末尾划 512KB, 分区 label=spiffs) ----
+# ⚠ 2026-10-02: 删除 `CONFIG_SPIFFS=y` —— IDF 的 spiffs 组件**没有**这个顶层符号
+#   (只有 SPIFFS_PAGE_SIZE/SPIFFS_USE_MAGIC 等子项), 组件靠 REQUIRES spiffs 引入。
+#   留着它每次 configure 都会刷 "unknown kconfig symbol 'SPIFFS'" 告警。
+CONFIG_SPIFFS_USE_MAGIC=y
+CONFIG_SPIFFS_USE_MAGIC_LENGTH=y
+CONFIG_SPIFFS_OBJ_NAME_LEN=64
+CONFIG_SPIFFS_PAGE_SIZE=256
+
+# ---- LVGL：已整体删除（2026-10，改用原生 1bpp 渲染，移植层与组件均无残留）----
+# 这里曾有 87 条 LV_* 瘦身配置；组件删掉后它们全变成 unknown kconfig symbol，# 每次 configure 刷一屏告警 ⇒ 已清空。要重新接 LVGL 从 docs/LVGL接入方案.md 恢复清单。
+
+# ============================================================
+# 内部 RAM 精简 (2026-10-01)  —— 详见 docs/内部RAM预算与蓝牙WiFi精简.md
+# 现象: 蓝牙初始化后内部空闲仅 56KB / 最大连续块 31KB,
+#       esp_wifi_init 报 ESP_ERR_NO_MEM ("Expected to init 4 rx buffer, actual is 1"),
+#       WiFi 完全打不开。
+# 原则: 只调"条目上限 / 产线测试开关", 不动任何功能性能力。
+# ============================================================
+# 蓝牙 Bluedroid 主机侧优先从 PSRAM 分配
+CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
+# 控制器广播上报队列 100 -> 10
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50
+# 广播上报丢弃阈值 20 -> 5
+CONFIG_BT_CTRL_BLE_ADV_REPORT_DISCARD_THRSHOLD=20
+# 蓝牙 alarm 槽 50 -> 10
+CONFIG_BT_ALARM_MAX_NUM=50
+# BLE 绑定记录 15 -> 6
+CONFIG_BT_SMP_MAX_BONDS=15
+# 关 BLE5.0 DTM 产线测试模式
+CONFIG_BT_BLE_50_DTM_TEST_EN=y
+# 关 BLE4.2 DTM 产线测试模式
+CONFIG_BT_BLE_42_DTM_TEST_EN=y
+# WiFi 静态 TX 缓冲 16 -> 8 (~省13KB)
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=16
+# 不用 ESP-NOW -> 0
+CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM=7
+
+# panic 复位前留 3 秒, 让 panic 正文能打出来 (否则被复位吞掉)
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=3
+
+# ---- TLS 内存瘦身 (2026-10-02) ----
+# 背景: 蓝牙(手柄)+WiFi 同时开着时内部堆只剩 ~15KB/最大连续块 7.6KB,
+# 而默认 IN=16384 的 mbedtls 上下文需要一块连续 16KB → calloc 失败 →
+# esp_http_client_open 242µs 就返回 ESP_ERR_HTTP_CONNECT (实测日志)。
+# DYNAMIC_BUFFER 把收发缓冲从"上下文内"改成"按需单独分配", 于是不再要求
+# 一整块 16KB 连续内存; IN 降到 4096 / OUT 降到 2048 进一步压低峰值。
+# ⚠ 代价: 单个 TLS 记录 >4096B 会失败 (服务器一般按 ≤4KB 分包; 若遇到大响应,
+#   表现为 ESP_ERR_HTTP_CONNECT 或握手后读失败, 可再调大 IN)。
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# ---- mbedtls 的 TLS 工作内存一律用 PSRAM (2026-10-02 linit 立规) ----
+# 原来 INTERNAL_MEM_ALLOC=y → 握手每一小块都从内部 RAM 要, BT+WiFi 同开时只剩 ~14KB,
+# 直接 `Dynamic Impl: alloc(2389 bytes) failed` + `mbedtls_ssl_handshake returned -0x0010`
+# (= MBEDTLS_ERR_SSL_ALLOC_FAILED) → esp_http_client 报 ESP_ERR_HTTP_CONNECT(28674)。
+# 改成 EXTERNAL_SPIRAM: mbedtls 的 calloc/free 走 PSRAM(空闲 6.5MB), 内部 RAM 只留必要项。
+CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=n
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# ★ 2026-10-16 官方开关: 允许 新 i2c_master 与旧 i2c 驱动共存
+#   (hw_cfg 板型探测用新驱动 driver/i2c_master.h, 工程别处还有旧驱动;
+#    不开这个开关 IDF 会在开机 check_i2c_driver_conflict 里 abort 重启)
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# ★★★ 2026-10-16 官方省内部 RAM 开关(实测 .iram0.text 119K→103K, 内部堆 +17.8KB)
+#   S3 上 IRAM(代码) 与 DRAM 共用 512KB SRAM ⇒ 把这些非关键函数放进 flash 即等于还内存
+# ★ 2026-10-29 6.0: FREERTOS_PLACE_FUNCTIONS_INTO_FLASH 已删除; 等价手段是保持
+#   CONFIG_FREERTOS_IN_IRAM=n (见文件上方 "V2.x 内存精简" 一节)
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
+# CONFIG_ESP_WIFI_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+
+# ★ 2026-10-16 追加(官方): PSRAM 外置 (WiFi/lwIP 缓冲优先 PSRAM 见上方唯一定义)
+CONFIG_ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# ★★ 2026-10-16 内存优化终版(全部实测有效)
+# WiFi 静态缓冲缩减(官方+Arduino社区实证): RX 10→6 / TX 16→7 ⇒ 运行时省 ~12KB
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=16
+# 蓝牙内存改为"运行时分配"(官方): 不启用蓝牙就不占 ✗→✓
+CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY=y
+# ⛔ 不要开 XIP_FROM_PSRAM/FETCH_INSTRUCTIONS/RODATA: 实测只省 6KB 内部, 却吃掉 3.3MB PSRAM
+# ⛔ 不要动 ESP_MAIN_TASK_STACK_SIZE(12288): 这是**主循环任务**的栈, 下列调用都在它上面跑 ——
+#     计算器 calc_eval(曾占栈 7.3KB)、阅读器排版、Lua 应用、设置页。
+#   2026-11-01 事故: sdkconfig 里被改成 6144 ⇒ 计算器一按"= "就栈溢出,
+#   表现是"答案正常显示出来, 然后重启"(溢出没立刻炸, 返回后才踩坏相邻内存)。
+#   降到 4096 时 main_free 只剩 1864B, 同样会溢出。
+#   注意: 它**不能**放 PSRAM —— 主循环要读 NVS/flash, 禁缓存期间 PSRAM 栈不可访问会 panic。
+
+CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y
+
+# CONFIG_SPI_FLASH_AUTO_SUSPEND is not set  # ⛔ 与 PSRAM 冲突, 开启会重启循环(实测)
+
+# ★ 2026-10-28: 删掉历史上的 CONFIG_COMPILER_OPTIMIZATION_SIZE=y。
+#   COMPILER_OPTIMIZATION 在 Kconfig 里是 **choice(单选)**, PERF 与 SIZE 不能共存。
+#   本工程在第 141 行已明确选 PERF(带注释说明 v5.5 把 SPEED 改名为 PERF),
+#   这行 SIZE 是改名前的遗留, 生成出来的 sdkconfig 里生效的一直是 PERF —— 属死配置。
+#   已用 idf.py reconfigure 验证: 删除后 sdkconfig 仍为 CONFIG_COMPILER_OPTIMIZATION_PERF=y。
+
+CONFIG_COMPILER_SAVE_RESTORE_LIBCALLS=y
+
+# ★ 2026-10-29 ESP-IDF 6.0.3 迁移: 6.0 默认给的是**裸 -Werror**(任何警告都算错误)。
+#   本工程有 140+ 条历史警告(多为模拟器/第三方代码), 换台机器重新生成 sdkconfig 后
+#   必然在第一条 -Wtype-limits 处编译失败(已实测: 缺此项时 st7305.c 直接报错)。
+#   官方 6.0 根 Kconfig 对此项的说明正是"升级 IDF 期间不把默认警告当错误"的过渡开关;
+#   开启后等价于 -Werror=all(只有 -Wall 组算错误), 警告**仍照常打印**, 只是不中断构建。
+#   ⚠ 这是过渡手段 —— 官方帮助写明"修代码才是首选", 后续应逐条清警告后再关掉。
+CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
+
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y   # ★无线手柄 begin_ap 需要 SoftAP, 不能关
+
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=y
+
+# ★ 2026-10-16 实测: 以下选项影响 WiFi 连接稳定性, 一律保持官方默认
+
+# 关掉 8MB PSRAM 全片自检: 开机省 ~1s
+CONFIG_SPIRAM_MEMTEST=n
+
+# === 2026-10-20: 关掉 DHCP 拿到地址后的 ARP 冲突探测 ===
+# 开了它每拿一个 offer 都要先发 ARP 探测等应答(最多 ~1-2s/次) ⇒ 上电到联网慢 2 秒多。
+# 家用局域网不存在重复地址, 关掉不影响使用。
+CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP=y
+CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n
+
+# ★★★ 2026-10-25: 系统事件任务栈必须 ≥3072
+#   实测崩溃(linit 报"连网一直正在扫描然后重启"): WIFI_EVENT_SCAN_DONE 回调里
+#   esp_wifi_scan_get_ap_records + 插入排序 + 日志格式化，1536 字节栈直接溢出:
+#   "***ERROR*** A stack overflow in task sys_evt has been detected."
+#   IDF 默认 2304 也偏紧（WiFi/BT 所有事件都在这条任务上），给到 3072。
+#   ⛔ 别再为省 1.5KB 把它压小。
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
+CONFIG_SYSTEM_EVENT_TASK_STACK_SIZE=3072
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND=y
+CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND=y
+
+# 日志同时输出到 USB Serial/JTAG（UART0 保持主控制台）—— 抓崩溃日志用
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# 堆越界保护：定位"堆元数据被写坏"类崩溃（仙剑 StoreProhibited）
+CONFIG_HEAP_POISONING_DISABLED=y
+
+# ---- 2026-10-31 下载吞吐: TCP 接收窗口 / 收包队列 / 802.11 收块确认窗口 ----
+CONFIG_LWIP_TCP_WND_DEFAULT=8192
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
+
+# 时间服务: SNTP 候选服务器数 (阿里/腾讯/pool 三源, 单点故障自动换)
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+
+# --- WiFi TX 缓冲走 PSRAM（linit 2026-11-01）---
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=0
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=16
+CONFIG_ESP32_WIFI_STATIC_TX_BUFFER=y
+CONFIG_ESP32_WIFI_TX_BUFFER_TYPE=0
+CONFIG_ESP32_WIFI_STATIC_TX_BUFFER_NUM=16
+
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+CONFIG_ESP_WIFI_SLP_IRAM_OPT=y
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
