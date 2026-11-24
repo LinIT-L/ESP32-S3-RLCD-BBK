@@ -1,0 +1,1020 @@
+/**
+ * svc_quickbar.c — 全局下拉快捷栏 (音量 / 蓝牙 / Wi-Fi)
+ *
+ * ── 形态 (400×300 单色屏, 2026-10-29) ──────────────────────────────────────
+ *   从屏幕顶部向下展开一条 **40px** 高的横向控制栏:
+ *
+ *     x=1                                     x=366        x=399
+ *     ┌──┐                                        ┌──┐
+ *     │BT│  10px   [🔈 ▓▓▓▓▓░░░░░░░░░░]   10px   │WiFi│
+ *     └──┘                                        └──┘
+ *      45                                        355
+ *      └────────── 音量控制区, 中心 = (45+355)/2 = 200 ──────────┘
+ *
+ *   几何推导 (把"中心严格 200"当成硬约束反解出来, 不是凑出来的):
+ *     直径 34 的圆钮 ×2 + 间距 10 ×2 = 88; 400 - 88 = 312
+ *     要让音量区中心正好 200, 区宽必须是**奇数**: 311 ⇒ x 从 45 到 355
+ *     ⇒ 左钮 1..34, 间隙 35..44, 音量 45..355, 间隙 356..365, 右钮 366..399
+ *     左右边距 1px / 0px —— 差 1px 是"中心 200"换来的, 视觉上不可辨。
+ *
+ * ── 交互 ─────────────────────────────────────────────────────────────────
+ *   · 起手区: 顶部中央 200×10 (x 100..299, y 0..10), 只在**收起时**受理;
+ *   · 下滑 ≥12px 展开; 展开后上滑 ≥12px 收起 (音量区内的拖动除外);
+ *   · 展开期间抽屉范围 (y<40) 的触摸优先归本服务, 不透给下方页面/游戏;
+ *   · 睡眠/屏保: 内核在屏保态直接 return, 本服务收不到 tick/touch, 天然不响应。
+ *
+ * ── 数据来源 ─────────────────────────────────────────────────────────────
+ *   全部走 os_platform_ops_t 注入的 getter/setter, 不直接引用 bt_ctl /
+ *   wifi_manager / audio_player —— 与状态栏保持同一套解耦约定。
+ *   setter 为 NULL 时按钮画成"不可操作"(空心 + 叉), 绝不假装成功。
+ */
+#include "os.h"
+#include "ui_common.h"
+#include "input.h"
+#include "wallpapers.h"
+#include "vid_tune.h"
+#include "vibrator.h"   /* 音量档位咔哒反馈 */   /* 画面优化器: 快捷栏内入口 */   /* os_screensaver_active: 屏保/睡眠时不响应下拉 */
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"   /* ★ 2026-10-31: trylock 保证 qb_tick/qb_render 单写者 */
+#include "freertos/queue.h"    /* ★ 2026-11-22: 延迟动作投递 (避开 PSRAM 栈 + flash) */
+#include "esp_heap_caps.h"     /* ★ 内部 RAM 分配执行任务的 TCB/栈 (见 qb_act_init) */
+/* 蓝牙 / Wi-Fi 图标直接用状态栏那一套位图, 保证与状态栏完全一致
+ * (status_icons.inc 里的 static 数组, 各编译单元各存一份, 不会冲突)。 */
+#include "status_icons.inc"
+#include <string.h>
+
+static const char *TAG = "quickbar";
+
+/* ===== 布局 (px) =====
+ *  2026-10-29 改版: 控件整体收拢居中, 只占 65..334 (原来铺满 1..399 显得过宽)。
+ *  蓝牙/Wi-Fi 紧贴音量区两侧各 10px, 音量区中心仍严格 = 200。
+ *
+ *     57                        65    98      109        291        334   342
+ *     ┌──────────────────────────┬─────┬────────┬──────────┬─────────┬──────┐
+ *     │ 白底                                 │  [🔊 ▬▬▬●▬▬▬]        │            │
+ *     └──────────────────────────┴─────┴────────┴──────────┴─────────┴──────┘
+ *                              蓝牙34  10   喇叭16  滑轨  10  Wi-Fi34
+ *                                        └──── 音量区 109..291, 中心 200 ────┘
+ *  白底 57..342 (控件外各留 8px), 左右边距均为 57 ⇒ 视觉对称。
+ */
+#define QB_H         40          /* 抽屉高度 */
+#define QB_BTN_D     34          /* 按钮边长 (方块) */
+/* 蓝牙/Wi-Fi 图形尺寸: 原 32x32 与音量喇叭摆在一起显得偏大, 缩到 24x24 对齐 */
+#define QB_ICON_SZ   24
+#define QB_ICON_HALF (QB_ICON_SZ / 2)
+
+/* ===== 24x24 专用图标 (2026-10-30 重绘) =====
+ * 原来是把状态栏 16x16 位图硬放大 2 倍得到 32x32, 缩小到 24 后又用最近邻采样,
+ * 线条会断、圆点变方。这两张是**按 24x24 直接画**的: 蓝牙是经典 BLE 符文
+ * (竖干 + 上下两个三角), Wi-Fi 是底部圆点 + 三道同心弧。
+ * 格式: 每行 3 字节, MSB 在前, 1 = 黑。 */
+static const uint8_t qb_bt_24[3 * 24] = {
+    0x00,0x00,0x00,
+    0x00,0x10,0x00,
+    0x00,0x1C,0x00,
+    0x00,0x13,0x00,
+    0x00,0x10,0x80,
+    0x00,0x10,0x60,
+    0x10,0x10,0x10,
+    0x0C,0x10,0x60,
+    0x02,0x10,0x80,
+    0x01,0x93,0x00,
+    0x00,0x54,0x00,
+    0x00,0x38,0x00,
+    0x00,0x38,0x00,
+    0x00,0x54,0x00,
+    0x01,0x93,0x00,
+    0x02,0x10,0x80,
+    0x0C,0x10,0x60,
+    0x10,0x10,0x10,
+    0x00,0x10,0x60,
+    0x00,0x10,0x80,
+    0x00,0x13,0x00,
+    0x00,0x1C,0x00,
+    0x00,0x10,0x00,
+    0x00,0x00,0x00,
+};
+
+static const uint8_t qb_wifi_24[3 * 24] = {
+    0x00,0x00,0x00,
+    0x00,0x7E,0x00,
+    0x01,0xFF,0x80,
+    0x07,0x00,0xE0,
+    0x0C,0x00,0x30,
+    0x38,0x00,0x1C,
+    0x20,0x00,0x04,
+    0x60,0x00,0x06,
+    0xC0,0x00,0x03,
+    0x00,0x7E,0x00,
+    0x01,0xC3,0x80,
+    0x03,0x00,0xC0,
+    0x06,0x00,0x60,
+    0x0C,0x00,0x30,
+    0x00,0x00,0x00,
+    0x00,0x00,0x00,
+    0x00,0x3C,0x00,
+    0x00,0x66,0x00,
+    0x00,0xC3,0x00,
+    0x00,0x00,0x00,
+    0x00,0x00,0x00,
+    0x00,0x18,0x00,
+    0x00,0x18,0x00,
+    0x00,0x00,0x00,
+};
+#define QB_BTN_R     5           /* 圆角半径 R5 */
+#define QB_BTN_Y0    3           /* 按钮上沿 */
+#define QB_BAR_CY    20          /* 滑轨垂直中心 */
+#define QB_BAR_HW    5           /* 滑轨半高 —— 与 MP3 音量条 MP3_VOL_HW 一致 */
+#define QB_DOT_R     12          /* 圆球半径 —— 与 MP3 MP3_VOL_DOT_R 一致 */
+#define QB_OPT_SZ    28          /* 28×28 (2026-10-29 linit: 在 14 基础上放大一倍) */
+#define QB_PANEL_R   6           /* 面板圆角 R6 */
+
+/* ===== 横向布局 (2026-11-22 改为运行时布局) =====
+ * ⛔ 原来所有 x 坐标都是按 **400 宽横屏**写死的 #define。书库竖屏(300×400)下拉时:
+ *    面板 x1=342 直接超出 300 ⇒ 右侧被裁("有一部分没显示"), 且整体偏右("没居中")。
+ * 现在统一走 qb_lay(): 横屏(400) 与原值**一字不改**, 竖屏(300) 用紧凑一套。
+ * 只把 x 方向参数化; y 方向(抽屉 40 / 展开 120 / 行高)两种方向完全相同。 */
+typedef struct {
+    int panel_x0, panel_x1, panel_x1b;  /* 白底左沿 / 右沿(无优化器) / 右沿(有优化器) */
+    int bt_lx, wifi_rx, opt_x;          /* 蓝牙钮 / Wi-Fi 钮 / 优化器图标 左沿 (opt_x<0=不显示) */
+    int spk_x, bar_x0, bar_x1;          /* 喇叭图标 / 滑轨球心起止 */
+    int vol_x0, vol_x1;                 /* 音量热区 (点按/拖动判定) */
+    int hs_x0, hs_x1;                   /* 顶部起手区 (dx 范围) */
+    int tune_x0, tune_cw, tune_trk_w;   /* 展开态: 左沿 / 每格宽 / 滑轨长 */
+    int save_x, canc_x;                 /* 展开态: 保存 / 取消 按钮左沿 */
+} qb_lay_t;
+
+/* 横屏 400×300 —— 与 2026-10-29 定稿的数值完全一致, 行为零变化。
+ *   57 白底左 | 65..98 蓝牙 | 109..140 喇叭 | 155..291 滑轨 | 301..334 WiFi | 342/379 白底右 */
+static const qb_lay_t QB_LAND = {
+    .panel_x0 = 57, .panel_x1 = 342, .panel_x1b = 379,
+    .bt_lx = 65, .wifi_rx = 301, .opt_x = 344,
+    .spk_x = 109, .bar_x0 = 155, .bar_x1 = 291,
+    .vol_x0 = 109, .vol_x1 = 291,
+    .hs_x0 = 100, .hs_x1 = 299,
+    .tune_x0 = 56, .tune_cw = 138, .tune_trk_w = 92,
+    .save_x = 8, .canc_x = (400 - 8 - 36),
+};
+
+/* 竖屏 300×400 —— 以逻辑宽 300 重新排, 左右对称:
+ *   4 白底左 | 4..37 蓝牙 | 45..76 喇叭 | 91..238 滑轨 | 254..287 WiFi | 292 白底右
+ *   滑轨球心最大 238 ⇒ 球右缘 253, 与 WiFi 左沿 254 相切不压住 ✓
+ *   优化器图标 28px 在 300 宽里塞不下 ⇒ opt_x=-1 (不画也不命中) */
+static const qb_lay_t QB_PORT = {
+    .panel_x0 = 4, .panel_x1 = 292, .panel_x1b = 292,
+    .bt_lx = 4, .wifi_rx = 254, .opt_x = -1,
+    .spk_x = 45, .bar_x0 = 91, .bar_x1 = 238,
+    .vol_x0 = 45, .vol_x1 = 254,
+    .hs_x0 = 50, .hs_x1 = 249,
+    .tune_x0 = 8, .tune_cw = 142, .tune_trk_w = 92,
+    .save_x = 8, .canc_x = (300 - 8 - 36),
+};
+
+/* 当前方向该用哪套: 竖屏逻辑宽 = 300 (< 400) */
+static inline const qb_lay_t *qb_lay(void) {
+    return (ui_screen_w() < ST7305_WIDTH) ? &QB_PORT : &QB_LAND;
+}
+
+/* ===== 画面调节展开态 (2026-10-30 linit 定稿) =====
+ *   从 1 格(40) 下拉到 3 格(120): 左"保存" 右"取消", 中间 2×2 四条
+ *   (亮度/对比/白点/黑点), 每条 = 2 字标签 + 与音量条同款的胶囊滑轨 + 圆球。 */
+#define QB_H_EXP      120
+#define QB_TUNE_ROW0  52
+#define QB_TUNE_ROW1  86
+
+/* 前向: 展开态渲染, 定义在 qb_touch 之前 */
+static void qb_draw_tune(st7305_handle_t *lcd);
+
+/* 手势 */
+#define QB_HS_Y1     10
+#define QB_TH        12          /* 下拉/上滑判定阈值 */
+/* ★ 2026-10-31 (linit): 面板自身的"免收起缓冲带"。
+ *   手指点面板边缘/按钮下沿时很容易落到 1~2px 之外, 原来立刻被判成"点外部"
+ *   把面板关掉。用户要求"判定范围整体加大": 这里独立取 60 (原来等于 QB_H=40),
+ *   面板本体 40 高 + 下方 60 = 100 以内都不算"点外部"。 */
+#define QB_HIT_PAD    60
+/* ★ 2026-11-07 linit「按实际位置按」: 动作类控件(蓝牙/Wi-Fi/音量)的纵向容差。
+ *   抽屉只画 40px 高, 手指边缘差几像素很常见, 给 4px 足够; 再多就是"栏外也能按"。 */
+#define QB_TOUCH_TOL_Y 4
+/* 面板内点按 vs 手势上滑的分界。
+ *   原来"上滑收起"对任何起点都只要求 dy <= -QB_TH(12)，于是点蓝牙/Wi-Fi 按钮时
+ *   手指往上带 12px 就被判成"上滑收起" —— 按钮没响应、面板却关了。
+ *   现在按起点位置区分：起点在面板内(点按钮)要滑 48px 才收起，点按抖动不会误关；
+ *   起点在面板外(下方空白)仍用 QB_TH，手势保持干脆。 */
+#define QB_CLOSE_TH_IN 48        /* 面板内起手时, 判定为上滑收起所需位移 */
+
+/* ===== 状态 ===== */
+static bool s_open;              /* 抽屉是否展开 */
+static bool s_gesture;           /* 本次触摸是否已被本服务接管 */
+static bool s_from_hs;           /* 本次手势是否从起手区开始 */
+static bool s_vol_track;         /* 正在拖音量条 */
+/* ★ 2026-10-29: 本次触摸已被"下拉打开抽屉"消费掉。
+ *   不加这个会误调音量: 打开后 s_gesture 复位, 下一帧手指还在屏上,
+ *   又按"新按下"处理, 而它正落在音量区 ⇒ 一拉下来音量就被改了。 */
+static bool s_swallowed;
+/* ★ 游戏内没有 os 的 tap 分发 (引擎阻塞主循环), 所以"点击按钮"必须本服务自己判:
+ *   按下时记位置, 抬起时若没被下拉手势消费, 就当作一次点击交给 qb_touch。 */
+static bool s_expand;            /* 画面调节展开态 */
+static int  s_drag_param = -1;   /* 正在拖的滑条 0..3, -1 无 */
+static bool s_tap_valid;
+/* ★ 同一次按下是否已经由 os 触摸回调处理过 —— 防止"按下切换一次、抬手又切换一次"相互抵消 */
+static bool s_press_done;
+static int  s_tap_x, s_tap_y;
+static int  s_start_y;
+
+/* ===== 平台挂钩 ===== */
+static const os_platform_ops_t *s_ops;
+void os_quickbar_set_platform(const os_platform_ops_t *ops) { s_ops = ops; }
+
+/* ★★★ 2026-10-31: 单写者保护。
+ *   本服务在两种上下文里被驱动:
+ *     ① 普通页面: os_tick → 服务 tick (主循环任务)
+ *     ② 全屏游戏: board_shim 视频任务 / 引擎帧循环 (阻塞式引擎)
+ *   两者可能在同一时刻都调进来 (游戏刚起来/刚退出那一瞬) ⇒ s_open/s_gesture/
+ *   s_vol_track 会被两个任务同时改, 表现是"拉一半收回去""手势丢失"。
+ *   这里用**非阻塞 trylock**: 拿不到就跳过本帧, 绝不等待 —— 不引入新的阻塞点。 */
+static SemaphoreHandle_t s_qb_mtx = NULL;
+static bool qb_guard_take(void)
+{
+    if (!s_qb_mtx) {
+        s_qb_mtx = xSemaphoreCreateMutex();
+        if (!s_qb_mtx) return true;      /* 建不出来就退化为无保护, 至少功能不丢 */
+    }
+    return xSemaphoreTake(s_qb_mtx, 0) == pdTRUE;
+}
+static void qb_guard_give(void) { if (s_qb_mtx) xSemaphoreGive(s_qb_mtx); }
+
+bool os_quickbar_is_open(void) { return s_open; }
+
+/* 立刻收起 (2026-10-29: 按返回键时优先关快捷栏, 而不是退出页面/游戏) */
+void os_quickbar_close(void)
+{
+    if (!s_open) return;
+    bool g = qb_guard_take();
+    s_open = false;
+    s_gesture = false;
+    s_from_hs = false;
+    s_vol_track = false;
+    s_expand = false;
+    s_drag_param = -1;
+    s_tap_valid = false;
+    s_press_done = false;
+    input_set_overlay_lock(false);
+    /* ★ 2026-10-31: 把触摸派生的按键状态一起清掉 —— 否则引擎停在"手指还按着",
+     *   退出快捷栏后角色自己走/方向卡住 (虚拟手柄状态是上一帧的快照)。 */
+    input_touch_release_all();
+    if (g) qb_guard_give();
+}
+
+/* ===== 小工具 ===== */
+static int qb_isqrt(int v)
+{
+    if (v <= 0) return 0;
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+/* 实心圆 (逐行填矩形, 单色屏上就是最省的做法) */
+static void qb_disc(st7305_handle_t *lcd, int cx, int cy, int r, st7305_color_t c)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        int dx = qb_isqrt(r * r - dy * dy);
+        fill_rect(lcd, cx - dx, cy + dy, cx + dx, cy + dy, c);
+    }
+}
+
+/* ===== 位图与圆角矩形 ===== */
+
+/* 圆角矩形填充: 中间十字矩形 + 四角整圆 (R 阶圆角) */
+static void qb_fill_round_rect(st7305_handle_t *lcd, int x0, int y0, int x1, int y1,
+                               int r, st7305_color_t c)
+{
+    if (r <= 0) { fill_rect(lcd, x0, y0, x1, y1, c); return; }
+    fill_rect(lcd, x0 + r, y0, x1 - r, y1, c);              /* 横向带 */
+    fill_rect(lcd, x0, y0 + r, x0 + r - 1, y1 - r, c);      /* 左直边 */
+    fill_rect(lcd, x1 - r + 1, y0 + r, x1, y1 - r, c);      /* 右直边 */
+    qb_disc(lcd, x0 + r, y0 + r, r, c);                     /* 四角 */
+    qb_disc(lcd, x1 - r, y0 + r, r, c);
+    qb_disc(lcd, x0 + r, y1 - r, r, c);
+    qb_disc(lcd, x1 - r, y1 - r, r, c);
+}
+
+/* ===== 图标: 全部取自状态栏位图 (status_icons.inc) =====
+ * inv = true 表示画在实心黑底上, 用白色; 反之黑色。 */
+/* 2 倍放大绘制 1bpp 位图 (最近邻, 每源像素画 2×2) */
+static void qb_blit_1bpp_scaled(st7305_handle_t *lcd, int x, int y, int sw, int sh,
+                              const uint8_t *src, int dw, int dh, st7305_color_t c)
+{
+    int bpr = (sw + 7) >> 3;
+    for (int dy = 0; dy < dh; dy++) {
+        int sy = dy * sh / dh;
+        for (int dx = 0; dx < dw; dx++) {
+            int sx = dx * sw / dw;
+            if (src[sy * bpr + (sx >> 3)] & (0x80u >> (sx & 7)))
+                st7305_draw_pixel(lcd, x + dx, y + dy, c);
+        }
+    }
+}
+
+/* 关闭态标记: 3px 粗斜杠 (无方框后靠这个区分开/关) */
+
+/* 蓝牙: 裁出原图中间 16 列 → 16×16, 再**放大一倍**到 32×32; 无方框 */
+static void qb_icon_bt_big(st7305_handle_t *lcd, int cx, int cy, bool on)
+{
+    (void)on;                                  /* 关闭态由外层的斜点线表示 */
+    qb_blit_1bpp_scaled(lcd, cx - QB_ICON_HALF, cy - QB_ICON_HALF,
+                        QB_ICON_SZ, QB_ICON_SZ, qb_bt_24,
+                        QB_ICON_SZ, QB_ICON_SZ, ST7305_COLOR_BLACK);
+}
+
+/* Wi-Fi: 16×16 原图**放大一倍**到 32×32; 无方框 */
+static void qb_icon_wifi_big(st7305_handle_t *lcd, int cx, int cy, bool on)
+{
+    (void)on;                                  /* 关闭态由外层的斜点线表示 */
+    qb_blit_1bpp_scaled(lcd, cx - QB_ICON_HALF, cy - QB_ICON_HALF,
+                        QB_ICON_SZ, QB_ICON_SZ, qb_wifi_24,
+                        QB_ICON_SZ, QB_ICON_SZ, ST7305_COLOR_BLACK);
+}
+
+/* 音量图标: **直接复用 MP3 播放器音量键的那个 32×32 图标**
+ *   (数据原样取自 apps/pages/mp3_icons.h 的 mp3_icon_vol_32)。
+ *   os 层不能依赖 apps 组件, 所以这里复制了一份; 若 MP3 侧换图标, 需同步此处。 */
+#define QB_ICON_VOL_W 32
+#define QB_ICON_VOL_H 32
+static const uint8_t qb_icon_vol[128] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80, 0x00,
+    0x00, 0x07, 0x80, 0x00, 0x00, 0x0C, 0x80, 0x00, 0x00, 0x18, 0x80, 0x00,
+    0x00, 0x70, 0x81, 0x00, 0x07, 0xC0, 0x81, 0x80, 0x0C, 0x00, 0x80, 0x80,
+    0x08, 0x00, 0x80, 0xC0, 0x08, 0x00, 0x88, 0xC0, 0x08, 0x00, 0x8C, 0x60,
+    0x08, 0x00, 0x84, 0x60, 0x08, 0x00, 0x84, 0x60, 0x08, 0x00, 0x84, 0x60,
+    0x08, 0x00, 0x8C, 0x60, 0x08, 0x00, 0x88, 0x40, 0x08, 0x00, 0x80, 0xC0,
+    0x0C, 0x00, 0x80, 0x80, 0x07, 0xC0, 0x81, 0x80, 0x00, 0x70, 0x81, 0x00,
+    0x00, 0x18, 0x80, 0x00, 0x00, 0x0C, 0x80, 0x00, 0x00, 0x07, 0x80, 0x00,
+    0x00, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+static void qb_icon_spk(st7305_handle_t *lcd, int x, int y, st7305_color_t c)
+{
+    const int bpr = (QB_ICON_VOL_W + 7) >> 3;
+    for (int dy = 0; dy < QB_ICON_VOL_H; dy++)
+        for (int dx = 0; dx < QB_ICON_VOL_W; dx++)
+            if (qb_icon_vol[dy * bpr + (dx >> 3)] & (0x80u >> (dx & 7)))
+                st7305_draw_pixel(lcd, x + dx, y + dy, c);
+}
+
+/* ===== 状态读取 ===== */
+static bool qb_bt_on(void)   { return (s_ops && s_ops->bt_enabled)   ? s_ops->bt_enabled()   : false; }
+static bool qb_wifi_on(void) { return (s_ops && s_ops->wifi_enabled) ? s_ops->wifi_enabled() : false; }
+static int  qb_vol(void)     { return (s_ops && s_ops->get_volume)   ? s_ops->get_volume()   : 0; }
+
+/* ===== 延迟动作执行 =====
+ * ⛔ 为什么动作不能就地执行 (2026-11-22):
+ *   全屏游戏里本服务的 tick 由 board_shim 的**视频刷新任务**驱动, 而那个任务的栈在
+ *   **PSRAM** (board_shim.c:90 `EXT_RAM_BSS_ATTR static StackType_t s_video_stack[16384]`,
+ *   64KB)。而这三个动作全都要落盘:
+ *     · Wi-Fi 开关 → wifi_manager_set_want_on() 写 NVS + esp_wifi_start()
+ *     · 蓝牙开关 → bt 控制器初始化读 NVS 配置
+ *     · 画面调节「保存」→ vid_tune_save() → store_flush() 写 NVS blob
+ *   flash 操作期间 cache 关闭, 此时访问 PSRAM 栈立刻失效复位 ——
+ *   与 main.c:200 记录的 gps_guard / os_app 两次同类事故是同一个机理。
+ *   ⇒ 动作一律投递给**内部 RAM 小栈**的执行任务, 调用方只投递、不落盘。
+ *   附带收益: 点一下 Wi-Fi 那 1~3 秒不再堵死视频任务, 游戏画面不再卡住
+ *   (原来锁外执行虽然不占帧锁, 但视频任务本身被阻塞, 期间一帧都刷不出去)。 */
+enum { QB_ACT_BT = 1, QB_ACT_WIFI, QB_ACT_TUNE_SAVE };
+/* 执行任务栈: 5KB, 内部 RAM (里面要跑 NVS 写 / esp_wifi_start, 不能省) */
+#define QB_ACT_STK_BYTES 5120
+static QueueHandle_t s_act_q;
+/* ⛔ 执行任务的 TCB 与栈必须落在**内置 RAM**, 不能写成函数内 static (2026-11-22 实测):
+ *   components/system/os/linker.lf 把整个 libos.a 的 .bss 收进了 .ext_ram.bss,
+ *   于是 `static StaticTask_t tcb;` 也跟着进了 PSRAM ⇒ 开机建任务直接
+ *     assert failed: xTaskCreateStaticPinnedToCore (xPortCheckValidTCBMem(pxTaskBuffer))
+ *   无限重启。栈同样必须内部: 本任务要写 NVS, flash 期间 cache 关闭, PSRAM 栈必炸。
+ *   ⇒ 一份 heap_caps_malloc(MALLOC_CAP_INTERNAL) 出来, 指针存 .bss 就无所谓了。 */
+static StaticTask_t *s_act_tcb;
+static StackType_t  *s_act_stk;
+/* 同一类动作一次只允许一个在飞: 连点不会排成一串"开→关→开" */
+static volatile bool s_wifi_busy, s_bt_busy;
+
+static void qb_act_run(int act);   /* 前向: 任务体与兜底路径共用 */
+
+static void qb_act_task(void *arg)
+{
+    (void)arg;
+    uint8_t act;
+    /* 防御: 句柄没挂上就退出, 绝不让 NULL 进 xQueueReceive */
+    if (!s_act_q) { vTaskDelete(NULL); return; }
+    for (;;) {
+        if (xQueueReceive(s_act_q, &act, portMAX_DELAY) != pdTRUE) continue;
+        qb_act_run((int)act);
+    }
+}
+
+/* 就地执行一条动作 —— 只在没有可用执行任务时兜底, 或由执行任务调用 */
+static void qb_act_run(int act)
+{
+    switch (act) {
+    case QB_ACT_BT:
+        if (s_ops && s_ops->set_bt_enabled) s_ops->set_bt_enabled(!qb_bt_on());
+        s_bt_busy = false;
+        break;
+    case QB_ACT_WIFI:
+        if (!s_ops || !s_ops->set_wifi_enabled) {
+            ESP_LOGW(TAG, "Wi-Fi 不可操作 (未注入 set_wifi_enabled)");
+        } else {
+            bool want = !qb_wifi_on();
+            if (!s_ops->set_wifi_enabled(want))
+                ESP_LOGW(TAG, "Wi-Fi %s 失败 — 按钮状态保持真实值", want ? "开启" : "关闭");
+        }
+        s_wifi_busy = false;
+        break;
+    case QB_ACT_TUNE_SAVE:
+        vid_tune_save();
+        break;
+    default:
+        break;
+    }
+}
+
+/* 建队列 + 执行任务。开机在 os_init(内部 RAM 栈) 调一次, 之后 qb_post 只投递。 */
+static void qb_act_init(void)
+{
+    if (s_act_q) return;
+    QueueHandle_t q = xQueueCreate(8, sizeof(uint8_t));
+    if (!q) return;
+
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    s_act_tcb = heap_caps_malloc(sizeof(StaticTask_t), caps);
+    s_act_stk = heap_caps_malloc(QB_ACT_STK_BYTES, caps);
+    if (!s_act_tcb || !s_act_stk) {
+        if (s_act_tcb) { heap_caps_free(s_act_tcb); s_act_tcb = NULL; }
+        if (s_act_stk) { heap_caps_free(s_act_stk); s_act_stk = NULL; }
+        vQueueDelete(q);
+        ESP_LOGE(TAG, "执行任务内存不足(内部RAM) ⇒ 动作退回就地执行");
+        return;
+    }
+    ESP_LOGI(TAG, "延迟动作任务: tcb=%p stack=%p (均为内置 RAM)", (void *)s_act_tcb, (void *)s_act_stk);
+    /* ⛔ 必须先挂上队列句柄再建任务: 新任务优先级 4 > main_task 1, 建完立刻就会跑,
+     *    任务体第一步就是 xQueueReceive(s_act_q) —— 句柄还是 NULL 就是
+     *    assert failed: xQueueReceive queue.c:1531 (( pxQueue )) 无限重启。 */
+    s_act_q = q;
+    if (!xTaskCreateStaticPinnedToCore(qb_act_task, "qb_act",
+                                       QB_ACT_STK_BYTES / sizeof(StackType_t), NULL, 4,
+                                       s_act_stk, s_act_tcb, 0)) {
+        s_act_q = NULL;
+        heap_caps_free(s_act_tcb); s_act_tcb = NULL;
+        heap_caps_free(s_act_stk); s_act_stk = NULL;
+        vQueueDelete(q);
+        ESP_LOGE(TAG, "执行任务创建失败 ⇒ 动作退回就地执行");
+        return;
+    }
+}
+
+/* 投递一个动作 (调用方上下文任意: 主循环任务 / 视频任务 / 引擎帧循环) */
+static void qb_post(int act)
+{
+    if (!s_act_q) {
+        qb_act_init();
+        if (!s_act_q) {   /* 建不出来就就地执行, 至少功能不丢 */
+            qb_act_run(act);
+            return;
+        }
+    }
+    uint8_t a = (uint8_t)act;
+    if (xQueueSend(s_act_q, &a, 0) != pdTRUE) {
+        /* ★ 队列异常满(正常不会: busy 标志已挡住同类连点) 时**就地执行**,
+         *   不能只打日志丢掉 —— 调用方已经把 s_wifi_busy / s_bt_busy 置了 true,
+         *   动作被丢就没人把它清回 false, 那一颗按钮从此点不动。 */
+        ESP_LOGW(TAG, "动作队列满, 就地执行 act=%d", act);
+        qb_act_run(act);
+    }
+}
+
+/* ===== 绘制 =====
+ * 蓝牙 / Wi-Fi: **不要方框**, 直接用状态栏图标**整体放大一倍** (16→32px)。
+ *   开 = 黑色图标; 关 = 图标 + 3px 斜杠。 */
+/* 禁用态虚线框: 沿边框 3 像素实 / 3 像素空.
+ * 关闭的蓝牙 / Wi-Fi 用它表示"当前禁用", 比原来的斜杠更直观,
+ * 也不遮住图标本身 (斜杠会压在人字形中间, 小屏上容易糊成一团). */
+
+/* 关闭态标记: **斜虚线** (3 像素实 / 3 像素空, 2px 粗), 压在图标上表示已关闭.
+ * 用虚线而不是实线: 小屏 32px 图标上一条实斜杠太重, 会把图标本身的形状吃掉;
+ * 断开之后既能看出"被划掉", 又能看清底下的蓝牙/Wi-Fi 图形。 */
+static void qb_icon_slash_dashed(st7305_handle_t *lcd, int cx, int cy, int r)
+{
+    /* 点状斜线: 沿对角线每隔 4 步画一个 2x2 点.
+     * 之前是 3px 实/3px 空, 连起来看还是一条粗斜杠; 改成独立小点后
+     * 才真正是"一点一点", 既压住图标表示关闭, 又不盖掉形状. */
+    for (int i = -r; i <= r; i++) {
+        if (((i + r) % 4) != 0) continue;
+        st7305_draw_pixel(lcd, cx + i,     cy + i,     ST7305_COLOR_BLACK);
+        st7305_draw_pixel(lcd, cx + i + 1, cy + i,     ST7305_COLOR_BLACK);
+        st7305_draw_pixel(lcd, cx + i,     cy + i + 1, ST7305_COLOR_BLACK);
+        st7305_draw_pixel(lcd, cx + i + 1, cy + i + 1, ST7305_COLOR_BLACK);
+    }
+}
+
+static void qb_draw_button(st7305_handle_t *lcd, int x, bool on, bool usable, int icon)
+{
+    int cx = x + QB_BTN_D / 2;
+    int cy = QB_BTN_Y0 + QB_BTN_D / 2;
+    bool active = on && usable;
+    /* 关闭态: 图标只表示"这是蓝牙/Wi-Fi", 用虚线框统一表示不可用 */
+    if (!active) qb_icon_slash_dashed(lcd, cx, cy, 11);   /* 关闭: 斜虚线 */
+    if (icon == 0) qb_icon_bt_big(lcd, cx, cy, active);
+    else           qb_icon_wifi_big(lcd, cx, cy, active);
+}
+
+/* 画面优化器图标 (28×28): 白底黑框 + 三根滑条, 与 vid_tune 浮标同款 */
+static void qb_icon_opt(st7305_handle_t *lcd, int x, int y)
+{
+    fill_rect(lcd, x, y, x + QB_OPT_SZ - 1, y + QB_OPT_SZ - 1, ST7305_COLOR_WHITE);
+    draw_rect_outline(lcd, x, y, x + QB_OPT_SZ - 1, y + QB_OPT_SZ - 1, ST7305_COLOR_BLACK);
+    for (int k = 0; k < 3; k++) {
+        int cx = x + 6 + k * 8;
+        fill_rect(lcd, cx, y + 6, cx + 1, y + QB_OPT_SZ - 7, ST7305_COLOR_BLACK);
+        fill_rect(lcd, cx - 2, y + 8 + k * 6, cx + 3, y + 11 + k * 6, ST7305_COLOR_BLACK);
+    }
+}
+
+/* 横向音量条 —— 完全复用 MP3 播放器那一条的样式与尺寸:
+ *   滑轨 = 外白圈(hw+3) → 黑轮廓(hw) → 白芯(hw-1) 三层;
+ *   滑块 = 黑芯(r) + 3px 白圈;  无"已选段填充"。
+ *   横向化: 中间矩形 + 两端半圆拼成胶囊 (与竖版的 capsule 等价)。 */
+static void qb_draw_volume(st7305_handle_t *lcd)
+{
+    const qb_lay_t *L = qb_lay();
+    int vol = qb_vol();
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+
+    const int cy = QB_BAR_CY;
+
+    /* 音量图标 (32×32, 垂直居中于 40px 抽屉: 4..35) */
+    qb_icon_spk(lcd, L->spk_x, cy - 16, ST7305_COLOR_BLACK);
+
+    /* ① 外白圈 (比黑轮廓外扩 3px): 矩形主体 + 两端圆 */
+    fill_rect(lcd, L->bar_x0, cy - QB_BAR_HW - 3, L->bar_x1, cy + QB_BAR_HW + 3, ST7305_COLOR_WHITE);
+    qb_disc(lcd, L->bar_x0, cy, QB_BAR_HW + 3, ST7305_COLOR_WHITE);
+    qb_disc(lcd, L->bar_x1, cy, QB_BAR_HW + 3, ST7305_COLOR_WHITE);
+
+    /* ② 黑轮廓 */
+    fill_rect(lcd, L->bar_x0, cy - QB_BAR_HW, L->bar_x1, cy + QB_BAR_HW, ST7305_COLOR_BLACK);
+    qb_disc(lcd, L->bar_x0, cy, QB_BAR_HW, ST7305_COLOR_BLACK);
+    qb_disc(lcd, L->bar_x1, cy, QB_BAR_HW, ST7305_COLOR_BLACK);
+
+    /* ③ 白芯 (比黑轮廓内缩 1px) */
+    fill_rect(lcd, L->bar_x0, cy - QB_BAR_HW + 1, L->bar_x1, cy + QB_BAR_HW - 1, ST7305_COLOR_WHITE);
+    qb_disc(lcd, L->bar_x0, cy, QB_BAR_HW - 1, ST7305_COLOR_WHITE);
+    qb_disc(lcd, L->bar_x1, cy, QB_BAR_HW - 1, ST7305_COLOR_WHITE);
+
+    /* ④ 圆球: 白圈 3px + 黑芯; 位置随音量在滑轨上移动 */
+    int cx = L->bar_x0 + ((L->bar_x1 - L->bar_x0) * vol) / 100;
+    qb_disc(lcd, cx, cy, QB_DOT_R + 3, ST7305_COLOR_WHITE);
+    qb_disc(lcd, cx, cy, QB_DOT_R, ST7305_COLOR_BLACK);
+}
+
+static void qb_render_impl(ui_ctx_t *ctx)
+{
+    if (!s_open || !ctx || !ctx->lcd) return;
+    st7305_handle_t *lcd = ctx->lcd;
+    const qb_lay_t *L = qb_lay();
+
+    /* ★ 面板: **顶部两角直角** (贴屏幕边, 不留 R 角) + 底部保留 R6 圆角。
+     *   做法: 外框 = 上部矩形 + 底部圆角块; 内部同形状填白, 整体内缩 1px 形成边框。 */
+    const bool opt_on = vid_tune_enabled() && L->opt_x >= 0;   /* 竖屏放不下优化器图标 */
+    const int  qbH   = s_expand ? QB_H_EXP : QB_H;   /* 展开态: 3 格高 */
+    {
+        const int x0 = L->panel_x0, x1 = opt_on ? L->panel_x1b : L->panel_x1;
+        const int y1 = qbH - 1, r = QB_PANEL_R;
+        fill_rect(lcd, x0, 0, x1, y1 - r, ST7305_COLOR_BLACK);
+        qb_fill_round_rect(lcd, x0, y1 - 2 * r, x1, y1, r, ST7305_COLOR_BLACK);
+        fill_rect(lcd, x0 + 1, 1, x1 - 1, y1 - r, ST7305_COLOR_WHITE);
+        qb_fill_round_rect(lcd, x0 + 1, y1 - 2 * r, x1 - 1, y1 - 1,
+                           (r > 1) ? r - 1 : 0, ST7305_COLOR_WHITE);
+    }
+
+    bool bt_ok   = (s_ops && s_ops->set_bt_enabled);
+    bool wifi_ok = (s_ops && s_ops->set_wifi_enabled);
+    qb_draw_button(lcd, L->bt_lx, qb_bt_on(),   bt_ok,   0);
+    qb_draw_button(lcd, L->wifi_rx, qb_wifi_on(), wifi_ok, 1);
+    if (opt_on) qb_icon_opt(lcd, L->opt_x, (QB_H - QB_OPT_SZ) / 2);   /* 垂直居中 */
+    qb_draw_volume(lcd);
+    if (s_expand) qb_draw_tune(lcd);   /* 展开态: 2×2 四条 + 保存/取消 */
+}
+
+/* 绘制包一层 trylock: 与 qb_tick 用的是同一把锁 —— 保证"正在处理触摸"时不会被
+ * 另一个任务插进来画半屏; 拿不到就跳过本帧 (下一帧还会画)。 */
+static void qb_render(ui_ctx_t *ctx)
+{
+    if (!qb_guard_take()) return;
+    qb_render_impl(ctx);
+    qb_guard_give();
+}
+
+/* ===== 操作 ===== */
+/* ★ 2026-10-30 音量改为**离散档位** (0..10 档, 每档 10%):
+ *   - 滑块位置吸附到最近档位, 松手后不会停在两档之间;
+ *   - **只有跨档才震动一次** (咔哒感), 同一档内反复滑动不重复震;
+ *   - 震动走 vibrator_tap_ui, 遵守"菜单震动"开关 —— 关了就完全不震 (不强制)。
+ *   - 松手不震: 本条只在档位真的变化时触发, 抬手路径不调它。 */
+#define QB_VOL_STEPS 10
+static int s_last_step = -1;      /* 本次拖动上一次的档位, -1 = 尚未定档 */
+
+static void qb_set_vol(ui_ctx_t *ctx, int x)
+{
+    const qb_lay_t *L = qb_lay();
+    int span = L->bar_x1 - L->bar_x0;
+    int raw = ((x - L->bar_x0) * 100) / (span > 0 ? span : 1);
+    if (raw < 0) raw = 0;
+    if (raw > 100) raw = 100;
+
+    /* 吸附到 0..QB_VOL_STEPS 的最近档, 再换算回百分比 (保持 set_volume 语义不变) */
+    int step = (raw * QB_VOL_STEPS + 50) / 100;
+    if (step < 0) step = 0;
+    if (step > QB_VOL_STEPS) step = QB_VOL_STEPS;
+    int v = step * 100 / QB_VOL_STEPS;
+
+    if (s_ops && s_ops->set_volume) s_ops->set_volume(v);
+
+    /* 跨档才咔哒一下; 同档内不重复 (快速划过也只按实际经过的档位各震一次) */
+    if (step != s_last_step) {
+        s_last_step = step;
+        vibrator_tap_ui(8, 60);      /* 8ms / 60%: 短促机械感, 遵守 UI 震动开关 */
+    }
+    if (ctx) ctx->needs_redraw = true;
+}
+
+static void qb_toggle_bt(ui_ctx_t *ctx)
+{
+    if (!s_ops || !s_ops->set_bt_enabled) {
+        ESP_LOGW(TAG, "蓝牙不可操作 (未注入 set_bt_enabled)");
+        return;
+    }
+    if (s_bt_busy) return;      /* 上一次还没执行完, 连点不再叠加 */
+    s_bt_busy = true;
+    qb_post(QB_ACT_BT);        /* 内部 RAM 栈执行: 见 qb_post 上方说明 */
+    if (ctx) ctx->needs_redraw = true;
+}
+
+static void qb_toggle_wifi(ui_ctx_t *ctx)
+{
+    if (!s_ops || !s_ops->set_wifi_enabled) {
+        ESP_LOGW(TAG, "Wi-Fi 不可操作 (未注入 set_wifi_enabled)");
+        return;
+    }
+    if (s_wifi_busy) return;
+    s_wifi_busy = true;
+    qb_post(QB_ACT_WIFI);      /* esp_wifi_start + NVS: 必须离开 PSRAM 栈 */
+    if (ctx) ctx->needs_redraw = true;
+}
+
+/* ===== 手势 (每帧轮询) =====
+ * 点击事件 (tap) 走 qb_touch; 持续拖动只能轮询 input_get_touch_pos,
+ * 与 os_pane / 各页面拖动的做法一致。 */
+/* ===== 画面调节展开态 (2026-10-30 linit 定稿) =====
+ *   快捷栏从 1 格(40) 下拉到 3 格(120):
+ *     左 = 保存, 右 = 取消, 中间 2×2 四条 (亮度/对比/白点/黑点),
+ *     每条 = 2 字标签 + 与音量条同款的横向胶囊滑轨 + 圆球。 */
+static const char *qb_tune_label(int i)
+{
+    static const char *L[4] = {
+        "\xe4\xba\xae\xe5\xba\xa6",   /* 亮度 */
+        "\xe5\xaf\xb9\xe6\xaf\x94",   /* 对比 */
+        "\xe7\x99\xbd\xe7\x82\xb9",   /* 白点 */
+        "\xe9\xbb\x91\xe7\x82\xb9",   /* 黑点 */
+    };
+    return L[i & 3];
+}
+static int qb_tune_bx(int i)   { return qb_lay()->tune_x0 + (i & 1) * qb_lay()->tune_cw; }
+static int qb_tune_rowy(int i) { return (i < 2) ? QB_TUNE_ROW0 : QB_TUNE_ROW1; }
+static int qb_tune_trk_x0(int i) { return qb_tune_bx(i) + 40; }
+static int qb_tune_trk_x1(int i) { return qb_tune_trk_x0(i) + qb_lay()->tune_trk_w; }
+
+static void qb_draw_tune(st7305_handle_t *lcd)
+{
+    const qb_lay_t *L = qb_lay();
+    for (int i = 0; i < 4; i++) {
+        int bx = qb_tune_bx(i), y = qb_tune_rowy(i);
+        int x0 = qb_tune_trk_x0(i), x1 = qb_tune_trk_x1(i);
+        int cy = y + 6;
+
+        draw_text(lcd, bx, y, qb_tune_label(i), false);   /* 2 字标签 */
+
+        /* 滑轨: 与音量条同款三层胶囊 (外白圈 → 黑轮廓 → 白芯) */
+        fill_rect(lcd, x0, cy - QB_BAR_HW - 2, x1, cy + QB_BAR_HW + 2, ST7305_COLOR_WHITE);
+        qb_disc(lcd, x0, cy, QB_BAR_HW + 2, ST7305_COLOR_WHITE);
+        qb_disc(lcd, x1, cy, QB_BAR_HW + 2, ST7305_COLOR_WHITE);
+        fill_rect(lcd, x0, cy - QB_BAR_HW, x1, cy + QB_BAR_HW, ST7305_COLOR_BLACK);
+        qb_disc(lcd, x0, cy, QB_BAR_HW, ST7305_COLOR_BLACK);
+        qb_disc(lcd, x1, cy, QB_BAR_HW, ST7305_COLOR_BLACK);
+        fill_rect(lcd, x0, cy - QB_BAR_HW + 1, x1, cy + QB_BAR_HW - 1, ST7305_COLOR_WHITE);
+        qb_disc(lcd, x0, cy, QB_BAR_HW - 1, ST7305_COLOR_WHITE);
+        qb_disc(lcd, x1, cy, QB_BAR_HW - 1, ST7305_COLOR_WHITE);
+
+        /* 圆球 (黑芯 + 白圈), 位置 = 当前参数 */
+        int pct = vid_tune_get_pct(i);
+        int kx = x0 + (L->tune_trk_w * pct) / 100;
+        qb_disc(lcd, kx, cy, 7, ST7305_COLOR_WHITE);
+        qb_disc(lcd, kx, cy, 5, ST7305_COLOR_BLACK);
+    }
+
+    /* 左右按钮 */
+    draw_rect_outline(lcd, L->save_x, 62, L->save_x + 35, 98, ST7305_COLOR_BLACK);
+    draw_text(lcd, L->save_x + 2, 76, "\xe4\xbf\x9d\xe5\xad\x98", false);   /* 保存 */
+    draw_rect_outline(lcd, L->canc_x, 62, L->canc_x + 35, 98, ST7305_COLOR_BLACK);
+    draw_text(lcd, L->canc_x + 2, 76, "\xe5\x8f\x96\xe6\xb6\x88", false);   /* 取消 */
+}
+
+/* 展开态的触摸: 拖滑条 / 点保存 / 点取消。返回 true 表示已消费。 */
+static bool qb_tune_touch(ui_ctx_t *ctx, int x, int y)
+{
+    const qb_lay_t *L = qb_lay();
+    /* 按钮: y 62..98 */
+    if (y >= 58 && y <= 102) {
+        if (x >= L->save_x && x <= L->save_x + 35) {
+            qb_post(QB_ACT_TUNE_SAVE);   /* NVS 落盘: 不能在 PSRAM 栈上写 flash */
+            s_expand = false;
+            if (ctx) ctx->needs_redraw = true;
+            return true;
+        }
+        if (x >= L->canc_x && x <= L->canc_x + 35) {
+            vid_tune_restore();
+            s_expand = false;
+            if (ctx) ctx->needs_redraw = true;
+            return true;
+        }
+    }
+    /* 滑条命中 (上下各放宽 12px 便于手指) */
+    for (int i = 0; i < 4; i++) {
+        int x0 = qb_tune_trk_x0(i), x1 = qb_tune_trk_x1(i);
+        int y0 = qb_tune_rowy(i);
+        if (y >= y0 - 10 && y <= y0 + 22 && x >= x0 - 8 && x <= x1 + 8) {
+            int pct = (x - x0) * 100 / L->tune_trk_w;
+            vid_tune_set_pct(i, pct);
+            s_drag_param = i;
+            return true;
+        }
+    }
+    return true;   /* 展开区其它位置也吃掉, 不落到游戏 */
+}
+
+static bool qb_touch(ui_ctx_t *ctx, int x, int y);   /* 前向: 游戏内点击复用同一套判定 */
+static void qb_tick_impl(ui_ctx_t *ctx)
+{
+    /* ★ 2026-10-29 linit: 屏保/睡眠/动态壁纸状态下不响应下拉。
+     *   此时既不该弹出抽屉, 也不该保持展开 (退出时顺带归还触摸控制权)。 */
+    if (os_screensaver_active()) {
+        if (s_open) {
+            s_open = false;
+            input_set_overlay_lock(false);
+        }
+        s_gesture = false;
+        s_from_hs = false;
+        s_vol_track = false;
+        return;
+    }
+
+    int tx = 0, ty = 0;
+    /* ★★★ 2026-10-31: 引擎阻塞主循环时没人采样触摸, 快照会停在旧值。
+     *   过期就自己补采一次 (幂等, 只更新"按住/坐标", 不碰手势状态机)。 */
+    if (input_touch_age_ms() > 50) input_touch_resample();
+    /* 用 _raw 读: 本服务自己必须能看到触摸, 即使已经置了独占锁 */
+    bool down = input_get_touch_pos_raw(&tx, &ty);
+
+    if (!down) {
+        /* 抬起: 若这次不是"下拉打开"而是"点了一下", 就按按钮处理。
+         * 游戏内没有 os_handle_touch, 这是唯一的点击通路。 */
+        /* ⚠ 2026-10-30 修"松手弹回": 必须排除 s_vol_track ——
+         * 拖动过音量条时不能把这个手势再当"点击", 否则会用**按下位置**重设音量,
+         * 把刚拖到的档位覆盖掉 (这正是弹回的真正原因)。 */
+        /* ★ 2026-10-31: 不再限制 `s_tap_y < QB_H`。
+         *   原来只有"点在面板内"才走 qb_touch ⇒ **游戏里点面板外根本收不起来**
+         *   (游戏没有 os 触摸分发, 抬手判定是唯一通路)。现在任意位置的点击都交给
+         *   qb_touch 判: 面板内→按钮/滑条, 面板外(缓冲带之外)→收起。 */
+        if (s_open && s_tap_valid && !s_swallowed && !s_vol_track)
+            qb_touch(ctx, s_tap_x, s_tap_y);
+        /* 本次手势结束, 允许下一次按下重新处理 (放在抬手侧复位,
+         * 才能保证"按下即生效", 而不是从第二次起变成松手才响应) */
+        s_press_done = false;
+        s_tap_valid = false;
+        s_gesture = false;
+        s_from_hs = false;
+        s_vol_track = false;
+        s_swallowed = false;      /* 抬手: 本次手势彻底结束, 下次按下可正常调音量 */
+        s_last_step = -1;         /* 下次拖动第一档也应有咔哒反馈 */
+        s_start_y = -1;
+        /* 手指抬起: 抽屉还开着就继续独占(免得点穿到下层); 已收起则**在这里**归还触摸。
+         * ★ 2026-10-31: 归还时顺手把虚拟手柄的按下态清掉 —— 覆盖层独占期间引擎读不到
+         *   触点, 它内部还留着"上一帧按着"的快照, 不清就是"退出后角色自己走"。 */
+        if (s_open) {
+            input_set_overlay_lock(true);
+        } else {
+            input_set_overlay_lock(false);
+            input_touch_release_all();
+        }
+        return;
+    }
+
+    if (!s_gesture) {
+        const qb_lay_t *L = qb_lay();
+        s_gesture = true;
+        s_start_y = ty;
+        s_vol_track = false;
+        s_tap_valid = true;          /* 记录本次按下的落点, 供抬起时判点击 */
+        s_tap_x = tx;
+        s_tap_y = ty;
+        /* 只在收起时认顶部起手区 (x 范围随横/竖屏布局) */
+        s_from_hs = (!s_open && tx >= L->hs_x0 && tx <= L->hs_x1 && ty <= QB_HS_Y1);
+        /* ★ 关键: 从起手区按下、或抽屉已展开 → 立刻独占触摸,
+         *   使下方主菜单/列表的 poll 拿不到手指, 下拉时不会跟着滚动。 */
+        if (s_from_hs || s_open) input_set_overlay_lock(true);
+        /* 已展开且按在音量区: 直接进入跟手调音量。
+         * ⚠ s_swallowed 必须判: 刚用这次触摸把抽屉拉下来时, 不许顺手改音量。 */
+        if (s_open && !s_swallowed && ty < QB_H &&
+            tx >= L->vol_x0 && tx <= L->vol_x1) {
+            s_vol_track = true;
+            qb_set_vol(ctx, tx);
+        }
+        return;
+    }
+
+    if (s_vol_track) {
+        qb_set_vol(ctx, tx);
+        return;
+    }
+
+    int dy = ty - s_start_y;
+    if (!s_open) {
+        if (s_from_hs && dy >= QB_TH) {
+            s_open = true;
+            s_gesture = false;          /* 一次手势只做一件事 */
+            s_swallowed = true;         /* ★ 本次触摸只用于打开, 不触发音量 */
+            if (ctx) ctx->needs_redraw = true;
+            ESP_LOGI(TAG, "展开 (dy=%d)", dy);
+        }
+    } else if (dy <= -QB_TH && !s_from_hs) {
+        /* ★ 2026-10-31 (linit): 起点在**面板内**(点蓝牙/Wi-Fi/音量)时, 必须明显上滑
+         *   才收起。原来这里一律用 QB_TH(12), 点按时手指往上带一点就被判成"上滑收起"
+         *   —— 按钮没响应、面板却关了, 正是用户说的"点的时候经常变成关闭"。
+         *   起点在面板外(下方空白)时仍然按 QB_TH, 手势保持干脆。 */
+        int need = (s_tap_y <= QB_H) ? QB_CLOSE_TH_IN : QB_TH;
+        if (dy <= -need) {
+            s_open = false;
+            s_gesture = false;
+            if (ctx) ctx->needs_redraw = true;
+            ESP_LOGI(TAG, "收起 (dy=%d 阈值=%d 起点y=%d)", dy, need, s_tap_y);
+        }
+    }
+}
+
+/* tick 包一层 trylock (与 qb_render 共用): 主循环与游戏刷新任务同时驱动时,
+ * 只让一个进来, 另一个跳过本帧。绝不阻塞。 */
+static void qb_tick(ui_ctx_t *ctx)
+{
+    if (!qb_guard_take()) return;
+    qb_tick_impl(ctx);
+    qb_guard_give();
+}
+
+/* ===== 触摸 (tap) ===== */
+/* QB_HIT_PAD / QB_CLOSE_TH_IN 已挪到上方常量区(手势状态机也要用) */
+
+static bool qb_touch(ui_ctx_t *ctx, int x, int y)
+{
+    /* 展开态: 先判"点外面 → 收起", 再交给调节区 (滑条/保存/取消) */
+    if (s_open && s_expand) {
+        if (y >= QB_H_EXP + QB_HIT_PAD) {
+            s_open = false;
+            s_expand = false;
+            s_drag_param = -1;
+            if (ctx) ctx->needs_redraw = true;
+            ESP_LOGI(TAG, "收起 (点外部, 展开态 y=%d)", y);
+            return true;
+        }
+        return qb_tune_touch(ctx, x, y);
+    }
+    if (!s_open) {
+        /* 收起时只占住起手区: 消费掉, 避免下层把它当点击 (下拉由 tick 完成) */
+        const qb_lay_t *L = qb_lay();
+        return (y <= QB_HS_Y1 && x >= L->hs_x0 && x <= L->hs_x1);
+    }
+
+    /* 抽屉内: 一次按下只认一次动作.
+     * 普通页面里 qb_touch 会被调两次 —— os 的触摸回调(按下) + qb_tick 的抬手判定
+     * (为游戏内没有 os 触摸分发而留的通路)。两次都执行 toggle 就等于没按,
+     * 现象正是"按一下立刻恢复原状"。 */
+    if (s_press_done) return true;
+    s_press_done = true;
+
+    /* 面板外(含缓冲带之外): 关闭并吃掉这一次点击, 防止误触下方页面/游戏 */
+    if (y >= QB_H + QB_HIT_PAD) {
+        s_open = false;
+        s_expand = false;
+        /* ★ 2026-10-31: 这里**不立刻**解锁 —— 手指还按在屏上(就在刚刚点的那一下).
+         *   立刻 unlock 会让这一下点击穿透到游戏(角色跳/开枪)。
+         *   所有权统一在 qb_tick 的抬手分支归还 (见那里 input_set_overlay_lock(false))。 */
+        if (ctx) ctx->needs_redraw = true;
+        ESP_LOGI(TAG, "收起 (点外部 y=%d)", y);
+        return true;
+    }
+
+    /* ★★★ 2026-11-07 linit「栏外点击不该生效」★★★
+     *   原来这里只有一句 `if (y >= QB_H + QB_HIT_PAD) 收起`, 之后蓝牙/Wi-Fi/音量
+     *   **只判 x 不判 y** —— 抽屉实际只有 QB_H=40px 高, 但 y<100 全被当成"面板内",
+     *   于是在栏外下方(40~99px)点一下, 蓝牙/Wi-Fi 会被切换、音量会被改。
+     *   用户实测就是"快捷栏外面点过之后还会生效"。
+     *   现在动作类控件只认**实际绘制范围内**(y < QB_H)外加 4px 手指容差;
+     *   栏外仍按原逻辑吞掉这一次点击并收起, 但**不下发任何动作**。 */
+    const bool in_bar = (y < QB_H + QB_TOUCH_TOL_Y);
+    const qb_lay_t *L = qb_lay();
+
+    if (in_bar && x >= L->bt_lx   && x < L->bt_lx   + QB_BTN_D) { qb_toggle_bt(ctx);   return true; }
+    if (in_bar && x >= L->wifi_rx && x < L->wifi_rx + QB_BTN_D) { qb_toggle_wifi(ctx); return true; }
+    if (in_bar && vid_tune_enabled() && L->opt_x >= 0 &&
+        x >= L->opt_x && x < L->opt_x + QB_OPT_SZ && y < QB_H) {
+        /* 画面优化器: 快捷栏**就地向下展开到 3 格**, 显示 2×2 调节条。
+         * 竖屏 300 宽放不下这个图标 (opt_x<0) ⇒ 不显示、不命中。 */
+        vid_tune_begin_edit();     /* 备份当前值, 供"取消"还原 */
+        s_expand = true;
+        if (ctx) ctx->needs_redraw = true;
+        return true;
+    }
+    if (in_bar && x >= L->vol_x0 && x <= L->vol_x1) { qb_set_vol(ctx, x);  return true; }
+
+    return true;   /* 抽屉内的空白也算本服务消费 */
+}
+
+/* ===== 服务注册 ===== */
+static const os_service_t s_svc_quickbar = {
+    .name        = "quickbar",
+    .tick        = qb_tick,
+    .render      = qb_render,
+    .touch       = qb_touch,
+    .overlay_top = true,     /* 全屏游戏/应用里也要能画、能收触摸 */
+};
+
+/* ★ 2026-10-29 修「游戏全屏下拉不出快捷栏」:
+ *   游戏引擎运行时**阻塞主循环** (eng_task_run_loop / gam4980_emu_run 自己 while),
+ *   os_tick 不执行 → 本服务的 tick/render 一次都不会被调到, 所以全屏游戏里拉不出来。
+ *   这个接口由引擎的**帧循环**直接调用 (与 vid_tune_overlay_tick / virtual_keys 同一层),
+ *   内部: 收手势 → 需要时把抽屉画在游戏帧上面。flush 仍由引擎负责。 */
+void os_quickbar_game_frame(st7305_handle_t *lcd)
+{
+    if (!lcd || !s_ops) return;
+    qb_tick(NULL);                        /* ctx=NULL: 内部已判空, 仅用于收手势 */
+    if (s_open || s_gesture) {
+        /* 游戏内没有 ui_ctx_t: 造一个只带 lcd 的临时上下文给渲染用
+         * (qb_render 只读 ctx->lcd, 其余字段写回无效但不影响)。 */
+        ui_ctx_t tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        tmp.lcd = lcd;
+        qb_render(&tmp);
+    }
+}
+
+/* ★★★ 2026-10-31: 分段入口 —— board_shim 的视频任务在**持有帧锁**时调 overlay,
+ *   而这里点一下 Wi-Fi 会走 esp_wifi_start()(1~3 秒), 锁被占住 ⇒ 模拟任务提交不了帧,
+ *   整个游戏冻住。所以把"收手势/执行动作"挪到锁外(tick), 锁内只画(draw)。 */
+void os_quickbar_game_tick(void)
+{
+    if (!s_ops) return;
+    qb_tick(NULL);
+}
+
+void os_quickbar_game_draw(st7305_handle_t *lcd)
+{
+    if (!lcd || !s_ops) return;
+    if (!(s_open || s_gesture)) return;
+    ui_ctx_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.lcd = lcd;
+    qb_render(&tmp);
+}
+
+/* void* 适配层: input 层的钩子用 void* 以避免依赖 st7305 类型 */
+static void qb_game_frame_void(void *lcd)
+{
+    os_quickbar_game_frame((st7305_handle_t *)lcd);
+}
+static void qb_game_tick_void(void)
+{
+    os_quickbar_game_tick();
+}
+static void qb_game_draw_void(void *lcd)
+{
+    os_quickbar_game_draw((st7305_handle_t *)lcd);
+}
+
+void os_svc_quickbar_register(void)
+{
+    qb_act_init();   /* 提前建好动作执行任务: 开机这里是内部 RAM 栈, 建任务最安全 */
+    os_register_service(&s_svc_quickbar);
+    /* 把实现注入给引擎层: 阻塞式引擎每帧调 engine_overlay_quickbar() 就能用 */
+    engine_overlay_set_quickbar(qb_game_frame_void);
+    engine_overlay_set_quickbar_split(qb_game_tick_void, qb_game_draw_void);
+}

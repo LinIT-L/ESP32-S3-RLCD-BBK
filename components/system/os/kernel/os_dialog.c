@@ -1,0 +1,1439 @@
+/**
+ * os_dialog.c — 通用弹窗 (modal 覆盖页) 内核模块 + 弹窗栈.
+ *
+ * 供所有页面复用统一弹窗: 列表选择 / 确认框 / 提示 toast.
+ * 以 OS_PAGE_DIALOG 压栈 (modal), 不退出底层页面; 关闭后自动恢复底层.
+ * 内部维护弹窗栈 (settings/list_dialog 嵌套): 开子弹窗压栈, 返回弹栈恢复父弹窗.
+ * 复杂弹窗 (时间编辑等) 通过 os_dlg_stack 的 on_render/on_key 自定义.
+ * 私有 state 全部 static 留本文件.
+ *
+ * 使用示例:
+ *   os_dialog_list(ctx, "键鼠布局", items, n, sel, on_sel, NULL);
+ *   os_dialog_confirm(ctx, "确定退出?", on_res, NULL);
+ *   os_dialog_toast(ctx, "已收藏");
+ *   os_dialog_push(ctx, &dlg);   [子弹窗 - 栈内嵌套]
+ *   os_dialog_pop(ctx);          [返回父弹窗]
+ */
+#include "os.h"
+#include "ui_common.h"
+#include "ui_scroll.h"   /* ★ 2026-10-25 弹窗列表滚动统一走模块 */
+#include "input.h"
+#include "vibrator.h"   /* ★ 2026-11-24: 档位滚轮自己的"调值一格"反馈 */
+#include "bt_manager.h"   /* os_confirm_exit_blocking: 手柄退出确认直读电平 */
+#include "esp_timer.h"
+#include "esp_attr.h"
+#include "esp_log.h"
+#include <stdio.h>
+#include <string.h>
+
+/* 行右侧删除"×"长按即时检测用到: 取手势按下起点 (显式声明, 复用 menu 的约定) */
+bool input_touch_start_pos(int *x, int *y);
+
+#define TAG "DLG"
+
+/* ★ 2026-11-22: 弹窗内所有"手动居中/算框宽"的地方都要按当前菜单字号缩放。
+ *   draw_text 的步进已改为跟随字号 (16px 档中文前进 16 而不是 24),
+ *   这里若继续用 24 基准的 text_width, 16px 档文字会整体偏左、框也会偏宽。
+ *   例外: 用 ui_text16* 绘制的那几处 (note / corner) 本身就是固定 16px,
+ *   仍然直接用 text_width, 不能跟着菜单字号变。 */
+static inline int dlg_tw(const char *s) { return text_width(s) * ui_menu_font_size() / 24; }
+
+#define DLG_MAX_DEPTH 4
+#define DLG_MAX_ITEMS 60   /* 支持数值选择等长列表 */
+#define DLG_ITEM_LEN  30
+
+/* 弹窗布局 — 严格复刻 3.3 版 list_dialog:
+ * 固定尺寸, 离屏幕上下左右各 25px → 350×250; 行高 40; 无标题;
+ * 列表: 2px 黑边框 / 选中行黑底白字 / 底部固定"返回"行+分隔线 / 右侧滚动条;
+ * 确认框: 3px 黑边框 / 标题(消息)在上 / 分隔线 / 确定·取消两行. */
+#define DLG_MARGIN  25
+#define DLG_LINE_H  40
+#define DLG_W       (ui_screen_w() - DLG_MARGIN * 2)   /* 350 (横屏) / 250 (竖屏 300 宽) */
+#define DLG_H       (ui_screen_h() - DLG_MARGIN * 2)   /* 250 (横屏) / 350 (竖屏 400 高) */
+
+static int dlg_content_count(const os_dlg_stack_t *d);   /* 前向声明 (dlg_geom 用) */
+
+/* 几何 (模板分离):
+ *  列表模板: 固定 350×250, 行高40, 底部固定返回行, 右侧滚动条
+ *  大确认模板: 350×250, 3px 边框, 标题+分隔线+按钮行 (关机/删除/格式化等)
+ *  小确认模板 (small): 更小 (3.2/更早版 退出确认样式):
+ *      消息居中在上, 最下方一行 左右两侧 = 确定/取消 并排 */
+static void dlg_geom(const os_dlg_stack_t *d, int *x, int *y, int *w, int *h) {
+    if (d->no_footer && d->small) {
+        int tw = dlg_tw(d->title);
+        if (d->icon) {
+            /* 图标确认窗 (仅图标, 无标题): 上留10 + 图标 + 间距12 + 按钮区40.
+             * h = 62 + 图标高; 宽默认 fix_w(见下), 否则随图标自适应.
+             * ★ 2026-11-08: note 非空时, 图标下多一行 16px 说明 ⇒ 高 +22, 宽按说明文字撑开. */
+            int ih = d->icon_h > 0 ? d->icon_h : 0;
+            int iw = d->icon_w > 0 ? d->icon_w : 0;
+            bool has_note = d->note[0] != 0;
+            *h = 62 + ih + (has_note ? 20 : 0);
+            *w = 140;
+            if (iw + 24 > *w) *w = iw + 24;   /* 图标左右各留 12px */
+            if (has_note) {
+                int nw = ui_text16_ready() ? ui_text16w(d->note) : text_width(d->note);
+                if (nw + 16 > *w) *w = nw + 16;   /* 说明左右各留 8px */
+            }
+        } else {
+            /* 固定小窗: 宽随标题文字自适应 (最小 140), 高 74.
+             * 标题/横杠/确定取消 之间全 5px 间距, 竖线与文字随宽度对称居中. */
+            *w = 140;
+            if (tw + 24 > *w) *w = tw + 24;   /* 左右各留 12px */
+            *h = 74;
+        }
+        if (*w > ui_screen_w() - 40) *w = ui_screen_w() - 40;   /* 极限: 屏宽-40 */
+        /* fix_w>0: 强制统一宽度 (确认框→图标窗原位变形保持同框同宽) */
+        if (d->fix_w > 0) *w = d->fix_w;
+        /* ★ 2026-11-08: 同宽约束不能把 note 挤出去 —— 说明文字优先保证完整可见 */
+        if (d->icon && d->note[0]) {
+            int nw = ui_text16_ready() ? ui_text16w(d->note) : text_width(d->note);
+            if (*w < nw + 16) *w = nw + 16;
+        }
+        if (*w > ui_screen_w() - 40) *w = ui_screen_w() - 40;
+    } else {
+        *w = DLG_W;
+        *h = DLG_H;
+        /* 列表自适应高度版: 内容行少自动收窄(保留右下返回行), 多则保持满高滚动 */
+        if (d->auto_h && !d->no_footer) {
+            const int inner = 4;
+            int c = dlg_content_count(d);
+            int avail = DLG_H - inner * 2 - DLG_LINE_H;      /* 除底部返回行外的可视高度 */
+            if (c > 0) {
+                int need = c * DLG_LINE_H;
+                if (need <= avail) *h = inner * 2 + DLG_LINE_H + need;
+                /* need>avail → 保持满高, 走滚动 */
+            }
+        }
+    }
+    *x = (ui_screen_w() - *w) / 2;
+    *y = (ui_screen_h() - *h) / 2;
+}
+
+/* 统一布局计算 (渲染/触摸/滚动共用, 保证三者几何完全一致).
+ * 确认框: 标题(消息) 在 y+14, 分隔线 y+38, 按钮行区从 y+44 起垂直居中;
+ * 列表  : 内容区 y+4 .. 返回分隔线上方 垂直居中, 底部固定"返回"行. */
+/* ★★ 弹窗正在拖动/回弹?
+ *   dlg_render 用它走"只重画内容区"的快速路径（边框/标题/底栏沿用上一帧），
+ *   解决"目录列表上下滑动非常卡"。 */
+static bool  s_scroll_busy = false;
+/* ★★★ 2026-10-25 linit: 弹窗列表滚动改用统一 ui_scroll 模块。
+ *   原来这里是全项目**最后一份**自写滚动 (s_fling×0.86 + 手写子像素回弹),
+ *   硬件管理 / 系统信息 / 网络列表 / 文件浏览 等**所有弹窗列表**都吃它。
+ *   现在 sel / scroll_px 退化为"渲染镜像" —— 渲染代码一行未改:
+ *       内容偏移 off = sel*DLG_LINE_H - scroll_px
+ *   反向同步靠下面两个 shadow 值检测"外部改了 sel"(按键 UP/DOWN、页内逻辑)。 */
+static ui_scroll_t s_dlg_sc;
+static bool s_dlg_sc_rdy = false;
+static int  s_dlg_sc_cnt = -1;    /* 已建控制器时的条目数 */
+static int  s_dlg_sc_vh  = -1;    /* 已建控制器时的可视高 */
+static int  s_dlg_shadow_sel = -1, s_dlg_shadow_px = 0;
+
+static int s_top_fwd(void);       /* 前向: 判断弹窗是否还开着 */
+
+/* ★★ 2026-10-24 修 "状态栏消失":
+ *   s_scroll_busy 原来只在 dlg_poll 里更新, 而 dlg_poll **只在弹窗是当前模块时**才跑。
+ *   一旦弹窗在"正在拖动/回弹(scroll_px!=0)"时被关掉(超时/选中/BACK/换页), 这个标志就
+ *   永久停在 true ⇒ os_core 从此每帧都跳过状态栏 ⇒ 顶部信息条再也不出现, 主循环还会
+ *   一直按 8ms 跑(费电)。这里给一个显式的复位入口, 关窗时无条件清干净。 */
+static void dlg_scroll_state_reset(void)
+{
+    s_scroll_busy = false;
+    ui_scroll_cancel(&s_dlg_sc);     /* 清 pressed/dragging/fling/anchor */
+    s_dlg_sc_cnt = -1;
+    s_dlg_sc_vh  = -1;
+    s_dlg_shadow_sel = -1;
+    s_dlg_shadow_px  = 0;
+}
+
+bool os_dialog_scrolling(void)
+{
+    /* 没有弹窗时"正在滚动"必然不成立 —— 兜底, 防止任何路径漏复位 */
+    return s_scroll_busy && s_top_fwd() >= 0;
+}
+
+typedef struct {
+    int x, y, w, h;
+    int footer_y;        /* 底部"返回"行顶 (无则 -1) */
+    int content_y0;      /* 内容区首行顶 y */
+    int clip_top;        /* 内容区可视上缘 (含滚动偏移) */
+    int clip_bottom;     /* 内容区可视下缘 (含滚动偏移) */
+    int visible;         /* 可见行数 */
+    int scroll;          /* 当前滚动偏移 (选中窗口首行) */
+    int px;              /* 跟手子像素偏移 (内容相对选中窗口平移, [-DLG_LINE_H, DLG_LINE_H)) */
+    int content_count;   /* 内容项数 (不含返回行) */
+} dlg_layout_t;
+
+static void dlg_layout(const os_dlg_stack_t *d, dlg_layout_t *L) {
+    const int inner_pad = 4;
+    dlg_geom(d, &L->x, &L->y, &L->w, &L->h);
+    L->content_count = dlg_content_count(d);
+    bool has_footer = !d->no_footer && d->count > 0;
+    L->footer_y = has_footer ? (L->y + L->h - inner_pad - DLG_LINE_H) : -1;
+    int top, bottom;
+    if (d->no_footer) {
+        top    = L->y + 40;                       /* 消息 y+4..38 + 分隔线 y+38 之下 */
+        bottom = L->y + L->h - 4;
+    } else {
+        top    = L->y + 4;
+        bottom = has_footer ? (L->footer_y - 2) : (L->y + L->h - 4);
+        /* ★ 2026-11-08: 有右下角小字时, 内容区底部让出 18px 给它 ——
+         *   否则滚动时 fill_rect 会把那行擦掉, 而且会和最后一行文字压在一起。 */
+        if (d->corner[0] && has_footer) bottom -= 18;
+    }
+    int area_h = bottom - top;
+    int total_h = L->content_count * DLG_LINE_H;
+    int top_pad = (area_h - total_h) / 2;
+    if (top_pad < 0) top_pad = 0;
+    L->content_y0 = top + top_pad;
+    L->clip_top = top;
+    L->clip_bottom = bottom;
+    L->visible = area_h / DLG_LINE_H;
+    if (L->visible < 1) L->visible = 1;
+    L->scroll = 0;
+    if (d->sel >= L->visible && d->sel < L->content_count)
+        L->scroll = d->sel - L->visible + 1;
+    /* ★★★ 2026-11-20: 拖动产生的滚动位置必须独立保存。
+     *   原来只靠上面一行从 sel 反推 —— 而拖动时镜像代码把 sel 写成"可视首行"(如 2),
+     *   下一帧反推成 0 ⇒ **拖着拖着自己弹回顶部**, 永远停不到底
+     *   (硬件管理 8 行刚超一屏, 用户最先在这里发现)。
+     *   规则: 只有 sel 仍落在拖动窗口内才采用 scroll_row; 按键把 sel 移出窗口时
+     *   自动回落到 sel 推导值(UP 能回顶), 未拖动过时 scroll_row=0 完全走原逻辑。 */
+    {
+        int maxs = L->content_count - L->visible;
+        if (maxs < 0) maxs = 0;
+        if (d->scroll_row > 0 && d->sel >= d->scroll_row &&
+            d->sel < d->scroll_row + L->visible) {
+            L->scroll = d->scroll_row;
+        }
+        if (L->scroll > maxs) L->scroll = maxs;
+        if (L->scroll < 0) L->scroll = 0;
+    }
+    /* 跟手子像素偏移: 只对可滚动列表生效 */
+    L->px = d->scroll_px;
+    if (L->content_count <= L->visible) L->px = 0;
+    /* ★★★ 2026-10-16 改(linit): 去掉"边界硬归零" ⇒ 到顶/到底仍可继续拉(留给回弹), 
+     *   并把可视位移放宽到 1.5 行, 手感连续; 松手后由拖动层衰减回弹归零。 */
+    int pxmax = DLG_LINE_H + DLG_LINE_H / 2;
+    if (L->px < -pxmax) L->px = -pxmax;
+    if (L->px >  pxmax) L->px =  pxmax;
+}
+
+/* 当前弹窗可视行数 (拖动跟手判定: 内容超一屏才滚动) */
+static int dlg_visible_rows(const os_dlg_stack_t *d) {
+    dlg_layout_t L;
+    dlg_layout(d, &L);
+    return L.visible;
+}
+
+/* 弹窗栈 (每层一份完整状态, 弹栈时恢复父层). 放 PSRAM, 不占内部 SRAM. */
+EXT_RAM_BSS_ATTR static os_dlg_stack_t s_stack[DLG_MAX_DEPTH];
+static int s_top = -1;
+/* 最后一次"弹窗真正关掉"的时刻(us)。只有 Lua 桥读(触摸屏蔽窗口), 见 os_dialog_pop。 */
+static int64_t s_last_close_us = 0;
+static int s_top_fwd(void) { return s_top; }
+
+/* ★★★ 2026-11-01 「关弹窗把关掉整页」根因修复:
+ *   `os_push()` **不去重** —— 每调一次都往 s_back_stack 压一个父页。
+ *   而弹窗页(OS_PAGE_DIALOG)有 3 条关闭路径(os_dialog_pop / toast_tick / toast_dismiss)，
+ *   只要"开的次数"多于"关的次数"，就会残留一个**空白弹窗页**：
+ *   用户按返回关它时，被弹掉的就是下层真页面(应用中心 → 直接回主菜单)。
+ *   实测对应现象：Wi-Fi 连上后应用中心被弹回主菜单，再进商店又弹一次联网确认
+ *   (p_am_exit 复位了会话标志)。
+ *   这里用一个权威标志 + 实时页面类型双重判断，保证"页最多开一次、关一次"。 */
+static bool s_dlg_page_open = false;
+
+/* 弹窗页此刻是否真的在页面栈顶(以实际页面为准, 不信单一标志) */
+static bool dlg_page_live(const ui_ctx_t *ctx) {
+    return s_dlg_page_open || (ctx && ctx->current_page == OS_PAGE_DIALOG);
+}
+
+/* toast (不占弹窗栈: 瞬时提示) */
+static char     s_toast_msg[72];   /* 72B=24 个汉字(UTF-8 3B/字), 避免长中文提示被截到汉字中间成乱码 */
+static uint32_t s_toast_ms;
+
+static os_dlg_stack_t *top(void) { return (s_top >= 0) ? &s_stack[s_top] : NULL; }
+
+/* 提示弹窗显示时长。
+ * ★★ 2026-10-27 linit 统一规范: **正常 1 秒自动消失; 按任意键立即消失; 最长不超过 3 秒**。
+ *   (原来是 0.5s —— 太短, 用户还没看清就没了。) */
+#define TOAST_MS      1000
+#define TOAST_MS_MAX  3000   /* 强制上限: 任何自定义时长都不许超过 3 秒 */
+static uint32_t s_toast_dur_ms = TOAST_MS;   /* V1.5.x: 当前 toast 显示时长 (ms) */
+/* 是否需要显示 toast 提示 (有弹窗时也叠在弹窗之上显示, 到时自动消失) */
+static bool toast_active(void) {
+    return (s_toast_msg[0] != 0) && (os_millis() - s_toast_ms < s_toast_dur_ms);
+}
+
+/* ============ 渲染 (不清屏, 覆盖在底层之上) ============ */
+/* 内容项数: list 模式若调用方已把"返回"作为最后一项, 该行降级为底部固定返回行 */
+static int dlg_content_count(const os_dlg_stack_t *d) {
+    int c = d->count;
+    if (!d->no_footer && c > 0 &&
+        strcmp(d->items[c - 1], "\xe8\xbf\x94\xe5\x9b\x9e") == 0)   /* 返回 */
+        c--;
+    return c;
+}
+static const char *dlg_ret_text(const os_dlg_stack_t *d) {
+    if (d->footer[0]) return d->footer;   /* 自定义底部标签 (文件浏览: 返回/退出) */
+    if (!d->no_footer && d->count > 0 &&
+        strcmp(d->items[d->count - 1], "\xe8\xbf\x94\xe5\x9b\x9e") == 0)
+        return d->items[d->count - 1];
+    /* 深度自适应: 首个(根)列表底部显示"退出", 更深子列表显示"返回上一页" */
+    if (s_top <= 0) return "\xe9\x80\x80\xe5\x87\xba";   /* 退出 */
+    return "\xe8\xbf\x94\xe5\x9b\x9e";                    /* 返回 */
+}
+
+/* 画一行 (3.3 样式): 选中=黑底白字居中; 未选=白底黑字居中 (强制白底防残留)
+ * rows16=true 时尝试用 16px 小字 (字库未就绪自动回落 24px).
+ * is_footer 行永远 24px (底部"返回"行保持全项目一致). */
+static void dlg_draw_row(st7305_handle_t *lcd, const dlg_layout_t *L,
+                         int abs_y, const char *text, bool selected, bool is_footer, bool rows16) {
+    int y0c = abs_y, y1c = abs_y + DLG_LINE_H - 2;      /* 本行绘制范围 */
+    int y0v = y0c, y1v = y1c;
+    if (!is_footer) {                       /* 内容行: 先按内容区裁剪 */
+        if (y1c < L->clip_top) return;      /* 整行在上边界之上 */
+        if (y0c > L->clip_bottom) return;   /* 整行在下边界之下 */
+        y0v = (y0c < L->clip_top) ? L->clip_top : y0c;
+        y1v = (y1c > L->clip_bottom) ? L->clip_bottom : y1c;
+    }
+    /* 绝对钳制: 绝不越出弹窗框 (边框 2px) */
+    int box_top = L->y + 2, box_bot = L->y + L->h - 2;
+    if (y1v < box_top || y0v > box_bot) return;
+    if (y0v < box_top) y0v = box_top;
+    if (y1v > box_bot) y1v = box_bot;
+
+    /* ★★★ 2026-10-16: 设 y 裁剪带 —— 超出可见段的笔画被"切掉", 可见部分照常显示
+     *   (替代之前"整行才显示文字"的做法 ⇒ 滚动时不再整行文字突然消失) */
+    if (is_footer) st7305_reset_clip_y(lcd);
+    else           st7305_set_clip_y(lcd, y0v, y1v);
+
+    int x0 = L->x + 6, x1 = L->x + L->w - 6;
+    bool use_16 = rows16 && !is_footer && ui_text16_ready();
+    int font_h = use_16 ? 16 : 24;
+    int top = abs_y + (DLG_LINE_H - font_h) / 2;
+    const char *t = text;
+    if (use_16) {
+        if (ui_text16w(text) > x1 - x0) t = text_clip(text, x1 - x0);
+    } else {
+        if (dlg_tw(text) > x1 - x0) t = text_clip(text, x1 - x0);
+    }
+    if (selected) {
+        fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_BLACK);
+        if (use_16) {
+            int tw = ui_text16w(t);
+            ui_text16(lcd, x0 + ((x1 - x0 - tw) >> 1), top, t, true);
+        } else {
+            draw_text_centered(lcd, top, t, true);
+        }
+    } else {
+        fill_rect(lcd, x0, y0v, x1 - 1, y1v, ST7305_COLOR_WHITE);
+        if (use_16) {
+            int tw = ui_text16w(t);
+            ui_text16(lcd, x0 + ((x1 - x0 - tw) >> 1), top, t, false);
+        } else {
+            draw_text_centered(lcd, top, t, false);
+        }
+    }
+    st7305_reset_clip_y(lcd);
+}
+
+/* ★ 2026-11-08: 列表底栏"返回"上方的右下角一行小字 (技能商店显示当前积分)。
+ *   位置在内容区之外 (dlg_layout 已把内容区底部让出 18px), 所以滚动/跟手都不会擦掉它。 */
+static void dlg_draw_corner(st7305_handle_t *lcd, const dlg_layout_t *L,
+                            const os_dlg_stack_t *d) {
+    if (!d->corner[0] || L->footer_y < 0) return;
+    bool small = ui_text16_ready();
+    int tw = small ? ui_text16w(d->corner) : text_width(d->corner);
+    int th = small ? 16 : 24;
+    int cx = L->x + L->w - 8 - tw;
+    if (cx < L->x + 6) cx = L->x + 6;
+    int cy = L->footer_y - 4 - th;
+    if (cy < L->clip_bottom + 1) cy = L->clip_bottom + 1;
+    fill_rect(lcd, cx - 4, cy - 1, L->x + L->w - 5, cy + th, ST7305_COLOR_WHITE);
+    if (small) ui_text16(lcd, cx, cy, d->corner, false);
+    else       draw_text(lcd, cx, cy, d->corner, false);
+}
+
+/* 居中 toast 提示框 (与确认框同族观感: 2px 黑边框 + 12px 左右内边距, 高 40, 只显示消息、不显示标题) *
+ * 2026-09-22 改: 原来 3px 粗边框 + 文字左右只留 3px → 框贴着字, 看起来"不一样"。
+ * 现在与 os_dialog_confirm_ex 用同一套边距语言 (2px 框 + 留白), 并保持严格居中:
+ * 文字 24px 高, 框 40 → 上下各 8px。 */
+static void dlg_draw_toast(st7305_handle_t *lcd) {
+    const int PAD = 12;                 /* 文字左右内边距 */
+    const int BORD = 2;                 /* 边框粗度 (与确认框一致) */
+    int tw = dlg_tw(s_toast_msg);
+    int w = (BORD + PAD) * 2 + tw;
+    if (w > ui_screen_w() - 40) w = ui_screen_w() - 40;
+    const int h = 40;
+    int x0 = (ui_screen_w() - w) / 2;
+    int y0 = (ui_screen_h() - h) / 2;
+    fill_rect(lcd, x0, y0, x0 + w - 1, y0 + h - 1, ST7305_COLOR_WHITE);
+    for (int k = 0; k < BORD; k++) {
+        draw_hline(lcd, x0 + k, x0 + w - 1 - k, y0 + k, ST7305_COLOR_BLACK);
+        draw_hline(lcd, x0 + k, x0 + w - 1 - k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, x0 + k, y0 + k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, x0 + w - 1 - k, y0 + k, y0 + h - 1 - k, ST7305_COLOR_BLACK);
+    }
+    draw_text_centered(lcd, y0 + (h - 24) / 2, s_toast_msg, false);   /* 24px 文字垂直居中 → 上下各 8px */
+}
+
+static void dlg_render(ui_ctx_t *ctx) {
+    st7305_handle_t *lcd = ctx->lcd;
+    if (!lcd) return;
+
+    /* 独立 toast (无弹窗栈): 整页只画提示框 */
+    if (toast_active() && s_top < 0) {
+        dlg_draw_toast(lcd);
+        return;
+    }
+
+    os_dlg_stack_t *d = top();
+    if (!d) return;
+
+    /* 自定义渲染: 若消费则不再画默认列表 */
+    if (d->on_render && d->on_render(ctx, d, d->ud)) return;
+
+    /* ==== 3.3 固定尺寸弹窗 ==== */
+    /* 弹窗不清屏: 仅绘制弹窗本身, 弹窗之外保留原背景 (白板画布/主菜单等).
+     * 弹窗区域内由下方 fill_rect 白底覆盖, 保证内容干净. */
+    dlg_layout_t L;
+    dlg_layout(d, &L);
+    bool is_confirm = d->no_footer;
+    /* V1.6: 两套输入方案 — 触屏优先. 触屏下"选择"用点哪算哪, 不默认高亮黑块;
+     * 手柄下才默认高亮一项并用方向键. 统一查 input_scheme_touch() 保证全项目一致. */
+    bool touch_scheme = input_scheme_touch();
+
+    if (is_confirm && d->small && d->icon) {
+        /* 图标确认窗 (仅图标, 无标题): 图标居中于上部, 底部按钮区.
+         * 几何与 dlg_geom/touch 完全一致: 图标顶 L.y+10; 按钮区 btn_top/btn_bot;
+         * 单按钮(items[1]空)居中, 双按钮左右对称. */
+        int icon_top = L.y + 10;
+        int ih       = d->icon_h > 0 ? d->icon_h : 0;
+        int note_h   = d->note[0] ? 20 : 0;   /* ★ 图标下说明行占位 */
+        int btn_top  = L.y + 22 + ih + note_h;
+        int btn_bot  = L.y + L.h - 6;
+        /* 弹窗白底 + 2px 黑边框 */
+        fill_rect(lcd, L.x, L.y, L.x + L.w - 1, L.y + L.h - 1, ST7305_COLOR_WHITE);
+        for (int k = 0; k < 2; k++) {
+            draw_hline(lcd, L.x + k, L.x + L.w - 1 - k, L.y + k, ST7305_COLOR_BLACK);
+            draw_hline(lcd, L.x + k, L.x + L.w - 1 - k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+            draw_vline(lcd, L.x + k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+            draw_vline(lcd, L.x + L.w - 1 - k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+        }
+        /* 居中位图 (挂载图标等) */
+        if (d->icon_w > 0 && d->icon_h > 0)
+            st7305_draw_bitmap_1bit(lcd, L.x + (L.w - d->icon_w) / 2, icon_top,
+                                    d->icon_w, d->icon_h, d->icon);
+        /* ★ 2026-11-08: 图标下一行说明 (如 "IP：192.168.1.100"), 16px 优先 */
+        if (d->note[0]) {
+            int ny = icon_top + ih + 2;
+            if (ui_text16_ready())
+                ui_text16c(lcd, L.x + L.w / 2, ny, d->note, false);
+            else
+                draw_text_centered_in(lcd, L.x + 2, L.x + L.w - 1, ny, d->note, false);
+        }
+        /* 底部按钮区: 上方 2px 分隔线 + 按钮, 24px 黑字垂直居中.
+         * 单按钮(items[1]空)居中, 双按钮左右对称. */
+        draw_hline(lcd, L.x,     L.x + L.w - 1, btn_top,     ST7305_COLOR_BLACK);
+        draw_hline(lcd, L.x,     L.x + L.w - 1, btn_top + 1, ST7305_COLOR_BLACK);
+        int cy = btn_top + 2 + ((btn_bot - btn_top - 2) - 24) / 2;
+        const char *lbl = d->items[0][0] ? d->items[0] : "\xe9\x80\x80\xe5\x87\xba\xe6\x8c\x82\xe8\xbd\xbd"; /* 退出挂载 */
+        if (d->items[1][0]) {
+            int mid = L.x + L.w / 2;
+            draw_vline(lcd, mid,     btn_top + 2, btn_bot, ST7305_COLOR_BLACK);
+            draw_vline(lcd, mid + 1, btn_top + 2, btn_bot, ST7305_COLOR_BLACK);
+            int cx0 = (L.x + 2 + mid - 1) / 2;
+            int cx1 = (mid + 2 + L.x + L.w - 3) / 2;
+            draw_text(lcd, cx0 - dlg_tw(d->items[0]) / 2, cy, d->items[0], false);
+            draw_text(lcd, cx1 - dlg_tw(d->items[1]) / 2, cy, d->items[1], false);
+        } else {
+            draw_text(lcd, L.x + L.w / 2 - dlg_tw(lbl) / 2, cy, lbl, false);
+        }
+        if (toast_active()) dlg_draw_toast(lcd);
+        return;
+    }
+
+    /* ==== 小确认模板: 固定 140×74, 标题在上, 按钮区白底黑字(无选中高亮).
+     * 几何: 边框2px; 标题 y+7(24px, 距上边框5px); 横杠 y+36/+37 连接左右边框
+     * (标题距横杠5px); 按钮白底区 左右各留2px(不盖边框), 下留5px;
+     * 正中竖线 x=L.x+70 从横杠到底边框; 确定/取消 24px @ y+43 (距横杠5px),
+     * 左右两半对称居中. ==== */
+    if (is_confirm && d->small) {
+        /* 弹窗区域白底 (背景只在弹窗之外透出) */
+        fill_rect(lcd, L.x, L.y, L.x + L.w - 1, L.y + L.h - 1, ST7305_COLOR_WHITE);
+        for (int k = 0; k < 2; k++) {
+            draw_hline(lcd, L.x + k, L.x + L.w - 1 - k, L.y + k, ST7305_COLOR_BLACK);
+            draw_hline(lcd, L.x + k, L.x + L.w - 1 - k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+            draw_vline(lcd, L.x + k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+            draw_vline(lcd, L.x + L.w - 1 - k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+        }
+        /* 消息居中在上 (距上边框内沿 5px) */
+        /* ★★★ 2026-10-18 linit 明确: **只有"应用中心→下载 XX?"那个弹窗用 16px**,
+         *   其余所有弹窗(含确认框/列表/提示)**一律 24px**, 与底部按钮同尺寸 ✓
+         *   (之前无条件改 16px ⇒ 全项目弹窗都变小了 ✗) */
+        if (d->title_small && ui_text16_ready())
+            ui_text16c(lcd, L.x + L.w / 2, L.y + 11, d->title, false);
+        else
+            draw_text_centered(lcd, L.y + 7, d->title, false);
+        /* 按钮区: 横杠/竖线连接到弹窗边框 (横杠连左右, 竖线连横杠与底边框),
+         * 确定/取消 对称居中于左右两半 */
+        int bx0 = L.x + 2, bx1 = L.x + L.w - 1 - 2;   /* 按钮白底区: 不覆盖左右边框 */
+        int bot = L.y + L.h - 1 - 2;                  /* 竖线到底边框内 2px */
+        int by  = L.y + 36;                           /* 横杠 y (按钮区上缘, 标题距横杠5px) */
+        int mid = L.x + L.w / 2;                      /* 正中分割竖线 x (2px) */
+        const char *s0 = d->items[0][0] ? d->items[0] : "\xe7\xa1\xae\xe5\xae\x9a"; /* 确定 */
+        const char *s1 = d->items[1][0] ? d->items[1] : "\xe5\x8f\x96\xe6\xb6\x88"; /* 取消 */
+        /* 按钮区白底/黑底 (选中侧=d->sel 加黑, 手柄 LEFT/RIGHT 切换选择) */
+        fill_rect(lcd, bx0, by, mid - 1, bot, (touch_scheme || d->sel != 0) ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK);
+        fill_rect(lcd, mid + 1, by, bx1, bot, (touch_scheme || d->sel != 1) ? ST7305_COLOR_WHITE : ST7305_COLOR_BLACK);
+        /* 顶部横线: 左右连接到弹窗边框 (L.x .. L.x+w-1) */
+        draw_hline(lcd, L.x,     L.x + L.w - 1, by,     ST7305_COLOR_BLACK);
+        draw_hline(lcd, L.x,     L.x + L.w - 1, by + 1, ST7305_COLOR_BLACK);
+        /* 中间竖线: 从横杠到弹窗底边框 */
+        draw_vline(lcd, mid,     by, bot, ST7305_COLOR_BLACK);
+        draw_vline(lcd, mid + 1, by, bot, ST7305_COLOR_BLACK);
+        /* 文字各占半边居中 (选中侧白字, 未选黑字) */
+        int ty = by + 7;
+        int cx0 = (bx0 + mid - 1) / 2;
+        int cx1 = (mid + 2 + bx1) / 2;
+        draw_text(lcd, cx0 - dlg_tw(s0) / 2, ty, s0, (!touch_scheme && d->sel == 0));
+        draw_text(lcd, cx1 - dlg_tw(s1) / 2, ty, s1, (!touch_scheme && d->sel == 1));
+        if (toast_active()) dlg_draw_toast(lcd);
+        return;
+    }
+
+    /* ★★★ 2026-10-23 真优化 (linit: "目录滑动非常卡"):
+     *   拖动/回弹期间，弹窗的白底、2px 边框、标题行、底部"返回"栏**全都没变**，
+     *   每帧把它们重画一遍纯属浪费（整窗白底 87K 像素 + 8 条边线 + 标题 + 底栏）。
+     *   这里只清「内容区」再重画可见行与滚动条，其余保留上一帧 ⇒ 每帧工作量大幅下降。
+     *   ⚠ 只有"可滚动列表"走这条路；确认框/图标框/短列表保持原样。 */
+    if (s_scroll_busy && !is_confirm && d->count > 0 && L.footer_y >= 0) {
+        fill_rect(lcd, L.x + 2, L.clip_top, L.x + L.w - 3, L.clip_bottom, ST7305_COLOR_WHITE);
+
+        for (int i = -1; i <= L.visible; i++) {
+            int idx = i + L.scroll;
+            if (idx < 0 || idx >= L.content_count) continue;
+            int row_y = L.content_y0 + i * DLG_LINE_H + L.px;
+            if (row_y + DLG_LINE_H <= L.clip_top || row_y >= L.clip_bottom) continue;
+            dlg_draw_row(lcd, &L, row_y, d->items[idx], (!touch_scheme && idx == d->sel), false, d->rows16);
+            if (d->row_x && row_y >= L.clip_top && row_y + DLG_LINE_H - 2 <= L.clip_bottom) {
+                bool sel = (!touch_scheme && idx == d->sel);
+                int ox = L.x + L.w - 6 - 16;
+                int oy = row_y + (DLG_LINE_H - 24) / 2;
+                draw_text(lcd, ox, oy, "X", sel);
+            }
+        }
+
+        if (L.content_count > L.visible) {
+            int bar_x = L.x + L.w - 3;
+            int bar_y0 = L.content_y0;
+            int bar_y1 = L.content_y0 + L.visible * DLG_LINE_H - 1;
+            draw_vline(lcd, bar_x, bar_y0, bar_y1, ST7305_COLOR_BLACK);
+            int track_h = bar_y1 - bar_y0 + 1;
+            int thumb_h = (track_h * L.visible) / L.content_count;
+            if (thumb_h < 4) thumb_h = 4;
+            int max_scroll = L.content_count - L.visible;
+            int thumb_y = bar_y0 + (max_scroll > 0 ? (track_h - thumb_h) * L.scroll / max_scroll : 0);
+            if (thumb_y < bar_y0) thumb_y = bar_y0;
+            if (thumb_y + thumb_h > bar_y1 + 1) thumb_y = bar_y1 + 1 - thumb_h;
+            draw_vline(lcd, bar_x - 1, thumb_y, thumb_y + thumb_h - 1, ST7305_COLOR_BLACK);
+            draw_vline(lcd, bar_x + 1, thumb_y, thumb_y + thumb_h - 1, ST7305_COLOR_BLACK);
+            for (int ty = thumb_y; ty < thumb_y + thumb_h; ty++)
+                st7305_draw_pixel(lcd, bar_x, ty, ST7305_COLOR_BLACK);
+        }
+        if (toast_active()) dlg_draw_toast(lcd);
+        dlg_draw_corner(lcd, &L, d);     /* 滚动时它在内容区之外, 照旧画 (几像素, 忽略) */
+        return;                      /* 边框/标题/底栏沿用上一帧 */
+    }
+
+    /* 弹窗整体白底覆盖底层 */
+    fill_rect(lcd, L.x, L.y, L.x + L.w - 1, L.y + L.h - 1, ST7305_COLOR_WHITE);
+    /* 边框: 列表 2px / 确认框 3px */
+    int border = is_confirm ? 3 : 2;
+    for (int k = 0; k < border; k++) {
+        draw_hline(lcd, L.x + k, L.x + L.w - 1 - k, L.y + k, ST7305_COLOR_BLACK);
+        draw_hline(lcd, L.x + k, L.x + L.w - 1 - k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, L.x + k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, L.x + L.w - 1 - k, L.y + k, L.y + L.h - 1 - k, ST7305_COLOR_BLACK);
+    }
+
+    /* 确认模板 (3.3): 标题(消息) 居中于 y+14, 分隔线 y+38, 下方按钮行 */
+    if (is_confirm && d->title[0]) {
+        draw_text_centered(lcd, L.y + 14, d->title, false);
+        draw_hline(lcd, L.x + 10, L.x + L.w - 10, L.y + 38, ST7305_COLOR_BLACK);
+    }
+
+    /* 内容行 (确认框=确定/取消; 列表=各项).
+     * 跟手拖动: 用 L.px 平移内容, 并多画上下各 1 行做部分出界显示 (按可视区裁剪). */
+    for (int i = -1; i <= L.visible; i++) {
+        int idx = i + L.scroll;
+        if (idx < 0 || idx >= L.content_count) continue;
+        int row_y = L.content_y0 + i * DLG_LINE_H + L.px;
+        /* 裁剪: 行完全在可视区外(上下)则跳过; 部分出界由 dlg_draw_row 自己不越界即可 */
+        if (row_y + DLG_LINE_H <= L.clip_top || row_y >= L.clip_bottom) continue;
+        dlg_draw_row(lcd, &L, row_y, d->items[idx], (!touch_scheme && idx == d->sel), false, d->rows16);
+        if (d->row_x && row_y >= L.clip_top && row_y + DLG_LINE_H - 2 <= L.clip_bottom) {
+            bool sel = (!touch_scheme && idx == d->sel);
+            int ox = L.x + L.w - 6 - 16;
+            int oy = row_y + (DLG_LINE_H - 24) / 2;
+            draw_text(lcd, ox, oy, "X", sel);
+        }
+    }
+
+    /* 列表: 底部固定"返回"行 + 上方分隔线 (仅内容多于返回行时画分隔线) */
+    if (!is_confirm && L.footer_y >= 0 && d->count > 0) {
+        if (L.content_count > 0)
+            draw_hline(lcd, L.x + 6, L.x + L.w - 6, L.footer_y - 1, ST7305_COLOR_BLACK);
+        dlg_draw_row(lcd, &L, L.footer_y, dlg_ret_text(d), (!touch_scheme && d->sel == L.content_count), true, false);
+        dlg_draw_corner(lcd, &L, d);     /* 右下角小字 (积分), 画在"返回"行上方 */
+    }
+
+    /* 滚动条: 内容超出可见区时右侧竖条 + 滑块 */
+    if (L.content_count > L.visible) {
+        int bar_x = L.x + L.w - 3;
+        int bar_y0 = L.content_y0;
+        int bar_y1 = L.content_y0 + L.visible * DLG_LINE_H - 1;
+        draw_vline(lcd, bar_x, bar_y0, bar_y1, ST7305_COLOR_BLACK);
+        int track_h = bar_y1 - bar_y0 + 1;
+        int thumb_h = (track_h * L.visible) / L.content_count;
+        if (thumb_h < 4) thumb_h = 4;
+        int max_scroll = L.content_count - L.visible;
+        int thumb_y = bar_y0 + (max_scroll > 0 ? (track_h - thumb_h) * L.scroll / max_scroll : 0);
+        if (thumb_y < bar_y0) thumb_y = bar_y0;
+        if (thumb_y + thumb_h > bar_y1 + 1) thumb_y = bar_y1 + 1 - thumb_h;
+        draw_vline(lcd, bar_x - 1, thumb_y, thumb_y + thumb_h - 1, ST7305_COLOR_BLACK);
+        draw_vline(lcd, bar_x + 1, thumb_y, thumb_y + thumb_h - 1, ST7305_COLOR_BLACK);
+        for (int ty = thumb_y; ty < thumb_y + thumb_h; ty++)
+            st7305_draw_pixel(lcd, bar_x, ty, ST7305_COLOR_BLACK);
+    }
+
+    /* toast 叠在弹窗之上 (居中提示) */
+    if (toast_active()) dlg_draw_toast(lcd);
+}
+
+/* ============ 动作 ============ */
+/* cb 内是否已"接管"弹窗 (push 下一步 / replace 刷新 / toast 提示).
+ * 接管后 dlg_finish_top 不再自动关闭当前层, 保持"同一窗口换内容/回原位". */
+static bool s_cb_handled = false;
+
+/* ★★ 2026-11-23 linit「长按到时间就弹窗, 不要等松手」的配套保护 ★★
+ *   长按在**按住期间**弹窗时, 打开它的那只手指还没抬起; 松手那一下会被输入层
+ *   当成一次"点击(带坐标)"投给新弹窗 —— 坐标落在行/确定按钮上就直接执行,
+ *   落在"返回"行就是 result=-1。实测表现: 弹窗一闪就没 / 刚弹出就把文件删了。
+ *   这里在 push 时若检测到"手指正按着", 就吞掉本次手势的后续点击; 手指抬起后
+ *   再留 200ms 宽限(等那次松手点击投递完)即自动解除, 不影响后续正常点击。
+ *   放在弹窗层 ⇒ 任何页面/应用"长按弹窗"都自动受保护, 不用各应用自己防。 */
+static bool     s_swallow_tap     = false;
+static bool     s_swallow_saw_down = false;
+static uint32_t s_swallow_up_ms   = 0;
+#define DLG_SWALLOW_GRACE_MS  200u
+
+static void dlg_finish_top(ui_ctx_t *ctx, int result) {
+    os_dlg_stack_t *d = top();
+    if (!d) return;
+    ESP_LOGI(TAG, "finish: result=%d title=\"%s\"", result, d->title);
+    os_dialog_cb_t cb = d->cb;
+    void *ud = d->ud;
+    s_cb_handled = false;
+    if (cb) cb(ctx, result, ud);
+    /* cb 未接管 (未 push/replace/toast) → 关闭当前层回上层/关弹窗页 */
+    if (!s_cb_handled) os_dialog_pop(ctx);
+}
+
+static void dlg_action(ui_ctx_t *ctx, os_action_t a) {
+    /* 长按弹窗本身那次"持续按住": 输入层在 2s 还会投一次 LONG_PRESS(带坐标),
+     * 它只改选中行、不确认, 但会让刚弹出的确认框高亮跳一下 —— 直接忽略。 */
+    if (s_swallow_tap && a == OS_ACTION_LONG_PRESS) return;
+    if (toast_active()) {
+        /* 有 toast: 任何按键/点击先关掉提示; 仅独立 toast (无弹窗) 才弹层 */
+        if (s_top < 0) os_pop(ctx);
+        s_toast_msg[0] = 0;
+        /* ★ 2026-10-28: 关提示必须置脏。原来只有"独立 toast"那条路(os_pop)会置脏,
+         *   toast 叠在已有弹窗上时只清文案不重绘 ⇒ 提示框留在屏上, 看着像"按键没反应"。 */
+        ctx->needs_redraw = true;
+        return;
+    }
+    os_dlg_stack_t *d = top();
+    if (!d) return;
+    /* 统一置脏: 任何弹窗按键都触发重绘. 修复"自定义 on_key 消费 CONFIRM/打开子弹窗
+     * 却没置脏 → 画面不刷新, 需再按一次方向键才显示"的共性缺漏 (触摸路径先置脏故正常). */
+    ctx->needs_redraw = true;
+    /* 触摸长按: 先用长按位置命中弹窗行, 再交给 on_key (供"长按删除"等) */
+    if (a == OS_ACTION_LONG_PRESS) {
+        int tx, ty;
+        if (input_consume_tap(&tx, &ty)) {
+            dlg_layout_t L;
+            dlg_layout(d, &L);
+            int rel = ty - (L.content_y0 + L.px);
+            if (rel >= 0) {
+                int idx = rel / DLG_LINE_H + L.scroll;
+                if (idx >= 0 && idx < L.content_count) { d->sel = idx; ctx->needs_redraw = true; }
+            }
+        }
+    }
+    /* 自定义按键: 消费则不再走默认 */
+    if (d->on_key && d->on_key(ctx, d, a, d->ud)) return;
+    int content_count = dlg_content_count(d);   /* 不含底部返回行 */
+    int max_sel = d->no_footer ? (d->count - 1) : content_count;   /* list 含底部返回行 */
+    switch (a) {
+    /* ★★★ 2026-10-17 (社区反馈: 无触摸机型只有几个物理键):
+     *   ① 首尾循环 —— 到底再按就回第一条, 不用反向按到底
+     *   ② LEFT/RIGHT 等同 UP/DOWN —— 只有上下键的机器也能用, 四个方向都能翻 */
+    case OS_ACTION_UP:
+        d->sel = (d->sel > 0) ? (d->sel - 1) : max_sel;
+        d->scroll_px = 0;   /* 按键导航吸附回正 */
+        ctx->needs_redraw = true;
+        break;
+    case OS_ACTION_DOWN:
+        d->sel = (d->sel < max_sel) ? (d->sel + 1) : 0;
+        d->scroll_px = 0;   /* 按键导航吸附回正 */
+        ctx->needs_redraw = true;
+        break;
+    case OS_ACTION_CONFIRM:
+        /* 物理键激活也置脏 (与触摸选中一致): 立即请求重绘, 否则界面要到下次输入才刷新 */
+        ctx->needs_redraw = true;
+        if (!d->no_footer && d->sel == content_count) dlg_finish_top(ctx, -1);   /* 返回行 → 取消 */
+        else dlg_finish_top(ctx, d->sel);
+        break;
+    case OS_ACTION_BACK:
+        ctx->needs_redraw = true;
+        dlg_finish_top(ctx, -1);
+        break;
+    case OS_ACTION_LEFT:
+    case OS_ACTION_RIGHT:
+        /* 小确认框: 手柄 LEFT/RIGHT 在 确定/取消 (或三按钮) 之间切换黑块选择,
+         * CONFIRM=选中项, BACK=取消. 列表/其它弹窗左右键忽略. */
+        if (d->no_footer && d->small && d->count >= 2) {
+            int n = (d->count == 2) ? 2 : 3;
+            if (a == OS_ACTION_LEFT) d->sel = (d->sel + n - 1) % n;
+            else d->sel = (d->sel + 1) % n;
+            ctx->needs_redraw = true;
+        } else if (!d->no_footer && max_sel >= 0) {
+            /* ★ 2026-10-17 (社区反馈): 列表弹窗原来"左右键忽略" ⇒ 无触摸机型只有方向键时
+             *   少一半按键可用。改为左右键也能翻, 且首尾循环。 */
+            int n = max_sel + 1;
+            if (a == OS_ACTION_LEFT) d->sel = (d->sel > 0) ? (d->sel - 1) : max_sel;
+            else                     d->sel = (d->sel < max_sel) ? (d->sel + 1) : 0;
+            (void)n;
+            d->scroll_px = 0;
+            ctx->needs_redraw = true;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static bool dlg_touch(ui_ctx_t *ctx, int x, int y) {
+    /* 长按弹窗: 吞掉"打开它的那只手指"的松手点击 (见 s_swallow_tap 注释)。
+     * 返回 true = 已消费, 不让它落到底层页面/弹窗行上。 */
+    if (s_swallow_tap) return true;
+    if (toast_active()) {
+        if (s_top < 0) os_pop(ctx);
+        s_toast_msg[0] = 0;
+        /* ★ 2026-10-28: 同 dlg_action —— 触摸关提示也要置脏, 否则提示残留到下次重绘 */
+        ctx->needs_redraw = true;
+        return true;
+    }
+    os_dlg_stack_t *d = top();
+    if (!d) return false;
+    dlg_layout_t L;
+    dlg_layout(d, &L);
+    if (x < L.x || x > L.x + L.w - 1) return false;
+
+    /* Icon 小确认窗按钮区 (渲染对齐: 单按钮=整区0; 双按钮=左右对称, 命中即回传 0/1) */
+    if (d->no_footer && d->small && d->icon) {
+        int btn_top = L.y + 22 + (d->icon_h > 0 ? d->icon_h : 0) + (d->note[0] ? 20 : 0);
+        int btn_bot = L.y + L.h - 6;
+        if (y >= btn_top && y <= btn_bot) {
+            if (d->items[2][0]) {
+                /* 三按钮: 三等分 左=0 中=1 右=2 */
+                int x0 = L.x + 2, x1 = L.x + L.w - 3;
+                int w3 = (x1 - x0 + 1) / 3;
+                if (x < x0 + w3) d->sel = 0;
+                else if (x < x0 + 2 * w3) d->sel = 1;
+                else d->sel = 2;
+            } else if (d->items[1][0])
+                d->sel = (x < L.x + L.w / 2) ? 0 : 1;   /* 双按钮: 左=idx0 右=idx1 */
+            else
+                d->sel = 0;
+            dlg_finish_top(ctx, d->sel);
+            return true;
+        }
+        return true;   /* 弹窗内其他区域忽略 */
+    }
+
+    /* 小确认模板: 按钮区 (渲染对齐: 左右留2, 下留2, 顶 y+36, 正中竖线) */
+    if (d->no_footer && d->small) {
+        int bx0 = L.x + 2, bx1 = L.x + L.w - 1 - 2;
+        int by = L.y + 36, bot = L.y + L.h - 1 - 2;
+        int mid = L.x + L.w / 2;
+        if (y >= by && y <= bot && x >= bx0 && x <= bx1) {
+            d->sel = (x < mid) ? 0 : 1;   /* 左=确定 右=取消 */
+            dlg_finish_top(ctx, d->sel);
+            return true;
+        }
+        return true;   /* 弹窗内其他区域忽略 */
+    }
+
+    /* 自定义整层渲染对话框 (非列表 count=0, 如时间/休眠滚轮): 
+     * 触摸由 on_touch 全权处理整个弹窗框 (含上部相邻值, 点列/点按钮) */
+    if (d->on_render && d->count == 0 && d->on_touch)
+        return d->on_touch(ctx, d, x, y, d->ud);
+
+    /* 底部"返回"行 */
+    if (!d->no_footer && y >= L.footer_y && y < L.footer_y + DLG_LINE_H) {
+        dlg_finish_top(ctx, -1);
+        return true;
+    }
+    /* 内容区: 与渲染共用 dlg_layout, 几何完全一致 (含确认框消息区) */
+    int rel = y - (L.content_y0 + L.px);
+    if (rel < 0) return false;
+    int idx = rel / DLG_LINE_H + L.scroll;
+    if (idx >= 0 && idx < L.content_count) {
+        d->sel = idx;
+        ctx->needs_redraw = true;
+        /* 行右侧删除"×": 点击直接命中该行并投递 LONG_PRESS (弹删除确认), 不真正选中/打开 */
+        if (d->row_x && x >= L.x + L.w - 6 - 16 &&
+            x <= L.x + L.w - 6) {
+            if (d->on_key && d->on_key(ctx, d, OS_ACTION_LONG_PRESS, d->ud)) return true;
+            return true;
+        }
+        /* 与按键 CONFIRM 同语义: 先过 on_key (如设置主菜单: 开子弹窗不关闭),
+         * 被消费则不 dlg_finish_top; 否则按默认完成 (选中项 / 底部返回行=取消) */
+        if (d->on_key && d->on_key(ctx, d, OS_ACTION_CONFIRM, d->ud)) return true;
+        dlg_finish_top(ctx, d->sel);
+        return true;
+    }
+    /* 自定义整层触摸(非列表弹窗: 如滚轮 点列/确认/取消按钮), 弹窗框内转交回调 */
+    if (d->on_touch) return d->on_touch(ctx, d, x, y, d->ud);
+    return false;
+}
+
+/* 拖动/惯性产生的子像素偏移 -> 行吸附: 滚过整行就换选中行, 并回收到 (-LINE_H, LINE_H) */
+static void dlg_poll(ui_ctx_t *ctx) {
+    /* 解除"吞松手点击"的布防: 手指抬起后留 DLG_SWALLOW_GRACE_MS 宽限 ——
+     * 松手点击是与本 poll 同一帧 dispatch 的, 必须等它先被吞掉再解锁。 */
+    if (s_swallow_tap) {
+        if (input_touch_hold_ms() > 0) {
+            s_swallow_saw_down = true;
+            s_swallow_up_ms    = 0;
+        } else if (s_swallow_saw_down) {
+            uint32_t t = os_millis();
+            if (s_swallow_up_ms == 0) {
+                s_swallow_up_ms = t ? t : 1u;
+            } else if (t - s_swallow_up_ms > DLG_SWALLOW_GRACE_MS) {
+                s_swallow_tap      = false;
+                s_swallow_saw_down = false;
+                s_swallow_up_ms    = 0;
+            }
+        }
+    }
+    /* 空 DIALOG 页自愈: 独立 toast 已消失 (超时/被任意输入清除) 但页面未退出时自动回
+     * 底层 — 防止"提示没了却卡在空白弹窗页, 按键/触摸全无效" (触摸路径只清 toast 不弹页) */
+    if (s_top < 0 && !toast_active()) {
+        os_pop(ctx);
+        return;
+    }
+    /* toast 超时: 到时后自动关闭 (回到弹出提示前的位置).
+     * 注意不能用 toast_active() 判断 (它要求 < 时长, 与超时判断矛盾) */
+    if (s_toast_msg[0] && os_millis() - s_toast_ms >= s_toast_dur_ms) {
+        if (s_top < 0) os_pop(ctx);   /* 独立 toast: 关弹窗页; 叠弹窗上的提示仅清消息 */
+        s_toast_msg[0] = 0;
+        ctx->needs_redraw = true;
+    }
+    /* 弹窗超时: 打开后 timeout_ms 毫秒未操作, 自动以 timeout_result 完成 */
+    os_dlg_stack_t *d = top();
+    if (d && d->timeout_ms > 0 && os_millis() - d->open_ms >= d->timeout_ms) {
+        dlg_finish_top(ctx, d->timeout_result);
+        d = top();
+    }
+    /* 当前层自定义轮询 (按键映射捕获等) */
+    if (d && d->on_poll) d->on_poll(ctx, d, d->ud);
+
+    /* 行右侧删除"×"长按即时弹出 (按住期间即触发, 不须松手): 命中内容行 → 投递 LONG_PRESS
+     * ★ 2026-11-23: row_long 也走这里 —— 只借"长按命中行", 不画 ×.
+     *   时长按语义分开: row_x(删除类, 800ms 就够) / row_long(需明确意图, 1s). */
+    static bool s_rowx_fired = false;
+    if (d && (d->row_x || d->row_long)) {
+        const uint32_t need_ms = d->row_x ? 800u : 1000u;
+        uint32_t hold = input_touch_hold_ms();
+        if (hold == 0) {
+            s_rowx_fired = false;   /* 手指已松, 允许下次再触发 */
+        } else if (!s_rowx_fired && hold >= need_ms) {
+            int sx, sy;
+            if (input_touch_start_pos(&sx, &sy)) {
+                dlg_layout_t Lx;
+                dlg_layout(d, &Lx);
+                int rel = sy - (Lx.content_y0 + Lx.px);
+                if (rel >= 0) {
+                    int idx = rel / DLG_LINE_H + Lx.scroll;
+                    if (idx >= 0 && idx < dlg_content_count(d)) {
+                        /* 命中的是非删除×区域 (×区点击由 dlg_touch 单独处理) */
+                        s_rowx_fired = true;
+                        d->sel = idx;
+                        ctx->needs_redraw = true;
+                        if (d->on_key) d->on_key(ctx, d, OS_ACTION_LONG_PRESS, d->ud);
+                    }
+                }
+            }
+        }
+    }
+
+    /* ================= 触摸滚动 (统一 ui_scroll 模块) =================
+     * 只有"内容超一屏的列表"才滚; 确认框/短列表原样不动。
+     * 手感与主界面列表完全一致: 12px 判定 / 惯性 ×0.86 / 越界回弹 / 松手吸附整行。 */
+    {
+        os_dlg_stack_t *d2 = top();
+        bool list = d2 && !d2->no_footer;
+        int cnt = list ? dlg_content_count(d2) : 0;
+        int vis = list ? dlg_visible_rows(d2) : 0;
+        bool scrollable = list && vis > 0 && cnt > vis;
+
+        if (!scrollable) {
+            if (s_dlg_sc_rdy) ui_scroll_cancel(&s_dlg_sc);
+            s_dlg_sc_cnt = -1;
+            s_dlg_sc_vh  = -1;
+            if (list) d2->scroll_px = 0;
+            s_scroll_busy = false;
+        } else {
+            if (!s_dlg_sc_rdy) {
+                /* ★ 2026-10-28: 必须 SNAP_INSTANT —— 本文件的偏移会反算成
+                 *   sel = off/行高 + scroll_px 再做渲染与点击命中, 吸附缓动的
+                 *   中间态会让 sel 在两行之间反复跨(高亮闪、松手卡回去)。 */
+                ui_scroll_config(&s_dlg_sc, UI_SCROLL_LIST, UI_SCROLL_F_SNAP_INSTANT);
+                s_dlg_sc_rdy = true;
+            }
+            int view = vis * DLG_LINE_H;
+            if (s_dlg_sc_cnt != cnt || s_dlg_sc_vh != view) {
+                /* 换弹窗 / 条目数变了: 重建并对齐到当前 sel (此刻一定没在动) */
+                ui_scroll_init(&s_dlg_sc, DLG_LINE_H, view, cnt * DLG_LINE_H);
+                s_dlg_sc_cnt = cnt;
+                s_dlg_sc_vh  = view;
+                /* ★ 2026-11-20: 有拖动位置(scroll_row)时以它为准, 否则按 sel 对齐 */
+                int o = (d2->scroll_row > 0 ? d2->scroll_row : d2->sel) * DLG_LINE_H - d2->scroll_px;
+                /* ★ 2026-11-23: 统一走 ui_scroll_set_offset(夹紧 + 清 sub/fling/吸附) */
+                ui_scroll_set_offset(&s_dlg_sc, o);
+            } else if (!ui_scroll_busy(&s_dlg_sc) &&
+                       (d2->sel != s_dlg_shadow_sel || d2->scroll_px != s_dlg_shadow_px)) {
+                /* ★ 外部改了 sel (按键 UP/DOWN 导航、长按删行、页内跳转)
+                 *   ⇒ 反向同步回控制器, 否则下一帧就被镜像拉回旧位置。 */
+                int o = d2->sel * DLG_LINE_H - d2->scroll_px;
+                ui_scroll_set_offset(&s_dlg_sc, o);
+            }
+
+            int tx, ty;
+            bool down = input_get_touch_pos(&tx, &ty);
+            ui_scroll_touch_xy(&s_dlg_sc, tx, ty, down);   /* 内部按 12px 判定拖动 */
+            ui_scroll_poll(&s_dlg_sc);
+
+            /* 镜像回 sel / scroll_px (渲染与命中判定仍读这两个字段) */
+            int o = ui_scroll_offset(&s_dlg_sc);   /* 含越界 sub, 保留回弹观感 */
+            int sel = o / DLG_LINE_H;
+            if (sel < 0) sel = 0;
+            if (sel > cnt) sel = cnt;
+            /* ★ 2026-11-20: 拖动位置单独记进 scroll_row (见 dlg_layout 里的说明);
+             *   它只是"可视首行", 上限是 cnt-vis(滚到底), 与 sel 的 cnt(返回行) 不同。 */
+            int maxrow = cnt - vis;
+            if (maxrow < 0) maxrow = 0;
+            int row = (sel > maxrow) ? maxrow : sel;
+            int px = -(o - sel * DLG_LINE_H);
+            int pxmax = DLG_LINE_H + DLG_LINE_H / 2;
+            if (px >  pxmax) px =  pxmax;
+            if (px < -pxmax) px = -pxmax;
+            if (d2->sel != sel || d2->scroll_px != px || d2->scroll_row != row) {
+                d2->sel = sel;
+                d2->scroll_px = px;
+                d2->scroll_row = row;
+                ctx->needs_redraw = true;
+            }
+            s_dlg_shadow_sel = d2->sel;
+            s_dlg_shadow_px  = d2->scroll_px;
+            s_scroll_busy = ui_scroll_busy(&s_dlg_sc);
+        }
+    }
+}
+
+static const os_module_t s_mod_dialog = {
+    .name       = "dialog",
+    .page_id    = OS_PAGE_DIALOG,
+    .render     = dlg_render,
+    .action     = dlg_action,
+    .touch      = dlg_touch,
+    .poll       = dlg_poll,
+    .modal      = true,
+};
+
+void os_page_dialog_register(void) { os_register(&s_mod_dialog); }
+
+/* ★ 2026-11-24: 当前最上层是否"档位滚轮"(os_dialog_wheel)。
+ *   滚轮自己按"变档/确认/返回"发反馈, os_core 的通用按键反馈要**让路**,
+ *   否则一次按键会震两下(confirm 被冷却拒后回落基础 tap, 听感是"哒哒")。 */
+static bool s_top_is_wheel = false;
+bool os_dialog_wheel_open(void) { return s_top_is_wheel; }
+
+/* ============ 弹窗栈 API ============ */
+void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg) {
+    if (!dlg) return;
+    if (s_top + 1 >= DLG_MAX_DEPTH) return;   /* 栈满: 拒绝 */
+    /* 首层: 只在弹窗页确实不在栈上时才打开 —— 否则会叠出第二个 DIALOG 页 */
+    if (s_top < 0 && !dlg_page_live(ctx)) {
+        os_push(ctx, OS_PAGE_DIALOG);
+        s_dlg_page_open = true;
+    }
+    s_stack[++s_top] = *dlg;                       /* 整体拷贝, 含回调/ud/自定义 */
+    s_top_is_wheel = false;                        /* 新层默认不是滚轮, os_dialog_wheel 会在 push 后置回 */
+    s_stack[s_top].open_ms = os_millis();             /* 记录打开时刻 (供超时) */
+    s_stack[s_top].scroll_row = 0;                    /* ★ 每次打开都从"没拖动过"开始 */
+    /* ★★★ 2026-10-28 linit「点一个弹窗没有刷新」根因修复 ★★★
+     *   push 有两条路: 首层会走 os_push(OS_PAGE_DIALOG), 而 os_push 内部会置
+     *   ctx->needs_redraw; 但从**第二层起**只在 s_stack 里加一项、完全不碰 needs_redraw
+     *   ⇒ 上级弹窗原地换内容 / 子弹窗弹出时, 主循环判定"画面没变"直接跳过渲染,
+     *   表现就是"点了一下没反应, 再点一次才动一下"。
+     *   这里无条件置脏, 并作废送屏指纹:
+     *   · needs_redraw   —— 保证本帧一定重绘
+     *   · invalidate     —— 弹窗**首次出现一律整屏刷新**(st7305_flush 本来就是全屏
+     *                       15KB 窗口; invalidate 只保证它不被"内容哈希相同"跳过) */
+    if (ctx) ctx->needs_redraw = true;
+    st7305_invalidate_frame();
+    /* 长按期间弹窗: 布防"吞掉松手点击"(见 s_swallow_tap) */
+    if (input_touch_hold_ms() > 0) {
+        s_swallow_tap      = true;
+        s_swallow_saw_down = true;
+        s_swallow_up_ms    = 0;
+        ESP_LOGD(TAG, "push: 手指仍按着 ⇒ 屏蔽本次手势的松手点击");
+    }
+    ESP_LOGI(TAG, "push: \"%s\" top=%d", s_stack[s_top].title, s_top);
+    s_cb_handled = true;   /* cb 内调用=下一步同窗替换, 不自动关闭父层 */
+}
+
+/* 覆盖当前层内容 (刷新/下一步, 不加深层级) 已由调用方改为 pop+push 组合实现, 此 API 删除. */
+void os_dialog_clear_all(ui_ctx_t *ctx) {
+    ESP_LOGI(TAG, "clear_all: top=%d (无回调直清!)", s_top);
+    while (s_top >= 0) os_dialog_pop(ctx);
+    dlg_scroll_state_reset();
+    s_toast_msg[0] = 0;
+    ctx->needs_redraw = true;
+}
+
+void os_dialog_pop(ui_ctx_t *ctx) {
+    ESP_LOGI(TAG, "pop: top=%d (无回调直弹!)", s_top);
+    s_top_is_wheel = false;   /* 回到父层: 按普通弹窗发反馈 */
+    if (s_top > 0) {
+        s_top--;   /* 弹栈, 恢复父弹窗 (sel 已在各自层保存) */
+    } else if (s_top == 0) {
+        s_top = -1;
+        os_pop(ctx);   /* 关闭弹窗页, 恢复底层 */
+        s_dlg_page_open = false;
+    }
+    /* ★ 2026-10-24: 关窗即清滚动状态。否则"拖动中被关掉"会让 s_scroll_busy 永久为真,
+     *   os_core 从此不画状态栏 (顶部信息条整块消失)。 */
+    dlg_scroll_state_reset();
+    s_cb_handled = true;   /* cb 内显式弹栈=已接管, 避免 dlg_finish_top 再自动关 */
+    /* ★★★ 2026-10-28 linit「弹窗关掉后留框/残留」根因修复 ★★★
+     *   dlg_render 的约定是"只画弹窗自己那块, 不清屏、不重绘背景"(见其注释),
+     *   所以 pop 之后谁来擦掉弹窗框? 原逻辑没人擦:
+     *   · 回父弹窗时: 栈顶换成父窗, 子窗比父窗大的那圈边框留在屏上
+     *   · 关到页面时: 页面 render 只重画自己的元素, 弹窗覆盖的空白区留白框/黑边
+     *   这里统一作废背景 —— 下一帧整屏清白 + 重绘最底层页面, 再叠当前(父)弹窗。
+     *   pop 是用户点击才触发的低频动作, 一次整屏刷(≈4.5ms)完全可接受。 */
+    os_invalidate_bg();
+    ctx->needs_redraw = true;
+
+    /* ★★ 2026-11-23: 记下"弹窗关闭时刻", 供 Lua 桥做触摸屏蔽。
+     *   原来桥里那套"关窗后 120ms 不给脚本触摸"是靠**脚本每帧调 app.touch()** 时
+     *   自己观察 os_dialog_depth() 来布防的(s_dlg_seen)。但 os_core 每帧只 poll
+     *   栈顶页 —— 弹窗期间 Lua 页根本不 poll ⇒ 那个观察永远不发生, 屏蔽形同虚设。
+     *   触发实测(linit): 点设置里的项, 关窗那一帧手指还按在屏上, 坐标正好落在游戏
+     *   热区里 ⇒ "透过弹窗敲了一下木鱼"。这里由**框架**权威记录时刻, 桥只读它。 */
+    s_last_close_us = esp_timer_get_time();
+}
+
+int os_dialog_depth(void) { return s_top + 1; }
+int64_t os_dialog_last_close_us(void) { return s_last_close_us; }
+const os_dlg_stack_t *os_dialog_top(void) { return top(); }
+
+/* 原位改写当前弹窗 (同一框变形): 返回栈顶可写句柄. 供"确认框 → 图标窗"驻留同一弹窗使用. */
+os_dlg_stack_t *os_dialog_top_mut(ui_ctx_t *ctx) {
+    ctx->needs_redraw = true;
+    return top();
+}
+
+/* 标记回调已"接管"弹窗 (保持同一窗, dlg_finish_top 不再自动关闭). */
+void os_dialog_mark_handled(ui_ctx_t *ctx) {
+    s_cb_handled = true;
+    ctx->needs_redraw = true;
+}
+
+/* ============ 旧 API (单层快捷方式, 复用弹窗栈) ============ */
+void os_dialog_list(ui_ctx_t *ctx, const char *title,
+                    const char *const *items, int count, int sel,
+                    os_dialog_cb_t cb, void *ud) {
+    os_dialog_list_corner(ctx, title, items, count, sel, NULL, cb, ud);
+}
+
+/* ★ 2026-11-08: 列表 + 右下角一行小字 (技能商店显示"积分 N")。
+ *   几何/滚动完全不变, 只在底栏"返回"上方多画一块, 因此不影响任何现有弹窗。 */
+void os_dialog_list_corner(ui_ctx_t *ctx, const char *title,
+                           const char *const *items, int count, int sel,
+                           const char *corner, os_dialog_cb_t cb, void *ud) {
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    snprintf(dlg.title, sizeof(dlg.title), "%s", title ? title : "");
+    dlg.count = count < DLG_MAX_ITEMS ? count : DLG_MAX_ITEMS;
+    if (dlg.count < 0) dlg.count = 0;
+    for (int i = 0; i < dlg.count; i++)
+        snprintf(dlg.items[i], DLG_ITEM_LEN, "%s", items[i]);
+    dlg.sel = sel < 0 ? 0 : sel;
+    if (dlg.sel >= dlg.count) dlg.sel = 0;
+    if (corner && corner[0]) snprintf(dlg.corner, sizeof(dlg.corner), "%s", corner);
+    dlg.cb = cb;
+    dlg.ud = ud;
+    os_dialog_push(ctx, &dlg);
+}
+
+void os_dialog_confirm_ex(ui_ctx_t *ctx, const char *msg, uint32_t timeout_ms,
+                          int timeout_result, os_dialog_cb_t cb, void *ud) {
+    /* 小自适应确认模板 (3.3 退出 notice 样式): 退出程序?/关机? 等 */
+    const char *items[2] = { "\xe7\xa1\xae\xe5\xae\x9a", "\xe5\x8f\x96\xe6\xb6\x88" }; /* 确定/取消 */
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    snprintf(dlg.title, sizeof(dlg.title), "%s", msg ? msg : "");
+    dlg.count = 2;
+    snprintf(dlg.items[0], DLG_ITEM_LEN, "%s", items[0]);
+    snprintf(dlg.items[1], DLG_ITEM_LEN, "%s", items[1]);
+    dlg.sel = 0;
+    dlg.no_footer = true;
+    dlg.small = true;    /* 小自适应 */
+    dlg.timeout_ms = timeout_ms;
+    dlg.timeout_result = timeout_result;
+    dlg.cb = cb;
+    dlg.ud = ud;
+    os_dialog_push(ctx, &dlg);
+}
+
+/* ================= 通用档位滚轮模板 (V1.7.x) =================
+ * 上下滑动/方向键翻档, 触摸点击对应文字直接选中; 底部确认/取消.
+ * 回调 on_done(ctx, sel): sel=选中档; 取消/BACK → sel=-1.
+ * 供"关机时间/字体大小/音量/暗黑模式"等档位型设置复用 (标准模板). */
+#define WHEEL_GEN_ROW   26    /* 档位行高 */
+#define WHEEL_GEN_SIDE  2     /* 当前档上下各显示 2 档 */
+
+static bool wheel_gen_render(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)ud;
+    st7305_handle_t *lcd = ctx->lcd;
+    if (!lcd) return true;
+    int W = 170, H = 34 + WHEEL_GEN_ROW * 5 + 40;   /* 5 档位区 + 按钮区 */
+    for (int i = 0; i < d->count; i++) {
+        int w = dlg_tw(d->items[i]) + 40;
+        if (w > W) W = w;
+    }
+    int bx = (ui_screen_w() - W) / 2, by = (ui_screen_h() - H) / 2;
+    fill_rect(lcd, bx, by, bx + W - 1, by + H - 1, ST7305_COLOR_WHITE);
+    for (int k = 0; k < 2; k++) {
+        draw_hline(lcd, bx + k, bx + W - 1 - k, by + k, ST7305_COLOR_BLACK);
+        draw_hline(lcd, bx + k, bx + W - 1 - k, by + H - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, bx + k, by + k, by + H - 1 - k, ST7305_COLOR_BLACK);
+        draw_vline(lcd, bx + W - 1 - k, by + k, by + H - 1 - k, ST7305_COLOR_BLACK);
+    }
+    /* 档位区: 当前档居中黑框, 上下各 2 档 */
+    int y0 = by + 14;
+    for (int k = -WHEEL_GEN_SIDE; k <= WHEEL_GEN_SIDE; k++) {
+        int idx = d->sel + k;
+        if (idx < 0 || idx >= d->count) continue;
+        int ry = y0 + (k + WHEEL_GEN_SIDE) * WHEEL_GEN_ROW;
+        int tw = dlg_tw(d->items[idx]);
+        int cx = bx + (W - tw) / 2;
+        if (k == 0) {
+            fill_rect(lcd, cx - 6, ry, cx + tw + 5, ry + 24, ST7305_COLOR_BLACK);
+            draw_text(lcd, cx, ry, d->items[idx], true);
+        } else {
+            draw_text(lcd, cx, ry, d->items[idx], false);
+        }
+    }
+    /* 底部确认/取消 */
+    int bbt = by + H - 40;
+    draw_hline(lcd, bx + 2, bx + W - 3, bbt, ST7305_COLOR_BLACK);
+    int mid = bx + W / 2;
+    draw_vline(lcd, mid, bbt, by + H - 3, ST7305_COLOR_BLACK);
+    int ty = bbt + 10;
+    draw_text(lcd, bx + W / 4 - dlg_tw("\xe7\xa1\xae\xe8\xae\xa4") / 2, ty, "\xe7\xa1\xae\xe8\xae\xa4", false);  /* 确认 */
+    draw_text(lcd, bx + W * 3 / 4 - dlg_tw("\xe5\x8f\x96\xe6\xb6\x88") / 2, ty, "\xe5\x8f\x96\xe6\xb6\x88", false); /* 取消 */
+    return true;
+}
+
+static bool wheel_gen_touch(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud) {
+    (void)ud;
+    int W = 170, H = 34 + WHEEL_GEN_ROW * 5 + 40;
+    for (int i = 0; i < d->count; i++) {
+        int w = dlg_tw(d->items[i]) + 40;
+        if (w > W) W = w;
+    }
+    int bx = (ui_screen_w() - W) / 2, by = (ui_screen_h() - H) / 2;
+    int y0 = by + 14;
+    /* 点击档位文字 → 直接选中 */
+    for (int k = -WHEEL_GEN_SIDE; k <= WHEEL_GEN_SIDE; k++) {
+        int idx = d->sel + k;
+        if (idx < 0 || idx >= d->count) continue;
+        int ry = y0 + (k + WHEEL_GEN_SIDE) * WHEEL_GEN_ROW;
+        if (y >= ry - 2 && y <= ry + 25 && x >= bx && x <= bx + W - 1) {
+            if (idx != d->sel) { d->sel = idx; if (ctx) ctx->needs_redraw = true; }
+            return true;
+        }
+    }
+    /* 底部按钮: 确认=完成, 取消=取消 */
+    int bbt = by + H - 40;
+    if (y >= bbt && y <= by + H - 3) {
+        if (x < bx + W / 2) dlg_finish_top(ctx, d->sel);
+        else                dlg_finish_top(ctx, -1);
+        return true;
+    }
+    return true;
+}
+
+static void wheel_gen_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+    (void)ud;
+    int tx, ty;
+    static int s_t_last = -1, s_t_acc = 0;
+    if (input_get_touch_pos(&tx, &ty)) {
+        if (s_t_last < 0) { s_t_last = ty; s_t_acc = 0; return; }
+        s_t_acc += ty - s_t_last;
+        s_t_last = ty;
+        bool moved = false;
+        while (s_t_acc >= WHEEL_GEN_ROW) { s_t_acc -= WHEEL_GEN_ROW; if (d->sel > 0) { d->sel--; ctx->needs_redraw = true; moved = true; } }
+        while (s_t_acc <= -WHEEL_GEN_ROW) { s_t_acc += WHEEL_GEN_ROW; if (d->sel < d->count - 1) { d->sel++; ctx->needs_redraw = true; moved = true; } }
+        /* 拖动调值: 每帧最多一次"格"反馈(限频由效果库的冷却兜住), 音量才有刻度感 */
+        if (moved) vibrator_sem(VIB_SEM_STEP);
+    } else {
+        s_t_last = -1; s_t_acc = 0;
+    }
+}
+
+static bool wheel_gen_key(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud) {
+    (void)ud;
+    switch (a) {
+    case OS_ACTION_UP:
+        if (d->sel > 0) {
+            d->sel--; if (ctx) ctx->needs_redraw = true;
+            vibrator_sem(VIB_SEM_STEP);      /* 真变了一格才震; 到头不震, 避免"假反馈" */
+        }
+        return true;
+    case OS_ACTION_DOWN:
+        if (d->sel < d->count - 1) {
+            d->sel++; if (ctx) ctx->needs_redraw = true;
+            vibrator_sem(VIB_SEM_STEP);
+        }
+        return true;
+    case OS_ACTION_CONFIRM:
+        vibrator_sem(VIB_SEM_CONFIRM);
+        dlg_finish_top(ctx, d->sel);
+        return true;
+    case OS_ACTION_BACK:
+        vibrator_sem(VIB_SEM_BACK);
+        dlg_finish_top(ctx, -1);
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* 通用档位滚轮: items 档位文字, sel 当前档, on_done 完成回调 (result=档位, -1=取消) */
+void os_dialog_wheel(ui_ctx_t *ctx, const char *const *items, int n, int sel,
+                     os_dialog_cb_t on_done) {
+    if (!ctx || !items || n <= 0) return;
+    os_dlg_stack_t dlg;
+    memset(&dlg, 0, sizeof(dlg));
+    int c = n > 60 ? 60 : n;
+    for (int i = 0; i < c; i++)
+        snprintf(dlg.items[i], sizeof(dlg.items[i]), "%s", items[i] ? items[i] : "");
+    dlg.count = c;
+    dlg.sel = (sel < 0) ? 0 : (sel >= c ? c - 1 : sel);
+    dlg.no_footer = true;
+    dlg.cb = on_done;
+    dlg.on_render = wheel_gen_render;
+    dlg.on_touch  = wheel_gen_touch;
+    dlg.on_poll   = wheel_gen_poll;
+    dlg.on_key    = wheel_gen_key;
+    os_dialog_push(ctx, &dlg);
+    s_top_is_wheel = true;   /* 让 os_core 跳过通用按键反馈(滚轮自己发) */
+}
+
+/* ============ 统一入口 (2026-10-19) ============ */
+void os_dlg_open(ui_ctx_t *ctx, const os_dlg_cfg_t *cfg) {
+    if (!ctx || !cfg) return;
+    switch (cfg->type) {
+    case OS_DLG_TOAST:
+        os_dialog_toast_ms(ctx, cfg->msg, cfg->timeout_ms);
+        break;
+    case OS_DLG_CONFIRM:
+        os_dialog_confirm_ex(ctx, cfg->msg, cfg->timeout_ms, cfg->timeout_result, cfg->cb, cfg->ud);
+        break;
+    case OS_DLG_LIST:
+        os_dialog_list(ctx, cfg->title, cfg->items, cfg->count, cfg->sel, cfg->cb, cfg->ud);
+        break;
+    default: break;
+    }
+}
+
+void os_dialog_toast(ui_ctx_t *ctx, const char *msg) {
+    os_dialog_toast_ms(ctx, msg, TOAST_MS);
+}
+
+/* V1.6.x: toast 查询/清除 (os_core 任意按键/触摸即时关闭) */
+static bool s_toast_owns_page = false;   /* 弹窗页是 toast 自己开的 ⇒ 关提示时要把它一起收掉 */
+
+bool os_dialog_toast_active(void) { return toast_active(); }
+void os_dialog_toast_clear(void) {
+    s_toast_msg[0] = 0;
+    s_toast_dur_ms = TOAST_MS;
+}
+/* ★★ 2026-10-20 修"点提示后直接退回桌面":
+ *   原来按键/触摸关提示只清文案, **toast 自己打开的 DIALOG 页留在栈上** ⇒ 用户再按一次
+ *   BACK 就把下层页(手柄/收藏夹)关掉, 表现为"关个提示结果退到桌面"。
+ *   这里把关提示与"收掉自己开的弹窗页"绑成一个动作。 */
+void os_dialog_toast_dismiss(ui_ctx_t *ctx) {
+    bool owns = s_toast_owns_page;
+    s_toast_owns_page = false;
+    os_dialog_toast_clear();
+    if (ctx && owns) { os_pop(ctx); if (s_top < 0) s_dlg_page_open = false; }
+    if (ctx) ctx->needs_redraw = true;
+}
+/* V1.7.x: 全局 toast 超时清理 — 由 os_core 每帧调用 (不依赖 DIALOG 页的 dlg_poll,
+ * 保证 toast 叠在普通弹窗/页面之上时同样 1s 自动关并重绘, 不残留不卡死) */
+void os_dialog_toast_tick(ui_ctx_t *ctx) {
+    if (s_toast_msg[0] && os_millis() - s_toast_ms >= s_toast_dur_ms) {
+        if (s_toast_owns_page) {
+            if (ctx) os_pop(ctx);
+            s_toast_owns_page = false;
+            if (s_top < 0) s_dlg_page_open = false;
+        }
+        s_toast_msg[0] = 0;
+        if (ctx) ctx->needs_redraw = true;
+    }
+}
+
+/* V1.5.x: 自定义时长 toast — ms 毫秒后自动消失 (0=默认 1s). 用于"回连成功"等短提示. */
+void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms) {
+    /* ★ 2026-10-27 linit 规范: 未指定 = 1 秒; 指定也不许超过 3 秒(强制上限) */
+    if (ms == 0) ms = TOAST_MS;
+    if (ms > TOAST_MS_MAX) ms = TOAST_MS_MAX;
+    s_toast_dur_ms = ms;
+    snprintf(s_toast_msg, sizeof(s_toast_msg), "%s", msg ? msg : "");
+    s_toast_ms = os_millis();
+    /* 无弹窗栈时需要弹窗页承载 toast。⚠ 必须判"页面是否已开"：
+     *   原来只判 s_top，连续两条 toast 会 push 两个 DIALOG 页，只 pop 一次 ⇒ 残留空白页。 */
+    if (s_top < 0) {
+        if (!dlg_page_live(ctx)) {
+            os_push(ctx, OS_PAGE_DIALOG);
+            s_dlg_page_open = true;
+            s_toast_owns_page = true;
+        } else {
+            s_toast_owns_page = false;   /* 页面是别人开的, 不归 toast 收 */
+        }
+    }
+    ctx->needs_redraw = true;                      /* 立即触发重绘, 让 toast 叠在顶层显示 */
+    /* ★★ 2026-10-19 linit: **toast 不得保活弹窗**。
+     * 原来这里置 s_cb_handled=true ⇒ 回调里只要弹了 toast，确认框就永远不关
+     * (全系统 12 个 confirm 回调都是这个毛病)。toast 只是覆盖层，与弹窗生命周期无关。 */
+}
+
+/* 全局顶层 toast 覆盖: 由 os_render 在**所有模块渲染之后、flush 之前**调用,
+ * 确保提示弹窗恒显示在最上 (不受全屏页如赞助二维码 st7305_clear 覆盖). */
+void os_dialog_draw_overlay(ui_ctx_t *ctx) {
+    if (!ctx->lcd) return;
+    if (toast_active()) dlg_draw_toast(ctx->lcd);
+}
+
+/* ==== 统一退出确认 (冻结帧直绘版) ====
+ * 步步高/文曲星等"自驱动游戏画面"引擎不能走 os 弹窗管道 (它们自己画帧),
+ * 故退到冻结的游戏帧上直绘同一套确认框。外观/交互与 os_dialog_confirm_ex
+ * 的 small 小确认模板完全一致 (标题"退出程序?"在上、左"确定"右"取消"、四边黑框、
+ * 手柄 LEFT=确定/RIGHT=取消 黑块选择, CONFIRM=当前选中项, BACK=取消+松手守卫,
+ * 触摸弹窗内左=确定 右=取消)。阻塞直到用户决定, 返回 true=确认退出。
+ *
+ * 输入一律直读手柄电平 (LEFT/RIGHT/CONFIRM/BACK) 并配上升沿/松手守卫, 不依赖
+ * input 层的 nav/gamemode 开关 —— 游戏内 nav 已关闭时手柄左右仍然可控, 这是与
+ * 其它自驱动引擎可靠交互的关键。物理返回/触摸仍走 input_get_action。 */
+bool os_confirm_exit_blocking(st7305_handle_t *lcd) {
+    if (!lcd) return true;
+    const int W = 140, H = 74, MID = W / 2;
+    const int BX = (ui_screen_w() - W) / 2, BY = (ui_screen_h() - H) / 2;
+    const char *s0 = "\xe7\xa1\xae\xe5\xae\x9a"; /* 确定 */
+    const char *s1 = "\xe5\x8f\x96\xe6\xb6\x88"; /* 取消 */
+    const char *title = "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?"; /* 退出程序? */
+    int sel = 0;   /* 0=确定 1=取消 */
+
+    bool conn = bt_manager_is_connected();
+    /* 各键上次电平 (上升沿触发一次) + 触发键/确认键是否还按着 (松手守卫) */
+    bool l_prev = conn && bt_manager_is_key_pressed(F_LEFT);
+    bool r_prev = conn && bt_manager_is_key_pressed(F_RIGHT);
+    bool c_prev = conn && bt_manager_is_key_pressed(F_CONFIRM);
+    bool b_prev = conn && bt_manager_is_key_pressed(F_BACK);
+    /* 进入弹窗这一刻若触发键/确认键还按着, 不立即当作确认/取消 (松手守卫) */
+    bool confirm_held = c_prev;
+    bool back_held    = b_prev;
+
+    while (1) {
+        fill_rect(lcd, BX, BY, BX + W - 1, BY + H - 1, ST7305_COLOR_WHITE);
+        for (int k = 0; k < 2; k++) {
+            draw_hline(lcd, BX + k, BX + W - 1 - k, BY + k, ST7305_COLOR_BLACK);
+            draw_hline(lcd, BX + k, BX + W - 1 - k, BY + H - 1 - k, ST7305_COLOR_BLACK);
+            draw_vline(lcd, BX + k, BY + k, BY + H - 1 - k, ST7305_COLOR_BLACK);          /* 左边线 */
+            draw_vline(lcd, BX + W - 1 - k, BY + k, BY + H - 1 - k, ST7305_COLOR_BLACK);  /* 右边线 */
+        }
+        draw_text_centered(lcd, BY + 7, title, false);
+        int by = BY + 36;
+        int bot = BY + H - 1 - 2;
+        int bx0 = BX + 2, bx1 = BX + W - 1 - 2;
+        int mid = BX + W / 2;   /* 正中分界竖线 (绝对坐标, 对齐 os_dialog small 模板) */
+        fill_rect(lcd, bx0, by, mid - 1, bot, (sel == 0) ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+        fill_rect(lcd, mid + 1, by, bx1, bot, (sel == 1) ? ST7305_COLOR_BLACK : ST7305_COLOR_WHITE);
+        draw_hline(lcd, BX,     BX + W - 1, by,     ST7305_COLOR_BLACK);
+        draw_hline(lcd, BX,     BX + W - 1, by + 1, ST7305_COLOR_BLACK);
+        draw_vline(lcd, mid,     by, bot, ST7305_COLOR_BLACK);
+        draw_vline(lcd, mid + 1, by, bot, ST7305_COLOR_BLACK);
+        int ty = by + 7;
+        int cx0 = (bx0 + mid - 1) / 2, cx1 = (mid + 2 + bx1) / 2;
+        draw_text(lcd, cx0 - dlg_tw(s0) / 2, ty, s0, (sel == 0));
+        draw_text(lcd, cx1 - dlg_tw(s1) / 2, ty, s1, (sel == 1));
+        st7305_flush(lcd);
+
+        /* ---- 手柄: 直读电平上升沿, 与 nav/gamemode 无关 ---- */
+        if (conn) {
+            bool l = bt_manager_is_key_pressed(F_LEFT);
+            if (l && !l_prev) sel = 0;          /* LEFT=确定 */
+            l_prev = l;
+            bool r = bt_manager_is_key_pressed(F_RIGHT);
+            if (r && !r_prev) sel = 1;          /* RIGHT=取消 */
+            r_prev = r;
+            bool c = bt_manager_is_key_pressed(F_CONFIRM);
+            if (c && !c_prev && !confirm_held) return (sel == 0);   /* CONFIRM=当前选中项 */
+            confirm_held = confirm_held || c;
+            if (!c) confirm_held = false;
+            c_prev = c;
+            bool b = bt_manager_is_key_pressed(F_BACK);
+            if (b && !b_prev && !back_held) return false;           /* BACK=取消 */
+            back_held = back_held || b;
+            if (!b) back_held = false;
+            b_prev = b;
+        }
+
+        /* ---- 物理键 / 触摸: 走 input 层动作 ---- */
+        menu_action_t action = input_get_action();
+        if (action == MENU_ACTION_LEFT) sel = 0;
+        else if (action == MENU_ACTION_RIGHT) sel = 1;
+        else if (action == MENU_ACTION_BACK) return false;          /* 物理返回=取消 */
+        else if (action == MENU_ACTION_CONFIRM || action == MENU_ACTION_LONG_LEFT) {
+            int tx, ty2;
+            if (input_consume_tap(&tx, &ty2)) {
+                if (tx >= BX && tx < BX + W && ty2 >= BY && ty2 < BY + H)
+                    return (tx < BX + MID);                          /* 触摸: 左=确定 右=取消 */
+                continue;                                            /* 点在弹窗外 → 忽略 */
+            }
+            if (!confirm_held) return (sel == 0);                    /* 物理确认键 → 当前选中项 */
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(16));
+    }
+}

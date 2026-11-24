@@ -1,0 +1,648 @@
+/**
+ * os.h — 标准化模块化 OS 内核契约.
+ *
+ * 设计目标:
+ *  1. 无共享大结构: 每个"页面/应用"模块自持私有状态, 留在各自 .c（static/私有 struct）。
+ *  2. 极薄公共上下文 ui_ctx_t: 只给内核与模块传"世界句柄"。
+ *  3. 全局服务单例: 状态栏/音量/电量/蓝牙 等不占页面栈, 可任意叠加渲染。
+ *  4. 纯引擎/纯组件不动: 只做接口对接（见各 *_module.c 适配层）。
+ *
+ * 用法:
+ *   os_init(&ctx, &lcd);
+ *   os_register(&some_module);        // 编译期静态注册
+ *   os_register_service(&statusbar);  // 注册全局服务
+ *   os_push(PAGE_MAIN);               // 进入桌面
+ *   // 主循环:
+ *   os_handle_action(&ctx, action);
+ *   if (os_handle_touch(&ctx, x, y)) ...
+ *   os_render(&ctx);
+ */
+#ifndef OS_H
+#define OS_H
+
+#include "st7305.h"
+#include <stdint.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_timer.h"
+
+/* ===== 统一时间源 (2026-10-24 规范化) =====
+ * 全项目"开机以来多少毫秒"只用这一个函数。
+ * 起因: 排查发现 21 个文件共 55 处各自写 `xTaskGetTickCount() * portTICK_PERIOD_MS`,
+ *       其中 4 个文件还各有一份同名 static now_ms() —— 写法不一, 漏乘 portTICK_PERIOD_MS
+ *       就会变成"1 tick 当 1ms"(本板 TICK_RATE=1000 恰好相等, 换配置立刻错)。
+ * 为什么用 static inline: 它只是读一次 tick, 不该为它付函数调用开销。
+ * ⛔ 新代码不要再写 xTaskGetTickCount()*portTICK_PERIOD_MS, 一律 os_millis()。
+ * ⛔ 需要"跨深睡不丢"的时间用 esp_rtc_get_time_us() (睡眠期间 tick 会停)。 */
+static inline uint32_t os_millis(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+#ifdef __cplusplus
+extern "C" {
+
+#endif
+
+/* ==== 动作码（语义与旧 menu_action_t 一致, 避免改 main.c/input.c/各引擎交互） ==== */
+typedef enum {
+    OS_ACTION_NONE = 0,
+    OS_ACTION_UP,
+    OS_ACTION_DOWN,
+    OS_ACTION_LEFT,
+    OS_ACTION_RIGHT,
+    OS_ACTION_CONFIRM,
+    OS_ACTION_BACK,
+    OS_ACTION_HOME,        /* 退出到桌面 (手柄映射第 7 键) */
+    OS_ACTION_LONG_LEFT,   /* LEFT 长按 500ms */
+    OS_ACTION_LONG_PRESS,  /* 触摸长按 */
+    OS_ACTION_KEY_FAV,     /* 物理 KEY 长按 = 收藏 */
+    OS_ACTION_POWER_LOCK,  /* 软关机键点按 = 锁屏休眠 */
+    OS_ACTION_POWER_HINT,  /* 软关机键 0.5s = 提示 */
+    OS_ACTION_POWER_RELEASE, /* 软关机键 0.5s 后松手 */
+    OS_ACTION_BT_SEARCH,     /* 硬件确认键长按 2s = 蓝牙搜索 */
+} os_action_t;
+
+/* ==== 模块/页面 id（迁移后的页面清单, 与旧 menu_page_t 语义一一对应） ==== */
+typedef enum {
+    OS_PAGE_MAIN = 0,          /* 主菜单桌面 */
+    OS_PAGE_SELECT_GAME,       /* 选择文曲星游戏 */
+    OS_PAGE_SETTINGS,          /* 设置容器 */
+    OS_PAGE_GAMEPAD,           /* 手柄配置 */
+    /* ★ 2026-11-24: 删除 10 个"零注册、零业务引用"的历史页面 id —— 设置页早期是独立子页,
+     *   后来全部改成设置页内的弹窗栈, 这些 id 只剩枚举占位 (远程命令表里那几条 os_push
+     *   必然 "not registered" 失败, 属无效入口)。删前已核实: 除本枚举外仅 remcon 命令表、
+     *   注册自检脚本的忽略清单、os_core 字体白名单出现; 无 Lua 接口、无 NVS 持久化,
+     *   页面 id 不落盘 ⇒ 改枚举数值不影响任何已保存数据。
+     *   被删: SETTINGS_DISPLAY / SETTINGS_TIME / SETTINGS_BT / SETTINGS_SD / SETTINGS_INFO /
+     *        BTINFO / KEY_CONFIG / VOLUME / RETURN_GAME / GAME_SETTINGS */
+    OS_PAGE_MP3_PLAYER,        /* MP3 播放器 */
+    OS_PAGE_GB_GAME,           /* GB 游戏 */
+    OS_PAGE_BOOK,              /* 电子书 */
+    OS_PAGE_WALLPAPER,         /* 壁纸设置 */
+    OS_PAGE_POMODORO,          /* 番茄钟 */
+    OS_PAGE_USB_HID,           /* USB HID 键鼠 */
+    OS_PAGE_APP_MANAGER,       /* 应用管家 (应用管理+商店合并) */
+    OS_PAGE_STORAGE,           /* 存储管理 (3.3: 浏览/挂载/格式化/信息) */
+    OS_PAGE_GBC_GAME,          /* GBC 游戏 */
+    OS_PAGE_NES_GAME,          /* NES 游戏 */
+    OS_PAGE_MD_GAME,           /* MD/Genesis 游戏 (Gwenesis) — 已停用, 见 LINTOS_ENABLE_MD */
+
+    /* ★ 2026-10-13 (linit 决定): **MD/Genesis 模拟器默认不再编入固件**。
+     *   理由: 它占 **715 KB**(全固件第二大) 却**完全没有页面处理器**(死代码),
+     *         注册项也已 hidden ⇒ 纯占体积。把这里改回 1 即可恢复(需同时把
+     *         CMakeLists 里被删掉的 md_emu 加回 os/apps 两个组件的 REQUIRES)。 */
+#ifndef LINTOS_ENABLE_MD
+/* ===== 未完成功能总开关 (2026-10-24 linit 定) =====
+ * 发布前一律置 0: 不注册页面、不进应用中心/引擎分类、不占内部 RAM。
+ * 代码保留在仓库里但**默认编译关闭**, 需要时改 1 即可恢复。
+ * ★ 2026-10-24: NPE (诺亚舟 9288T) 已**整体删除** —— 组件/页面/命令全部移除, 不再有开关。 */
+#ifndef LINTOS_ENABLE_KEYMGR
+#define LINTOS_ENABLE_KEYMGR   0   /* 密钥管理器 (占位页, 功能未完成) */
+#endif
+
+#define LINTOS_ENABLE_MD 0
+#endif
+    OS_PAGE_SMS_GAME,          /* SMS/GG 游戏 (SMSPlus) */
+    OS_PAGE_ARDUBOY_GAME,      /* ArduBoy 游戏 */
+    OS_PAGE_DIAGNOSIS,         /* 故障诊断 */
+    OS_PAGE_WQX,               /* wqx 文曲星 */
+    OS_PAGE_VPET,              /* 暴龙机 */
+    OS_PAGE_WHITEBOARD,        /* 白板 */
+    OS_PAGE_TERMINAL,          /* 终端 */
+    OS_PAGE_SPONSOR,           /* 全屏弹窗 (第5类模板: 全屏显示, 如收款二维码) */
+    OS_PAGE_DIALOG,            /* 通用弹窗 (modal 覆盖页, 由 os_dialog 驱动) */
+    OS_PAGE_USB_BT,            /* USB 蓝牙适配器 (USB-BT) */
+    OS_PAGE_USB_NET,           /* USB 网卡共享 (有线/USB-RNDIS) */
+    OS_PAGE_WINASSIST,         /* Win工具台 (USB 键鼠+串口+U盘复合; 原名 运维助手) */
+    OS_PAGE_PLACEHOLDER_SECURE,/* 占位应用: 安全密码机 (开发中) */
+    /* ★ 2026-11-24: 删除 OS_PAGE_PLACEHOLDER_ALARM (占位应用: 闹钟) —— 从未注册页面、
+     *   应用表里也没有条目, 纯枚举占位。需要闹钟功能时按页模板新写, 不要复活这个 id。 */
+    OS_PAGE_MODTOOL,           /* 修改机: 游戏内存搜索修改工具 */
+    OS_PAGE_LOGDIAO,           /* 日志诊断: Ghost-Audit 集成 (目标电脑日志收集/回传) */
+    OS_PAGE_CALC,              /* 计算器: 科学计算器 */
+    OS_PAGE_WIFIPROBE,         /* Wi-Fi 万用表: 扫描/热力图/探针嗅探/隐藏SSID */
+    OS_PAGE_MORSE,             /* 摩斯密码: 52键键盘+发声/震动+播放全部 */
+    OS_PAGE_NETDECT,           /* 网络分析: 主机发现/端口服务/弱口令/报告 */
+    OS_PAGE_FAV,               /* 收藏夹: 账号/密码 一键模拟键盘输入 */
+    OS_PAGE_LUA,               /* Lua 单文件程序 (可放到内存卡运行) */
+    OS_PAGE_SDR,                   /* 频谱仪 (new_app.py 生成) */
+    OS_PAGE_PAL,                   /* 仙剑奇侠传 (new_app.py 生成) */
+    OS_PAGE_PERFMON,               /* 性能监视器: 独立应用页 (面板与设置里的弹窗同一套绘制) */
+    OS_PAGE_COUNT
+} os_page_t;
+
+/* 前置声明（与旧 menu_state_s 回调指针同一形态约束） */
+typedef struct ui_ctx ui_ctx_t;
+
+/* 页面模块契约 — 任何"页面/应用"都实现这组 ops ==== */
+typedef void (*os_hk_fn)(void);   /* 资源管家: 瞬态资源清理回调 */
+typedef struct os_module os_module_t;
+struct os_module {
+    const char *name;                 /* 模块名（调试用） */
+    os_page_t  page_id;               /* 页面 id, 唯一 */
+
+    void (*on_enter)(ui_ctx_t *ctx);  /* 进入: 分配资源/加载. 可能为 NULL */
+    void (*on_exit)(ui_ctx_t *ctx);   /* 退出: 释放内存 + 存档. 可能为 NULL */
+    void (*render)(ui_ctx_t *ctx);    /* 整页渲染 (无系统状态栏时负责全屏) */
+    void (*action)(ui_ctx_t *ctx, os_action_t a);   /* 按键: 模块内部处理 */
+    bool (*touch)(ui_ctx_t *ctx, int x, int y);     /* 触摸 hit-test: true=命中消费 */
+    void (*poll)(ui_ctx_t *ctx);      /* 每帧后台轮询(可选). 可能为 NULL */
+
+    bool modal;                       /* 是否模态覆盖页 (是则不重绘底层) */
+    bool fullscreen;                  /* 是否全屏(隐藏状态栏); 游戏/应用页=true */
+    /* 是否屏蔽"底部上滑=返回"(白板/终端等全屏绘图/输入页用), 由内核 os_push/os_pop
+     * 统一设置 gesture_back_enable(!swipe_back_disabled), 不依赖各页自行开关,
+     * 避免某页 exit 被跳过导致全局上滑返回卡死. (V1.1.0: 开关已迁到 gesture_back 模块) */
+    bool swipe_back_disabled;
+    /* ★ 2026-10-30 (A6): 是否关闭"底部拖动屏蔽带"。
+     * 该屏蔽带在 input_get_touch_pos 内: 底部 50px 带 (x∈[125,275]) 起手 + 位移≥40px
+     * 就**不再给下层坐标**(防菜单/列表底部误拖)。全屏绘图页(白板)需要整面可用, 否则
+     * 画布下沿的笔迹会被凭空截断 —— 置 true, 由内核 push/pop 统一关闭/恢复。 */
+    bool no_bottom_shield;
+    /* ★ 2026-10-14 linit 全局规范: **应用页按硬件返回键要先弹"退出程序?"确认, 确认才退**。
+     * true = 内核统一拦 BACK 弹确认 (应用页默认应设 true)。
+     * 不设 (=false, 排除项) 的三类:
+     *   ① 引擎类   —— 走游戏态那条分支 (冻结帧确认 + 10s 超时自动退);
+     *   ② 弹窗类   —— 无页面内容的弹窗页 (usb_bt/usb_net/modtool 等), BACK 只关弹窗;
+     *   ③ 自带确认 —— 页内 BACK 有自己的语义 (关详情/回上一步/回列表) 或已自建确认
+     *                 (usb_hid 二级菜单 / lua 脚本可控确认), 它们在"真要退出"处自行调
+     *                 `os_request_exit_confirm()`。 */
+    bool exit_confirm;
+    /* ★ 2026-10-20 linit: **收藏夹这类"工具页"不能被空闲超时弹回桌面**。
+     * 内核 life_tick 会按空闲时长把非全屏页 os_pop_to_main(); 但收藏夹/终端这种
+     * 用户是"打开着慢慢填"的，弹走等于丢现场。置 true = 空闲不自动退回。
+     * (与 fullscreen 无关: fullscreen 还管状态栏显隐，不能为了不弹走而误设。) */
+    bool keep_on_idle;
+    /* ★ 2026-11-22: 退出清理较慢(几十~上百 ms)的**非全屏**菜单页。置 true 后内核走
+     * "先把上一页刷上屏, 再做 on_exit" (与 fullscreen 页同一套 late_exit 路径) ——
+     * 用户按键后画面立刻变, 卸载引擎/释放缓冲在后面跑, 不再干等。
+     * 只给实测慢的菜单页用 (目前: select_game 卸载 gam4980 实测退出 100ms),
+     * 普通菜单页 on_exit 很轻, 不要随手打开 —— 会打乱"先清理后建页"的时序。 */
+    bool defer_exit;
+};
+
+/* ==== 全局服务契约 — 状态栏/音量/电量 等, 不占页面栈, 可在任意页面上方叠加 ==== */
+typedef struct os_service os_service_t;
+struct os_service {
+    const char *name;
+    /* 每帧开头调用, 用于驱动内部状态(电量采样/蓝牙状态等) */
+    void (*tick)(ui_ctx_t *ctx);
+    /* 帧末叠加渲染(在模块 render 之后、flush 之前). 可能为 NULL */
+    void (*render)(ui_ctx_t *ctx);
+    /* V1.5.x: 可选"常驻热区触摸". 当前模块无 touch 且非全屏/非弹窗时兜底分发,
+     * 供状态栏图标等常驻控件响应点击 (命中=返回 true). 旧服务不设则为 NULL. */
+    bool (*touch)(ui_ctx_t *ctx, int x, int y);
+    /* ★ 2026-10-29: true = 本服务是"全局顶层覆盖"(如下拉快捷栏)。
+     *   普通服务的 render/touch 在内核里被 fullscreen / 滚动 状态挡掉 ——
+     *   那对状态栏是对的(全屏页不该画条), 但快捷栏必须**全屏游戏里也能用**。
+     *   置 true 后:
+     *     · render 在 fullscreen / 滚动 时照常画 (仍排在模块 render 之后);
+     *     · touch 在模块 touch **之前**被询问, 命中即消费 (可挡住下方游戏);
+     *     · 本服务自行决定"只在展开时拦截", 收起时只认顶部手势区。
+     *   默认 false, 不影响既有两个服务。 */
+    bool overlay_top;
+};
+
+/* ==== 内核公共状态（薄） ==== */
+struct ui_ctx {
+    st7305_handle_t *lcd;      /* 屏句柄 */
+    int  current_page;         /* 当前模块 id (OS_PAGE_*) */
+    bool needs_redraw;         /* 脏标记 */
+    bool modal_active;         /* 当前是否为模态覆盖页 */
+    bool fullscreen;           /* 运行时全屏覆盖 (模块 render 内设置, 帧末复位;
+                                * 阅读器/游戏等需隐藏状态栏的应用页用) */
+    bool statusbar_on;         /* 本帧状态栏是否显示 (OS 每帧合成, 只读).
+                                * 应用不要直接写, 用 os_statusbar_show(); 要读就调
+                                * os_statusbar_visible() (同一份数据). */
+    /* 页面级触摸坐标映射 (可选): 如书架竖屏(左/右)与 180°(下)时, 把物理横屏坐标
+     * 换算成 UI 逻辑坐标. 页面在 enter/render 时设置, 内核在分发 tap 前与拖动
+     * 轮询 (os_pane_poll) 中统一应用, 弹窗层与页面层共用同一份映射 — 对应 3.3
+     * 书架页内手动旋转的做法. 阅读器等自管全局 input 旋转的模块不设置此钩子. */
+    void (*map_touch)(int *x, int *y);
+    /* 内部(不应被模块直接触碰) */
+    const os_module_t *cur;    /* 当前激活模块 */
+    /* 模块私有状态一律放各自 .c, 不放这里 */
+};
+
+/* ==== 内核 API ==== */
+void os_init(ui_ctx_t *ctx, st7305_handle_t *lcd);
+
+/* 注册模块(编译期静态/运行期均可). 页 id 重复时后者覆盖并告警. */
+void os_register(const os_module_t *mod);
+
+/* 注册全局服务(可在任意页面叠加渲染). */
+void os_register_service(const os_service_t *svc);
+
+/* 进入页: 压栈 + 调用 on_enter. 返回 true=成功. */
+bool os_push(ui_ctx_t *ctx, os_page_t page);
+
+/* 退出当前页: 调用 on_exit + 弹栈回到记录页. */
+void os_pop(ui_ctx_t *ctx);
+
+/* 回主菜单: 一次清空页面栈(只跑最底层非模态页的 on_exit), 再 push 桌面.
+ * 不做逐层 on_enter/on_exit 往返 —— 那是"用户逐级按返回"的语义. */
+void os_pop_to_main(ui_ctx_t *ctx);
+
+/* 请求"收尾完成后强制回桌面"(长按返回 3s / HOME 的逃生口).
+ * 引擎页在阻塞循环里只能 break, 真正的清栈要等模拟任务 stop/unload 之后,
+ * 所以这里只置待办, 由 os_tick 在下一帧执行. 其它页直接调 os_pop_to_main 即可. */
+void os_request_home(ui_ctx_t *ctx);
+
+/* V1.5.x: 当前所在页 id (-1=未进页). 深睡待机前保存, 唤醒后恢复"原页面". */
+int os_current_page(void);
+
+/* 返回栈深度 (0 = 桌面/栈空). 供"退出时收干净"的循环判断:
+ * 栈空时 os_pop 会原地早退、current_page 不变, 只靠页 id 判断会空转。 */
+int os_stack_depth(void);
+
+/* ==== 资源管家 (瞬态资源清理) ==== */
+/* 登记一个"瞬态资源"清理回调 (去重); 由内核在退回主菜单/应用管家时统一执行. */
+void os_housekeeper_add(os_hk_fn fn);
+/* 立即执行已登记的全部瞬态清理 (幂等, 执行后清空登记表). */
+void os_housekeeper_sync(void);
+/* 当前待清理的瞬态项数量 (调试). */
+int  os_housekeeper_pending(void);
+/* 内存审计 (V1.6.x): 输出整机内存分类明细 + 内部/PSRAM 各类大小 + 所有任务栈水位.
+ * 由 remcon `audit` 与管家联调使用, 便于定位"谁占用内部 RAM". */
+void os_housekeeper_mem_audit(void);
+
+/* 事件路由: 按当前模块 action(); 若模块不消费则处理全局 BACK/退栈. */
+void os_handle_action(ui_ctx_t *ctx, os_action_t a);
+void os_page_gamepad_open_scan(ui_ctx_t *ctx);   /* 长按确认键2s: 任意页进入蓝牙搜索 */
+void settings_wifi_connect_open(ui_ctx_t *ctx);  /* 系统"连接WiFi"流程 (设置页实现, 各页共用) */
+
+/* 输入分发: 触摸 hit-test 到当前模块; 未命中返回 false (调用方可回退确认). */
+bool os_handle_touch(ui_ctx_t *ctx, int x, int y);
+
+/* 每帧: 驱动所有 service tick(). */
+void os_tick(ui_ctx_t *ctx);
+
+/* 渲染: 非模态模块 render (全屏页隐藏状态栏), 再叠加所有 service render, flush. */
+void os_render(ui_ctx_t *ctx);
+
+/* 作废"已送屏背景"(2026-10-28): 下一帧先整屏清白 + 重绘最底层非模态页, 再叠弹窗.
+ * 用于背景被旁路刷屏盖过的场景 —— 屏保壁纸独占、全屏模态页返回、引擎直刷.
+ * 不调用的后果: 弹窗叠上去时底下还是上一幅壁纸/全屏页的残影.
+ * 副作用(正面): 整屏清白+重绘=全屏刷新, 满足"弹窗首次出现必须整屏刷". */
+void os_invalidate_bg(void);
+
+/* 请求下一帧重绘 (2026-11-23). 幂等; 给"拿不到 ctx"的调用点用。 */
+void os_request_redraw(void);
+
+/* 查询当前是否停在桌面 (供蓝牙自动重连/屏保等后台逻辑判断). */
+bool os_is_main(const ui_ctx_t *ctx);
+/* 某个页面模块是否已注册 (2026-09-29): 应用表里有 app 却没注册页面 → 点了"毫无反应",
+ * 开机自检用它把这种错配直接报出来。 */
+bool os_page_registered(int page);
+
+/* 是否有模态弹窗/覆盖 (弹窗期间禁止背景拖动等). */
+bool os_modal_active(const ui_ctx_t *ctx);
+
+/* 当前壁纸程序 id (page_wallpaper 保存; 桌面/屏保渲染用; 0=星空默认). */
+int os_wallpaper_get_program(void);
+
+/* ==== 屏保 (星空壁纸) ====
+ * 桌面空闲超过阈值自动全屏渲染星空 (wp_program_render), 任何输入自动唤醒.
+ * 由 os_mgr 空闲检测置位/复位, os_core 渲染 & 输入唤醒. */
+bool os_screensaver_active(void);
+void os_screensaver_reset(void);
+void os_screensaver_force_enter(void);   /* 锁屏键点按: 强制进入壁纸屏保 */
+
+/* ==== 通用弹窗 (modal 覆盖页) ====
+ * 供各页面复用统一弹窗: 列表选择 / 确认框 / 提示 toast.
+ * 打开后压入 OS_PAGE_DIALOG (modal), 不退出底层页面; 关闭后自动恢复底层.
+ * 回调 result: -1=取消/BACK, >=0 选中索引 (确认框: 0=确定 1=取消). */
+typedef void (*os_dialog_cb_t)(ui_ctx_t *ctx, int result, void *ud);
+
+/* ★★ 2026-10-19: **统一弹窗入口** —— 应用只描述"说什么", 显示/关闭全由模块负责.
+ *   规则见 docs/UI规范.md. 旧的 os_dialog_toast/confirm_ex/list 仍然可用(内部转调). */
+typedef enum {
+    OS_DLG_TOAST = 0,     /* 提示条: msg, timeout_ms 可选 */
+    OS_DLG_CONFIRM = 1,   /* 确认框: msg, cb(result: 0=确定 1=取消) */
+    OS_DLG_LIST = 2,      /* 列表选择: title, items, count, sel, cb(result=索引, -1=返回) */
+} os_dlg_type_t;
+
+typedef struct {
+    os_dlg_type_t   type;
+    const char     *title;          /* LIST 用 */
+    const char     *msg;            /* TOAST / CONFIRM 用 */
+    const char *const *items;       /* LIST 用 */
+    int             count;          /* LIST 用 */
+    int             sel;            /* LIST 初始选中 */
+    uint32_t        timeout_ms;     /* 0=不超时 */
+    int             timeout_result; /* 超时结果 */
+    os_dialog_cb_t  cb;             /* 回调 (模块在回调返回后自动关闭) */
+    void           *ud;
+} os_dlg_cfg_t;
+
+void os_dlg_open(ui_ctx_t *ctx, const os_dlg_cfg_t *cfg);
+
+void os_dialog_list(ui_ctx_t *ctx, const char *title,
+                    const char *const *items, int count, int sel,
+                    os_dialog_cb_t cb, void *ud);
+/* ★ 2026-11-08: 同 os_dialog_list, 额外在底栏"返回"上方右侧画一行小字 (corner)。
+ *   corner 为 NULL/空串时与 os_dialog_list 完全一致 —— 老调用方不受影响。 */
+void os_dialog_list_corner(ui_ctx_t *ctx, const char *title,
+                           const char *const *items, int count, int sel,
+                           const char *corner, os_dialog_cb_t cb, void *ud);
+void os_dialog_confirm_ex(ui_ctx_t *ctx, const char *msg, uint32_t timeout_ms,
+                          int timeout_result, os_dialog_cb_t cb, void *ud); /* 超时自动完成 */
+/* V1.7.x: 通用档位滚轮 (上下滑动/方向键翻档, 触摸点击文字直接选中, 底部确认/取消).
+ * 回调 cb(ctx, sel): sel=选中档, -1=取消. 供档位型设置 (关机时间/字体大小/音量/暗黑等) 复用. */
+void os_dialog_wheel(ui_ctx_t *ctx, const char *const *items, int n, int sel,
+                     os_dialog_cb_t on_done);
+/* ★ 2026-11-24: 最上层是否是这个档位滚轮。滚轮自己按"变档/确认/返回"发震动
+ *   (调值一格 = STEP, 比列表移格更明显), 全局按键反馈据此让路, 避免一次按键震两下。 */
+bool os_dialog_wheel_open(void);
+/* 统一退出确认 (冻结帧直绘版): 步步高/文曲星等自驱动引擎在退出点调用.
+ * 外观/交互与 os_dialog_confirm_ex 完全一致: 标题"退出程序?", 左"确定"右"取消",
+ * 手柄 LEFT=确定/RIGHT=取消 黑块选择, CONFIRM=当前选中项, BACK=取消(松手守卫),
+ * 触摸弹窗内左=确定 右=取消. 阻塞直到用户决定. 返回 true=确认退出. */
+bool os_confirm_exit_blocking(st7305_handle_t *lcd);
+
+/* ★ 全屏应用"退出确认"统一入口 (2026-10-14): 无线探测/网络检测/电脑诊断 等全屏应用,
+ * 按硬件返回键先弹"退出程序?"(左确定/右取消), **确认后才退**。
+ * 各页只在"真要退出"那一处调本函数 (页内 BACK 的其它语义不受影响);
+ * 真正 os_pop 延迟到下一帧由 os_tick 执行 (弹窗回调里直接弹栈会只弹掉弹窗层)。 */
+void os_request_exit_confirm(ui_ctx_t *ctx);
+
+/* 延迟退出一页 (2026-10-28): 在**弹窗回调**里调用 —— 弹窗真正关闭后的下一帧才执行 os_pop。
+ * 为什么不能直接 os_pop: 回调执行时弹窗页还在栈顶, 直接 pop 只会弹掉弹窗层, 页面原地不动。
+ * 用途: "点取消就不该继续留在这个页面" —— 如频谱仪未启用时的"占用64KB, 是否启用?"。 */
+void os_request_pop(ui_ctx_t *ctx);
+
+void os_dialog_toast(ui_ctx_t *ctx, const char *msg);   /* 0.5s 自动关闭 (2026-09-22 规范) */
+void os_dialog_toast_ms(ui_ctx_t *ctx, const char *msg, uint32_t ms); /* 自定义时长 toast (0=默认 0.5s) */
+void os_dialog_draw_overlay(ui_ctx_t *ctx);             /* 全局顶层 toast 覆盖: os_render flush 前调用 */
+/* V1.6.x: toast 查询/清除 — os_core 在按键/触摸分发最前调用, 保证任意场景提示即时关闭 */
+bool os_dialog_toast_active(void);
+void os_dialog_toast_clear(void);
+void os_dialog_toast_dismiss(ui_ctx_t *ctx);   /* 关提示 + 收掉 toast 自己开的弹窗页 */
+/* V1.7.x: 全局 toast 超时清理 — os_core 每帧调用 (任意页面/弹窗上 toast 1s 自动关+重绘) */
+void os_dialog_toast_tick(ui_ctx_t *ctx);
+/* V1.6.x: AP 热点激活标志 — 任一模块开热点时置位, 状态栏据此显示 NET 图标 */
+void os_ap_set(bool on);
+bool os_ap_active(void);
+
+/* ==== 弹窗栈 (settings/list_dialog 嵌套弹窗支持) ====
+ * os_dialog 内部维护一层弹窗栈: 开子弹窗压栈, 返回弹栈恢复父弹窗原选中位.
+ * 自定义渲染/按键 (时间编辑等复杂弹窗) 通过 on_render/on_key 挂接.
+ * 嵌套导航: 下一步内容先 os_dialog_pop 弹掉当前层再 os_dialog_push 压入新层 (原地换内容, 不加深层级);
+ * 返回键逐层回退 (上一步), 消除"每个子项单独弹窗"的观感. */
+typedef struct os_dlg_stack os_dlg_stack_t;
+typedef bool (*os_dlg_render_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);
+typedef bool (*os_dlg_key_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, os_action_t a, void *ud);
+typedef void (*os_dlg_poll_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);   /* 每帧轮询 (按键映射捕获等) */
+typedef bool (*os_dlg_touch_t)(ui_ctx_t *ctx, os_dlg_stack_t *d, int x, int y, void *ud); /* 可选: 自定义整层触摸(点列/按钮), true=已消费 */
+struct os_dlg_stack {
+    char  title[32];
+    char  items[60][30];   /* 列表项 (支持数值选择等长列表, 弹窗栈 4 层共 ~7.2KB) */
+    int   count;
+    int   sel;
+    os_dialog_cb_t cb;
+    void *ud;
+    os_dlg_render_t on_render;   /* 可选: 自定义整层渲染, true=已消费 */
+    os_dlg_key_t    on_key;      /* 可选: 自定义按键, true=已消费 */
+    os_dlg_poll_t   on_poll;     /* 可选: 每帧轮询 (当前层激活时调用) */
+    os_dlg_touch_t  on_touch;    /* 可选: 自定义整层触摸(点列/按钮), true=已消费 */
+    bool  no_footer;             /* true=无底部"返回"行 (如确认框: 确定/取消) */
+    bool  small;                 /* true=小自适应确认弹窗 (退出等, 3.3 notice 样式); false=大窗 350×250 */
+    bool  auto_h;                /* true=列表自适应高度(内容少自动收窄, 多则满高滚动); false=固定 350×250 */
+    bool  title_small;           /* ★ 标题用 16px(小字) — 仅应用中心"下载 XX?"用; 其他一律 24px */
+    bool  row_x;                 /* true=每行内容最右侧显示删除"×", 点击 x 命中该行→弹删除确认 (长按即时同义) */
+    bool  row_long;              /* ★ 2026-11-23: 长按列表行(1s)投递 OS_ACTION_LONG_PRESS, **不画** × 图标.
+                                  *   与 row_x 的区别: row_x 是"删除"语义(画×, 长按 800ms);
+                                  *   row_long 只借"长按命中行"这个机制, 显示保持纯名称
+                                  *   (手柄页: 长按连接记录里的手柄名 → 弹"忘记此手柄?"确认).
+                                  *   命中项由 on_key 用 d->sel 取, 与非长按路径完全一致. */
+    bool  rows16;                /* ★ 列表内容用 16px 小字 (扫描弹窗/密集列表); 字库未就绪自动回落 24px */
+    const uint8_t *icon;         /* 可选: 确认弹窗文字区下方居中的 1bpp 位图 (如挂载/传输图标); NULL=无 */
+    int   icon_w, icon_h;        /* icon 宽高 (bitmap 每行 ceil(w/8) 字节, 位=1 黑像素) */
+    char  note[28];              /* ★ 2026-11-08: 图标窗图标下方的一行 16px 说明 (如 "IP：192.168.1.100");
+                                  *   空串=不占高度, 图标窗几何自动增高 22px 并把按钮区下推 */
+    int   fix_w;                 /* >0: 固定弹窗宽度 (两阶段同宽; 0=按内容自适应) — 供确认框→图标窗原位变形同框用 */
+    uint32_t timeout_ms;         /* >0: 打开后超时自动完成 (0=不超时) */
+    int      timeout_result;     /* 超时自动回调的 result */
+    uint32_t open_ms;            /* 内部: push 时记录打开时刻 */
+    char  footer[12];            /* 底部固定"返回"行文字 (默认"返回"; 文件浏览用"返回"/"退出"动态) */
+    char  corner[20];            /* ★ 2026-11-08: 底栏"返回"上方的右下角小字 (如 "积分 32");
+                                  *   空串=不画。列表弹窗用, 不影响行数/滚动几何 */
+    int   scroll_px;             /* 列表跟手拖动: 内容相对"选中窗口"的子像素偏移 ([-DLG_LINE_H, DLG_LINE_H)) */
+    int   scroll_row;            /* ★ 2026-11-20: 拖动产生的滚动位置(可视首行索引, 0=没拖动过)。
+                                  *   原来滚动位置只能由 sel 反推, 拖动后下一帧被算回 0 ⇒ 拖着拖着自己
+                                  *   弹回顶部(硬件管理 8 行刚超一屏, 表现最明显)。
+                                  *   规则: 仅当 sel 落在 [scroll_row, scroll_row+visible) 内才认它,
+                                  *   按键把 sel 移出窗口时自动回到 sel 推导值(能正常回顶)。 */
+};
+void os_dialog_push(ui_ctx_t *ctx, const os_dlg_stack_t *dlg);  /* 压入弹窗栈 (栈空自动开弹窗页); cb 内调用=下一步同窗替换 */
+void os_dialog_pop(ui_ctx_t *ctx);                              /* 弹栈 (回上一层); 栈空则关闭弹窗页 */
+void os_dialog_clear_all(ui_ctx_t *ctx);                        /* 关闭全部弹窗 (清空栈+关弹窗页) */
+int  os_dialog_depth(void);
+/* 最后一次弹窗**真正关掉**的时刻 (us, esp_timer 时间基); 0 = 从未关过。
+ * 给"弹窗关掉那一帧手指可能还按在屏上"的场景做触摸屏蔽窗口 —— 关窗即置位,
+ * 调用方自己算时间差。★ 不要用 os_dialog_depth()==0 判断"刚关完", 那个看不出时间。 */
+int64_t os_dialog_last_close_us(void);
+const os_dlg_stack_t *os_dialog_top(void);
+/* 原位改写当前弹窗内容 (同一框变形, 不加深/不关闭): 返回栈顶可写句柄用于改字段. */
+os_dlg_stack_t *os_dialog_top_mut(ui_ctx_t *ctx);
+/* 标记回调已"接管"当前弹窗 (保持同一窗不自动关闭; 配合 top_mut 原位变形用). */
+void os_dialog_mark_handled(ui_ctx_t *ctx);
+
+/* ==== 应用注册表 (主菜单/应用管理共用; 为应用商店动态安装预留) ==== */
+typedef struct os_app os_app_t;
+struct os_app {
+    const char *id;        /* 唯一 id, 如 "settings" */
+    const char *label;     /* 显示名 (UTF-8) */
+    int         icon_idx;  /* 主菜单 SF 图标索引 */
+    os_page_t   page;      /* 启动进入的页面 */
+    bool        hidden;    /* true=默认不在主菜单显示 (内部页/引擎等) */
+    bool        touch_only;/* true=必须触摸屏才可用 (无触摸时自动隐藏) */
+    const char *cat;       /* 商店子分类: "游戏"/"程序"/"网络"/"运维"/"手册"/"学习", NULL=无分类 */
+    bool        reveal;    /* true=彩蛋(赞助页5连点)揭示类: 开关打开后仅显示引擎游戏+应用管家 */
+    /* ★★★ 2026-10-25: 资源包类应用 —— 依赖目录不存在时**整条不显示**。
+     *   例: 仙剑 requires="/sdcard/pal" ⇒ 没装游戏数据时应用列表里看不到它,
+     *   商店安装资源包解压到该目录后自动出现。以后同类"安装包型"应用照这个填。 */
+    const char *requires;
+};
+
+/* 编译期/运行期注册应用 (商店安装后运行时注册, 主菜单自动出现). */
+void os_app_register(const os_app_t *app);
+/* ★ 2026-11-23: 从注册表移除一条应用。用途 = 扫描换代后发现"文件已删除"的
+ *   Lua/LPK 条目，否则它会永久残留（应用中心分类里一直显示、点开又没文件）。
+ *   内置 C 应用由固件表注册, 不会被调用方移除。 */
+void os_app_unregister(const char *id);
+
+/* ════════════════════════════════════════════════════════════════════════
+ * ★ 2026-11-23 linit「应用中心动态同步」: 注册表**对账式**接口（唯一入口）
+ * ------------------------------------------------------------------------
+ * 注册表只提供"经过同步的当前有效应用"，不再永久累积历史记录。
+ * 使用顺序（同一线程，一次同步 = sync 一次 + prune 一次）：
+ *   1) os_app_sync(views, n)  注册/更新本轮扫描到的全部应用，并打上本轮标记；
+ *   2) os_app_prune(keep, ud) 回收"本轮没出现"的 Lua/LPK 条目（内置页永不清）。
+ * 只有 am_core（掌握扫描完整性与安装位置）调用；页面不要自己增删。
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/** 注册/更新一批应用视图（同 id 覆盖）。视图内容必须指向调用方**长期有效**的存储：
+ *  指针在下次 sync 之前一直被注册表引用（am_core 的双缓冲在换代后仍保留旧缓冲）。 */
+void os_app_sync(const os_app_t *const *views, int n);
+
+/** 回收本轮未出现的条目。keep(id, ud) 返回 true = 保留（例如卡暂时没挂载）。
+ *  只处理 `page == OS_PAGE_LUA` 的动态条目 —— 内置 C 应用不受影响。
+ *  必须在 os_app_sync() 之后调用；从未 sync 过则什么都不做。
+ *  返回移除条数。 */
+int os_app_prune(bool (*keep)(const char *id, void *ud), void *ud);
+
+/** 本轮同步序号（每次 os_app_sync +1）。诊断/测试用。 */
+uint32_t os_app_sync_epoch(void);
+
+int  os_app_count(void);
+const os_app_t *os_app_get(int idx);
+/* 隐藏应用开关 (赞助页 5 连点): 打开后主菜单显示隐藏的引擎/应用管理 */
+bool os_app_hidden_visible(void);
+void os_app_toggle_hidden_visible(void);
+bool os_app_visible(const os_app_t *a);
+/* ★ 2026-11-08: 已知「依赖存在性」时的可见性判断 —— 不访问文件系统。
+ *   requires_ok 由调用方给出（应用中心用 am_app_t.storage_ok，扫描时已确认过文件）。
+ *   隐藏/触摸/主菜单策略与 os_app_visible 完全一致。
+ *   用途: 应用中心切分类时批量预算可见性，避免对每条 Lua/LPK 再 stat 一次 TF 卡。 */
+bool os_app_visible_with(const os_app_t *a, bool requires_ok);
+/* ★ 2026-10-25: 只判断"资源是否就绪"(requires), 不涉及主菜单显示策略。
+ *   应用管家列表要用这个 —— 用 os_app_visible 会把所有 hidden 应用(引擎/工具)全过滤掉。 */
+bool os_app_available(const os_app_t *a);
+int  os_app_visible_count(void);
+const os_app_t *os_app_visible_at(int idx);
+
+/* 主菜单自定义管理 (应用管家): 用户可把任意应用添加到主菜单 / 移出主菜单.
+ * 持久化到 NVS, 覆盖应用的默认 hidden. 返回是否"显式出现在主菜单". */
+bool os_app_in_mainmenu(const char *id);
+void os_app_set_mainmenu(const char *id, bool show);
+/* ★ 2026-11-01: 桌面"图标的增删"代次。用户添加/删除桌面图标**不改变条目数**，
+ *   主菜单原来只在 os_app_count() 变化时重建可见缓存 ⇒ 删掉图标后回到桌面仍然显示
+ *   （看着就是"删不掉"）。主菜单 poll 比一次这个代次即可立刻生效。 */
+uint32_t os_app_vis_gen(void);
+/* 显式隐藏/恢复 (从主菜单彻底移除, 类似卸载的入口动作). */
+bool os_app_in_hidden(const char *id);
+void os_app_set_hidden(const char *id, bool hide);
+
+void os_page_lua_set_boot(const char *path);   /* 应用管家设置要运行的 Lua 脚本 */
+
+/* ★ 2026-11-23: 重载当前 Lua 页 (不压新层)。
+ *   远程控制台反复执行 `app <脚本>` 时用 —— 原来每次都 os_push 一层, 连开 N 次
+ *   就堆 N 层 Lua 页, 退出只弹得掉有限层, 剩下的是空白列表页, 要按好几次返回。 */
+void os_page_lua_reload(ui_ctx_t *ctx);
+
+/* ★ 2026-11-23 linit 报障: 录音机等 Lua 应用「顶部状态栏老是不刷新、不显示」。
+ *   根因 = Lua 页模块静态 fullscreen=true ⇒ 系统状态栏一律不画, 而应用自己又
+ *   留了 24px 给状态栏 (app.fill 从 y=24 起) ⇒ 顶部 24px 永远是上一屏的残留像素。
+ *   这里给脚本一个**统一开关**: app.statusbar(true/false) ⇒ 本页要/不要系统状态栏。
+ *   开关为 true 时 os 层每帧按系统那套 (日期/时间/电量/信号) 自动画, 脚本不用自己拼,
+ *   样式与桌面/内置应用逐像素一致; 为 false (默认) 时保持原行为 (全屏, 不画)。
+ *   脚本约定: 声明 true 后, 自己的内容从状态栏高度 (24px) 之下开始画。 */
+void os_page_lua_set_statusbar(bool on);
+
+/* 状态栏条高度 (与 svc_statusbar.c 的 SB_STRIP_H 一致)。
+ * Lua 脚本用 app.statusbar_h() 取同一个值, 保证"内容起点"与系统一致。 */
+#define OS_STATUS_H 24
+
+/* ==== 平台状态挂钩 (由外壳 main.c 注入, 解耦 os 与具体硬件组件) ====
+ * 状态栏/服务不直接引用 bt_manager/wifi_manager/board_battery 等实现,
+ * 而是通过这组 getter 读取系统状态, 避免 os 依赖旧 menu 巨石组件. */
+typedef struct os_platform_ops {
+    uint8_t (*get_battery)(void);   /* 0..100, 255=未检测到电池 */
+    uint8_t (*get_chg_state)(void); /* ★ 2026-11-21: 0=未充电 1=充电中 2=已充满 (可空) */
+    int     (*get_volume)(void);    /* 0..100 */
+    bool    (*is_muted)(void);
+    bool    (*bt_enabled)(void);
+    bool    (*bt_connected)(void);
+    bool    (*wifi_enabled)(void);
+    bool    (*wifi_connected)(void);
+    bool    (*usb_data_active)(void);
+    /* ==== 操作类 (2026-10-29 快捷栏用) ====
+     * 只给 getter 的话, 快捷栏要么拿不到真实开关, 要么得让 os 反向依赖 bt_ctl /
+     * wifi_manager / audio_player —— 与本结构"解耦"的初衷相悖。
+     * 这里补三个 setter, 由外壳(main.c)注入; 任一为 NULL 表示该功能不可用,
+     * UI 侧显示为不可操作, 绝不假装成功。 */
+    void    (*set_volume)(int percent);      /* 0..100 */
+    void    (*set_bt_enabled)(bool on);      /* 失败无返回: bt_core_radio_on/off 本身幂等 */
+    bool    (*set_wifi_enabled)(bool on);    /* 返回是否成功 (开热点失败要能告诉用户) */
+} os_platform_ops_t;
+
+/* 注入平台状态挂钩 (可多次调用, 覆盖生效). */
+void os_platform_set(const os_platform_ops_t *ops);
+/* 由 os_platform_set() 内部转发: 快捷栏与状态栏共用同一份挂钩, 外壳只需注入一次. */
+void os_quickbar_set_platform(const os_platform_ops_t *ops);
+
+/* ==== CPU 双核静态亲和性工具 (内核 os_core, 独立于资源管家裁剪) ====
+ * 与资源管理无关, 属系统范围工具, 从旧 os_mgr 迁出归位. */
+int  os_core_current_core(void);                              /* 当前运行核 (0/1) */
+void os_core_pin_task(void *task_handle, int core);           /* core 0/1; -1=任意核 */
+
+/* ==== 内建全局服务 (components/os/services 目录) ==== */
+
+/* 状态栏: 由 os_register_all_internal() 自动注册; 此声明仅供需要手动注册/调试时使用. */
+void os_svc_statusbar_register(void);
+/* V1.6.x: 运行时切换状态栏反白模式 (科幻暗色页调用, 仅本页有效). */
+void os_statusbar_set_invert(bool v);
+
+/* ==== 状态栏统一接口 (2026-11-23 linit 整改) ====
+ *
+ * 规范: **应用只声明要不要, 显隐/刷新全由 OS 负责**。不要自己画时间/电量那一排。
+ *
+ *   os_statusbar_show(true)   本页要系统状态栏 (时间/电量/Wi-Fi/蓝牙由 OS 持续刷新)
+ *   os_statusbar_show(false)  本页不要 (全屏)
+ *
+ * 实施细则:
+ *   · 声明**黏在声明时所在的那一页**, 换页自动回到"按页面属性推", 应用退出时
+ *     不需要再调一次 false —— 不会残留到下一页 (这是旧实现最常见的 bug)。
+ *     本页弹出系统弹窗(退出确认等)期间声明**继续有效**, 不会突然变回默认。
+ *   · 在 on_enter / render 里调用均可; render 里每帧调也安全(幂等, 不产生额外重绘)。
+ *   · 开了状态栏后, 应用内容必须从 os_statusbar_visible() 判定为真时的
+ *     OS_STATUS_H(24) 之下开始画; 不放心就一律用 os_statusbar_height() 做起点。
+ *   · 页面本身是 fullscreen 但也想要这条栏 → 直接 show(true), 声明优先于全屏属性。
+ *   · 暗底页面另调 os_statusbar_set_invert(true) (同样按页归属, 换页自动还原).
+ */
+void os_statusbar_show(bool on);
+/* 撤销本页的声明, 回到"按页面属性推"(非全屏就显示)。
+ * ★ 2026-11-23 (第2轮): 供页面在**新应用启动时**清掉上一个应用留下的声明。
+ *   应用一般不需要调用 —— 声明的生命周期由页面模块负责, 不是应用的责任。 */
+void os_statusbar_auto(void);
+/* 本帧是否真的在显示状态栏 (只读, 应用据此算内容起点)。 */
+bool os_statusbar_visible(void);
+/* 状态栏高度 (固定 24)。应用内容起点的唯一来源, 不要再写死 20/24。 */
+int  os_statusbar_height(void);
+/* 当前页的声明值 (OS_SB_AUTO/HIDE/SHOW), 供内核合成显隐; 应用不用调。 */
+int  os_statusbar_page_req(void);
+
+/* 修改机状态栏常驻服务 (mini 图标 + 二级菜单) */
+void os_svc_modtool_register(void);
+
+/* ==== 全局下拉快捷栏 (音量/蓝牙/Wi-Fi, 2026-10-29) ====
+ * 顶部中央 200×10 手势区下滑展开, 展开高度 40px; 上滑收起。
+ * 全屏页(游戏/应用)同样可用。 */
+void os_svc_quickbar_register(void);
+/* 快捷栏是否处于展开状态 —— 内核据此强制 flush (游戏态下引擎自己刷屏,
+ * 不强制 flush 的话快捷栏画进 fb 却送不上屏)。 */
+bool os_quickbar_is_open(void);
+/* 立刻收起快捷栏并归还触摸 (返回键优先调用) */
+void os_quickbar_close(void);
+
+/* 游戏/全屏应用**帧循环**里调用: 收下拉手势并把快捷栏画在当前帧上。
+ * 必须在引擎自己的 while 循环里每帧调 —— 那时 os_tick 不跑, 服务收不到 tick。
+ * lcd 为当前帧缓冲; 内部只在展开/手势中才绘制。 */
+void os_quickbar_game_frame(st7305_handle_t *lcd);
+
+#ifdef __cplusplus
+}
+#endif
+
+void svc_statusbar_draw_game(st7305_handle_t *lcd, uint8_t battery, bool pad_connected);
+/* ---- 片内温度 (ESP32-S3 内置传感器) ----
+ * os_temp_c10(): 当前温度 ×10 (如 364 = 36.4°C)；传感器不可用时返回 -1000。
+ * os_temp_max_c10(): 本次开机以来的最高值 (同样 ×10)，用于"加一项热多少"的对比。
+ * ⚠ ±5°C 绝对值，只可靠地看相对变化，别当环境温度。 */
+int os_temp_c10(void);
+int os_temp_max_c10(void);
+
+#endif /* OS_H */
