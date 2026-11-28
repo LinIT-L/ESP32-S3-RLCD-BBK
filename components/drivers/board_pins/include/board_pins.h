@@ -34,6 +34,10 @@ typedef struct {
     int lcd_freq_mhz;                                    /* LCD SPI 时钟 (走线长/小板要降) */
     int tp_sda, tp_scl, tp_int, tp_rst;                  /* 触摸 I2C (-1 = 无触摸) */
     int btn_pwr, btn_right, btn_left;                    /* 三个按键 */
+    /* LTC2954 电源控制脚 (-1 = 本板无此芯片)。★ 2026-11-28 四版本改造:
+     * 从 ltc2954.h 的硬编码宏挪进板型表 —— 小智关机版 S1_4: KILL=44/INT=1,
+     * 老版 S1_1/微雪/标准无 2954 ⇒ -1。随板型/0x68 判据动态生效。 */
+    int pwr_kill, pwr_int;
     int bat_adc_chan;                                    /* 电池 ADC 通道号 (ADC1) */
     /* 充电中检测 (-1 = 未接): 开漏低有效, **低 = 正在充电**。
      * ★ 2026-11-21 定案: 只有这一根线, 小智板接在 GPIO44 (模组 29 脚 CHRG)。
@@ -44,6 +48,10 @@ typedef struct {
      *   见 board_battery.c 的 charge_state()。
      * ⛔ GPIO2 / GPIO43 是扩展脚, 不得占用 ⇒ 不做 VBUS 分压。 */
     int chrg;
+    /* ★ 2026-11-28: CHRG 极性。0=模组 CHRG 开漏低有效(充电中拉低);
+     *   1=VBUS 分压高有效(100k/100k 从 +5V 到 GND, 插电时 GPIO 读高)。
+     *   S1_4 关机版用后者(GPIO42)。 */
+    bool chrg_active_high;
     int i2s_mclk, i2s_bclk, i2s_ws, i2s_dout, i2s_din;   /* 音频 I2S */
     int codec_sda, codec_scl, pa_pin;                    /* 编解码器 I2C + 功放使能 */
     int vib;                                             /* 震动马达 PWM (-1 = 无) */

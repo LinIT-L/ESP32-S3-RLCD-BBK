@@ -4,7 +4,10 @@ idf_component_register(
     SRCS "sd_scan.c" "sd_arb.c"
     INCLUDE_DIRS "."
     REQUIRES sdmmc fatfs esp_driver_gpio esp_driver_sdmmc freertos
-    PRIV_REQUIRES nvs_flash
+    PRIV_REQUIRES
+        nvs_flash
+        esp_pm         # ★ 2026-11-25: sd_arb 的 ESP_PM_NO_LIGHT_SLEEP 锁
+                       #   (覆盖"一次逻辑访问 = 多次事务"之间的浅睡空档)
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

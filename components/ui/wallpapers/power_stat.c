@@ -10,7 +10,7 @@
 #include "esp_sleep.h"      /* esp_sleep_get_wakeup_cause(): 数"到底醒了几次" */
 #include "esp_system.h"    /* esp_reset_reason(): 区分冷启动 / 深睡唤醒 */
 #include "esp_log.h"
-#include "usb_hid.h"        /* usb_hid_host_mounted(): USB 插入检测 (不做充电检测) */
+#include "usb_hid.h"        /* USB 在位检测: mode_owns_phy(MSC 也算) + host_mounted(CDC) */
 
 #define TAG "PSTAT"
 
@@ -150,7 +150,10 @@ void power_stat_on_deep_sleep(void)
 void power_stat_tick(void)
 {
     static bool prev_usb = false;
-    bool usb = usb_hid_host_mounted();
+    /* ★ 2026-11-25: 判据与屏保统一 —— USB 设备模式(含纯 MSC, 此时没有 CDC,
+     *   host_mounted 会漏判)也算"USB 在位"。host_mounted 内部已有 mode 守卫,
+     *   切换窗口不会碰半拆的 tud_* 栈。纯内存读, 屏保任务可安全调用。 */
+    bool usb = usb_hid_mode_owns_phy() || usb_hid_host_mounted();
     if (usb && !prev_usb) {
         /* USB 插入 = 开始充电 → 三个统计从这一刻重新计时 (linit: 没有充电检测, 按 USB 插入算) */
         ps_clear(ps_now());
@@ -173,7 +176,7 @@ void power_stat_get(power_stat_t *out)
         out->sleep_s = s_ps.sleep_s;
     }
     out->since_usb_s = out->awake_s + out->sleep_s;
-    out->usb_now = usb_hid_host_mounted();
+    out->usb_now = usb_hid_mode_owns_phy() || usb_hid_host_mounted();
 }
 
 /* ★ 2026-10-26: 打印事件日志 (旧→新). 供串口 `pwr` 命令 / 诊断用. */

@@ -26,6 +26,7 @@
 #include "tinyusb_default_config.h"
 #include "tusb_config.h"
 #include "driver/usb_serial_jtag.h"
+#include "esp_pm.h"
 #include "class/hid/hid.h"
 #include "class/hid/hid_device.h"
 #include "class/cdc/cdc_device.h"
@@ -211,12 +212,87 @@ typedef enum {
                             *   ⇒ 重试动作 = **先卸 TinyUSB, 再装 SJ** */
 } usb_mode_t;
 
-static usb_mode_t s_mode = USB_MODE_NORMAL;
+/* ★ 2026-11-25: 加 volatile —— usb_hid_mode_owns_phy() 会被**别的核/别的任务**读
+ *   (wallpapers 屏保监督任务在另一核, remcon 在串口任务), 普通 static 可能被编译器
+ *   提升成寄存器缓存, 看到过期的模式状态(浅睡判定就会漏一拍)。 */
+static volatile usb_mode_t s_mode = USB_MODE_NORMAL;
 
 /* 是否处于"TinyUSB 在跑"的四个正常模式 */
 static inline bool mode_is_tinyusb(usb_mode_t m)
 {
     return m == USB_MODE_HID || m == USB_MODE_MSC || m == USB_MODE_BTH || m == USB_MODE_NET;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * USB 模式浅睡否决权 (2026-11-25)
+ *
+ * 规则: 只要 PHY 归 USB 设备模式(TinyUSB 在跑, 或卸载失败后的不确定态),
+ *       就持一把 ESP_PM_NO_LIGHT_SLEEP 锁 —— **USB 模式期间一律不许自动浅睡**。
+ *       退出到 NORMAL 立刻释放, 原有浅睡管理逻辑(桌面档/屏保档/省电)照旧生效。
+ *
+ * 为什么用 PM 锁而不是继续改 light_sleep_enable:
+ *   ① 浅睡会关 USB PHY / USB Serial-JTAG(本文件历史实测), MSC 传输中掉 PHY =
+ *      电脑侧 U 盘消失 + 重新枚举, 现象就是"访问 TF 卡/传文件自动重启"。
+ *   ② 这把锁是 IDF 内部的**硬否决**: pm_impl.c 中 acquire 会把
+ *      BIT(PM_MODE_APB_MIN) 置进 s_mode_mask, get_lowest_allowed_mode()
+ *      因此恒返回 APB_MIN, 永远到不了 PM_MODE_LIGHT_SLEEP。
+ *      ⇒ 任何路径(wallpapers 桌面/屏保、remcon `lsleep 1` / `pwrbin 0x10`、
+ *        power_mgr 收尾)把 light_sleep_enable 改成 true 都**绕不过它**,
+ *        满足"统一遵循、不能有遗漏或覆盖"。
+ *   ③ 不再依赖 usb_serial_jtag_is_connected() / SOF / usb_hid_host_mounted():
+ *      MSC 期间 USJ 驱动已被本文件卸载(SOF 恒 false), tud_mounted() 又只在
+ *      TinyUSB 侧有意义 —— 两者在切换窗口都可能误判。这里只看**自己的模式状态**,
+ *      进入前就上锁, 没有任何"先判后睡"的竞态窗口。
+ *   ④ 不是永久禁浅睡: 只在 USB 模式存活期间持有, 计数归零后该睡照睡。
+ *   ⑤ 不改频率: NO_LIGHT_SLEEP 只映射到 PM_MODE_APB_MIN, CPU 上限不动。
+ *
+ * 计数语义: esp_pm_lock 是计数式, 但本模块的语义是"模式期间持有一份",
+ *   用 s_pm_nols_held 保证 take/give 严格 1:1 —— 反复 enter/exit 不会累积计数,
+ *   也不会出现"exit 多放一次把别人的配额减掉"。
+ * 线程: take/give 只在 usb_mode_enter/exit 里调(任务上下文), 且都不在临界区内。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static esp_pm_lock_handle_t s_pm_nols = NULL;
+static int  s_pm_nols_state = 0;      /* 0=未创建 2=可用 3=不可用(只报一次, 单调) */
+static volatile bool s_pm_nols_held = false;  /* 是否已持有一份(诊断会被别的任务读) */
+
+static void usb_pm_nols_ensure(void)
+{
+    if (s_pm_nols_state != 0) return;
+
+    esp_pm_lock_handle_t h = NULL;
+    esp_err_t err = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "usb_mode", &h);
+    if (err == ESP_OK && h) {
+        s_pm_nols = h;
+        s_pm_nols_state = 2;
+        ESP_LOGI(TAG, "浅睡否决权就绪: USB 模式期间禁止自动浅睡");
+    } else {
+        /* 没开 CONFIG_PM_ENABLE / 内存不足: 不致命 —— 此时 light_sleep_enable 本身也无效。 */
+        s_pm_nols_state = 3;
+        ESP_LOGW(TAG, "浅睡否决权不可用(%s)", esp_err_to_name(err));
+    }
+}
+
+/* 进入 USB 模式前调用: 必须在**动 PHY 之前**拿到否决权,
+ * 否则卸载 USJ / 装 TinyUSB 的那几毫秒里, 一次 8ms 空闲就可能被 tickless idle 抓走。 */
+static void usb_pm_nols_take(void)
+{
+    if (s_pm_nols_held) return;       /* 已持有: 不重复计数 */
+    usb_pm_nols_ensure();
+    if (!s_pm_nols) return;
+    esp_err_t err = esp_pm_lock_acquire(s_pm_nols);
+    if (err == ESP_OK) {
+        s_pm_nols_held = true;
+    } else {
+        ESP_LOGW(TAG, "禁浅睡失败(%s) ⇒ 本次 USB 模式期间仍可能被浅睡打断", esp_err_to_name(err));
+    }
+}
+
+/* 回到 NORMAL(或确认 PHY 不再归 TinyUSB)时调用。幂等。 */
+static void usb_pm_nols_give(void)
+{
+    if (!s_pm_nols_held) return;
+    s_pm_nols_held = false;
+    if (s_pm_nols) esp_pm_lock_release(s_pm_nols);
 }
 
 /* 切换期间日志接管: 只丢弃输出, 不写任何串口 (切换窗口几 ms, 丢失可忽略) */
@@ -260,6 +336,11 @@ static bool usj_restore(void)
  * 注: 挂载模式由调用方 (usbh_msc) 额外暂停串口控制台 (只写文件), 键鼠模式与旧版一致. */
 static esp_err_t usb_mode_enter(const uint8_t *config_desc, const char **strings, int str_count)
 {
+    /* ★ 2026-11-25: 先否决自动浅睡, 再动 PHY。
+     *   必须在卸载 Serial/JTAG 之前 —— 那一刻起 PHY 就随时可能被 USB 栈接管,
+     *   任何一次浅睡都会把 PHY 关掉, 让枚举/传输半途而废。 */
+    usb_pm_nols_take();
+
     vprintf_like_t prev = esp_log_set_vprintf(&usb_log_discard);
 
     /* 释放 Serial/JTAG (与虚拟键鼠一致的切换序列), 稍等稳定 */
@@ -267,6 +348,7 @@ static esp_err_t usb_mode_enter(const uint8_t *config_desc, const char **strings
     if (sj_ret != ESP_OK) {
         ESP_LOGD(TAG, "卸载 Serial/JTAG 失败: %s", esp_err_to_name(sj_ret));
         esp_log_set_vprintf(prev);
+        usb_pm_nols_give();              /* 没进 USB 模式, 把浅睡还回去 */
         return sj_ret;
     }
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -291,6 +373,9 @@ static esp_err_t usb_mode_enter(const uint8_t *config_desc, const char **strings
          *   (重试动作 = 只装 SJ), 不是 TINYUSB_STUCK。 */
         bool ok = usj_restore();
         esp_log_set_vprintf(prev);
+        /* 两种结果都已离开 TinyUSB(install 失败路径内部会 usb_del_phy 清理 PHY)
+         * ⇒ 不该继续占着浅睡否决权, 否则一次失败就把整机省电永久废掉。 */
+        usb_pm_nols_give();
         if (!ok) {
             s_mode = USB_MODE_RECOVER_FAIL;
             ESP_LOGE(TAG, "进入 TinyUSB 失败(%s) 且串口回滚也失败 ⇒ RECOVER_FAIL, 下次退出会重试",
@@ -312,7 +397,11 @@ static esp_err_t usb_mode_enter(const uint8_t *config_desc, const char **strings
  *    现在: 按状态分支 + 失败保留失败态 + 每一步都查返回值并打错误码。 */
 static esp_err_t usb_mode_exit(void)
 {
-    if (s_mode == USB_MODE_NORMAL) return ESP_OK;   /* 正常态: 没有 TinyUSB 要卸 */
+    if (s_mode == USB_MODE_NORMAL) {
+        /* 防御: 正常态不该持有否决权。真持有(异常路径残留)就还掉, 否则省电永久失效。 */
+        usb_pm_nols_give();
+        return ESP_OK;                  /* 正常态: 没有 TinyUSB 要卸 */
+    }
 
     usb_mode_t from = s_mode;
     vprintf_like_t prev = esp_log_set_vprintf(&usb_log_discard);
@@ -345,10 +434,15 @@ static esp_err_t usb_mode_exit(void)
 
     if (!ok) {
         s_mode = USB_MODE_RECOVER_FAIL;      /* ← 关键: 绝不置 NORMAL */
+        /* TinyUSB 已确认卸净, PHY 不再归它(只是 pad 没开回来) ⇒ 释放浅睡否决权。
+         * 这里放开是安全的: 没有 USB 通信可被打断, 而一直禁浅睡纯属白耗电。 */
+        usb_pm_nols_give();
         ESP_LOGE(TAG, "退出模式(%d)失败: 串口未恢复, 状态=RECOVER_FAIL(下次可重试)", (int)from);
         return ESP_FAIL;
     }
     s_mode = USB_MODE_NORMAL;
+    /* 回到正常模式: 把浅睡还给原有管理逻辑(桌面档 auto / 屏保档 / 省电模式)。 */
+    usb_pm_nols_give();
     ESP_LOGI(TAG, "已退出模式(%d), Serial/JTAG 已恢复", (int)from);
     return ESP_OK;
 }
@@ -382,6 +476,7 @@ static esp_err_t mode_prepare_enter(void)
 
     if (usj_restore()) {                       /* RECOVER_FAIL: 当场补装一次 */
         s_mode = USB_MODE_NORMAL;
+        usb_pm_nols_give();                    /* 回到 NORMAL ⇒ 不支持有否决权(幂等) */
         ESP_LOGW(TAG, "上一模式恢复首次失败(%s), 重试已成功, 继续进入", esp_err_to_name(er));
         return ESP_OK;
     }
@@ -451,6 +546,39 @@ bool usb_composite_is_connected(void)
     /* ★ 2026-10-29: 用 mode_is_tinyusb 而不是 != NORMAL —— 失败态(RECOVER_FAIL/STUCK)下
      *   TinyUSB 栈已卸载, 调 tud_mounted() 没有意义且不安全。 */
     return mode_is_tinyusb(s_mode) && tud_mounted();
+}
+
+/* ★ 2026-11-25: PHY 是否被 USB 设备模式占用 —— 电源管理的唯一判据。
+ * 只看本模块的模式状态, **不读 SOF、不调 tud_*()**:
+ *   · 四个 TinyUSB 正常模式           → true
+ *   · RECOVER_FAIL / TINYUSB_STUCK    → 也 true(卸载失败, PHY 归属不确定,
+ *                                        不能在这个状态下让 PHY 掉电)
+ *   · NORMAL                          → false
+ * 纯内存读, 任意任务/任意时刻可调(屏保监督任务的栈在 PSRAM 也没问题)。 */
+bool usb_hid_mode_owns_phy(void)
+{
+    /* 第二个条件盖住"切换窗口": usb_mode_enter() 先 take 锁, s_mode 由调用方
+     * 在 enter 返回后才置位, 中间隔着整个 TinyUSB install(几十 ms)。
+     * 这段时间 PHY 已经在改归属, 必须同样算"USB 模式占用", 否则那一小段
+     * 仍可能被判成"线拔了"。 */
+    return s_mode != USB_MODE_NORMAL || s_pm_nols_held;
+}
+
+/* 当前是否真的握着浅睡否决权 (诊断用: `pm` 的锁表里能看到 usb_mode) */
+bool usb_hid_light_sleep_blocked(void)
+{
+    return s_pm_nols_held;
+}
+
+/* ★ 2026-11-25: TinyUSB 设备栈是否已确认卸净 —— TF 卡能不能收回本机的判据。
+ *   NORMAL        : 没有 TinyUSB 在跑               → true
+ *   RECOVER_FAIL  : TinyUSB 已确认卸净(只差 SJ)      → true
+ *   TINYUSB_STUCK : 卸载失败, PHY 可能仍归 OTG       → false
+ *   四个 TinyUSB 正常模式                            → false
+ * 只看模式状态, 不调 tud_*(): 失败态下 TinyUSB 栈可能已不存在。 */
+bool usb_hid_tinyusb_gone(void)
+{
+    return s_mode == USB_MODE_NORMAL || s_mode == USB_MODE_RECOVER_FAIL;
 }
 
 /* ---------------- 对外 API (键鼠) ---------------- */
@@ -597,7 +725,19 @@ bool usb_hid_host_mounted(void)
     /* linit 明确: 不做充电检测, 只按 **USB/串口连接** 判。
      * tud_mounted()      = 主机已枚举我们(插到电脑上就算, 不要求打开串口)
      * tud_cdc_connected()= 串口已被主机打开(在跑 monitor / 传文件)
-     * 两者任一为真即视为"USB 连着"。纯充电器不枚举 → 仍检测不到(板子没把 CHRG/VBUS 接给 MCU)。 */
+     * 两者任一为真即视为"USB 连着"。纯充电器不枚举 → 仍检测不到(板子没把 CHRG/VBUS 接给 MCU)。
+     *
+     * ★★ 2026-11-25 崩溃修复: 必须有 mode 守卫 ★★
+     *   原实现无条件调 tud_*()。TinyUSB 卸载窗口里(usb_mode_exit 的
+     *   tinyusb_driver_uninstall → tusb_deinit 之间)栈处于半拆状态, 此时
+     *   power_stat_tick()(屏保监督任务每轮调用)读 tud_mounted() 会访问
+     *   已释放/未初始化的 usbd 状态 ⇒ 随机重启。
+     *   与同文件 usb_composite_is_connected()/usb_hid_cdc_connected() 的
+     *   mode 守卫对齐: 只有确定处于 TinyUSB 模式才允许问协议栈。
+     *   RECOVER_FAIL/TINYUSB_STUCK/NORMAL 三个失败态一律返回 false。
+     *   ⚠ 这条只影响"电源统计/UI 显示", 屏保与关机的 USB 判据走的是
+     *     wallpapers 的 wp_usb_present() → usb_hid_mode_owns_phy(), 不受影响。 */
+    if (!mode_is_tinyusb(s_mode)) return false;
     return tud_mounted() || tud_cdc_connected();
 }
 

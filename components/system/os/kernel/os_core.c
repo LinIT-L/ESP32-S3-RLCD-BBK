@@ -330,6 +330,13 @@ void os_handle_action(ui_ctx_t *ctx, os_action_t a)
         return;
     }
     uint32_t now_a = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    /* ★ 2026-11-25: 关机是系统级动作, 必须在屏保唤醒吞掉逻辑**之前**处理 ——
+     *   否则屏保态长按 PWR 2s 只会唤醒壁纸、action 被丢弃, 关机框弹不出。
+     *   os_power_shutdown_confirm 内部会自己退屏保(解除 LCD 独占/flush 门禁)。 */
+    if (a == OS_ACTION_POWER_SHUTDOWN) {
+        os_power_shutdown_confirm(ctx);
+        return;
+    }
     bool was_ss = os_screensaver_active();
     /* 屏保唤醒: 物理键/手柄直接唤醒; 触摸动作须"触摸唤醒"开关开启才唤醒.
      * V1.5.x: 关闭触摸唤醒后, 屏保态长按/滑动等触摸产生的 action 不得解除屏保. */

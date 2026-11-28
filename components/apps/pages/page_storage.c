@@ -204,10 +204,11 @@ static void sd_format_stage(ui_ctx_t *ctx) {
 }
 
 static void open_sd_format(ui_ctx_t *ctx) {
-    /* ★ 2026-11-22: 卡已交给电脑 (USB MSC) 时禁止格式化 ——
+    /* ★ 2026-11-22/2026-11-25: 卡交出去期间禁止格式化 ——
      *   否则会在 PC 正在读写这张卡的时候抢占 SDMMC 并整卡擦除 (PC 侧直接损坏)。
-     *   驱动层 sd_format_start_async() 也有同一道闸, 这里先给出可读的提示。 */
-    if (usbh_msc_is_running() || sd_usb_owned()) {
+     *   用 card_busy() 而不是 state==USB: PREPARING/STOPPING/RESTORING 这三个过渡态
+     *   同样不能碰卡。驱动层 sd_format_start_async() 仍有同一道闸, 这里先给可读提示。 */
+    if (usbh_msc_card_busy() || sd_usb_owned()) {
         os_dialog_toast(ctx, "请先退出电脑挂载");
         return;
     }
@@ -216,209 +217,239 @@ static void open_sd_format(ui_ctx_t *ctx) {
 }
 
 /* =====================================================================
- * 挂载/卸载 — 复用确认弹窗 + 图标弹窗, 真实挂载移到后台任务 (UI 不卡顿).
+ * 挂载/卸载 —— 一个弹窗按状态原地变形, 真实流程全在后台 (UI 不卡顿)。
  *
- * 关键修复(彻底解决"点挂载后等十几秒"): 之前 sd_mount_confirm 在 UI 回调里
- * 同步执行 usbh_msc_start()——Serial/JTAG 卸载 + tinyusb 安装 + PHY 切 OTG
- * 独占式耗时十几秒, UI 白屏卡死. 现在:
- *   1. 点"确定" → 立刻关闭确认框, 弹出"挂载中…"图标弹窗(含挂载图标 + 单按钮"退出挂载");
- *   2. 真实挂载 (sd_unmount_vfs_keep_card + usbh_msc_start) 放到独立低优先级后台任务,
- *      UI 继续流畅; 完成后由弹窗 on_poll 把标题切成"已挂载";
- *   3. 全程可取消: 挂载中按"退出挂载" → 置取消标志, 后台就绪后立即拆除重挂;
- *      已挂载按"退出挂载" → 停止 MSC + 重挂 VFS + 恢复 watcher, 无需重启.
+ * 历史: 最初在 UI 回调里同步执行 (Serial/JTAG 卸载 + tinyusb 安装 + PHY 切 OTG
+ * 十几秒, 白屏卡死) → 后来改成两个后台任务 + 一堆界面标志。
+ * 2026-11-25 收敛成: 界面只发请求 + 按 usbh_msc 状态机渲染 (见下面的大段说明)。
  * ===================================================================== */
 #include "mount_icon.inc"
 #include "web_icon.inc"     /* ★ 2026-11-01: 「网络访问存储」用的浏览器图标 64x64 */
 
-/* 后台挂载/卸载状态机 (on_poll 轮询, 避免跨任务直接改 UI):
- *  -2=挂载中; -1=空闲; 0=已挂载; 1=卸载VFS失败; 2=usbh_msc_start失败; 3=挂载中取消; 4=已卸载 */
-#define M_MOUNTING   -2
-#define M_IDLE       -1
-#define M_MOUNTED     0
-#define M_MOUNT_FAIL1 1
-#define M_MOUNT_FAIL2 2
-#define M_CANCELLED   3
-#define M_UNMOUNTED   4
-#define M_MOUNT_BUSY  5   /* ★ 2026-11-24: 网页共享还在传文件, 不能交卡 */
-static volatile int  s_mount_result  = M_IDLE;
-static volatile bool s_mount_cancel  = false;
-static volatile bool s_unmounting    = false;   /* 后台正执行卸载 (UI 不卡顿) */
-static TaskHandle_t  s_mount_task    = NULL;
+/* ═══════════════════════════════════════════════════════════════════════════
+ * USB 访问存储: 界面只做两件事 —— 发请求 + 按状态渲染
+ *
+ * 2026-11-25 重构: 这里原来自己维护 7 个状态变量 (s_mount_result / s_unmounting /
+ *   s_vfs_restoring / s_mount_t0 / s_unmount_t0 / s_vfs_t0 / s_mount_cancel)、
+ *   两个后台任务 (mount_worker / unmount_worker) 和三处超时, 与 usbh_msc、sd_scan
+ *   各自记的"卡归谁"互相打架, 于是出现:
+ *     · "电脑上已卸载, 机器上弹窗不关" —— 关窗条件其实挂在本地 VFS 重挂上;
+ *     · "提示存储恢复中, 只能重启" —— 守卫没有超时, 后台卡在挂载锁上就永久拒绝;
+ *     · "超时后放行入口" —— 状态被界面改掉, 后台却还在跑。
+ *   现在生命周期全部归 usbh_msc 的会话状态机 (见 usbh_msc_sdspi.h), 本文件:
+ *     · 发请求: usbh_msc_request_start / stop / cancel
+ *     · 读快照: usbh_msc_status()  (state + outcome + seq)
+ *     · 渲染:   状态变一次就整体重画一次 (seq 就是"有没有新事件"的判据)
+ *   ⛔ 不要在这里重新加"正在挂载/正在卸载"之类的本地标志或超时。
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* 停止 USB MSC 并重挂 TF (退出挂载/取消挂载共用) */
-static void mount_teardown(void) {
-    usbh_msc_stop();
-    sd_remount_vfs_from_card();
-    sd_watcher_set_paused(false);
-    web_files_resume();        /* ★ 卡回到本机: 恢复受理网页请求 */
+/* 弹窗打开那一刻的状态 seq —— 只用于"自打开以来有没有新事件",
+ * 是**弹窗作用域**的基准值, 不是生命周期状态。 */
+static uint32_t s_dlg_seq0 = 0;
+
+static void mount_dlg_render(os_dlg_stack_t *d, usbh_msc_status_t st);
+static void mount_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud);
+static void mount_btn_cb(ui_ctx_t *ctx, int result, void *ud);
+
+/* 按状态整体改写弹窗内容。同一份代码既用于"首次打开"也用于"状态变了重绘",
+ * 因此不存在"某个转换忘了改标题/按钮"这类问题。
+ * ⚠ 只填字段, **不做 memset** —— 它也会被用于改写活弹窗(os_dialog_top_mut)。 */
+static void mount_dlg_render(os_dlg_stack_t *d, usbh_msc_status_t st)
+{
+    const int64_t nowm = (int64_t)(esp_timer_get_time() / 1000);
+    const int64_t in_state_ms = st.since_ms ? (nowm - (int64_t)st.since_ms) : 0;
+
+    d->title[0]  = '\0';
+    d->count     = 0;
+    d->sel       = 0;
+    d->icon      = NULL;
+    d->icon_w    = 0;
+    d->icon_h    = 0;
+    d->no_footer = true;
+    d->small     = true;
+    d->cb        = mount_btn_cb;
+    d->on_poll   = mount_dlg_poll;
+    /* 宽度按"确认框"定死: 挂载中/已挂载都是同一个框原位变形, 宽度跳变很显眼 */
+    d->fix_w     = text_width("确定挂载到电脑?") + 24;
+
+    switch (st.state) {
+    case USBH_MSC_IDLE:
+    case USBH_MSC_FAULT:
+        snprintf(d->title, sizeof(d->title), "%s",
+                 (st.state == USBH_MSC_FAULT) ? "重新挂载到电脑?" : "确定挂载到电脑?");
+        d->count = 2;
+        snprintf(d->items[0], sizeof(d->items[0]), "确定");
+        snprintf(d->items[1], sizeof(d->items[1]), "取消");
+        break;
+
+    case USBH_MSC_PREPARING:
+        /* 图标 + 单个「取消」: 后台在每个阶段边界都查取消闩锁, 点了就一定会收手
+         * (没交卡就直接退; 已交卡就立刻收回), 不会留下半挂状态。 */
+        if (in_state_ms > 20000) snprintf(d->title, sizeof(d->title), "挂载较慢…");
+        d->icon   = mount_icon_tf_64;
+        d->icon_w = MOUNT_ICON_W;
+        d->icon_h = MOUNT_ICON_H;
+        d->count  = 1;
+        snprintf(d->items[0], sizeof(d->items[0]), "取消");
+        break;
+
+    case USBH_MSC_USB:
+        d->icon   = mount_icon_tf_64;
+        d->icon_w = MOUNT_ICON_W;
+        d->icon_h = MOUNT_ICON_H;
+        d->count  = 2;
+        snprintf(d->items[0], sizeof(d->items[0]), "卸载");
+        snprintf(d->items[1], sizeof(d->items[1]), "取消");
+        break;
+
+    case USBH_MSC_STOPPING:
+        /* USB 侧还在退(等主机完成未结的 SCSI 命令)。只报告, 不假装完成。 */
+        if (in_state_ms > 15000) snprintf(d->title, sizeof(d->title), "卸载较慢…");
+        d->icon   = mount_icon_tf_64;
+        d->icon_w = MOUNT_ICON_W;
+        d->icon_h = MOUNT_ICON_H;
+        d->count  = 1;
+        snprintf(d->items[0], sizeof(d->items[0]), "卸载中");
+        break;
+
+    default:   /* RESTORING: 正常情况下弹窗已关(poll 关的), 这里只是兜底 */
+        d->count = 1;
+        snprintf(d->items[0], sizeof(d->items[0]), "存储恢复中");
+        break;
+    }
 }
 
-/* 后台任务: 真实执行挂载, 并记录"内部速度/挂载耗时"供串口核对 */
-static void mount_worker_task(void *arg) {
-    (void)arg;
-    sd_watcher_set_paused(true);          /* 先暂停 SD watcher (VFS 卸载后 PC 读写扇区) */
-    int64_t t0 = esp_timer_get_time();
-
-    /* ★★ 2026-11-24 交卡前必须先让网页文件服务清场。
-     *   原来这里直接 sd_unmount_vfs_keep_card() —— 如果此刻浏览器正在下载/上传
-     *   (用户恰恰就是先传文件、再点挂载), httpd 的 handler 手里握着 /sdcard 上的
-     *   FILE*, 而交卡会把 VFS 上下文 free 掉 ⇒ 下一次 fread/fwrite 就是悬垂指针,
-     *   设备立刻重启。这一条就是"电脑一访问就重启"的第二个入口。
-     *   清不掉(真的在传大文件)就**不交卡**, 明确告诉用户, 而不是赌它刚好传完。 */
-    if (!web_files_quiesce(3000)) {
-        sd_watcher_set_paused(false);
-        web_files_resume();          /* 没交卡 ⇒ 立刻让网页共享恢复受理 */
-        s_mount_result = M_MOUNT_BUSY;
-        ESP_LOGW(TAG, "挂载中止: 网页共享仍在传输文件");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int rc1 = sd_unmount_vfs_keep_card();               /* 卸载 VFS, 保留 card */
-    int64_t t1 = esp_timer_get_time();
-    if (rc1 != 0) {
-        sd_watcher_set_paused(false);
-        web_files_resume();
-        s_mount_result = M_MOUNT_FAIL1;
-        ESP_LOGD(TAG, "挂载失败: 卸载 VFS 失败");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    esp_err_t rc2 = usbh_msc_start();                   /* Serial/JTAG 卸载 + tinyusb + PHY 切 OTG */
-    int64_t t2 = esp_timer_get_time();
-    ESP_LOGI(TAG, "[挂载耗时] 卸载VFS %lldms | tinyusb+PHY切换 %lldms | 合计 %lldms (内部速度)",
-             (long long)((t1 - t0) / 1000),
-             (long long)((t2 - t1) / 1000),
-             (long long)((t2 - t0) / 1000));
-
-    if (rc2 != ESP_OK) {
-        sd_remount_vfs_from_card();
-        sd_watcher_set_paused(false);
-        web_files_resume();            /* 交卡失败, 卡回到本机 ⇒ 恢复网页访问 */
-        s_mount_result = M_MOUNT_FAIL2;
-        ESP_LOGD(TAG, "挂载失败: usbh_msc_start %s", esp_err_to_name(rc2));
-        vTaskDelete(NULL);
-        return;
-    }
-    if (s_mount_cancel) {                                /* 用户挂载中已取消 → 立即拆除 */
-        mount_teardown();
-        s_mount_result = M_CANCELLED;
-        ESP_LOGI(TAG, "挂载中取消: MSC 停止, VFS 已重挂");
-        vTaskDelete(NULL);
-        return;
-    }
-    s_mount_result = M_MOUNTED;                          /* 成功 */
-    ESP_LOGI(TAG, "挂载成功 (USB MSC), 请连接电脑");
-    vTaskDelete(NULL);
-}
-
-/* 后台任务: 卸载 (停止 USB MSC + 重挂 VFS + 恢复 watcher), 记录耗时 — UI 不卡顿 */
-static void unmount_worker_task(void *arg) {
-    (void)arg;
-    int64_t t0 = esp_timer_get_time();
-    usbh_msc_stop();
-    sd_remount_vfs_from_card();
-    sd_watcher_set_paused(false);
-    web_files_resume();                /* ★ 卡回到本机: 恢复受理网页请求 */
-    int64_t t1 = esp_timer_get_time();
-    ESP_LOGI(TAG, "[卸载耗时] 停止MSC+重挂VFS %lldms (内部速度)",
-             (long long)((t1 - t0) / 1000));
-    s_unmounting = false;
-    s_mount_result = M_UNMOUNTED;
-    ESP_LOGI(TAG, "卸载完成 (MSC 已停止, VFS 已重挂)");
-    vTaskDelete(NULL);
-}
-
-/* 图标弹窗 on_poll: 后台挂载/卸载完成后的 UI 收尾.
- * 挂载中/后台卸载中/已挂载 均保持弹窗; 仅在 取消/失败/卸载完成 时收尾. */
-static void mount_state_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud) {
+static void mount_dlg_poll(ui_ctx_t *ctx, os_dlg_stack_t *d, void *ud)
+{
     (void)ud;
-    int st = s_mount_result;
-    if (s_unmounting || st == M_MOUNTING || st == M_MOUNTED || st == M_IDLE) return;
-    s_mount_result = M_IDLE;                             /* 消费本次状态 */
-    if (st == M_CANCELLED) {
-        os_dialog_pop(ctx);
-        os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8f\x96\xe6\xb6\x88\xe6\x8c\x82\xe8\xbd\xbd"); /* 已取消挂载 */
-    } else if (st == M_UNMOUNTED) {
-        os_dialog_pop(ctx);
-        os_dialog_toast(ctx, "\xe5\xb7\xb2\xe5\x8d\xb8\xe8\xbd\xbd"); /* 已卸载 */
-    } else if (st == M_MOUNT_BUSY) {
-        os_dialog_pop(ctx);
-        os_dialog_toast(ctx, "正在传输文件，请稍后再试");   /* 网页共享还在传, 没交卡 */
-    } else { /* M_MOUNT_FAIL1 / M_MOUNT_FAIL2 */
-        os_dialog_pop(ctx);
-        os_dialog_toast(ctx, (st == M_MOUNT_FAIL1)
-                        ? "\xe5\x8d\xb8\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5"   /* 卸载失败 */
-                        : "\xe6\x8c\x82\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5"); /* 挂载失败 */
-    }
-}
+    usbh_msc_status_t st = usbh_msc_status();
 
-/* "已挂载" 状态按钮 (同一框仅图标): 0=卸载, 1=取消(无反应). 卸载走后台, 不卡 UI. */
-static void mount_btn_cb(ui_ctx_t *ctx, int result, void *ud) {
-    (void)ud;
-    if (result != 0) {                    /* 取消: 无任何反应, 保持弹窗 */
-        os_dialog_mark_handled(ctx);
-        return;
-    }
-    if (s_unmounting || s_mount_result == M_MOUNTING) {  /* 挂载/卸载中 → 标记取消 */
-        s_mount_cancel = true;
-        os_dialog_mark_handled(ctx);
-        return;
-    }
-    if (s_mount_result == M_MOUNTED) {    /* 已挂载 → 后台卸载 (UI 不卡顿) */
-        s_unmounting = true;
-        s_mount_cancel = false;
-        os_dialog_mark_handled(ctx);      /* 保持弹窗 (显示图标), 卸载完成后再关 */
-        if (xTaskCreate(unmount_worker_task, "unmount", 3072, NULL, 5, &s_mount_task) != pdPASS) {
-            s_unmounting = false;
-            ESP_LOGD(TAG, "卸载后台任务创建失败");
+    if (st.seq == s_dlg_seq0) {
+        /* 没有新事件: 只在"卡在过渡态很久"时补一次文字提示 ——
+         * 纯提示, **不改状态、不放行任何操作**(放行只能等状态机自己迁移)。 */
+        const int64_t nowm = (int64_t)(esp_timer_get_time() / 1000);
+        const int64_t el   = st.since_ms ? (nowm - (int64_t)st.since_ms) : 0;
+        if (d->title[0] == '\0' &&
+            ((st.state == USBH_MSC_PREPARING && el > 20000) ||
+             (st.state == USBH_MSC_STOPPING  && el > 15000))) {
+            mount_dlg_render(d, st);
+            ctx->needs_redraw = true;
         }
         return;
     }
+    s_dlg_seq0 = st.seq;
+
+    if (st.state == USBH_MSC_RESTORING) {
+        /* USB 侧确实已经退出 = 用户视角的"卸载完成"。此刻就关窗,
+         * 后面本地 VFS 恢复再慢也不影响界面 —— 这正是原 bug 的判据。 */
+        os_dialog_pop(ctx);
+        os_dialog_toast(ctx, "已卸载");
+        return;
+    }
+    if (st.state == USBH_MSC_IDLE || st.state == USBH_MSC_FAULT) {
+        os_dialog_pop(ctx);
+        switch (st.outcome) {
+        case USBH_MSC_OP_START_FAIL_VFS: os_dialog_toast(ctx, "卸载存储失败"); break;
+        case USBH_MSC_OP_START_FAIL_USB: os_dialog_toast(ctx, "挂载失败"); break;
+        case USBH_MSC_OP_START_BUSY:     os_dialog_toast(ctx, "正在传输文件，请稍后再试"); break;
+        case USBH_MSC_OP_CANCELLED:      os_dialog_toast(ctx, "已取消挂载"); break;
+        case USBH_MSC_OP_STOP_OK:        os_dialog_toast(ctx, "已卸载"); break;
+        case USBH_MSC_OP_STOP_DEGRADED:  os_dialog_toast(ctx, "已卸载，但存储未恢复"); break;
+        case USBH_MSC_OP_STOP_USB_STUCK: os_dialog_toast(ctx, "USB 未退干净，请重启"); break;
+        case USBH_MSC_OP_STOP_DEFERRED:  os_dialog_toast(ctx, "电脑仍在写入，请在电脑上弹出后重试"); break;
+        default: break;      /* 状态被别处改回终态: 不提示 */
+        }
+        return;
+    }
+    mount_dlg_render(d, st);          /* PREPARING / USB / STOPPING: 原位变形 */
+    ctx->needs_redraw = true;
 }
 
-/* 确定挂载 (同一弹窗原位变形, 不弹新窗): 确认框 → "已挂载!"+图标+卸载/取消.
- * 真实挂载移到后台任务 (UI 不卡顿); 宽保持同宽 fix_w, 高度随图标扩高. */
-static void sd_mount_confirm(ui_ctx_t *ctx, int result, void *ud) {
+/* 弹窗按钮: items[0] 永远是主操作(确定/取消/卸载), items[1] 是「取消」。 */
+static void mount_btn_cb(ui_ctx_t *ctx, int result, void *ud)
+{
     (void)ud;
-    if (result != 0) return;   /* 取消/返回 → 默认弹栈关闭, 不挂载 */
-    os_dlg_stack_t *d = os_dialog_top_mut(ctx);   /* 同一框可写句柄 */
-    if (!d) return;
-    os_dialog_mark_handled(ctx);                    /* 保持同一弹窗, 不自动关闭 */
-    /* 原位改写成"仅图标" 状态 (去掉文字, 只留图片): 标题清空 + 图标 + 卸载/取消 */
-    d->title[0] = '\0';
-    d->count = 2;
-    snprintf(d->items[0], sizeof(d->items[0]), "\xe5\x8d\xb8\xe8\xbd\xbd");      /* 卸载 */
-    snprintf(d->items[1], sizeof(d->items[1]), "\xe5\x8f\x96\xe6\xb6\x88");      /* 取消 */
-    d->sel = 0;
-    d->icon = mount_icon_tf_64;                       /* 触发图标窗扩高 */
-    d->icon_w = MOUNT_ICON_W;
-    d->icon_h = MOUNT_ICON_H;
-    d->cb = mount_btn_cb;
-    d->on_poll = mount_state_poll;
-    s_mount_result = M_MOUNTING;
-    s_mount_cancel = false;
-    s_unmounting = false;
-    if (xTaskCreate(mount_worker_task, "mount", 3072, NULL, 5, &s_mount_task) != pdPASS) {
-        s_mount_result = M_MOUNT_FAIL2;              /* 任务创建失败按挂载失败处理 */
-        ESP_LOGD(TAG, "挂载后台任务创建失败");
+    usbh_msc_state_t st = usbh_msc_status().state;
+
+    if (result != 0) {                        /* 取消 / 返回键 */
+        if (st == USBH_MSC_PREPARING) {       /* 交卡中: 请求撤销, 保持弹窗看结果 */
+            usbh_msc_request_cancel();
+            os_dialog_mark_handled(ctx);
+        } else if (st == USBH_MSC_STOPPING) { /* 卸载中: 保持弹窗(后台正在改卡状态) */
+            os_dialog_mark_handled(ctx);
+        }
+        /* USB: 关窗即可(卡仍归电脑, 需要时再从菜单进来卸载);
+         * IDLE / FAULT: 交回框架正常出栈。两者都不 mark_handled。 */
+        return;
+    }
+
+    switch (st) {
+    case USBH_MSC_IDLE:
+    case USBH_MSC_FAULT:
+        if (!usbh_msc_request_start()) os_dialog_toast(ctx, "正在忙，请稍后");
+        os_dialog_mark_handled(ctx);          /* 保持弹窗, poll 会改成"挂载中" */
+        break;
+    case USBH_MSC_PREPARING:                  /* 此时按钮是「取消」 */
+        usbh_msc_request_cancel();
+        os_dialog_mark_handled(ctx);
+        break;
+    case USBH_MSC_USB:                        /* 此时按钮是「卸载」 */
+        usbh_msc_request_stop();
+        os_dialog_mark_handled(ctx);
+        break;
+    default:                                  /* STOPPING / RESTORING: 忽略重复点击 */
+        os_dialog_mark_handled(ctx);
+        break;
     }
 }
 
+/* 挂载/卸载两个后台任务、三处超时、旧的状态消费逻辑已在 2026-11-25 全部删除:
+ * 它们和 usbh_msc 的会话状态机重复, 是"弹窗不关 / 存储恢复中卡死"的根源。
+ * 现在真实流程在 usbh_msc_sdspi.c 的 msc_do_start / msc_do_stop 里, 单线程、单所有者。 */
+
+/* ── 旧的 unmount_worker_task (两阶段上报) 已删除 ──────────────────────────
+ * 它把"USB 已退出"和"本地 VFS 已恢复"分成两次上报, 但两者仍然挤在同一个任务里,
+ * 且状态靠两个 bool 传递; 现在由状态机直接表达:
+ *   STOPPING(USB 还在退) → RESTORING(USB 已退, 本地恢复中) → IDLE/FAULT。
+ * UI 只需在见到 RESTORING 时关窗 —— 与本地恢复耗时彻底解耦。 */
+
+/* 旧的 mount_state_poll 已删除 —— 状态消费与超时兜底统一由 mount_dlg_poll +
+ * usbh_msc 状态机负责, 界面不再"改状态来关弹窗"。 */
+
+/* 旧的 mount_btn_cb 已删除 —— 按钮语义统一按"当前状态"决定 (见上面的 mount_btn_cb):
+ * 每个状态下 items[0] 的含义固定, 重复点击在当前状态下自然被忽略, 不再需要
+ * s_mount_cancel / s_unmounting 这类跨任务标志。 */
+
+/* 旧的 sd_mount_confirm 已删除: 确认框与"挂载中/已挂载"是**同一份渲染**(mount_dlg_render),
+ * 确认动作只是 usbh_msc_request_start(), 弹窗由 poll 随状态原地变形。 */
+
 static void open_sd_mount(ui_ctx_t *ctx) {
+    usbh_msc_status_t st = usbh_msc_status();
+
+    /* 过渡态不弹新窗: 直接按**当前状态**给一句提示。
+     * 这里没有"守卫"也没有超时 —— 状态机自己会离开这些态(RESTORING 最多
+     * 8s+4s+1s 的有界等待后必进 IDLE 或 FAULT), 所以入口不可能被永久拒绝。 */
+    if (st.state == USBH_MSC_STOPPING) {
+        os_dialog_toast(ctx, "正在卸载");
+        return;
+    }
+    if (st.state == USBH_MSC_RESTORING) {
+        os_dialog_toast(ctx, "存储恢复中");
+        return;
+    }
+    /* ★ FAULT: 上一次卸载后本机 VFS 没恢复。弹窗已在 RESTORING 时关掉(USB 侧卸载
+     *   是既成事实, 不能为等 VFS 而吊住界面), 所以这里按状态补一句提示 ——
+     *   不新增"待播报"标志, 状态机本身就是这则提示的唯一真相源。 */
+    if (st.state == USBH_MSC_FAULT) {
+        os_dialog_toast(ctx, "本机存储未恢复，可重试挂载");
+    }
+    /* IDLE / FAULT / PREPARING / USB: 都可以开这个弹窗 ——
+     * PREPARING 打开就是"挂载中(可取消)", USB 打开就是"已挂载(可卸载)"。 */
+
     os_dlg_stack_t dlg;
-    memset(&dlg, 0, sizeof(dlg));
-    snprintf(dlg.title, sizeof(dlg.title), "\xe7\xa1\xae\xe5\xae\x9a\xe6\x8c\x82\xe8\xbd\xbd\xe5\x88\xb0\xe7\x94\xb5\xe8\x84\x91?"); /* 确定挂载到电脑? */
-    dlg.count = 2;
-    snprintf(dlg.items[0], sizeof(dlg.items[0]), "\xe7\xa1\xae\xe5\xae\x9a");   /* 确定 */
-    snprintf(dlg.items[1], sizeof(dlg.items[1]), "\xe5\x8f\x96\xe6\xb6\x88");   /* 取消 */
-    dlg.sel = 0;
-    dlg.no_footer = true;
-    dlg.small = true;
-    dlg.fix_w = text_width(dlg.title) + 24;           /* 固定宽度: 两阶段/变形前后完全一致 */
-    dlg.cb = sd_mount_confirm;
-    dlg.on_poll = mount_state_poll;
+    memset(&dlg, 0, sizeof(dlg));          /* 只清零**栈上副本**, 绝不 memset 活弹窗 */
+    s_dlg_seq0 = st.seq;
+    mount_dlg_render(&dlg, st);
     os_dialog_push(ctx, &dlg);
 }
 
@@ -1149,27 +1180,26 @@ static void p_sto_enter(ui_ctx_t *ctx) {
     open_sd_dlg(ctx);
 }
 
-/* 退出存储页: 若仍在 USB MSC 挂载, 停止并重挂 SD (不重启, 保持串口正常) */
+/* 退出存储页: 只"表达意图", 不在这里做任何卡操作。
+ *
+ * ★ 2026-11-25 重构: 原来这里要等后台卸载收尾、再 stop 一次、再重挂 VFS、再补
+ *   resume/watcher —— 那些正是"双所有者"造成的: 页面和后台任务都能改同一套状态,
+ *   于是必须靠 s_unmounting 等标志互相让路(还可能双 free)。
+ *   现在卡的生命周期只有 usbh_msc 会话任务一个所有者:
+ *     · 正在交卡(M_MOUNTING) → request_cancel(): 后台在阶段边界收手;
+ *     · 已挂载(USB)          → request_stop()  : 后台自己停 USB + 收回本地存储;
+ *     · 其它过渡态           → 什么都不做, 会话任务本来就会跑完并落终态。
+ *   页面退出不影响后台完成; 下次进存储页读到的就是状态机的当前值。 */
 static void p_sto_exit(ui_ctx_t *ctx) {
     (void)ctx;
-    /* ★ 2026-11-22: 后台还在挂载 (M_MOUNTING) 时直接退出页面 —— 原来这里看
-     *   usbh_msc_is_running() 还是 false, 什么也不做; 而后台任务照样把卡交给电脑,
-     *   于是 UI 已经离开存储页、卡却再也收不回来 (本机认为"未挂载")。
-     *   这里置取消标志, 由 mount_worker_task 在 usbh_msc_start() 之后自行拆除。 */
-    if (s_mount_result == M_MOUNTING) s_mount_cancel = true;
-    if (usbh_msc_is_running()) {
-        ESP_LOGI(TAG, "退出存储页: 停止 USB MSC 并重挂 SD (不重启)");
-        usbh_msc_stop();
-        sd_remount_vfs_from_card();
+    usbh_msc_state_t st = usbh_msc_status().state;
+    if (st == USBH_MSC_PREPARING) {
+        ESP_LOGI(TAG, "退出存储页: 挂载尚未完成 ⇒ 请求取消");
+        usbh_msc_request_cancel();
+    } else if (st == USBH_MSC_USB) {
+        ESP_LOGI(TAG, "退出存储页: 停止 USB MSC 并收回本地存储 (后台执行, 不重启)");
+        usbh_msc_request_stop();
     }
-    /* ★ 2026-11-24: 卡已回到本机 ⇒ 解除网页共享的暂停。
-     *   漏了这一句就是"直接从存储页退出后, /files/ 一直 503 busy"
-     *   —— 因为交卡前 web_files_quiesce() 把受理开关关掉了。 */
-    if (web_files_is_running()) web_files_resume();
-    /* ★ 2026-11-22: 与 mount_worker_task/unmount_worker_task 对齐 ——
-     *   它们各自负责恢复 watcher, 而我们这里也要恢复: 否则一旦挂载路径走到一半
-     *   就退出页面, watcher 会永远停在 paused (watcher 现在被禁用, 属潜在隐患)。 */
-    sd_watcher_set_paused(false);
 }
 
 /* 页面本体**不渲染** —— 存储只做弹窗界面 (用户规范 2026-09-28)。

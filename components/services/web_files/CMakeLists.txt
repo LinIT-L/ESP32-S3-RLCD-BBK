@@ -12,6 +12,7 @@ idf_component_register(
         sd_scan              # 挂载状态 / 容量
         heap                 # heap_caps_malloc（搬运缓冲放 PSRAM）
         esp_hw_support       # esp_random
+        esp_timer            # ★ 2026-11-25: 活动保活时间戳 (esp_timer_get_time)
         freertos
     PRIV_REQUIRES
         nvs_flash            # ★ 2026-11-24: 记住"共享开着"状态, 重启后自动恢复

@@ -74,6 +74,12 @@ typedef enum {
 typedef bool (*gam4980_exit_confirm_cb_t)(st7305_handle_t *lcd);
 void gam4980_set_exit_confirm_cb(gam4980_exit_confirm_cb_t cb);
 
+/* ★ 2026-11-25: 系统级关机确认回调注入 (同破环手段).
+ * 电源键长按 2s 走 action 通道, 引擎检测到后调本回调让 os 层弹系统确认框;
+ * 引擎不依赖 os。确认后回调不返回(真断电), 取消则返回继续游戏。 */
+typedef void (*gam4980_power_shutdown_cb_t)(st7305_handle_t *lcd);
+void gam4980_set_power_shutdown_cb(gam4980_power_shutdown_cb_t cb);
+
 /* === V1.2 模块化: 游戏内状态栏绘制回调注入 (同破环手段) ===
  * 游戏内状态栏属"系统服务"而非引擎职责; 由 os 侧注入 svc_statusbar_draw_game.
  * 未注入时引擎跳过状态栏绘制 (不崩、只是不显示系统信息). */

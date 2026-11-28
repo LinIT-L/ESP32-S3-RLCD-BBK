@@ -142,13 +142,19 @@ esp_err_t web_core_start(uint16_t port)
      *   · 栈 8192：与旧收藏夹一致（默认 4096 起不来）
      *   · uri_match_fn=wildcard：支持末尾星号通配（收藏夹的 api 段与各应用兜底都要）
      *   · lru_purge：socket 用满时踢掉最久未用的，避免浏览器连不上
-     *   · max_open_sockets 6：LWIP 总共 10 个，给客户端连接留余量 */
+     *   · max_open_sockets 7：LWIP 总共 10 个，给客户端连接留余量
+     *   · keep_alive：IDF 默认 **关闭**，意味着一律 "响应完即断连" ⇒ 浏览器每个
+     *     fetch 都要重做 TCP 握手。网页手柄每次按键一个 POST，实测表现就是
+     *     "按键反应慢、连点会排队只生效一次"。握手在 ESP32 上是几十 ms 级开销,
+     *     开着可以让同一页面复用连接(浏览器默认 keep-alive)。 */
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port        = port ? port : 80;
     cfg.max_uri_handlers   = 24;
-    cfg.max_open_sockets   = 6;
+    cfg.max_open_sockets   = 7;
     cfg.stack_size         = 8192;
     cfg.lru_purge_enable   = true;
+    cfg.keep_alive_enable  = true;
+    cfg.keep_alive_idle    = 5;    /* 空闲 5s 才回收，短时间连点全在复用 */
     cfg.uri_match_fn       = httpd_uri_match_wildcard;
 
     esp_err_t e = httpd_start(&s_srv, &cfg);

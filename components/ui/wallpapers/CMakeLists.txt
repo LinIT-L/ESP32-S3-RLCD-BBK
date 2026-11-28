@@ -16,8 +16,14 @@ idf_component_register(
         #   net_client → netc_busy(): 下载/上传/商店/OTA/Lua 网络任务不算"无操作"
         #   bt_ctl     → bt_manager_is_busy() / bt_manager_release_async()
         net_client bt_ctl
+        # ★ 2026-11-25: web_files_active() —— 局域网文件访问/传文件中不算"无操作"
+        #   (netc_busy() 只管 net_client, 不含 web_core 的 httpd 传输)
+        web_files
+        # ★ 2026-11-25: sd_format_is_running() —— 整卡擦除期间不进屏保/关射频/关机
+        sd_scan
         esp_hw_support
-        # usb_hid: usb_hid_host_mounted() —— "USB 连接时不自动休眠" (2026-10-02) / power_stat 的充电判定
+        # usb_hid: usb_hid_mode_owns_phy() —— USB 模式判据(浅睡否决的唯一来源)
+        #          / power_stat 的充电判定仍用 usb_hid_host_mounted()
         # esp_hw_support: power_stat.c 的 esp_rtc_get_time_us() (RTC 计时, 跨深睡)
 )
 

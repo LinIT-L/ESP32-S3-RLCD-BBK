@@ -211,7 +211,18 @@ static void p_gamepad_menu(ui_ctx_t *ctx);      /* 前向声明: 映射结束后
 static void bt_connect_task(void *arg) {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(300));
-    bt_manager_connect_device(&s_conn_dev);
+    /* ★★ 2026-11-28: 返回 false **不等于**"连接失败"。
+     *   最常见的原因是 bt_manager 返回 BT_CONN_BUSY —— 扫描事务还占着射频, 这次连接
+     *   "根本没发起"(日志: 扫描 4000 ms 内未收尾 ⇒ 本次连接暂不发起)。原代码丢弃返回值,
+     *   conn_dlg_poll 1s 后看到"不在连接中"就弹"连接失败/已断开" —— 用户看到的假失败
+     *   就是这个。这里退避重试(最多 4 次), 每次把 s_conn_start 前推, 让 UI 的
+     *   宽限窗口一起延长, 不把"还在等射频"误判成失败。 */
+    for (int i = 0; i < 4; i++) {
+        if (bt_manager_connect_device(&s_conn_dev)) break;
+        if (bt_manager_is_connecting()) break;      /* 已由其它路径发起, 不再重复 */
+        s_conn_start = esp_timer_get_time();        /* 重试期不计入失败判定 */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
     vTaskDelete(NULL);
 }
 

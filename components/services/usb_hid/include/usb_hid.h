@@ -42,6 +42,25 @@ esp_err_t usb_composite_exit(void);
 /* 当前 USB 设备是否已枚举 (处于 TinyUSB 模式且被主机枚举) */
 bool usb_composite_is_connected(void);
 
+/* 当前 PHY 是否被 USB 设备模式(TinyUSB)占用 —— 电源管理的**唯一判据**。
+ * 只看本模块模式状态, 不依赖 SOF / usb_serial_jtag_is_connected() / tud_mounted():
+ * 进入 USB 模式前就上锁, 没有"先判断再睡"的竞态; MSC 期间 USJ 驱动已卸载也不影响。
+ * true  = 正处于 USB 模式(含卸载失败的失败态), 期间**禁止 Automatic Light Sleep**
+ * false = 正常模式(Serial/JTAG 控制台), 浅睡由 wallpapers 原有逻辑管理 */
+bool usb_hid_mode_owns_phy(void);
+
+/* 当前是否真的握着浅睡否决权(诊断用; `pm` 的锁表里可看到 usb_mode) */
+bool usb_hid_light_sleep_blocked(void);
+
+/* ★ 2026-11-25: TinyUSB 设备栈是否**已确认卸净** —— 用于判断"能不能把卡收回本机"。
+ *   true  = NORMAL(正常模式) 或 RECOVER_FAIL(TinyUSB 已确认卸净, 只差 Serial/JTAG 没装回)
+ *   false = 四个 TinyUSB 正常模式, 或 TINYUSB_STUCK(卸载失败, PHY 可能仍归 OTG)
+ * 为什么需要它: MSC 卸载后要把 TF 卡挂回本机 VFS。若 TinyUSB 还没确认卸净,
+ *   主机可能仍在读写扇区, 此时本地挂 FatFs 就是"两边同时写同一张卡"。
+ *   ⚠ 与 usb_hid_mode_owns_phy() 的区别: 后者对 RECOVER_FAIL 也返回 true(电源偏保守),
+ *     而本函数只回答"TinyUSB 还在不在"。 */
+bool usb_hid_tinyusb_gone(void);
+
 /* 启动键鼠模式 (切换到 HID 键盘+鼠标+CDC). 返回 ESP_OK 表示已就绪. */
 esp_err_t usb_hid_start(void);
 

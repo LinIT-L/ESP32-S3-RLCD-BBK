@@ -42,14 +42,27 @@ static const board_pins_t BP_XIAOZHI = {
      *   /INT 是 2954 的按键状态输出(开漏低有效, /PB 拉低 ~32ms 后跟随), 官方用法就是给 MCU 读,
      *   短按 0.5s / 长按 2s 判定只多 32ms, 无感。
      *   代价: 44 不是 RTC 脚 ⇒ 深睡 EXT1 唤醒用不了它, wake_key_mask() 会自动退到左右键。 */
-    .btn_pwr = 44, .btn_right = 0, .btn_left = 4,
+    /* ★ 2026-11-28 四版本定案(以三份权威网表为准):
+     *   小智两版电源键**都是 GPIO1** —— S1_1(老): SW1.1→U2.39(IO1);
+     *   S1_4(关机版): U6.5(/INT)→U2.39(IO1)。区别只在有无 LTC2954:
+     *     · S1_4 有 2954(U6) + DS3231(U1 0x68) ⇒ KILL#=U6.8→GPIO44;
+     *     · S1_1 无 2954/无 DS3231 ⇒ 同一张表但 ltc2954_init() 靠 0x68 判据
+     *       早退、根本不驱动 pwr_kill, 关机走深睡(所以这里填 44 对老版无害)。
+     *   ★ 靠 0x68 全自动切, 无用户开关: 有 RTC=关机版拉 KILL, 无=老版深睡。
+     *   撞脚检查: 1≠4(left) 且 1≠0(right) ✓ */
+    .btn_pwr = 1, .btn_right = 0, .btn_left = 4,
+    .pwr_kill = 44, .pwr_int = 1,           /* S1_4: KILL#=U6.8→GPIO44 /INT=U6.5→GPIO1 */
     .bat_adc_chan = 2,                     /* ADC1_CH2 = GPIO3 (模块内部电池分压) */
     /* ⛔ 本板**没有**充电检测信号: 模组 28/29 脚(DONE/CHRG)在 Gerber 上悬空(NET_8/NET_9
      *   只有模组自己的焊盘), 板上不存在 CHRG 网络。
      *   而 GPIO44 并不空闲 —— 它是 LTC2954 的 /INT 输出(U6.5 → 模组 36 脚)。
      *   若把这里填 44, 按电源键时 /INT 拉低会被当成"充电中" ⇒ 状态栏误跳闪电。
      *   ⇒ 必须 -1; 等改板把 CHRG 引到空闲脚再启用(旧板此脚本来就空着, 通吃不受影响)。 */
-    .chrg = -1,
+    /* ★ 2026-11-28 上机实证: GPIO42 读到的是**系统电源节点**(AO3415A 漏极+VSYS_IN),
+     *   拔掉 USB 仍恒高 ⇒ 充电图标误报不断。已实测确认硬件上此脚不是充电信号,
+     *   ⇒ 临时关闭充电检测(.chrg=-1), 状态栏不显示闪电, 电量显示照常。
+     *   将来改板把真正的 CHRG/SWVI 引到空闲 GPIO 再打开(填 .chrg + 极性)。 */
+    .chrg = -1, .chrg_active_high = true,
     .i2s_mclk = 40, .i2s_bclk = 39, .i2s_ws = 45, .i2s_dout = 48, .i2s_din = 21,
     .codec_sda = 38, .codec_scl = 47, .pa_pin = 46,
     .vib = 8,
@@ -76,6 +89,7 @@ static const board_pins_t BP_WEIXUE = {
     /* 触摸: 原板没有；这两个字段留给"微雪 + 自己加触摸"(见标准扩展版) */
     .tp_sda = 15, .tp_scl = 7, .tp_int = 17, .tp_rst = 2,
     .btn_pwr = 18, .btn_right = 0, .btn_left = 18,     /* PWR 非 GPIO（硬件锁存），18 = KEY，仅用于唤醒 */
+    .pwr_kill = -1, .pwr_int = -1,         /* 微雪: PWR 走电源锁存 IC, 无 LTC2954 */
     .bat_adc_chan = 3,                     /* ADC1_CH3 = GPIO4 */
     .chrg = -1,                            /* 微雪原版: 无此信号 */
     .i2s_mclk = 16, .i2s_bclk = 9, .i2s_ws = 45, .i2s_dout = 8, .i2s_din = 10,
@@ -94,6 +108,7 @@ static const board_pins_t BP_STD = {
     .lcd_freq_mhz = 33,          /* 同小智: 33MHz 请求 → 实际 80/3≈26.7MHz, 见上 */
     .tp_sda = 15, .tp_scl = 7, .tp_int = 17, .tp_rst = 2,
     .btn_pwr = 1, .btn_right = 0, .btn_left = 18,     /* 电源 / 返回 / 确认（三脚独立, linit 2026-10-18 更正） */
+    .pwr_kill = -1, .pwr_int = -1,                     /* 标准模块版无 LTC2954 */
     .bat_adc_chan = 3,                                 /* 同微雪: GPIO4 */
     .chrg = -1,                                        /* 标准扩展版: 按需自己加 */
     .i2s_mclk = -1, .i2s_bclk = 9, .i2s_ws = 45, .i2s_dout = 8, .i2s_din = -1,

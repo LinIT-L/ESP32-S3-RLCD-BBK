@@ -41,6 +41,11 @@ bool hw_cfg_enabled(hw_id_t id);           /* 该不该启动(默认=detected) *
 void hw_cfg_set_enabled(hw_id_t id, bool on);  /* 设置页改, 立即存 NVS */
 void hw_cfg_rescan(void);                  /* 重新自检 */
 void hw_cfg_set_board(int id);             /* 手动指定板型 0=小智 1=微雪 2=标准扩展 (落盘, 重启完全生效) */
+
+/* ★ 2026-11-28 四版本全自动: 小智两版靠 RTC(0x68) 自动切, 无用户开关。
+ *   本板实际是否有 LTC2954 = 小智板 && 认到过 0x68 (rtc_ever 永久印记)。
+ *   有 = S1_4 关机版(拉 KILL 真断电); 无 = S1_1 老版(不碰 KILL, 深睡关机)。 */
+bool hw_cfg_has_ltc2954(void);
 uint8_t hw_cfg_det_mask(void);
 uint8_t hw_cfg_en_mask(void);
 

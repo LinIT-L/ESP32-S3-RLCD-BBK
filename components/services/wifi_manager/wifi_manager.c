@@ -970,6 +970,9 @@ esp_err_t wifi_manager_ap_start_impl(const char *ssid, const char *pass,
     }
 
     s_ap_on = true;
+    /* ★ 2026-11-28: AP 一开就把射频钉到 NONE(见 apply_ps 里的 panic 取证)。
+     *   必须在 s_ap_on=true 之后调, apply_ps 就是靠这个标志判断的。 */
+    wifi_manager_apply_ps();
     ESP_LOGI(TAG, "AP 已开启: '%s' (%s, ch=%u, captive=%d) 已连接的 STA 保持不动",
              ssid, cfg.ap.authmode == WIFI_AUTH_OPEN ? "开放" : "WPA2",
              (unsigned)cfg.ap.channel, (int)captive);
@@ -992,6 +995,9 @@ static void wifi_manager_ap_stop_impl(void)
     if (s_ap_dns) { stop_dns_server(s_ap_dns); s_ap_dns = NULL; }
     /* 只关 AP，STA 继续用：回 STA 模式即可（AP netif 不再承载流量） */
     if (s_enabled) esp_wifi_set_mode(WIFI_MODE_STA);
+    /* ★ 2026-11-28: 回纯 STA 后恢复统一省电档(MIN_MODEM)。s_ap_on 已置 false,
+     *   所以 apply_ps 会重新走 s_ps_mode 分支。 */
+    wifi_manager_apply_ps();
     ESP_LOGI(TAG, "AP 已关闭（STA 保持不变: %s）", s_connected ? "已连接" : "未连接");
 }
 
@@ -1167,7 +1173,7 @@ static void wifi_supervisor_task(void *arg) {
         /* ★ 2026-11-08 官方式空闲降档: 连上但连续 20s 没有网络活动 ⇒ 转 MAX_MODEM。
          *   射频占空比从"每 102ms 醒一次"降到"每 listen_interval 个 beacon 醒一次",
          *   待机发热随之下降; 任何请求进来经 wifi_manager_note_net_activity() 立刻回档。 */
-        if (s_ps_auto && s_connected && !s_connecting && s_rf_measure == 0) {
+        if (s_ps_auto && s_connected && !s_connecting && s_rf_measure == 0 && !s_ap_on) {
             uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             if (s_last_act_ms == 0) s_last_act_ms = now_ms;
             if (s_ps_mode != WIFI_PS_MAX_MODEM &&
@@ -1230,6 +1236,9 @@ const char *wifi_manager_get_status(void) { return s_status; }
  *   ⇒ **未做真机验证前不选 MAX_MODEM**。验证通过后只改下面这一行即可全局切档。
  */
 const char *wifi_manager_ps_name(void) {
+    /* ★ 2026-11-28: AP 开着时 apply_ps 会强制 NONE, 这里必须如实报 ——
+     *   否则 `wifi` 诊断显示 MIN_MODEM 而射频实际是 NONE, 又变成"日志骗人"。 */
+    if (s_ap_on) return "NONE(AP)";
     /* ★ 2026-11-08: 原来 switch 的是编译期宏 WIFI_PS_UNIFIED —— 运行期切档后
      *   这里仍报旧名字, 日志会骗人。改成读当前实际档位 s_ps_mode。 */
     switch (s_ps_mode) {
@@ -1250,6 +1259,21 @@ void wifi_manager_apply_ps(void) {
     if (esp_wifi_get_mode(&m) != ESP_OK) return;
     if (s_rf_measure > 0) {
         esp_wifi_set_ps(WIFI_PS_NONE);      /* 频谱仪测量窗口: 必须连续收 */
+        return;
+    }
+    /* ★★★ 2026-11-28 linit「网页手柄/热点期间不许 modem sleep」★★★
+     *   真机 panic 取证(crash 命令): reason="Cache error", core=0, task=IDLE0,
+     *   PC=0x40389f82 `ic_update_light_sleep_wake_ahead_time`(WiFi 预编译库 IRAM),
+     *   调用者 `esp_wifi_internal_update_light_sleep_wake_ahead_time`。
+     *   即崩溃发生在 **STA 侧 modem sleep 更新唤醒提前时间** 这条内部路径上,
+     *   两次复位都在「AP/APSTA + 网页服务开着」之后(uptime 60.8s / 200.8s)。
+     *   AP 本身要求射频常开(beacon 不能停), 与 STA 的 MIN/MAX_MODEM 睡眠窗口
+     *   互相打架 —— 这条组合是 IDF WiFi 库的脆弱面, 固件侧唯一可靠的规避是
+     *   **AP 开着时把射频钉在 NONE**。代价可忽略: 网页手柄/传文件本来就该连续收发,
+     *   而且此时一定有客户端连着, 本来也省不下电。
+     *   退出 AP(ap_stop → 回 STA)后由下面恢复 s_ps_mode(MIN_MODEM)。 */
+    if (s_ap_on || m == WIFI_MODE_AP || m == WIFI_MODE_APSTA) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
         return;
     }
     esp_err_t e = esp_wifi_set_ps(s_ps_mode);

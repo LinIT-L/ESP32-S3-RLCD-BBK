@@ -271,22 +271,31 @@ void os_remote_shutdown(int auto_mode) {
     if (auto_mode) do_auto_shutdown();
     else           do_manual_shutdown(NULL);
 }
-/* 关机确认: 长按关机键 2s 弹出, 确认=关机 / **10 秒无操作=取消** / 返回=取消。
- * ★ 2026-11-24: 超时结果由"确定"改成"取消" —— 人不在时不该自己关机。 */
-static bool s_pwr_dlg_open = false;
-static void on_power_confirm(ui_ctx_t *ctx, int result, void *ud) {
-    (void)ud;
-    s_pwr_dlg_open = false;
-    vibrator_set_reader_mute(false);   /* 恢复点击震动 (取消/超时路径; 确认路径即将断电) */
-    if (result == 0) {
-        /* ★ 2026-11-20 linit「点了确认就实行硬件关机」:
-         *   这里强制本次走 LTC2954 断电链路, 不再要求先去设置里把"硬件关机"打开
-         *   (那个开关默认关, 导致装了硬件也还是深睡, 等于白焊)。
-         *   · 不写 NVS ⇒ 设置页的开关状态不被覆盖, 用户想关仍然关得住(只是本次确认生效)
-         *   · 引脚冲突/本板无此芯片 ⇒ is_hw_available()=false, 自然回落到深睡 */
-        if (ltc2954_is_hw_available()) ltc2954_force_cut_once();
-        do_manual_shutdown(ctx);
+/* ★ 2026-11-25 系统级关机确认 (全局响应):
+ * 长按 2s 由 input 5ms 任务检测并置事件(不依赖主循环、模拟器也照样登记);
+ * UI 执行方(主循环 / 引擎循环)在安全点取事件后调本函数走系统级直绘确认框。
+ * 直绘框冻结当前帧、直读手柄+物理键+触摸, 不受应用弹窗栈/全屏模态影响。
+ * 10 秒超时=取消(人不在时不自关机); 手柄/按键/触摸的确定与取消都正常。 */
+void os_power_shutdown_confirm(ui_ctx_t *ctx)
+{
+    /* 屏保态先退屏保: 解除 LCD 独占 + 开 flush 门禁 + 恢复触屏, 否则直绘被吞 */
+    if (os_screensaver_active()) {
+        os_screensaver_reset();
+        os_invalidate_bg();
+        ctx->needs_redraw = true;
+        st7305_invalidate_frame();
     }
+    vibrator_sem(VIB_SEM_ALERT);            /* 两下重击: 不看屏也知道要确认 */
+    vibrator_set_reader_mute(true);         /* 关闭 UI 点击震动, 确认后直接断电 */
+    /* 系统级确认: 冻结帧直绘, 超时 10s=取消 */
+    bool yes = os_system_confirm(ctx->lcd, "\xe5\x85\xb3\xe6\x9c\xba?", 10000, false);
+    vibrator_set_reader_mute(false);        /* 取消/超时: 恢复; 确认路径即将断电无所谓 */
+    if (yes) {
+        /* 强制走 LTC2954 硬件断电链路(不写 NVS, 不影响设置开关); 无此芯片自然回落深睡 */
+        if (ltc2954_is_hw_available()) ltc2954_force_cut_once();
+        do_manual_shutdown(ctx);            /* 不返回 */
+    }
+    ctx->needs_redraw = true;               /* 取消后整屏恢复底层 */
 }
 
 /* 新 OS 主循环: input -> os 内核分发(action/touch) -> 管家 -> 渲染 */
@@ -432,44 +441,10 @@ static void os_shell_loop(ui_ctx_t *ctx) {
          *     ③ input_set_touch_blocked(false)    —— 恢复触屏, 让弹窗能用手指点
          *   屏保监督任务由 s_ss_active 门控, 退出后不再抢刷, 弹窗能稳定画在最上层。
          *   ⚠ 顺序: 必须"先退屏保、后开弹窗", 反了的话弹窗画进 fb 但 flush 被门禁吃掉。 */
-        if (input_power_should_sleep()) {
-            /* ★ 2026-11-21 linit: 确认框**保留**(不要删)。点确认后由
-             *   on_power_confirm → ltc2954_force_cut_once() 强制走硬件断电，
-             *   不再落回深睡。这里不做任何拦截。 */
-            if (os_screensaver_active()) {
-                os_screensaver_reset();       /* 解除独占 + 开刷屏门禁 + 恢复触屏 */
-                /* ★ 背景脏: 屏保是旁路 flush_override 直刷的, fb 里此刻是壁纸画面。
-                 *   不标记的话, dlg_render 只画弹窗自己那块、不清屏 ⇒ 弹窗浮在壁纸上。
-                 *   标记后 os_render 会先整屏清白 + 重绘最底层页面(桌面), 再叠弹窗。 */
-                os_invalidate_bg();
-                ctx->needs_redraw = true;
-                st7305_invalidate_frame();    /* 作废送屏指纹: 弹窗首帧必须整屏送出 */
-                ESP_LOGI(TAG, "屏保态长按键关机: 已退出屏保, 改为弹确认框");
-            }
-            if (!s_pwr_dlg_open) {
-                s_pwr_dlg_open = true;
-                /* ★ 2026-11-24 linit「关机最后那下震动去掉」: 关机确认框弹出期间
-                 *   静音 UI 点击反馈 —— 点"确定"的 click/tap_ui 不再震, 随后直接断电.
-                 *   取消/超时由 on_power_confirm 复位, 不永久静音其它页面. */
-                /* ★ 2026-11-24 linit「弹关机确认要重震一下」: 两下 90ms 重击(效果库 alert),
-                 *   与普通点击/返回完全不同, 不看屏幕也知道"要我确认了"。
-                 *   ⚠ 必须在 reader_mute 打开**之前**发: 静音闸门只挡 UI 反馈, 顺序反了就发不出来。 */
-                vibrator_sem(VIB_SEM_ALERT);
-                vibrator_set_reader_mute(true);
-                /* ★ 2026-11-24: 超时结果 = **取消(1)**, 不是确认(0)。
-                 *   原来超时按"确定"处理 ⇒ 长按 2s 弹出后放着不管 10 秒, 机器自己关机,
-                 *   用户以为"卡了一下就没了"。关机必须由人点头。 */
-                os_dialog_confirm_ex(ctx, "\xe5\x85\xb3\xe6\x9c\xba?", 10000, 1, /* 关机? 超时=取消 */
-                                     on_power_confirm, NULL);
-            }
-        }
-        /* ★ 2026-10-28: 弹窗若被别的路径关掉(clear_all / 上层 pop / 页面被顶掉),
-         *   s_pwr_dlg_open 没人复位 ⇒ 关机框从此再也弹不出来(必须重启才好)。
-         *   每帧对齐一次"标志 vs 实际弹窗深度", 以实际状态为准。 */
-        if (s_pwr_dlg_open && os_dialog_depth() <= 0) {
-            s_pwr_dlg_open = false;
-            vibrator_set_reader_mute(false);   /* 兜底复位: 弹窗被别路径关掉也要恢复震动 */
-        }
+        /* ★ 2026-11-25 系统级关机确认: 电源键长按 2s 由 input tick 状态机投递
+         *   OS_ACTION_POWER_SHUTDOWN, 与本文件下方的其它 action 一起走 os_handle_action
+         *   → os_power_shutdown_confirm (系统级直绘框, 不受弹窗栈/全屏模态拦截)。
+         *   引擎/模拟器阻塞主循环时由引擎循环自己消费同一 action (见 page_engine.c)。 */
         /* 屏保态: 不轮询触摸(碰 I2C/flash)、不跑 os_tick、不写日志、不跑 os_mgr_poll,
          * 屏保画面由独立监督任务渲染。 */
         if (os_screensaver_active()) {
@@ -1195,6 +1170,18 @@ void app_main(void)
       } }
     hw_cfg_init();
     boot_ts("NVS + hw_cfg");
+
+    /* ★ 2026-11-25: 崩溃现场的**落盘**阶段, 必须在 nvs_flash_init() 之后。
+     *   原来转存 NVS / 回退读 NVS 全写在 svc_crash_init() 里, 而那个调用点在
+     *   nvs_flash_init() **之前**(本文件 svc_crash_init 那一段) ⇒ nvs_open 一律
+     *   返回 NOT_INITIALIZED, 函数静默 return, 于是:
+     *     · panic 现场从来没被转存过;
+     *     · 真掉电(或 brownout 清 RTC)后没有任何存档可回退。
+     *   现在早期 svc_crash_init() 只负责"读 RTC + 打印", 这里才落盘, 并**无条件**
+     *   把本次复位原因追加进 NVS 历史环 —— 看门狗/掉压这类不走 panic 的复位
+     *   也能留下"什么时候、以什么原因重启"的证据。 */
+    svc_crash_persist();
+    boot_ts("svc_crash_persist");
 
     /* ★ 2026-11-24: 「网络访问存储」开机自动恢复 —— 若上次是"开着共享"关机的,
      *   等 WiFi(STA) 连上后自动重新拉起。原来完全没有持久化: s_running 是静态变量,

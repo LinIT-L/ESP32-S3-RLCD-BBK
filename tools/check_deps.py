@@ -66,6 +66,12 @@ ALLOW_INVERSIONS = {
     #   (商店下载/OTA/Lua 网络都走它), 用它比各页面自己判断可靠。同属 ui→services 倒置,
     #   与上面几条一起留到 P5 把电源/闲置编排拆到 services/power 时还。
     ("wallpapers", "net_client"),
+    # ★ 2026-11-25: 局域网文件共享的传输状态。netc_busy() 只反映 net_client 那一个
+    #   请求槽, 不含 web_core/httpd 的文件上传下载 ⇒ 浏览器正拖大文件进来时被判"闲置",
+    #   1 分钟息屏、3 分钟关射频, 传输当场断在 80 端口。web_files_busy() 复用 quiesce
+    #   的 s_xfer 计数, 是全项目唯一的"局域网传输中"信号。同属 ui→services 倒置,
+    #   与上面几条一起留到 P5 把电源/闲置编排拆到 services/power 时还。
+    ("wallpapers", "web_files"),
     # usb_hid: 屏保/自动关机策略要知道"USB 是否插在主机上"(2026-10-02 linit 要求
     # "USB 连接时不自动休眠")。同上面几条, 属 ui→services 倒置, 一并归到 P5 拆分时还。
     ("wallpapers", "usb_hid"),

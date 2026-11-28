@@ -62,6 +62,7 @@ typedef enum {
     OS_ACTION_POWER_HINT,  /* 软关机键 0.5s = 提示 */
     OS_ACTION_POWER_RELEASE, /* 软关机键 0.5s 后松手 */
     OS_ACTION_BT_SEARCH,     /* 硬件确认键长按 2s = 蓝牙搜索 */
+    OS_ACTION_POWER_SHUTDOWN,/* ★ 电源键长按 2s = 系统级关机确认 (与 MENU_ACTION 同值) */
 } os_action_t;
 
 /* ==== 模块/页面 id（迁移后的页面清单, 与旧 menu_page_t 语义一一对应） ==== */
@@ -360,7 +361,25 @@ bool os_dialog_wheel_open(void);
  * 外观/交互与 os_dialog_confirm_ex 完全一致: 标题"退出程序?", 左"确定"右"取消",
  * 手柄 LEFT=确定/RIGHT=取消 黑块选择, CONFIRM=当前选中项, BACK=取消(松手守卫),
  * 触摸弹窗内左=确定 右=取消. 阻塞直到用户决定. 返回 true=确认退出. */
+/* ★ 系统级模态确认 (全局最高优先级, 冻结帧直绘):
+ * 不走普通弹窗栈(栈满会静默丢弃 / 全屏模态会盖住 / 引擎阻塞主循环时弹不出),
+ * 直接在当前帧直绘 small 确认框, 直读手柄+物理键+触摸, 阻塞直到用户决定。
+ * 用于"关机?"、引擎退出这类必须可靠弹出的系统确认。
+ * title   : 标题(UTF-8), 左"确定"右"取消"固定
+ * timeout : >0 到点返回 default_result; 0=不超时
+ * return  : true=确定 / false=取消(含超时)
+ * ⚠ 调用前须确保当前帧已冻结(引擎 pause / 屏保退出), 否则直绘会被其它渲染覆盖。 */
+bool os_system_confirm(st7305_handle_t *lcd, const char *title,
+                       uint32_t timeout_ms, bool default_result);
+
+/* 兼容包装: "退出程序?"确认 = os_system_confirm(不超时, 默认确定) */
 bool os_confirm_exit_blocking(st7305_handle_t *lcd);
+
+/* 系统级关机确认 (实现在 main: 依赖电源断电链路): 由 UI 执行方在收到
+ * OS_ACTION_POWER_SHUTDOWN (电源键长按 2s, 与返回键同一 action 通道) 后调用。
+ * 内部先退屏保, 再走 os_system_confirm("关机?", 10s 超时=取消), 确认则真断电/深睡。
+ * ⚠ 调用方须处于"画面可冻结"状态(主循环普通帧 / 引擎已 pause)。 */
+void os_power_shutdown_confirm(ui_ctx_t *ctx);
 
 /* ★ 全屏应用"退出确认"统一入口 (2026-10-14): 无线探测/网络检测/电脑诊断 等全屏应用,
  * 按硬件返回键先弹"退出程序?"(左确定/右取消), **确认后才退**。

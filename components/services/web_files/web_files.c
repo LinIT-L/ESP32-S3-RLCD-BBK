@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "esp_heap_caps.h"
+#include "esp_timer.h"       /* ★ 2026-11-25: 活动保活时间戳 (h_api 入口) */
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -67,6 +68,13 @@ static SemaphoreHandle_t s_io_lock = NULL;
 static volatile int      s_xfer     = 0;
 static volatile bool     s_abort    = false;
 static volatile bool     s_paused   = false;
+/* ★ 2026-11-25: 最近一次 API 访问的时刻(ms)。
+ * web_files_busy() 的 s_xfer 只覆盖**流式上传/下载**, 列目录/建目录/删除/改名这些
+ * 短请求不在其中 —— 用户在浏览器里翻目录时, 每个请求之间可能停顿 >1 分钟,
+ * 屏保监督任务只看 s_xfer 就会判"闲置"进壁纸、再 3 分钟关射频, 正在浏览的会话被砍。
+ * 在 h_api() 入口统一刷新本时间戳(覆盖全部 API), 供 web_files_active() 判活。 */
+static volatile uint32_t s_last_access_ms = 0;
+#define WF_ACTIVE_WINDOW_MS  30000u   /* 30s 内有访问视为"活动", 覆盖翻目录的停顿 */
 
 /* 前向声明: web_files_stop() 在定义之前就要用它 */
 static void wf_auto_save(bool on);
@@ -666,6 +674,10 @@ static esp_err_t h_rename(httpd_req_t *req)
 
 static esp_err_t h_api(httpd_req_t *req)
 {
+    /* ★ 活动保活: 任何文件管理请求都算"用户在用"。用 esp_timer 而非 os_millis,
+     *   避免 services→system 新增依赖; 纯内存读, 屏保任务也可安全查询。 */
+    s_last_access_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
     /* ★★★ 2026-11-24 根因修复：「浏览器打开 /files/ 看不到 TF 卡任何内容」★★★
      *
      *   原来: strstr(req->uri, "/api/") + 5, 然后 `strcmp(p, "list")` 精确比较。
@@ -876,6 +888,25 @@ void web_files_boot_restore(void)
 }
 
 bool web_files_is_running(void) { return s_running; }
+
+/* ★ 2026-11-25: 传输中 = 有上传/下载流在跑。
+ * 直接复用 h_upload / h_download 已经在维护的 s_xfer（交卡前的 quiesce 也靠它），
+ * 不新建第二套状态: 两处口径必须一致，否则会出现"quiesce 认为还在传、省电认为没事"。
+ * 不再额外判 s_running: 服务没跑时 s_xfer 必然为 0，多一个判据只会多一种不同步的可能。 */
+bool web_files_busy(void) { return s_xfer > 0; }
+
+/* ★ 2026-11-25: "有用户在用网页文件共享"的保活判据。
+ * 与 busy 的区别: busy 只看正在跑的上传/下载流(交卡同步用, 必须精确);
+ *   active 额外把"最近 30s 内有过任何 API 请求(列目录/建目录/删除/改名...)"也算进来 ——
+ *   浏览器翻目录时每个请求之间可能停顿, 只看 s_xfer 会被省电误判成闲置。
+ * 只做时间戳比较, 纯内存读, 屏保监督任务(PSRAM 栈)可安全调用。
+ * 服务没跑(s_last_access_ms==0)时恒 false, 不会长期阻止省电。 */
+bool web_files_active(void)
+{
+    if (s_last_access_ms == 0) return false;
+    if (s_xfer > 0) return true;
+    return (uint32_t)(esp_timer_get_time() / 1000) - s_last_access_ms < WF_ACTIVE_WINDOW_MS;
+}
 
 bool web_files_get_addr(char *out, size_t cap)
 {

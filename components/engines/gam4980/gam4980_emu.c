@@ -1674,6 +1674,12 @@ void gam4980_set_exit_confirm_cb(gam4980_exit_confirm_cb_t cb) {
     s_exit_confirm_cb = cb;
 }
 
+/* ★ 2026-11-25: 系统级关机确认回调 (同破环手段) */
+static gam4980_power_shutdown_cb_t s_power_shutdown_cb = NULL;
+void gam4980_set_power_shutdown_cb(gam4980_power_shutdown_cb_t cb) {
+    s_power_shutdown_cb = cb;
+}
+
 /* 游戏内状态栏绘制回调 (os 注入 svc_statusbar_draw_game; 未注入则跳过绘制) */
 void gam4980_set_statusbar_cb(gam4980_statusbar_cb_t cb) {
     s_statusbar_cb = cb;
@@ -1766,6 +1772,13 @@ game_exit_result_t gam4980_emu_run(void) {
          *    本来都统一弹确认, 保留 HOME 分支兼容物理返回键长按 3s 的逃生口。
          *  - BACK (手柄退出键 / 实体返回 / 底部上滑) → 统一弹确认退出 */
         menu_action_t action = input_get_action();
+        /* ★ 2026-11-25: 电源键长按 2s = 系统级关机确认 (与返回键同一 action 通道)。
+         *   BBK 自驱动阻塞运行, os_core 分发跑不到, 走注入回调让 os 层弹系统框。
+         *   确认后不返回(真断电); 取消则返回继续游戏。 */
+        if (action == MENU_ACTION_POWER_SHUTDOWN) {
+            if (s_power_shutdown_cb) s_power_shutdown_cb(g_lcd);
+            action = MENU_ACTION_NONE;
+        }
         if (action == MENU_ACTION_HOME ||
             action == MENU_ACTION_BACK || action == MENU_ACTION_LONG_LEFT) {
             ESP_LOGI(TAG, "退出键 -> 请求退出游戏(弹确认)");

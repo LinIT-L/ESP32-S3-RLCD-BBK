@@ -8,7 +8,12 @@
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "sdmmc_cmd.h"   /* for sdmmc_card_t typedef */
+
+/* ★ 2026-11-25: 挂载锁"有界等待"相关约定 (见 sd_vfs_handoff / sd_vfs_reclaim) */
+#define SD_REMOUNT_EBUSY       (-4)          /* 挂载锁在超时内没拿到: 未修改任何状态 */
+#define SD_LOCK_WAIT_FOREVER   (0xFFFFFFFFu) /* 无限等待 (= 原 portMAX_DELAY 行为) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,15 +84,34 @@ int  sd_format_pct(void);              /* 0..100 */
 const char *sd_format_stage_str(void); /* 阶段文字 (UTF-8; ⚠ 别叫 sd_format_stage —— 存储页已有同名静态函数) */
 int  sd_format_result(void);           /* 完成后: 0=成功, <0 = sd_format_and_create_dirs 的返回码 */
 
-/* 卸载 VFS 但保留 card 句柄 (切换 USB MSC 模式用)
- * 返回 0=卡已交给 USB MSC; <0=失败, 调用方必须**中止挂载**并保持本地挂载不变:
- *   -1 格式化进行中 / 没有可交出的 card   -2 注销本地 VFS 失败 (本地仍挂载) */
-int sd_unmount_vfs_keep_card(void);
+/* ══ 卡所有权交接: **只有这两个入口** (2026-11-25 统一) ══════════════════════
+ * 背景: 原来有 4 个语义重叠的入口 (unmount_vfs_keep_card / remount_vfs_from_card
+ *   / remount_..._wait / usb_ownership_release), 调用方必须自己挑"该用哪个",
+ *   于是出现了"某条路用无界版把界面吊死"、"超时后没人收尾"这类问题。
+ * 现在统一成: 交出 (handoff) / 收回 (reclaim) / 兜底释放 (release) 三个动作,
+ *   每个都带显式锁等待上限, 且**拿不到锁就什么都不改**。
+ *
+ * 锁等待语义 (两者共用):
+ *   lock_wait_ms = SD_LOCK_WAIT_FOREVER → 无限等 (只给确定不在 UI 路径上的调用方)
+ *   其它值 → 最多等这么久; 拿不到返回 SD_REMOUNT_EBUSY 且不修改任何状态
+ *            (s_mounted / s_card / 所有权 / 仲裁 / VFS / FatFs 全部原样)。
+ *   ⚠ 拿不到锁返回 EBUSY 是**正常可恢复**结果, 调用方必须如实上报, 不能当成成功。
+ */
 
-/* 从已有 card 句柄重新挂载 VFS/FAT (退出 USB MSC 模式用)
- * 返回 0=成功; -1 无 card; -2 注册 VFS 失败; -3 f_mount 失败
- * ⚠ 失败后卡状态被置为 UNKNOWN ⇒ 下一次 sd_mount() 会重新认卡。 */
-int sd_remount_vfs_from_card(void);
+/* 交出卡: 卸载本地 VFS(保留 card 句柄), 所有权转给 USB MSC。
+ * 返回 0=卡已可交给 USB; -1=格式化中或没有可交出的 card;
+ *      -2=注销 VFS 失败(卡已转为未挂载, 不归 USB); -4=锁超时(未改动)。 */
+int sd_vfs_handoff(uint32_t lock_wait_ms);
+
+/* 收回卡: 从保留的 card 句柄重新挂 VFS/FAT, 所有权还给本机。
+ * 返回 0=成功; -1=无 card; -2=注册 VFS 失败; -3=f_mount 失败; -4=锁超时(未改动)。
+ * ⚠ -2/-3 会把卡状态置 UNKNOWN ⇒ 下一次 sd_mount() 重新认卡。 */
+int sd_vfs_reclaim(uint32_t lock_wait_ms);
+
+/* 兜底: 卡已回本机但 VFS 没挂上时, 只把所有权/状态标志交回本机
+ * (不碰 VFS/FatFs/SDMMC host), 让 sd_probe/sd_mount 走已验证的重挂路径。
+ * 返回 0=已交回(或本来已挂上); -4=锁超时, 未做任何修改。 */
+int sd_usb_ownership_release(uint32_t lock_wait_ms);
 
 /* 卡当前是否已交给 USB MSC (挂载到电脑)。
  * 为 true 时 sd_mount()/sd_remount()/sd_get_info()/格式化全部让路 ——

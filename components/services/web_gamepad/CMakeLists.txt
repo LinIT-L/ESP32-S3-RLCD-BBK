@@ -9,4 +9,5 @@ idf_component_register(
         wifi_manager
         board_battery
         nvs_flash svc_nvs
+        esp_timer            # 按键状态存活时间戳(超时复位)
 )

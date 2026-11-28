@@ -64,6 +64,16 @@ static SemaphoreHandle_t bt_hidh_cb_semaphore = NULL;
 static SemaphoreHandle_t ble_hidh_cb_semaphore = NULL;
 #define SEND_BLE_CB() xSemaphoreGive(ble_hidh_cb_semaphore)
 
+/* ★★★ 2026-11-28 扫描"真的开始"确认 ★★★
+ *   实测(开机后首次扫描): esp_ble_gap_start_scanning() 返回 OK, 但
+ *     · 从未收到 SCAN_START_COMPLETE
+ *     · 1.6s 后 stop 报 "BTM_BleScan scan not active" + status=0x6(BTM_WRONG_MODE)
+ *     · 13s 后 wait_ble_cb 超时, 用户在此期间点选手柄只会得到"扫描未收尾, 暂不发起连接"
+ *   说明命令进了队列但 BTM 层没进入扫描态(开机初期 RF 全校准 / 主机层未就绪),
+ *   返回值 OK 并不代表扫描在跑。这里给"启动"本身加确认 + 上层重试。 */
+static volatile bool             s_ble_scan_start_evt    = false;
+static volatile esp_bt_status_t  s_ble_scan_start_status = (esp_bt_status_t)0;
+
 /* ★ 2026-11-23 R2: 等扫描完成事件**必须有上限**.
  *   原来 WAIT_BLE_CB() 是 portMAX_DELAY: 只要完成事件丢了(射频被上层关掉 / 扫描被
  *   主动 stop / 事件被另一个扫描消费者取走), 扫描任务就永久卡在 xSemaphoreTake 里 ——
@@ -661,6 +671,13 @@ static void ble_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_p
         }
         break;
     }
+    case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT: {
+        /* ★ 2026-11-28: 扫描启动完成的唯一可靠凭据 —— 见文件上方 s_ble_scan_start_evt */
+        s_ble_scan_start_status = param->scan_start_cmpl.status;
+        s_ble_scan_start_evt    = true;
+        ESP_LOGI(TAG, "[BLE-GAP] SCAN_START_COMPLETE, status=%d", param->scan_start_cmpl.status);
+        break;
+    }
     case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT: {
         ESP_LOGI(TAG, "[BLE-GAP] SCAN_STOP_COMPLETE, status=%d", param->scan_stop_cmpl.status);
         break;
@@ -763,11 +780,30 @@ static esp_err_t start_ble_scan(uint32_t seconds)
     }
 
     ESP_LOGI(TAG, "[SCAN] start_scanning(%u)...", (unsigned)seconds);
+    s_ble_scan_start_evt    = false;
+    s_ble_scan_start_status = (esp_bt_status_t)0;
     if ((ret = esp_ble_gap_start_scanning(seconds)) != ESP_OK) {
         ESP_LOGE(TAG, "[SCAN] start_scanning FAILED: %s (0x%x)", esp_err_to_name(ret), ret);
         return ret;
     }
-    ESP_LOGI(TAG, "[SCAN] start_scanning OK, waiting DONE evt...");
+    /* ★ 2026-11-28: 等 SCAN_START_COMPLETE(上限 1s)。收不到 ⇒ 命令被 BTM 层丢弃
+     *   (实测开机首次扫描: 无此事件, 1.6s 后 stop 报 WRONG_MODE, 13s 后才超时收尾;
+     *    这 13s 里用户点选手柄只会得到"扫描未收尾, 暂不发起连接")。
+     *   此处立即判失败, 让上层用一次重试换掉这 13s 空等。 */
+    for (int i = 0; i < 50 && !s_ble_scan_start_evt; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (!s_ble_scan_start_evt) {
+        ESP_LOGW(TAG, "[SCAN] 1s 内未收到 SCAN_START_COMPLETE ⇒ 本次启动被丢弃(BTM 未就绪)");
+        esp_ble_gap_stop_scanning();          /* 清掉可能残留的扫描态 */
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_ble_scan_start_status != (esp_bt_status_t)0) {
+        ESP_LOGW(TAG, "[SCAN] SCAN_START_COMPLETE status=%d ⇒ 本次扫描放弃",
+                 (int)s_ble_scan_start_status);
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_LOGI(TAG, "[SCAN] 扫描已确认启动, waiting DONE evt...");
     return ret;
 }
 
@@ -1254,7 +1290,18 @@ esp_err_t esp_hid_scan(uint32_t seconds, size_t *num_results, esp_hid_scan_resul
     while (xSemaphoreTake(ble_hidh_cb_semaphore, 0) == pdTRUE) { }
 
     rc = start_ble_scan(seconds);
-    if (rc != ESP_OK) goto done;
+    if (rc != ESP_OK) {
+        /* ★ 2026-11-28: 开机后首次扫描常被 controller 丢弃(BTM 未就绪/RF 全校准),
+         *   表现为"连一次失败、再连一次就好"。这里等 600ms 自行重试一次,
+         *   让用户一次点选就能连上, 而不是先去撞一次"连接失败已断开"。 */
+        ESP_LOGW(TAG, "[SCAN] BLE 启动失败(%s) ⇒ 600ms 后重试一次", esp_err_to_name(rc));
+        vTaskDelay(pdMS_TO_TICKS(600));
+        rc = start_ble_scan(seconds);
+        if (rc != ESP_OK) {
+            ESP_LOGE(TAG, "[SCAN] 重试仍失败: %s", esp_err_to_name(rc));
+            goto done;
+        }
+    }
     if (!wait_ble_cb(seconds)) { rc = ESP_ERR_TIMEOUT; goto done; }
 #endif /* CONFIG_BT_BLE_ENABLED */
 

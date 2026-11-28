@@ -45,6 +45,15 @@ static gs_t s_gs;
 /* ★ 2026-10-30 按需蓝牙的租约 (幂等位图); 没配对过手柄时永远为空 → 不占内存 */
 static os_hw_lease_t s_bt_lease;
 
+/* ★ 2026-11-25: 系统级关机确认 (电源键长按 2s) — gam4980 自驱动引擎注入.
+ * gam4980 不依赖 os, 由本页注入回调; ctx 静态保存(同时只有一个 BBK 实例). */
+static ui_ctx_t *s_gam4980_ctx = NULL;
+static void bbk_power_shutdown_cb(st7305_handle_t *lcd)
+{
+    (void)lcd;
+    if (s_gam4980_ctx) os_power_shutdown_confirm(s_gam4980_ctx);
+}
+
 static bool is_gam(const char *name) {
     size_t len = strlen(name);
     return (len > 4) && (strcasecmp(name + len - 4, ".gam") == 0);
@@ -122,6 +131,10 @@ static void on_game_select(ui_ctx_t *ctx, os_pane_t *p,
     gam4980_set_key_vib(s_gs.key_vib != 0);
     /* V1.2 模块化: 注入引擎回调 — 破 os ⇄ gam4980 循环依赖 (引擎不再 include os.h) */
     gam4980_set_exit_confirm_cb(os_confirm_exit_blocking);
+    /* ★ 2026-11-25: 系统级关机确认 (电源键长按 2s)。gam4980 是自驱动阻塞引擎,
+     *   主循环分发跑不到, 必须走引擎内回调。ctx 用静态保存(同时只有一个 BBK 实例)。 */
+    s_gam4980_ctx = ctx;
+    gam4980_set_power_shutdown_cb(bbk_power_shutdown_cb);
     gam4980_set_statusbar_cb(svc_statusbar_draw_game);
     input_set_gamepad_nav_enabled(false);
     input_set_gamepad_gamemode(true);   /* V1.3.x: 步步高也是"游戏" — 暗黑UI模式(除游戏外反色)进入时恢复不反色 */

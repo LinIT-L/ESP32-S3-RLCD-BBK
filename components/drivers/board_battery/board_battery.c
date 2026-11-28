@@ -14,7 +14,7 @@
 #include "esp_rtc_time.h"   /* esp_rtc_get_time_us(): 窗口"天"计时, 跨深睡继续走 */
 #include "nvs_flash.h"      /* 一个月电池日档持久化 (跨天写一次) */
 #include "driver/gpio.h"
-#include "board_pins.h"     /* board_pins_get()->chrg: 充电中检测脚 (小智板 = GPIO44) */
+#include "board_pins.h"     /* board_pins_get()->chrg: 充电中检测脚 */
 #include "battery_model.h"  /* ★ 2026-10-31: 纯算法层 (滤波/曲线/稳定/充电识别) */
 
 static const char *TAG = "board_battery";
@@ -230,20 +230,19 @@ static void board_battery_init_calibration(void)
     ESP_LOGD(TAG, "ADC calibration unavailable, battery voltage will use raw estimate");
 }
 
-/* ---------------- 充电三态: 单根 CHRG + 电压判充满 ----------------
- * ★ 2026-11-21 最终方案(linit 定): GPIO2/43 是扩展脚, 固件不得占用 ⇒ 没有余量做 VBUS 分压,
- *   只用模组 29 脚 CHRG 这一根线。
- *   chrg : **开漏低有效**, 充电中拉低。
- * 判定:
- *   没插线                    → NONE   (未充电)
- *   CHRG 低                   → ACTIVE (充电中)
- *   CHRG 高 + VBAT ≥ 4150mV   → FULL   (已充满: 充电结束时 IC 释放 CHRG, 此时电压已到顶)
- * ⇒ 只用**一根 CHRG**。GPIO2 已定为扩展口(与外接共用, 固件不得占用), 没有余量再做 VBUS 分压。
- * ⚠ 单线分不出"插着线但没在充"和"没插线"(两者 CHRG 都高), 这是单 IO 的信息上限;
- *   用电压补足, 且"满电拔线"显示满格本来就符合直觉。
- * 引脚来自板型表 `.chrg` (-1 = 本板没接), 按需懒初始化,
- * 避免在"板型还没识别完"时把脚配错。 */
-static int s_chrg_pin = -2;        /* -2 = 还没解析过 */
+/* ---------------- 充电三态: 一根检测脚 + 电压判充满 ----------------
+ * ★ 2026-11-28 扩展: 板型表 .chrg_active_high 决定极性 ——
+ *   ① 低有效(CHRG, 老板): 开漏, 充电中拉低 → 低=插电
+ *   ② 高有效(S1_4): GPIO42 接充电芯片 SWVI 数字信号(0/3.3V), 充电中=高
+ * 判定(统一用"是否插电"plugged):
+ *   没插线                       → NONE   (未充电)
+ *   plugged + VBAT < 4150mV      → ACTIVE (充电中)
+ *   plugged + VBAT ≥ 4150mV      → FULL   (已充满, 电压到顶)
+ * ⚠ SWVI 只报"充电中", 判不出是否充满 → 充满靠 VBAT≥4150mV 补足,
+ *   这是单 IO 的信息上限; 满电时显示"已充满"符合直觉。
+ * 引脚来自板型表 `.chrg` (-1 = 本板没接), 按需懒初始化。 */
+static int  s_chrg_pin = -2;        /* -2 = 还没解析过 */
+static bool s_chrg_active_high = false;  /* true=高有效(SWVI 数字信号/充电中=高) */
 
 /* 已充满判定门限: 满量程 4200, 充电截止后静置会从 4.2 缓慢回落到 4.15 左右,
  * 取 4150 既能在"刚充满"时认出, 又不会把 3.9~4.0 的普通满格电量误报成"充满"。 */
@@ -253,28 +252,39 @@ static void chrg_ensure(void) {
     if (s_chrg_pin != -2) return;
     const board_pins_t *bp = board_pins_get();
     s_chrg_pin = bp ? bp->chrg : -1;
+    s_chrg_active_high = bp ? bp->chrg_active_high : false;
+    /* ★ 小智老版 S1_1 的 GPIO42 是排针悬空脚(U1.5), 无分压电路 ⇒ 读恒低。
+     *   本板是"高有效"(插电=高), 读低=没插电 ⇒ 天然不会误报充电, 无需额外屏蔽。 */
 
     if (s_chrg_pin >= 0) {
         gpio_config_t io = {
             .pin_bit_mask = (1ULL << s_chrg_pin),
             .mode         = GPIO_MODE_INPUT,
-            .pull_up_en   = GPIO_PULLUP_ENABLE,      /* 开漏: 必须上拉才能读"高" */
+            /* 低有效(开漏 CHRG): 上拉; 高有效(SWVI 推挽数字): 不拉 */
+            .pull_up_en   = s_chrg_active_high ? GPIO_PULLUP_DISABLE : GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type    = GPIO_INTR_DISABLE,
         };
         gpio_config(&io);
     }
-    ESP_LOGI(TAG, "充电检测: CHRG=GPIO%d (低=充电中; 充满靠 VBAT≥%dmV 判)",
-             s_chrg_pin, BAT_FULL_MV);
+    ESP_LOGI(TAG, "充电检测: GPIO%d(%s) (插电=%s; 充满靠 VBAT≥%dmV 判)",
+             s_chrg_pin, s_chrg_active_high ? "SWVI数字/高有效" : "CHRG开漏/低有效",
+             s_chrg_active_high ? "高" : "低", BAT_FULL_MV);
 }
 
 int  board_battery_chrg_pin(void) { chrg_ensure(); return s_chrg_pin; }
 
-/* 充电中 = CHRG 拉低。 */
+/* 归一化"是否插电": 低有效脚读低 / 高有效脚读高 = 插电 */
+static bool chrg_plugged(void) {
+    if (s_chrg_pin < 0) return false;
+    int lvl = gpio_get_level((gpio_num_t)s_chrg_pin);
+    return s_chrg_active_high ? (lvl == 1) : (lvl == 0);
+}
+
+/* 快路径只用于日志/诊断, 语义=插着电 */
 bool board_battery_charging(void) {
     chrg_ensure();
-    if (s_chrg_pin < 0) return false;      /* 没接 CHRG → 不知道, 一律报"未充电" */
-    return gpio_get_level((gpio_num_t)s_chrg_pin) == 0;
+    return chrg_plugged();
 }
 
 /* 轮询版: 500ms 缓存一次, 状态翻转时打一行日志。
@@ -769,24 +779,27 @@ esp_err_t board_battery_read_cached(board_battery_status_t *status)
          *   现在电压每轮独立计算、电量纯查表，**没有任何跨轮历史**，
          *   所以深睡唤醒后的第一次采样天然就是新值，不需要重置逻辑。 */
 
-        /* ---- ★ 2026-11-21 三态: CHRG 低=充电中; CHRG 高且电压到顶=已充满 ----
+        /* ---- ★ 2026-11-28 三态(极性由 .chrg_active_high 定) ----
+         *   plugged = 插着电(低有效读低 / 高有效读高)
+         *   plugged + 电压未到顶 = ACTIVE(闪电); plugged + 到顶 = FULL; 没插 = NONE
          * 不叠去抖: 60s 才采一次, 再套 3 次去抖要 3 分钟才翻转, 图标明显滞后。
-         * bm_chrg_update 仍保留给 board_battery_charging_cached() 的 500ms 快路径用。 */
+         * S1_4: GPIO42 SWVI 数字高有效, 充电中=高。 */
         chrg_ensure();
-        int chrg_lvl = (s_chrg_pin >= 0)
-                     ? gpio_get_level((gpio_num_t)s_chrg_pin) : -1;
-        bool charging = (chrg_lvl == 0);
+        bool plugged = chrg_plugged();
+        bool have_pin = (s_chrg_pin >= 0);
+        /* bm_chrg_db 内部按"低=充电"记, 这里喂归一化后的电平给快路径 */
+        int chrg_lvl = !have_pin ? -1 : (plugged ? 0 : 1);
         bm_chrg_update(&s_chg, chrg_lvl);
 
         uint8_t chg_state;
-        if (chrg_lvl < 0) {                          /* 本板没接 CHRG */
+        if (!have_pin) {                             /* 本板没接检测脚 */
             chg_state = BAT_CHG_NONE;
-        } else if (charging) {                       /* CHRG 低 = 充电中 */
-            chg_state = BAT_CHG_ACTIVE;
-        } else if (raw.voltage_mv >= BAT_FULL_MV) {  /* CHRG 已释放 + 电压到顶 = 充满 */
+        } else if (!plugged) {                       /* 没插电 */
+            chg_state = BAT_CHG_NONE;
+        } else if (raw.voltage_mv >= BAT_FULL_MV) {  /* 插着 + 电压到顶 = 充满 */
             chg_state = BAT_CHG_FULL;
-        } else {                                     /* CHRG 高 + 电压没到 = 没插线 */
-            chg_state = BAT_CHG_NONE;
+        } else {                                     /* 插着 + 电压没到 = 充电中 */
+            chg_state = BAT_CHG_ACTIVE;
         }
 
         /* ---- ④ 查表得电量 + 显示平滑 ----
@@ -794,7 +807,7 @@ esp_err_t board_battery_read_cached(board_battery_status_t *status)
          *   smooth 只压**单轮大跳变** (带载压降/回升假象), 正常放电原样跟随。
          *   充电状态已经算好, 直接喂进去决定上升方向要不要快速响应。 */
         uint8_t soc_target = board_battery_voltage_to_percent(raw.voltage_mv);
-        uint8_t soc        = bm_soc_smooth(&s_soc_sm, soc_target, charging);
+        uint8_t soc        = bm_soc_smooth(&s_soc_sm, soc_target, plugged);
 
         s_cache.voltage_mv = raw.voltage_mv;
         s_cache.percent    = soc;
@@ -804,10 +817,10 @@ esp_err_t board_battery_read_cached(board_battery_status_t *status)
 
         /* 诊断快照 */
         s_diag.soc      = soc;
-        s_diag.charging = charging;
+        s_diag.charging = plugged;
 
         /* 真机测试记录（关闭时只判一个 bool，不采样不分配） */
-        bat_trace_push((uint16_t)raw.voltage_mv, soc, s_diag.flags, (uint8_t)(charging ? 1 : 0));
+        bat_trace_push((uint16_t)raw.voltage_mv, soc, s_diag.flags, (uint8_t)(plugged ? 1 : 0));
 
         /* ★ 开机 10s 静默期: boot 期间 WiFi/BT/SD/LCD/音频一起上电, 电池端电压被负载拉低,
          *   这段时间记进去就是 linit 问的"刚开机电压为什么波动"(那是真实压降, 但不该污染趋势图)。 */

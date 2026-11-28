@@ -476,6 +476,17 @@ static void eng_task_run_loop(ui_ctx_t *ctx, eng_loop_ops_t *ops) {
             /* 锁屏键点按 → 交给独立监视任务渲染, 本循环不自己画壁纸 */
             os_screensaver_force_enter();
             a = OS_ACTION_NONE;
+        } else if (a == OS_ACTION_POWER_SHUTDOWN) {
+            /* ★ 2026-11-25 系统级关机确认 (与"返回键退出程序框"同一条 action 通道):
+             *   引擎前台阻塞主循环, os_core 的分发跑不到, 必须在本循环消费。
+             *   上面已 pause 引擎 → 画面冻结, 直绘系统框; 取消则 resume 继续游戏,
+             *   确认则真断电(不返回)。这条正是用户验证过"游戏里有效"的那条路径。 */
+            os_power_shutdown_confirm(ctx);
+            if (ops->resume) ops->resume();
+            st7305_invalidate_frame();        /* 作废帧指纹, 下一帧整屏重画回游戏 */
+            ctx->needs_redraw = true;
+            vTaskDelay(pdMS_TO_TICKS(50));    /* 给恢复一帧稳定时间 */
+            a = OS_ACTION_NONE;
         }
         /* ★ 2026-11-22 linit「长按返回 3s 强制退出所有、回桌面」:
          *   原来 HOME 与 BACK 一视同仁 ⇒ 游戏里长按返回 3s 仍然弹「退出程序?」,

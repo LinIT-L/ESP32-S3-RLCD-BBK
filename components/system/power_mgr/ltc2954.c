@@ -5,13 +5,14 @@
  *   power_mgr_off() 那一条（停射频 → 关音频 → GPS 停靠 → 卸 SD → 关屏 → 深睡），
  *   本模块只在 power_mgr_off() 的**末尾**补一步"真断电"。
  *
- * 时序:
- *   ① 开机 ltc2954_init(): GPIO42 = 开漏输出 + 释放(高) → 上电绝不断电
- *   ② /INT 实物接 GPIO44, **由 input.c 当普通电源键轮询**(btn_pwr=44)做 0.5s/2s 判定;
+ * 时序(★ 2026-11-28 四版本: KILL/INT 脚从 board_pins 动态取, S1_4=44/1):
+ *   ① 开机 ltc2954_init(): KILL(GPIO44) = 开漏输出 + 释放(高) → 上电绝不断电
+ *      ★ 有 0x68(DS3231) 才配脚: 无时钟 = S1_1 老版(无 2954) = 不碰, 走深睡。
+ *   ② /INT 实物接 GPIO1, **由 input.c 当普通电源键轮询**(btn_pwr=1)做 0.5s/2s 判定;
  *      本模块既不配置也不消费这个脚 —— 一个脚不能两个主人, 且"按下即断电"体验等于重启。
  *   ③ 2s 长按 → 关机确认框 → power_mgr_off():
  *      快速收尾(音频/功放/震动/屏 Sleep In/日志落盘/SD 卸载, ~260ms) → ltc2954_power_cut()
- *   ④ ltc2954_power_cut() → GPIO42 拉低 → LTC2954 断开系统电源(不再走到深睡)
+ *   ④ ltc2954_power_cut() → KILL(GPIO44) 拉低 → LTC2954 断开系统电源(不再走到深睡)
  *      若 800ms 内没断（未接硬件/开关关闭），power_mgr 回落深睡兜底。
  *
  * 电气约定（与 LTC2954 数据手册一致）:
@@ -19,7 +20,7 @@
  *   芯片拉低 EN 完成断电。因此:
  *     · 空闲/安全电平 = **高（开漏释放）**，绝不主动驱动高电平（避免与外部上拉打架）
  *     · 触发断电     = 拉低并保持 CUT_HOLD_MS
- *   /INT(GPIO44) 是 2954 的按键镜像输出, 由 input.c 当电源键读; 本模块不碰（见 ②）。
+ *   /INT(GPIO1) 是 2954 的按键镜像输出, 由 input.c 当电源键读; 本模块不碰（见 ②）。
  */
 #include "ltc2954.h"
 
@@ -55,8 +56,7 @@ static bool s_force    = false;   /* ★ 本次关机强制真断电（确认框
 /* ---- 板型冲突检查 ----
  * 任务要求"检查两个 GPIO 是否与现有工程功能冲突"。
  * 事实: 三张板型表里 ——
- *   小智一体版（本次目标板）: tp_rst=6, gps_tx=41, chrg=-1 ⇒ GPIO42 在固件视角空闲
- *     (GPIO44 硬件上是 2954 的 /INT, 固件不配置它, 所以也算空闲)
+ *   小智一体版: tp_rst=6, gps_tx=41, chrg=-1, /INT=GPIO1, KILL=GPIO44 ⇒ 44 在固件视角空闲
  *   微雪原版 / 标准扩展版  : tp_rst=2, gps_tx=43 ⇒ 仍需逐脚比对
  * 所以不能写死"永远可用"：换板后必须自动让位，绝不能去抢触摸复位脚或 GPS 的 TX。
  * 这里把 board_pins_t 里所有"功能脚"字段逐个比对，命中即判冲突并整体禁用本模块。 */
@@ -116,18 +116,18 @@ static const char *pin_owner(const board_pins_t *bp, int pin)
     return "?";
 }
 
-/* GPIO42 KILL: 开漏输出 + 内部上拉 = 安全电平(高)。
+/* KILL(动态脚, S1_4=GPIO44): 开漏输出 + 内部上拉 = 安全电平(高)。
  * ⚠ 两条都是必须的，少一条就可能是"莫名其妙断电"或"关不掉机":
  *   · 开漏(OD)而不是推挽: 释放时不主动驱动高，板上有上拉就跟着上拉，
  *     不会与 LTC2954 的 KILL 输入结构对顶；只有关机那一刻才主动拉低。
  *   · **必须开内部上拉**: 开漏释放 = 高阻。若既不上拉又开漏，引脚就是浮空的，
  *     噪声一拉低就可能触发 LTC2954 断电 —— 这是最危险的一种"偶发断电"。
  * ★ 抽成函数: 旧版小智首探不到时钟时先不配脚，等 svc_rtc 后置确认到 DS3231
- *   （= 确实是 PCB1_3）再调本函数补配，见 ltc2954_autoconf_from_rtc()。 */
+ *   （= 确实是 S1_4 关机版）再调本函数补配，见 ltc2954_autoconf_from_rtc()。 */
 static esp_err_t kill_pin_setup(void)
 {
     gpio_config_t kc = {
-        .pin_bit_mask = 1ULL << LTC2954_KILL_GPIO,
+        .pin_bit_mask = 1ULL << ltc2954_kill_pin(),
         .mode         = GPIO_MODE_OUTPUT_OD,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -136,10 +136,10 @@ static esp_err_t kill_pin_setup(void)
     esp_err_t err = gpio_config(&kc);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "GPIO%d(KILL) 配置失败: %s ⇒ 硬件关机禁用",
-                 LTC2954_KILL_GPIO, esp_err_to_name(err));
+                 ltc2954_kill_pin(), esp_err_to_name(err));
         return err;
     }
-    gpio_set_level((gpio_num_t)LTC2954_KILL_GPIO, KILL_IDLE_LEVEL);
+    gpio_set_level((gpio_num_t)ltc2954_kill_pin(), KILL_IDLE_LEVEL);
     return ESP_OK;
 }
 
@@ -150,15 +150,23 @@ esp_err_t ltc2954_init(void)
 
     const board_pins_t *bp = board_pins_get();
 
+    /* ---- ⓪ 本板型无 2954 (pwr_kill=-1: 微雪/标准/老小智以外) ⇒ 一个寄存器都不碰 ---- */
+    if (ltc2954_kill_pin() < 0) {
+        s_hw_ok = false;
+        s_enabled = false;
+        ESP_LOGI(TAG, "本板型 pwr_kill=-1 ⇒ 无 LTC2954, 硬件关机禁用, 不碰任何引脚");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     /* ---- ① 冲突检查（先查再动脚，冲突时一个寄存器都不写） ---- */
-    const bool c_kill = pin_used_by_board(bp, LTC2954_KILL_GPIO);
+    const bool c_kill = pin_used_by_board(bp, ltc2954_kill_pin());
     if (c_kill) {
         s_hw_ok = false;
-        /* 只检查 KILL: /INT(GPIO44) 归 input.c, 本模块从不碰它, 无需判冲突 */
+        /* 只检查 KILL: /INT(GPIO1) 归 input.c, 本模块从不碰它, 无需判冲突 */
         ESP_LOGW(TAG, "GPIO%d 与当前板型[%s]冲突 (KILL:%s 占用=%s)"
                       " ⇒ 硬件关机功能禁用, 不触碰该引脚",
-                 LTC2954_KILL_GPIO, bp ? bp->name : "?",
-                 pin_owner(bp, LTC2954_KILL_GPIO), "是");
+                 ltc2954_kill_pin(), bp ? bp->name : "?",
+                 pin_owner(bp, ltc2954_kill_pin()), "是");
         /* ★ 2026-11-22 linit: 设置页不再暴露"硬件关机"开关，改为**有硬件就自动开**。
          *   引脚与本板型冲突 ⇒ 这块板上根本没有可用的 LTC2954 ⇒ 一律关闭，
          *   不再从 NVS 读用户选择（那个开关已经从 UI 移除）。 */
@@ -166,26 +174,27 @@ esp_err_t ltc2954_init(void)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    /* ---- ①.5 两代小智一体版的分辨（2026-11-22 linit 要求） ----
-     * 引脚表完全相同，但只有 PCB1_3 焊了 LTC2954 + DS3231MZ+；
-     * 旧版 PCB1_0~1_2 的 42/44 是空脚，断电靠"深睡模拟关机"。
-     * 2954 没有任何可探的通道，而 DS3231 能用 I2C 问 0x68，两片永远同板出现
-     * ⇒ **以时钟芯片为判据**：没时钟 = 旧版 = 不碰 GPIO42，关机走休眠模拟。
+    /* ---- ①.5 两代小智的分辨: ★ 靠时钟芯片(0x68)自动切换 ----
+     * 三份权威网表: S1_1(老,无 2954/无 DS3231, 电源键 SW1.1→GPIO1);
+     *   S1_4(关机版, 有 2954 U6 + DS3231 U1, KILL=U6.8→GPIO44, /INT→GPIO1)。
+     * 2954 无可探通道, DS3231 可 I2C 问 0x68, 两片永远同板出现
+     * ⇒ **以时钟芯片为判据**: 没 0x68 = S1_1 老版 = 不碰 KILL, 关机走深睡;
+     *   有 0x68 = S1_4 关机版 = 拉 KILL 真断电。两版电源键同为 GPIO1, 无需切换。
      * ⚠ 首探可能因触摸总线还没建好而漏（见 hw_cfg.h 对 hw_cfg_note_rtc 的说明），
      *   所以这里只"暂不启用"、不清除引脚可用性；4 秒后 svc_rtc 挂上芯片会回调
      *   ltc2954_autoconf_from_rtc() 补配引脚并启用，不会把新版永久判成旧版。 */
     s_pin_ok = true;
-    if (hw_cfg_board_id() == HW_BOARD_XIAOZHI && !hw_cfg_detected(HW_RTC)) {
-        /* ★ 2026-11-22 linit: 「有识别到时钟就自动开启, 没有就自动关闭」——
-         *   无 0x68 ⇒ 旧版小智(无 LTC2954) ⇒ 硬件关机**关闭**，不再看 NVS。
-         *   设置页的开关已移除，用户无从手动干预，这里必须自洽。 */
+    /* ★ 2026-11-28 四版本全自动: 用 hw_cfg_has_ltc2954() 统一判据
+     *   小智看 0x68(RTC 印记): 有=S1_4关机版, 无=S1_1老版。无用户开关。
+     *   非小智板这里是 false, 但 ⓪ 已按 pwr_kill<0 早退, 不会走到这。 */
+    if (!hw_cfg_has_ltc2954()) {
         s_enabled = false;
-        ESP_LOGW(TAG, "未检测到时钟芯片(0x68) ⇒ 判定旧版小智一体版(无 LTC2954): "
-                      "GPIO%d 不驱动, 关机走休眠模拟", LTC2954_KILL_GPIO);
+        ESP_LOGW(TAG, "判定本板无 LTC2954 (小智老版 S1_1) ⇒ "
+                      "KILL GPIO%d 不驱动, 关机走休眠模拟", ltc2954_kill_pin());
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    /* ---- ② GPIO42 KILL: 开漏输出 + 内部上拉 = 安全电平(高) ----
+    /* ---- ② KILL 脚: 开漏输出 + 内部上拉 = 安全电平(高) ----
      * ⚠ 两条都是必须的，少一条就可能是"莫名其妙断电"或"关不掉机":
      *   · 开漏(OD)而不是推挽: 释放时不主动驱动高，板上有上拉就跟着上拉，
      *     不会与 LTC2954 的 KILL 输入结构对顶；只有关机那一刻才主动拉低。
@@ -197,13 +206,13 @@ esp_err_t ltc2954_init(void)
 
     s_hw_ok   = true;
     /* ★ 2026-11-22 linit: 走到这里说明**已识别到时钟芯片(0x68)** ⇒ 这块板就是
-     *   带 LTC2954 的 PCB1_3 ⇒ 硬件关机自动开启，不再从 NVS 读、也不再让用户手选。
+     *   带 LTC2954 的 S1_4 ⇒ 硬件关机自动开启，不再从 NVS 读、也不再让用户手选。
      *   没有时钟的旧版在前面 ①.5 就 return 了，不会到这里。 */
     s_enabled = true;
 
     ESP_LOGI(TAG, "初始化完成: KILL=GPIO%d(开漏, 安全电平=释放/高) | /INT=GPIO%d(归 input.c "
                   "当电源键, 本模块不接管) | 板型=%s | 硬件关机=%s",
-             LTC2954_KILL_GPIO, LTC2954_INT_GPIO, bp ? bp->name : "?",
+             ltc2954_kill_pin(), ltc2954_int_pin(), bp ? bp->name : "?",
              s_enabled ? "自动开启(已识别时钟芯片)" : "关闭");
     return ESP_OK;
 }
@@ -218,11 +227,11 @@ bool ltc2954_is_cut_requested(void) { return s_enabled || s_force; }
 
 void ltc2954_set_enabled(bool en)
 {
-    /* ⚠ 关键: 无论开关怎么变，GPIO42 一律回到"安全电平"。
+    /* ⚠ 关键: 无论开关怎么变，KILL 一律回到"安全电平"。
      *   关掉开关只是让 ltc2954_power_cut() 不再拉低 KILL(改走深睡), 绝不能顺手断电。 */
     if (s_hw_ok) {
-        gpio_hold_dis((gpio_num_t)LTC2954_KILL_GPIO);
-        gpio_set_level((gpio_num_t)LTC2954_KILL_GPIO, KILL_IDLE_LEVEL);
+        gpio_hold_dis((gpio_num_t)ltc2954_kill_pin());
+        gpio_set_level((gpio_num_t)ltc2954_kill_pin(), KILL_IDLE_LEVEL);
     }
     s_enabled = en;
     svc_cfg_set_u8(LTC2954_CFG_NS, LTC2954_CFG_KEY, en ? 1 : 0);
@@ -234,13 +243,13 @@ void ltc2954_set_enabled(bool en)
         return;
     }
     ESP_LOGI(TAG, "硬件关机=%s (GPIO%d 保持安全电平, NVS %s.%s=%d)",
-             en ? "开" : "关", LTC2954_KILL_GPIO,
+             en ? "开" : "关", ltc2954_kill_pin(),
              LTC2954_CFG_NS, LTC2954_CFG_KEY, en ? 1 : 0);
 }
 
 /* ★ 2026-11-22 linit「有识别到时钟就自动开启, 没有就自动关闭」
  *   判据唯一: **时钟芯片 DS3231(0x68) 在不在**。两片永远同板出现
- *   （PCB1_3 焊 DS3231 + LTC2954；PCB1_0~1_2 都不焊）。
+ *   （S1_4 焊 DS3231 + LTC2954；S1_1 都不焊）。
  *   ⛔ 不再读 NVS 里的用户开关，也不再检查 MANUAL 标志 —— 设置页的
  *     「硬件关机」开关已按 linit 要求移除，用户无从手动干预，
  *     留着 MANUAL 判断只会让状态与 UI 不一致。
@@ -250,11 +259,11 @@ void ltc2954_autoconf_from_rtc(void)
     if (!s_pin_ok) return;                   /* 引脚冲突(微雪/标准) ⇒ 与本板无关 */
     if (!s_hw_ok) {
         /* 开机首探没认到 0x68 ⇒ 上面按"旧版小智"暂不启用；现在 svc_rtc 真把芯片挂上了
-         * ⇒ 就是 PCB1_3，补配引脚再启用（否则新版会被永久判成旧版，失去硬件断电）。 */
+         * ⇒ 就是 S1_4 关机版，补配引脚再启用（否则新版会被永久判成旧版，失去硬件断电）。 */
         if (kill_pin_setup() != ESP_OK) return;
         s_hw_ok = true;
         ESP_LOGW(TAG, "后置确认到时钟芯片(DS3231 0x68) ⇒ 补配 GPIO%d, 启用硬件断电",
-                 LTC2954_KILL_GPIO);
+                 ltc2954_kill_pin());
     }
     if (s_enabled) return;                   /* 已开, 不重复动作 */
     /* kill_pin_setup() 已把 KILL 置为安全电平(高) ⇒ 这里只翻状态位，不写 NVS。 */
@@ -266,22 +275,22 @@ void ltc2954_power_cut(void)
 {
     if (!s_hw_ok) return;      /* 板型冲突/未接入: 一个脚都不碰 */
 
-    /* GPIO42 可能在前面的"引脚隔离 / hold"里被冻结，先解冻再驱动 */
-    gpio_hold_dis((gpio_num_t)LTC2954_KILL_GPIO);
-    gpio_set_direction((gpio_num_t)LTC2954_KILL_GPIO, GPIO_MODE_OUTPUT_OD);
+    /* KILL 脚可能在前面的"引脚隔离 / hold"里被冻结，先解冻再驱动 */
+    gpio_hold_dis((gpio_num_t)ltc2954_kill_pin());
+    gpio_set_direction((gpio_num_t)ltc2954_kill_pin(), GPIO_MODE_OUTPUT_OD);
 
     if (!ltc2954_is_cut_requested()) {
         /* 开关关闭且本次没强制: 回到安全电平后直接返回 —— 关机仍由调用方的深睡完成 */
-        gpio_set_level((gpio_num_t)LTC2954_KILL_GPIO, KILL_IDLE_LEVEL);
+        gpio_set_level((gpio_num_t)ltc2954_kill_pin(), KILL_IDLE_LEVEL);
         ESP_LOGI(TAG, "硬件关机开关=关 ⇒ 不拉 KILL (GPIO%d 保持安全电平), 走原深睡流程",
-                 LTC2954_KILL_GPIO);
+                 ltc2954_kill_pin());
         return;
     }
 
-    ESP_LOGW(TAG, "安全关机已完成 ⇒ 拉低 GPIO%d 触发 LTC2954 硬件断电%s", LTC2954_KILL_GPIO,
+    ESP_LOGW(TAG, "安全关机已完成 ⇒ 拉低 GPIO%d 触发 LTC2954 硬件断电%s", ltc2954_kill_pin(),
              s_enabled ? "" : " (本次由确认框强制)");
-    gpio_set_level((gpio_num_t)LTC2954_KILL_GPIO, KILL_ACTIVE_LEVEL);
-    gpio_hold_en((gpio_num_t)LTC2954_KILL_GPIO);   /* 万一没立刻断电，电平也保持不变 */
+    gpio_set_level((gpio_num_t)ltc2954_kill_pin(), KILL_ACTIVE_LEVEL);
+    gpio_hold_en((gpio_num_t)ltc2954_kill_pin());   /* 万一没立刻断电，电平也保持不变 */
 
     /* 等芯片内部定时器到点断开 EN。正常情况这里不会返回。 */
     vTaskDelay(pdMS_TO_TICKS(CUT_HOLD_MS));

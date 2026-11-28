@@ -1367,24 +1367,30 @@ void os_dialog_draw_overlay(ui_ctx_t *ctx) {
     if (toast_active()) dlg_draw_toast(ctx->lcd);
 }
 
-/* ==== 统一退出确认 (冻结帧直绘版) ====
- * 步步高/文曲星等"自驱动游戏画面"引擎不能走 os 弹窗管道 (它们自己画帧),
- * 故退到冻结的游戏帧上直绘同一套确认框。外观/交互与 os_dialog_confirm_ex
- * 的 small 小确认模板完全一致 (标题"退出程序?"在上、左"确定"右"取消"、四边黑框、
- * 手柄 LEFT=确定/RIGHT=取消 黑块选择, CONFIRM=当前选中项, BACK=取消+松手守卫,
- * 触摸弹窗内左=确定 右=取消)。阻塞直到用户决定, 返回 true=确认退出。
+/* ==== 系统级模态确认 (冻结帧直绘版) — 全局最高优先级 ====
+ * 用于"关机?"、自驱动引擎的"退出程序?"这类**必须弹出、不能被任何应用/页面/
+ * 菜单/普通弹窗栈阻拦**的系统确认。原理: 不走 os_dialog 的弹窗栈(栈满会静默
+ * return、全屏模态会盖住、引擎阻塞主循环时根本弹不出), 直接在当前冻结帧上
+ * 画同一套 small 确认模板, 直读手柄电平 + input 层物理键/触摸, 阻塞到决定。
  *
- * 输入一律直读手柄电平 (LEFT/RIGHT/CONFIRM/BACK) 并配上升沿/松手守卫, 不依赖
- * input 层的 nav/gamemode 开关 —— 游戏内 nav 已关闭时手柄左右仍然可控, 这是与
- * 其它自驱动引擎可靠交互的关键。物理返回/触摸仍走 input_get_action。 */
-bool os_confirm_exit_blocking(st7305_handle_t *lcd) {
-    if (!lcd) return true;
+ * 外观/交互与 os_dialog_confirm_ex 一致 (标题在上、左"确定"右"取消"、四边黑框、
+ * 手柄 LEFT=确定/RIGHT=取消 黑块选择, CONFIRM=当前选中项, BACK=取消+松手守卫,
+ * 触摸左=确定 右=取消)。
+ * 输入一律直读手柄电平并配上升沿/松手守卫, 不依赖 input 的 nav/gamemode 开关
+ * —— 游戏内 nav 已关闭时手柄左右仍可控, 这是与自驱动引擎可靠交互的关键。
+ *
+ * timeout_ms>0 时到点返回 default_result (关机场景传"取消", 防人不在时自关机);
+ * timeout_ms=0 表示不超时 (退出程序确认沿用原行为)。 */
+bool os_system_confirm(st7305_handle_t *lcd, const char *title,
+                       uint32_t timeout_ms, bool default_result)
+{
+    if (!lcd) return default_result;
     const int W = 140, H = 74, MID = W / 2;
     const int BX = (ui_screen_w() - W) / 2, BY = (ui_screen_h() - H) / 2;
     const char *s0 = "\xe7\xa1\xae\xe5\xae\x9a"; /* 确定 */
     const char *s1 = "\xe5\x8f\x96\xe6\xb6\x88"; /* 取消 */
-    const char *title = "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?"; /* 退出程序? */
-    int sel = 0;   /* 0=确定 1=取消 */
+    const uint32_t start_ms = os_millis();
+    int sel = default_result ? 1 : 0;   /* 默认高亮: 取消 / 确定 */
 
     bool conn = bt_manager_is_connected();
     /* 各键上次电平 (上升沿触发一次) + 触发键/确认键是否还按着 (松手守卫) */
@@ -1397,6 +1403,10 @@ bool os_confirm_exit_blocking(st7305_handle_t *lcd) {
     bool back_held    = b_prev;
 
     while (1) {
+        /* 超时: 按调用方给定结果收尾 (关机=取消), 绝不由系统替用户点头 */
+        if (timeout_ms > 0 && (uint32_t)(os_millis() - start_ms) >= timeout_ms)
+            return default_result;
+
         fill_rect(lcd, BX, BY, BX + W - 1, BY + H - 1, ST7305_COLOR_WHITE);
         for (int k = 0; k < 2; k++) {
             draw_hline(lcd, BX + k, BX + W - 1 - k, BY + k, ST7305_COLOR_BLACK);
@@ -1458,4 +1468,12 @@ bool os_confirm_exit_blocking(st7305_handle_t *lcd) {
 
         vTaskDelay(pdMS_TO_TICKS(16));
     }
+}
+
+/* 兼容包装: 引擎"退出程序?"确认沿用原语义(不超时、默认确定)。
+ * 5 处既有调用方(page_engine/page_pal/gam4980 注入)无需改动。 */
+bool os_confirm_exit_blocking(st7305_handle_t *lcd)
+{
+    return os_system_confirm(lcd, "\xe9\x80\x80\xe5\x87\xba\xe7\xa8\x8b\xe5\xba\x8f?", /* 退出程序? */
+                             0, false);
 }

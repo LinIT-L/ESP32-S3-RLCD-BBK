@@ -97,6 +97,10 @@ static bool s_mounted = false;
 static char s_mount_point[16] = "/sdcard";
 /* 保存 sdmmc_card_t 句柄, 让 USB MSC 可以直接读写扇区 */
 static sdmmc_card_t *s_card = NULL;
+/* ★ 2026-11-25: 交卡时记下这张卡真正占用的 FatFs 盘号 (CONFIG_FATFS_VOLUME_COUNT=2,
+ *   不一定是 0)。收卡时复用它, 绝不硬编码 register_sdmmc(0) —— 那会覆写另一个卷的
+ *   diskio 表项、踩坏它的目录项。0xFF = 未记录。 */
+static BYTE s_card_pdrv = 0xFF;
 
 /* ================= 「卡已交给 USB MSC」门闸 (2026-11-22) =================
  * 问题: 挂载到电脑时本机 VFS 被注销、s_mounted=false, 但 **s_card 仍然有效**,
@@ -352,6 +356,24 @@ static inline void mnt_lock(void)
 static inline void mnt_unlock(void)
 {
     if (s_mnt_mutex) xSemaphoreGive(s_mnt_mutex);
+}
+
+/* ★ 2026-11-25: 挂载锁的**有界**获取 —— 专供 UI 相关流程(USB 卸载后的本地恢复)。
+ *   背景: sd_remount_vfs_from_card() 第一句是 mnt_lock() = portMAX_DELAY,
+ *   一旦此刻别的任务正持锁做 sd_mount()/sd_full_remount()/格式化, 调用方就无限期挂住。
+ *   page_storage 的"存储恢复中"守卫就是因为这种无限等待而永远解除不掉(实测需重启)。
+ *
+ *   语义严格限定为"拿不到就不动": 返回 false 时**不修改 s_mounted / s_card /
+ *   s_usb_owned / 仲裁状态中的任何一个**, 也不碰 VFS/FatFs —— 状态一致性交给
+ *   真正的持锁者, 我们只是放弃这一次尝试, 让上层拿到明确错误码后退出。
+ *   这样既不会出现"超时后硬来"的并发重挂, 也不会留下半挂状态。 */
+static inline bool mnt_lock_to(uint32_t wait_ms)
+{
+    mnt_lazy_init();
+    if (!s_mnt_mutex) return false;          /* 没有锁 ⇒ 无法保证互斥, 一律当作失败 */
+    if (wait_ms == SD_LOCK_WAIT_FOREVER)
+        return xSemaphoreTake(s_mnt_mutex, portMAX_DELAY) == pdTRUE;
+    return xSemaphoreTake(s_mnt_mutex, pdMS_TO_TICKS(wait_ms)) == pdTRUE;
 }
 
 static esp_err_t sd_mount_body(void);
@@ -857,6 +879,10 @@ void sd_unmount(void) {
     ESP_LOGI(TAG, "SD 卡已卸载 (SDMMC host 已释放)");
 }
 
+/* ★ 2026-11-25 统一交卡/收卡入口的"已持锁体"。
+ *   约定: 调用方必须已持挂载锁, 函数内每个出口自带 mnt_unlock() ——
+ *   这与改造前完全一致, 只是把"取锁"从函数体内提到入口, 好让入口能加等待上限。 */
+
 /* 卸载 VFS 但保留 card 句柄 (用于切换到 USB MSC 模式)
  *
  * ★★ 2026-11-22 三处修正 (这三点任意一条失效都可能丢卡上数据):
@@ -867,14 +893,14 @@ void sd_unmount(void) {
  *   ③ ff_sdmmc_set_disk_status_check() **内部没有边界检查**, 而
  *      ff_diskio_get_pdrv_card() 找不到卡时返回 0xFF ⇒ 原来会写
  *      `s_disk_status_check_en[255]`, 越界踩 fatfs 组件里的相邻静态变量。 */
-int sd_unmount_vfs_keep_card(void) {
+static int sd_vfs_handoff_locked(void) {
     /* 格式化进行中: 卡正在被整卡擦除, 绝不能交给电脑 */
     if (sd_format_is_running()) {
         ESP_LOGW(TAG, "[卸载VFS] 格式化进行中 ⇒ 拒绝交出卡");
+        mnt_unlock();
         return -1;
     }
 
-    mnt_lock();
     if (!s_mounted || !s_card) {
         /* 本来就没有本地 VFS: 有 card ⇒ 可以直接交给电脑; 没 card ⇒ 失败 */
         s_usb_owned = (s_card != NULL);
@@ -913,6 +939,7 @@ int sd_unmount_vfs_keep_card(void) {
     }
 
     BYTE pdrv = ff_diskio_get_pdrv_card(s_card);
+    s_card_pdrv = pdrv;              /* ★ 留给收卡时复用, 不硬编码 0 */
     if (pdrv < FF_VOLUMES) {
         ff_sdmmc_set_disk_status_check(pdrv, false);
     } else {
@@ -942,8 +969,20 @@ int sd_unmount_vfs_keep_card(void) {
     return 0;
 }
 
-int sd_remount_vfs_from_card(void) {
-    mnt_lock();
+/* 交卡唯一入口: 有界拿锁 → 交给持锁体。拿不到锁**什么都不改**。 */
+int sd_vfs_handoff(uint32_t lock_wait_ms)
+{
+    if (!mnt_lock_to(lock_wait_ms)) {
+        ESP_LOGE(TAG, "[卸载VFS] 挂载锁 %ums 内未取到 ⇒ 放弃本次交卡(未改动任何状态)",
+                 (unsigned)lock_wait_ms);
+        return SD_REMOUNT_EBUSY;
+    }
+    return sd_vfs_handoff_locked();
+}
+
+/* ★ 2026-11-25: 拆分"已持锁体" + 入口, 与交卡同构。
+ *   调用方必须已持挂载锁, 函数内每个出口自带 mnt_unlock()(与改动前完全一致)。 */
+static int sd_remount_vfs_locked(void) {
     if (s_mounted) {
         s_usb_owned = false;
         sd_arb_set_state(SD_ARB_LOCAL);
@@ -964,12 +1003,19 @@ int sd_remount_vfs_from_card(void) {
 
     ESP_LOGI(TAG, "[重挂VFS] 从已有 card=%p 重新挂载 FAT/VFS", s_card);
 
-    BYTE pdrv = ff_diskio_get_pdrv_card(s_card);
-    if (pdrv == 0xFF) {
-        ff_diskio_register_sdmmc(0, s_card);
+    /* ★ 2026-11-25: 优先复用交卡时记录的真实盘号; 没记录则按卡句柄现查。
+     *   原来无条件 register_sdmmc(0) 会踩掉另一个卷(如 SPIFFS/另一张卡)的 diskio 表项。 */
+    BYTE pdrv = (s_card_pdrv < FF_VOLUMES) ? s_card_pdrv
+                                           : ff_diskio_get_pdrv_card(s_card);
+    if (pdrv >= FF_VOLUMES) {
+        /* 盘号确实没记录/句柄已注销: 退回原始行为注册到 0(已长期验证可用)。
+         * IDF 未公开"按盘号查占用"的接口, 不做私有头依赖; 正常流程都走上面的复用分支,
+         * 不会踩到别的卷。 */
         pdrv = 0;
-        ESP_LOGI(TAG, "[重挂VFS] 重新注册 diskio, pdrv=%u", pdrv);
+        ff_diskio_register_sdmmc(pdrv, s_card);
+        ESP_LOGI(TAG, "[重挂VFS] 盘号无记录, 按默认注册 diskio pdrv=%u", pdrv);
     }
+    s_card_pdrv = pdrv;
 
     char drive_str[8];
     snprintf(drive_str, sizeof(drive_str), "%u:", pdrv);
@@ -1013,6 +1059,42 @@ int sd_remount_vfs_from_card(void) {
     sd_arb_set_state(SD_ARB_LOCAL);   /* ★ 卷已就绪, 这才放开本机访问 */
     mnt_unlock();
     ESP_LOGI(TAG, "[重挂VFS] 成功 @ %s", s_mount_point);
+    return 0;
+}
+
+/* 收卡唯一入口: 有界拿锁 → 交给持锁体。
+ *   拿不到锁返回 SD_REMOUNT_EBUSY, **不修改任何状态** —— 由调用方如实上报,
+ *   而不是继续操作(那才是真正的并发重挂)。 */
+int sd_vfs_reclaim(uint32_t lock_wait_ms) {
+    if (!mnt_lock_to(lock_wait_ms)) {
+        ESP_LOGE(TAG, "[重挂VFS] 挂载锁 %ums 内未取到 ⇒ 放弃本次恢复(未改动任何状态)",
+                 (unsigned)lock_wait_ms);
+        return SD_REMOUNT_EBUSY;
+    }
+    return sd_remount_vfs_locked();
+}
+
+/* ★ 2026-11-25 新增: "卡已回本机但 VFS 没挂上"的收尾。
+ *   只改所有权/状态标志(全部在挂载锁内), **绝不碰 VFS / FatFs / SDMMC host** ——
+ *   目的只是别把卡永久锁在"归电脑"的所有权上, 让 sd_watcher / 下次 sd_mount()
+ *   能按正常路径重新探测(那是已经被验证过的重挂路径)。
+ *   拿不到锁就返回 EBUSY 且不做任何修改: 此时有别的任务正在操作卡, 它自己会收尾。 */
+int sd_usb_ownership_release(uint32_t lock_wait_ms) {
+    if (!mnt_lock_to(lock_wait_ms)) {
+        ESP_LOGE(TAG, "[收卡] 挂载锁 %ums 内未取到 ⇒ 所有权保持原样(未改动)",
+                 (unsigned)lock_wait_ms);
+        return SD_REMOUNT_EBUSY;
+    }
+    if (s_mounted) {                 /* 别的任务已经把卷挂回来了, 无需收尾 */
+        mnt_unlock();
+        ESP_LOGW(TAG, "[收卡] 卷已由其它路径挂回 ⇒ 无需释放所有权");
+        return 0;
+    }
+    s_usb_owned = false;
+    s_mnt_state = SD_MNT_UNKNOWN;    /* 允许下次重新探测, 而不是锁存"无卡" */
+    sd_arb_set_state(SD_ARB_OFF);    /* 卷未就绪 ⇒ 本机访问继续被拒(不乱读) */
+    mnt_unlock();
+    ESP_LOGW(TAG, "[收卡] 所有权已交回本机, 状态=UNKNOWN (等待重新探测/重挂)");
     return 0;
 }
 

@@ -147,6 +147,10 @@ void wallpapers_set_light_sleep(int mode);
 int  wallpapers_light_sleep_mode(void);       /* -1/0/1 */
 int  wallpapers_light_sleep_effective(void);  /* 1=当前允许浅睡 0=不允许 */
 int  wallpapers_usb_connected(void);          /* 1=插着电脑 */
+/* ★ 2026-11-25: 1=正处于 USB 设备模式(TinyUSB 占 PHY)。
+ * 该模式下 usb_hid 已持有 ESP_PM_NO_LIGHT_SLEEP 锁, 自动浅睡被硬否决 ——
+ * `lsleep 1` / `pwrbin 0x10` 改 light_sleep_enable 也绕不过。 */
+int  wallpapers_usb_mode_active(void);
 
 #ifdef __cplusplus
 }

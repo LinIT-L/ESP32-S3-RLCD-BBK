@@ -99,6 +99,7 @@
 #include "os_sources.h"   /* ★ 2026-11-08: store src 私有源 */
 #include "espnow_link.h"   /* remcon `now` 命令: ESP-NOW 现场诊断 */
 #include "nes_emu.h"
+#include "usbh_msc_sdspi.h"   /* ★ 2026-11-25: mscstat 读 USB MSC 生命周期诊断记录(NVS) */
 #include "st7305.h"      /* 抓屏: 帧缓冲布局 + 面板尺寸 */
 #include "os_hw.h"       /* wifi 命令: 走资源管家开/关射频 (与页面同一记账) */
 #include "driver/gpio.h"
@@ -214,6 +215,9 @@ static const struct { const char *name; os_action_t act; } s_actions[] = {
     {"power_hint", OS_ACTION_POWER_HINT},
     {"power_release", OS_ACTION_POWER_RELEASE},
     {"bt_search", OS_ACTION_BT_SEARCH},
+    /* ★ 2026-11-28: 注入"长按电源键关机确认" —— 走与真实按键完全相同的 action 路径,
+     *   用于区分"按键信号没到" vs "弹框机制坏了"。key shutdown_ask ⇒ 弹关机确认框。 */
+    {"shutdown_ask", OS_ACTION_POWER_SHUTDOWN},
 };
 
 /* ===== 字符串工具 ===== */
@@ -393,21 +397,58 @@ static void rc_cmd_immediate(const char *line){
         printf("KEYS done\r\n");
     } else if (strcmp(cmd, "crash") == 0) {
         /* ★ 2026-11-22: 读上次崩溃现场（svc_crash 的 RTC/NVS 自留证）。
-         * 串口没接着也能事后查 —— 地址用 addr2line 对照 LinTOS.elf 即可定位。 */
+         * 串口没接着也能事后查 —— 地址用 addr2line 对照 LinTOS.elf 即可定位。
+         * ★ 2026-11-25: 补栈余量/堆/卡状态/网页服务，并打印 NVS 复位历史 ——
+         *   看门狗与掉压不走 panic handler，只有历史环能证明"在以什么方式循环重启"。 */
         svc_crash_rec_t cr;
         if (!svc_crash_get(&cr)) {
-            printf("CRASH: 无记录\r\n");
+            printf("CRASH: 无崩溃现场(RTC/NVS 都没有)\r\n");
         } else {
-            printf("CRASH rst=%u uptime=%ums\r\n",
-                   (unsigned)cr.reset_reason, (unsigned)cr.uptime_ms);
+            printf("CRASH rst=%u(%s) uptime=%ums seq=%u\r\n",
+                   (unsigned)cr.reset_reason, svc_crash_rst_name(cr.reset_reason),
+                   (unsigned)cr.uptime_ms, (unsigned)cr.boot_seq);
             printf("CRASH reason=%s | %s\r\n",
                    cr.reason[0] ? cr.reason : "?", cr.desc[0] ? cr.desc : "?");
             printf("CRASH task=%s core=%u exc=%u addr=0x%08x frames=%u\r\n",
                    cr.task[0] ? cr.task : "?", (unsigned)cr.core, (unsigned)cr.exception,
                    (unsigned)cr.addr, (unsigned)cr.nframes);
+            if (cr.reg_pc || cr.reg_exccause || cr.reg_excvaddr) {
+                printf("CRASH PC=0x%08x PS=0x%08x EXCCAUSE=%u EXCVADDR=0x%08x\r\n",
+                       (unsigned)cr.reg_pc, (unsigned)cr.reg_ps,
+                       (unsigned)cr.reg_exccause, (unsigned)cr.reg_excvaddr);
+                printf("CRASH A0=0x%08x A1=0x%08x A2=0x%08x A3=0x%08x A4=0x%08x A5=0x%08x\r\n",
+                       (unsigned)cr.reg_a0, (unsigned)cr.reg_a1, (unsigned)cr.reg_a2,
+                       (unsigned)cr.reg_a3, (unsigned)cr.reg_a4, (unsigned)cr.reg_a5);
+            }
+            printf("CRASH stack=%uB heap=%u/%u psram=%u\r\n",
+                   (unsigned)cr.stack_free, (unsigned)cr.heap_free,
+                   (unsigned)cr.heap_min, (unsigned)cr.psram_free);
+            printf("CRASH sd_state=%u inflight=%u msc_owned=%u web_running=%u\r\n",
+                   (unsigned)cr.sd_state, (unsigned)cr.sd_inflight,
+                   (unsigned)cr.msc_owned, (unsigned)cr.web_running);
             for (int i = 0; i < cr.nframes && i < SVC_CRASH_FRAMES; i++)
                 printf("CRASH #%d 0x%08x\r\n", i, (unsigned)cr.frames[i]);
             printf("CRASH tip: xtensa-esp32s3-elf-addr2line -pfiaC -e LinTOS.elf <addr...>\r\n");
+        }
+        /* ★ 2026-11-25: 复位历史 —— 判断"是不是在循环重启、循环在什么类型上"。
+         *   这份在 NVS，RTC 被掉压清掉也还在，是目前唯一能覆盖 brownout/WDT 的证据。 */
+        {
+            svc_crash_hist_t hs;
+            if (svc_crash_hist_get(&hs)) {
+                uint32_t cnt = hs.total < SVC_CRASH_HIST_N ? hs.total : SVC_CRASH_HIST_N;
+                printf("CRASH ---- 复位历史: 累计 %u 次, 显示最近 %u 次(旧→新) ----\r\n",
+                       (unsigned)hs.total, (unsigned)cnt);
+                uint32_t start = (hs.head + SVC_CRASH_HIST_N - cnt) % SVC_CRASH_HIST_N;
+                for (uint32_t i = 0; i < cnt; i++) {
+                    const __typeof__(hs.e[0]) *e = &hs.e[(start + i) % SVC_CRASH_HIST_N];
+                    printf("CRASH   [%2u] rst=%u(%s) uptime=%ums%s\r\n",
+                           (unsigned)(hs.total - cnt + i + 1),
+                           (unsigned)e->rst, svc_crash_rst_name(e->rst),
+                           (unsigned)e->uptime, (e->flags & 1) ? " 有现场" : "");
+                }
+            } else {
+                printf("CRASH ---- 无复位历史(NVS 尚未写入) ----\r\n");
+            }
         }
         /* ★ 崩溃前日志环：不管有没有崩溃记录都打一遍，这是定位"当时在干什么"的关键 */
         svc_logring_dump("crash 命令");
@@ -419,6 +460,16 @@ static void rc_cmd_immediate(const char *line){
     } else if (strcmp(cmd, "logring_clear") == 0) {
         svc_logring_clear();
         printf("LOGRING cleared\r\n");
+    } else if (strcmp(cmd, "mscstat") == 0) {
+        /* mscstat [clear] —— USB MSC 生命周期诊断记录 (NVS "mscdiag"/"last")。
+         * 为什么必须事后读: 挂载期间串口控制台被暂停、SD 已交给电脑(文件日志也写不了);
+         *   卸载瞬间 Serial/JTAG 刚装回, 主机还没重新枚举出 CDC, IDF 串口 VFS write()
+         *   直接返回 EIO ⇒ 那一刻打的日志全部丢失(实测两次抓串口都是 0 字节)。
+         *   所以时序只能落 NVS, 用本命令事后读。
+         * 记录内容: 进USB/建LUN/主机枚举/卸载 各段耗时、exit 码、本地 VFS 恢复结果、串口驱动状态。 */
+        char *a = rc_next(&rest);
+        if (a && strcmp(a, "clear") == 0) usbh_msc_diag_clear();
+        else                              usbh_msc_diag_dump();
     } else if (strcmp(cmd, "echo") == 0) {
         printf("ECHO %s\r\n", rest ? rest : "");
     } else if (strcmp(cmd, "hwoff") == 0) {
@@ -520,21 +571,26 @@ static void rc_cmd_immediate(const char *line){
         if (av && (strcmp(av, "1") == 0 || strcmp(av, "high") == 0 ||
                    strcmp(av, "on") == 0)) lvl = 1;
 
+        if (ltc2954_kill_pin() < 0) {   /* 无 2954 的板型(老版小智/微雪/标准): 不能碰 */
+            printf("KILL: 本板型无 LTC2954 (pwr_kill=%d), 不操作\r\n", ltc2954_kill_pin());
+            fflush(stdout);
+            return;
+        }
         gpio_config_t o = {
-            .pin_bit_mask = 1ULL << LTC2954_KILL_GPIO,
+            .pin_bit_mask = 1ULL << ltc2954_kill_pin(),
             .mode         = GPIO_MODE_OUTPUT,
             .pull_up_en   = GPIO_PULLUP_DISABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type    = GPIO_INTR_DISABLE,
         };
         gpio_config(&o);
-        gpio_set_level((gpio_num_t)LTC2954_KILL_GPIO, 1);   /* 先回安全电平, 防配置顺带拉低 */
+        gpio_set_level((gpio_num_t)ltc2954_kill_pin(), 1);   /* 先回安全电平, 防配置顺带拉低 */
         vTaskDelay(pdMS_TO_TICKS(20));
 
         if (lvl) {
             /* 反向验证: 只释放 KILL, 不关机 */
-            gpio_set_level((gpio_num_t)LTC2954_KILL_GPIO, 1);
-            printf("KILL GPIO%d -> 高 (释放, 电源保持)\r\n", LTC2954_KILL_GPIO);
+            gpio_set_level((gpio_num_t)ltc2954_kill_pin(), 1);
+            printf("KILL GPIO%d -> 高 (释放, 电源保持)\r\n", ltc2954_kill_pin());
             fflush(stdout);
             return;
         }
@@ -547,7 +603,7 @@ static void rc_cmd_immediate(const char *line){
             ltc2954_force_cut_once();   /* 本次强制真断电, 不写设置页开关 */
         }
         printf("KILL 关机: GPIO%d 拉低 + 保持, hw_ok=%d, hwoff=%d\r\n",
-               LTC2954_KILL_GPIO, (int)hw_ok, (int)ltc2954_is_enabled());
+               ltc2954_kill_pin(), (int)hw_ok, (int)ltc2954_is_enabled());
         fflush(stdout);
 
         BaseType_t ok = xTaskCreate(rc_task_shutdown, "killoff", 8192,
@@ -1237,21 +1293,31 @@ static void rc_cmd_immediate(const char *line){
     } else if (strcmp(cmd, "lsleep") == 0) {
         /* lsleep [auto|0|1] —— 桌面档浅睡控制。
          *   auto(默认): 插着电脑不浅睡(保串口), 拔线允许浅睡
-         *   0: 永久禁浅睡(回到旧行为)   1: 强制开(插着线也睡, 串口会断) */
+         *   0: 永久禁浅睡(回到旧行为)   1: 强制开(插着线也睡, 串口会断)
+         * ★ 2026-11-25: USB 模式(TinyUSB 占 PHY)期间 usb_hid 持有
+         *   ESP_PM_NO_LIGHT_SLEEP 锁, 本命令改得了配置但**改不动行为** ——
+         *   锁是 IDF 内部的硬否决, 优先级高于 light_sleep_enable。
+         *   所以这里如实提示, 不让现场误以为"开了却没生效是别的问题"。 */
         char *v = rc_next(&rest);
         if (!v) {
-            printf("LSLEEP mode=%d (%s) effective=%d usb=%d\r\n",
+            printf("LSLEEP mode=%d (%s) effective=%d usb=%d usbmode=%d\r\n",
                    wallpapers_light_sleep_mode(),
                    wallpapers_light_sleep_mode() < 0 ? "auto" :
                    (wallpapers_light_sleep_mode() ? "force-on" : "force-off"),
                    wallpapers_light_sleep_effective(),
-                   wallpapers_usb_connected());
+                   wallpapers_usb_connected(),
+                   wallpapers_usb_mode_active());
+            if (wallpapers_usb_mode_active())
+                printf("LSLEEP USB 模式进行中: 自动浅睡已被 PM 锁否决(本命令无法绕过)\r\n");
         } else if (strcmp(v, "auto") == 0) {
             wallpapers_set_light_sleep(-1);
             printf("LSLEEP auto (按USB自动)\r\n");
         } else {
-            wallpapers_set_light_sleep(atoi(v) != 0);
-            printf("LSLEEP %s\r\n", atoi(v) ? "force-on (串口会断)" : "force-off");
+            int on = atoi(v) != 0;
+            wallpapers_set_light_sleep(on);
+            printf("LSLEEP %s\r\n", on ? "force-on (串口会断)" : "force-off");
+            if (on && wallpapers_usb_mode_active())
+                printf("LSLEEP 注意: USB 模式进行中, PM 锁已否决自动浅睡, 该设置退出 USB 模式后才生效\r\n");
         }
     } else if (strcmp(cmd, "pwrbin") == 0) {
         /* ★ 2026-11-08 linit「二分定位发热源」: 运行期逐项关模块，重启即完全恢复。
@@ -1290,6 +1356,9 @@ static void rc_cmd_immediate(const char *line){
             esp_err_t pe = esp_pm_configure(&pm);
             printf("PWRBIN PM max=%dMHz light_sleep=%d (%s)\r\n",
                    maxf, (want & 0x10) ? 1 : 0, esp_err_to_name(pe));
+            /* ★ 2026-11-25: 0x10 位也绕不过 USB 模式保护(PM 锁是硬否决), 如实提示。 */
+            if ((want & 0x10) && wallpapers_usb_mode_active())
+                printf("PWRBIN 注意: USB 模式进行中, 自动浅睡已被 PM 锁否决(0x10 暂不生效)\r\n");
         }
         cur = want;
         printf("PWRBIN mask=0x%02X (01WiFi 02音频 04SD 08降频 10浅睡)\r\n", (unsigned)cur);
@@ -1913,7 +1982,7 @@ static void rc_cmd_immediate(const char *line){
             fflush(stdout);
         }
     } else if (strcmp(cmd, "help") == 0) {
-        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait bat batdiag batlog esr esw es7 es7w mic help\r\n");
+        printf("CMDS: hello echo reboot shutdown loglevel mem blk audit stack uptime tasks ls cat rm cp diag page key tap fbinfo fbdump nes scan app wait bat batdiag batlog esr esw es7 es7w mic help mscstat\r\n");
     }
     fflush(stdout);
 }
@@ -2181,6 +2250,9 @@ static void rc_exec(const char *line){
                                          *   ⇒ 永远 "RC_ERR unknown cmd" (本轮又踩了一次)。 */
         strcmp(cmd, "logring") == 0 ||       /* 只看崩溃前日志环 */
         strcmp(cmd, "logring_clear") == 0 || /* 清空日志环(自测用) */
+        strcmp(cmd, "mscstat") == 0 ||   /* ★ 2026-11-25: USB MSC 生命周期诊断记录(NVS).
+                                          *   同 sleepstage/hwoff 的坑: dispatch 里实现了,
+                                          *   白名单漏登记 ⇒ 永远 "RC_ERR unknown cmd". */
         strcmp(cmd, "pwrstate") == 0 || /* ★ 2026-11-21: 真断电 or 深睡 的复位原因判读 */
         strcmp(cmd, "rtcset") == 0 ||   /* ★ 2026-11-21: 写 DS3231 + 清 OSF(断电保持验证) */
         strcmp(cmd, "rtcdump") == 0 ||  /* ★ 2026-11-21: 只读原样 dump 芯片寄存器+OSF */

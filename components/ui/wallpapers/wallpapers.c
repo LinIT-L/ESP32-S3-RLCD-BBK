@@ -378,6 +378,11 @@ EXT_RAM_BSS_ATTR static StackType_t s_ss_stack[SS_SUPER_STACK];  /* 静态 PSRAM
 static StaticTask_t s_ss_tcb;   /* ⛔ 必须内部 RAM: xPortCheckValidTCBMem 校验 */
 static TaskHandle_t s_ss_task_h = NULL;  /* 深睡前 vTaskSuspend */
 static int s_ss_pm_mode = -1;      /* 屏保分档: -1=未定 0=静态省电 1=动态流畅 (退出时复位) */
+/* ★ 2026-11-25: 屏保档上一次实际生效的"浅睡开关"。-1=还没配过。
+ *   为什么单独记: 屏保一挂一整夜, 期间**用户可能插上电脑**(传文件/调试),
+ *   而 USB 在位数一变就必须立刻关掉浅睡。原来屏保档只看 s_ss_pm_mode,
+ *   它是常量 0, 进屏保配一次就再也不重配 ⇒ 插线也拦不住浅睡。 */
+static int s_ss_ls = -1;
 /* ★ 2026-10-26 linit「进屏保直接关 WiFi」: 射频 20~30mA。
  *   即使 MIN_MODEM 也要按 DTIM 醒来收包; disable() 才真正 stop+deinit 并释放内部 RAM。
  *   短暂息屏也一样关（linit 要求）; 解锁后后台重新初始化，不阻塞界面。 */
@@ -438,11 +443,14 @@ static void wifi_restore_task(void *arg)
     vTaskDelete(NULL);
 }
 
-#include "usb_hid.h" /* usb_hid_host_mounted(): USB 插着只抑制**自动关机**, 不阻止息屏 (2026-11-22 收窄) */
+#include "usb_hid.h" /* ★ 2026-11-25: usb_hid_mode_owns_phy() —— USB 模式判据(唯一来源);
+                      *   插着 USB 只抑制**自动关机**, 不阻止息屏 (2026-11-22 收窄) */
 #include "audio_player.h" /* ★ 2026-11-22: 播放/录音中不自动息屏/关机 (见 wp_media_busy) */
 #include "power_stat.h" /* power_stat_tick(): USB 插入边沿 → 电源统计清零 (电池信息页) */
 #include "net_client.h" /* ★ 2026-11-24: netc_busy() —— 下载/上传/商店/OTA/Lua 网络任务不算"无操作" */
 #include "bt_manager.h" /* ★ 2026-11-24: 省电模式蓝牙闲置判定 + 内部栈异步深拆 */
+#include "web_files.h"  /* ★ 2026-11-25: web_files_active() —— 局域网文件访问/传文件中不算"无操作" */
+#include "sd_scan.h"    /* ★ 2026-11-25: sd_format_is_running() —— 整卡擦除期间不进屏保/关机 */
 
 /* USB(主机已枚举) 期间不自动休眠: 插在电脑上时正在传文件/调试/充电, 不希望它息屏甚至自动关机。 */
 static bool s_usb_suppress_prev = false;
@@ -470,6 +478,38 @@ static bool wp_media_busy(void)
     return false;
 }
 
+/* ★★★ 2026-11-25: 「USB 在位」的唯一判定点 ★★★
+ *
+ * 分两层, 且两层职责严格分开:
+ *
+ * ① **USB 设备模式(TinyUSB)**: 直接问 usb_hid_mode_owns_phy() —— 也就是
+ *    "现在是不是 USB 模式"这个**自身模式状态**。
+ *    不再用 usb_serial_jtag_is_connected()/SOF, 也不再调用 usb_hid_host_mounted():
+ *      · MSC 期间 usb_mode_enter() 已把 USJ 驱动卸载, 该函数**恒为 false**
+ *        ⇒ 曾经连续 8 轮判成"线拔了" → 开浅睡 → 浅睡关 USB PHY → 电脑侧 U 盘
+ *          消失/重枚举 → MSC 传输断裂(这就是"访问 TF 卡自动重启"的根因链)。
+ *      · tud_mounted() 在切换窗口里也可能读到上一模式/未初始化的状态。
+ *    模式状态没有这些问题: 进模式前就置位, 出模式才复位, 中途不会抖。
+ *    另外 usb_hid 在进入 USB 模式时已持 ESP_PM_NO_LIGHT_SLEEP 锁, 这里返回 true
+ *    只是让 light_sleep_enable 也跟着写 0(配置值与实际一致, 诊断不误导)。
+ *
+ * ② **正常模式(Serial/JTAG 控制台)**: 只有 SOF 能反映"插着电脑"。
+ *    这一层不是 USB 模式判定, 而是"插着电脑就别断串口"的省电让步 ——
+ *    没有别的信号可用(板子没把 VBUS/CHRG 接给 MCU), 所以保留。
+ *    ⛔ 不要用它去判 USB 模式(①的误判就是这么来的)。
+ *
+ * 纯内存读, 不加锁、不碰 flash, 可在 PSRAM 栈的屏保监督任务里调用。 */
+static bool wp_usb_present(void)
+{
+    if (usb_hid_mode_owns_phy()) return true;   /* ① USB 模式: 按模式状态, 不看信号 */
+    return usb_serial_jtag_is_connected();      /* ② 正常模式: 仅用于"插着电脑保串口" */
+}
+
+/* ★ 2026-11-25: 是否处于 USB 设备模式(TinyUSB 占 PHY)。remcon `lsleep`/`pwrbin` 诊断用。
+ * 放在这里(!)而不是文件前部, 是因为 usb_hid.h 在本文件中段才 include —— 提前调用
+ * 会拿到隐式声明。 */
+int wallpapers_usb_mode_active(void) { return usb_hid_mode_owns_phy() ? 1 : 0; }
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  "系统正在被使用" 的**唯一聚合点** (2026-11-24 省电模式)
  *
@@ -488,8 +528,29 @@ static bool wp_media_busy(void)
  *    它只进下一层 wp_shutdown_busy() —— 息屏可以, 强杀关卡进度不行。
  *    真正在跑、连屏幕都不能盖住的会话(如仙剑、频谱仪)自己调 wp_idle_hold(true)。
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* ═══ 需要"活动保护"的外部资源 (2026-11-25 统一) ═══
+ * USB MSC 挂载、Wi-Fi 文件访问/传输、SD 格式化 —— 这三类的共同点:
+ *   ① 用户在设备**外部**(电脑浏览器)操作, 没有本机按键/触摸刷新空闲时钟;
+ *   ② 一旦进壁纸/关射频/自动关机, 正在进行的会话被硬砍(传文件断、U 盘掉线、擦卡中断)。
+ * 统一在这一处判, 三条门禁(进屏保 / 自动关机 / 关无线电)共用 —— 不允许各路径
+ * 再各写一份, 否则新增活动源时必然漏一处(历史上就是这么漂移的)。
+ * 全部是纯内存读(usb_hid 模式状态 / 时间戳 / 原子计数), 屏保任务 PSRAM 栈安全。 */
+static bool wp_resource_busy(void)
+{
+    /* USB 设备模式(TinyUSB 占 PHY): MSC 挂载到电脑期间。
+     * 只用模式状态, 不用 usb_serial_jtag_is_connected()/SOF —— 后者在 MSC 下
+     * 因 USJ 驱动被卸而恒 false, 会把"正在传文件"误判成"线拔了"。 */
+    if (usb_hid_mode_owns_phy()) return true;
+    /* Wi-Fi 文件管理: 流式上传/下载 + 最近 30s 内的任意 API 请求(翻目录等)。 */
+    if (web_files_active())      return true;
+    /* SD 格式化: 整卡擦除数十秒, 进壁纸/关射频/关机都会中断它。 */
+    if (sd_format_is_running())  return true;
+    return false;
+}
+
 static bool wp_activity_busy(void)
 {
+    if (wp_resource_busy())     return true;   /* ★ USB MSC / Wi-Fi 文件访问 / SD 格式化 */
     if (wp_media_busy())        return true;   /* 音乐播放 / 录音 */
     if (input_game_key_held())  return true;   /* 正按着游戏键 */
     if (netc_busy())            return true;   /* 下载 / 上传 / 商店 / OTA / Lua 网络 */
@@ -598,8 +659,19 @@ static void wp_eco_tick(uint32_t now)
      *   (开机放桌上没人用)会永远不算闲置, 射频白开着。 */
     const uint32_t last_in = input_last_any_ms();
     const uint32_t ref     = last_in ? last_in : s_eco_boot_ms;
-    const bool sys_idle = ((uint32_t)(now - ref) >= WP_ECO_IDLE_MS) &&
-                          !wp_activity_busy();
+    /* ★ 2026-11-25: 有业务在跑(音乐/下载/局域网传文件/页面占位) ⇒ 把两个
+     *   "连续闲置"起点清零。
+     *   只判 `!busy` 而不清零是不够的: 传一个大文件期间 s_eco_wifi_idle 停在很早
+     *   的时间戳上, 传输一结束 `now - s_eco_wifi_idle` 早已超过 3 分钟 ⇒
+     *   **下一次 tick 立刻关射频**, 用户刚关掉文件管理器列表就白屏。
+     *   清零后"业务结束才开始计时", 与"用户刚动过手"完全等价 —— 这就是
+     *   "传完恢复原有省电计时、不长期阻止省电"的落地。 */
+    const bool busy = wp_activity_busy();
+    if (busy) {
+        s_eco_wifi_idle = 0;
+        s_eco_bt_idle   = 0;
+    }
+    const bool sys_idle = !busy && ((uint32_t)(now - ref) >= WP_ECO_IDLE_MS);
 
     /* ---------- Wi-Fi: 开了、没连接、没扫描、没任务、闲置 3 分钟 → 关 ---------- */
     if (!wifi_manager_is_enabled() || wifi_manager_is_busy() || s_ss_wifi_off) {
@@ -676,7 +748,7 @@ static void ss_supervisor_task(void *arg) {
              *   仍在跑时把 s_ss_enter_ms 顶到现在 ⇒ 结束后重新给足整档时长,
              *   不会"一停就关机"。 */
             if (wp_shutdown_busy()) s_ss_enter_ms = now;
-            if (!usb_hid_host_mounted() && !usb_serial_jtag_is_connected() &&
+            if (!wp_usb_present() &&
                 !wp_shutdown_busy() && now - s_ss_enter_ms >= wp_ss_run_ms()) {
                 s_ss_shutdown = true;
                 vTaskSuspend(xTaskGetCurrentTaskHandle());
@@ -727,12 +799,24 @@ static void ss_supervisor_task(void *arg) {
                  *   ⚠ 帧率后来又被 linit 打回 16fps（4fps 观感太卡），见下方 dly 的注释；
                  *     省电主要靠"关 WiFi + 80MHz + 浅睡"这三项，不靠压帧率。 */
                 int want = 0;
-                if (want != s_ss_pm_mode) {
+                /* ★★★ 2026-11-25: 屏保档**不再无条件开浅睡** ★★★
+                 *   原来这里 light_sleep_enable 写死 true，与桌面档那段
+                 *   "插着 USB 绝不浅睡"自相矛盾: 桌面档守住了, 可只要到了壁纸时间
+                 *   (省电模式把壁纸时间强制成 1 分钟)就无条件开浅睡 —— 而浅睡会关
+                 *   USB PHY(本文件有实测记录) ⇒ MSC 传着传着电脑侧 U 盘消失、
+                 *   串口掉线。现在两档共用 wp_usb_present() 这一个判据。
+                 *   USB 在位时仍是 80/80MHz, 只是不进浅睡: 频率档不变, 只少了
+                 *   tickless idle 那部分收益, 换来 USB 与串口稳定。 */
+                int ls_want = wp_usb_present() ? 0 : 1;
+                if (want != s_ss_pm_mode || ls_want != s_ss_ls) {
                     s_ss_pm_mode = want;
+                    s_ss_ls      = ls_want;
+                    s_ls_eff     = ls_want;   /* 让 `pm`/诊断看到的"当前是否允许浅睡"是真实值 */
                     esp_pm_config_t pm = (esp_pm_config_t){ .max_freq_mhz = 80, .min_freq_mhz = 80,
-                                                            .light_sleep_enable = true };
+                                                            .light_sleep_enable = (ls_want != 0) };
                     esp_pm_configure(&pm);
-                    ESP_LOGI(WP_TAG, "屏保省电档: 80MHz + 浅睡 (动态 62ms/帧 = 16fps)");
+                    ESP_LOGI(WP_TAG, "屏保省电档: 80MHz + %s (动态 62ms/帧 = 16fps)",
+                             ls_want ? "浅睡" : "USB 在位数/保 USB 不浅睡");
                 }
                 /* ★★★ 2026-11-24 省电模式: 「进屏保就关 WiFi」**取消**, 合并进 wp_eco_tick()。
                  *   原来这里是无条件关射频(屏保一进就关), 任务书要求与"闲置 3 分钟关"统一,
@@ -770,7 +854,14 @@ static void ss_supervisor_task(void *arg) {
                  *   两个方向都能正确切换, 且只在跨档时调一次 esp_pm_configure。 */
                 /* ★ 2026-11-08: 每次循环都看一眼 USB 状态(62ms 一次, 开销可忽略),
                  *   状态变了就重配 PM —— 拔线后自动允许浅睡, 插线后自动退出浅睡。 */
-                int usb_now = usb_serial_jtag_is_connected() ? 1 : 0;
+                /* ★★★ 2026-11-25 修复「USB MSC 传输中自动重启」★★★
+                 *   原来这里是 usb_serial_jtag_is_connected() 单判。MSC 模式下
+                 *   usb_mode_enter() 已把 USJ 驱动卸载(把 PHY 让给 TinyUSB),
+                 *   该函数因此**恒为 false** ⇒ 连续 8 轮(约 8 秒)后被判成"线拔了"
+                 *   ⇒ 开浅睡 ⇒ 浅睡关 USB PHY ⇒ 电脑侧 U 盘消失/重枚举 ⇒ MSC 传输断裂。
+                 *   改用 wp_usb_present()(两条信号取或, 见其定义处), 与关机抑制、
+                 *   屏保档口径完全一致。 */
+                int usb_now = wp_usb_present() ? 1 : 0;
                 /* ★★★ 2026-11-08 实测教训: 不能只靠 IDF 官方锁 ★★★
                  *   CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y 号称"USB 连着就持
                  *   ESP_PM_NO_LIGHT_SLEEP 锁, 阻止自动浅睡"。真机实测**没拦住**:
@@ -792,6 +883,16 @@ static void ss_supervisor_task(void *arg) {
                     ls_now = (s_usb_gone_n >= WP_USB_GONE_CONFIRM) ? 1 : 0;
                 }
                 if (esp_timer_get_time() < 60LL * 1000 * 1000) ls_now = 0;
+                /* ★★★ 2026-11-25: USB 模式期间一律写 0 —— `lsleep 1` 也不能绕过 ★★★
+                 *   真正的否决权是 usb_hid 在进入 USB 模式时持有的 ESP_PM_NO_LIGHT_SLEEP
+                 *   锁(即使这里写 1 也睡不进去, IDF 的 get_lowest_allowed_mode() 到不了
+                 *   PM_MODE_LIGHT_SLEEP)。这里写 0 是为了让 `pm`/`lsleep` 打印的
+                 *   light_sleep 配置值与实际行为一致, 不给现场诊断留"显示允许却从不睡"的坑。
+                 *   同时清零断开确认计数: 回到桌面时从干净状态重新计。 */
+                if (usb_hid_mode_owns_phy()) {
+                    ls_now = 0;
+                    s_usb_gone_n = 0;
+                }
                 if (s_ss_pm_mode != 1 || ls_now != s_ls_eff || usb_now != s_usb_conn) {
                     s_ss_pm_mode = 1;
                     s_ls_eff     = ls_now;
@@ -881,7 +982,7 @@ static void ss_supervisor_task(void *arg) {
              *   原来这里带 `!usb` ⇒ 插着线就永不进壁纸, 用户以为"息屏/关机设置没生效"。
              *   息屏不关串口、不影响传文件, 没有理由拦; 抑制只保留给"自动关机"(见上面屏保分支)。
              *   ⛔ 不要再把 `!usb` 加回来。 */
-            bool usb = usb_hid_host_mounted() || usb_serial_jtag_is_connected();
+            bool usb = wp_usb_present();
             if (usb != s_usb_suppress_prev) {
                 s_usb_suppress_prev = usb;
                 ESP_LOGD(WP_TAG, "USB 主机%s → %s", usb ? "已连接" : "已断开",
@@ -953,6 +1054,7 @@ void wp_set_program(int prog) {
     /* 让下一次进入屏保重新判定档位（静态 idle_ms / 动态 62ms + 对应频率），
      * 否则会沿用上一个壁纸的档位，直到"本帧有无新内容"翻转才纠正。 */
     s_ss_pm_mode = -1;
+    s_ss_ls      = -1;   /* 与档位一起置脏: 下一帧屏保重新按 USB 在位数决定浅睡 */
     ESP_LOGI(WP_TAG, "屏保壁纸切换为: %s (id=%d)", wp_prog_name(s_ss_prog), s_ss_prog);
 }
 

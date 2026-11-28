@@ -164,8 +164,11 @@ if (hw_cfg_enabled(HW_SD)) {
     }
 }
 
-    /* 3. 初始化按键 */
-if (hw_cfg_enabled(HW_TOUCH) || hw_cfg_enabled(HW_SD)) { input_init(); }   /* 按键总在; 触摸由 input 内部按指纹判 */
+    /* 3. 初始化按键 —— ★ 2026-11-28: **无条件调用**。
+     *   原条件是 `hw_cfg_enabled(HW_TOUCH) || hw_cfg_enabled(HW_SD)`, 一旦探测/使能
+     *   掩码异常就整块跳过 ⇒ 三颗物理键(含电源键)全部无响应, 而屏幕/触摸照常,
+     *   症状与"按键坏了"完全一样。按键是系统基本输入, 不该由外设探测结果决定。 */
+    input_init();
 
     /* 4. 初始化 NVS (蓝牙/WiFi 需要存储校准数据和配置) */
     ret = svc_nvs_flash_init();

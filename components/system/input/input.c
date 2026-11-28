@@ -206,37 +206,6 @@ static btn_ctx_t s_btns[3];
 static void input_key_task(void *arg);
 static bool s_key_task_started = false;
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * ★★★ 2026-11-22 电源键(2954 /INT = GPIO44) 硬件边沿观测 ★★★
- *   背景: 用户反馈"按 2954 的 PB, /INT 到固件反应慢"。查代码确认: 这一脚在固件里
- *   是 **纯轮询** (`intr_type = GPIO_INTR_DISABLE`), 状态机 tick() 只在主循环每次
- *   input_get_action() 时跑一遍 ⇒ 响应快慢 = 主循环帧率(游戏里 = 游戏帧率)。
- *   本段先**只观测不改行为**, 把两段延迟分开量:
- *     A. 2954/信号侧: 边沿本身什么时候到 (ISR 时间戳)
- *     B. 固件侧: 下一次 tick 才认出按下 —— 差值就是主循环节奏造成的延迟
- *   有了 A/B 才能判定该改硬件滤波还是改调度, 不凭感觉改架构。
- * ⚠ 断点式测量, 定位完即可整段删除。
- * ═══════════════════════════════════════════════════════════════════════════ */
-static int s_pwr_gpio_cached = -1;                  /* ISR 内不能调 board_pins_get() */
-static volatile int64_t  s_pwr_edge_down_us = 0;    /* 最近一次下降沿(按下)时刻 */
-static volatile int64_t  s_pwr_edge_up_us   = 0;    /* 最近一次上升沿(松开)时刻 */
-static volatile uint32_t s_pwr_edge_cnt     = 0;    /* 开机以来边沿总数 */
-static bool s_pwr_int_ok = false;
-
-static void IRAM_ATTR pwr_int_isr(void *arg)
-{
-    (void)arg;
-    int lvl = gpio_get_level((gpio_num_t)s_pwr_gpio_cached);
-    int64_t t = esp_timer_get_time();
-    if (lvl == 0) s_pwr_edge_down_us = t;
-    else          s_pwr_edge_up_us   = t;
-    s_pwr_edge_cnt++;
-}
-
-/* 主循环扫描间隔 (判定"是主循环慢还是信号慢"的第二个证据) */
-static int64_t  s_pwr_tick_last_us = 0;
-static uint32_t s_pwr_slow_log_ms  = 0;
-
 /* ★ 2026-11-22: 物理键动作流水 (供 `keys` 快照判读)
  *   s_act_cnt      开机以来物理键产生的动作**总数** —— 按了键这个数不涨, 就说明动作
  *                  压根没从输入层出来(引脚/状态机问题), 与上层分发无关;
@@ -828,11 +797,6 @@ void input_init(void) {
              gpio_get_level(BTN_GPIO_LEFT), gpio_get_level(BTN_GPIO_RIGHT),
              gpio_get_level(BTN_GPIO_PWR));
 
-    /* ★ 2026-11-22: PWR(2954 /INT) 的边沿中断必须在 power_mgr_pin_init() **之后**注册 ——
-     *   它内部的 keys_config() 用 gpio_config(intr_type=GPIO_INTR_DISABLE) 重配所有键脚,
-     *   会把这里挂的中断清掉(第一次就是踩了这个, 日志有"已挂"但 ISR 永不触发)。
-     *   详见下方 power_mgr_pin_init(); 之后的注册块。 */
-
     /* 触摸面板 (V1.0.65): 未检测到芯片时 read 恒返回 false, 零开销
      * ★ 2026-10-18: 引脚按**板型表运行时**下发（原来是编译期 BOARD_TP_* 宏 = 小智的 5/13/12/6，
      *   在标准扩展版上既打不开触摸、还会把该板的 LCD DC(5) 配成开漏上拉 ⇒ 屏不刷新）。 */
@@ -869,8 +833,11 @@ void input_init(void) {
     input_cfg_keys();                          /* 按结果配置物理键语义 */
     /* 开关键 (V1.5.x): rel_short=true — 短按动作改"释放判定":
      *   按住 <0.5s 松手 → POWER_LOCK(锁屏进壁纸); 持续按住 ≥0.5s 不投(避免长按关机途中误锁屏),
-     *   到 2s 由 input_power_should_sleep 独立轮询弹"是否关机"确认框.
-     *   long_action 保持 NONE (长按关机不由本键 tick 投递). */
+     *   到 2s 由 tick 状态机投递 POWER_SHUTDOWN (★2026-11-25 改为 action 通道).
+     *   ★★ 为什么不再用独立 GPIO 轮询(input_power_should_sleep) ★★
+     *     那条路依赖主循环每帧调用, 模拟器/引擎前台阻塞时永远跑不到; 且撞脚机型
+     *     (PWR==LEFT/RIGHT)恒 false。改成 tick 投递后与"返回键退出框"走同一条
+     *     input_get_action 通道, 任何界面/引擎/板型都一致生效。 */
     /* ★★★ 2026-10-16: 板型可能把"电源键"和"确认键"放在同一个脚(微雪=GPIO18) ⇒
      *   若两条目读同一 GPIO, 状态机互相打架 ⇒ **按键全部点不动**。
      *   这里统一处理: 同脚时**只保留 KEY(确认)条目**, 电源键条目禁用(pin=-1)。 */
@@ -878,7 +845,8 @@ void input_init(void) {
         s_btns[2] = (btn_ctx_t){ (gpio_num_t)(-1), ST_IDLE, 0, POWER_HOLD_MS,
                                  MENU_ACTION_NONE, MENU_ACTION_NONE, false, "PWR(同脚,禁用)" };
     } else {
-        s_btns[2] = (btn_ctx_t){ BTN_GPIO_PWR, ST_IDLE, 0, POWER_HOLD_MS, MENU_ACTION_POWER_LOCK, MENU_ACTION_NONE, true, "PWR" };
+        s_btns[2] = (btn_ctx_t){ BTN_GPIO_PWR, ST_IDLE, 0, POWER_HOLD_MS,
+                                 MENU_ACTION_POWER_LOCK, MENU_ACTION_POWER_SHUTDOWN, true, "PWR" };
     }
 
     /* [电源收拢] 唤醒/睡眠引脚(RTC域上拉 + EXT1唤醒掩码)统一由电源模块 sleep.c 负责
@@ -892,26 +860,27 @@ void input_init(void) {
     if (BTN_GPIO_RIGHT >= 0) gpio_sleep_sel_dis((gpio_num_t)BTN_GPIO_RIGHT);
     if (BTN_GPIO_PWR   >= 0) gpio_sleep_sel_dis((gpio_num_t)BTN_GPIO_PWR);
 
-    /* ★ 2026-11-22: PWR(2954 /INT) 双边沿观测中断 —— 必须放在 power_mgr_pin_init()
-     *   **之后**：它的 keys_config() 会用 gpio_config(intr_type=DISABLE) 重配键脚,
-     *   早挂会被静默清掉(日志显示"已挂"但 ISR 永不触发, 实测踩过)。
-     *   只观测, 不改变按键判定: 记下边沿时刻, 由 tick() 算出"边沿→识别"延迟。 */
     if (BTN_GPIO_PWR >= 0) {
-        s_pwr_gpio_cached = BTN_GPIO_PWR;
-        esp_err_t isr_srv = gpio_install_isr_service(0);   /* 已被别处装过返回 INVALID_STATE, 无害 */
-        if (isr_srv != ESP_OK && isr_srv != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "GPIO ISR 服务安装失败: %s", esp_err_to_name(isr_srv));
-        } else {
-            esp_err_t e1 = gpio_set_intr_type((gpio_num_t)BTN_GPIO_PWR, GPIO_INTR_ANYEDGE);
-            esp_err_t e2 = gpio_isr_handler_add((gpio_num_t)BTN_GPIO_PWR, pwr_int_isr, NULL);
-            if (e1 == ESP_OK && e2 == ESP_OK) {
-                s_pwr_int_ok = true;
-                ESP_LOGI(TAG, "PWR(GPIO%d) 边沿观测中断已挂 (ANYEDGE, 在 pin_init 之后)", BTN_GPIO_PWR);
-            } else {
-                ESP_LOGW(TAG, "PWR 中断挂载失败: intr=%s add=%s",
-                         esp_err_to_name(e1), esp_err_to_name(e2));
-            }
-        }
+        /* 不依赖 power_mgr 的 keys_config 掩码 —— 这里显式配一次"输入 + 上拉"。
+         * 幂等; 放在 power_mgr_pin_init() 之后, 不会被打回。 */
+        gpio_config_t pc = {
+            .pin_bit_mask = 1ULL << BTN_GPIO_PWR,
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&pc);
+        /* ★★★ 2026-11-28: LTC2954ITS8-2 的 /INT(U6.5→GPIO1) 是**开漏输出**,
+         *   必须外部上拉才能读到"松开=高"。Schematic1_4/111.tel 的 GPIO1 网络
+         *   只有 U2.39+U6.5 两个焊盘, **没有外部上拉电阻**(R7 100k 拉的是 KILL#/GPIO44)。
+         *   固件必须把 GPIO1 的上拉坐实 —— 数字域 + RTC 域**两处都开**:
+         *     · 数字域 pullup: 运行期读到确定的高电平(按键状态机读它)
+         *     · RTC 域 pullup: 深睡/浅睡时 pad 切到 RTC 域, 数字域掉电后仍要有上拉,
+         *       否则 /INT 浮空 ⇒ EXT1 误判"按下" ⇒ 关机瞬间自唤醒
+         *   这里在 power_mgr_pin_init(keys_config) 之后**再显式确认一次**, 不依赖别处顺序。 */
+        gpio_set_pull_mode((gpio_num_t)BTN_GPIO_PWR, GPIO_PULLUP_ONLY);
+        if (BTN_GPIO_PWR <= 21) rtc_gpio_pullup_en((gpio_num_t)BTN_GPIO_PWR);  /* GPIO1 ∈ RTC 域 */
     }
 
     /* ★ 2026-11-22: 物理键专职扫描任务 (5ms)。与 UI 帧率完全解耦 ——
@@ -936,28 +905,19 @@ static menu_action_t tick(btn_ctx_t *b) {
     if (b->gpio < 0) return MENU_ACTION_NONE;        /* 该键已禁用(同脚/无此键) */
     bool pressed = (gpio_get_level(b->gpio) == 0);   /* 低电平=按下 */
     uint32_t now = now_ms();
-    /* ★ 2026-11-22: 电源键的扫描间隔 = 主循环帧周期。>45ms 说明这一帧被拖慢,
-     *   此时按电源键必然"反应慢", 且与 2954/信号无关。1s 节流防刷屏。 */
-    if (b->rel_short) {
-        int64_t t = esp_timer_get_time();
-        if (s_pwr_tick_last_us) {
-            int64_t gap = t - s_pwr_tick_last_us;
-            uint32_t now_u = (uint32_t)(t / 1000);
-            if (gap > 45000 && (now_u - s_pwr_slow_log_ms) >= 1000u) {
-                s_pwr_slow_log_ms = now_u;
-                ESP_LOGW(TAG, "[PWR] 扫描间隔 %.1f ms ⇒ 电源键响应被主循环拖慢", gap / 1000.0);
-            }
-        }
-        s_pwr_tick_last_us = t;
-    }
     switch (b->state) {
         case ST_IDLE:
-            if (pressed) { b->state = ST_DEBOUNCE; b->press_start = now;
-                /* ★ 2026-11-22: 2954 /INT 下降沿 → 状态机认出按下, 就是纯固件侧延迟 */
-                if (b->rel_short && s_pwr_int_ok && s_pwr_edge_down_us > 0) {
-                    int64_t d = esp_timer_get_time() - s_pwr_edge_down_us;
-                    ESP_LOGI(TAG, "[PWR] 边沿→识别 %.1f ms (边沿累计 %u)",
-                             d / 1000.0, (unsigned)s_pwr_edge_cnt);
+            if (pressed) {
+                if (b->rel_short) {
+                    /* 2954 的 /INT 最短低电平 32ms(datasheet tDB,OFF), 与本文件
+                     * DEBOUNCE_MS(30ms) 几乎重合。芯片自身已做 32ms 硬件去抖,
+                     * 固件不再叠加 ⇒ 开关键跳过 ST_DEBOUNCE 直接进 PRESSED。
+                     * 其余机械键仍走 30ms 防抖。 */
+                    b->state = ST_PRESSED;
+                    b->press_start = now;
+                } else {
+                    b->state = ST_DEBOUNCE;
+                    b->press_start = now;
                 }
                 ESP_LOGD(TAG, "[dbg] key %s DOWN det=%d", b->name, b->gpio); }
             break;
@@ -978,31 +938,27 @@ static menu_action_t tick(btn_ctx_t *b) {
         case ST_PRESSED:
             if (pressed) {
                 uint32_t thr = (b->long_ms > 0) ? b->long_ms : LONG_PRESS_MS;
-                if (now - b->press_start > thr) {
+                /* ★ 2026-11-28: `>=` 而非 `>` —— 按住满 2s 的**当帧**就投关机动作,
+                 *   不要求松手(松手后才弹窗是旧行为, 用户按到 3s 会先被 2954 硬件断电)。 */
+                if ((now - b->press_start) >= thr) {
                     /* V1.0.40: 长按发射后进入 ST_LONG_FIRED, 等按键释放才回 IDLE.
-                     * V1.5.x 提示: 开关键(rel_short)长按 2s 在此进入 LONG_FIRED,
-                     * 投递 long_action=NONE (长按关机由 input_power_should_sleep
-                     * 独立轮询弹确认框), 此后释放不再误触发锁屏. */
+                     * ★ 2026-11-25: 开关键(rel_short)长按 2s 在此投递
+                     *   long_action=MENU_ACTION_POWER_SHUTDOWN(不再是 NONE),
+                     *   与返回键走同一 action 通道 ⇒ 引擎/模拟器阻塞主循环时照样生效;
+                     *   进入 LONG_FIRED 后释放不再误触发锁屏. */
                     b->state = ST_LONG_FIRED;
                     return b->long_action;
                 }
             } else {
                 b->state = ST_IDLE;
                 if (b->rel_short) {
-                    if ((now - b->press_start) < PWR_SHORT_MS) {
-                        /* ★ 2026-11-22: 2954 /INT 上升沿 → 真正投出锁屏动作 */
-                        if (s_pwr_int_ok && s_pwr_edge_up_us > 0) {
-                            int64_t d = esp_timer_get_time() - s_pwr_edge_up_us;
-                            ESP_LOGI(TAG, "[PWR] 松开→投锁屏 %.1f ms (按住 %u ms)",
-                                     d / 1000.0, (unsigned)(now - b->press_start));
-                        }
-                        return b->short_action;
-                    }
-                    /* [死区修复] 开关键按住 >=0.5s 但未达 2s 关机即松手: 不投锁屏(POWER_LOCK),
-                     * 此前也不刷新 s_last_any_ms -> 屏保态下监督任务唤醒判定恒假 -> "按一下退不出,
-                     * 要再按一次". 此处仅刷新统一活动时钟, 监督任务据此唤醒壁纸; 长按到 2s 走
-                     * ST_LONG_FIRED(关机), 不进本分支, 不影响"壁纸态长按关机". */
+                    /* 开关键语义(两条互斥、无空隙):
+                     *   · 按住未达 2s 就松手 ⇒ 锁屏(POWER_LOCK)
+                     *   · 按住满 2s(松不松都一样) ⇒ 关机确认框(见 ST_PRESSED 长按分支) */
+                    ESP_LOGI(TAG, "[PWR] 点按→投锁屏 (按住 %u ms)",
+                             (unsigned)(now - b->press_start));
                     s_last_any_ms = now;
+                    return b->short_action;
                 }
             }
             break;
@@ -1081,6 +1037,7 @@ static menu_action_t key_q_pop(const char **name)
  *     若要换回更省的 30ms, 必须同时把 DEBOUNCE_MS 调小, 否则本条失效会重现。 */
 #define KEY_IDLE_MS        10    /* 空闲轮询周期: 必须明显 < DEBOUNCE_MS(30), 且 > 浅睡门槛 8ms */
 #define KEY_FAST_HOLD_MS   400   /* 动作后继续快档的时间(连击/连按跟手) */
+
 static void input_key_task(void *arg)
 {
     (void)arg;
@@ -1105,6 +1062,8 @@ static void input_key_task(void *arg)
         }
         uint32_t now = now_ms();
         if (active) last_act_ms = now;
+        /* ★ 2026-11-25: 电源键长按走本状态机的 tick() 投递 MENU_ACTION_POWER_SHUTDOWN,
+         *   不再用独立 GPIO 轮询 + 事件标志 —— 那条路在引擎阻塞时不生效。 */
         bool fast = active || (last_act_ms && (uint32_t)(now - last_act_ms) < KEY_FAST_HOLD_MS);
         vTaskDelay(pdMS_TO_TICKS(fast ? 5 : KEY_IDLE_MS));
     }

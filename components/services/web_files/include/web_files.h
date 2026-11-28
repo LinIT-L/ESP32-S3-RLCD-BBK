@@ -38,18 +38,29 @@ void web_files_stop(void);
 
 bool web_files_is_running(void);
 
+/* ★ 2026-11-25: 是否**正在传输**(上传/下载流)。
+ * 给省电系统用: 局域网传文件时浏览器那头没有按键/触摸, 按"输入空闲"判断会
+ * 1 分钟就息屏、3 分钟关射频 —— 射频一关, httpd 的 socket 全断, 传输直接被腰斩。
+ * 只读 s_xfer 计数, 纯内存访问, 不加锁、不碰 flash, 可以在 PSRAM 栈的
+ * 屏保监督任务里安全调用。传输结束立刻返回 false, 不会长期阻止省电。 */
+bool web_files_busy(void);
+
+/* ★ 2026-11-25: "有用户在用网页文件共享"的保活判据 (省电专用)。
+ * 在 busy(仅流式传输)之外, 把最近 30s 内的任意 API 请求(翻目录/建目录/删除/改名)
+ * 也算活动 —— 避免浏览器翻目录的停顿被误判闲置、进壁纸/关射频把会话砍断。
+ * 纯内存时间戳比较, 可在 PSRAM 栈的屏保监督任务里调用; 传完 30s 自动 false,
+ * 不长期阻止省电。 */
+bool web_files_active(void);
+
 /* ─────────────────────────────────────────────────────────────────────
- * USB MSC「挂载到电脑」前后的清场 / 恢复（2026-11-24）
+ * USB MSC「挂载到电脑」前后的清场 / 恢复
  *
- * 交卡顺序必须是:
- *   ① web_files_quiesce(3000)   —— 不再受理新请求, 打断正在跑的上传/下载
- *   ② sd_unmount_vfs_keep_card() —— 注销 VFS (内部还有 sd_arb 在途归零)
- *   ③ usbh_msc_start()
- * 收卡顺序:
- *   ① usbh_msc_stop()
- *   ② sd_remount_vfs_from_card()
- *   ③ web_files_resume()
- * 跳过 ① 就会重演"电脑一访问就重启": handler 手里的 FILE* 跨过了 VFS 注销点。
+ * 2026-11-25 起, 这几个调用的**顺序由 usbh_msc 的会话状态机统一负责**
+ * (见 services/usbh_msc/include/usbh_msc_sdspi.h): 会话任务在 PREPARING 阶段先
+ *   web_files_quiesce() → sd_vfs_handoff() → 起 USB,
+ * 在 RESTORING 阶段 sd_vfs_reclaim() → web_files_resume()。
+ * 页面/其它模块**不要**再自己拼这套顺序 —— 漏掉一次 quiesce 就是
+ * "电脑一访问就重启": handler 手里的 FILE* 跨过了 VFS 注销点。
  * ───────────────────────────────────────────────────────────────────── */
 
 /* 停止受理并等正在跑的传输收尾。返回 false = 超时(仍有传输未退出)。

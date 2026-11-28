@@ -241,14 +241,25 @@ static uint8_t scan_peripherals(int board) {
 int hw_cfg_board_id(void) { return s_board; }
 const char *hw_cfg_board_name(void) {
     switch (s_board) {
-        case HW_BOARD_XIAOZHI: return "小智一体版";
+        /* ★ 2026-11-28 四版本: 小智两版靠 RTC(0x68) 自动分辨显示
+         *   有 0x68 = S1_4 关机版(有 LTC2954); 无 = S1_1 老版(无 LTC2954)。
+         *   rtc_ever 印记让"认到过一次"永久保留, 避免首探漏判来回跳。 */
+        case HW_BOARD_XIAOZHI:
+            return hw_cfg_has_ltc2954() ? "小智关机版" : "小智老版";
         case HW_BOARD_WEIXUE:  return "微雪原版";
-        case HW_BOARD_STD:     return "标准扩展版";
+        case HW_BOARD_STD:     return "标准模块版";
         default:               return "未知";
     }
 }
 uint8_t hw_cfg_det_mask(void) { return s_det; }
 uint8_t hw_cfg_en_mask(void)  { return s_en; }
+
+/* ★ 2026-11-28 四版本全自动: 小智两版靠 RTC(0x68) 自动分辨, 无用户开关 */
+bool hw_cfg_has_ltc2954(void) {
+    if (hw_cfg_board_id() != HW_BOARD_XIAOZHI) return false;
+    /* 认到过 0x68 (rtc_ever 永久印记) 或本次 det 有位 = S1_4 关机版 */
+    return (s_det & (1u << HW_RTC)) || cfg_get_u8("rtc_ever", 0);
+}
 
 /* 由 svc_rtc 在真正挂载成功(0x68 有应答)之后回填 (2026-11-20)
  *   为什么需要: 本文件的探测跑在 T+76ms, 那时触摸驱动还没建 I2C 总线,

@@ -19,6 +19,10 @@ typedef enum {
     MENU_ACTION_POWER_HINT,    /* 软关机键 0.5s = 提示 */
     MENU_ACTION_POWER_RELEASE, /* 软关机键 0.5s 后松手 = 返回 */
     MENU_ACTION_BT_SEARCH,     /* 硬件 KEY(确认) 长按 2s = 进入蓝牙搜索 */
+    /* ★ 2026-11-25: 电源键长按 2s = 关机确认。走与返回键相同的 action 通道
+     * (tick 状态机投递 → input_get_action → 各 UI 执行方消费),
+     * 不依赖主循环/独立 GPIO 轮询 —— 模拟器前台阻塞主循环时照样生效。 */
+    MENU_ACTION_POWER_SHUTDOWN,
 } menu_action_t;
 
 #include "touch_panel.h"   /* V1.0.xx: tp_point_t (多点触控) */

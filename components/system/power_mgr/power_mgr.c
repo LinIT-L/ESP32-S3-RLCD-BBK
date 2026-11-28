@@ -719,12 +719,12 @@ void power_mgr_off(int origin)
             KEEP_PIN(bp->sd_clk);  KEEP_PIN(bp->sd_cmd);  KEEP_PIN(bp->sd_d0);
             KEEP_PIN(bp->sd_cs);   KEEP_PIN(bp->sd_sck);  KEEP_PIN(bp->sd_mosi); KEEP_PIN(bp->sd_miso);
             /* ★★★ 2026-11-13 LTC2954: 这两个脚必须留在白名单。
-             *   GPIO2(KILL) ≤ 21 ⇒ 下面的隔离循环会调 rtc_gpio_isolate(2)，
-             *   把数字域到 pad 的通路切断；之后 gpio_set_level(2,0) 根本送不到
-             *   LTC2954 的 KILL 输入 ⇒ "硬件断电"变成一个静默的空操作（最难查的那种）。
-             *   GPIO43(INT) > 21 不会被 isolate，但也不能被关掉上拉，否则按键读不到。
-             *   ⚠ 冲突板型上这两个脚本来就在白名单里（TP_RST / GPS_TX），重复加入无副作用。 */
-            KEEP_PIN(LTC2954_KILL_GPIO);   KEEP_PIN(LTC2954_INT_GPIO);
+             *   ★ 2026-11-27 临时测试固件(Schematic1_4): KILL=GPIO44(>21)、INT=GPIO1(≤21)。
+             *   KILL 现在 >21 不会被 isolate，但仍在白名单保证上拉不被关；
+             *   INT=GPIO1 ≤21 会被 rtc_gpio_isolate 切断 → 必须在白名单(且本来就是 PWR_KEY)。
+             *   ⚠ 语义不变: 少加任一脚可能让 KILL 断电失效或电源键读不到。
+             *   ⚠ 冲突板型上这两个脚本来就在白名单里，重复加入无副作用。 */
+            KEEP_PIN(ltc2954_kill_pin());   KEEP_PIN(ltc2954_int_pin());
         }
         int niso = 0;
         /* ★ 2026-10-28: 0x40(引脚隔离) 未置位 ⇒ 循环体一次都不执行(整段跳过)。
